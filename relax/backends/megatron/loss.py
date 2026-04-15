@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any

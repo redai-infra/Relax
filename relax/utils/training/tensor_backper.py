@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable

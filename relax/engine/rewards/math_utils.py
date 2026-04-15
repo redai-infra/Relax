@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 # from https://github.com/agentica-project/deepscaler/blob/e6080ccd974eb64bd3430f0b36108244a6fee330/deepscaler/rewards/math_utils/utils.py
 """Answer checker API that uses sympy to simplify expressions and check for
 equality.

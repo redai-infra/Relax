@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 import dataclasses
 from argparse import Namespace
 from collections.abc import Sequence

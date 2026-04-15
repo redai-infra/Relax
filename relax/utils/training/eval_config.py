@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from __future__ import annotations
 
 from collections.abc import Iterable

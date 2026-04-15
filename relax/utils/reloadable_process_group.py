@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 import os
 from contextlib import contextmanager
 from datetime import timedelta

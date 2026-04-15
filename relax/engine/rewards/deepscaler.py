@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from .math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
 
 

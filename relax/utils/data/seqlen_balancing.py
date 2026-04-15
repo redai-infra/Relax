@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
-# Copied from https://github.com/volcengine/verl/blob/468adf22c43b744348051fccd7a5d830c6c3c36a/verl/utils/seqlen_balancing.py
-
 import copy
 import heapq
 

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from relax.utils.misc import get_current_node_ip, get_free_port
 
 

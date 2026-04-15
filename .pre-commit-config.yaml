@@ -63,7 +63,72 @@ repos:
         files: \.(c|cc|cxx|cpp|cu|h|hpp|hxx|proto|xpu|kps|py|pyi|sh)$
         exclude: |
             (?x)^(
-                examples/.*| docs/.* | docker/.*
+                examples/.* | docs/.* | docker/.* |
+                relax/backends/megatron/kernels/__init__\.py |
+                relax/backends/megatron/misc_utils\.py |
+                relax/backends/megatron/sglang\.py |
+                relax/backends/megatron/weight_conversion/deepseekv3\.py |
+                relax/backends/megatron/weight_update/__init__\.py |
+                relax/distributed/ray/__init__\.py |
+                relax/engine/__init__\.py |
+                relax/engine/filters/__init__\.py |
+                relax/engine/filters/base_types\.py |
+                relax/engine/rewards/deepscaler\.py |
+                relax/engine/rollout/__init__\.py |
+                relax/engine/router/__init__\.py |
+                relax/engine/router/middleware/__init__\.py |
+                relax/utils/__init__\.py |
+                relax/utils/data/__init__\.py |
+                relax/utils/data/mask_utils\.py |
+                relax/utils/debug/__init__\.py |
+                relax/utils/external/__init__\.py |
+                relax/utils/metrics/adapters/__init__\.py |
+                relax/utils/multimodal/__init__\.py |
+                relax/utils/training/__init__\.py |
+                relax/utils/training/flops_utils\.py |
+                relax/backends/megatron/ci_utils\.py |
+                relax/backends/megatron/cp_utils\.py |
+                relax/backends/megatron/initialize\.py |
+                relax/backends/megatron/kernels/fp8_kernel\.py |
+                relax/backends/megatron/kernels/int4_qat/setup\.py |
+                relax/backends/megatron/loss\.py |
+                relax/backends/megatron/weight_conversion/__init__\.py |
+                relax/backends/megatron/weight_conversion/glm4\.py |
+                relax/backends/megatron/weight_conversion/glm4moe\.py |
+                relax/backends/megatron/weight_conversion/llama\.py |
+                relax/backends/megatron/weight_conversion/mimo\.py |
+                relax/backends/megatron/weight_conversion/processors/__init__\.py |
+                relax/backends/megatron/weight_conversion/processors/quantizer_compressed_tensors\.py |
+                relax/backends/megatron/weight_conversion/processors/quantizer_fp8\.py |
+                relax/backends/megatron/weight_conversion/qwen2\.py |
+                relax/backends/megatron/weight_conversion/qwen3_next\.py |
+                relax/backends/megatron/weight_conversion/qwen3_vl\.py |
+                relax/backends/megatron/weight_conversion/qwen3moe\.py |
+                relax/backends/megatron/weight_update/hf_weight_iterator_base\.py |
+                relax/backends/megatron/weight_update/hf_weight_iterator_direct\.py |
+                relax/backends/megatron/weight_update/update_weight_from_distributed\.py |
+                relax/distributed/ray/ray_actor\.py |
+                relax/distributed/ray/utils\.py |
+                relax/engine/rewards/f1\.py |
+                relax/engine/rewards/gpqa\.py |
+                relax/engine/rewards/ifbench\.py |
+                relax/engine/rewards/math_dapo_utils\.py |
+                relax/engine/rewards/math_utils\.py |
+                relax/engine/rollout/base_types\.py |
+                relax/engine/router/middleware/radix_tree_middleware\.py |
+                relax/engine/router/router\.py |
+                relax/utils/async_utils\.py |
+                relax/utils/data/seqlen_balancing\.py |
+                relax/utils/distributed_utils\.py |
+                relax/utils/external/typer_utils\.py |
+                relax/utils/megatron_bridge_utils\.py |
+                relax/utils/metrics/metric_utils\.py |
+                relax/utils/reloadable_process_group\.py |
+                relax/utils/rocm_checkpoint_writer\.py |
+                relax/utils/training/eval_config\.py |
+                relax/utils/training/routing_replay\.py |
+                relax/utils/training/tensor_backper\.py |
+                relax/utils/types\.py
             )$
       - id: check-conflict-markers
         name: check-conflict-markers

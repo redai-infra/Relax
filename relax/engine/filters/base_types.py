@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from collections import defaultdict
 from dataclasses import dataclass
 

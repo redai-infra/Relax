@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 import torch
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any

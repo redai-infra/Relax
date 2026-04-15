@@ -1,6 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
-
 def calculate_embedding_flops(seqlen, hidden_size):
     return 2 * seqlen * hidden_size
 

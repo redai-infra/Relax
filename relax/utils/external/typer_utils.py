@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 import dataclasses
 import inspect
 from typing import Annotated

@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 """CI utilities for Megatron backend testing."""
 
 from collections.abc import Sequence
