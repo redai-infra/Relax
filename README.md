@@ -279,7 +279,7 @@ Relax is built upon the shoulders of excellent open-source projects:
 
 - [Slime](https://github.com/THUDM/slime) — Scalable training and inference framework for reinforcement learning
 - [SGLang](https://github.com/sgl-project/sglang) — Fast serving framework for large language models
-- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) & [Megatron-Bridge](https://github.com/NVIDIA/Megatron-Bridge) — Large-scale distributed training framework and HF ↔ Megatron weight conversion bridge, with sincere thanks to the entire **NVIDIA** team
+- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) & [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) — Large-scale distributed training framework and HF ↔ Megatron weight conversion bridge, with sincere thanks to the entire **NVIDIA** team
 - [TransferQueue](https://github.com/Ascend/TransferQueue) — High-performance distributed data transfer queue
 - [Ray](https://github.com/ray-project/ray) — Distributed computing framework
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) — State-of-the-art model hub

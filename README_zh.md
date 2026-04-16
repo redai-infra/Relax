@@ -279,7 +279,7 @@ Relax 的构建离不开以下优秀的开源项目：
 
 - [Slime](https://github.com/THUDM/slime) — 可扩展的强化学习训练与推理框架
 - [SGLang](https://github.com/sgl-project/sglang) — 高性能大语言模型推理框架
-- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) 与 [Megatron-Bridge](https://github.com/NVIDIA/Megatron-Bridge) — 大规模分布式训练框架及 HF ↔ Megatron 权重转换桥接库，衷心感谢整个 **NVIDIA** 团队
+- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) 与 [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) — 大规模分布式训练框架及 HF ↔ Megatron 权重转换桥接库，衷心感谢整个 **NVIDIA** 团队
 - [TransferQueue](https://github.com/Ascend/TransferQueue) — 高性能分布式数据传输队列
 - [Ray](https://github.com/ray-project/ray) — 分布式计算框架
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) — 最先进的模型中心
