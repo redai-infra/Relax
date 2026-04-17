@@ -2,38 +2,51 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Entrypoint for Ray Job tasks.
+# Entrypoint / source helper for Ray Job tasks.
 # The Ray cluster is already running. This script MUST NOT kill ray or stop the
-# cluster. It only cleans up residual python/sglang processes and then runs the
-# training script directly via python3.
+# cluster. It only cleans up residual python/sglang processes and then sets up
+# the environment for running training against an existing Ray cluster.
 #
-# Usage:
-#   bash scripts/entrypoint/ray-job.sh <run-script> [extra-args...]
+# Two usage modes:
+#   1) Entry-point mode — first argument is a .sh script path:
+#        bash scripts/entrypoint/ray-job.sh <run-script> [extra-args...]
+#      Sets up env, cleans residual processes, then execs the run script.
 #
-# Example:
-#   bash scripts/entrypoint/ray-job.sh scripts/training/text/run-qwen35-9B-8xgpu-async.sh
-#   bash scripts/entrypoint/ray-job.sh scripts/training/text/run-qwen35-9B-8xgpu-async.sh --lr 5e-7
+#      Example:
+#        bash scripts/entrypoint/ray-job.sh scripts/training/text/run-qwen35-9B-8xgpu-async.sh
+#        bash scripts/entrypoint/ray-job.sh scripts/training/text/run-qwen35-9B-8xgpu-async.sh --lr 5e-7
+#
+#   2) Source mode — no .sh script arg (like local.sh):
+#        source scripts/entrypoint/ray-job.sh
+#      Sets up env only, so the caller can continue execution.
 #
 # Environment variables (optional):
 #   MEGATRON      - Path to Megatron-LM (default: /root/Megatron-LM/)
 #   RELAX         - Path to Relax project (default: ../../)
 
+# Guard: skip if already sourced by another entrypoint
+if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+# ── mode detection ──────────────────────────────────────────────────────────
+# Entry-point mode: directly executed AND first arg is an existing .sh file.
+# Otherwise act as a sourced setup script.
+_RAY_JOB_RUN_SCRIPT=""
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    _RAY_JOB_FIRST_ARG="${1:-}"
+    if [ -n "$_RAY_JOB_FIRST_ARG" ] && [ -f "$_RAY_JOB_FIRST_ARG" ] && [[ "$_RAY_JOB_FIRST_ARG" == *.sh ]]; then
+        _RAY_JOB_RUN_SCRIPT="$_RAY_JOB_FIRST_ARG"
+        shift
+    else
+        echo "Usage: $0 <run-script.sh> [extra-args...]" >&2
+        exit 1
+    fi
+fi
+
 set -eo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-
-# ── argument parsing ────────────────────────────────────────────────────────
-RUN_SCRIPT="${1:-}"
-if [ -z "$RUN_SCRIPT" ]; then
-    echo "Usage: $0 <run-script> [extra-args...]" >&2
-    exit 1
-fi
-shift  # remaining args are extra overrides
-
-if [ ! -f "$RUN_SCRIPT" ]; then
-    echo "ERROR: run script not found: $RUN_SCRIPT" >&2
-    exit 1
-fi
 
 # ── clean up residual python/sglang processes (NOT ray) ─────────────────────
 # IMPORTANT: Do NOT pkill ray or run ray stop — the cluster is managed externally.
@@ -46,14 +59,13 @@ ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K
 set -x
 
 # ── environment setup ───────────────────────────────────────────────────────
-# Use the first GPU node as MASTER_ADDR and SLIME_HOST_IP (prefer head node)
+# Use the first GPU node as MASTER_ADDR (prefer head node)
 export MASTER_ADDR=$(ray list nodes --format json | jq -r '
   map(select(.state == "ALIVE" and (.resources_total.GPU // 0) > 0)) |
   sort_by(.is_head_node | not) |
   .[0].node_ip
 ')
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
@@ -74,13 +86,12 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-# ── delegate to run script ──────────────────────────────────────────────────
-echo "=== Launching training script: $RUN_SCRIPT ==="
+# ── entrypoint mode & runtime env ──────────────────────────────────────────
 export RELAX_ENTRYPOINT_MODE="ray-job"
 RAY_DEBUG=${RAY_DEBUG:-"0"}
 RAY_DEBUG_POST_MORTEM=${RAY_DEBUG_POST_MORTEM:-"0"}
 
-# Runtime env for ray-job mode (empty, env inherited from Ray cluster)
+# Runtime env for ray-job mode (env inherited from Ray cluster)
 export RUNTIME_ENV_JSON="{
 \"env_vars\": {
    \"PYTHONUNBUFFERED\": \"1\",
@@ -93,4 +104,11 @@ export RUNTIME_ENV_JSON="{
    \"RAY_DEBUG_POST_MORTEM\": \"${RAY_DEBUG_POST_MORTEM}\"
 }
 }"
-exec bash "$RUN_SCRIPT" "$@"
+
+echo "=== Ray-job environment ready ==="
+
+# ── delegate to run script (entry-point mode only) ─────────────────────────
+if [ -n "$_RAY_JOB_RUN_SCRIPT" ]; then
+    echo "=== Launching training script: $_RAY_JOB_RUN_SCRIPT ==="
+    exec bash "$_RAY_JOB_RUN_SCRIPT" "$@"
+fi

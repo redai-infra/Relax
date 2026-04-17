@@ -7,6 +7,10 @@
 # It is designed to be *sourced* by run-*.sh scripts when no external entrypoint
 # (spmd-multinode.sh or ray-job.sh) has been used.
 #
+# When an existing Ray cluster is detected (RAY_ADDRESS set and `ray status` OK),
+# this script delegates to `ray-job.sh` (source mode) instead of starting a new
+# local Ray head node.
+#
 # Usage (from a run script):
 #   source scripts/entrypoint/local.sh
 #
@@ -19,6 +23,19 @@
 
 # Guard: skip if already sourced by another entrypoint
 if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+_LOCAL_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# ── delegate to ray-job.sh when inside an existing Ray cluster ─────────────
+# When RAY_ADDRESS is set AND `ray status` succeeds, we're already part of an
+# externally-managed Ray cluster. Skip local Ray startup / process cleanup and
+# fall through to ray-job.sh (source mode) for env setup.
+if [ -n "${RAY_ADDRESS:-}" ] && timeout 5 ray status >/dev/null 2>&1; then
+    echo "=== Detected existing Ray cluster (RAY_ADDRESS=$RAY_ADDRESS); delegating to ray-job.sh ==="
+    # shellcheck source=./ray-job.sh
+    source "${_LOCAL_SH_DIR}/ray-job.sh"
     return 0 2>/dev/null || exit 0
 fi
 
@@ -38,7 +55,6 @@ pkill -9 python 2>/dev/null || true
 set -x
 
 # ── environment setup ───────────────────────────────────────────────────────
-_LOCAL_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 unset MASTER_ADDR 2>/dev/null || true
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
