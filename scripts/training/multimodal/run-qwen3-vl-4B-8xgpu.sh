@@ -67,6 +67,8 @@ PERF_ARGS=(
    #--micro-batch-size 16 # avoid OOM
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
+
+   --no-rope-fusion
 )
 
 GRPO_ARGS=(

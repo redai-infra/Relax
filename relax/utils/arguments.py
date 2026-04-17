@@ -259,6 +259,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to freeze the vision projection parameters (used in bridge mode for multimodal models).",
             )
             parser.add_argument(
+                "--vision-dp-when-tp",
+                action="store_true",
+                default=False,
+                help="Split vision encoder workload across TP ranks (data-parallel over TP). "
+                "Each TP rank processes a chunk of images, then all-reduce gathers the full embedding.",
+            )
+            parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
                 help="Whether to disable recompute loss function to save memory during training.",

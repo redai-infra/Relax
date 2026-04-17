@@ -122,6 +122,7 @@ OPTIMIZER_ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
+    --no-rope-fusion
 )
 
 ###############################################################################

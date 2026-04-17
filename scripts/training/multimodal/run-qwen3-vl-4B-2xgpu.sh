@@ -93,6 +93,7 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
    --clip-grad 1.0
+   --no-rope-fusion
 )
 
 WANDB_ARGS=(

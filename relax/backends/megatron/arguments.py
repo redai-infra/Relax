@@ -57,6 +57,18 @@ def _hf_validate_args(args, hf_config):
 
     errors = []
 
+    # Multimodal models (Qwen3-VL, Qwen3.5, Qwen3-Omni, etc.) use multi-axis RoPE whose
+    # rotary_pos_emb is a Python list of tensors, not a single Tensor. Megatron's fused
+    # RoPE kernel cannot handle this and produces numerically different results from the
+    # unfused HF/SGLang implementation, causing training-inference log-prob mismatch.
+    is_multimodal = hasattr(hf_config, "text_config") or hasattr(hf_config, "thinker_config")
+    if is_multimodal and getattr(args, "apply_rope_fusion", False):
+        errors.append(
+            "Multimodal models use multi-axis RoPE (list of tensors) which is incompatible "
+            "with fused RoPE kernels — this causes training-inference log-prob mismatch. "
+            "Add --no-rope-fusion to the launch script."
+        )
+
     # omni models have different config structure
     if hasattr(hf_config, "thinker_config"):
         hf_config = hf_config.thinker_config

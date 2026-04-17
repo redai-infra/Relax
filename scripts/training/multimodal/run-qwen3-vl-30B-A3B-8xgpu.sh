@@ -91,6 +91,7 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
 
    # NOTE(wuhuan): to avoid algorithm performance degradation
+   --no-rope-fusion
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
 )
