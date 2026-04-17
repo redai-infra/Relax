@@ -809,7 +809,6 @@ EVAL_PROMPT_DATASET = {}
 
 
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
-    assert not args.group_rm, "Group RM is not supported for eval rollout"
 
     state = GenerateState(args)
     # Increment evaluating counter so that abort() knows to wait for eval to finish.

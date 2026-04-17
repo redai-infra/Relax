@@ -127,35 +127,6 @@ def get_model_provider_func(
             "vision_dp_when_tp",
         ]
 
-        # NOTE(wuhuan): Multimodal models (e.g. Qwen3-VL) use multi-axis RoPE whose
-        # `rotary_pos_emb` is a Python list of tensors, not a single Tensor. Megatron's
-        # `CheckpointFunction.forward` calls `ctx.save_for_backward(*forward_args)`, which
-        # rejects list arguments with:
-        #   TypeError: save_for_backward can only save variables, but argument 6 is of type list
-        # So `recompute-granularity full` is incompatible with multimodal providers until
-        # upstream Megatron-Bridge unpacks the rope list. Detect that case and disable the
-        # recompute overrides (bridge default = no full recompute), warning the user loudly.
-        is_multimodal = hasattr(provider, "freeze_vision_model") or hasattr(provider, "vision_transformer_config")
-        if is_multimodal and getattr(args, "recompute_granularity", None) == "full":
-            logger.warning(
-                "Multimodal model detected together with --recompute-granularity=full. "
-                "Full activation recomputation is incompatible with multi-axis RoPE "
-                "(rotary_pos_emb is a list, which Megatron's CheckpointFunction cannot "
-                "save_for_backward). Disabling recompute overrides for this run — "
-                "remove --recompute-granularity from the launch script to silence this warning."
-            )
-            bridge_keys = [
-                k
-                for k in bridge_keys
-                if k
-                not in (
-                    "recompute_granularity",
-                    "recompute_method",
-                    "recompute_num_layers",
-                    "distribute_saved_activations",
-                )
-            ]
-
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
