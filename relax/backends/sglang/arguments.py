@@ -7,7 +7,68 @@ from sglang.srt.server_args import ServerArgs
 from relax.utils.http_utils import _wrap_ipv6
 
 
-# TODO: use all sglang router arguments with `--sglang-router` prefix
+def _router_passthrough_skip_fields() -> set[str]:
+    return {
+        # Framework-managed addressing and topology.
+        "host",
+        "port",
+        "worker_urls",
+        "prefill",
+        "decode",
+        "prefill_urls",
+        "decode_urls",
+        "pd_disaggregation",
+        "service_discovery",
+        "selector",
+        "service_discovery_port",
+        "service_discovery_namespace",
+        "prefill_selector",
+        "decode_selector",
+        "bootstrap_port_annotation",
+        "prometheus_port",
+        # Backward-compatible explicit flags handled below.
+        "policy",
+        "request_timeout_secs",
+    }
+
+
+def _add_prefixed_router_args(parser) -> None:
+    from sglang_router.router_args import RouterArgs
+
+    old_add_argument = argparse._ActionsContainer.add_argument
+    skipped_args = _router_passthrough_skip_fields()
+
+    def new_add_argument_wrapper(*name_or_flags, **kwargs):
+        canonical_name = kwargs.get("dest")
+        if not canonical_name:
+            for flag_name_candidate in name_or_flags:
+                if isinstance(flag_name_candidate, str) and flag_name_candidate.startswith("--"):
+                    canonical_name = flag_name_candidate[2:].replace("-", "_")
+                    break
+
+        if canonical_name in skipped_args:
+            return
+
+        final_name_or_flags = []
+        for item_flag in name_or_flags:
+            if isinstance(item_flag, str) and item_flag.startswith("--"):
+                final_name_or_flags.append(f"--sglang-router-{item_flag[2:]}")
+            else:
+                final_name_or_flags.append(item_flag)
+
+        final_kwargs = kwargs.copy()
+        if canonical_name and not str(canonical_name).startswith("router_"):
+            final_kwargs["dest"] = f"router_{canonical_name}"
+
+        old_add_argument(*final_name_or_flags, **final_kwargs)
+
+    argparse._ActionsContainer.add_argument = new_add_argument_wrapper
+    try:
+        RouterArgs.add_cli_args(parser, use_router_prefix=False, exclude_host_port=False)
+    finally:
+        argparse._ActionsContainer.add_argument = old_add_argument
+
+
 def add_sglang_router_arguments(parser):
     """Add arguments to the parser for the SGLang router."""
     parser.add_argument(
@@ -34,6 +95,7 @@ def add_sglang_router_arguments(parser):
         default=14400,
         help="Timeout for requests to the SGLang router in seconds",
     )
+    _add_prefixed_router_args(parser)
     return parser
 
 
