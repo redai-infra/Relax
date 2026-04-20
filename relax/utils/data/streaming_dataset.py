@@ -129,8 +129,12 @@ class StreamingReader:
         pf = pq.ParquetFile(self.path)
         self._parquet_data = []
 
-        for batch in pf.iter_batches():
-            self._parquet_data.extend(batch.to_pylist())
+        # Read row groups individually instead of using iter_batches().
+        # iter_batches() creates chunked arrays for multi-row-group files,
+        # which fails with ArrowNotImplementedError on nested types
+        # (e.g. list<struct<...>>, struct<...>).
+        for i in range(pf.metadata.num_row_groups):
+            self._parquet_data.extend(pf.read_row_group(i).to_pylist())
 
         # Apply row slice if specified
         if self.row_slice is not None:

@@ -49,19 +49,18 @@ CKPT_ARGS=(
     --save ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
     --megatron-to-hf-mode bridge
     --save-interval 100
-    --max-actor-ckpt-to-keep 3
-    # --load ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
+    --max-actor-ckpt-to-keep 1
 )
 
 ###############################################################################
 #                                  DATASETS                                   #
 ###############################################################################
 
-TRAIN_FILES=()
-for i in {0..9}; do
-    TRAIN_FILES+=("'${DATA_DIR}/deepeyes/train/v0.1.2.parquet/partition=${i}/3ce23f4945e8498085ac5f72f0afc133-0.parquet'")
-done
-TEST_FILES=("${DATA_DIR}/deepeyes/test.parquet")
+TRAIN_FILES=(
+    "'${DATA_DIR}/deepeyes-v1/data_0.1.2_visual_toolbox_v2.parquet@[0:5000]'"
+    "'${DATA_DIR}/deepeyes-v1/data_v0.8_visual_toolbox_v2.parquet@[0:5000]'"
+)
+TEST_FILES=("${DATA_DIR}/deepeyes-v1/data_thinklite_reasoning_acc.parquet@[0:256]")
 PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 ###############################################################################
@@ -91,6 +90,7 @@ ROLLOUT_ARGS=(
     --global-batch-size 256
     --use-fault-tolerance
     --rollout-shuffle
+    --use-streaming-dataset
 )
 
 ###############################################################################
@@ -152,6 +152,7 @@ SGLANG_ARGS=(
 
 LOG_ARGS=(
     --use-clearml
+    --use-metrics-service
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name ${EXP_NAME}
     # --dump-details dump_details_8k_0204
@@ -194,6 +195,7 @@ RAY_RESOURCE_ARGS=(
     --max-staleness 0
     --num-data-storage-units 1
     --colocate
+    --use-health-check
 )
 
 ###############################################################################

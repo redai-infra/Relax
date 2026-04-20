@@ -2,6 +2,7 @@ ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
 ARG BASE_IMAGE=lmsysorg/sglang:v0.5.9
+ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
 
 ENV NVIDIA_PYTORCH_VERSION=25.06 \
@@ -73,7 +74,8 @@ RUN NVCC_APPEND_FLAGS="--threads 4" \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
     git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 
-FROM train as relax
+ARG TRAIN_IMAGE=train
+FROM ${TRAIN_IMAGE} as relax
 
 ARG PATCH_VERSION=latest
 ARG ENABLE_SGLANG_PATCH=1
@@ -86,7 +88,7 @@ RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
     apt-get install -y jq
 
-RUN pip install git+https://github.com/redai-infra/megatron-bridge.git@relax/dev --no-build-isolation --no-deps --force-reinstall --no-cache-dir && \
+RUN pip install git+https://github.com/redai-infra/megatron-bridge.git@f13bec09 --no-build-isolation --no-deps --force-reinstall --no-cache-dir && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
@@ -111,10 +113,10 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     rm sglang.patch; \
 fi
 
-FROM relax as relax-release
+# FROM relax as relax-release
 
-WORKDIR /root/Relax
+# WORKDIR /root/Relax
 
-COPY . .
+# COPY . .
 
-RUN pip install -e . --no-deps
+# RUN pip install -e . --no-deps

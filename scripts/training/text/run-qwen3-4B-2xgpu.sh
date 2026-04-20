@@ -27,7 +27,8 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=4}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3-4B/
-   --ref-load ${EXP_DIR}/Qwen3-4B_torch_dist
+   --ref-load ${EXP_DIR}/Qwen3-4B/
+   --megatron-to-hf-mode bridge
    --load ${EXP_DIR}/Qwen3-4B_mcore/
    --save ${EXP_DIR}/Qwen3-4B_mcore/
    --save-interval 100

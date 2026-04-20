@@ -28,9 +28,10 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3-30B-A3B-Instruct/
+   --ref-load ${EXP_DIR}/Qwen3-30B-A3B-Instruct/
+   --megatron-to-hf-mode bridge
    --load ${EXP_DIR}/Qwen3-30B-A3B-Instruct_mcore_16xgpu/
    --save ${EXP_DIR}/Qwen3-30B-A3B-Instruct_mcore_16xgpu/
-   --ref-load ${EXP_DIR}/Qwen3-30B-A3B-Instruct_torch_dist//
    --save-interval 100
 )
 

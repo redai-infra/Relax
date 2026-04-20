@@ -158,6 +158,7 @@ SGLANG_ARGS=(
 
 LOG_ARGS=(
     --use-clearml
+    --use-metrics-service
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name ${EXP_NAME}
     # --dump-details dump_details_8k_0204

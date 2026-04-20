@@ -4,6 +4,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 TASK_NAME="${1:-run-qwen3-4B-4xgpu-async}"
+shift || true
+EXTRA_ARGS="$*"
 
 # settings envs
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -42,6 +44,25 @@ else
         exit 1
     fi
     echo "Found script: ${SCRIPT_PATH}"
+fi
+
+# ── inject extra CLI args into the training script ──────────────────────────
+# When extra arguments are passed (e.g. --save /tmp/x --num-rollout 10), we
+# create a patched copy of the training script that appends them to the
+# `python3 -m relax.entrypoints.train` command line.  Since argparse uses
+# last-value-wins for store actions, appended flags override the defaults.
+if [ -n "${EXTRA_ARGS}" ]; then
+    echo "Extra training args: ${EXTRA_ARGS}"
+    PATCHED_SCRIPT=$(mktemp "$(dirname "${SCRIPT_PATH}")/.relax-benchmark-XXXXXX.sh")
+    trap 'rm -f "${PATCHED_SCRIPT}"' EXIT
+    sed 's#2>&1 | tee #'"${EXTRA_ARGS}"' 2>\&1 | tee #' "${SCRIPT_PATH}" > "${PATCHED_SCRIPT}"
+    if diff -q "${SCRIPT_PATH}" "${PATCHED_SCRIPT}" >/dev/null 2>&1; then
+        echo "WARN: could not inject extra args (no '2>&1 | tee' anchor found)" >&2
+        rm -f "${PATCHED_SCRIPT}"
+    else
+        chmod +x "${PATCHED_SCRIPT}"
+        SCRIPT_PATH="${PATCHED_SCRIPT}"
+    fi
 fi
 
 # ── multi-node vs single-node execution ─────────────────────────────────────
