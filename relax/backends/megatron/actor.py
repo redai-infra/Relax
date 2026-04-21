@@ -7,6 +7,7 @@ import socket
 import time
 from argparse import Namespace
 from contextlib import nullcontext
+from functools import partial
 from typing import List
 
 import ray
@@ -369,10 +370,14 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator: list[DataIterator],
         num_microbatches: list[int],
         store_prefix: str = "",
+        collect_topk: bool = False,
     ) -> dict[str, list[torch.Tensor]]:
         with timer(f"{store_prefix}log_probs"):
+            log_prob_func = get_log_probs_and_entropy
+            if collect_topk:
+                log_prob_func = partial(log_prob_func, with_topk=True, topk_k=self.args.opd_log_prob_top_k)
             return forward_only(
-                get_log_probs_and_entropy,
+                log_prob_func,
                 self.args,
                 self.model,
                 data_iterator,
@@ -421,6 +426,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
+                    if self.args.opd_log_prob_top_k > 0:
+                        data_fields.append("teacher_topk_token_ids")
+                        data_fields.append("teacher_topk_k")
                 with timer("train_get_data"):
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
@@ -493,6 +501,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="teacher_",
+                            collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
                         )
                     )
 
@@ -508,6 +517,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="",
+                            collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
                         )
                     )
                     if self.args.use_rollout_routing_replay:
@@ -695,6 +705,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.use_opd and self.args.opd_type == "sglang":
             data_fields.append("teacher_log_probs")
             data_fields.append("opd_reverse_kl")
+            if self.args.opd_log_prob_top_k > 0:
+                data_fields.append("teacher_topk_token_ids")
+                data_fields.append("teacher_topk_k")
         if self.data_iterator is None:
             self.data_iterator, self.num_microbatches = create_stream_dataloader(
                 self.args,

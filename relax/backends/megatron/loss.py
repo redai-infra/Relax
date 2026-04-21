@@ -232,6 +232,8 @@ def get_log_probs_and_entropy(
     total_lengths: list[int],
     response_lengths: list[int],
     with_entropy: bool = False,
+    with_topk: bool = False,
+    topk_k: int | None = None,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
@@ -261,8 +263,10 @@ def get_log_probs_and_entropy(
         a list of `[R]` tensors.
     """
     assert non_loss_data
+    resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
     log_probs_list = []
     entropy_list = []
+    topk_token_ids_list = []
     for logits_chunk, tokens_chunk in get_responses(
         logits,
         args=args,
@@ -282,11 +286,17 @@ def get_log_probs_and_entropy(
         log_probs_list.append(log_prob.squeeze(-1))
         entropy_list.append(entropy)
 
+        if with_topk:
+            k = min(max(int(resolved_topk_k), 1), int(logits_chunk.size(-1)))
+            topk_token_ids_list.append(torch.topk(logits_chunk, k=k, dim=-1).indices)
+
     res = {
         "log_probs": log_probs_list,
     }
     if with_entropy:
         res["entropy"] = entropy_list
+    if with_topk:
+        res["topk_token_ids"] = topk_token_ids_list
 
     # we need to turn the all gather kv into zigzag ring attn kv
     if args.allgather_cp:

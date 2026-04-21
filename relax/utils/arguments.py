@@ -1298,6 +1298,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-teacher-timeout-s",
+                type=float,
+                default=30.0,
+                help=(
+                    "Timeout (seconds) for OPD teacher HTTP requests when --opd-type=sglang. "
+                    "Increase this for long responses or high-latency cross-host teacher services."
+                ),
+            )
+            parser.add_argument(
+                "--opd-log-prob-top-k",
+                type=int,
+                default=0,
+                help=(
+                    "Top-k token ids to request/collect for OPD overlap metrics. Set to 0 to disable top-k collection."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -2024,6 +2041,11 @@ def slime_validate_args(args):
             )
 
     # Validate on-policy distillation (OPD) arguments
+    if args.opd_teacher_timeout_s <= 0:
+        raise ValueError("--opd-teacher-timeout-s must be > 0.")
+    if args.opd_log_prob_top_k < 0:
+        raise ValueError("--opd-log-prob-top-k must be >= 0.")
+
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")

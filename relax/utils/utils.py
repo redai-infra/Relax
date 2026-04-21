@@ -81,6 +81,25 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].teacher_log_probs is not None:
         train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+    if any(sample.teacher_topk_token_ids is not None for sample in samples):
+        topk_k = max(
+            (
+                len(sample.teacher_topk_token_ids[0])
+                for sample in samples
+                if sample.teacher_topk_token_ids is not None and len(sample.teacher_topk_token_ids) > 0
+            ),
+            default=0,
+        )
+        train_data["teacher_topk_token_ids"] = [
+            (
+                [token_id for step_topk in sample.teacher_topk_token_ids for token_id in step_topk]
+                if sample.teacher_topk_token_ids is not None
+                else []
+            )
+            for sample in samples
+        ]
+        train_data["teacher_topk_k"] = [topk_k for _ in samples]
+
     total_lengths = [len(t) for t in train_data["tokens"]]
     train_data["total_lengths"] = total_lengths
     if args.debug_train_only:

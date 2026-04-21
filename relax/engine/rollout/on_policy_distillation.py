@@ -10,6 +10,108 @@ from relax.utils.types import Sample
 logger = get_logger(__name__)
 
 
+def _get_opd_topk(args) -> int:
+    """Resolve OPD top-k for overlap metrics.
+
+    Priority:
+    1) args.opd_log_prob_top_k (CLI/runtime)
+    2) fallback 0 when missing (for backward compatibility)
+    """
+    top_k = getattr(args, "opd_log_prob_top_k", None)
+    if top_k is None:
+        return 0
+    return max(int(top_k), 0)
+
+
+def _extract_token_id(candidate) -> int | None:
+    """Best-effort extraction of token id from a top-logprob candidate item."""
+    if isinstance(candidate, dict):
+        for key in ("token_id", "id"):
+            if key in candidate and isinstance(candidate[key], int):
+                return int(candidate[key])
+        token_val = candidate.get("token")
+        if isinstance(token_val, int):
+            return int(token_val)
+        return None
+
+    if isinstance(candidate, (list, tuple)):
+        for item in candidate:
+            if isinstance(item, int):
+                return int(item)
+        return None
+
+    return int(candidate) if isinstance(candidate, int) else None
+
+
+def _extract_topk_ids_from_candidates(candidates, top_k: int) -> tuple[list[int], bool]:
+    """Extract fixed-width token-id top-k list from a candidate container.
+
+    Returns:
+        (token_ids, has_valid_token_id)
+    """
+    token_ids: list[int] = []
+    has_valid_token_id = False
+
+    if isinstance(candidates, dict):
+        candidates = candidates.get("top_logprobs") or candidates.get("candidates") or []
+
+    if isinstance(candidates, (list, tuple)):
+        for item in candidates:
+            token_id = _extract_token_id(item)
+            if token_id is not None:
+                token_ids.append(token_id)
+                has_valid_token_id = True
+            if len(token_ids) >= top_k:
+                break
+
+    if len(token_ids) < top_k:
+        token_ids.extend([-1] * (top_k - len(token_ids)))
+    else:
+        token_ids = token_ids[:top_k]
+
+    return token_ids, has_valid_token_id
+
+
+def _extract_teacher_topk_token_ids(teacher_resp: dict, response_length: int, top_k: int) -> list[list[int]] | None:
+    """Extract response-aligned teacher top-k token ids from SGLang response.
+
+    Returns None when top-k information is unavailable.
+    """
+    if top_k <= 0 or response_length <= 0:
+        return None
+
+    meta_info = teacher_resp.get("meta_info", {})
+
+    top_logprobs = (
+        meta_info.get("input_top_logprobs")
+        or meta_info.get("input_token_top_logprobs")
+        or teacher_resp.get("top_logprobs")
+    )
+    if isinstance(top_logprobs, list) and top_logprobs:
+        per_token_candidates = top_logprobs[-response_length:]
+        if len(per_token_candidates) >= response_length:
+            teacher_topk_ids: list[list[int]] = []
+            any_valid = False
+            for candidates in per_token_candidates:
+                token_ids, has_valid = _extract_topk_ids_from_candidates(candidates, top_k)
+                any_valid = any_valid or has_valid
+                teacher_topk_ids.append(token_ids)
+            if any_valid:
+                return teacher_topk_ids
+    return None
+
+
+def _fallback_teacher_topk_token_ids(response_length: int, top_k: int) -> list[list[int]]:
+    """Build a fixed-shape fallback for teacher top-k ids.
+
+    Uses -1 as sentinel token id so downstream flatten/reshape stays stable
+    while clearly indicating unavailable teacher top-k content.
+    """
+    if response_length <= 0 or top_k <= 0:
+        return []
+    return [[-1] * top_k for _ in range(response_length)]
+
+
 def _get_teacher_url(args) -> str:
     """Resolve OPD teacher URL from args with backward-compatible fallback.
 
@@ -99,7 +201,10 @@ async def fetch_teacher_log_probs(args, sample: Sample, session: aiohttp.ClientS
     if response_length <= 0:
         # Avoid Python slicing pitfall: x[-0:] == x[:], not empty.
         sample.teacher_log_probs = []
+        sample.teacher_topk_token_ids = []
         return
+
+    opd_top_k = _get_opd_topk(args)
 
     payload = {
         "input_ids": sample.tokens,
@@ -111,6 +216,8 @@ async def fetch_teacher_log_probs(args, sample: Sample, session: aiohttp.ClientS
         "return_logprob": True,
         "logprob_start_len": 0,
     }
+    if opd_top_k > 0:
+        payload["top_logprobs_num"] = opd_top_k
 
     try:
         teacher_resp = await _post_teacher_request_with_diagnostics(args, payload, session=session)
@@ -119,15 +226,18 @@ async def fetch_teacher_log_probs(args, sample: Sample, session: aiohttp.ClientS
         # Avoid ABORTED status here because aborted samples enter a different
         # buffering path that may impact rollout progress under sustained errors.
         sample.teacher_log_probs = _fallback_teacher_log_probs(sample, response_length)
+        sample.teacher_topk_token_ids = _fallback_teacher_topk_token_ids(response_length, opd_top_k)
         if sample.metadata is None:
             sample.metadata = {}
         sample.metadata["opd_teacher_error"] = f"{type(exc).__name__}: {str(exc)[:512]}"
         sample.metadata["opd_teacher_fallback"] = "rollout_log_probs"
-        logger.exception(
-            "OPD teacher fetch failed for sample_index=%s, response_length=%s, url=%s. Falling back to rollout log-probs.",
+        logger.error(
+            "OPD teacher fetch failed for sample_index=%s, response_length=%s, url=%s, error=%s. "
+            "Falling back to rollout log-probs.",
             getattr(sample, "index", None),
             response_length,
             _get_teacher_url(args),
+            f"{type(exc).__name__}: {str(exc)[:256]}",
         )
         return
 
@@ -135,6 +245,7 @@ async def fetch_teacher_log_probs(args, sample: Sample, session: aiohttp.ClientS
     token_logprobs = teacher_resp.get("meta_info", {}).get("input_token_logprobs", None)
     if not token_logprobs:
         sample.teacher_log_probs = _fallback_teacher_log_probs(sample, response_length)
+        sample.teacher_topk_token_ids = _fallback_teacher_topk_token_ids(response_length, opd_top_k)
         if sample.metadata is None:
             sample.metadata = {}
         sample.metadata["opd_teacher_error"] = "Missing meta_info.input_token_logprobs in teacher response"
@@ -148,6 +259,7 @@ async def fetch_teacher_log_probs(args, sample: Sample, session: aiohttp.ClientS
     all_log_probs = torch.tensor([item[0] for item in token_logprobs[1:]], dtype=torch.float32)
     if all_log_probs.numel() < response_length:
         sample.teacher_log_probs = _fallback_teacher_log_probs(sample, response_length)
+        sample.teacher_topk_token_ids = _fallback_teacher_topk_token_ids(response_length, opd_top_k)
         if sample.metadata is None:
             sample.metadata = {}
         sample.metadata["opd_teacher_error"] = (
@@ -164,3 +276,15 @@ async def fetch_teacher_log_probs(args, sample: Sample, session: aiohttp.ClientS
 
     teacher_log_probs = all_log_probs[-response_length:]
     sample.teacher_log_probs = teacher_log_probs.tolist()
+
+    teacher_topk_token_ids = _extract_teacher_topk_token_ids(teacher_resp, response_length, opd_top_k)
+    if teacher_topk_token_ids is None:
+        if opd_top_k > 0:
+            logger.warning(
+                "OPD teacher response missing top-logprobs for sample_index=%s (opd_log_prob_top_k=%s). "
+                "Using sentinel top-k ids.",
+                getattr(sample, "index", None),
+                opd_top_k,
+            )
+        teacher_topk_token_ids = _fallback_teacher_topk_token_ids(response_length, opd_top_k)
+    sample.teacher_topk_token_ids = teacher_topk_token_ids

@@ -11,6 +11,8 @@
 | `--opd-kl-coef`           | OPD KL 惩罚系数（默认：1.0）。控制蒸馏信号相对于 RL 优势的权重。                                                 |
 | `--opd-teacher-load`      | 教师模型路径。当 `--opd-type=megatron` 时**必须**设置，当 `--opd-type=sglang` 时**不能**设置。                   |
 | `--opd-teacher-ckpt-step` | 教师模型的可选检查点步骤。                                                                                       |
+| `--opd-teacher-timeout-s` | SGLang 模式下 OPD teacher HTTP 请求超时（秒），默认 `30`。                                                      |
+| `--opd-log-prob-top-k`    | 用于 OPD 动态指标的 teacher/student top-k 候选集合大小（设为 `0` 可关闭，默认 `0`）。                          |
 | `--opd-only-reward`       | 仅保留 OPD 奖励信号（将基础 RL reward 置零，只使用 OPD KL 项）。需配合 `--use-opd`。                            |
 
 ## 工作原理
@@ -35,7 +37,11 @@ $$\hat{A}_t = A_t - \lambda_{\text{opd}} \cdot D_{\text{KL}}(P_{\text{teacher}} 
 
 1. 外部 SGLang 服务器运行教师模型。
 2. 在回滚期间，每个样本的奖励计算完成后，框架自动将样本发送到教师服务器以获取词元级对数概率，并将其存储在 `sample.teacher_log_probs` 中。
-3. 在训练期间，从存储的教师对数概率计算 KL 惩罚并应用于优势。
+3. 当 `--opd-log-prob-top-k > 0` 时，框架还会请求并提取 teacher 的 top-k 候选信息（通过 SGLang 请求字段），并存储：
+	- `sample.teacher_topk_token_ids`
+	- `sample.teacher_topk_log_probs`（若 teacher 返回）
+4. 当 teacher 请求失败或响应缺失 top-k 字段时，OPD 会进入安全回退路径（使用 rollout log-probs 与占位 top-k 数据），避免打断 rollout 主流程。
+5. 在训练期间，从存储的教师对数概率计算 KL 惩罚并应用于优势。
 
 > **注意**：OPD sglang 模式不再占用 `--custom-rm-path` 和 `--custom-reward-post-process-path`。用户可以自由地同时使用自定义奖励函数和 OPD，两者互不冲突。
 
@@ -45,8 +51,27 @@ $$\hat{A}_t = A_t - \lambda_{\text{opd}} \cdot D_{\text{KL}}(P_{\text{teacher}} 
 --use-opd
 --opd-type sglang
 --opd-kl-coef 1.0
+--opd-teacher-timeout-s 30
+--opd-log-prob-top-k 10
 --rm-url http://<TEACHER_IP>:<TEACHER_PORT>/generate
 ```
+
+## 动态指标
+
+启用 top-k 采集后，OPD 可以在线监控 student 与 teacher 候选空间的一致性。
+
+定义 $S_t^{(p)} = \text{TopK}(p_t, k)$、$S_t^{(q)} = \text{TopK}(q_t, k)$，分别表示 token 步 $t$ 上 student/teacher 的 top-$k$ 集合。
+
+### Overlap Ratio（重叠率）
+
+$$
+\mathcal{M}_{\text{overlap}} \triangleq \mathbb{E}_t \left[ \frac{|S_t^{(p)} \cap S_t^{(q)}|}{k} \right]
+$$
+
+解释：
+
+- 重叠率低：student 与 teacher 候选空间偏离较大。
+- 重叠率高：student 策略逐步靠近 teacher 支撑区域。
 
 ### Megatron 模式 (`--opd-type megatron`)
 

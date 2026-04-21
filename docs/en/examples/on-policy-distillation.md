@@ -11,6 +11,8 @@ On-Policy Distillation (OPD) enables knowledge transfer from a large teacher mod
 | `--opd-kl-coef`           | OPD KL penalty coefficient (default: 1.0). Controls the weight of the distillation signal relative to the RL advantage.                    |
 | `--opd-teacher-load`      | Path to the teacher model. **Must** be set when `--opd-type=megatron`, **must not** be set when `--opd-type=sglang`.                       |
 | `--opd-teacher-ckpt-step` | Optional checkpoint step for the teacher model.                                                                                            |
+| `--opd-teacher-timeout-s` | Timeout (seconds) for OPD teacher HTTP requests in SGLang mode (default: 30).                                                              |
+| `--opd-log-prob-top-k`    | Top-k size for collecting teacher/student candidate tokens used by OPD dynamic metrics (set `0` to disable, default: 0).                 |
 | `--opd-only-reward`       | Keep only the OPD reward signal (zero out base RL reward and use OPD KL term only). Requires `--use-opd`.                                 |
 
 ## How It Works
@@ -35,7 +37,11 @@ The teacher model runs on an external SGLang server, and the teacher's log-probs
 
 1. An external SGLang server runs the teacher model.
 2. During rollout, after the reward is computed for each sample, the framework automatically sends the sample to the teacher server to obtain token-level log-probs and stores them in `sample.teacher_log_probs`.
-3. During training, the KL penalty is computed from the stored teacher log-probs and applied to advantages.
+3. When `--opd-log-prob-top-k > 0`, the framework also requests teacher top-k candidates (via SGLang request fields), and stores:
+	- `sample.teacher_topk_token_ids`
+	- `sample.teacher_topk_log_probs` (if returned by teacher)
+4. If teacher request fails or top-k fields are missing, OPD uses a safe fallback path (rollout log-probs and placeholder top-k data) to avoid breaking the rollout loop.
+5. During training, the KL penalty is computed from the stored teacher log-probs and applied to advantages.
 
 > **Note**: OPD sglang mode does NOT occupy `--custom-rm-path` or `--custom-reward-post-process-path`. Users can freely use custom reward functions alongside OPD.
 
@@ -45,8 +51,27 @@ The teacher model runs on an external SGLang server, and the teacher's log-probs
 --use-opd
 --opd-type sglang
 --opd-kl-coef 1.0
+--opd-teacher-timeout-s 30
+--opd-log-prob-top-k 10
 --rm-url http://<TEACHER_IP>:<TEACHER_PORT>/generate
 ```
+
+## Dynamic Metrics
+
+When top-k collection is enabled, OPD can monitor student-teacher candidate alignment online.
+
+Let $S_t^{(p)} = \text{TopK}(p_t, k)$ and $S_t^{(q)} = \text{TopK}(q_t, k)$ denote student/teacher top-$k$ sets at token step $t$.
+
+### Overlap Ratio
+
+$$
+\mathcal{M}_{\text{overlap}} \triangleq \mathbb{E}_t \left[ \frac{|S_t^{(p)} \cap S_t^{(q)}|}{k} \right]
+$$
+
+Interpretation:
+
+- Lower overlap suggests candidate-space mismatch between student and teacher.
+- Higher overlap indicates the student policy is moving closer to teacher support.
 
 ### Megatron Mode (`--opd-type megatron`)
 

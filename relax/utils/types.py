@@ -29,6 +29,7 @@ class Sample:
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    teacher_topk_token_ids: list[list[int]] | None = None  # Teacher top-k token ids per response token for OPD
 
     class Status(Enum):
         PENDING = "pending"

@@ -532,6 +532,42 @@ def log_rollout_data(
         total_lengths = rollout_data["total_lengths"]
         max_seq_lens = rollout_data.get("max_seq_lens", None)
 
+        # OPD dynamic metric: overlap ratio on top-k token sets.
+        student_topk_ids = rollout_data.get("topk_token_ids", None)
+        teacher_topk_ids = rollout_data.get("teacher_topk_token_ids", None)
+        if isinstance(student_topk_ids, list) and isinstance(teacher_topk_ids, list):
+            assert len(student_topk_ids) == len(teacher_topk_ids)
+
+            overlap_ratio_per_sample = []
+            for s_ids, t_ids in zip(student_topk_ids, teacher_topk_ids, strict=False):
+                if not isinstance(s_ids, torch.Tensor) or not isinstance(t_ids, torch.Tensor):
+                    continue
+                if s_ids.ndim < 2 or t_ids.ndim < 2:
+                    continue
+                k = min(int(s_ids.size(-1)), int(t_ids.size(-1)))
+                if k <= 0:
+                    continue
+                s_ids = s_ids[:, :k].long()
+                t_ids = t_ids[:, :k].long()
+                overlap_matrix = s_ids.unsqueeze(-1).eq(t_ids.unsqueeze(-2))
+                overlap_ratio = overlap_matrix.any(dim=-1).float().sum(dim=-1) / float(k)
+                overlap_ratio_per_sample.append(overlap_ratio)
+
+            if overlap_ratio_per_sample:
+                loss_masks_t = loss_masks
+                total_lengths_i = total_lengths
+                response_lengths_i = response_lengths
+                overlap_ratio_flat = torch.cat(overlap_ratio_per_sample).clone().detach().to(loss_masks_t[0].device)
+                sum_of_sample_mean = get_sum_of_sample_mean(
+                    total_lengths_i,
+                    response_lengths_i,
+                    loss_masks_t,
+                    qkv_format=args.qkv_format,
+                    max_seq_lens=max_seq_lens,
+                )
+                overlap_ratio_value = cp_size * sum_of_sample_mean(overlap_ratio_flat) / len(loss_masks_t)
+                log_dict["opd_overlap_ratio"] = overlap_ratio_value.item()
+
         for key, val in rollout_data.items():
             if key in [
                 "tokens",
@@ -541,6 +577,11 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "topk_token_ids",
+                "topk_log_probs",
+                "teacher_topk_token_ids",
+                "teacher_topk_log_probs",
+                "teacher_topk_k",
             ]:
                 continue
             # Upload per sample mean for each rollout value

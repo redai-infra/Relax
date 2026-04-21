@@ -66,19 +66,40 @@ bash examples/on_policy_distillation/run-qwen3-8B-megatron-opd.sh
 
 ## 关键参数说明
 
-| 参数                 | 说明                                                                           |
-| -------------------- | ------------------------------------------------------------------------------ |
-| `--use-opd`          | 启用 OPD                                                                       |
-| `--opd-type`         | 教师类型：`sglang` 或 `megatron`                                               |
-| `--opd-kl-coef`      | OPD KL 系数（默认 1.0）                                                        |
-| `--opd-teacher-load` | teacher 模型路径（`--opd-type megatron` 时必需；可配合 bridge 直接填 HF 路径） |
-| `--opd-only-reward`  | 仅保留 OPD reward 信号（将 base reward 置零，仅注入 OPD KL）                   |
-| `--rm-url`           | SGLang teacher 服务地址（`--opd-type sglang` 时必需）                          |
+| 参数                      | 说明                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------ |
+| `--use-opd`               | 启用 OPD                                                                       |
+| `--opd-type`              | 教师类型：`sglang` 或 `megatron`                                               |
+| `--opd-kl-coef`           | OPD KL 系数（默认 1.0）                                                        |
+| `--opd-teacher-load`      | teacher 模型路径（`--opd-type megatron` 时必需；可配合 bridge 直接填 HF 路径） |
+| `--opd-teacher-timeout-s` | SGLang 模式下 OPD teacher HTTP 请求超时（秒），默认 `30`                       |
+| `--opd-log-prob-top-k`    | teacher/student top-k 候选集合大小（设为 `0` 可关闭，默认 `0`）                |
+| `--opd-only-reward`       | 仅保留 OPD reward 信号（将 base reward 置零，仅注入 OPD KL）                   |
+| `--rm-url`                | SGLang teacher 服务地址（`--opd-type sglang` 时必需）                          |
 
 > Note:
 >
 > 1. OPD `sglang` 模式不占用 `--custom-rm-path` 与 `--custom-reward-post-process-path`，可与自定义奖励并存。
 > 2. `--opd-only-reward` 需要配合 `--use-opd` 使用。
+> 3. 当 `--opd-log-prob-top-k > 0` 时，框架会在 SGLang teacher 请求中启用 top-k 采集，并尝试提取 teacher 的 top-k token ids / log-probs。
+> 4. 若 teacher 响应缺失 top-k 字段或请求失败，会自动回退到安全路径（rollout log-probs + 占位 top-k），不打断 rollout 主流程。
+
+## 动态指标
+
+启用 top-k 采集后，OPD 可以在线监控 student 与 teacher 候选空间的一致性。
+
+定义 $S_t^{(p)} = \\text{TopK}(p_t, k)$、$S_t^{(q)} = \\text{TopK}(q_t, k)$，分别表示 token 步 $t$ 上 student/teacher 的 top-$k$ 集合。
+
+### Overlap Ratio（重叠率）
+
+$$
+\\mathcal{M}\_{\\text{overlap}} \\triangleq \\mathbb{E}\_t \\left\[ \\frac{|S_t^{(p)} \\cap S_t^{(q)}|}{k} \\right\]
+$$
+
+解释：
+
+- 重叠率低：student 与 teacher 候选空间偏离较大。
+- 重叠率高：student 策略逐步靠近 teacher 支撑区域。
 
 ## 后端支持
 
