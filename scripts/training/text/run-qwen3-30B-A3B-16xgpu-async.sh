@@ -57,6 +57,7 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=(
    --log-passrate
    --eval-interval 20
+   --skip-eval-before-train
    --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 16384
@@ -96,6 +97,13 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+   --optimizer-cpu-offload
+   --overlap-cpu-optimizer-d2h-h2d
+   --use-precision-aware-optimizer
+
+   # NOTE(wuhuan): to avoid algorithm performance degradation
+   --moe-router-load-balancing-type "none"
+   --moe-aux-loss-coeff 0.0
 )
 
 SGLANG_ARGS=(

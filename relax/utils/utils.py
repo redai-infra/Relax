@@ -167,25 +167,22 @@ def dict_to_tensordict(
             return 1 + _nesting_depth(x[0])
         return 0
 
-    def _infer_dtype_from_sample(sample: Any) -> torch.dtype:
-        """Infer a basic torch dtype from a single scalar sample."""
+    def _scalar_dtype(sample) -> Optional[torch.dtype]:
+        """Return an explicit dtype only for bool/float; None lets torch.tensor
+        infer."""
         if isinstance(sample, bool):
             return torch.bool
-        elif isinstance(sample, int):
-            return torch.long
-        elif isinstance(sample, float):
+        if isinstance(sample, float):
             return torch.float32
-        else:
-            # fallback
-            return torch.float32
+        # int or mixed int/float: let torch.tensor auto-promote (C++ level, zero overhead)
+        return None
 
     def _to_tensor_1d(lst):
-        dtype = _infer_dtype_from_sample(lst[0])
-        res = torch.tensor(lst, dtype=dtype, device=device)
-        return res
+        dtype = _scalar_dtype(lst[0])
+        return torch.tensor(lst, dtype=dtype, device=device)
 
     def _to_tensor_2d(lst):
-        dtype = _infer_dtype_from_sample(lst[0][0])
+        dtype = _scalar_dtype(lst[0][0])
         tensors = [torch.tensor(seq, dtype=dtype, device=device) for seq in lst]
         return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 

@@ -286,12 +286,17 @@ class DeviceDirectBackend(CommBackend):
                 f"Bridge mapping registry has no entry for '{global_name}'. "
                 f"Available task map keys: {list(self._bridge_task_map.keys())[:10]}..."
             )
+            # Do NOT pass param_weight=param here — the param_weight field is
+            # only used for HF→Megatron (load) direction, not Megatron→HF
+            # (export).  Storing the EP-gathered tensor in the cached task
+            # would prevent ~20 GB from being freed on _is_pp_src_rank for
+            # MoE models with many experts.
             task = WeightConversionTask(
                 param_name=global_name,
                 global_param_name=global_name,
                 mapping=mapping,
                 megatron_module=None,
-                param_weight=param,
+                param_weight=None,
             )
             # Eagerly initialize AutoMapping inner delegate (same logic as
             # ``_init_bridge_tasks``).  Since ``megatron_module`` is None and
@@ -303,7 +308,7 @@ class DeviceDirectBackend(CommBackend):
             if isinstance(inner_tp, AutoMapping) and inner_tp._mapping is None:
                 inner_tp._detected_type = "replicated"
                 inner_tp._mapping = inner_tp._get_or_create_mapping("replicated")
-            # Cache for future iterations
+            # Cache for future iterations (task has no tensor references)
             self._bridge_task_map[global_name] = task
 
         mapping = task.mapping
@@ -751,7 +756,6 @@ class DeviceDirectBackend(CommBackend):
                 self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
                 converted_named_tensors.clear()
             origin_named_tensors.clear()
-
         dist.barrier(group=get_gloo_group())
 
         buffer_size = 0
@@ -767,7 +771,6 @@ class DeviceDirectBackend(CommBackend):
             self._update_expert_bucket_weights_from_distributed(
                 named_tensors, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar
             )
-
         dist.barrier(group=get_gloo_group())
         if not rollout_only:
             if dist.get_rank() == 0:
@@ -794,6 +797,14 @@ class DeviceDirectBackend(CommBackend):
                 self._batch_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
             self._cleanup_rollout_engines()
+
+        # Release fragmented CUDA reserved memory left behind by the
+        # all_gather + HF-convert buffers that were allocated and freed
+        # during the weight update loop.  Without this, the caching
+        # allocator keeps large reserved blocks that are internally
+        # fragmented, which can cause OOM when the optimizer later tries
+        # to allocate contiguous Adam state buffers.
+        torch.cuda.empty_cache()
 
     def _update_weight_from_distributed(
         self,
