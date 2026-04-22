@@ -32,6 +32,24 @@ def get_async_loop():
     return async_loop
 
 
+def shutdown_async_loop(timeout: float = 5.0):
+    """Stop the global async event loop and **block** until its thread exits.
+
+    Must be called before ``ray.shutdown()`` during global restart.  The call
+    is blocking: it waits for the event-loop thread to fully terminate so that
+    no C++ ObjectRefStream watchers survive into ``ray.shutdown()``. The next
+    call to :func:`run` will lazily create a fresh loop.
+    """
+    global async_loop
+    if async_loop is None:
+        return
+    inst = async_loop
+    async_loop = None
+    loop = inst.loop
+    loop.call_soon_threadsafe(loop.stop)
+    inst._thread.join(timeout=timeout)
+
+
 def run(coro):
     """Run a coroutine in the background event loop."""
     return get_async_loop().run(coro)

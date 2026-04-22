@@ -92,6 +92,7 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
             continue_last_task=False,
             output_uri=False,
             reuse_last_task_id=False,
+            auto_connect_frameworks={"tensorboard": False, "pytorch": False},
         )
         self._connect_git_metadata(args)
         logger.info(

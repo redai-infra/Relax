@@ -16,7 +16,7 @@ from relax.components.genrm import register_genrm
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
-from relax.utils.async_utils import run
+from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -44,7 +44,10 @@ class Controller:
         self._restarting = False  # Flag to indicate a restart is in progress
         self._restart_done_event = threading.Event()  # Signals main thread that global restart Phase 1+2 is done
         self._restart_error = None  # Stores any error from the global restart thread
-        # Track global restart count across __init__ calls (preserved via _global_restart)
+        # Preserve across __init__ calls during global restart (same pattern as _global_restart_count)
+        if not hasattr(self, "_pending_task_refs"):
+            self._pending_task_refs: list = []
+            self._pending_task_refs_lock = threading.Lock()
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
 
@@ -154,6 +157,30 @@ class Controller:
             logger.exception(f"Failed to start AutoscalerService: {e}")
             self._report_error_to_metrics_service(e)
             raise
+
+    def _cancel_pending_tasks(self) -> None:
+        """Cancel all pending service ObjectRefs to unblock the main thread.
+
+        Must be called BEFORE ray.shutdown() during global restart. Without
+        this, the main thread remains blocked awaiting ObjectRefs that become
+        dangling after ray.shutdown(), causing a fatal C++ crash:
+        ``TryReadObjectRefStream API can be used only when the stream has been
+        created and not removed.``
+        """
+        with self._pending_task_refs_lock:
+            refs_to_cancel = list(self._pending_task_refs)
+            self._pending_task_refs.clear()
+
+        if not refs_to_cancel:
+            return
+
+        logger.info(f"[Global Restart] Cancelling {len(refs_to_cancel)} pending task ref(s)...")
+        for ref in refs_to_cancel:
+            try:
+                ray.cancel(ref, force=True)
+            except Exception as e:
+                logger.debug(f"[Global Restart] Failed to cancel task ref (may already be done): {e}")
+        logger.info("[Global Restart] All pending task refs cancelled")
 
     def _on_service_unhealthy(self, role: str) -> None:
         """Callback when a service becomes unhealthy. Initiates service
@@ -396,7 +423,6 @@ class Controller:
                 for service in self.serve_dict.values():
                     await service.set_step(step)
 
-            # Submit all service tasks and get their ObjectRefs
             task_refs = []
             service_names = []
             for role, service in self.serve_dict.items():
@@ -405,16 +431,20 @@ class Controller:
                     task_refs.append(task_ref)
                     service_names.append(service.role)
 
+            with self._pending_task_refs_lock:
+                self._pending_task_refs = list(task_refs)
+
             if task_refs:
                 logger.info(f"Started {len(task_refs)} services in parallel: {service_names}")
 
-                # Monitor tasks in background while keeping loop alive
-                # Use ray.wait() to check completion status without blocking
                 try:
                     [await task_ref for task_ref in task_refs]
                     logger.info("Service task completed successfully")
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}")
+                finally:
+                    with self._pending_task_refs_lock:
+                        self._pending_task_refs.clear()
 
         while True:
             try:
@@ -545,14 +575,16 @@ class Controller:
         Steps:
         Phase 1 — Teardown:
           1. Stop health management to prevent further callbacks
-          2. Tear down all existing Ray Serve deployments (services + metrics + DCS)
-          3. Tear down data system (storage units + controller)
-          4. Shutdown Ray Serve and Ray completely
-          5. Re-initialize Ray and Ray Serve
+          2. Cancel pending ObjectRefs to unblock the main thread
+          3. Tear down all existing Ray Serve deployments (services + metrics + DCS)
+          4. Tear down data system (storage units + controller)
+          5. Stop the async event loop (prevents C++ crash on ObjectRefStream)
+          6. Shutdown Ray Serve and Ray completely
+          7. Re-initialize Ray and Ray Serve
 
         Phase 2 — Re-initialize:
-          6. Call self.__init__() to re-create all subsystems from zero
-          7. Signal the main thread to re-run training_loop()
+          8. Call self.__init__() to re-create all subsystems from zero
+          9. Signal the main thread to re-run training_loop()
         """
         # --- Check global restart limit ---
         self._global_restart_count += 1
@@ -609,7 +641,13 @@ class Controller:
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to stop health manager: {e}")
 
-        # --- 1.2 Tear down all service deployments ---
+        # --- 1.2 Cancel pending ObjectRefs to unblock the main thread ---
+        # This MUST happen while Ray is still alive so ray.cancel() can reach
+        # the workers.  Without this, the main thread stays blocked on stale
+        # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
+        self._cancel_pending_tasks()
+
+        # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():
             try:
                 service._stop_heartbeat_thread()
@@ -626,7 +664,7 @@ class Controller:
         self.serve_dict.clear()
         logger.info("[Global Restart] All service references cleared")
 
-        # --- 1.3 Tear down metrics deployment ---
+        # --- 1.4 Tear down metrics deployment ---
         if self._metrics_service_enabled:
             try:
                 serve.delete("metrics")
@@ -634,7 +672,7 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete metrics deployment: {e}")
 
-        # --- 1.4 Tear down autoscaler deployment ---
+        # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:
             try:
                 serve.delete("autoscaler")
@@ -642,20 +680,28 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete autoscaler deployment: {e}")
 
-        # --- 1.5 Tear down DCS coordinator ---
+        # --- 1.6 Tear down DCS coordinator ---
         try:
             serve.delete("dcs_coordinator")
             logger.info("[Global Restart] Deleted DCS coordinator deployment")
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to delete DCS coordinator: {e}")
 
-        # --- 1.5 Tear down data system (storage units + controller) ---
+        # --- 1.7 Tear down data system (storage units + controller) ---
         try:
             tq.close()
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
-        # --- 1.6 Shutdown Ray Serve and Ray completely to kill all processes ---
+        # --- 1.8 Stop the global async event loop BEFORE ray.shutdown() ---
+        # The AsyncLoopThread may still hold internal watchers on Ray
+        # ObjectRefStreams.  If we call ray.shutdown() while the loop is alive,
+        # those watchers touch destroyed streams → fatal C++ crash
+        # (TryReadObjectRefStream on a removed stream).
+        shutdown_async_loop()
+        logger.info("[Global Restart] Async event loop stopped")
+
+        # --- 1.9 Shutdown Ray Serve and Ray to kill all processes ---
         try:
             serve.shutdown()
             logger.info("[Global Restart] Ray Serve shutdown completed")
@@ -680,7 +726,7 @@ class Controller:
         time.sleep(5)
         logger.info("[Global Restart] Waited 5s for resource release")
 
-        # --- 1.7 Re-initialize Ray and Ray Serve (same as train.py) ---
+        # --- 1.10 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
         logger.info("[Global Restart] Ray re-initialized")
         try:
