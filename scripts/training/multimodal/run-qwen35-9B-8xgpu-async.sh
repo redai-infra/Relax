@@ -35,7 +35,7 @@ CKPT_ARGS=(
    # --ref-load ${EXP_DIR}/Qwen3-VL-4B-Instruct
    --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
-   --save-interval 4
+   --save-interval 100
    --megatron-to-hf-mode bridge
 )
 
@@ -58,7 +58,8 @@ ROLLOUT_ARGS=(
    --rollout-temperature 0.8
    --global-batch-size 256
    --multimodal-keys '{"image":"image"}'
-    --system-prompt "${SYSTEM_PROMPT}"
+   --system-prompt "${SYSTEM_PROMPT}"
+   --use-streaming-dataset
 )
 
 PERF_ARGS=(

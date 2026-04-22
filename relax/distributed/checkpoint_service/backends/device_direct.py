@@ -14,6 +14,7 @@ Features:
 """
 
 import asyncio
+import logging
 import socket
 import time
 from collections.abc import Sequence
@@ -38,6 +39,8 @@ from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.logging_utils import get_logger
 
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
 

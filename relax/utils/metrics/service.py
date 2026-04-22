@@ -14,6 +14,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.adapters.apprise import _AppriseAdapter
 from relax.utils.metrics.adapters.clearml import _ClearMLAdapter
 from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
+from relax.utils.metrics.adapters.wandb import _is_offline_mode
 from relax.utils.metrics.timeline_trace import TimelineTraceAdapter
 
 
@@ -130,7 +131,12 @@ class MetricsService:
 
         self._use_wandb = getattr(config, "use_wandb", False)
         if self._use_wandb:
-            logger.info("W&B support enabled")
+            try:
+                self._init_wandb(config)
+                logger.info("W&B adapter initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize W&B adapter: {e}")
+                self._use_wandb = False
 
         # Initialize TimelineTrace adapter
         timeline_dump_dir = getattr(config, "timeline_dump_dir", None)
@@ -141,6 +147,51 @@ class MetricsService:
             self._timeline_adapter = None
 
         logger.info(f"MetricsService initialized with adapters: {list(self._adapters.keys())}")
+
+    @staticmethod
+    def _init_wandb(config: Namespace) -> None:
+        """Initialize W&B for the MetricsService.
+
+        Unlike init_wandb_primary (designed for training workers with
+        rank/group), MetricsService is a single Ray Serve replica that only
+        needs basic project and run name configuration.
+        """
+        import os
+
+        if config.wandb_mode:
+            os.environ["WANDB_MODE"] = config.wandb_mode
+
+        offline = _is_offline_mode(config)
+
+        if (not offline) and getattr(config, "wandb_key", None) is not None:
+            wandb.login(key=config.wandb_key, host=getattr(config, "wandb_host", None))
+
+        project = getattr(config, "wandb_project", None) or getattr(config, "tb_project_name", None)
+        run_name = getattr(config, "tb_experiment_name", None) or "metrics-service"
+
+        init_kwargs = {
+            "project": project,
+            "name": run_name,
+            "entity": getattr(config, "wandb_team", None),
+        }
+
+        if offline:
+            init_kwargs["settings"] = wandb.Settings(mode="offline")
+
+        wandb_dir = getattr(config, "wandb_dir", None)
+        if wandb_dir:
+            os.makedirs(wandb_dir, exist_ok=True)
+            init_kwargs["dir"] = wandb_dir
+
+        wandb.init(**init_kwargs)
+
+        wandb.define_metric("train/step")
+        wandb.define_metric("train/*", step_metric="train/step")
+        wandb.define_metric("rollout/step")
+        wandb.define_metric("rollout/*", step_metric="rollout/step")
+        wandb.define_metric("eval/step")
+        wandb.define_metric("eval/*", step_metric="eval/step")
+        wandb.define_metric("perf/*", step_metric="rollout/step")
 
     @app.post("/log_metric")
     async def log_metric(self, request: LogMetricRequest) -> Dict[str, Any]:
