@@ -405,8 +405,26 @@ class DCSCoordinator:
         )
 
     @app.get("/recv_weight_meta")
-    async def recv_weight_meta(self, index: int):
-        """recv_weight_meta."""
+    async def recv_weight_meta(self, index: int, wait_timeout_s: float = 0.0):
+        """Receive weight metadata from the given index.
+
+        Args:
+            index: Start index in the internal weight metadata buffer.
+            wait_timeout_s: Optional long-poll timeout in seconds. If > 0 and no
+                new metadata is available, this endpoint waits up to the timeout
+                for new entries before returning.
+        """
+        if wait_timeout_s <= 0:
+            return self.weight_meta_buffer[index:]
+
+        deadline = time.monotonic() + wait_timeout_s
+        # Lightweight long-poll loop; event-driven sync can be added later if needed.
+        while time.monotonic() < deadline:
+            data = self.weight_meta_buffer[index:]
+            if data:
+                return data
+            await asyncio.sleep(0.01)
+
         return self.weight_meta_buffer[index:]
 
     @app.get("/clear_weight_meta")

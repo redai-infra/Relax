@@ -18,29 +18,20 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen3-omni-30B-A3B.sh"
+source "${MODEL_CONFIG_DIR}/qwen3-vl-30B-A3B.sh"
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/omni}"
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/openr1mm}"
 EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
-
-HF_CHECKPOINT="${HF_CHECKPOINT:-/path/to/Qwen3-Omni-30B-A3B-Instruct}"
-SAVE_CKPT="${SAVE_CKPT:-${EXP_DIR}/ckpt/omni-sync-16gpu}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CHECKPOINT}
-   # --load ${SAVE_CKPT}
-   --ref-load ${HF_CHECKPOINT}
+   --hf-checkpoint ${EXP_DIR}/Qwen3-VL-30B-A3B-Thinking
+   --ref-load ${EXP_DIR}/Qwen3-VL-30B-A3B-Thinking
    --megatron-to-hf-mode bridge
-   --save ${SAVE_CKPT}
-   --save-interval 100
-   --async-save
-   --max-actor-ckpt-to-keep 2
 )
 
-SYSTEM_PROMPT="Please think about this question as if you were a human pondering deeply, carefully considering both the visual and audio information before answering, engaging in an internal dialogue using expressions such as let me think, wait, hmm, oh I see, or let's break it down, including self-reflection or verification in the reasoning process, providing the detailed reasoning between the <think> </think> tags, and finally giving only the single option letter (e.g., A, B, C, D, etc.) as the final answer within the <answer> </answer> tags."
-
-PROMPT_SET="${PROMPT_SET:-/path/to/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train_convert.jsonl}"
+PROMPT_SET=${EXP_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
+SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
@@ -48,52 +39,42 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-
-   --rm-type multiple_choice
+   --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 64
+   --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 1024
-   # --rollout-max-prompt-len 2048
+   --rollout-max-prompt-len 2048
    --rollout-temperature 0.8
-   --global-batch-size 512
-    --use-fault-tolerance
-    --system-prompt "${SYSTEM_PROMPT}"
-    --multimodal-keys '{"image":"image","audio":"audio"}'
-    --use-streaming-dataset
-)
-
-EVAL_ARGS=(
-   --eval-interval 50
-   --eval-prompt-data avqa ${EVAL_PROMPT_DATA:-/path/to/AVQA-R1-6K/AVQA_R1/valid/small_valid.jsonl}
-   --n-samples-per-eval-prompt 8
-   --eval-max-response-len 2048
-   --eval-top-p 0.7
+   --global-batch-size 256
+   --use-fault-tolerance
+   --system-prompt "${SYSTEM_PROMPT}"
+   --multimodal-keys '{"image":"image"}'
+   --use-streaming-dataset
 )
 
 PERF_ARGS=(
-   --train-backend megatron
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
-
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
-   --micro-batch-size 4 # avoid OOM
-   --max-tokens-per-gpu 8192
+   #--micro-batch-size 16 # avoid OOM
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 9216
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
    --use-kl-loss
-   --kl-loss-coef 0.001
+   --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --eps-clip 3.0
+   --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
 )
@@ -105,10 +86,15 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
+
+   # NOTE(wuhuan): to avoid algorithm performance degradation
    --no-rope-fusion
+   --moe-router-load-balancing-type "none"
+   --moe-aux-loss-coeff 0.0
 )
 
 SGLANG_ARGS=(
@@ -118,9 +104,13 @@ SGLANG_ARGS=(
 
 WANDB_ARGS=(
    --use-clearml
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen3-30B-A3B-16x-async-${now}
    --use-metrics-service
+   --tb-project-name  ${PROJECT_NAME}
+   --tb-experiment-name qwen3-vl-30B-A3B-${now}
+   # --use-wandb
+   # --wandb-project slime-dev
+   # --wandb-group qwen3-4B-test
+   # --wandb-key ${WANDB_KEY}
 )
 
 MISC_ARGS=(
@@ -143,7 +133,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    --resource '{"actor": [1, 8], "rollout": [1, 4], "reference": [1, 2], "actor_fwd": [1, 2], "advantages": [1, 0]}'\
    --max-staleness 2 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 64 \
+   --num-iters-per-train-update 32 \
    --ref-actor-config '{"tensor_model_parallel_size": 2, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 2, "micro_batch_size": 8, "max_tokens_per_gpu": 32768, "sequence_parallel": true}' \
    --fully-async \
    --use-health-check \
@@ -154,6 +144,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    "${GRPO_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
-   "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-30B-A3B-omni-GRPO-gpu16-async-${now}.log
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-vl-30B-A3B-GRPO-gpu16-async-${now}.log
