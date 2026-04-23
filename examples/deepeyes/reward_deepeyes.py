@@ -24,49 +24,49 @@ def get_gpt4_score_ICE():
 [Question]: Is the countertop tan or blue?
 [Standard Answer]: The countertop is tan.
 [Model_answer] : tan
-Judgement: 1
+Judgment: 1
 """  # noqa
 
     example_2 = """
 [Question]: On which side of the picture is the barrier?
 [Standard Answer]: The barrier is on the left side of the picture.
 [Model_answer] : left
-Judgement: 1
+Judgment: 1
 """  # noqa
 
     example_3 = """
 [Question]: Is the kite brown and large?
 [Standard Answer]: Yes, the kite is brown and large.
 [Model_answer] : Yes
-Judgement: 1
+Judgment: 1
 """  # noqa
 
     example_4 = """
 [Question]: Are the spots on a giraffe?
 [Standard Answer]: No, the spots are on a banana.
 [Model_answer] : no
-Judgement: 1
+Judgment: 1
 """  # noqa
 
     example_5 = """
 [Question]: Who is wearing pants?
 [Standard Answer]: The boy is wearing pants.
 [Model_answer] : The person in the picture is wearing pants.
-Judgement: 1
+Judgment: 1
 """  # noqa
 
     example_6 = """
 [Question]: Is the man phone both blue and closed?
 [Standard Answer]: Yes, the man phone is both blue and closed.
 [Model_answer] : No.
-Judgement: 0
+Judgment: 0
 """  # noqa
 
     example_7 = """
 [Question]: What color is the towel in the center of the picture?
 [Standard Answer]: The towel in the center of the picture is blue.
 [Model_answer] : The towel in the center of the picture is pink.
-Judgement: 0
+Judgment: 0
 """  # noqa
 
     return [example_1, example_2, example_3, example_4, example_5, example_6, example_7]
@@ -76,7 +76,7 @@ def get_chat_template():
     chat_template = """
 Below are two answers to a question. Question is [Question], [Standard Answer] is the standard answer to the question, and [Model_answer] is the answer extracted from a model's output to this question.  Determine whether these two answers are consistent.
 Note that [Model Answer] is consistent with [Standard Answer] whenever they are essentially the same. If the meaning is expressed in the same way, it is considered consistent, for example, 'pink' and 'it is pink'.
-If they are consistent, Judement is 1; if they are different, Judement is 0. Just output Judement and don't output anything else.\n\n
+If they are consistent, Judgment is 1; if they are different, Judgment is 0. Just output Judgment and don't output anything else.\n\n
 """
     return chat_template
 
@@ -91,7 +91,7 @@ def get_prompt(predict_str, ground_truth, question):
 [Question]: {question}
 [Standard Answer]: {ground_truth}
 [Model_answer] : {predict_str}
-Judgement:"""
+Judgment:"""
     full_prompt = f"{demo_prompt}{test_prompt}"
 
     return full_prompt
@@ -189,8 +189,8 @@ def compute_score(predict_str: str, ground_truth: str, extra_info: dict | None =
                     response = "error"
 
         # print(response)
-        if "Judgement:" in response:
-            response = response.split("Judgement:")[-1].strip()
+        if "Judgment:" in response:
+            response = response.split("Judgment:")[-1].strip()
             if "1" in response:
                 acc_reward = 1.0
             elif "0" in response:
