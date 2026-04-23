@@ -16,23 +16,31 @@ from argparse import Namespace
 from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
+import pytest
 import torch
 
+
+# Skip the whole module when Megatron (or its Bridge) isn't installed — e.g. on
+# the CPU-only CI runner. All tests here exercise real Bridge mapping objects
+# and the DeviceDirectBackend, which imports ``megatron.core`` at module level.
+pytest.importorskip("megatron.core")
+pytest.importorskip("megatron.bridge")
+
 # Real Bridge mapping classes
-from megatron.bridge.models.conversion.param_mapping import (
+from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
     AutoMapping,
     GatedMLPMapping,
     MegatronParamMapping,
     ReplicatedMapping,
 )
-from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (
+from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (  # noqa: E402
     ExpertMLPDownProjMapping,
     ExpertMLPGateUpProjMapping,
 )
 
-from relax.backends.megatron.misc_utils import strip_param_name_prefix
-from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
-from relax.distributed.checkpoint_service.backends.device_direct import DeviceDirectBackend
+from relax.backends.megatron.misc_utils import strip_param_name_prefix  # noqa: E402
+from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding  # noqa: E402
+from relax.distributed.checkpoint_service.backends.device_direct import DeviceDirectBackend  # noqa: E402
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
