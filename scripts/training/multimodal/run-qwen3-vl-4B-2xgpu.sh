@@ -16,9 +16,11 @@ echo "当前时间: $now"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../entrypoint/device_env.sh"
 
-SELECTED_GPUS="$(relax_select_top_gpus_by_free_mem 2)"
-if [ -n "${SELECTED_GPUS}" ]; then
-    relax_export_visible_devices "${SELECTED_GPUS}"
+if [ -z "$(relax_visible_devices)" ]; then
+    SELECTED_GPUS="$(relax_select_top_gpus_by_free_mem 2)"
+    if [ -n "${SELECTED_GPUS}" ]; then
+        relax_export_visible_devices "${SELECTED_GPUS}"
+    fi
 fi
 
 # Auto-source local environment when not launched via an external entrypoint

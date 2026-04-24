@@ -118,8 +118,8 @@ relax_select_top_gpus_by_free_mem() {
 
     if command -v rocm-smi >/dev/null 2>&1; then
         rocm-smi --showmeminfo vram --csv 2>/dev/null \
-            | awk -F, 'NR > 1 {gsub("card", "", $1); free = $2 - $3; print $1 "," free}' \
-            | sort -t, -k2 -rn \
+            | awk -F, '$1 ~ /^card[0-9]+$/ {gsub("card", "", $1); free = $2 - $3; print $1 "," free}' \
+            | sort -t, -k2 -gr \
             | head -n "${count}" \
             | cut -d, -f1 \
             | paste -sd ','

@@ -109,11 +109,7 @@ def setup_model_and_optimizer(
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
     assert not args.moe_use_upcycling
-    if args.load is None and args.pretrained_checkpoint is None:
-        if args.debug_train_only:
-            logger.warning("No checkpoint provided for debug_train_only; initialize Megatron model from random weights.")
-        else:
-            raise AssertionError("args.load or args.pretrained_checkpoint must be set")
+    assert args.load is not None or args.pretrained_checkpoint is not None
 
     model = get_model(
         wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
@@ -821,16 +817,13 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     clear_memory()
-    if args.load is not None or args.pretrained_checkpoint is not None:
-        iteration, _ = load_checkpoint(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            checkpointing_context={},
-            skip_load_to_model_and_opt=False,
-        )
-    else:
-        iteration = 0
+    iteration, _ = load_checkpoint(
+        model,
+        optimizer,
+        opt_param_scheduler,
+        checkpointing_context={},
+        skip_load_to_model_and_opt=False,
+    )
     clear_memory()
     if opt_param_scheduler is not None:
         opt_param_scheduler.step(increment=iteration * args.global_batch_size)

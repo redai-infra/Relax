@@ -49,6 +49,7 @@ To run a real-model 2-GPU training smoke inside that container:
 
 ```bash
 cd /root/Relax
+CUDA_VISIBLE_DEVICES=6,7 \
 REAL_HF_MODEL_DIR=/mnt/dcgpuval/models/meta-llama/Meta-Llama-3-8B-Instruct \
 NUM_GPUS=2 \
 bash scripts/training/text/run-llama3-8b-2xgpu-debug.sh
