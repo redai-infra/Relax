@@ -12,6 +12,7 @@ import torch.distributed as dist
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils.distributed_utils import init_gloo_group
+from relax.utils.device_utils import get_visible_devices, to_local_visible_device_index
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
 
@@ -19,12 +20,35 @@ from relax.utils.memory_utils import clear_memory, print_memory
 logger = get_logger(__name__)
 
 
-def get_local_gpu_id():
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cvd is None:
-        return ray.get_gpu_ids()[0]
+def _assigned_gpu_ids() -> list[str]:
+    gpu_ids = []
+    for gpu_id in ray.get_gpu_ids():
+        if isinstance(gpu_id, float) and gpu_id.is_integer():
+            gpu_ids.append(str(int(gpu_id)))
+        else:
+            gpu_ids.append(str(gpu_id))
+    return gpu_ids
+
+
+def _configure_visible_devices_for_current_actor() -> None:
+    assigned_gpu_ids = _assigned_gpu_ids()
+    if not assigned_gpu_ids:
+        return
+
+    joined_ids = ",".join(assigned_gpu_ids)
+    if torch.version.hip is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = joined_ids
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     else:
-        return cvd.split(",").index(str(ray.get_gpu_ids()[0]))
+        os.environ["CUDA_VISIBLE_DEVICES"] = joined_ids
+
+
+def get_local_gpu_id():
+    visible_devices = get_visible_devices()
+    if not visible_devices:
+        return ray.get_gpu_ids()[0]
+    return to_local_visible_device_index(int(ray.get_gpu_ids()[0]))
 
 
 class TrainRayActor(RayActor):
@@ -43,6 +67,7 @@ class TrainRayActor(RayActor):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
+        _configure_visible_devices_for_current_actor()
         # TODO: currently this doesn't work as ray has already set torch.cuda.device_count().
         # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
@@ -57,7 +82,14 @@ class TrainRayActor(RayActor):
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(f"cuda:{local_rank}")
+        logger.info(
+            "Initializing TrainRayActor rank=%s local_rank=%s visible_devices=%s hip=%s",
+            self._rank,
+            local_rank,
+            get_visible_devices(),
+            torch.version.hip is not None,
+        )
+        torch.cuda.set_device(local_rank)
 
         backend = args.distributed_backend
 

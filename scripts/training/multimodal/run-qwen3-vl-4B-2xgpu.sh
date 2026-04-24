@@ -13,9 +13,14 @@ set -o pipefail
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
-export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | sort -t, -k2 -rn | head -n 2 | cut -d, -f1 | paste -sd ',')
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/../../entrypoint/device_env.sh"
+
+SELECTED_GPUS="$(relax_select_top_gpus_by_free_mem 2)"
+if [ -n "${SELECTED_GPUS}" ]; then
+    relax_export_visible_devices "${SELECTED_GPUS}"
+fi
+
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"

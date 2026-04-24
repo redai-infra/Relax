@@ -40,6 +40,7 @@ from relax.distributed.checkpoint_service.backends.base import CommBackend, Tens
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
 
 
@@ -143,6 +144,7 @@ class DeviceDirectBackend(CommBackend):
         if self._bridge_task_map is not None:
             return
 
+        ensure_megatron_bridge_importable()
         from megatron.bridge import AutoBridge
         from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
         from megatron.bridge.models.conversion.param_mapping import AutoMapping

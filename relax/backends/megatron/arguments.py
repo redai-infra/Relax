@@ -188,6 +188,13 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
     """Parse megatron args, validate HF config, and set defaults."""
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
 
+    debug_train_only = getattr(args, "debug_train_only", False)
+    skip_hf_validate = skip_hf_validate or (
+        debug_train_only and args.megatron_to_hf_mode != "bridge" and args.load is None and args.pretrained_checkpoint is None
+    )
+    if skip_hf_validate and args.hf_checkpoint:
+        logger.warning("Skip HF config validation for debug_train_only raw-init smoke run.")
+
     if args.hf_checkpoint and not skip_hf_validate:
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
         _hf_validate_args(args, hf_config)

@@ -1,0 +1,95 @@
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG BASE_IMAGE=rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+ARG GPU_ARCH=gfx950
+ARG TRAIN_IMAGE=train
+
+FROM ${BASE_IMAGE} AS base
+
+ARG GPU_ARCH
+
+ENV PYVER=3.12 \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+    TZ=Asia/Shanghai \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    MAX_JOBS=64 \
+    PYTORCH_ROCM_ARCH=${GPU_ARCH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential patchelf tmux net-tools htop nano iputils-ping \
+    autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
+    libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync \
+    locales tzdata jq git git-lfs ca-certificates && \
+    locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /sgl-workspace && \
+    cd /tmp && git clone -b update-transformers-v5 https://github.com/sgl-project/sglang.git && \
+    mv /tmp/sglang /sgl-workspace/sglang
+
+FROM base AS sglang
+
+WORKDIR /sgl-workspace/sglang
+
+# SGLang keeps ROCm-specific dependency metadata in pyproject_other.toml.
+# Installing the CUDA-default pyproject would pull cu12 wheels into the image.
+RUN cp python/pyproject_other.toml python/pyproject.toml && \
+    pip install -e "python[srt_hip]" --no-build-isolation
+
+FROM sglang AS train
+
+ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
+ARG MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862
+
+RUN cd /root && git clone "${MEGATRON_REPO}" --recursive && \
+    cd /root/Megatron-LM && \
+    git checkout "${MEGATRON_COMMIT}" && \
+    git submodule update --init --recursive && \
+    pip install -e . --no-deps
+
+ARG TRAIN_IMAGE=train
+FROM ${TRAIN_IMAGE} AS relax
+
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
+
+WORKDIR /root
+
+COPY docker/requirements-rocm.txt /tmp/requirements-rocm.txt
+RUN pip install -r /tmp/requirements-rocm.txt && \
+    pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps
+
+RUN pip install git+https://github.com/redai-infra/megatron-bridge.git@f13bec09 --no-build-isolation --no-deps --force-reinstall && \
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
+
+COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+RUN cd /root/Megatron-LM && \
+    git update-index --refresh && \
+    git apply megatron.patch --3way && \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    rm megatron.patch
+
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+    cd /sgl-workspace/sglang && git add . && \
+    git update-index --refresh && \
+    git apply sglang.patch --3way && \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    rm sglang.patch; \
+fi
+
+WORKDIR /root/Relax
+COPY . .
+RUN pip install -e . --no-deps

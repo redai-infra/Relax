@@ -47,6 +47,7 @@ fi
 set -eo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "${DIR}/device_env.sh"
 
 # ── clean up residual python/sglang processes (NOT ray) ─────────────────────
 # IMPORTANT: Do NOT pkill ray or run ray stop — the cluster is managed externally.
@@ -73,23 +74,25 @@ export RELAX=${RELAX:-${DIR}/../../}
 export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
 
-# ── NVLink detection ────────────────────────────────────────────────────────
-if nvidia-smi 2>&1 > /dev/null; then
-    NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-else
-    NVLINK_COUNT=0
-fi
-if [ "$NVLINK_COUNT" -gt 0 ]; then
-    export HAS_NVLINK=1
-else
-    export HAS_NVLINK=0
-fi
-echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+# ── fast interconnect detection ────────────────────────────────────────────
+export HAS_NVLINK="$(relax_detect_fast_interconnect)"
+echo "HAS_NVLINK: $HAS_NVLINK"
 
 # ── entrypoint mode & runtime env ──────────────────────────────────────────
 export RELAX_ENTRYPOINT_MODE="ray-job"
 RAY_DEBUG=${RAY_DEBUG:-"0"}
 RAY_DEBUG_POST_MORTEM=${RAY_DEBUG_POST_MORTEM:-"0"}
+
+_VISIBLE_DEVICE_ENV_JSON=""
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    _VISIBLE_DEVICE_ENV_JSON="
+   \"CUDA_VISIBLE_DEVICES\": \"${CUDA_VISIBLE_DEVICES}\",
+"
+elif [ -n "${ROCR_VISIBLE_DEVICES:-}" ] || [ -n "${HIP_VISIBLE_DEVICES:-}" ]; then
+    _VISIBLE_DEVICE_ENV_JSON="
+   \"CUDA_VISIBLE_DEVICES\": \"${ROCR_VISIBLE_DEVICES:-${HIP_VISIBLE_DEVICES:-}}\",
+"
+fi
 
 # Runtime env for ray-job mode (env inherited from Ray cluster)
 export RUNTIME_ENV_JSON="{
@@ -97,7 +100,8 @@ export RUNTIME_ENV_JSON="{
    \"PYTHONUNBUFFERED\": \"1\",
    \"PYTHONPATH\": \"${PYTHONPATH}\",
    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-   \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
+   \"RELAX_SERVE_PORT\": \"${RELAX_SERVE_PORT:-8000}\",
+${_VISIBLE_DEVICE_ENV_JSON}   \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
    \"MASTER_ADDR\": \"${MASTER_ADDR}\",
    \"RAY_DEBUG\": \"${RAY_DEBUG}\",

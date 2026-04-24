@@ -11,6 +11,7 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args
 
 from relax.utils import megatron_bridge_utils
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
 
 
@@ -171,6 +172,7 @@ def _patch_scatter_dtype_cast():
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
+    ensure_megatron_bridge_importable()
     from megatron.bridge import AutoBridge
 
     source_path = load_path or args.hf_checkpoint

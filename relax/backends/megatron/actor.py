@@ -17,11 +17,11 @@ import torch.distributed as dist
 import transfer_queue as tq
 from megatron.core import mpu
 from tensordict import TensorDict
-from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.utils.external.torch_memory_saver import torch_memory_saver
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (

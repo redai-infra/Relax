@@ -25,6 +25,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.utils import tracking_utils
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
 from relax.utils.timer import timer
@@ -108,7 +109,11 @@ def setup_model_and_optimizer(
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
     assert not args.moe_use_upcycling
-    assert args.load is not None or args.pretrained_checkpoint is not None
+    if args.load is None and args.pretrained_checkpoint is None:
+        if args.debug_train_only:
+            logger.warning("No checkpoint provided for debug_train_only; initialize Megatron model from random weights.")
+        else:
+            raise AssertionError("args.load or args.pretrained_checkpoint must be set")
 
     model = get_model(
         wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
@@ -764,6 +769,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
     )
 
     try:
+        ensure_megatron_bridge_importable()
         from megatron.bridge import AutoBridge
 
         from relax.utils.megatron_bridge_utils import patch_megatron_model
@@ -815,13 +821,16 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     clear_memory()
-    iteration, _ = load_checkpoint(
-        model,
-        optimizer,
-        opt_param_scheduler,
-        checkpointing_context={},
-        skip_load_to_model_and_opt=False,
-    )
+    if args.load is not None or args.pretrained_checkpoint is not None:
+        iteration, _ = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context={},
+            skip_load_to_model_and_opt=False,
+        )
+    else:
+        iteration = 0
     clear_memory()
     if opt_param_scheduler is not None:
         opt_param_scheduler.step(increment=iteration * args.global_batch_size)

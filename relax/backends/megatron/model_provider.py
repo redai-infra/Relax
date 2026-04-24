@@ -19,14 +19,37 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 
 
 logger = get_logger(__name__)
+
+
+def _patch_no_te_rmsnorm_runtime() -> None:
+    """Route Megatron layer norms to pure torch norm implementations.
+
+    In ROCm/no-Transformer-Engine runtimes with Apex installed, Megatron-Core
+    still defaults some norm paths to Apex FusedLayerNorm. That implementation
+    only supports LayerNorm, not RMSNorm, so Llama-family bridge providers fail
+    during model construction. Force those module-level defaults to the torch
+    norm wrapper for the local-runtime path.
+    """
+    import megatron.core.models.gpt.gpt_layer_specs as gpt_layer_specs_module
+    import megatron.core.transformer.transformer_block as transformer_block_module
+
+    if getattr(gpt_layer_specs_module, "LNImpl", None) is not WrappedTorchNorm:
+        logger.info("Patch Megatron GPT local LNImpl to WrappedTorchNorm for no-TE RMSNorm runtime")
+        gpt_layer_specs_module.LNImpl = WrappedTorchNorm
+
+    if getattr(transformer_block_module, "LayerNormImpl", None) is not WrappedTorchNorm:
+        logger.info("Patch Megatron TransformerBlock LayerNormImpl to WrappedTorchNorm for no-TE RMSNorm runtime")
+        transformer_block_module.LayerNormImpl = WrappedTorchNorm
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -90,7 +113,9 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
+        ensure_megatron_bridge_importable()
         from megatron.bridge import AutoBridge
+        from megatron.bridge.models.gpt_provider import local_layer_spec
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
@@ -150,6 +175,16 @@ def get_model_provider_func(
             provider.fp16 = False
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
+
+        if getattr(args, "transformer_impl", None) == "local" and not getattr(provider, "restore_modelopt_state", False):
+            logger.info("Override provider.transformer_layer_spec to local_layer_spec for no-TE runtime")
+            provider.transformer_layer_spec = local_layer_spec
+            provider.use_transformer_engine_full_layer_spec = False
+            if getattr(provider, "persist_layer_norm", False):
+                logger.info("Disable provider.persist_layer_norm for local torch norm runtime")
+                provider.persist_layer_norm = False
+            if getattr(provider, "normalization", None) == "RMSNorm":
+                _patch_no_te_rmsnorm_runtime()
 
         provider.finalize()
 

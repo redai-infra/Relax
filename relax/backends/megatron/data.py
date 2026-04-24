@@ -614,6 +614,9 @@ def log_rollout_data(
                     else:
                         val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
+                elif isinstance(val[0], dict):
+                    logger.info(f"Skip rollout metric aggregation for {key}: dict-valued payload is not reducible.")
+                    continue
                 else:
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):

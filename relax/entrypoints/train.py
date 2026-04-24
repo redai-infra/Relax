@@ -64,8 +64,10 @@ def main(args):
         ray.init(runtime_env=runtime_env)
         logger.info("Ray initialized successfully")
         try:
+            serve_host = os.environ.get("RELAX_SERVE_HOST", "0.0.0.0")
+            serve_port = int(os.environ.get("RELAX_SERVE_PORT", "8000"))
             serve.start(
-                http_options={"host": "0.0.0.0", "port": "8000"},
+                http_options={"host": serve_host, "port": serve_port},
                 detached=True,
             )
         except RuntimeError:
