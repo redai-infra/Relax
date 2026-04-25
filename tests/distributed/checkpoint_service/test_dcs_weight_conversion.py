@@ -37,6 +37,12 @@ from megatron.bridge.models.qwen_vl.qwen3_vl_bridge import (  # noqa: E402
     ExpertMLPDownProjMapping,
     ExpertMLPGateUpProjMapping,
 )
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (  # noqa: E402
+    ExpertMLPDownProjMapping as Qwen35ExpertMLPDownProjMapping,
+)
+from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import (  # noqa: E402
+    ExpertMLPGateUpProjMapping as Qwen35ExpertMLPGateUpProjMapping,
+)
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix  # noqa: E402
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding  # noqa: E402
@@ -77,7 +83,14 @@ def _patch_gather_from_ep_ranks():
         return {str(hf_param_name): megatron_weights}
 
     saved_originals: dict = {}
-    patched_classes = [MegatronParamMapping, GatedMLPMapping, ExpertMLPGateUpProjMapping, ExpertMLPDownProjMapping]
+    patched_classes = [
+        MegatronParamMapping,
+        GatedMLPMapping,
+        ExpertMLPGateUpProjMapping,
+        ExpertMLPDownProjMapping,
+        Qwen35ExpertMLPGateUpProjMapping,
+        Qwen35ExpertMLPDownProjMapping,
+    ]
     for cls in patched_classes:
         if "gather_from_ep_ranks" in cls.__dict__:
             saved_originals[cls] = cls.__dict__["gather_from_ep_ranks"]
@@ -113,15 +126,35 @@ def _make_expert_down_mapping(layer_idx: int, expert_id: int) -> ExpertMLPDownPr
     return m
 
 
+def _make_qwen35_expert_gate_up_mapping(layer_idx: int, expert_id: int) -> Qwen35ExpertMLPGateUpProjMapping:
+    """Create a real Qwen3.5 ExpertMLPGateUpProjMapping for testing."""
+    return Qwen35ExpertMLPGateUpProjMapping(
+        megatron_param=f"language_model.decoder.layers.{layer_idx}.mlp.experts.linear_fc1.weight{expert_id}",
+        hf_param=f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+    )
+
+
+def _make_qwen35_expert_down_mapping(layer_idx: int, expert_id: int) -> Qwen35ExpertMLPDownProjMapping:
+    """Create a real Qwen3.5 ExpertMLPDownProjMapping with eagerly initialized
+    inner mapping."""
+    m = Qwen35ExpertMLPDownProjMapping(
+        megatron_param=f"language_model.decoder.layers.{layer_idx}.mlp.experts.linear_fc2.weight{expert_id}",
+        hf_param=f"model.language_model.layers.{layer_idx}.mlp.experts.down_proj",
+    )
+    m._detected_type = "replicated"
+    m._mapping = m._get_or_create_mapping("replicated")
+    return m
+
+
 def _apply_expert_postprocessing(
     converted_dict: Dict[str, torch.Tensor],
     megatron_param_name: str,
+    bridge_expert_transposes_down: bool = True,
 ) -> List[Tuple[str, torch.Tensor]]:
     """Apply the same expert weight post-processing as
     ``_convert_to_hf_bridge``.
 
-    This calls the real production logic extracted from device_direct.py lines
-    399-420.
+    Mirrors the production logic in device_direct.py.
     """
     converted_named_tensors = list(converted_dict.items())
     expert_id_match = re.search(r"weight(\d+)", megatron_param_name)
@@ -130,14 +163,22 @@ def _apply_expert_postprocessing(
         postprocessed: list[tuple[str, torch.Tensor]] = []
         for hf_name, tensor in converted_named_tensors:
             if hf_name.endswith(".experts.gate_up_proj"):
-                gate_tensor = tensor[0].transpose(-1, -2).contiguous()
-                up_tensor = tensor[1].transpose(-1, -2).contiguous()
                 base = hf_name[: -len(".gate_up_proj")]
+                if tensor.ndim == 3:
+                    gate_tensor = tensor[0].transpose(-1, -2).contiguous()
+                    up_tensor = tensor[1].transpose(-1, -2).contiguous()
+                else:
+                    gate_tensor, up_tensor = tensor.chunk(2, dim=0)
                 postprocessed.append((f"{base}.{expert_id}.gate_proj.weight", gate_tensor))
                 postprocessed.append((f"{base}.{expert_id}.up_proj.weight", up_tensor))
             elif hf_name.endswith(".experts.down_proj"):
                 base = hf_name[: -len(".down_proj")]
-                postprocessed.append((f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous()))
+                if tensor.ndim == 2 and not bridge_expert_transposes_down:
+                    postprocessed.append((f"{base}.{expert_id}.down_proj.weight", tensor))
+                else:
+                    postprocessed.append(
+                        (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
+                    )
             else:
                 postprocessed.append((hf_name, tensor))
         converted_named_tensors = postprocessed
@@ -657,3 +698,88 @@ class TestExpertWeightEdgeCases:
         postprocessed = _apply_expert_postprocessing(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
         total_numel = sum(t.numel() for _, t in postprocessed)
         assert total_numel == original_numel
+
+
+# ─── Tests for Qwen3.5 Bridge (2D cat, no transpose) ─────────────────────────
+
+
+class TestQwen35BridgeMappingOutput:
+    """Test Qwen3.5 Bridge mapping output format (2D cat, no transpose)."""
+
+    def test_qwen35_gate_up_outputs_2d_cat(self):
+        """Qwen3.5 ExpertMLPGateUpProjMapping outputs 2D [2*H, D] via cat."""
+        with _patch_gather_from_ep_ranks():
+            m = _make_qwen35_expert_gate_up_mapping(layer_idx=0, expert_id=3)
+            H, D = 768, 2048
+            fused = torch.randn(H * 2, D)
+            result = m.megatron_to_hf(fused, None)
+
+        key = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        assert list(result.keys()) == [key]
+        tensor = result[key]
+        assert tensor.ndim == 2
+        assert tensor.shape == (H * 2, D)
+
+    def test_qwen35_down_proj_no_transpose(self):
+        """Qwen3.5 ExpertMLPDownProjMapping does not transpose."""
+        with _patch_gather_from_ep_ranks():
+            m = _make_qwen35_expert_down_mapping(layer_idx=0, expert_id=3)
+            D, H = 2048, 768
+            param = torch.randn(D, H)
+            result = m.megatron_to_hf(param, None)
+
+        key = "model.language_model.layers.0.mlp.experts.down_proj"
+        assert list(result.keys()) == [key]
+        tensor = result[key]
+        assert tensor.shape == (D, H)
+        assert torch.allclose(tensor, param)
+
+    def test_qwen35_expert_transposes_down_detection(self):
+        """Qwen3.5 ExpertMLPDownProjMapping lacks megatron_to_hf override."""
+        assert "megatron_to_hf" not in Qwen35ExpertMLPDownProjMapping.__dict__
+        assert "megatron_to_hf" in ExpertMLPDownProjMapping.__dict__
+
+
+class TestQwen35PostProcessingCorrectness:
+    """Verify Qwen3.5 Bridge output + post-processing produces correct HF
+    weights."""
+
+    def test_qwen35_gate_up_postprocessed(self):
+        """Qwen3.5 gate_up 2D + post-processing produces correct gate/up."""
+        H, D = 768, 2048
+        expert_id = 3
+        megatron_param = torch.randn(H * 2, D)
+        expected_gate, expected_up = megatron_param.chunk(2, dim=0)
+
+        with _patch_gather_from_ep_ranks():
+            mapping = _make_qwen35_expert_gate_up_mapping(layer_idx=0, expert_id=expert_id)
+            bridge_output = mapping.megatron_to_hf(megatron_param, None)
+
+        megatron_name = f"language_model.decoder.layers.0.mlp.experts.linear_fc1.weight{expert_id}"
+        postprocessed = _apply_expert_postprocessing(bridge_output, megatron_name, bridge_expert_transposes_down=False)
+
+        assert len(postprocessed) == 2
+        assert postprocessed[0][0].endswith(f".experts.{expert_id}.gate_proj.weight")
+        assert postprocessed[1][0].endswith(f".experts.{expert_id}.up_proj.weight")
+        assert postprocessed[0][1].shape == (H, D)
+        assert postprocessed[1][1].shape == (H, D)
+        assert torch.allclose(postprocessed[0][1], expected_gate)
+        assert torch.allclose(postprocessed[1][1], expected_up)
+
+    def test_qwen35_down_proj_postprocessed(self):
+        """Qwen3.5 down_proj passthrough (no transpose undo)."""
+        D, H = 2048, 768
+        expert_id = 5
+        megatron_param = torch.randn(D, H)
+
+        with _patch_gather_from_ep_ranks():
+            mapping = _make_qwen35_expert_down_mapping(layer_idx=0, expert_id=expert_id)
+            bridge_output = mapping.megatron_to_hf(megatron_param, None)
+
+        megatron_name = f"language_model.decoder.layers.0.mlp.experts.linear_fc2.weight{expert_id}"
+        postprocessed = _apply_expert_postprocessing(bridge_output, megatron_name, bridge_expert_transposes_down=False)
+
+        assert len(postprocessed) == 1
+        assert postprocessed[0][0].endswith(f".experts.{expert_id}.down_proj.weight")
+        assert postprocessed[0][1].shape == (D, H)
+        assert torch.allclose(postprocessed[0][1], megatron_param)

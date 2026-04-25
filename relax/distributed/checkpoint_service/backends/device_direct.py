@@ -121,6 +121,7 @@ class DeviceDirectBackend(CommBackend):
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
         self._bridge_task_map: Optional[Dict[str, Any]] = None  # global_param_name -> WeightConversionTask
         self._bridge_mapping_registry = None  # MegatronMappingRegistry for dynamic lookups
+        self._bridge_expert_transposes_down: bool = True  # set in _init_bridge_tasks
 
     def _init_bridge_tasks(self) -> None:
         """Lazily initialize Bridge conversion tasks and build a lookup table.
@@ -203,6 +204,16 @@ class DeviceDirectBackend(CommBackend):
                 if task.megatron_module is not None:
                     inner_tp._detected_type = inner_tp._detect_parallelism_type(task.megatron_module)
                     inner_tp._mapping = inner_tp._get_or_create_mapping(inner_tp._detected_type)
+
+        # Detect whether the Bridge's ExpertMLPDownProjMapping applies a
+        # transpose in megatron_to_hf (Qwen3-VL does, Qwen3.5 does not).
+        # Used by _convert_to_hf_bridge to decide whether to undo the transpose.
+        self._bridge_expert_transposes_down = False
+        for task in self._bridge_task_map.values():
+            cls = type(task.mapping)
+            if cls.__name__ == "ExpertMLPDownProjMapping":
+                self._bridge_expert_transposes_down = "megatron_to_hf" in cls.__dict__
+                break
 
         logger.info(f"Bridge task map initialized with {len(self._bridge_task_map)} local tasks")
 
@@ -391,16 +402,21 @@ class DeviceDirectBackend(CommBackend):
 
         # ── Post-process expert weights ──────────────────────────────────
         # Bridge's ExpertMLPGateUpProjMapping and ExpertMLPDownProjMapping
-        # (used by Qwen3-VL MoE) apply an extra ``.transpose(-1, -2)`` in
-        # their ``megatron_to_hf`` methods, assuming Megatron stores expert
-        # weights in column-major order.  However, the raw ``convert_to_hf``
-        # does NOT transpose expert weights — Megatron's expert weights are
-        # already in the same layout as HF.  We must undo Bridge's transpose
-        # to match the format that SGLang / ``convert_to_hf`` expects.
+        # apply transformations that differ by model family:
+        #
+        # **Qwen3-VL** (qwen3_vl_bridge.py):
+        #   gate_up_proj: transpose each half then stack → [2, D_out, D_in]
+        #   down_proj: transpose → [D_in, D_out]
+        #   We must undo the transpose.
+        #
+        # **Qwen3.5** (qwen35_vl_bridge.py):
+        #   gate_up_proj: cat without transpose → [2*H, D]  (2-D)
+        #   down_proj: no transpose (AutoMapping) → [H, D]  (2-D)
+        #   No un-transpose needed; just split the fused tensor.
         #
         # Additionally, Bridge outputs fused names without expert_id:
-        #   - ``...experts.gate_up_proj`` with shape [2, D_out, D_in]
-        #   - ``...experts.down_proj`` with shape [D_in, D_out]
+        #   - ``...experts.gate_up_proj``
+        #   - ``...experts.down_proj``
         # We split into per-expert format with correct names and shapes:
         #   - ``...experts.{E}.gate_proj.weight`` [H, D]
         #   - ``...experts.{E}.up_proj.weight``   [H, D]
@@ -411,19 +427,28 @@ class DeviceDirectBackend(CommBackend):
             postprocessed: list[tuple[str, torch.Tensor]] = []
             for hf_name, tensor in converted_named_tensors:
                 if hf_name.endswith(".experts.gate_up_proj"):
-                    # Bridge output: [2, D_out, D_in] (transposed by Bridge)
-                    # Undo transpose on each slice: [D_out, D_in] -> [D_in, D_out]
-                    gate_tensor = tensor[0].transpose(-1, -2).contiguous()
-                    up_tensor = tensor[1].transpose(-1, -2).contiguous()
                     base = hf_name[: -len(".gate_up_proj")]
+                    if tensor.ndim == 3:
+                        # Qwen3-VL style: [2, D_out, D_in] (transposed by Bridge)
+                        # Undo transpose on each slice: [D_out, D_in] -> [D_in, D_out]
+                        gate_tensor = tensor[0].transpose(-1, -2).contiguous()
+                        up_tensor = tensor[1].transpose(-1, -2).contiguous()
+                    else:
+                        # Qwen3.5 style: [2*H, D] (cat, no transpose by Bridge)
+                        # Split along dim 0 into two [H, D] tensors
+                        gate_tensor, up_tensor = tensor.chunk(2, dim=0)
                     postprocessed.append((f"{base}.{expert_id}.gate_proj.weight", gate_tensor))
                     postprocessed.append((f"{base}.{expert_id}.up_proj.weight", up_tensor))
                 elif hf_name.endswith(".experts.down_proj"):
-                    # Bridge output: transposed — undo to match raw convert_to_hf
                     base = hf_name[: -len(".down_proj")]
-                    postprocessed.append(
-                        (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
-                    )
+                    if tensor.ndim == 2 and not self._bridge_expert_transposes_down:
+                        # Qwen3.5 style: AutoMapping, no transpose — already [H, D]
+                        postprocessed.append((f"{base}.{expert_id}.down_proj.weight", tensor))
+                    else:
+                        # Qwen3-VL style: transposed — undo to match raw convert_to_hf
+                        postprocessed.append(
+                            (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
+                        )
                 else:
                     postprocessed.append((hf_name, tensor))
             converted_named_tensors = postprocessed
