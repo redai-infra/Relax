@@ -591,6 +591,8 @@ class DeviceDirectBackend(CommBackend):
                     dist.destroy_process_group(self._model_update_groups)
                     ray.get(futures)
                     self._model_update_groups = None
+                    # Wait for NCCL socket ports to be released by the OS
+                    time.sleep(2.0)
                 except Exception as e:
                     logger.warning(f"Error destroying old process group: {e}")
                     self._model_update_groups = None
@@ -605,32 +607,59 @@ class DeviceDirectBackend(CommBackend):
                 cumulative_offset += gpus_for_node
             world_size = cumulative_offset
 
-            master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
+            max_retries = 3
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
 
-            # Prepare init payloads for each rollout node
-            init_payloads = {}
-            for rank, role_info in self.rollout_topology.items():
-                init_payloads[int(rank)] = {
-                    "master_address": master_address,
-                    "master_port": master_port,
-                    "rank_offset": rank_offsets[int(rank)],
-                    "world_size": world_size,
-                    "group_name": self._group_name,
-                    "backend": self.backend_type,
-                }
+                init_payloads = {}
+                for rank, role_info in self.rollout_topology.items():
+                    init_payloads[int(rank)] = {
+                        "master_address": master_address,
+                        "master_port": master_port,
+                        "rank_offset": rank_offsets[int(rank)],
+                        "world_size": world_size,
+                        "group_name": self._group_name,
+                        "backend": self.backend_type,
+                    }
 
-            logger.info(f"Sending init_weights_update_group to {len(self.rollout_topology)} rollout nodes...")
-            futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
+                logger.info(
+                    f"Sending init_weights_update_group to {len(self.rollout_topology)} rollout nodes "
+                    f"(attempt {attempt}/{max_retries}, port={master_port})..."
+                )
+                futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
 
-            self._model_update_groups = init_process_group(
-                backend=self.backend_type,
-                init_method=f"tcp://{master_address}:{master_port}",
-                world_size=world_size,
-                rank=0,
-                group_name=self._group_name,
-                timeout=timedelta(seconds=180),
-            )
-            ray.get(futures)
+                try:
+                    self._model_update_groups = init_process_group(
+                        backend=self.backend_type,
+                        init_method=f"tcp://{master_address}:{master_port}",
+                        world_size=world_size,
+                        rank=0,
+                        group_name=self._group_name,
+                        timeout=timedelta(seconds=180),
+                    )
+                    ray.get(futures)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Failed to init process group for rollout (attempt {attempt}/{max_retries}, "
+                        f"port={master_port}): {e}",
+                        exc_info=(attempt == max_retries),
+                    )
+                    self._model_update_groups = None
+                    try:
+                        ray.get(futures, timeout=5)
+                    except Exception:
+                        pass
+                    if attempt < max_retries:
+                        time.sleep(5.0 * attempt)
+
+            if last_error is not None:
+                raise RuntimeError(
+                    f"Failed to init process group for rollout after {max_retries} attempts"
+                ) from last_error
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
