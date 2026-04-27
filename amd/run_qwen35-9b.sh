@@ -37,7 +37,7 @@ export TORCHDYNAMO_DISABLE="1"
 export PYTHONUNBUFFERED="1"
 
 export RAY_ADDRESS="${MASTER_ADDR}:${RAY_PORT}"
-export PYTHONPATH="${RELAX}:${MEGATRON}:${RELAX}:${PYTHONPATH:-}"
+export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
 
 cleanup_stale_processes() {
     echo "=== Cleaning stale Relax/Ray/SGLang processes ==="
