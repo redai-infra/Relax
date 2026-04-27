@@ -188,3 +188,8 @@ bash amd/run_qwen35-9b.sh
   - `--n-samples-per-prompt 2`
   - `--rollout-max-response-len 1024`
   - `--global-batch-size 2`
+- Reran the reduced smoke profile:
+  - Rollout generation succeeded and prepared a 2-sample rollout batch.
+  - New non-backend blocker: TransferQueue GRPO sampler rejected `batch_size=1` because it must be a multiple of `n_samples_per_prompt=2`.
+  - Changed `--global-batch-size` to `4` while keeping `n_samples_per_prompt=2`.
+- Changed `--num-iters-per-train-update` to `1` so the actor training loop consumes a single rollout iteration in this tiny smoke profile.

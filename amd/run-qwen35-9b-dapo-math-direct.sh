@@ -63,7 +63,7 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt 2
    --rollout-max-response-len 1024
    --rollout-temperature 1
-   --global-batch-size 2
+   --global-batch-size 4
    --use-fault-tolerance
 )
 
@@ -142,7 +142,7 @@ python3 -m relax.entrypoints.train \
    --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}' \
    --max-staleness 2 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 2 \
+   --num-iters-per-train-update 1 \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
    --use-health-check \
