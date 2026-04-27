@@ -6,12 +6,13 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
 
 # Edit this block directly when changing the smoke configuration.
 export MODEL_DIR="${SCRIPT_DIR}/assets/exps"
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 export NUM_GPUS="4"
-export MASTER_ADDR="10.235.26.199"
+export MASTER_ADDR="${MASTER_ADDR:-${DEFAULT_MASTER_ADDR:-127.0.0.1}}"
 export RAY_PORT="6380"
 export RAY_DASHBOARD_PORT="8266"
 export RAY_MIN_WORKER_PORT="30000"
@@ -36,7 +37,7 @@ export TORCHDYNAMO_DISABLE="1"
 export PYTHONUNBUFFERED="1"
 
 export RAY_ADDRESS="${MASTER_ADDR}:${RAY_PORT}"
-export PYTHONPATH="${RELAX}:${MEGATRON}:${RELAX}:${PYTHONPATH:-}"
+export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
 
 cleanup_stale_processes() {
     echo "=== Cleaning stale Relax/Ray/SGLang processes ==="

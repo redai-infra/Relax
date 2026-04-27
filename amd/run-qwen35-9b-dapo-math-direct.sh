@@ -13,11 +13,13 @@ RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/runs/${RUN_ID}}"
 mkdir -p "${RUN_DIR}"
 cd "${RUN_DIR}"
 
+DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
+
 export MODEL_DIR="${MODEL_DIR:-${SCRIPT_DIR}/assets/exps}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NUM_GPUS="${NUM_GPUS:-8}"
-export RAY_ADDRESS="${RAY_ADDRESS:-10.235.26.199:6380}"
-export MASTER_ADDR="${MASTER_ADDR:-10.235.26.199}"
+export MASTER_ADDR="${MASTER_ADDR:-${DEFAULT_MASTER_ADDR:-127.0.0.1}}"
+export RAY_ADDRESS="${RAY_ADDRESS:-${MASTER_ADDR}:6380}"
 export RELAX_SERVE_PORT="${RELAX_SERVE_PORT:-18080}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export NVTE_DEBUG="${NVTE_DEBUG:-1}"
@@ -34,7 +36,7 @@ source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${MODEL_DIR}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=4}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=2}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3.5-9B
@@ -57,11 +59,11 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 2
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 2048
+   --rollout-batch-size 1
+   --n-samples-per-prompt 2
+   --rollout-max-response-len 1024
    --rollout-temperature 1
-   --global-batch-size 16
+   --global-batch-size 2
    --use-fault-tolerance
 )
 

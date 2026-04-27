@@ -176,3 +176,15 @@ bash amd/run_qwen35-9b.sh
     - `--rollout-batch-size 2`
     - `--rollout-max-response-len 2048`
     - `--global-batch-size 16`
+- Reran the smaller smoke profile:
+  - All 5 services registered successfully.
+  - Actor, rollout, reference, actor_fwd, and advantages entered step 0.
+  - Rollout data reached reference/actor_fwd/actor training paths.
+  - TE selected `FusedAttention backend (sub-backend 1)`.
+  - SGLang still hit HIP OOM in logits allocation during step-0 generation.
+- Reduced the default smoke profile further for follow-up validation:
+  - `NUM_ROLLOUT=2`
+  - `--rollout-batch-size 1`
+  - `--n-samples-per-prompt 2`
+  - `--rollout-max-response-len 1024`
+  - `--global-batch-size 2`
