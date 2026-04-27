@@ -492,7 +492,8 @@ def get_serve_url(route_prefix: str = "") -> str:
     if route_prefix and not route_prefix.startswith("/"):
         route_prefix = "/" + route_prefix
 
-    serve_url = f"http://{head_ip}:{8000}{route_prefix}"
+    serve_port = int(os.environ.get("RELAX_SERVE_PORT", "8000"))
+    serve_url = f"http://{head_ip}:{serve_port}{route_prefix}"
     logger.info("Serve URL: %s", serve_url)
     return serve_url
 

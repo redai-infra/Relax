@@ -1,35 +1,39 @@
-#!/bin/bash
-
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-#
-# Qwen3.5-35B-A3B 16xGPU (2-node) fully async training script for DAPO math dataset.
-#
-# Usage:
-#   bash scripts/training/text/run-qwen35-9B-8xgpu-async.sh
+#!/usr/bin/env bash
 
 set -ex
 set -o pipefail
 
-now=$(date "+%Y-%m-%d-%H:%M:%S")
-echo "当前时间: $now"
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-# Auto-source local environment when not launched via an external entrypoint
-if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
-fi
-source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
-# source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+RUN_ID="${RUN_ID:-qwen35-9b-dapo-math-direct-$(date +%Y%m%d-%H%M%S)}"
+RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/runs/${RUN_ID}}"
 
+mkdir -p "${RUN_DIR}"
+cd "${RUN_DIR}"
+
+export MODEL_DIR="${MODEL_DIR:-${SCRIPT_DIR}/assets/exps}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export NUM_GPUS="${NUM_GPUS:-8}"
+export RAY_ADDRESS="${RAY_ADDRESS:-10.235.26.199:6380}"
+export MASTER_ADDR="${MASTER_ADDR:-10.235.26.199}"
+export RELAX_SERVE_PORT="${RELAX_SERVE_PORT:-18080}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export MEGATRON="${MEGATRON:-/root/Megatron-LM/}"
+export RELAX="${RELAX:-${REPO_ROOT}}"
+export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
+export MODEL_CONFIG_DIR="${MODEL_CONFIG_DIR:-${REPO_ROOT}/scripts/models}"
+
+source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
+
+now=$(date "+%Y-%m-%d-%H:%M:%S")
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+EXP_DIR="${MODEL_DIR}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3.5-9B
    --ref-load ${EXP_DIR}/Qwen3.5-9B
    --megatron-to-hf-mode bridge
-
    --load ${EXP_DIR}/Qwen3-9B_mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3-9B_mcore_8xgpu/
    --save-interval 50
@@ -72,16 +76,11 @@ PERF_ARGS=(
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
-
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
-
-   # --use-dynamic-batch-size
-   # --max-tokens-per-gpu 10240
-   --micro-batch-size 1 # avoid OOM
+   --micro-batch-size 1
    --qkv-format bshd
-
    --no-rope-fusion
 )
 
@@ -103,7 +102,6 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
-
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
@@ -118,40 +116,33 @@ SGLANG_ARGS=(
 WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9B-8x-async-${now}
+   --tb-project-name ${PROJECT_NAME}
+   --tb-experiment-name qwen35-9B-8x-direct-${now}
 )
 
 MISC_ARGS=(
-   # default dropout in megatron is 0.1
    --attention-dropout 0.0
    --hidden-dropout 0.0
-   # should be good for model performance
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   # need to comment this when using model with MLA
    --attention-backend flash
 )
 
-mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:${RAY_DASHBOARD_PORT:-8265}" \
-   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}'\
+python3 -m relax.entrypoints.train \
+   --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}' \
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 32 \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
-    --use-health-check \
-    "${MODEL_ARGS[@]}" \
-    "${CKPT_ARGS[@]}" \
-    "${ROLLOUT_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${PERF_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
-    "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-gpu16-async-${now}.log
+   --use-health-check \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" 2>&1 | tee "direct-train-${now}.log"
