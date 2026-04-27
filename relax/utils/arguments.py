@@ -1906,6 +1906,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             default=None,
             help="Path to the YAML config for custom function arguments.",
         )
+        parser.add_argument(
+            "--normalize-bbox",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Convert model-output bbox coordinates from normalized [0, 1000] to absolute pixels. "
+                "Required for Qwen-VL/Qwen2-VL/Qwen3-VL (default True). "
+                "Set --no-normalize-bbox for Qwen2.5-VL which outputs absolute pixel coordinates."
+            ),
+        )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
 
         return parser
