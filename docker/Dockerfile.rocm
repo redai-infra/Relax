@@ -17,7 +17,16 @@ ENV PYVER=3.12 \
     DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     MAX_JOBS=64 \
-    PYTORCH_ROCM_ARCH=${GPU_ARCH}
+    PYTORCH_ROCM_ARCH=${GPU_ARCH} \
+    SGLANG_DISABLE_CUDNN_CHECK=1 \
+    HIP_FORCE_DEV_KERNARG=1 \
+    HSA_NO_SCRATCH_RECLAIM=1 \
+    SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+    SGLANG_INT4_WEIGHT=0 \
+    SGLANG_MOE_PADDING=1 \
+    SGLANG_ROCM_DISABLE_LINEARQUANT=0 \
+    SGLANG_ROCM_FUSED_DECODE_MLA=1 \
+    SGLANG_SET_CPU_AFFINITY=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential patchelf tmux net-tools htop nano iputils-ping \
@@ -35,7 +44,18 @@ RUN mkdir -p /sgl-workspace && \
 
 FROM base AS sglang
 
+ARG GPU_ARCH
+
 WORKDIR /sgl-workspace/sglang
+
+# SGLang's ROCm image builds sgl-kernel from source. Installing only
+# python[srt_hip] leaves sgl_kernel missing at runtime.
+RUN python -m pip install --upgrade pip setuptools wheel setuptools_scm scikit-build-core pybind11 && \
+    cd sgl-kernel && \
+    rm -f pyproject.toml && \
+    cp pyproject_rocm.toml pyproject.toml && \
+    SGL_KERNEL_ARCH="${GPU_ARCH%%-*}" && \
+    AMDGPU_TARGET="${SGL_KERNEL_ARCH}" python setup_rocm.py install
 
 # SGLang keeps ROCm-specific dependency metadata in pyproject_other.toml.
 # Installing the CUDA-default pyproject would pull cu12 wheels into the image.
