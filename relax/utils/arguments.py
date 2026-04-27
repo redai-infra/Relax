@@ -10,6 +10,7 @@ from sglang_router.launch_router import RouterArgs
 
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 
@@ -62,7 +63,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
-                default="nccl",
+                default=device_utils.get_dist_backend(),
                 help=("Backend for checkpoint engine."),
             )
             parser.add_argument(
@@ -184,7 +185,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
-            reset_arg(parser, "--distributed-backend", type=str, default="nccl")
+            reset_arg(parser, "--distributed-backend", type=str, default=device_utils.get_dist_backend())
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=30)
 
             return parser

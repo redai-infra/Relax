@@ -2,9 +2,9 @@
 import os
 
 import ray
-import torch
 
 from relax.distributed.ray.ray_actor import RayActor
+from relax.utils import device as device_utils
 
 
 # Refer to
@@ -31,8 +31,8 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 
 def get_physical_gpu_id():
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = device_utils.current_device()
+    props = device_utils.get_device_properties(device)
     return str(props.uuid)
 
 

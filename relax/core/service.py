@@ -12,6 +12,7 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.distributed.ray.placement_group import InfoActor, sort_key
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url, recovery_load_path
 
@@ -295,7 +296,8 @@ class Service:
 
 def create_placement_group(num_gpus):
     """Create a placement group with the specified number of GPUs."""
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    accel_resource = device_utils.get_ray_accelerator_name()
+    bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
     ray.get(pg.ready())

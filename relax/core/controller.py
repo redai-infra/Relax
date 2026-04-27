@@ -16,6 +16,7 @@ from relax.components.genrm import register_genrm
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
+from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
@@ -238,7 +239,8 @@ class Controller:
             total_required = sum(num_gpus for _, _, num_gpus, _ in roles_to_create)
 
         cluster_resources = ray.cluster_resources()
-        total_available = int(cluster_resources.get("GPU", 0))
+        accel_resource = device_utils.get_ray_accelerator_name()
+        total_available = int(cluster_resources.get(accel_resource, 0))
 
         logger.info(
             f"Resource validation: required GPUs={total_required}, cluster GPUs={total_available}, colocate={colocate}"

@@ -20,6 +20,7 @@ from urllib3.exceptions import NewConnectionError
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.utils import device as device_utils
 from relax.utils.async_utils import run
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
@@ -42,10 +43,11 @@ def get_base_gpu_id(args, rank):
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_env = device_utils.get_visible_devices_env_var()
+    cvd = os.environ.get(visible_env)
     if not cvd:
         return physical_gpu_id  # no remapping
-    # CUDA_VISIBLE_DEVICES can be like "4,5,6,7"
+    # Visible devices can be like "4,5,6,7"
     visible = [int(x) for x in cvd.split(",") if x.strip() != ""]
     # In a remapped process, valid torch device indices are 0..len(visible)-1
     if physical_gpu_id in visible:
@@ -54,7 +56,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     if 0 <= physical_gpu_id < len(visible):
         return physical_gpu_id
     raise RuntimeError(
-        f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
+        f"Device id {physical_gpu_id} is not valid under {visible_env}={cvd}. "
         f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
     )
 

@@ -13,6 +13,8 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.utils import device as device_utils
+
 
 logger = logging.getLogger(__name__)
 
@@ -310,9 +312,9 @@ def get_data_from_transfer_queue(
         # will receive the real data via broadcast.
         rollout_data = [None, None]
 
-    # Use an explicit CUDA device so the communication backend (e.g. NCCL)
-    # can bind to a known CUDA context.
-    cuda_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    # Use an explicit device so the communication backend (e.g. NCCL)
+    # can bind to a known device context.
+    cuda_dev = device_utils.make_current_torch_device()
 
     # --- Extract rollout_routed_experts BEFORE broadcast_object_list ---
     # broadcast_object_list uses pickle for the entire payload. When
@@ -428,7 +430,7 @@ def post_process_rollout_data(args, rollout_data):
     # code in this module expects lists of sequence tensors for packing)
     from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
 
-    cuda_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    cuda_dev = device_utils.make_current_torch_device()
     rollout_data["tokens"] = [torch.tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
     rollout_data["loss_masks"] = [
         torch.tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]

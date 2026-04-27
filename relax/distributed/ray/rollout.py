@@ -23,6 +23,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.engine.rollout.base_types import call_rollout_fn
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import SLIME_HOST_IP_ENV, _wrap_ipv6, find_available_port, get_host_info, init_http_client
@@ -1425,7 +1426,8 @@ class RolloutManager(ReloadableMixin):
             per_replica_pgs = []
             for i in range(request.num_replicas):
                 num_gpus = gpus_per_engine
-                bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+                accel_resource = device_utils.get_ray_accelerator_name()
+                bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
                 pg = ray.util.placement_group(bundles, strategy="PACK")
                 per_replica_pgs.append(pg)
 
@@ -2065,13 +2067,14 @@ class RolloutManager(ReloadableMixin):
         )
 
         try:
+            dist_backend = device_utils.get_dist_backend()
             init_seed_ref = seed_engine.init_weights_send_group_for_remote_instance.remote(
                 master_address=master_address,
                 ports=ports_str,
                 group_rank=0,
                 world_size=2,
                 group_name=group_name,
-                backend="nccl",
+                backend=dist_backend,
             )
             init_new_ref = new_engine.init_weights_send_group_for_remote_instance.remote(
                 master_address=master_address,
@@ -2079,7 +2082,7 @@ class RolloutManager(ReloadableMixin):
                 group_rank=1,
                 world_size=2,
                 group_name=group_name,
-                backend="nccl",
+                backend=dist_backend,
             )
             init_results = await asyncio.wait_for(
                 asyncio.gather(init_seed_ref, init_new_ref),

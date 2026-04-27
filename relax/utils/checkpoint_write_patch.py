@@ -36,6 +36,7 @@ from time import time
 
 import torch
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 
 
@@ -245,10 +246,10 @@ def _patch_write_preloaded_data_multiproc():
         # cause SIGSEGV.  Use threaded parallel writes instead — all tensors
         # are already on CPU so the I/O releases the GIL and threads achieve
         # real parallelism without duplicating the CUDA context.
-        cuda_initialised = torch.cuda.is_available() and torch.cuda.is_initialized()
+        cuda_initialised = device_utils.is_available() and device_utils.is_initialized()
         if cuda_initialised:
             _logger.debug(
-                f"rank: {rank}, CUDA initialised – using threaded parallel "
+                f"rank: {rank}, device initialised – using threaded parallel "
                 f"(no-fork) checkpoint write for {len(write_buckets)} buckets"
             )
             write_results_or_exc = _write_buckets_threaded(transform_list, use_msc, write_buckets)
@@ -285,7 +286,7 @@ def _patch_temporal_async_caller():
         if async_req.async_fn is None:
             return  # nothing to do
 
-        cuda_initialised = torch.cuda.is_available() and torch.cuda.is_initialized()
+        cuda_initialised = device_utils.is_available() and device_utils.is_initialized()
         if not cuda_initialised:
             # CUDA not initialised — safe to use the original fork path.
             return _original_schedule(self, async_req)
@@ -301,7 +302,7 @@ def _patch_temporal_async_caller():
 
         rank = torch.distributed.get_rank()
         start_sync = time()
-        torch.cuda.synchronize()
+        device_utils.synchronize()
         end_sync = time()
         _logger.debug(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
 

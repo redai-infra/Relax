@@ -12,6 +12,7 @@ from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from torch.nn.utils.rnn import pad_sequence
 
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
@@ -173,7 +174,9 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=torch.cuda.current_device())
+            cu_seqlens = torch.tensor(
+                cu_seqlens_list, dtype=torch.int, device=device_utils.make_current_torch_device()
+            )
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
@@ -191,7 +194,9 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
+            cu_seqlens = (
+                torch.tensor(cu_seqlens, dtype=torch.int).to(device_utils.make_current_torch_device()) * cp_size
+            )
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         packed_seq_params = PackedSeqParams(
@@ -440,7 +445,9 @@ def get_data_iterator(
     # across DP ranks so that all ranks execute the same number of training steps
     # (required by collective operations in the training loop).
     if getattr(args, "balance_data", False):
-        steps_tensor = torch.tensor([num_steps_per_rollout], dtype=torch.int, device=torch.cuda.current_device())
+        steps_tensor = torch.tensor(
+            [num_steps_per_rollout], dtype=torch.int, device=device_utils.make_current_torch_device()
+        )
         dist.all_reduce(steps_tensor, op=dist.ReduceOp.MAX, group=dp_group)
         num_steps_per_rollout = steps_tensor.item()
 
@@ -472,7 +479,9 @@ def get_data_iterator(
                 get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
             )
 
-        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
+        num_microbatches = torch.tensor(
+            num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
+        )
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
 
         if vpp_size > 1:

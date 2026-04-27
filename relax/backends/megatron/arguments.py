@@ -5,6 +5,7 @@ from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from transformers import AutoConfig
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 
 
@@ -17,18 +18,17 @@ def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
 
-    import torch
-
-    if not torch.cuda.is_available():
+    if not device_utils.is_available():
         from unittest.mock import patch
 
-        class _CudaProperty:
+        class _DeviceProperty:
             major = 9
             minor = 0
 
+        device_name = device_utils.get_device_name()
         with (
-            patch("torch.cuda.get_device_properties", return_value=_CudaProperty()),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            patch(f"torch.{device_name}.get_device_properties", return_value=_DeviceProperty()),
+            patch(f"torch.{device_name}.get_device_capability", return_value=(9, 0)),
         ):
             _megatron_validate_args(args)
     else:

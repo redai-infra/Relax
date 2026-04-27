@@ -5,6 +5,7 @@ import gc
 import torch
 import torch.distributed as dist
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 
 
@@ -12,23 +13,23 @@ logger = get_logger(__name__)
 
 
 def clear_memory(clear_host_memory: bool = False):
-    torch.cuda.synchronize()
+    device_utils.synchronize()
     gc.collect()
-    torch.cuda.empty_cache()
+    device_utils.empty_cache()
     if clear_host_memory:
         torch._C._host_emptyCache()
 
 
 def available_memory():
-    device = torch.cuda.current_device()
-    free, total = torch.cuda.mem_get_info(device)
+    dev = device_utils.current_device()
+    free, total = device_utils.mem_get_info(dev)
     return {
-        "gpu": str(device),
+        "device": str(dev),
         "total_GB": _byte_to_gb(total),
         "free_GB": _byte_to_gb(free),
         "used_GB": _byte_to_gb(total - free),
-        "allocated_GB": _byte_to_gb(torch.cuda.memory_allocated(device)),
-        "reserved_GB": _byte_to_gb(torch.cuda.memory_reserved(device)),
+        "allocated_GB": _byte_to_gb(device_utils.memory_allocated(dev)),
+        "reserved_GB": _byte_to_gb(device_utils.memory_reserved(dev)),
     }
 
 

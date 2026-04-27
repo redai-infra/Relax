@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import print_memory
 
@@ -109,7 +110,16 @@ class _TorchMemoryProfiler(_BaseMemoryProfiler):
     def start(self):
         logger.info("Attach OOM dump memory history.")
 
-        torch.cuda.memory._record_memory_history(
+        # Memory snapshot APIs are currently CUDA-specific.
+        # On non-CUDA backends, log a warning and skip.
+        device_mod = device_utils.get_torch_device_module()
+        if not hasattr(device_mod, "memory"):
+            logger.warning(
+                f"Memory snapshot profiling is not supported on {device_utils.get_device_name()} backend, skipping."
+            )
+            return
+
+        device_mod.memory._record_memory_history(
             max_entries=1000000,
             # record stack information for the trace events
             # trace_alloc_record_context=True,
@@ -121,15 +131,22 @@ class _TorchMemoryProfiler(_BaseMemoryProfiler):
                 f"Observe OOM, will dump snapshot to {self._path_dump}. ({device=} {alloc=} {device_alloc=} {device_free=}; stacktrace is as follows)"
             )
             traceback.print_stack()
-            torch.cuda.memory._dump_snapshot(self._path_dump)
+            device_mod.memory._dump_snapshot(self._path_dump)
             print_memory("when oom")
 
-        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+        if hasattr(torch._C, "_cuda_attach_out_of_memory_observer"):
+            torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
     def stop(self):
         logger.info(f"Dump memory snapshot to: {self._path_dump}")
-        torch.cuda.memory._dump_snapshot(self._path_dump)
-        torch.cuda.memory._record_memory_history(enabled=None)
+        device_mod = device_utils.get_torch_device_module()
+        if not hasattr(device_mod, "memory"):
+            logger.warning(
+                f"Memory snapshot profiling is not supported on {device_utils.get_device_name()} backend, skipping."
+            )
+            return
+        device_mod.memory._dump_snapshot(self._path_dump)
+        device_mod.memory._record_memory_history(enabled=None)
 
 
 class _MemrayMemoryProfiler(_BaseMemoryProfiler):

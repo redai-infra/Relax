@@ -6,6 +6,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 # Get CUDA arch list
+# NOTE: This setup script is CUDA-only as it compiles .cu kernel files via CUDAExtension.
+# Non-CUDA backends (NPU, XPU, PPU) should provide their own kernel implementations.
 arch_list = []
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):

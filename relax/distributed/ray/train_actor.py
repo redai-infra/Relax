@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
+from relax.utils import device as device_utils
 from relax.utils.distributed_utils import init_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
@@ -20,7 +21,7 @@ logger = get_logger(__name__)
 
 
 def get_local_gpu_id():
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    cvd = os.environ.get(device_utils.get_visible_devices_env_var(), None)
     if cvd is None:
         return ray.get_gpu_ids()[0]
     else:
@@ -57,7 +58,7 @@ class TrainRayActor(RayActor):
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(f"cuda:{local_rank}")
+        device_utils.set_device(f"{device_utils.get_device_name()}:{local_rank}")
 
         backend = args.distributed_backend
 
@@ -70,27 +71,8 @@ class TrainRayActor(RayActor):
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()
 
-        try:
-            if torch.version.hip is not None:
-                logger.info("Detected ROCm/HIP environment, skipping NUMA affinity setup")
-                # will find the coresponding API to implement ROCm version as below
-            else:
-                import pynvml
-
-                pynvml.nvmlInit()
-
-                local_rank = int(os.environ["RANK"]) % args.num_gpus_per_node
-
-                handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
-                pynvml.nvmlDeviceSetCpuAffinity(handle)
-
-                logger.info(f"Set NUMA affinity for GPU {local_rank}")
-                pynvml.nvmlShutdown()
-
-        except ImportError:
-            logger.info("Warning: pynvml not available, skipping NUMA affinity setup")
-        except Exception as e:
-            logger.info(f"Warning: Failed to set NUMA affinity: {e}")
+        numa_local_rank = int(os.environ["RANK"]) % args.num_gpus_per_node
+        device_utils.set_numa_affinity(numa_local_rank)
 
     def clear_memory(self):
         print_memory("before TrainRayActor.clear_memory")

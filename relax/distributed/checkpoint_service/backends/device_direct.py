@@ -39,6 +39,7 @@ from relax.backends.megatron.weight_update.common import all_gather_param, named
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
+from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.logging_utils import get_logger
 
@@ -98,7 +99,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
-        self.device = next(model[0].parameters()).device if model else torch.cuda.current_device()
+        self.device = next(model[0].parameters()).device if model else device_utils.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
@@ -114,7 +115,7 @@ class DeviceDirectBackend(CommBackend):
 
         # Ray actors for rollout communication
         self.rollout_engines: Dict[int, Any] = {}  # rank -> Ray actor handle
-        torch.cuda.set_device(self.device)
+        device_utils.set_device(self.device)
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
@@ -804,7 +805,7 @@ class DeviceDirectBackend(CommBackend):
         # allocator keeps large reserved blocks that are internally
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
-        torch.cuda.empty_cache()
+        device_utils.empty_cache()
 
     def _update_weight_from_distributed(
         self,
