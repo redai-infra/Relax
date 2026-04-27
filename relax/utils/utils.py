@@ -58,8 +58,12 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     train_data["loss_masks"] = loss_masks
 
     # overwriting the raw reward
-    if samples[0].metadata and "raw_reward" in samples[0].metadata:
-        train_data["raw_reward"] = [sample.metadata["raw_reward"] for sample in samples]
+    # populate this field for a subset of samples (e.g. SWE but not code).
+    if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
+        train_data["raw_reward"] = [
+            sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
+            for sample in samples
+        ]
 
     # For rollout buffer
     if samples[0].metadata and "round_number" in samples[0].metadata:
@@ -75,7 +79,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
-    if samples[0].multimodal_train_inputs is not None:
+    if any(sample.multimodal_train_inputs is not None for sample in samples):
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
     if samples[0].teacher_log_probs is not None:
