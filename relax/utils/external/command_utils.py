@@ -11,8 +11,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from relax.utils.external.typer_utils import dataclass_cli
 from relax.utils.device_utils import detect_fast_interconnect
+from relax.utils.external.typer_utils import dataclass_cli
 from relax.utils.misc import exec_command
 
 

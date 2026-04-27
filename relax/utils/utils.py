@@ -280,7 +280,8 @@ def _find_interface_name_by_ip(addr: str) -> str | None:
 
 
 def _first_non_loopback_ipv4() -> tuple[str | None, str | None]:
-    """Return the first non-loopback interface/IP pair visible to the process."""
+    """Return the first non-loopback interface/IP pair visible to the
+    process."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         for _, iface_name in socket.if_nameindex():

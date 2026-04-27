@@ -21,7 +21,6 @@ from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
-from relax.utils.external.torch_memory_saver import torch_memory_saver
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (
@@ -30,6 +29,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.external.torch_memory_saver import torch_memory_saver
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups

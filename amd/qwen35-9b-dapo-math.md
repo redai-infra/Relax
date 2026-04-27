@@ -116,3 +116,63 @@ Qwen3-9B_mcore_8xgpu/        # created or reused for checkpoints
 Qwen3.5-9B DAPO-Math cannot currently be run to training on this ROCm image with only launch-script changes. The run reached Ray/Serve placement and model service initialization, then failed on missing Qwen3.5 backend support in Megatron/SGLang.
 
 For AMD validation now, use a supported Qwen3/Qwen3-MoE recipe first. For Qwen3.5 specifically, the next work item is model-backend integration rather than launch orchestration.
+
+## Follow-up Runner
+
+Added `amd/run_qwen35-9b.sh` as the one-command Qwen3.5-9B smoke runner:
+
+- Cleans stale Relax, Ray, SGLang, Megatron worker, and Ray dashboard/worker processes at startup.
+- Recreates `/tmp/ray-qwen35-9b` and starts a fresh local Ray head on `10.235.26.199:6380` with 8 GPUs.
+- Exports the ROCm TE debug settings validated in the Qwen3-4B run.
+- Aligns the direct runner with the Qwen3-4B ROCm fixes:
+  - `--attention-backend auto`
+  - `TORCHDYNAMO_DISABLE=1`
+  - `--disable-jit-fuser`
+  - `--train-env-vars '{"TORCHDYNAMO_DISABLE": "1"}'`
+
+Intended usage:
+
+```bash
+bash amd/run_qwen35-9b.sh
+```
+
+### 2026-04-27 Follow-up
+
+- Ran `bash amd/run_qwen35-9b.sh`.
+- The wrapper correctly restarted Ray with 8 GPUs and launched the direct runner with:
+  - `attention_backend=auto`
+  - `disable_jit_fuser=True`
+  - `train_env_vars={'TORCHDYNAMO_DISABLE': '1'}`
+- The run passed Ray/Serve startup and began deploying actor, rollout, reference, actor_fwd, and advantages services.
+- New root blocker:
+  - `ImportError: FLA is not installed. Please install it with pip install flash-linear-attention.`
+  - Raised while instantiating Megatron `GatedDeltaNet`, then `TransformerLayer`.
+  - This confirms Qwen3.5-9B requires FLA/GatedDeltaNet backend support before training can proceed.
+- Stopped the run after capturing the error to avoid Serve restart loops.
+- Checked SGLang's ROCm Dockerfile:
+  - It installs AITER, SGLang ROCm extras, `sgl-kernel`, TileLang, and related ROCm serving dependencies.
+  - It does not explicitly install `flash-linear-attention`.
+  - The missing FLA error is from Megatron's `GatedDeltaNet`, not directly from SGLang.
+- Installed `flash-linear-attention==0.5.0` in the current container and verified Megatron's required imports:
+  - `fla.modules.convolution.causal_conv1d`
+  - `fla.modules.l2norm.l2norm`
+  - `fla.ops.gated_delta_rule.chunk_gated_delta_rule`
+- Updated `docker/Dockerfile.rocm` to install ROCm TransformerEngine 2.4.0 wheels and `flash-linear-attention==0.5.0` for future images.
+- Reran after installing FLA:
+  - Megatron `GatedDeltaNet` initialization passed the previous FLA import blocker.
+  - Megatron actor/reference began loading the Qwen3.5 HF checkpoint.
+  - New rollout blocker: SGLang TP=2 tried to use device ordinal 1 while the Ray actor saw only `CUDA_VISIBLE_DEVICES='4'`.
+  - Changed the 9B smoke runner to `--rollout-num-gpus-per-engine 1` so the two rollout GPUs run as two 1-GPU SGLang engines for the next smoke attempt.
+- Reran with two 1-GPU rollout engines:
+  - The invalid device ordinal issue did not recur.
+  - All 5 services registered successfully.
+  - Actor, rollout, reference, actor_fwd, and advantages entered step 0.
+  - TE selected `FusedAttention backend (sub-backend 1)` for Megatron logprob/training.
+  - New blocker: one SGLang engine hit HIP OOM in logits allocation while full token usage reached ~1.0.
+  - This was with the original full-style rollout settings (`num_rollout=1000`, `rollout_batch_size=32`, `response_len=8192`).
+  - Changed the default 9B runner to a smaller smoke profile:
+    - `NUM_ROLLOUT=4`
+    - `--num-iters-per-train-update 2`
+    - `--rollout-batch-size 2`
+    - `--rollout-max-response-len 2048`
+    - `--global-batch-size 16`

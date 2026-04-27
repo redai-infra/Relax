@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 set -ex
 set -o pipefail
 

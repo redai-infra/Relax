@@ -176,7 +176,9 @@ def get_model_provider_func(
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
 
-        if getattr(args, "transformer_impl", None) == "local" and not getattr(provider, "restore_modelopt_state", False):
+        if getattr(args, "transformer_impl", None) == "local" and not getattr(
+            provider, "restore_modelopt_state", False
+        ):
             logger.info("Override provider.transformer_layer_spec to local_layer_spec for no-TE runtime")
             provider.transformer_layer_spec = local_layer_spec
             provider.use_transformer_engine_full_layer_spec = False

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-# Copyright (c) 2026 Relax Authors. All Rights Reserved.
-
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -9,8 +7,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 
 # Edit this block directly when changing the smoke configuration.
 export MODEL_DIR="${SCRIPT_DIR}/assets/exps"
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
-export NUM_GPUS="4"
+export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export NUM_GPUS="8"
 export MASTER_ADDR="10.235.26.199"
 export RAY_PORT="6380"
 export RAY_DASHBOARD_PORT="8266"
@@ -21,13 +19,13 @@ export RAY_OBJECT_MANAGER_PORT="6382"
 export RAY_RUNTIME_ENV_AGENT_PORT="6383"
 export RAY_DASHBOARD_AGENT_LISTEN_PORT="6384"
 export RAY_DASHBOARD_AGENT_GRPC_PORT="6385"
-export RAY_TMPDIR="/tmp/ray-qwen3-4b"
-export RELAX_SERVE_PORT="18081"
+export RAY_TMPDIR="/tmp/ray-qwen35-9b"
+export RELAX_SERVE_PORT="18080"
 export MEGATRON="/root/Megatron-LM/"
 export RELAX="${REPO_ROOT}"
-export RUN_ID="qwen3-4b-dapo-math-te-debug-$(date +%Y%m%d-%H%M%S)"
+export RUN_ID="qwen35-9b-dapo-math-te-debug-$(date +%Y%m%d-%H%M%S)"
 
-# Runtime diagnostics for the current ROCm TransformerEngine backend issue.
+# Keep the 9B smoke aligned with the verified 4B ROCm settings.
 export CUDA_DEVICE_MAX_CONNECTIONS="1"
 export NVTE_DEBUG="1"
 export NVTE_DEBUG_LEVEL="2"
@@ -58,7 +56,7 @@ cleanup_stale_processes() {
 
     sleep 3
 
-    if [[ "${RAY_TMPDIR}" == /tmp/ray-qwen3-4b* ]]; then
+    if [[ "${RAY_TMPDIR}" == /tmp/ray-qwen35-9b* ]]; then
         rm -rf "${RAY_TMPDIR}"
     fi
     mkdir -p "${RAY_TMPDIR}"
@@ -98,6 +96,6 @@ start_ray_head() {
 cleanup_stale_processes
 start_ray_head
 
-echo "=== Launching Qwen3-4B DAPO-Math direct runner ==="
+echo "=== Launching Qwen3.5-9B DAPO-Math direct runner ==="
 cd "${REPO_ROOT}"
-exec bash "${SCRIPT_DIR}/run-qwen3-4b-dapo-math-direct.sh"
+exec bash "${SCRIPT_DIR}/run-qwen35-9b-dapo-math-direct.sh"

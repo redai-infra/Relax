@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
     libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
     libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync \
-    locales tzdata jq git git-lfs ca-certificates && \
+    locales tzdata jq git git-lfs ca-certificates wget && \
     locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
@@ -87,6 +87,26 @@ RUN pip install -r /tmp/requirements-rocm.txt && \
 
 RUN pip install git+https://github.com/redai-infra/megatron-bridge.git@f13bec09 --no-build-isolation --no-deps --force-reinstall && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
+
+ARG TE_VERSION=2.4.0
+ARG TE_ROCM_RELEASE=rocm-rel-7.2
+
+# Megatron's TE spec needs ROCm TransformerEngine at runtime. Install the
+# ROCm manylinux wheels that match the ROCm 7.2 PyTorch base image.
+RUN mkdir -p /tmp/te-rocm && \
+    cd /tmp/te-rocm && \
+    wget -q "https://repo.radeon.com/rocm/manylinux/${TE_ROCM_RELEASE}/transformer_engine-${TE_VERSION}-py3-none-any.whl" && \
+    wget -q "https://repo.radeon.com/rocm/manylinux/${TE_ROCM_RELEASE}/transformer_engine_rocm-${TE_VERSION}-py3-none-manylinux_2_28_x86_64.whl" && \
+    wget -q "https://repo.radeon.com/rocm/manylinux/${TE_ROCM_RELEASE}/transformer_engine_torch-${TE_VERSION}.tar.gz" && \
+    pip install \
+        "./transformer_engine-${TE_VERSION}-py3-none-any.whl" \
+        "./transformer_engine_rocm-${TE_VERSION}-py3-none-manylinux_2_28_x86_64.whl" \
+        "./transformer_engine_torch-${TE_VERSION}.tar.gz" \
+        --no-build-isolation && \
+    rm -rf /tmp/te-rocm
+
+# Qwen3.5 GatedDeltaNet in Megatron imports the FLA Python package.
+RUN pip install flash-linear-attention==0.5.0
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 RUN cd /root/Megatron-LM && \
