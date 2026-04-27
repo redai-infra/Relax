@@ -1,0 +1,4 @@
+[submodule "third_party/TransformerEngine"]
+	path = third_party/TransformerEngine
+	url = https://github.com/ROCm/TransformerEngine.git
+	branch = dev

@@ -18,6 +18,10 @@ export RAY_ADDRESS="${RAY_ADDRESS:-10.235.26.199:6380}"
 export MASTER_ADDR="${MASTER_ADDR:-10.235.26.199}"
 export RELAX_SERVE_PORT="${RELAX_SERVE_PORT:-18081}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NVTE_DEBUG="${NVTE_DEBUG:-1}"
+export NVTE_DEBUG_LEVEL="${NVTE_DEBUG_LEVEL:-2}"
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
+export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export MEGATRON="${MEGATRON:-/root/Megatron-LM/}"
 export RELAX="${RELAX:-${REPO_ROOT}}"
 export PYTHONPATH="${RELAX}:${MEGATRON}:${RELAX}:${PYTHONPATH:-}"
@@ -108,9 +112,10 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --no-rope-fusion
-   --transformer-impl local
-   --attention-backend flash
+   --qkv-format bshd
+   --attention-backend auto
+   --disable-jit-fuser
+   --train-env-vars '{"TORCHDYNAMO_DISABLE": "1"}'
 )
 
 python3 -m relax.entrypoints.train \

@@ -34,8 +34,13 @@ def validate_args(args):
     else:
         _megatron_validate_args(args)
 
-    # always use varlen
-    args.variable_seq_lengths = True
+    # Packed varlen is the default for RL batches, but ROCm TE does not support
+    # the THD causal path used by that mode. Keep padded BSHD batches when
+    # explicitly requested for ROCm smoke/debug runs.
+    if getattr(args, "qkv_format", None) == "bshd":
+        args.variable_seq_lengths = False
+    else:
+        args.variable_seq_lengths = True
     if getattr(args, "moe_token_dispatcher_type", None) == "allgather":
         logger.info(
             "--moe-token-dispatcher-type allgather does not support variable sequence length, "

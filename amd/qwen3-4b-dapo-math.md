@@ -142,3 +142,117 @@ Verified:
   - This indicates a Megatron Bridge conversion mapping issue for Qwen3-4B under the no-TE local spec path.
 - Cleanup:
   - Stopped the independent 4-GPU Ray cluster.
+
+## ROCm TransformerEngine Submodule
+
+Added ROCm TransformerEngine as a submodule:
+
+```text
+third_party/TransformerEngine -> https://github.com/ROCm/TransformerEngine.git (branch: dev)
+```
+
+ROCm TE docs describe two install paths.
+
+Wheel install for ROCm 7.2:
+
+```bash
+wget -r -l1 -nd -A 'transformer_engine*' https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
+pip install ./transformer_engine* --no-build-isolation
+```
+
+Source install from the submodule:
+
+```bash
+cd third_party/TransformerEngine
+git submodule update --init --recursive
+export NVTE_FRAMEWORK=pytorch
+export NVTE_ROCM_ARCH=gfx950
+export NVTE_USE_ROCM=1
+pip install --no-build-isolation .
+```
+
+If the HIP compiler cannot detect the platform, also export:
+
+```bash
+export HIP_PLATFORM=amd
+```
+
+## Current Container TransformerEngine Install
+
+Installed ROCm TE wheels for ROCm 7.2 into the current container:
+
+```bash
+mkdir -p /tmp/te-rocm72
+cd /tmp/te-rocm72
+wget -r -l1 -nd -A 'transformer_engine*' https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
+pip install ./transformer_engine-2.4.0-py3-none-any.whl \
+  ./transformer_engine_rocm-2.4.0-py3-none-manylinux_2_28_x86_64.whl \
+  ./transformer_engine_torch-2.4.0.tar.gz \
+  --no-build-isolation
+```
+
+Verified:
+
+- `transformer_engine`: `2.4.0`
+- `transformer_engine_torch`: `2.4.0`
+- `transformer_engine.pytorch.LayerNormLinear`: available
+- `transformer_engine.pytorch.RMSNorm`: available
+- `transformer_engine.pytorch.DotProductAttention`: available
+
+After TE install, removed the no-TE runner flags:
+
+- `--no-rope-fusion`
+- `--transformer-impl local`
+- Reran Qwen3-4B with TE installed:
+  - Megatron Bridge mapping issue passed.
+  - `actor`, `actor_fwd`, `reference`, `rollout`, and `advantages` all registered successfully.
+  - Rollout completed and transferred data.
+  - Actor-to-rollout weight update completed.
+  - Training reached actor/reference log-prob and actor train step.
+- New blocker:
+  - `ValueError: No dot product attention backend is available for the provided inputs.`
+  - Raised from `transformer_engine.pytorch.attention.dot_product_attention.DotProductAttention.forward`.
+  - Reference service became unhealthy and triggered global restart.
+  - Next debugging direction: run with `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2` to see why TE disables all attention backends, or switch training attention backend away from TE fused attention for this smoke.
+- NVTE debug / static backend selection showed the likely backend issue:
+  - Current training args use `qkv_format=thd`.
+  - TE ROCm selector reports `thd_thd_thd + causal` has no backend.
+  - `thd` disables `UnfusedDotProductAttention`.
+  - `sbhd` / `bshd` layouts have available fused or unfused backends.
+  - Fix under test: set `--qkv-format bshd` in the 4B smoke runner.
+- Reran with `--qkv-format bshd`:
+  - The TE dot-product attention backend error did not recur during initial log-prob/training.
+  - All 5 services registered successfully.
+  - Rollout generation completed the first 16 samples and transferred rollout batches.
+  - Actor training entered `MegatronTrainRayActor.train_async`.
+  - Run was still active at the time of this note.
+- Adjusted `relax/backends/megatron/arguments.py` so `qkv_format=bshd` keeps `variable_seq_lengths=False`.
+- Reran `bshd + variable_seq_lengths=False`:
+  - CLI args confirmed `qkv_format=bshd` and `variable_seq_lengths=False`.
+  - This run ended early with Ray/GCS disconnect (`Failed to connect to GCS within 60 seconds`) before producing a useful training-side result.
+  - GPU utilization returned to 0% after cleanup.
+- Added temporary TransformerEngine attention diagnostics in the current container:
+  - `dot_product_attention/utils.py` now warns when backend selection ends in `NoBackend`, including `run_config` and backend candidates.
+  - `dot_product_attention/dot_product_attention.py` now logs q/k/v tensor metadata, qkv layout, mask type, sequence lengths, and selected backend flags before raising the `No dot product attention backend` error.
+  - The direct runner now defaults `NVTE_DEBUG=1`, `NVTE_DEBUG_LEVEL=2`, and `RAY_DEDUP_LOGS=0` so TE and Ray preserve the backend rejection details in logs.
+- Added `amd/run_qwen3-4b.sh` as the one-command smoke runner:
+  - Kills stale Relax, Ray, SGLang, Megatron worker, and Ray dashboard/worker processes at startup.
+  - Recreates `/tmp/ray-qwen3-4b` and starts a fresh local Ray head on `10.235.26.199:6380`.
+  - Exports all Qwen3-4B DAPO-Math, ROCm TE debug, Ray, and Serve settings before invoking `amd/run-qwen3-4b-dapo-math-direct.sh`.
+  - Intended usage: edit variables inside the script, then run `bash amd/run_qwen3-4b.sh`.
+- TE backend root cause from `qwen3-4b-dapo-math-te-debug-20260427-153023`:
+  - The launch used `--attention-backend flash`, and Megatron set `NVTE_FUSED_ATTN=0` plus `NVTE_UNFUSED_ATTN=0`.
+  - ROCm TE reported `flash_attn_version='not installed'`, so FlashAttention was unavailable.
+  - With fused/unfused forced off and flash missing, backend selection ended as `available_backends=[False, 0, 0]`.
+  - Changed the smoke runner to `--attention-backend auto` so TE can fall back to fused or unfused on ROCm.
+- Reran with `--attention-backend auto`:
+  - TE selected `FusedAttention backend (sub-backend 1)`.
+  - Step 0 and step 1 logprob/training passed the previous attention blocker.
+  - New blocker at step 2: TorchDynamo fake tensor failure in Megatron `fused_cross_entropy.py` (`torch.split(..., SymInt)`).
+  - Added `TORCHDYNAMO_DISABLE=1`, `--disable-jit-fuser`, and `--train-env-vars '{"TORCHDYNAMO_DISABLE": "1"}'` to avoid the Dynamo compiled fused CE path for ROCm smoke.
+- Reran with Dynamo/JIT fuser disabled:
+  - All 5 services registered successfully.
+  - TE selected `FusedAttention backend (sub-backend 1)`.
+  - Rollout, reference logprob, actor_fwd logprob, advantages, and actor training completed all 4 smoke steps.
+  - Checkpoint saved successfully at iteration 3 under `Qwen3-4B_mcore_4xgpu/`.
+  - Process exited with code 0.
