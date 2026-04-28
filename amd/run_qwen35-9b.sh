@@ -8,10 +8,98 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
 
+select_available_gpus() {
+    local min_free_vram_gb="$1"
+    local requested_gpus="${2:-}"
+
+    python3 - "${min_free_vram_gb}" "${requested_gpus}" <<'PY'
+import os
+import sys
+
+threshold_gb = float(sys.argv[1])
+threshold = threshold_gb * 1024**3
+requested = int(sys.argv[2]) if sys.argv[2] else None
+supported_counts = sorted(
+    int(item) for item in os.environ.get("QWEN35_SUPPORTED_GPU_COUNTS", "4,6,8").split(",") if item
+)
+if requested is not None and requested not in supported_counts:
+    print(
+        f"[qwen35-gpu-select] Requested {requested} GPUs, but supported profiles are {supported_counts}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+    os.environ.pop(key, None)
+
+import torch
+
+if not torch.cuda.is_available():
+    print("[qwen35-gpu-select] torch.cuda is not available", file=sys.stderr)
+    sys.exit(2)
+
+selected = []
+for index in range(torch.cuda.device_count()):
+    free_bytes, total_bytes = torch.cuda.mem_get_info(index)
+    free_gb = free_bytes / 1024**3
+    total_gb = total_bytes / 1024**3
+    print(
+        f"[qwen35-gpu-select] GPU {index}: free={free_gb:.1f}GB total={total_gb:.1f}GB",
+        file=sys.stderr,
+    )
+    if free_bytes >= threshold:
+        selected.append(str(index))
+
+if requested is None:
+    target = max((count for count in supported_counts if count <= len(selected)), default=0)
+else:
+    target = requested
+
+if target <= 0:
+    print(
+        f"[qwen35-gpu-select] Need at least {supported_counts[0]} GPUs with >= {threshold_gb:.1f}GB free, "
+        f"but only found {len(selected)}: {','.join(selected) or '<none>'}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+if len(selected) < target:
+    print(
+        f"[qwen35-gpu-select] Need {target} GPUs with >= {threshold_gb:.1f}GB free, "
+        f"but only found {len(selected)}: {','.join(selected) or '<none>'}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+print(
+    f"[qwen35-gpu-select] Selected {target} GPUs from {len(selected)} eligible GPUs "
+    f"(supported={supported_counts})",
+    file=sys.stderr,
+)
+print(",".join(selected[:target]))
+PY
+}
+
 # Edit this block directly when changing the smoke configuration.
 export MODEL_DIR="${SCRIPT_DIR}/assets/exps"
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-export NUM_GPUS="8"
+export QWEN35_SUPPORTED_GPU_COUNTS="${QWEN35_SUPPORTED_GPU_COUNTS:-4,8}"
+export QWEN35_MIN_FREE_VRAM_GB="${QWEN35_MIN_FREE_VRAM_GB:-200}"
+if [ -n "${QWEN35_VISIBLE_DEVICES:-}" ]; then
+    SELECTED_GPUS="${QWEN35_VISIBLE_DEVICES}"
+else
+    if ! SELECTED_GPUS="$(select_available_gpus "${QWEN35_MIN_FREE_VRAM_GB}" "${QWEN35_NUM_GPUS:-}")"; then
+        echo "=== Not enough free GPUs for Qwen3.5 smoke; exiting without starting Ray ==="
+        exit 0
+    fi
+fi
+export CUDA_VISIBLE_DEVICES="${SELECTED_GPUS}"
+unset HIP_VISIBLE_DEVICES
+unset ROCR_VISIBLE_DEVICES
+export NUM_GPUS="$(python3 - <<'PY'
+import os
+print(len([x for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",") if x]))
+PY
+)"
 export MASTER_ADDR="${MASTER_ADDR:-${DEFAULT_MASTER_ADDR:-127.0.0.1}}"
 export RAY_PORT="6380"
 export RAY_DASHBOARD_PORT="8266"
@@ -24,9 +112,45 @@ export RAY_DASHBOARD_AGENT_LISTEN_PORT="6384"
 export RAY_DASHBOARD_AGENT_GRPC_PORT="6385"
 export RAY_TMPDIR="/tmp/ray-qwen35-9b"
 export RELAX_SERVE_PORT="18080"
+export TENSORBOARD_DIR="${SCRIPT_DIR}/tensorboard/qwen35-9b"
 export MEGATRON="/root/Megatron-LM/"
 export RELAX="${REPO_ROOT}"
 export RUN_ID="qwen35-9b-dapo-math-te-debug-$(date +%Y%m%d-%H%M%S)"
+
+if [ "${NUM_GPUS}" -ge 8 ]; then
+    export ACTOR_GPUS="${ACTOR_GPUS:-4}"
+    export ACTOR_TP="${ACTOR_TP:-4}"
+    export ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+else
+    export ACTOR_GPUS="${ACTOR_GPUS:-1}"
+    export ACTOR_TP="${ACTOR_TP:-1}"
+    export ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
+fi
+export REFERENCE_GPUS="${REFERENCE_GPUS:-1}"
+export ACTOR_FWD_GPUS="${ACTOR_FWD_GPUS:-1}"
+if [ -n "${QWEN35_RESOURCE:-}" ]; then
+    export RELAX_RESOURCE="${QWEN35_RESOURCE}"
+else
+    RELAX_RESOURCE="$(
+        python3 - <<'PY'
+import json
+import os
+
+resource = {
+    "actor": [1, int(os.environ["ACTOR_GPUS"])],
+    "rollout": [1, int(os.environ["ROLLOUT_GPUS"])],
+    "reference": [1, int(os.environ["REFERENCE_GPUS"])],
+    "actor_fwd": [1, int(os.environ["ACTOR_FWD_GPUS"])],
+    "advantages": [1, 0],
+}
+print(json.dumps(resource))
+PY
+    )"
+    export RELAX_RESOURCE
+fi
+
+echo "=== Selected GPUs: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} ==="
+echo "=== Resource plan: NUM_GPUS=${NUM_GPUS}, ACTOR_GPUS=${ACTOR_GPUS}, ACTOR_TP=${ACTOR_TP}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, REFERENCE_GPUS=${REFERENCE_GPUS}, ACTOR_FWD_GPUS=${ACTOR_FWD_GPUS} ==="
 
 # Keep the 9B smoke aligned with the verified 4B ROCm settings.
 export CUDA_DEVICE_MAX_CONNECTIONS="1"

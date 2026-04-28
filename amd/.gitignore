@@ -1,4 +1,5 @@
 assets/
 runs/
 logs/
+tensorboard/
 *.log

@@ -193,3 +193,24 @@ bash amd/run_qwen35-9b.sh
   - New non-backend blocker: TransferQueue GRPO sampler rejected `batch_size=1` because it must be a multiple of `n_samples_per_prompt=2`.
   - Changed `--global-batch-size` to `4` while keeping `n_samples_per_prompt=2`.
 - Changed `--num-iters-per-train-update` to `1` so the actor training loop consumes a single rollout iteration in this tiny smoke profile.
+- Added TensorBoard metrics logging and dynamic GPU selection:
+  - TensorBoard runs under `amd/tensorboard/qwen35-9b`.
+  - Runner selects the largest supported free-GPU profile among `4,6,8`, based on free VRAM threshold.
+  - It exits cleanly without starting Ray if fewer than 4 eligible GPUs are available.
+- Reran with 6 eligible GPUs (`0,1,2,3,4,7`):
+  - Resource plan: actor 2 GPUs / rollout 2 GPUs / reference 1 GPU / actor_fwd 1 GPU.
+  - Services reached startup and step-0 execution.
+  - New blocker: DCS/NCCL timeout in `update_actor_pp_0` during actor weight synchronization (`BROADCAST` timeout).
+  - Need to validate 6-GPU DCS topology before using actor TP=2 as the default adaptive profile.
+- Decision: skip the 6-GPU profile for now. The adaptive runner now defaults to `4,8` only:
+  - 8 eligible GPUs -> actor 4 / rollout 2 / reference 1 / actor_fwd 1.
+  - 4 or 5 eligible GPUs -> actor 1 / rollout 1 / reference 1 / actor_fwd 1.
+  - fewer than 4 eligible GPUs -> exit without starting Ray.
+- Reran with the 4-GPU profile:
+  - Resource plan: actor 1 / rollout 1 / reference 1 / actor_fwd 1.
+  - TensorBoard adapter initialized successfully.
+  - All 5 services registered successfully.
+  - Rollout 0 completed and transferred a 2-sample batch.
+  - Actor/reference/actor_fwd entered step 0.
+  - New blocker: DCS/NCCL timeout still occurred in `update_actor_pp_0` during actor weight synchronization.
+  - This points to DCS weight sync/topology handling as the next debugging target.

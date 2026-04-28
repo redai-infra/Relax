@@ -30,6 +30,26 @@ export MEGATRON="${MEGATRON:-/root/Megatron-LM/}"
 export RELAX="${RELAX:-${REPO_ROOT}}"
 export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
 export MODEL_CONFIG_DIR="${MODEL_CONFIG_DIR:-${REPO_ROOT}/scripts/models}"
+if [ -z "${RELAX_RESOURCE:-}" ]; then
+    RELAX_RESOURCE="$(
+        python3 - <<'PY'
+import json
+
+print(
+    json.dumps(
+        {
+            "actor": [1, 4],
+            "rollout": [1, 2],
+            "reference": [1, 1],
+            "actor_fwd": [1, 1],
+            "advantages": [1, 0],
+        }
+    )
+)
+PY
+    )"
+    export RELAX_RESOURCE
+fi
 
 source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 
@@ -78,7 +98,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size ${ACTOR_TP:-4}
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -122,7 +142,7 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=(
-   --use-clearml
+   --use-tensorboard
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
    --tb-experiment-name qwen35-9B-8x-direct-${now}
@@ -139,7 +159,7 @@ MISC_ARGS=(
 )
 
 python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}' \
+   --resource "${RELAX_RESOURCE}" \
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 1 \
