@@ -151,6 +151,6 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     rm sglang.patch; \
 fi
 
-WORKDIR /root/Relax
-COPY . .
-RUN pip install -e . --no-deps
+WORKDIR /root/
+# COPY . .
+# RUN pip install -e . --no-deps
