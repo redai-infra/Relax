@@ -4,29 +4,90 @@ A practical guide to maximizing training throughput in Relax. All parameters men
 
 ---
 
-## Profiling Training Performance
+## Profiling
 
-Before tuning, identify the bottleneck. Relax integrates PyTorch Profiler to generate TensorBoard-compatible traces.
+Before tuning, identify the bottleneck. Relax provides three complementary profiling tools that cover **inference engine**, **training backend**, and **GPU memory**. All trace files are saved under `traces/<tb_experiment_name>/` by default, separated by subdirectory:
 
-### Enabling the Profiler
+| Tool | Target | Default Output Directory | Viewer |
+|---|---|---|---|
+| SGLang Profiling | CUDA kernel / operator analysis for rollout inference | `traces/<tb_experiment_name>/sglang_trace/` | TensorBoard or `https://ui.perfetto.dev/` |
+| Training Profiling | Operator analysis for Actor training / log-probs computation | `traces/<tb_experiment_name>/train_trace/` | TensorBoard or `https://ui.perfetto.dev/` |
+| Memory Profiling | GPU memory allocation history, OOM diagnosis | `traces/<tb_experiment_name>/memory_snapshot/` | [PyTorch Memory Viz](https://pytorch.org/memory_viz) |
 
-The profiler is controlled by `--profile-step-start` and `--profile-step-end` (Megatron native parameters) together with `--profile-target`:
+### Trace File Naming
+
+- **Training traces** include `rank{global}_dp{dp}_tp{tp}_pp{pp}` in filenames, e.g. `train_overall_rank0_dp0_tp0_pp0.1713780123.pt.trace.json.gz`
+- **Memory snapshots** also include rank tags, e.g. `memory_snapshot_time1713780123_rank0_dp0_tp0_pp0_snapshot.pickle`
+- **SGLang traces** use `engine{i}` prefix to distinguish engine instances, e.g. `engine0-1713780123-TP-0.trace.json.gz`
+
+### 1. SGLang Inference Profiling
+
+Runs `torch.profiler` on all SGLang engines during rollout via the `/start_profile` and `/stop_profile` HTTP APIs. Does not interfere with training-side profiling.
+
+**Example usage** — profile every rollout step:
 
 ```bash
 python3 relax/entrypoints/train.py \
-    --profile-target train_overall \
-    --profile-step-start 2 \
-    --profile-step-end 4 \
-    --use-tensorboard \
-    --tb-project-name /path/to/tb_logs \
+    --sglang-profile \
+    --tb-experiment-name my-experiment \
     # ... other args
 ```
 
-You can specify multiple targets: `--profile-target train_overall train_actor train_log_probs`.
+**Selective step range** — only profile steps 2, 3, 4 (start/end are both inclusive; recommended to avoid excessive trace files):
 
-### Profiler Detail Flags
+```bash
+python3 relax/entrypoints/train.py \
+    --sglang-profile \
+    --sglang-profile-step-start 2 \
+    --sglang-profile-step-end 4 \
+    --tb-experiment-name my-experiment \
+    # ... other args
+```
 
-Three flags control what additional information the profiler records:
+You can also use `--sglang-profile-steps` to specify a non-contiguous list (takes precedence over start/end):
+
+```bash
+--sglang-profile-steps 2 5 10
+```
+
+All step parameters use **absolute rollout IDs** (0-indexed), i.e., step 0, step 1, ... regardless of `--start-rollout-id`.
+
+**Advanced parameters**:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--sglang-profile-step-start` | None | Start of the profiling rollout step range (**inclusive**, 0-indexed) |
+| `--sglang-profile-step-end` | None | End of the profiling rollout step range (**inclusive**, 0-indexed). E.g. start=2, end=4 profiles steps 2, 3, 4 |
+| `--sglang-profile-steps` | None | Non-contiguous step list; takes precedence over start/end |
+| `--sglang-profile-num-steps` | 3 | Number of SGLang forward steps to profile per rollout. -1 profiles the entire rollout step |
+| `--sglang-profile-activities` | CPU GPU | Activities to profile |
+| `--sglang-profile-by-stage` | False | Profile prefill / decode stages separately |
+| `--sglang-profile-with-stack` | False | Record Python call stacks |
+| `--sglang-profile-record-shapes` | False | Record tensor shape information |
+| `--sglang-profile-output-dir` | None | Custom output directory. Defaults to `traces/<tb_experiment_name>/sglang_trace` |
+
+### 2. Training Profiling (PyTorch Profiler)
+
+Profiles Actor training steps using `torch.profiler`, producing TensorBoard-compatible trace files.
+
+**Example usage** — profile steps 2, 3, 4 (start/end are both inclusive):
+
+```bash
+python3 relax/entrypoints/train.py \
+    --use-pytorch-profiler \
+    --profile-step-start 2 \
+    --profile-step-end 4 \
+    --tb-experiment-name my-experiment \
+    # ... other args
+```
+
+::: tip
+`--profile-step-start` and `--profile-step-end` are both **inclusive** and represent **step offsets** from the current training launch, not absolute rollout IDs. The counter resets on checkpoint resumption. E.g. start=2, end=4 profiles steps 2, 3, 4 (3 steps).
+
+Same inclusive semantics as `--sglang-profile-step-start/end`.
+:::
+
+**Detail flags**:
 
 | Flag | Effect |
 |---|---|
@@ -34,18 +95,18 @@ Three flags control what additional information the profiler records:
 | `--profile-with-memory` | Track CUDA memory allocations/deallocations in the trace. Helps find memory spikes |
 | `--profile-with-flops` | Estimate FLOPs for each operator. Useful for calculating hardware utilization (MFU) |
 
-Example with all detail flags:
+**Full example**:
 
 ```bash
 python3 relax/entrypoints/train.py \
+    --use-pytorch-profiler \
     --profile-target train_overall \
     --profile-step-start 2 \
     --profile-step-end 4 \
     --profile-with-stack \
     --profile-with-memory \
     --profile-with-flops \
-    --use-tensorboard \
-    --tb-project-name /path/to/tb_logs \
+    --tb-experiment-name my-experiment \
     # ... other args
 ```
 
@@ -53,10 +114,76 @@ python3 relax/entrypoints/train.py \
 Enabling `--profile-with-stack` and `--profile-with-memory` adds overhead. Use them for diagnostic runs, not for production training.
 :::
 
-View the trace in TensorBoard:
+### 3. GPU Memory Profiling
+
+Records CUDA memory allocation/deallocation history for diagnosing memory leaks and OOM issues. Automatically dumps a memory snapshot on OOM.
+
+**Minimal usage** — enable recording and proactively dump after step 2:
 
 ```bash
-tensorboard --logdir /path/to/tb_logs
+python3 relax/entrypoints/train.py \
+    --record-memory-history \
+    --memory-snapshot-num-steps 2 \
+    --tb-experiment-name my-experiment \
+    # ... other args
+```
+
+**Advanced parameters**:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--memory-snapshot-path` | snapshot.pickle | Snapshot filename suffix |
+| `--memory-snapshot-dir` | None | Custom output directory. Defaults to `traces/<tb_experiment_name>/memory_snapshot` |
+| `--memory-snapshot-num-steps` | None | Proactively dump a snapshot after the specified number of steps (0-indexed; setting 3 dumps after step 2) |
+| `--memory-recorder` | torch | Backend: `torch` (PyTorch built-in) or `memray` (requires `pip install memray`) |
+
+View snapshots: visit [PyTorch Memory Viz](https://pytorch.org/memory_viz) and drag in the generated `.pickle` file.
+
+### Combined Usage
+
+In practice, all three profiling tools can be enabled simultaneously for a comprehensive view. Here is a complete combined example:
+
+```bash
+python3 relax/entrypoints/train.py \
+    # --- SGLang Inference Profiling ---
+    --sglang-profile \
+    --sglang-profile-step-start 2 \
+    --sglang-profile-step-end 4 \
+    # --- Training Profiling ---
+    --use-pytorch-profiler \
+    --profile-step-start 2 \
+    --profile-step-end 4 \
+    # --- Memory Profiling ---
+    --record-memory-history \
+    --memory-snapshot-num-steps 2 \
+    # --- Experiment name (determines trace output directory) ---
+    --tb-experiment-name my-profiling-run \
+    # ... other training args
+```
+
+The above configuration produces the following directory structure:
+
+```
+traces/my-profiling-run/
+├── sglang_trace/                          # SGLang engine traces (subdirectory per rollout step)
+│   ├── rollout_2/
+│   │   ├── engine0-...-TP-0.trace.json.gz
+│   │   ├── engine0-...-TP-1.trace.json.gz
+│   │   ├── engine1-...-TP-0.trace.json.gz
+│   │   └── ...
+│   ├── rollout_3/
+│   │   └── ...
+│   └── rollout_4/
+│       ├── engine0-...-TP-0.trace.json.gz
+│       └── ...
+├── train_trace/                           # Training traces
+│   ├── train_overall_rank0_dp0_tp0_pp0.....pt.trace.json.gz
+│   ├── train_overall_rank1_dp0_tp1_pp0.....pt.trace.json.gz
+│   └── ...
+└── memory_snapshot/                       # Memory snapshots
+    ├── memory_snapshot_time..._rank0_dp0_tp0_pp0_snapshot.pickle
+    ├── memory_snapshot_time..._rank1_dp0_tp1_pp0_snapshot.pickle
+    └── ...
 ```
 
 ---

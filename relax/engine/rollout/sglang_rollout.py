@@ -36,6 +36,7 @@ from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for
 from relax.utils.http_utils import get, post
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
+from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.timer import Timer
 from relax.utils.training.eval_config import EvalDatasetConfig
 from relax.utils.training.train_dump_utils import save_debug_rollout_data
@@ -117,12 +118,16 @@ class GenerateState(metaclass=SingletonMeta):
         )  # tasks that should not be aborted (abort_count >= partial_rollout_max_aborted_count)
         self.aborted = False
         self.evaluating = getattr(self, "evaluating", 0)  # preserve eval state across resets
+        # Pre-fetched data ObjectRef for cross-step overlap.
+        # Persisted across reset() calls so the ref submitted at the end of
+        # step N is consumed at the beginning of step N+1.
+        if not hasattr(self, "prefetched_samples_ref"):
+            self.prefetched_samples_ref: ray.ObjectRef | None = None
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
         for group in samples:
             task = asyncio.create_task(
-                # submit a group of samples as a single task.
                 generate_and_rm_group(
                     self.args,
                     group,
@@ -260,7 +265,16 @@ async def generate(
 
     _t_mm_encode: float | None = None
     if sample.multimodal_inputs:
-        encoded_mm, _t_mm_encode = await _encode_multimodal_inputs(sample.multimodal_inputs)
+        # Use pre-encoded data from group-level de-dup if available; otherwise encode inline.
+        pre_encoded = getattr(sample, "_pre_encoded_mm", None)
+        if pre_encoded is not None:
+            encoded_mm = pre_encoded
+            _t_mm_encode = getattr(sample, "_pre_encoded_mm_elapsed", 0.0)
+            del sample._pre_encoded_mm
+            if hasattr(sample, "_pre_encoded_mm_elapsed"):
+                del sample._pre_encoded_mm_elapsed
+        else:
+            encoded_mm, _t_mm_encode = await _encode_multimodal_inputs(sample.multimodal_inputs)
         payload.update(encoded_mm)
 
     # Use existing tokens for multi-turn or tokenize the new prompt
@@ -486,6 +500,17 @@ async def generate_and_rm_group(
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
+    # Group-level multimodal encoding de-duplication: when samples in the same
+    # group share the same multimodal_inputs object (e.g. after shallow-copy in
+    # data_source), encode once and attach the result to every sample so that
+    # generate() picks up the pre-encoded data instead of re-encoding per sample.
+    first_mm = getattr(group[0], "multimodal_inputs", None)
+    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+        encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
+        for sample in group:
+            sample._pre_encoded_mm = encoded_mm
+            sample._pre_encoded_mm_elapsed = t_enc
+
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
@@ -616,6 +641,9 @@ async def generate_rollout_async(
 
     state = GenerateState(args)
 
+    # Start SGLang profiling if enabled
+    await start_sglang_profile(args, rollout_id)
+
     # instantiate data filters
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
@@ -636,10 +664,21 @@ async def generate_rollout_async(
     total_transfer_samples = 0
     get_samples_times: list[float] = []
 
+    loop = asyncio.get_running_loop()
+
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             _t_get_samples = monotonic()
-            samples = ray.get(data_source.get_samples.remote(args.over_sampling_batch_size, args.fully_async))
+
+            if state.prefetched_samples_ref is not None:
+                ref = state.prefetched_samples_ref
+                state.prefetched_samples_ref = None
+                logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
+            else:
+                ref = data_source.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
+
+            samples = await loop.run_in_executor(None, ray.get, ref)
+
             get_samples_times.append(monotonic() - _t_get_samples)
             num_old_samples = len(samples) - args.over_sampling_batch_size
             logger.info(
@@ -761,11 +800,19 @@ async def generate_rollout_async(
             f"Total yielded: {total_transfer_samples - num_old_samples}/{target_data_size - num_old_samples} for step: {rollout_id}"
         )
 
+    if not args.fully_async:
+        state.prefetched_samples_ref = data_source.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
+        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
+
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
         await asyncio.gather(*transfer_tasks)
     pbar.close()
+
+    # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
+    await stop_sglang_profile(args, rollout_id)
+
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",

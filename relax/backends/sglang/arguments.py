@@ -105,6 +105,86 @@ def add_sglang_arguments(parser):
     parser.set_defaults(router_balance_abs_threshold=10, router_balance_rel_threshold=1.2)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
 
+    # SGLang profiling arguments — triggers /start_profile and /stop_profile HTTP API
+    # on all SGLang engines during rollout inference.
+    # Can also be used standalone via: python tools/profile_rollout.py
+    parser.add_argument(
+        "--sglang-profile",
+        action="store_true",
+        default=False,
+        help="Enable torch profiling on SGLang engines during rollout. Profile traces will be saved per rollout step.",
+    )
+    parser.add_argument(
+        "--sglang-profile-output-dir",
+        type=str,
+        default=None,
+        help=("Output directory for SGLang profile traces. Defaults to traces/<tb_experiment_name>/sglang_trace."),
+    )
+    parser.add_argument(
+        "--sglang-profile-num-steps",
+        type=int,
+        default=3,
+        help="Number of SGLang forward steps to profile per rollout. "
+        "If -1, profiles the entire rollout step until stop_profile is called.",
+    )
+    parser.add_argument(
+        "--sglang-profile-activities",
+        type=str,
+        nargs="+",
+        default=["CPU", "GPU"],
+        help="Activities to profile (e.g., CPU GPU).",
+    )
+    parser.add_argument(
+        "--sglang-profile-by-stage",
+        action="store_true",
+        default=False,
+        help="Profile by stage (prefill/decode) separately.",
+    )
+    parser.add_argument(
+        "--sglang-profile-with-stack",
+        action="store_true",
+        default=False,
+        help="Record call stack in profile traces.",
+    )
+    parser.add_argument(
+        "--sglang-profile-record-shapes",
+        action="store_true",
+        default=False,
+        help="Record tensor shapes in profile traces.",
+    )
+    parser.add_argument(
+        "--sglang-profile-steps",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "List of absolute rollout step IDs (0-indexed) at which to enable SGLang profiling. "
+            "Takes precedence over --sglang-profile-step-start/end when set. "
+            "Example: --sglang-profile-steps 3 10 50"
+        ),
+    )
+    parser.add_argument(
+        "--sglang-profile-step-start",
+        type=int,
+        default=None,
+        help=(
+            "Start of the rollout step range for SGLang profiling (inclusive, 0-indexed). "
+            "Used together with --sglang-profile-step-end to specify a contiguous range. "
+            "Ignored if --sglang-profile-steps is set."
+        ),
+    )
+    parser.add_argument(
+        "--sglang-profile-step-end",
+        type=int,
+        default=None,
+        help=(
+            "End of the rollout step range for SGLang profiling (inclusive, 0-indexed). "
+            "Used together with --sglang-profile-step-start to specify a contiguous range. "
+            "Ignored if --sglang-profile-steps is set. "
+            "Example: --sglang-profile-step-start 2 --sglang-profile-step-end 4 profiles steps 2, 3, 4."
+        ),
+    )
+
     old_add_argument = parser.add_argument
 
     skipped_args = [

@@ -74,11 +74,8 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   # qwen3.5 only
-   --qkv-format bshd
-   --micro-batch-size 1
    #--micro-batch-size 16 # avoid OOM
-   # --use-dynamic-batch-size
+   --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 
    --no-rope-fusion

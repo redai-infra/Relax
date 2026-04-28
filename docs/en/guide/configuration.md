@@ -88,6 +88,9 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--rollout-seed` | int | 42 | Random seed for Rollout, used for shuffling prompts and random sampling |
 | `--use-streaming-dataset` | flag | False | Use streaming dataset to save memory |
 | `--streaming-buffer-size` | int | 10000 | Buffer size for streaming dataset |
+| `--prefetch-chunk-size` | int | 32 | Number of samples to dispatch to the thread-pool in each prefetch round. Larger values increase throughput but also memory pressure. Only effective when `--use-streaming-dataset` is set and the dataset contains multimodal data |
+| `--prefetch-max-cached` | int | 256 | Maximum number of pre-loaded samples kept in the prefetch cache. When the cache is full the background prefetch thread pauses until consumers free space. Set to 0 to disable prefetching. Only effective when `--use-streaming-dataset` is set and the dataset contains multimodal data |
+| `--prefetch-num-workers` | int | 1 | Number of parallel worker threads inside the prefetch buffer for I/O-bound media decoding (video/image). Set to 1 to serialise all decoding (safest for FFmpeg which is not fully thread-safe). Higher values increase parallelism but may trigger EAGAIN errors on some platforms. Only effective when prefetching is enabled |
 | `--data-source-path` | str | `relax.engine.rollout.data_source.RolloutDataSourceWithBuffer` | Rollout data source class path |
 | `--start-rollout-id` | int | None | Starting Rollout step. If not set, attempts to read from checkpoint specified by `--load` |
 
@@ -168,6 +171,16 @@ For more parameters, refer to SGLang official documentation.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--sglang-mem-fraction-static` | float | - | SGLang static memory allocation ratio |
+| `--sglang-profile` | flag | False | Enable torch profiling on SGLang engines during rollout. Profile traces will be saved per rollout step |
+| `--sglang-profile-steps` | int (list) | None | List of absolute rollout step IDs (0-indexed) at which to enable SGLang profiling. Takes precedence over `--sglang-profile-step-start/end`. Example: `--sglang-profile-steps 3 10 50` |
+| `--sglang-profile-step-start` | int | None | Start of the rollout step range for SGLang profiling (**inclusive**, 0-indexed). Used with `--sglang-profile-step-end` to specify a contiguous range. Ignored if `--sglang-profile-steps` is set |
+| `--sglang-profile-step-end` | int | None | End of the rollout step range for SGLang profiling (**inclusive**, 0-indexed). Used with `--sglang-profile-step-start` to specify a contiguous range. Ignored if `--sglang-profile-steps` is set. E.g. start=2, end=4 profiles steps 2, 3, 4 |
+| `--sglang-profile-output-dir` | str | None | Output directory for SGLang profile traces. Defaults to `traces/<tb_experiment_name>/sglang_trace` |
+| `--sglang-profile-num-steps` | int | 3 | Number of SGLang forward steps to profile per rollout. -1 profiles the entire rollout step until `stop_profile` is called |
+| `--sglang-profile-activities` | str (list) | ["CPU", "GPU"] | Activities to profile (e.g., `CPU GPU`) |
+| `--sglang-profile-by-stage` | flag | False | Profile by stage (prefill/decode) separately |
+| `--sglang-profile-with-stack` | flag | False | Record call stack in profile traces |
+| `--sglang-profile-record-shapes` | flag | False | Record tensor shapes in profile traces |
 
 ### Custom Rollout Functions
 
@@ -498,7 +511,9 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 
 ---
 
-## Debug Parameters
+## Debug & Profiling Parameters
+
+### Debug
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -510,14 +525,33 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 | `--save-debug-train-data` | str | None | Save training data. Path supports `{rollout_id}` placeholder |
 | `--dump-details` | str | None | Export all training details for post-hoc analysis |
 | `--check-weight-update-equal` | flag | False | Check if weight updates are equal |
-| `--memory-snapshot-dir` | str | . | Memory snapshot directory |
-| `--memory-snapshot-num-steps` | int | None | Memory snapshot steps |
+| `--enable-cuda-memory-check` | flag | False | Enable memory check around low-level NCCL communication calls. Logs available GPU memory before each collective and attaches memory info to exceptions on failure |
+
+### Training Performance Profiling
+
+These parameters control the PyTorch Profiler for training steps. Trace files are saved to `traces/<tb_experiment_name>/train_trace/` by default.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--use-pytorch-profiler` | flag | False | Enable PyTorch's built-in profiler to record CUDA kernels, CPU ops, and communication during training (from Megatron) |
+| `--profile-step-start` | int | 10 | Step offset at which to start profiling (**inclusive**, from Megatron). Counts from 0 since the current training launch, not absolute rollout ID; resets on checkpoint resumption |
+| `--profile-step-end` | int | 12 | Step offset at which to stop profiling (**inclusive**, from Megatron). Same counting semantics as above. E.g. start=10, end=12 profiles steps 10, 11, 12 (3 steps) |
 | `--profile-target` | str (list) | train_overall | Profiling targets: `train_overall`, `train_actor`, `train_log_probs` |
 | `--profile-with-stack` | flag | False | Record stack information in profiler traces |
 | `--profile-with-memory` | flag | False | Record memory information in profiler traces |
 | `--profile-with-flops` | flag | False | Estimate FLOPs in profiler traces |
-| `--memory-recorder` | str | torch | Memory recorder: `torch`, `memray` |
-| `--enable-cuda-memory-check` | flag | False | Enable memory check around low-level NCCL communication calls. Logs available GPU memory before each collective and attaches memory info to exceptions on failure |
+
+### GPU Memory Profiling
+
+These parameters control GPU memory snapshot collection for diagnosing memory leaks and OOM issues. Snapshot files can be viewed with PyTorch Memory Viz tools (`torch.cuda.memory._viz`).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--record-memory-history` | flag | False | Enable CUDA memory allocation history recording (from Megatron). Records call stacks and tensor info for each allocation/deallocation, and auto-dumps a snapshot on OOM |
+| `--memory-snapshot-path` | str | snapshot.pickle | Memory snapshot filename (from Megatron) |
+| `--memory-snapshot-dir` | str | None | Memory snapshot output directory. Defaults to `traces/<tb_experiment_name>/memory_snapshot` |
+| `--memory-snapshot-num-steps` | int | None | Proactively dump a memory snapshot after the specified number of steps (0-indexed, i.e., setting 3 means dump after step 2) |
+| `--memory-recorder` | str | torch | Memory recorder backend: `torch` (PyTorch built-in), `memray` (requires `pip install memray`) |
 
 ### Network
 

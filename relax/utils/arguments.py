@@ -682,6 +682,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=10000,
                 help="Buffer size for streaming dataset.",
             )
+            parser.add_argument(
+                "--prefetch-chunk-size",
+                type=int,
+                default=32,
+                help="Number of samples to dispatch to the thread-pool in each prefetch round. "
+                "Larger values increase throughput but also memory pressure. Only effective when "
+                "--use-streaming-dataset is set and the dataset contains multimodal data.",
+            )
+            parser.add_argument(
+                "--prefetch-max-cached",
+                type=int,
+                default=256,
+                help="Maximum number of pre-loaded samples kept in the prefetch cache. "
+                "When the cache is full the background prefetch thread pauses until consumers "
+                "free space. Set to 0 to disable prefetching. Only effective when "
+                "--use-streaming-dataset is set and the dataset contains multimodal data.",
+            )
+            parser.add_argument(
+                "--prefetch-num-workers",
+                type=int,
+                default=1,
+                help="Number of parallel worker threads inside the prefetch buffer for "
+                "I/O-bound media decoding (video/image). Set to 1 to serialise all "
+                "decoding (safest for FFmpeg which is not fully thread-safe). "
+                "Higher values increase parallelism but may trigger EAGAIN errors "
+                "on some platforms. Only effective when prefetching is enabled.",
+            )
             # TODO: maybe add an num_epoch and calculate the num_rollout from buffer
             parser.add_argument(
                 "--num-rollout",
@@ -816,7 +843,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "for true parallelism without GIL contention."
                 ),
             )
-
             parser.add_argument("--metadata-key", type=str, default="metadata", help="JSON dataset key")
             parser.add_argument(
                 "--tool-key",
@@ -1531,12 +1557,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--memory-snapshot-dir",
                 type=str,
-                default=".",
+                default=None,
+                help=("Directory for memory snapshot dumps. Defaults to traces/<tb_experiment_name>/memory_snapshot."),
             )
             parser.add_argument(
                 "--memory-snapshot-num-steps",
                 type=int,
                 default=None,
+                help="Number of rollout steps after which to dump the memory snapshot. "
+                "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
             )
             parser.add_argument(
                 "--profile-target",
