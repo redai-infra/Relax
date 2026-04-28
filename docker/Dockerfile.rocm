@@ -4,6 +4,9 @@ ARG NO_PROXY
 ARG BASE_IMAGE=rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
 ARG GPU_ARCH=gfx950
 ARG PYTORCH_ROCM_ARCH="gfx942;gfx950"
+ARG AITER_REPO=https://github.com/ROCm/aiter.git
+ARG AITER_COMMIT=v0.1.11.post1
+ARG AITER_GPU_ARCHS="gfx942;gfx950"
 ARG TRAIN_IMAGE=train
 
 FROM ${BASE_IMAGE} AS base
@@ -47,6 +50,9 @@ RUN mkdir -p /sgl-workspace && \
 FROM base AS sglang
 
 ARG GPU_ARCH
+ARG AITER_REPO
+ARG AITER_COMMIT
+ARG AITER_GPU_ARCHS
 
 WORKDIR /sgl-workspace/sglang
 
@@ -58,6 +64,19 @@ RUN python -m pip install --upgrade pip setuptools wheel setuptools_scm scikit-b
     cp pyproject_rocm.toml pyproject.toml && \
     SGL_KERNEL_ARCH="${GPU_ARCH%%-*}" && \
     AMDGPU_TARGET="${SGL_KERNEL_ARCH}" python setup_rocm.py install
+
+# AITER kernels are needed by SGLang's ROCm runtime. Build both MI300 and
+# MI350 targets by default so one image can run on gfx942 and gfx950 hosts.
+RUN python -m pip uninstall -y aiter amd-aiter && \
+    python -m pip install flydsl==0.0.1.dev95158637 psutil pybind11 && \
+    cd /sgl-workspace && \
+    git clone "${AITER_REPO}" aiter && \
+    cd aiter && \
+    git checkout "${AITER_COMMIT}" && \
+    git submodule update --init --recursive && \
+    sed -i '459 s/if.*:/if False:/' aiter/ops/triton/attention/pa_mqa_logits.py && \
+    sed -i '/c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)/i\    config = dict(config)' aiter/ops/triton/gemm/fused/fused_gemm_afp4wfp4_split_cat.py && \
+    PREBUILD_KERNELS=1 GPU_ARCHS="${AITER_GPU_ARCHS}" python setup.py develop
 
 # SGLang keeps ROCm-specific dependency metadata in pyproject_other.toml.
 # Installing the CUDA-default pyproject would pull cu12 wheels into the image.

@@ -107,6 +107,8 @@ class DeviceDirectBackend(CommBackend):
 
         # For recv, we need to know tensor shapes in advance or use a metadata channel
         self._pending_recvs: Dict[str, asyncio.Future] = {}
+        self._group_name: Optional[str] = None
+        self._rollout_group_generation = 0
         self._model_update_groups = None
         self._model_update_groups_for_actor_fwd_ref = None
 
@@ -552,13 +554,23 @@ class DeviceDirectBackend(CommBackend):
 
         ports = list(range(port_min, port_max + 1))
         random.shuffle(ports)
+        skipped_ports: list[tuple[int, int | None, str]] = []
         for port in ports:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.bind(("", port))
+                    logger.info(
+                        "Selected rollout weight update master port %s from range [%s, %s] after skipping %s ports",
+                        port,
+                        port_min,
+                        port_max,
+                        len(skipped_ports),
+                    )
+                    if skipped_ports:
+                        logger.info("Skipped rollout weight update master ports sample: %s", skipped_ports[:10])
                     return port
-            except OSError:
+            except OSError as exc:
+                skipped_ports.append((port, exc.errno, exc.strerror or str(exc)))
                 continue
         raise RuntimeError(f"No free port available in range [{port_min}, {port_max}]")
 
@@ -574,7 +586,7 @@ class DeviceDirectBackend(CommBackend):
         if self._is_pp_src_rank:
             pp_rank = mpu.get_pipeline_model_parallel_rank()
             master_address = ray._private.services.get_node_ip_address()
-            self._group_name = f"slime-pp_{pp_rank}"
+            base_group_name = f"slime-pp_{pp_rank}"
 
             if topology_data is None:
                 raise RuntimeError("topology_data is required for init_process_group_for_rollout")
@@ -585,12 +597,19 @@ class DeviceDirectBackend(CommBackend):
             self._update_rollout_engines()
 
             if self._model_update_groups is not None:
+                old_group_name = self._group_name or base_group_name
                 try:
-                    logger.info("Destroying old process group...")
-                    destroy_payload = {"group_name": self._group_name}
+                    logger.info(
+                        "Destroying old rollout process group: group_name=%s, local_group=%s, rollout_ranks=%s",
+                        old_group_name,
+                        self._model_update_groups,
+                        sorted(self.rollout_engines),
+                    )
+                    destroy_payload = {"group_name": old_group_name}
                     futures = self._batch_request("/destroy_weights_update_group", destroy_payload)
                     dist.destroy_process_group(self._model_update_groups)
                     ray.get(futures)
+                    logger.info("Destroyed old rollout process group: group_name=%s", old_group_name)
                     self._model_update_groups = None
                 except Exception as e:
                     logger.warning(f"Error destroying old process group: {e}")
@@ -607,6 +626,18 @@ class DeviceDirectBackend(CommBackend):
             world_size = cumulative_offset
 
             master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
+            self._rollout_group_generation += 1
+            self._group_name = f"{base_group_name}-g{self._rollout_group_generation}"
+            logger.info(
+                "Preparing rollout process group: group_name=%s, master=%s:%s, world_size=%s, rank_offsets=%s, "
+                "rollout_ranks=%s",
+                self._group_name,
+                master_address,
+                master_port,
+                world_size,
+                rank_offsets,
+                sorted(int(rank) for rank in self.rollout_topology),
+            )
 
             # Prepare init payloads for each rollout node
             init_payloads = {}
@@ -620,9 +651,22 @@ class DeviceDirectBackend(CommBackend):
                     "backend": self.backend_type,
                 }
 
-            logger.info(f"Sending init_weights_update_group to {len(self.rollout_topology)} rollout nodes...")
+            logger.info(
+                "Sending init_weights_update_group to %s rollout nodes: %s",
+                len(self.rollout_topology),
+                init_payloads,
+            )
             futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
 
+            logger.info(
+                "Initializing local rollout process group: init_method=tcp://%s:%s, world_size=%s, rank=0, "
+                "group_name=%s, backend=%s",
+                master_address,
+                master_port,
+                world_size,
+                self._group_name,
+                self.backend_type,
+            )
             self._model_update_groups = init_process_group(
                 backend=self.backend_type,
                 init_method=f"tcp://{master_address}:{master_port}",
@@ -632,6 +676,7 @@ class DeviceDirectBackend(CommBackend):
                 timeout=timedelta(seconds=180),
             )
             ray.get(futures)
+            logger.info("Initialized rollout process group: group_name=%s, master_port=%s", self._group_name, master_port)
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
@@ -952,6 +997,15 @@ class DeviceDirectBackend(CommBackend):
             "weight_version": str(self.weight_version),
             "flush_cache": False,
         }
+        logger.info(
+            "Sending rollout distributed weight bucket: group_name=%s, weight_version=%s, tensors=%s, "
+            "first_tensor=%s, rollout_ranks=%s",
+            self._group_name,
+            self.weight_version,
+            len(converted_named_tensors),
+            converted_named_tensors[0][0] if converted_named_tensors else None,
+            sorted(self.rollout_engines),
+        )
         # Send weight update to all rollout nodes via Ray actors
         futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
@@ -962,6 +1016,12 @@ class DeviceDirectBackend(CommBackend):
         for handle in handles:
             handle.wait()
         ray.get(futures)  # Ensure remote update completes
+        logger.info(
+            "Completed rollout distributed weight bucket: group_name=%s, weight_version=%s, tensors=%s",
+            self._group_name,
+            self.weight_version,
+            len(converted_named_tensors),
+        )
 
         ray.get(self.lock.release.remote())
         if pbar is not None:

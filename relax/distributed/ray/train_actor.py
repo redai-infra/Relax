@@ -37,14 +37,18 @@ def _configure_visible_devices_for_current_actor() -> None:
 
     joined_ids = ",".join(assigned_gpu_ids)
     if torch.version.hip is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = joined_ids
+        # On ROCm, Ray must not rewrite HIP_VISIBLE_DEVICES. Keep the full
+        # visible device list and select the assigned device with set_device().
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ.pop("ROCR_VISIBLE_DEVICES", None)
-        os.environ.pop("HIP_VISIBLE_DEVICES", None)
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = joined_ids
 
 
 def get_local_gpu_id():
+    if torch.version.hip is not None:
+        return to_local_visible_device_index(int(ray.get_gpu_ids()[0]))
+
     visible_devices = get_visible_devices()
     if not visible_devices:
         return ray.get_gpu_ids()[0]
@@ -83,9 +87,10 @@ class TrainRayActor(RayActor):
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         logger.info(
-            "Initializing TrainRayActor rank=%s local_rank=%s visible_devices=%s hip=%s",
+            "Initializing TrainRayActor rank=%s local_rank=%s ray_gpu_ids=%s visible_devices=%s hip=%s",
             self._rank,
             local_rank,
+            ray.get_gpu_ids(),
             get_visible_devices(),
             torch.version.hip is not None,
         )

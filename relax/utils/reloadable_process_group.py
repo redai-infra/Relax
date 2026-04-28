@@ -1,6 +1,11 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
+import socket
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -13,6 +18,124 @@ logger = get_logger(__name__)
 
 old_new_group_dict = {}
 _wrap_low_level_call_enabled = False
+
+
+def _safe_call(value_fn: Callable[[], Any]) -> Any:
+    try:
+        return value_fn()
+    except Exception as exc:  # noqa: BLE001
+        return f"<error: {type(exc).__name__}: {exc}>"
+
+
+def _describe_process_group(group: Any) -> dict[str, Any]:
+    if isinstance(group, ReloadableProcessGroup):
+        inner_group = group.group
+        return {
+            "type": type(group).__name__,
+            "inner_type": type(inner_group).__name__ if inner_group is not None else None,
+            "ranks": group.group_info.get("ranks"),
+            "rank": _safe_call(lambda: group.rank()),
+            "size": _safe_call(lambda: group.size()),
+        }
+
+    if isinstance(group, torch.distributed.ProcessGroup):
+        return {
+            "type": type(group).__name__,
+            "rank": _safe_call(lambda: group.rank()),
+            "size": _safe_call(lambda: group.size()),
+        }
+
+    return {"type": type(group).__name__}
+
+
+def _collect_distributed_debug_context(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    env_keys = [
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
+        "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
+        "NCCL_SOCKET_IFNAME",
+        "RCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
+        "NCCL_DEBUG",
+        "TORCH_DISTRIBUTED_DEBUG",
+    ]
+
+    process_groups = [
+        _describe_process_group(arg)
+        for arg in args
+        if isinstance(arg, (ReloadableProcessGroup, torch.distributed.ProcessGroup))
+    ]
+    process_groups.extend(
+        _describe_process_group(value)
+        for value in kwargs.values()
+        if isinstance(value, (ReloadableProcessGroup, torch.distributed.ProcessGroup))
+    )
+
+    context: dict[str, Any] = {
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "env": {key: os.environ.get(key) for key in env_keys if os.environ.get(key) is not None},
+        "torch_hip": torch.version.hip,
+        "process_groups": process_groups,
+        "dist_available": _safe_call(dist.is_available),
+        "dist_initialized": _safe_call(dist.is_initialized),
+    }
+
+    if dist.is_available() and dist.is_initialized():
+        context["dist"] = {
+            "rank": _safe_call(dist.get_rank),
+            "world_size": _safe_call(dist.get_world_size),
+            "backend": _safe_call(dist.get_backend),
+        }
+
+    if torch.cuda.is_available():
+        current_device = _safe_call(torch.cuda.current_device)
+        context["cuda"] = {
+            "device_count": _safe_call(torch.cuda.device_count),
+            "current_device": current_device,
+            "current_device_name": _safe_call(lambda: torch.cuda.get_device_name(current_device)),
+        }
+        if isinstance(current_device, int):
+            props = _safe_call(lambda: torch.cuda.get_device_properties(current_device))
+            if not isinstance(props, str):
+                context["cuda"]["current_device_properties"] = {
+                    "name": getattr(props, "name", None),
+                    "uuid": getattr(props, "uuid", None),
+                    "pci_bus_id": getattr(props, "pci_bus_id", None),
+                    "gcn_arch_name": getattr(props, "gcnArchName", None),
+                    "total_memory": getattr(props, "total_memory", None),
+                    "multi_processor_count": getattr(props, "multi_processor_count", None),
+                }
+
+    try:
+        import ray
+
+        context["ray"] = {
+            "is_initialized": ray.is_initialized(),
+            "gpu_ids": _safe_call(ray.get_gpu_ids),
+            "node_id": _safe_call(lambda: ray.get_runtime_context().get_node_id()),
+            "actor_id": _safe_call(lambda: ray.get_runtime_context().get_actor_id()),
+        }
+    except Exception as exc:  # noqa: BLE001
+        context["ray"] = f"<unavailable: {type(exc).__name__}: {exc}>"
+
+    return context
+
+
+def _log_distributed_exception(func_name: str, args: tuple[Any, ...], kwargs: dict[str, Any], exc: Exception) -> None:
+    context = _collect_distributed_debug_context(args, kwargs)
+    logger.exception("torch.distributed.%s failed with context: %s", func_name, context)
+    if hasattr(exc, "add_note"):
+        exc.add_note(f"torch.distributed.{func_name} debug context: {context}")
 
 
 def monkey_patch_torch_dist(args=None):
@@ -68,10 +191,16 @@ def monkey_patch_torch_dist(args=None):
         """Wrap communication functions with memory check."""
 
         def new_function(*args, **kwargs):
-            args = tuple([arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args])
+            original_args = args
+            original_kwargs = kwargs
+            args = tuple(arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args)
             kwargs = {k: (v.group if isinstance(v, ReloadableProcessGroup) else v) for k, v in kwargs.items()}
             with _wrap_low_level_call():
-                return func(*args, **kwargs)
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    _log_distributed_exception(func.__name__, original_args, original_kwargs, exc)
+                    raise
 
         return new_function
 
@@ -203,7 +332,11 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         if inner is None:
             raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
         with _wrap_low_level_call():
-            return getattr(inner, method)(*args, **kwargs)
+            try:
+                return getattr(inner, method)(*args, **kwargs)
+            except Exception as exc:
+                _log_distributed_exception(method, (self, *args), kwargs, exc)
+                raise
 
     def _fwd_query(self, method, *args, **kwargs):
         """Forward non-communication calls without memory check."""

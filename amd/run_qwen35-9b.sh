@@ -4,9 +4,11 @@
 
 set -Eeuo pipefail
 
+pkill -9 python 2>/dev/null || true
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
-DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
+source "${REPO_ROOT}/scripts/entrypoint/device_env.sh"
 
 select_available_gpus() {
     local min_free_vram_gb="$1"
@@ -82,8 +84,12 @@ PY
 
 # Edit this block directly when changing the smoke configuration.
 export MODEL_DIR="${SCRIPT_DIR}/assets/exps"
+export HF_MODEL_PATH="${HF_MODEL_PATH:-Qwen/Qwen3.5-9B}"
+export HF_MODEL_DIR="${HF_MODEL_DIR:-${SCRIPT_DIR}/assets/hf-models}"
+export HF_TRAIN_DATASET_PATH="${HF_TRAIN_DATASET_PATH:-zhuzilin/dapo-math-17k/dapo-math-17k.jsonl}"
+export HF_EVAL_DATASET_PATH="${HF_EVAL_DATASET_PATH:-zhuzilin/aime-2024/aime-2024.jsonl}"
 export QWEN35_SUPPORTED_GPU_COUNTS="${QWEN35_SUPPORTED_GPU_COUNTS:-4,8}"
-export QWEN35_MIN_FREE_VRAM_GB="${QWEN35_MIN_FREE_VRAM_GB:-200}"
+export QWEN35_MIN_FREE_VRAM_GB="${QWEN35_MIN_FREE_VRAM_GB:-150}"
 if [ -n "${QWEN35_VISIBLE_DEVICES:-}" ]; then
     SELECTED_GPUS="${QWEN35_VISIBLE_DEVICES}"
 else
@@ -92,17 +98,19 @@ else
         exit 0
     fi
 fi
-export CUDA_VISIBLE_DEVICES="${SELECTED_GPUS}"
-unset HIP_VISIBLE_DEVICES
+export HIP_VISIBLE_DEVICES="${SELECTED_GPUS}"
+unset CUDA_VISIBLE_DEVICES
 unset ROCR_VISIBLE_DEVICES
 export NUM_GPUS="$(python3 - <<'PY'
 import os
-print(len([x for x in os.environ["CUDA_VISIBLE_DEVICES"].split(",") if x]))
+print(len([x for x in os.environ["HIP_VISIBLE_DEVICES"].split(",") if x]))
 PY
 )"
-export MASTER_ADDR="${MASTER_ADDR:-${DEFAULT_MASTER_ADDR:-127.0.0.1}}"
-export RAY_PORT="6380"
-export RAY_DASHBOARD_PORT="8266"
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+export QWEN35_SOCKET_IFNAME="${QWEN35_SOCKET_IFNAME:-eth0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${QWEN35_SOCKET_IFNAME}}"
+export RAY_PORT="6379"
+export RAY_DASHBOARD_PORT="8265"
 export RAY_MIN_WORKER_PORT="30000"
 export RAY_MAX_WORKER_PORT="65000"
 export RAY_NODE_MANAGER_PORT="6381"
@@ -111,7 +119,7 @@ export RAY_RUNTIME_ENV_AGENT_PORT="6383"
 export RAY_DASHBOARD_AGENT_LISTEN_PORT="6384"
 export RAY_DASHBOARD_AGENT_GRPC_PORT="6385"
 export RAY_TMPDIR="/tmp/ray-qwen35-9b"
-export RELAX_SERVE_PORT="18080"
+export RELAX_SERVE_PORT="8000"
 export TENSORBOARD_DIR="${SCRIPT_DIR}/tensorboard/qwen35-9b"
 export MEGATRON="/root/Megatron-LM/"
 export RELAX="${REPO_ROOT}"
@@ -149,11 +157,12 @@ PY
     export RELAX_RESOURCE
 fi
 
-echo "=== Selected GPUs: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} ==="
+echo "=== Selected GPUs: HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES} ==="
 echo "=== Resource plan: NUM_GPUS=${NUM_GPUS}, ACTOR_GPUS=${ACTOR_GPUS}, ACTOR_TP=${ACTOR_TP}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, REFERENCE_GPUS=${REFERENCE_GPUS}, ACTOR_FWD_GPUS=${ACTOR_FWD_GPUS} ==="
 
 # Keep the 9B smoke aligned with the verified 4B ROCm settings.
 export CUDA_DEVICE_MAX_CONNECTIONS="1"
+export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES="1"
 export NVTE_DEBUG="1"
 export NVTE_DEBUG_LEVEL="2"
 export RAY_DEDUP_LOGS="0"
@@ -162,6 +171,20 @@ export PYTHONUNBUFFERED="1"
 
 export RAY_ADDRESS="${MASTER_ADDR}:${RAY_PORT}"
 export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
+export HOST_IP="${MASTER_ADDR}"
+export HAS_NVLINK="$(relax_detect_fast_interconnect)"
+export RUNTIME_ENV_JSON="{
+\"env_vars\": {
+   \"PYTHONUNBUFFERED\": \"1\",
+   \"PYTHONPATH\": \"${PYTHONPATH}\",
+   \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+   \"RELAX_SERVE_PORT\": \"${RELAX_SERVE_PORT}\",
+   \"HIP_VISIBLE_DEVICES\": \"${HIP_VISIBLE_DEVICES}\",
+   \"RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES\": \"${RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES}\",
+   \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
+   \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+}
+}"
 
 cleanup_stale_processes() {
     echo "=== Cleaning stale Relax/Ray/SGLang processes ==="
