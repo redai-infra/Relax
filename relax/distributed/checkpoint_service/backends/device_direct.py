@@ -15,6 +15,7 @@ Features:
 
 import asyncio
 import logging
+import os
 import re
 import socket
 import time
@@ -109,6 +110,7 @@ class DeviceDirectBackend(CommBackend):
         self._pending_recvs: Dict[str, asyncio.Future] = {}
         self._group_name: Optional[str] = None
         self._rollout_group_generation = 0
+        self._rollout_topology_signature: Optional[tuple[tuple[int, str, int, int], ...]] = None
         self._model_update_groups = None
         self._model_update_groups_for_actor_fwd_ref = None
 
@@ -544,6 +546,21 @@ class DeviceDirectBackend(CommBackend):
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
 
+    def _get_rollout_topology_signature(self) -> tuple[tuple[int, str, int, int], ...]:
+        default_gpus = self.args.rollout_num_gpus_per_engine
+        signature = []
+        for rank, role_info in sorted(self.rollout_topology.items(), key=lambda kv: int(kv[0])):
+            metadata = role_info.get("metadata") if isinstance(role_info, dict) else {}
+            signature.append(
+                (
+                    int(rank),
+                    str(role_info.get("ip")),
+                    int(role_info.get("port")),
+                    int((metadata or {}).get("num_gpus_per_engine", default_gpus)),
+                )
+            )
+        return tuple(signature)
+
     @staticmethod
     def _find_free_port_in_range(port_min: int, port_max: int) -> int:
         """Find a free port within [port_min, port_max] by attempting to bind.
@@ -592,9 +609,23 @@ class DeviceDirectBackend(CommBackend):
                 raise RuntimeError("topology_data is required for init_process_group_for_rollout")
 
             self.rollout_topology = topology_data.get("nodes", {}).get("rollout", {})
+            rollout_topology_signature = self._get_rollout_topology_signature()
 
             self._create_rollout_engines(self.rollout_topology)
             self._update_rollout_engines()
+
+            reuse_enabled = os.getenv("RELAX_ROLLOUT_PG_REUSE", "1").lower() not in ("0", "false", "no")
+            if (
+                reuse_enabled
+                and self._model_update_groups is not None
+                and self._rollout_topology_signature == rollout_topology_signature
+            ):
+                logger.info(
+                    "Reusing rollout process group: group_name=%s, topology_signature=%s",
+                    self._group_name,
+                    rollout_topology_signature,
+                )
+                return
 
             if self._model_update_groups is not None:
                 old_group_name = self._group_name or base_group_name
@@ -611,9 +642,18 @@ class DeviceDirectBackend(CommBackend):
                     ray.get(futures)
                     logger.info("Destroyed old rollout process group: group_name=%s", old_group_name)
                     self._model_update_groups = None
+                    self._rollout_topology_signature = None
+                    reinit_sleep_seconds = float(os.getenv("RELAX_ROLLOUT_PG_REINIT_SLEEP_SECONDS", "5"))
+                    if reinit_sleep_seconds > 0:
+                        logger.info(
+                            "Sleeping %.1fs before reinitializing rollout process group to let RCCL sockets close",
+                            reinit_sleep_seconds,
+                        )
+                        time.sleep(reinit_sleep_seconds)
                 except Exception as e:
                     logger.warning(f"Error destroying old process group: {e}")
                     self._model_update_groups = None
+                    self._rollout_topology_signature = None
 
             default_gpus = self.args.rollout_num_gpus_per_engine
             cumulative_offset = 1
@@ -676,6 +716,7 @@ class DeviceDirectBackend(CommBackend):
                 timeout=timedelta(seconds=180),
             )
             ray.get(futures)
+            self._rollout_topology_signature = rollout_topology_signature
             logger.info("Initialized rollout process group: group_name=%s, master_port=%s", self._group_name, master_port)
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
