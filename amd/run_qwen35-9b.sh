@@ -126,13 +126,15 @@ export RELAX="${REPO_ROOT}"
 export RUN_ID="qwen35-9b-dapo-math-te-debug-$(date +%Y%m%d-%H%M%S)"
 
 if [ "${NUM_GPUS}" -ge 8 ]; then
-    export ACTOR_GPUS="${ACTOR_GPUS:-4}"
-    export ACTOR_TP="${ACTOR_TP:-4}"
-    export ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+    export ACTOR_GPUS="${ACTOR_GPUS:-2}"
+    export ACTOR_TP="${ACTOR_TP:-2}"
+    export ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
+    export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}"
 else
     export ACTOR_GPUS="${ACTOR_GPUS:-1}"
     export ACTOR_TP="${ACTOR_TP:-1}"
     export ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
+    export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 fi
 export REFERENCE_GPUS="${REFERENCE_GPUS:-1}"
 export ACTOR_FWD_GPUS="${ACTOR_FWD_GPUS:-1}"
@@ -158,7 +160,7 @@ PY
 fi
 
 echo "=== Selected GPUs: HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES} ==="
-echo "=== Resource plan: NUM_GPUS=${NUM_GPUS}, ACTOR_GPUS=${ACTOR_GPUS}, ACTOR_TP=${ACTOR_TP}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, REFERENCE_GPUS=${REFERENCE_GPUS}, ACTOR_FWD_GPUS=${ACTOR_FWD_GPUS} ==="
+echo "=== Resource plan: NUM_GPUS=${NUM_GPUS}, ACTOR_GPUS=${ACTOR_GPUS}, ACTOR_TP=${ACTOR_TP}, ROLLOUT_GPUS=${ROLLOUT_GPUS}, ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE}, REFERENCE_GPUS=${REFERENCE_GPUS}, ACTOR_FWD_GPUS=${ACTOR_FWD_GPUS} ==="
 
 # Keep the 9B smoke aligned with the verified 4B ROCm settings.
 export CUDA_DEVICE_MAX_CONNECTIONS="1"
