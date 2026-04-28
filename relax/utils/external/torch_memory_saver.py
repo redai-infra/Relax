@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+
 TORCH_MEMORY_SAVER_IMPORT_ERROR: Exception | None = None
 
 try:

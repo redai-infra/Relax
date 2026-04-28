@@ -11,8 +11,8 @@ import torch.distributed as dist
 
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
-from relax.utils.distributed_utils import init_gloo_group
 from relax.utils.device_utils import get_visible_devices, to_local_visible_device_index
+from relax.utils.distributed_utils import init_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
 

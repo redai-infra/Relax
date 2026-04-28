@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 set -ex
 set -o pipefail
 
@@ -11,13 +13,19 @@ RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/runs/${RUN_ID}}"
 mkdir -p "${RUN_DIR}"
 cd "${RUN_DIR}"
 
+DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
+
 export MODEL_DIR="${MODEL_DIR:-${SCRIPT_DIR}/assets/exps}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NUM_GPUS="${NUM_GPUS:-8}"
-export RAY_ADDRESS="${RAY_ADDRESS:-10.235.26.199:6380}"
-export MASTER_ADDR="${MASTER_ADDR:-10.235.26.199}"
+export MASTER_ADDR="${MASTER_ADDR:-${DEFAULT_MASTER_ADDR:-127.0.0.1}}"
+export RAY_ADDRESS="${RAY_ADDRESS:-${MASTER_ADDR}:6380}"
 export RELAX_SERVE_PORT="${RELAX_SERVE_PORT:-18080}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NVTE_DEBUG="${NVTE_DEBUG:-1}"
+export NVTE_DEBUG_LEVEL="${NVTE_DEBUG_LEVEL:-2}"
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
+export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
 export MEGATRON="${MEGATRON:-/root/Megatron-LM/}"
 export RELAX="${RELAX:-${REPO_ROOT}}"
 export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
@@ -28,7 +36,7 @@ source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${MODEL_DIR}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=2}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3.5-9B
@@ -51,11 +59,11 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-batch-size 1
+   --n-samples-per-prompt 2
+   --rollout-max-response-len 1024
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 4
    --use-fault-tolerance
 )
 
@@ -108,7 +116,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
@@ -125,14 +133,16 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   --attention-backend flash
+   --attention-backend auto
+   --disable-jit-fuser
+   --train-env-vars '{"TORCHDYNAMO_DISABLE": "1"}'
 )
 
 python3 -m relax.entrypoints.train \
    --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}' \
    --max-staleness 2 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 32 \
+   --num-iters-per-train-update 1 \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
    --use-health-check \

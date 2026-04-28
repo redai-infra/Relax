@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 set -ex
 set -o pipefail
 
@@ -11,11 +13,13 @@ RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/runs/${RUN_ID}}"
 mkdir -p "${RUN_DIR}"
 cd "${RUN_DIR}"
 
+DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
+
 export MODEL_DIR="${MODEL_DIR:-${SCRIPT_DIR}/assets/exps}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NUM_GPUS="${NUM_GPUS:-4}"
-export RAY_ADDRESS="${RAY_ADDRESS:-10.235.26.199:6380}"
-export MASTER_ADDR="${MASTER_ADDR:-10.235.26.199}"
+export MASTER_ADDR="${MASTER_ADDR:-${DEFAULT_MASTER_ADDR:-127.0.0.1}}"
+export RAY_ADDRESS="${RAY_ADDRESS:-${MASTER_ADDR}:6380}"
 export RELAX_SERVE_PORT="${RELAX_SERVE_PORT:-18081}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export NVTE_DEBUG="${NVTE_DEBUG:-1}"
