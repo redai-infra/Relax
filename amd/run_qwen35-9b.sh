@@ -4,7 +4,9 @@
 
 set -Eeuo pipefail
 
+ulimit -n 1048576
 pkill -9 python 2>/dev/null || true
+pkill -9 python3 2>/dev/null || true
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
