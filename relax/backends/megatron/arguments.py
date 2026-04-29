@@ -25,10 +25,12 @@ def validate_args(args):
             major = 9
             minor = 0
 
-        device_name = device_utils.get_device_name()
+        # Megatron internally calls torch.cuda.get_device_properties / get_device_capability.
+        # When no real device is available, device_utils.get_device_name() returns "cpu",
+        # so we must patch torch.cuda specifically — that's what Megatron actually invokes.
         with (
-            patch(f"torch.{device_name}.get_device_properties", return_value=_DeviceProperty()),
-            patch(f"torch.{device_name}.get_device_capability", return_value=(9, 0)),
+            patch("torch.cuda.get_device_properties", return_value=_DeviceProperty()),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             _megatron_validate_args(args)
     else:
