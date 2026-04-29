@@ -151,6 +151,7 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     rm sglang.patch; \
 fi
 
-WORKDIR /root/
+# TODO(zty): remove this comment after testing
+# WORKDIR /root/
 # COPY . .
 # RUN pip install -e . --no-deps
