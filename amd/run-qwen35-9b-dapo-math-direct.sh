@@ -200,6 +200,7 @@ SGLANG_ARGS=(
 WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
+   --timeline-dump-dir ${RUN_DIR}/timeline
    --tb-project-name ${PROJECT_NAME}
    --tb-experiment-name qwen35-9B-8x-direct-${now}
 )
