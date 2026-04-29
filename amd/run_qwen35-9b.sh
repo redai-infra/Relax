@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 
+pkill -9 gcs_server
+pkill -9 python
+pkill -9 python3
+pkill -9 ray
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+sleep 5
 
 set -Eeuo pipefail
 
@@ -131,7 +136,7 @@ if [ "${NUM_GPUS}" -ge 8 ]; then
     export ACTOR_GPUS="${ACTOR_GPUS:-2}"
     export ACTOR_TP="${ACTOR_TP:-2}"
     export ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
-    export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}"
+    export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
 else
     export ACTOR_GPUS="${ACTOR_GPUS:-1}"
     export ACTOR_TP="${ACTOR_TP:-1}"

@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import importlib
+import random
 import subprocess
+import time
 from argparse import Namespace
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -82,10 +84,21 @@ def get_current_node_ip():
 
 def get_free_port(start_port=10000, consecutive=1):
     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
-    port = start_port
-    while not all(is_port_available(port + i) for i in range(consecutive)):
-        port += 1
-    return port
+    search_window = 1000
+    max_start_port = min(65535 - consecutive + 1, start_port + search_window - consecutive)
+    if consecutive < 1 or start_port > max_start_port:
+        raise ValueError(f"Invalid port search range: {start_port=}, {consecutive=}")
+
+    rng = random.Random(time.time_ns())
+    ports = list(range(start_port, max_start_port + 1))
+    rng.shuffle(ports)
+    for port in ports:
+        if all(is_port_available(port + i) for i in range(consecutive)):
+            return port
+    raise RuntimeError(
+        f"No free port available in [{start_port}, {start_port + search_window - 1}] "
+        f"with {consecutive} consecutive ports"
+    )
 
 
 def should_run_periodic_action(
