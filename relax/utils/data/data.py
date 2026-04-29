@@ -1,17 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import random
-import re
-
-import ray
 
 from relax.utils.data.data_utils import (
     BaseDataset,
     filter_long_prompts,
     read_file,
 )
-from relax.utils.timer import Timer
-from relax.utils.types import MultimodalTypes, Sample
+from relax.utils.types import Sample
 
 
 __all__ = ["Dataset", "BaseDataset"]
@@ -20,105 +16,6 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
-
-
-def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_length: int | None) -> list[Sample]:
-    if max_length is None:
-        return origin_samples
-
-    if not isinstance(origin_samples[0].prompt, str):
-        logger.warning(
-            "Skipping max_length check for list prompt. Set apply_chat_template=True to enable length filtering."
-        )
-        return origin_samples
-
-    if processor:
-        filtered_samples = []
-        for sample in origin_samples:
-            from relax.utils.data.processing_utils import process_vision_info
-
-            multimodal_inputs = process_vision_info(sample.prompt, processor)
-            processor_output = processor(text=sample.prompt, **multimodal_inputs)
-            input_ids = processor_output["input_ids"][0]
-            if len(input_ids) <= max_length:
-                filtered_samples.append(sample)
-    else:
-        prompts = [sample.prompt for sample in origin_samples]
-        input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
-        filtered_samples = [
-            sample
-            for sample, input_ids in zip(origin_samples, input_ids_list, strict=True)
-            if len(input_ids) <= max_length
-        ]
-
-    logger.info(f"Filtered {len(origin_samples) - len(filtered_samples)} samples longer than max_length={max_length}.")
-
-    return filtered_samples
-
-
-def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
-    prompt = data.get(prompt_key)
-
-    if isinstance(prompt, str):
-        # If prompt is a string and we don't apply chat template, return the prompt as is.
-        if not as_conversation:
-            return prompt
-        else:
-            prompt = [{"role": "user", "content": prompt}]
-
-    if multimodal_keys:
-        # Build mapping: placeholder -> (MultimodalType, content_list)
-        multimodals = {}
-        for type_name, data_key in multimodal_keys.items():
-            mt = MultimodalTypes.get(type_name)
-            if mt:
-                multimodal_data = data.get(data_key)
-                if multimodal_data is not None:
-                    multimodals[mt.placeholder] = (mt, list(multimodal_data))
-
-        pattern = "(" + "|".join(re.escape(p) for p in multimodals.keys()) + ")"
-
-        for message in prompt:
-            if isinstance(message["content"], str):
-                content_list = []
-                for segment in re.split(pattern, message["content"]):
-                    if not segment:
-                        continue
-                    if segment in multimodals:
-                        mt, content = multimodals[segment]
-                        assert len(content) > 0, (
-                            f"Not enough {mt.name} data: more '{mt.placeholder}' placeholders in prompt "
-                            f"than {mt.name}s provided in data"
-                        )
-                        content_list.append({"type": mt.name, mt.name: content.pop(0)})
-                    else:
-                        content_list.append({"type": "text", "text": segment})
-                message["content"] = content_list
-
-            elif isinstance(message["content"], list):
-                # TODO: handle more general cases. where message['content'] is a dict and contains multiple types of content.
-                # e.g.
-                #  "content": [
-                #     {
-                #         "type": "image",
-                #         "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-                #     },
-                #     {"type": "text", "text": "Describe this image."},
-                # ],
-                logger.warning("message['content'] is a list of dicts, no processing will be done.")
-                continue
-            else:
-                raise ValueError(
-                    f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"
-                )
-
-        for placeholder, (mt, remaining) in multimodals.items():
-            assert len(remaining) == 0, (
-                f"Multimodal data count mismatch: {len(remaining)} more {mt.name}(s)"
-                f"than '{placeholder}' placeholders in prompt"
-            )
-
-    return prompt
 
 
 class Dataset(BaseDataset):
@@ -216,17 +113,3 @@ def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
             batches.append(length)
 
     return len(batches)
-
-
-def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
-    assert len(rollout_data_ref) == dp_size
-    rollout_data = ray.get(rollout_data_ref[dp_rank].inner)
-
-    partition = rollout_data.pop("partition")
-    total_lengths = rollout_data["total_lengths"]
-
-    # save the seqlen of the whole rollout batch
-    Timer().seq_lens = total_lengths
-    rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
-
-    return rollout_data
