@@ -192,6 +192,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE:-${ROLLOUT_GPUS:-2}}
+   --sglang-router-policy round_robin
    --sglang-mem-fraction-static 0.8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
