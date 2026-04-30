@@ -182,6 +182,22 @@ export RAY_ADDRESS="${MASTER_ADDR}:${RAY_PORT}"
 export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
 export HOST_IP="${MASTER_ADDR}"
 export HAS_NVLINK="$(relax_detect_fast_interconnect)"
+
+build_bindlog_preload() {
+    if [ "${BINDLOG_ENABLE:-1}" != "1" ]; then
+        return 0
+    fi
+
+    echo "=== Building bindlog LD_PRELOAD hook inside zty_relax ==="
+    bash -lc \
+        "cd /B/Relax && gcc -shared -fPIC -O2 -Wall -Wextra -o tools/libbindlog.so tools/bindlog.c -ldl -pthread"
+}
+
+build_bindlog_preload
+export BINDLOG_PRELOAD_PATH="${BINDLOG_PRELOAD_PATH:-${REPO_ROOT}/tools/libbindlog.so}"
+export BINDLOG_LD_PRELOAD="${BINDLOG_PRELOAD_PATH}${LD_PRELOAD:+:${LD_PRELOAD}}"
+echo "=== bindlog enabled: LD_PRELOAD=${BINDLOG_LD_PRELOAD}==="
+
 export RUNTIME_ENV_JSON="{
 \"env_vars\": {
    \"PYTHONUNBUFFERED\": \"1\",
@@ -191,7 +207,8 @@ export RUNTIME_ENV_JSON="{
    \"HIP_VISIBLE_DEVICES\": \"${HIP_VISIBLE_DEVICES}\",
    \"RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES\": \"${RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES}\",
    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
-   \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+   \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+   \"LD_PRELOAD\": \"${BINDLOG_LD_PRELOAD}\"
 }
 }"
 

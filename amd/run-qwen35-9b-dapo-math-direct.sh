@@ -140,6 +140,8 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
    --global-batch-size 256
    --use-fault-tolerance
+   --partial-rollout
+   --partial-rollout-max-aborted-count 3
 )
 
 EVAL_ARGS=(
