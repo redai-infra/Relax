@@ -13,6 +13,8 @@ RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/runs/${RUN_ID}}"
 mkdir -p "${RUN_DIR}"
 cd "${RUN_DIR}"
 
+DEFAULT_MASTER_ADDR="$(hostname -I | awk '{print $1}')"
+
 export MODEL_DIR="${MODEL_DIR:-${SCRIPT_DIR}/assets/exps}"
 export HF_MODEL_PATH="${HF_MODEL_PATH:-Qwen/Qwen3.5-9B}"
 export HF_MODEL_DIR="${HF_MODEL_DIR:-${SCRIPT_DIR}/assets/hf-models}"
@@ -134,11 +136,11 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-batch-size 1
+   --n-samples-per-prompt 2
+   --rollout-max-response-len 1024
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 4
    --use-fault-tolerance
    --partial-rollout
    --partial-rollout-max-aborted-count 3
@@ -230,7 +232,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP:-${MASTER_A
    --resource "${RELAX_RESOURCE}" \
    --max-staleness 2 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 32 \
+   --num-iters-per-train-update 1 \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 1, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
    --use-health-check \
