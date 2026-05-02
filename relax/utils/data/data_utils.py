@@ -128,7 +128,7 @@ def build_messages(
 
         if multimodals:
             pattern = "(" + "|".join(re.escape(p) for p in multimodals.keys()) + ")"
-
+            built_prompt = []
             for message in prompt:
                 if isinstance(message["content"], str):
                     content_list = []
@@ -146,15 +146,19 @@ def build_messages(
                                 content_list.append({"type": mt.name, mt.name: content.pop(0)})
                         else:
                             content_list.append({"type": "text", "text": segment})
-                    message["content"] = content_list
+                    built_message = dict(message)
+                    built_message["content"] = content_list
+                    built_prompt.append(built_message)
                 elif isinstance(message["content"], list):
                     # Already processed, skip
                     logger.warning("message['content'] is a list of dicts, no processing will be done.")
-                    continue
+                    built_prompt.append(message)
                 else:
                     raise ValueError(
                         f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"
                     )
+
+            prompt = built_prompt
 
             if any(v > 0 for v in remain_data.values()):
                 raise RuntimeError(
@@ -453,6 +457,7 @@ def resolve_path_plan(path: Any) -> tuple[list[str], Optional[slice]]:
 
 
 def _build_reader_for_path(path: str):
+    path, row_slice = parse_generalized_path(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
 
@@ -470,7 +475,10 @@ def _build_reader_for_path(path: str):
                         logger.warning(f"JSON decode error at line {line_num}: {e}")
                         continue
 
-        return jsonl_reader(path)
+        reader = jsonl_reader(path)
+        if row_slice is not None:
+            reader = itertools.islice(reader, row_slice.start, row_slice.stop, row_slice.step)
+        return reader
 
     if path.endswith(".parquet"):
         if pq is None:
@@ -486,7 +494,10 @@ def _build_reader_for_path(path: str):
             for i in range(pf.metadata.num_row_groups):
                 yield from pf.read_row_group(i).to_pylist()
 
-        return parquet_reader(path)
+        reader = parquet_reader(path)
+        if row_slice is not None:
+            reader = itertools.islice(reader, row_slice.start, row_slice.stop, row_slice.step)
+        return reader
 
     raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
 
