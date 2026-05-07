@@ -63,10 +63,10 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -74,9 +74,11 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   #--micro-batch-size 16 # avoid OOM
+   --calculate-per-token-loss
+   # --micro-batch-size 16
+   # --qkv-format bshd
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 4096
 
    --no-rope-fusion
 )
@@ -137,7 +139,7 @@ if [ ${MODE} = "async" ]; then
    --max-staleness 2 \
         --num-data-storage-units 1 \
         --num-iters-per-train-update 8 \
-        --ref-actor-config '{"tensor_model_parallel_size": 1, "max_tokens_per_gpu": 16384, "sequence_parallel": false, "only_load_weight": true}' \
+        --ref-actor-config '{"context_parallel_size": 1, "tensor_model_parallel_size": 1, "max_tokens_per_gpu": 16384, "sequence_parallel": false, "only_load_weight": true}' \
         --fully-async \
         --use-health-check \
         "${MODEL_ARGS[@]}" \

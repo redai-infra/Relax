@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import io
+import json
+import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,7 +33,19 @@ DEFAULT_PATCH_SIZE = 14
 
 
 def load_tokenizer(name_or_path: str, **kwargs):
-    return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    # Multimodal models like Qwen3-Omni ship the chat template in a standalone
+    # chat_template.json (loaded by AutoProcessor) rather than tokenizer_config.json,
+    # so AutoTokenizer leaves chat_template unset. Backfill from the sidecar file.
+    if getattr(tokenizer, "chat_template", None) is None and os.path.isdir(name_or_path):
+        chat_template_path = os.path.join(name_or_path, "chat_template.json")
+        if os.path.isfile(chat_template_path):
+            with open(chat_template_path) as f:
+                chat_template = json.load(f).get("chat_template")
+            if chat_template:
+                tokenizer.chat_template = chat_template
+                logger.info(f"Loaded chat_template from {chat_template_path}")
+    return tokenizer
 
 
 def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:

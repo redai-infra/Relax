@@ -63,6 +63,87 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+# CP-PROBE: one-shot forward-pre-hook on the first attention module to verify that
+# context parallelism actually splits the sequence dimension at the attention input.
+# Compare seq_len across CP=1 vs CP=2 runs — it must halve.  Remove after verifying.
+_CP_PROBE_INSTALLED = False
+
+
+def _install_cp_probe(model: torch.nn.Module) -> None:
+    global _CP_PROBE_INSTALLED
+    if _CP_PROBE_INSTALLED:
+        return
+
+    from megatron.core import mpu
+
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    state = {"n": 0}
+
+    target_classes = (
+        "DotProductAttention",
+        "TEDotProductAttention",
+        "FusedAttention",
+        "FlashAttention",
+    )
+
+    def hook(module, args, kwargs):
+        if state["n"] >= 2 or tp_rank != 0:
+            return
+        shapes: dict[str, object] = {}
+        for name in (
+            "query",
+            "key",
+            "value",
+            "q",
+            "k",
+            "v",
+            "hidden_states",
+            "query_layer",
+            "key_layer",
+            "value_layer",
+        ):
+            t = kwargs.get(name)
+            if torch.is_tensor(t):
+                shapes[name] = tuple(t.shape)
+        for i, t in enumerate(args):
+            if torch.is_tensor(t):
+                shapes[f"arg{i}"] = tuple(t.shape)
+        for name in ("cu_seqlens_q", "cu_seqlens_kv"):
+            t = kwargs.get(name)
+            if torch.is_tensor(t):
+                shapes[name] = t.tolist()  # one-shot sync, OK for probe
+        logger.debug(f"[CP-PROBE] cp_rank={cp_rank}/{cp_size} module={type(module).__name__} shapes={shapes}")
+        state["n"] += 1
+
+    skip_prefixes = ("vision_model", "visual", "vit", "image_encoder", "projector", "audio")
+
+    def is_llm_backbone(n: str) -> bool:
+        return not any(p in n for p in skip_prefixes)
+
+    matches = [(n, m) for n, m in model.named_modules() if type(m).__name__ in target_classes]
+    llm_matches = [(n, m) for n, m in matches if is_llm_backbone(n)]
+    chosen = llm_matches or matches  # fallback to vision if no LLM backbone in this stage
+
+    if chosen:
+        name, m = chosen[0]
+        m.register_forward_pre_hook(hook, with_kwargs=True)
+        logger.debug(
+            f"[CP-PROBE] hook installed on '{name}' ({type(m).__name__}) "
+            f"cp_size={cp_size} cp_rank={cp_rank} "
+            f"(total_attn_modules={len(matches)}, llm_backbone={len(llm_matches)})"
+        )
+        _CP_PROBE_INSTALLED = True
+        return
+
+    candidates = [(n, type(m).__name__) for n, m in model.named_modules() if "attention" in n.lower()][:8]
+    logger.warning(
+        f"[CP-PROBE] no attention module matched on this stage (cp_rank={cp_rank}); "
+        f"attention-like candidates: {candidates}"
+    )
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -85,6 +166,7 @@ def get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
+            _install_cp_probe(model)
             return model
 
         return wrapped_model_provider
@@ -125,6 +207,7 @@ def get_model_provider_func(
             "freeze_vision_projection",
             # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
+            "calculate_per_token_loss",
         ]
 
         args_dict = vars(args)
@@ -162,7 +245,14 @@ def get_model_provider_func(
                 pickle.dump(provider, f)
             logger.info(f"Provider config saved to {pkl_path}")
 
-        return provider.provide
+        original_provide = provider.provide
+
+        def provide_with_cp_probe(*p_args, **p_kwargs):
+            model = original_provide(*p_args, **p_kwargs)
+            _install_cp_probe(model)
+            return model
+
+        return provide_with_cp_probe
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
         """Builds the model.
@@ -269,13 +359,14 @@ def get_model_provider_func(
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
+        _install_cp_probe(model)
         return model
 
     return model_provider
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
         sig = inspect.signature(original_provider)
         if "vp_stage" in sig.parameters:
             model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)

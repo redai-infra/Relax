@@ -2,6 +2,12 @@
 
 import logging
 
+
+try:
+    import relax.models  # noqa
+except BaseException as e:
+    print(f"failed to import relax.models, error={e}")
+
 from relax.utils import device as device_utils
 
 

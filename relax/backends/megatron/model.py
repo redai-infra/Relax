@@ -152,7 +152,7 @@ def setup_model_and_optimizer(
     optimizer = get_megatron_optimizer(
         config=config,
         model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
+        use_gloo_process_groups=args.use_gloo_process_groups,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
@@ -256,14 +256,39 @@ def forward_only(
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
+
+        is_vl_model = batch.get("multimodal_train_inputs", None) is not None
+        mm_kwargs = batch["multimodal_train_inputs"] if is_vl_model else {}
+
+        # VL + CP > 1: pass unsplit tokens so Bridge handles CP split after
+        # vision embedding (aligns with Bridge's qwen3_vl_step.py contract).
+        if is_vl_model and "unsplit_tokens" in batch:
+            forward_input_ids = batch["unsplit_tokens"]
+            forward_packed_seq_params = None
+        else:
+            forward_input_ids = tokens
+            forward_packed_seq_params = packed_seq_params
+
+        # thd VL+CP: bridge needs per-sample attention_mask + matching thd
+        # packed_seq_params (align_size = tp*cp*2).  loss_mask is None because
+        # labels=None means GPTModel won't run internal loss; Relax's loss is
+        # computed externally from full_loss_masks.
+        if is_vl_model and "vlm_packed_seq_params" in batch:
+            forward_attention_mask = batch["unsplit_attention_mask"]
+            forward_packed_seq_params = batch["vlm_packed_seq_params"]
+            forward_loss_mask = None
+        else:
+            forward_attention_mask = None
+            forward_loss_mask = batch["full_loss_masks"]
+
         output_tensor = model(
-            input_ids=tokens,
+            input_ids=forward_input_ids,
             position_ids=None,
-            attention_mask=None,
+            attention_mask=forward_attention_mask,
             labels=None,
-            packed_seq_params=packed_seq_params,
-            loss_mask=batch["full_loss_masks"],
-            **(batch["multimodal_train_inputs"] if batch.get("multimodal_train_inputs", None) is not None else {}),
+            packed_seq_params=forward_packed_seq_params,
+            loss_mask=forward_loss_mask,
+            **mm_kwargs,
         )
 
         return output_tensor, partial(
@@ -274,6 +299,7 @@ def forward_only(
             response_lengths=response_lengths,
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
+            padded_total_lengths=batch.get("padded_total_lengths", None),
         )
 
     # Turn on evaluation mode which disables dropout.
@@ -428,19 +454,31 @@ def train_one_step(
                 loss_mask=batch["full_loss_masks"],
             )
         else:
+            is_vl_model = batch.get("multimodal_train_inputs", None) is not None
+            use_unsplit = is_vl_model and "unsplit_tokens" in batch
+
             forward_kwargs = {
-                "input_ids": batch["tokens"],
+                "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
                 "position_ids": None,
                 "attention_mask": None,
                 "labels": None,
-                "packed_seq_params": batch["packed_seq_params"],
+                "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
             }
+
+            # thd VL+CP: bridge needs per-sample attention_mask + matching thd
+            # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
+            # because labels=None means GPTModel won't run internal loss;
+            # Relax's loss is computed externally from full_loss_masks.
+            if is_vl_model and "vlm_packed_seq_params" in batch:
+                forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
+                forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
+                forward_kwargs["loss_mask"] = None
 
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
 
-            if batch.get("multimodal_train_inputs", None) is not None:
+            if is_vl_model:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
             output_tensor = model(**forward_kwargs)

@@ -428,12 +428,12 @@ def get_data_from_transfer_queue(
 def post_process_rollout_data(args, rollout_data):
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
-    from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
+    from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
     cuda_dev = device_utils.make_current_torch_device()
-    rollout_data["tokens"] = [torch.tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
+    rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
     rollout_data["loss_masks"] = [
-        torch.tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
+        torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
     if "multimodal_train_inputs" in rollout_data:
         # Move multimodal training tensors to GPU in advance.
@@ -461,17 +461,24 @@ def post_process_rollout_data(args, rollout_data):
 
         rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
+    padded_total_lengths = maybe_padded_total_lengths(
+        rollout_data["total_lengths"],
+        args.qkv_format,
+        "multimodal_train_inputs" in rollout_data,
+    )
+
     for key in ["rollout_log_probs", "teacher_log_probs"]:
         if key not in rollout_data:
             continue
         rollout_data[key] = [
-            torch.tensor(
+            torch.as_tensor(
                 slice_log_prob_with_cp(
                     log_prob,
                     total_length,
                     response_length,
                     args.qkv_format,
                     rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
+                    padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
                 ),
                 device=cuda_dev,
                 dtype=torch.float32,
@@ -519,6 +526,7 @@ def post_process_rollout_data(args, rollout_data):
                 response_length,
                 args.qkv_format,
                 rollout_data["max_seq_lens"][i] if args.qkv_format == "bshd" else None,
+                padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
             )
             topk_tensors.append(topk_tensor)
 
@@ -528,6 +536,6 @@ def post_process_rollout_data(args, rollout_data):
         from tensordict.tensorclass import NonTensorData
 
         rollout_data["rollout_routed_experts"] = [
-            torch.tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
+            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
             for r in rollout_data["rollout_routed_experts"]
         ]

@@ -61,7 +61,7 @@ After adding the file, source the corresponding model configuration in your trai
 
 #### 2. Megatron Bridge Model Adaptation
 
-Relax uses [Megatron Bridge](https://github.com/redai-infra/megatron-bridge) for automatic HF ↔ Megatron weight conversion. If your model is not yet supported by Megatron Bridge, you need to add support on the Megatron Bridge side first — see its project documentation for details.
+Relax uses [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) for automatic HF ↔ Megatron weight conversion. If your model is not yet supported by Megatron Bridge, you need to add support on the Megatron Bridge side first — see its project documentation for details.
 
 ::: tip AI-Assisted Integration
 This project provides a Codewiz skill `model-integration` (located at `.codewiz/skills/model-integration/`), covering the complete integration workflow for Bridge / Raw / FSDP backends, weight converter specifications, TP sharding logic, and common pitfalls. Invoke it in Codewiz via `invoke skill model-integration` for step-by-step guidance.

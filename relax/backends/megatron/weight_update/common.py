@@ -99,7 +99,12 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
-    assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+    # NOTE: Megatron-LM (megatron/core/transformer/mlp.py) now explicitly sets partition_stride=2
+    # for GLU/SwiGLU linear_fc1 layers to indicate interleaved [gate, up] TP layout.
+    # The rechunk logic below (chunk(2) + reorder) already handles this correctly,
+    # so we only assert stride==1 for non-GLU parameters.
+    if "linear_fc1" not in name:
+        assert param.partition_stride == 1, f"{param.partition_stride=} != 1 is not supported"
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
     if "linear_fc1.weight" in name and "vision_model" not in name:
@@ -164,7 +169,7 @@ def all_gather_params_async(
             param = direct_param
         else:
             # Process the gathered partitions (same logic as original all_gather_param)
-            assert partition_dim is not None, "partition_stride != 1 is not supported"
+            assert partition_dim is not None, "partition_dim must be set for TP-sharded params"
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
             if "linear_fc1.weight" in info.name and "vision_model" not in info.name:

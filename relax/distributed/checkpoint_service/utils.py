@@ -87,8 +87,13 @@ def chunk_param(
         tp_rank = mpu.get_tensor_model_parallel_rank()
 
     # 4. Verify stride
+    # NOTE: Megatron-LM (megatron/core/transformer/mlp.py) sets partition_stride=2
+    # for GLU/SwiGLU linear_fc1 layers. The rechunk logic below handles this correctly.
     partition_dim = target_param.partition_dim
-    assert getattr(target_param, "partition_stride", 1) == 1, "partition_stride != 1 is not supported"
+    if "linear_fc1" not in name:
+        assert getattr(target_param, "partition_stride", 1) == 1, (
+            f"{name}: partition_stride={getattr(target_param, 'partition_stride', 1)} != 1 is not supported"
+        )
 
     # 5. Workaround grouped MoE partition bug for linear_fc2.weight
     effective_partition_dim = partition_dim

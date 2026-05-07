@@ -70,8 +70,8 @@ EVAL_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --pipeline-model-parallel-size 2
+   --context-parallel-size 2
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -79,6 +79,7 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
+   --calculate-per-token-loss
    #--micro-batch-size 16 # avoid OOM
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216

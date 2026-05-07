@@ -61,7 +61,7 @@ MODEL_ARGS=(
 
 #### 2. Megatron Bridge 模型适配
 
-Relax 通过 [Megatron Bridge](https://github.com/redai-infra/megatron-bridge) 实现 HF ↔ Megatron 的自动权重转换。若您的模型尚未被 Megatron Bridge 支持，需要先在 Megatron Bridge 侧完成适配，详见其项目文档。
+Relax 通过 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 实现 HF ↔ Megatron 的自动权重转换。若您的模型尚未被 Megatron Bridge 支持，需要先在 Megatron Bridge 侧完成适配，详见其项目文档。
 
 ::: tip AI 辅助接入
 本项目提供了 Codewiz skill `model-integration`（位于 `.codewiz/skills/model-integration/`），涵盖 Bridge / Raw / FSDP 三种后端的完整接入流程、权重转换器编写规范、TP 分片逻辑及常见陷阱，可在 Codewiz 中通过 `invoke skill model-integration` 调用以获得逐步指导。

@@ -53,10 +53,10 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 4
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -64,7 +64,9 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   #--micro-batch-size 16 # avoid OOM
+   --calculate-per-token-loss
+   # --micro-batch-size 16
+   # --qkv-format bshd
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
 

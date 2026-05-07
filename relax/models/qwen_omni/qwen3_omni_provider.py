@@ -1,0 +1,263 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Qwen3 VL MoE Model Provider configurations for Megatron-Core.
+
+This module provides configuration classes for Qwen3-VL MoE (Mixture of Experts) multimodal models,
+compatible with HuggingFace's Qwen3-VL-MoE model configurations.
+Reference: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
+from megatron.bridge.models.qwen_vl.qwen3_vl_provider import Qwen3VLMoEModelProvider
+from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoderConfig,
+    Qwen3OmniMoeTextConfig,
+    Qwen3OmniMoeVisionEncoderConfig,
+)
+
+from relax.models.qwen_omni.modeling_qwen3_omni.model import Qwen3OmniMoeModel
+
+
+@dataclass
+class Qwen3OmniModelProvider(Qwen3VLMoEModelProvider):
+    """Base model provider for Qwen 3 VL MoE Models. Inherits language model
+    MoE configuration from Qwen3MoEModelProvider.
+
+    Key MoE Parameters (inherited from Qwen3MoEModelProvider):
+    - num_moe_experts: Number of total experts (default 128)
+    - moe_router_topk: Number of experts selected per token (default 8)
+    - moe_router_load_balancing_type: Load balancing strategy (default "aux_loss")
+    - moe_aux_loss_coeff: Auxiliary loss coefficient (default 1e-3)
+    - moe_grouped_gemm: Use grouped GEMM for efficiency (default True)
+
+    Note: num_query_groups in parent class corresponds to num_key_value_heads in HF config.
+    """
+
+    # Vision configuration using the transformers Qwen3OmniMoeVisionEncoderConfig
+    # Default configuration matches the standard Qwen3VL vision encoder
+    # thinker_config: Qwen3OmniMoeThinkerConfig = field(default_factory=lambda: Qwen3OmniMoeThinkerConfig())
+    # talker_config: Qwen3OmniMoeTalkerConfig = field(default_factory=lambda: Qwen3OmniMoeTalkerConfig())
+    # code2wav_config: Qwen3OmniMoeCode2WavConfig = field(default_factory=lambda: Qwen3OmniMoeCode2WavConfig())
+
+    audio_config: Qwen3OmniMoeAudioEncoderConfig = field(default_factory=lambda: Qwen3OmniMoeAudioEncoderConfig())
+    vision_config: Qwen3OmniMoeVisionEncoderConfig = field(default_factory=lambda: Qwen3OmniMoeVisionEncoderConfig())
+    hf_text_config: Optional[Qwen3OmniMoeTextConfig] = None
+
+    pretrained_model_name: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+    audio_token_id: int = 151675
+    audio_start_token_id: int = 151669
+    audio_end_token_id: int = 151670
+    use_audio_in_video: bool = False
+
+    # Vision-specific token IDs matching Qwen3VL MoE configuration
+    # Based on HuggingFace Qwen3-VL-MoE configs
+    # Token ID for image placeholder in text
+    image_token_id: int = 151655
+    # Token ID for video placeholder in text
+    video_token_id: int = 151656
+    # Token ID marking start of vision content
+    vision_start_token_id: int = 151652
+    # Token ID marking end of vision content
+    vision_end_token_id: int = 151653
+    # BOS token ID for Qwen3-VL models
+    bos_token_id: int = 151643
+    # EOS token ID for Qwen3-VL models
+    eos_token_id: int = 151645
+
+    position_id_per_seconds: int = 0
+
+    head_dim: int = 128
+    qk_layernorm: bool = True
+    attention_softmax_in_fp32: bool = True
+    attention_dropout: float = 0.0
+
+    # Override position embedding for multimodal rope
+    position_embedding_type: str = "mrope"
+
+    # Multimodal rope section for [temporal, height, width] dimensions
+    # Based on HuggingFace Qwen3-VL config: mrope_section: [24, 20, 20]
+    mrope_section: List[int] = field(default_factory=lambda: [24, 20, 20])
+
+    # RoPE theta value specific to Qwen3-VL models
+    # From HuggingFace config: rope_theta: 5000000
+    rotary_base: float = 5000000.0
+    spatial_merge_size: int = 2
+    temporal_patch_size: int = 2
+    patch_size: int = 16
+
+    # Override to disable scattering embeddings for vision insertion
+    scatter_embedding_sequence_parallel: bool = False
+
+    # Router configuration
+    moe_router_pre_softmax: bool = False  # Qwen3 specific
+    moe_router_dtype: str = "fp32"  # Use FP32 for router computations
+    moe_router_score_function: str = "softmax"  # Softmax scoring
+    moe_router_bias_update_rate: float = 0.001  # Router bias update rate
+
+    # MoE optimization settings
+    moe_permute_fusion: bool = True  # Fuse permutation operations
+    moe_token_dispatcher_type: str = "alltoall"  # All-to-all communication
+
+    # Dense layers configuration (some layers may not use MoE)
+    # Empty list means all layers use MoE, otherwise specify layer indices
+    mlp_only_layers: List[int] = field(default_factory=list)
+
+    # Decoder sparse step (frequency of MoE layers)
+    decoder_sparse_step: int = 1  # Every layer is MoE by default
+
+    # Freeze options for fine-tuning scenarios
+    # Whether to freeze language model weights
+    freeze_language_model: bool = False
+    # Whether to freeze vision encoder weights
+    freeze_vision_model: bool = False
+    # Whether to freeze vision-to-language projection weights
+    freeze_vision_projection: bool = False
+    # Whether to freeze audio encoder weights
+    freeze_audio_model: bool = False
+    language_max_sequence_length: int = 2048
+
+    # QK layernorm is already True in Qwen3MoEModelProvider, no need to redefine
+
+    # These are typically set in the base class but documented here for clarity
+    persist_layer_norm: bool = True  # Persist layer norm for efficiency
+    bias_activation_fusion: bool = True  # Fuse bias and activation
+    bias_dropout_fusion: bool = True  # Fuse bias and dropout
+    masked_softmax_fusion: bool = False  # Don't fuse masked softmax (Qwen specific)
+    deallocate_pipeline_outputs: bool = True  # Deallocate pipeline outputs to save memory
+    async_tensor_model_parallel_allreduce: bool = True  # Async tensor parallel
+    distribute_saved_activations: bool = False  # Don't distribute saved activations
+    cp_comm_type: str = "p2p"  # Point-to-point communication for context parallel
+
+    def _process_thinker_config(self):
+        self.thinker_config.head_dim = self.thinker_config.text_config.head_dim
+        self.thinker_config.hidden_size = self.thinker_config.text_config.hidden_size
+        self.thinker_config.language_max_sequence_length = getattr(
+            self.thinker_config.text_config, "language_max_sequence_length", 2048
+        )
+
+        # self.thinker_config.patch_size = self.thinker_config.text_config.patch_size
+        # self.thinker_config.temporal_patch_size = self.thinker_config.text_config.temporal_patch_size
+        # self.thinker_config.in_channels = self.thinker_config.text_config.in_channels
+        # self.thinker_config.spatial_merge_size = self.thinker_config.text_config.spatial_merge_size
+        # self.thinker_config.num_position_embeddings = self.thinker_config.text_config.num_position_embeddings
+        # self.thinker_config.out_hidden_size = self.thinker_config.text_config.out_hidden_size
+        # self.thinker_config.apply_rotary_pos_emb_in_fp32 = self.thinker_config.text_config.apply_rotary_pos_emb_in_fp32
+        # self.thinker_config.deepstack_visual_indexes = self.thinker_config.text_config.deepstack_visual_indexes
+
+        self.thinker_config.rotary_percent = 1.0
+        self.thinker_config.apply_rope_fusion = False
+        self.thinker_config.position_embedding_type = "mrope"
+        self.thinker_config.mrope_section = self.thinker_config.text_config.rope_scaling.get(
+            "mrope_section", [24, 20, 20]
+        )
+        self.thinker_config.rotary_base = rope_theta_from_hf(self.thinker_config.text_config)
+
+        # self.thinker_config.audio_token_id = self.thinker_config.text_config.audio_token_id
+        # self.thinker_config.audio_start_token_id = self.thinker_config.text_config.audio_start_token_id
+        # self.thinker_config.audio_end_token_id = self.thinker_config.text_config.audio_end_token_id
+
+        # self.thinker_config.image_token_id = self.thinker_config.text_config.image_token_id
+        # self.thinker_config.video_token_id = self.thinker_config.text_config.video_token_id
+        # self.thinker_config.vision_start_token_id = self.thinker_config.text_config.vision_start_token_id
+        # self.thinker_config.vision_end_token_id = self.thinker_config.text_config.vision_end_token_id
+
+        self.thinker_config.bos_token_id = getattr(self.thinker_config.text_config, "bos_token_id", 151643)
+        self.thinker_config.eos_token_id = getattr(self.thinker_config.text_config, "eos_token_id", 151645)
+
+        self.thinker_config.qk_layernorm = True
+        self.thinker_config.attention_softmax_in_fp32 = True
+        self.thinker_config.attention_dropout = 0.0
+
+        self.thinker_config.moe_router_pre_softmax = False
+        self.thinker_config.moe_router_dtype = "fp32"
+        self.thinker_config.moe_router_score_function = "softmax"
+        self.thinker_config.moe_router_bias_update_rate = 0.001
+
+        self.thinker_config.moe_permute_fusion = True
+        self.thinker_config.moe_token_dispatcher_type = "alltoall"
+
+        self.thinker_config.mlp_only_layers = self.thinker_config.text_config.mlp_only_layers
+        self.thinker_config.decoder_sparse_step = self.thinker_config.text_config.decoder_sparse_step
+
+        # to check freeze
+        # self.thinker_config.freeze_language_model = self.thinker_config.text_config.freeze_language_model
+        # self.thinker_config.freeze_vision_model = self.thinker_config.text_config.freeze_vision_model
+        # self.thinker_config.freeze_vision_projection = self.thinker_config.text_config.freeze_vision_projection
+        self.thinker_config.language_max_sequence_length = 2048
+
+        self.thinker_config.persist_layer_norm = True
+        self.thinker_config.bias_activation_fusion = True
+        self.thinker_config.bias_dropout_fusion = True
+        self.thinker_config.masked_softmax_fusion = False
+        self.thinker_config.deallocate_pipeline_outputs = True
+        self.thinker_config.async_tensor_model_parallel_allreduce = True
+        self.thinker_config.distribute_saved_activations = False
+        self.thinker_config.cp_comm_type = "p2p"
+
+    def finalize(self) -> None:
+        if self.tensor_model_parallel_size > 1:
+            self.sequence_parallel = True
+
+        super().finalize()
+
+    def provide(self, pre_process=None, post_process=None, vp_stage=None):
+        """Provide a Qwen3VL MoE model instance with vision and language
+        components."""
+        # self._process_thinker_config()
+        language_transformer_config = self
+
+        # Create vision transformer config - placeholder for future use
+        # vision_transformer_config = deepcopy(self)
+        audio_config_hf = self.audio_config
+        vision_config_hf = self.vision_config
+
+        language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=self.num_moe_experts,
+            moe_grouped_gemm=True,
+            qk_layernorm=self.qk_layernorm,
+            # fp8=False,
+            # normalization="RMSNorm",
+        )
+
+        # reuse Qwen3OmniMoeModel for MoE model but replace the language model with MoE language model
+        model = Qwen3OmniMoeModel(
+            language_transformer_config=language_transformer_config,
+            language_transformer_layer_spec=language_transformer_layer_spec,
+            audio_transformer_config=audio_config_hf,
+            vision_transformer_config=vision_config_hf,
+            pre_process=pre_process,
+            post_process=post_process,
+            use_audio_in_video=self.use_audio_in_video,
+            pg_collection=getattr(self, "_pg_collection", None),
+        )
+
+        # Apply freeze options if any are enabled for fine-tuning
+        if self.freeze_language_model or self.freeze_vision_model or self.freeze_vision_projection:
+            model.freeze(
+                freeze_language_model=self.freeze_language_model,
+                freeze_vision_model=self.freeze_vision_model,
+                freeze_vision_projection=self.freeze_vision_projection,
+                freeze_audio_model=self.freeze_audio_model,
+            )
+
+        return model
+
+    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None) -> MCoreGPTModel:
+        """Provide just the language MoE model component without vision.
+
+        Args:
+            pre_process: Whether this is the first stage in pipeline parallelism
+            post_process: Whether this is the last stage in pipeline parallelism
+            vp_stage: Virtual pipeline stage number
+
+        Returns:
+            MCoreGPTModel instance (MoE language model only)
+        """
+        # Use parent class to create standard MoE language model
+        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)

@@ -87,10 +87,17 @@ export MEGATRON="your megatron path"
 export PYTHONPATH=your_megatron_path:$PYTHONPATH
 ```
 
-Additionally, Relax depends on megatron bridge for weight conversion. If you need weight conversion, install it:
+Additionally, Relax depends on [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) for weight conversion. Follow the install steps in `docker/Dockerfile`: merge the Bridge sources with the Megatron-LM submodule into a single directory and add it to `PYTHONPATH`:
 
 ```bash
-pip install git+https://github.com/redai-infra/megatron-bridge.git@relax/dev --no-build-isolation --no-deps
+export MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
+git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+cd Megatron-Bridge && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev
+mkdir -p /your/path/Megatron-LM
+cp -r src/megatron /your/path/Megatron-LM/
+rsync -avP 3rdparty/Megatron-LM/megatron/ /your/path/Megatron-LM/megatron/
+export PYTHONPATH=/your/path/Megatron-LM:$PYTHONPATH
 ```
 
 ## Next Steps

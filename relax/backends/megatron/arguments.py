@@ -2,7 +2,13 @@
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
-from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+
+
+try:
+    from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding as vocab_size_with_padding
+except ModuleNotFoundError:
+    from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+
 from transformers import AutoConfig
 
 from relax.utils import device as device_utils
@@ -50,6 +56,13 @@ def validate_args(args):
             "decoder_first_pipeline_num_layers and decoder_last_pipeline_num_layers should be None when "
             "pipeline_model_parallel_size is 1."
         )
+
+    # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
+    # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
+    if args.context_parallel_size > 1:
+        assert args.calculate_per_token_loss, (
+            "--calculate-per-token-loss must be set when context_parallel_size > 1 (required by Megatron-Bridge)."
+        )
     return args
 
 
@@ -79,15 +92,19 @@ def _hf_validate_args(args, hf_config):
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
 
-    for hf_config_name, megatron_config_name, compare_fn in [
-        ("hidden_size", "hidden_size", equal),
-        ("num_attention_heads", "num_attention_heads", equal),
-        ("num_hidden_layers", "num_layers", equal),
-        ("intermediate_size", "ffn_hidden_size", equal),
-        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
-        ("rms_norm_eps", "norm_epsilon", equal),
-        ("rope_theta", "rotary_base", equal),
-    ]:
+    for hf_config_name, megatron_config_name, compare_fn in (
+        [
+            ("hidden_size", "hidden_size", equal),
+            ("num_attention_heads", "num_attention_heads", equal),
+            ("num_hidden_layers", "num_layers", equal),
+            ("intermediate_size", "ffn_hidden_size", equal),
+            ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+            ("rope_theta", "rotary_base", equal),
+        ]
+        + [("rms_norm_eps", "norm_epsilon", equal)]
+        if hasattr(args, "norm_epsilon")
+        else [("rms_norm_eps", "layernorm_epsilon", equal)]
+    ):
         if hasattr(hf_config, hf_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(
@@ -115,7 +132,7 @@ def _set_default_megatron_args(args):
         args.rope_type = "yarn" if args.multi_latent_attention else "rope"
 
     if args.vocab_size and not args.padded_vocab_size:
-        args.padded_vocab_size = _vocab_size_with_padding(args.vocab_size, args)
+        args.padded_vocab_size = vocab_size_with_padding(args.vocab_size, args)
 
     if not args.tokenizer_model and not args.tokenizer_type:
         logger.info("--tokenizer-model not set, use --hf-checkpoint as tokenizer model.")

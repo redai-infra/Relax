@@ -777,7 +777,7 @@ class MegatronTrainRayActor(TrainRayActor):
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=True)
+            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
@@ -1046,11 +1046,19 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = model_tag
 
     def all_consumed(self, task_name, rollout_id):
-        if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0:
+        # Only (TP=0, PP=0, CP=0) queries the transfer queue; otherwise different cp_ranks
+        # may observe different consumption status due to concurrent fetches and diverge,
+        # leaving some ranks idle while others enter the next collective and hang.
+        if (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        ):
             status = [run(self.data_system_client.async_check_consumption_status(task_name, f"train_{rollout_id}"))]
         else:
             status = [True]
         status = torch.tensor(status, device=device_utils.make_current_torch_device())
+        dist.broadcast(status, group=mpu.get_context_parallel_group(), group_src=0)
         dist.broadcast(status, group=mpu.get_tensor_model_parallel_group(), group_src=0)
         dist.broadcast(status, group=mpu.get_pipeline_model_parallel_group(), group_src=0)
 

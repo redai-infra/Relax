@@ -2058,6 +2058,10 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    # Backward compatibility: old scripts may pass --enable-gloo-process-groups
+    if not hasattr(args, "use_gloo_process_groups"):
+        args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
+
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.max_staleness < 0:
