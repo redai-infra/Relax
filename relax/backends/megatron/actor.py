@@ -606,6 +606,13 @@ class MegatronTrainRayActor(TrainRayActor):
             except Exception as e:
                 logger.warning(f"Error triggering evaluation for rollout_id {rollout_id}: {e}")
 
+        # On the final training step the rollout component has already exited
+        # its main loop, so nothing else awaits the eval handler. Block here
+        # until eval finishes; otherwise the controller's atexit shutdown
+        # races with eval and tears down the SGLang engines mid-flight.
+        if is_train_done:
+            self._wait_for_previous_eval()
+
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -758,6 +765,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.warning(
                     f"Error during async weight update: {e}, maybe cause by rollout server failure. Will continue without async update for this step."
                 )
+            # On the final training step the rollout component has already
+            # exited its main loop, so the eval just triggered above will not
+            # be awaited anywhere. Block until it finishes; otherwise the
+            # controller's atexit shutdown races with eval and tears down the
+            # SGLang engines mid-flight.
+            if (rollout_id + 1) == self.args.num_rollout:
+                self._wait_for_previous_eval()
             if self.args.use_routing_replay:
                 RoutingReplay.clear_all()
         total_lengths = rollout_data["total_lengths"]
