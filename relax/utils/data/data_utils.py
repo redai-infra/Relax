@@ -150,8 +150,12 @@ def build_messages(
                     built_message["content"] = content_list
                     built_prompt.append(built_message)
                 elif isinstance(message["content"], list):
-                    # Already processed, skip
-                    logger.warning("message['content'] is a list of dicts, no processing will be done.")
+                    # Pre-structured content: count multimodal items so the
+                    # remain_data check below doesn't false-positive.
+                    for item in message["content"]:
+                        item_type = item.get("type")
+                        if item_type in remain_data:
+                            remain_data[item_type] -= 1
                     built_prompt.append(message)
                 else:
                     raise ValueError(
