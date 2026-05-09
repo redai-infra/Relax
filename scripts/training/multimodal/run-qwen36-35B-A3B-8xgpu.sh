@@ -27,6 +27,11 @@ CKPT_ARGS=(
    --hf-checkpoint ${EXP_DIR}/Qwen3.6-35B-A3B
    --ref-load ${EXP_DIR}/Qwen3.6-35B-A3B
    --megatron-to-hf-mode bridge
+
+   --load ${EXP_DIR}/save/Qwen3.6-35B_mcore_8xgpu/
+   --save ${EXP_DIR}/save/Qwen3.6-35B_mcore_8xgpu/
+   --max-actor-ckpt-to-keep 1
+   --save-interval 100
 )
 
 PROMPT_SET="${EXP_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet"
