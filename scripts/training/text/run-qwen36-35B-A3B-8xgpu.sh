@@ -5,7 +5,7 @@
 # Qwen3.5-35B-A3B 16xGPU (2-node) fully sync training script for DAPO math dataset.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen35-35B-A3B-16xgpu-sync.sh
+#   bash scripts/training/text/run-qwen36-35B-A3B-16xgpu-sync.sh
 
 set -ex
 set -o pipefail
@@ -18,19 +18,19 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
+source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3.5-35B-A3B/
-   --ref-load ${EXP_DIR}/Qwen3.5-35B-A3B/
+   --hf-checkpoint ${EXP_DIR}/Qwen3.6-35B-A3B/
+   --ref-load ${EXP_DIR}/Qwen3.6-35B-A3B/
    --megatron-to-hf-mode bridge
 
-   --load ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
-   --save ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
+   --load ${EXP_DIR}/save/Qwen3.6-35B-A3B_mcore_8xgpu/
+   --save ${EXP_DIR}/save/Qwen3.6-35B-A3B_mcore_8xgpu/
    --save-interval 100
    --max-actor-ckpt-to-keep 1
 )
@@ -66,11 +66,12 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 2
-   --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --context-parallel-size 2
+   --calculate-per-token-loss
+   --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
@@ -78,7 +79,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
+   --max-tokens-per-gpu 10240
 )
 
 GRPO_ARGS=(
@@ -120,7 +121,7 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen35-35B-A3B-16x-sync-${now}
+   --tb-experiment-name qwen36-35B-A3B-16x-sync-${now}
 )
 
 MISC_ARGS=(
@@ -134,12 +135,19 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+PARTIAL_ROLLOUT_ARGS=(
+    --partial-rollout
+    --over-sampling-batch-size 48
+    --mask-offpolicy-in-partial-rollout
+    --partial-rollout-max-aborted-count 3
+)
+
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 16], "rollout": [1, 16]}' \
+   --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
    --colocate \
    --max-staleness 0 \
    "${MODEL_ARGS[@]}" \
@@ -151,4 +159,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-35B-A3B-GRPO-gpu16-sync-${now}.log
+   "${PARTIAL_ROLLOUT_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen36-35B-A3B-GRPO-gpu8-sync-${now}.log

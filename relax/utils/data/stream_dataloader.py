@@ -464,10 +464,18 @@ def post_process_rollout_data(args, rollout_data):
     padded_total_lengths = maybe_padded_total_lengths(
         rollout_data["total_lengths"],
         args.qkv_format,
-        "multimodal_train_inputs" in rollout_data,
+        "multimodal_train_inputs" in rollout_data or getattr(args, "uses_unsplit_forward", False),
     )
 
-    for key in ["rollout_log_probs", "teacher_log_probs"]:
+    for key in [
+        "log_probs",
+        "ref_log_probs",
+        "rollout_log_probs",
+        "teacher_log_probs",
+        "advantages",
+        "returns",
+        "opd_reverse_kl",
+    ]:
         if key not in rollout_data:
             continue
         rollout_data[key] = [

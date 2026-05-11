@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
 from relax.utils import device as device_utils
@@ -167,14 +168,16 @@ def get_batch(
         packed_seq_params = None
 
     elif qkv_format == "thd":
-        # VL + CP > 1: bridge's Qwen3VLModel.forward expects per-sample
+        # bridge Qwen3VLModel.forward (used for Qwen3-VL and text-only
+        # Qwen3.5 / Qwen3.6 sharing the same architecture) expects per-sample
         # BSHD-padded input_ids + attention_mask, and re-derives the THD
         # packing internally with align_size = tp*cp*2.  Provide unsplit
         # inputs and a matching packed_seq_params so the caller-side cu_seqlens
         # agrees with what the bridge derives from attention_mask.
         # Mirrors verl's build_vlm_attn_mask_thd + preprocess_thd_engine.
         is_vl_model = batch.get("multimodal_train_inputs") is not None
-        if is_vl_model and cp_size > 1:
+        needs_unsplit_input = is_vl_model or getattr(get_args(), "uses_unsplit_forward", False)
+        if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
             device = device_utils.make_current_torch_device()
@@ -591,7 +594,7 @@ def log_rollout_data(
         padded_total_lengths = maybe_padded_total_lengths(
             total_lengths,
             args.qkv_format,
-            rollout_data.get("multimodal_train_inputs") is not None,
+            rollout_data.get("multimodal_train_inputs") is not None or getattr(args, "uses_unsplit_forward", False),
         )
 
         # OPD dynamic metric: overlap ratio on top-k token sets.
@@ -747,7 +750,8 @@ def log_rollout_data(
             correct_padded_total_lengths_full = maybe_padded_total_lengths(
                 total_lengths,
                 args.qkv_format,
-                rollout_data.get("multimodal_train_inputs") is not None,
+                rollout_data.get("multimodal_train_inputs") is not None
+                or getattr(args, "uses_unsplit_forward", False),
             )
             correct_padded_total_lengths: list[int] | None = (
                 [] if correct_padded_total_lengths_full is not None else None

@@ -69,6 +69,24 @@ class LinearForLastLayer(torch.nn.Linear):
 _CP_PROBE_INSTALLED = False
 
 
+def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module) -> None:
+    """Mark `args.uses_unsplit_forward` when the bridge produces a model whose
+    forward expects UNSPLIT input + global cu_seqlens + attention_mask and does
+    CP+SP splitting internally (Qwen3VLModel family — used for Qwen3-VL and
+    text-only Qwen3.5 / Qwen3.6 sharing the same architecture).
+
+    Read by data.py / loss.py to build unsplit tokens + tp*cp*2-aligned
+    cu_seqlens instead of the pre-split + cp-multiplied form, and by model.py
+    to route those through the forward.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    except ImportError:
+        return
+    if isinstance(model, Qwen3VLModel):
+        args.uses_unsplit_forward = True
+
+
 def _install_cp_probe(model: torch.nn.Module) -> None:
     global _CP_PROBE_INSTALLED
     if _CP_PROBE_INSTALLED:
@@ -166,6 +184,7 @@ def get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
+            _maybe_mark_unsplit_forward(args, model)
             _install_cp_probe(model)
             return model
 
@@ -249,6 +268,7 @@ def get_model_provider_func(
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
             model = original_provide(*p_args, **p_kwargs)
+            _maybe_mark_unsplit_forward(args, model)
             _install_cp_probe(model)
             return model
 
@@ -359,6 +379,7 @@ def get_model_provider_func(
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
+        _maybe_mark_unsplit_forward(args, model)
         _install_cp_probe(model)
         return model
 

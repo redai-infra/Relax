@@ -789,3 +789,21 @@ index 7fcf295e..7ac11345 100644
          return MegatronMappingRegistry(*mapping_list)
  
  
+diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
+index 8df4df1e5..fa86be44d 100644
+--- a/megatron/core/ssm/gated_delta_net.py
++++ b/megatron/core/ssm/gated_delta_net.py
+@@ -444,9 +444,10 @@ class GatedDeltaNet(MegatronModule):
+ 
+         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
+         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
+-        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+-            qkv, gate, beta, alpha, batch, seq_len
+-        )
++        with torch._dynamo.config.patch(disable=True):
++            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
++                qkv, gate, beta, alpha, batch, seq_len
++            )
+         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
+ 
+         # Calculate g and beta

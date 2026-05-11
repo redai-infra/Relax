@@ -259,21 +259,22 @@ def forward_only(
 
         is_vl_model = batch.get("multimodal_train_inputs", None) is not None
         mm_kwargs = batch["multimodal_train_inputs"] if is_vl_model else {}
+        needs_unsplit = is_vl_model or getattr(args, "uses_unsplit_forward", False)
 
-        # VL + CP > 1: pass unsplit tokens so Bridge handles CP split after
-        # vision embedding (aligns with Bridge's qwen3_vl_step.py contract).
-        if is_vl_model and "unsplit_tokens" in batch:
+        # Bridge Qwen3VLModel.forward (VL or text-only Qwen3.6) does CP+SP
+        # splitting internally, so pass unsplit tokens.
+        if needs_unsplit and "unsplit_tokens" in batch:
             forward_input_ids = batch["unsplit_tokens"]
             forward_packed_seq_params = None
         else:
             forward_input_ids = tokens
             forward_packed_seq_params = packed_seq_params
 
-        # thd VL+CP: bridge needs per-sample attention_mask + matching thd
+        # thd bridge+CP: bridge needs per-sample attention_mask + matching thd
         # packed_seq_params (align_size = tp*cp*2).  loss_mask is None because
         # labels=None means GPTModel won't run internal loss; Relax's loss is
         # computed externally from full_loss_masks.
-        if is_vl_model and "vlm_packed_seq_params" in batch:
+        if needs_unsplit and "vlm_packed_seq_params" in batch:
             forward_attention_mask = batch["unsplit_attention_mask"]
             forward_packed_seq_params = batch["vlm_packed_seq_params"]
             forward_loss_mask = None
@@ -455,7 +456,8 @@ def train_one_step(
             )
         else:
             is_vl_model = batch.get("multimodal_train_inputs", None) is not None
-            use_unsplit = is_vl_model and "unsplit_tokens" in batch
+            needs_unsplit = is_vl_model or getattr(args, "uses_unsplit_forward", False)
+            use_unsplit = needs_unsplit and "unsplit_tokens" in batch
 
             forward_kwargs = {
                 "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
@@ -470,7 +472,7 @@ def train_one_step(
             # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
             # because labels=None means GPTModel won't run internal loss;
             # Relax's loss is computed externally from full_loss_masks.
-            if is_vl_model and "vlm_packed_seq_params" in batch:
+            if needs_unsplit and "vlm_packed_seq_params" in batch:
                 forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
                 forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
                 forward_kwargs["loss_mask"] = None

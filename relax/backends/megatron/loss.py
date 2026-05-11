@@ -465,7 +465,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
         total_lengths,
         args.qkv_format,
-        rollout_data.get("multimodal_train_inputs") is not None,
+        rollout_data.get("multimodal_train_inputs") is not None or getattr(args, "uses_unsplit_forward", False),
     )
 
     # return when not the last pp stage.
