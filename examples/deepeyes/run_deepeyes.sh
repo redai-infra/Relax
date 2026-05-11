@@ -190,7 +190,6 @@ MEGATRON_ARGS=(
 ###############################################################################
 
 RAY_RESOURCE_ARGS=(
-    --rollout-num-gpus-per-engine 1
     --resource '{"actor": [1, 8], "rollout": [1, 8]}'
     --max-staleness 0
     --num-data-storage-units 1
