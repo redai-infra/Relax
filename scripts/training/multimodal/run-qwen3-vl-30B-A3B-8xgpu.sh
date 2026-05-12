@@ -94,6 +94,10 @@ OPTIMIZER_ARGS=(
    --no-rope-fusion
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
+
+   --fp16
+   --use-rollout-routing-replay
+   --use-slime-router
 )
 
 SGLANG_ARGS=(

@@ -96,6 +96,10 @@ OPTIMIZER_ARGS=(
    # NOTE(wuhuan): to avoid algorithm performance degradation
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
+
+   # --fp16 # Qwen3.5 does not support fp16 training for now
+   --use-rollout-routing-replay
+   --use-slime-router
 )
 
 SGLANG_ARGS=(

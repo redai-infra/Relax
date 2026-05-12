@@ -469,6 +469,8 @@ class EngineGroup:
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            if getattr(self.args, "fp16", False):
+                env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,

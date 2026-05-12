@@ -415,10 +415,14 @@ def get_serve_url(route_prefix: str = "") -> str:
     # 1. Determine head node IP. Prefer Ray cluster state; fall back to
     #    local hostname resolution for client-on-head scenarios.
     try:
-        # ray.nodes() returns info for all nodes
+        # ray.nodes() returns info for all nodes. Ray 2.x auto-registers
+        # "node:__internal_head__" on the head node; some legacy setups also
+        # mark it with a custom "head" resource. Accept either.
         for node in ray.nodes():
-            if node["Alive"] and node.get("Resources", {}).get("head"):
-                # Some setups mark head with a 'head' resource; not always present
+            if not node["Alive"]:
+                continue
+            resources = node.get("Resources", {})
+            if "node:__internal_head__" in resources or resources.get("head"):
                 head_ip = node["NodeManagerAddress"]
                 break
         else:

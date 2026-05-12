@@ -170,6 +170,8 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
         }
+        if getattr(args, "fp16", False):
+            env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
         genrm_engine = GenRMRayActor.options(
             num_cpus=num_cpus,
