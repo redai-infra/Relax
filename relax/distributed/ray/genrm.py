@@ -143,12 +143,16 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
         if all_genrm_engines[i] is not None:
             continue
 
-        num_gpus = getattr(args, "genrm_ray_num_gpus", 0.2)
+        # Lower default fractional-GPU footprint when sharing bundles with rollout
+        # (rollout uses 0.2 per actor; 0.2 + 0.2 risks Ray scheduler rejection).
+        shared_with_rollout = getattr(args, "_genrm_colocate_with_rollout", False)
+        default_ray_num_gpus = 0.1 if shared_with_rollout else 0.2
+        num_gpus = getattr(args, "genrm_ray_num_gpus", default_ray_num_gpus)
         num_cpus = num_gpus
 
         gpu_idx = i * num_gpu_per_engine
 
-        if not args.fully_async:
+        if not args.fully_async and not shared_with_rollout:
             gpu_idx += args.rollout_num_gpus
 
         # Get the base GPU ID from placement group

@@ -387,7 +387,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def train(self, rollout_id: int) -> None:
-        # offload genrm before train
+        # offload genrm before train (rollout has already self-offloaded at end of _async_run)
         if self.args.offload_rollout and dist.get_rank() == 0 and self.genrm_manager is not None:
             ray.get(self.genrm_manager.offload.remote())
 
@@ -821,10 +821,13 @@ class MegatronTrainRayActor(TrainRayActor):
             return
 
         if self.args.offload_rollout and dist.get_rank() == 0:
-            # Onload genRM manager if exists (for colocated mode with shared GPU)
+            # Onload rollout (weights) and genrm (KV resume only — genrm has no NCCL
+            # weight sync since the reward model is static) in parallel so both engines
+            # come back together before the next rollout step.
+            onload_handles = [self.rollout_manager.onload_weights.remote()]
             if self.genrm_manager is not None:
-                ray.get(self.genrm_manager.onload.remote())
-            ray.get(self.rollout_manager.onload_weights.remote())
+                onload_handles.append(self.genrm_manager.onload.remote())
+            ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:

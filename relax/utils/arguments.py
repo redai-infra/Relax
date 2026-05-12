@@ -1738,7 +1738,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "JSON dict for genRM engine initialisation. "
                     "Setting this enables genRM. Example: "
-                    '{ "dp_size": 1, "pp_size": 1, "max_total_tokens": 8192}'
+                    '{ "dp_size": 1, "pp_size": 1, "max_total_tokens": 8192}. '
+                    'When sharing GPUs with rollout, set "mem_fraction_static" here '
+                    "to control genRM's per-GPU memory share independently from rollout."
                 ),
             )
             parser.add_argument(
@@ -2263,6 +2265,7 @@ def slime_validate_args(args):
 
     # Check if genRM is enabled
     genrm_enabled = args.genrm_model_path is not None
+    args._genrm_colocate_with_rollout = False
 
     # always true on offload for colocate at the moment.
     if args.colocate and not genrm_enabled:
@@ -2291,20 +2294,31 @@ def slime_validate_args(args):
                 "For example: --rollout-num-gpus 4 --genrm-num-gpus 4 on an 8-GPU machine."
             )
 
-        total_inference_gpus = args.rollout_num_gpus + args.genrm_num_gpus
         actor_total_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
         if args.use_critic:
             actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
-        if total_inference_gpus > actor_total_gpus:
-            raise ValueError(
-                f"In colocated mode with genRM enabled, total inference GPUs (rollout: {args.rollout_num_gpus} + genrm: {args.genrm_num_gpus} = {total_inference_gpus}) "
-                f"exceed actor GPUs ({actor_total_gpus}). Adjust --rollout-num-gpus and/or --genrm-num-gpus."
-            )
-        elif total_inference_gpus < actor_total_gpus:
+        rollout_g = args.rollout_num_gpus
+        genrm_g = args.genrm_num_gpus
+        if rollout_g + genrm_g == actor_total_gpus:
+            args._genrm_colocate_with_rollout = False
             logger.info(
-                f"In colocated mode with genRM: rollout uses {args.rollout_num_gpus} GPUs, genRM uses {args.genrm_num_gpus} GPUs, "
-                f"total {total_inference_gpus} out of {actor_total_gpus} actor GPUs."
+                f"GenRM colocate (split bundles): rollout={rollout_g}, genrm={genrm_g}, "
+                f"actor total={actor_total_gpus}."
+            )
+        elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
+            args._genrm_colocate_with_rollout = True
+            logger.info(
+                f"GenRM colocate (shared bundles with rollout): rollout=genrm={actor_total_gpus} GPUs. "
+                f"Set per-engine SGLang mem_fraction_static via --sglang-config (rollout) and "
+                f"--genrm-engine-config '{{\"mem_fraction_static\": <float>}}' (genrm)."
+            )
+        else:
+            raise ValueError(
+                "In colocated mode with genRM enabled, GPU allocation must satisfy one of:\n"
+                f"  (1) split: --rollout-num-gpus + --genrm-num-gpus == actor total ({actor_total_gpus}), or\n"
+                f"  (2) shared: --rollout-num-gpus == --genrm-num-gpus == actor total ({actor_total_gpus}).\n"
+                f"Got rollout={rollout_g}, genrm={genrm_g}, actor total={actor_total_gpus}."
             )
 
     if args.offload_train is None:

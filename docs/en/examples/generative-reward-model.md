@@ -16,19 +16,42 @@ Both scripts in this example train **Qwen3-4B** with **GRPO** on the `dapo-math-
 
 ## Architecture
 
-In the recommended **colocate mode**, all 8 GPUs are owned by the Actor (training). During the inference phase, the Actor offloads its weights and the GPUs are time-shared: 4 GPUs run the Rollout engine, and the other 4 GPUs run the GenRM engine. Once inference is complete, GenRM and Rollout offload their weights back, and all 8 GPUs are reclaimed for training. This means the GenRM GPUs are not wasted — they directly accelerate training when not evaluating.
+In the recommended **colocate mode**, all GPUs are owned by the Actor (training). During the inference phase, the Actor offloads its weights and the GPUs are time-shared by Rollout and GenRM. Once inference is complete, GenRM and Rollout offload their weights back, and all GPUs are reclaimed for training. The GenRM GPUs are therefore not wasted — they directly accelerate training when not evaluating.
+
+Two colocate sub-modes are auto-detected from your GPU allocation:
+
+- **Split mode** (`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`): Rollout and GenRM occupy disjoint GPU bundles. Best when both engines are small enough that giving each a dedicated slice is more efficient than sharing.
+- **Shared mode** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`): Rollout and GenRM occupy the **same** GPU bundles, splitting each GPU's memory via SGLang `mem_fraction_static`. Best when GenRM is large (e.g., 30B) and benefits from full-cluster TP, while still leaving room for Rollout. Requires no extra CLI flag — it activates automatically.
 
 ```
-                 8-GPU Colocate Mode
+                 8-GPU Colocate (Split)
 
  ┌──────────── Placement Group (8 GPU) ────────────┐
  │                                                 │
  │  Inference phase:                               │
  │  ┌───────────────────┐   ┌───────────────────┐  │
  │  │  Rollout  (4 GPU) │──►│  GenRM   (4 GPU)  │  │
- │  │  SGLang Engine    │◄──│  SGLang Engine    │  │
+ │  │  bundles 0..3     │◄──│  bundles 4..7     │  │
  │  └───────────────────┘   └───────────────────┘  │
- │                  Score: 0 / 1                   │
+ │                                                 │
+ │  Training phase (offload inference weights):    │
+ │  ┌─────────────────────────────────────────┐    │
+ │  │         Actor  (8 GPU)                  │    │
+ │  │         Megatron Training               │    │
+ │  └─────────────────────────────────────────┘    │
+ └─────────────────────────────────────────────────┘
+
+
+              8-GPU Colocate (Shared)
+
+ ┌──────────── Placement Group (8 GPU) ────────────┐
+ │                                                 │
+ │  Inference phase (same bundles 0..7):           │
+ │  ┌─────────────────────────────────────────┐    │
+ │  │  Rollout: mem_fraction_static = 0.6     │    │
+ │  │  GenRM  : mem_fraction_static = 0.3     │    │
+ │  │  ~0.1 reserved for cuda / activations   │    │
+ │  └─────────────────────────────────────────┘    │
  │                                                 │
  │  Training phase (offload inference weights):    │
  │  ┌─────────────────────────────────────────┐    │
@@ -38,7 +61,7 @@ In the recommended **colocate mode**, all 8 GPUs are owned by the Actor (trainin
  └─────────────────────────────────────────────────┘
 ```
 
-All components live in the same placement group. During the inference phase, 4 GPUs run Rollout and 4 GPUs run GenRM. Rollout generates candidate responses and sends them with the ground-truth label to GenRM over HTTP; GenRM returns a binary score (1 = consistent, 0 = inconsistent). After reward computation, inference weights are offloaded and all 8 GPUs are reclaimed by the Actor for training.
+All components live in the same placement group. Rollout generates candidate responses and sends them with the ground-truth label to GenRM over HTTP; GenRM returns a binary score (1 = consistent, 0 = inconsistent). After reward computation, inference weights are offloaded and all GPUs are reclaimed by the Actor for training.
 
 ## Scripts
 
@@ -49,15 +72,23 @@ All components live in the same placement group. During the inference phase, 4 G
 
 ### Resource Layout
 
-**Colocate mode** (`--colocate`, recommended):
+**Colocate / Split** (`--colocate`, recommended for small GenRM):
 
 ```
 Actor (training):  8 GPU  (all GPUs participate in training)
-Rollout:           4 GPU  (time-shared with actor via offload)
-GenRM:             4 GPU  (time-shared with actor via offload)
+Rollout:           4 GPU  (bundles 0..3, time-shared with actor)
+GenRM:             4 GPU  (bundles 4..7, time-shared with actor)
 ```
 
-In this mode, the GenRM GPUs are not idle during training — they are offloaded back to the Actor for gradient computation, effectively giving training the full 8-GPU parallelism.
+**Colocate / Shared** (`--colocate`, recommended for large GenRM):
+
+```
+Actor (training):  8 GPU  (all GPUs participate in training)
+Rollout:           8 GPU  (bundles 0..7, mem_fraction_static = 0.6)
+GenRM:             8 GPU  (bundles 0..7, mem_fraction_static = 0.3)
+```
+
+In both colocate sub-modes, GenRM GPUs are offloaded back to the Actor for gradient computation during training, giving training full 8-GPU parallelism. Shared mode additionally lets GenRM use a larger TP (e.g., TP=8 for a 30B model) without giving up Rollout throughput.
 
 **Async mode** (`--fully-async`):
 
@@ -131,27 +162,28 @@ Expected response:
 
 ### Engine Config Keys
 
-| Key                | Type  | Default | Description               |
-| :----------------- | :---- | :------ | :------------------------ |
-| `max_context_len`  | `int` | `8192`  | Maximum context length    |
-| `dp_size`          | `int` | `1`     | Data parallelism size     |
-| `pp_size`          | `int` | `1`     | Pipeline parallelism size |
-| `max_total_tokens` | `int` | `8192`  | Maximum total tokens      |
+| Key                   | Type    | Default          | Description                                                                                  |
+| :-------------------- | :------ | :--------------- | :------------------------------------------------------------------------------------------- |
+| `max_context_len`     | `int`   | `8192`           | Maximum context length                                                                       |
+| `dp_size`             | `int`   | `1`              | Data parallelism size                                                                        |
+| `pp_size`             | `int`   | `1`              | Pipeline parallelism size                                                                    |
+| `ep_size`             | `int`   | `1`              | Expert parallelism size                                                                      |
+| `mem_fraction_static` | `float` | SGLang default   | Per-engine SGLang static memory fraction. Set this in shared-GPU colocate mode (see below).  |
 
 ### Sampling Config Keys
 
 | Key                | Type    | Default | Description                  |
 | :----------------- | :------ | :------ | :--------------------------- |
-| `temperature`      | `float` | `0.2`   | Sampling temperature         |
+| `temperature`      | `float` | `0.1`   | Sampling temperature         |
 | `top_p`            | `float` | `1.0`   | Nucleus sampling probability |
 | `top_k`            | `int`   | `-1`    | Top-k sampling (-1 disables) |
-| `max_response_len` | `int`   | `1024`  | Maximum response length      |
+| `max_response_len` | `int`   | `4096`  | Maximum response length      |
 
 ### Resource Allocation
 
 GenRM is included in the `--resource` JSON as a `"genrm"` role. The format is `[num_groups, num_gpus_per_group]`.
 
-**Colocated mode** (recommended):
+**Colocated / Split** (small GenRM, default):
 
 ```bash
 python3 relax/entrypoints/train.py \
@@ -164,8 +196,33 @@ python3 relax/entrypoints/train.py \
     --rm-type dapo-genrm
 ```
 
-::: warning
-In colocated mode, total inference GPUs (rollout + genRM) must not exceed actor GPUs. For example, on an 8-GPU machine: `--resource '{"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]}'` uses all 8 GPUs for inference, which are shared with training via offload.
+**Colocated / Shared** (large GenRM, NEW): set rollout and genrm to the full actor allocation; the framework auto-detects shared mode and lets the two engines split each GPU's memory via `mem_fraction_static`:
+
+```bash
+python3 relax/entrypoints/train.py \
+    --genrm-model-path /path/to/genrm/model \
+    --genrm-num-gpus-per-engine 8 \
+    --genrm-engine-config '{"max_context_len": 10240, "mem_fraction_static": 0.3}' \
+    --genrm-sampling-config '{"temperature": 0.1, "top_p": 1.0, "top_k": -1, "max_response_len": 1024}' \
+    --rollout-num-gpus-per-engine 1 \
+    --sglang-mem-fraction-static 0.6 \
+    --resource '{"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]}' \
+    --colocate \
+    --rm-type dapo-genrm
+```
+
+::: tip Auto-detected colocate sub-mode
+On `--colocate` with GenRM, the GPU layout determines the sub-mode automatically:
+
+| Allocation                                           | Sub-mode                            |
+| :--------------------------------------------------- | :---------------------------------- |
+| `rollout_num_gpus + genrm_num_gpus == actor_total`   | **Split** (rollout and genrm on disjoint bundles) |
+| `rollout_num_gpus == genrm_num_gpus == actor_total`  | **Shared** (rollout and genrm on the same bundles) |
+| Anything else                                        | Rejected at startup with a clear error |
+:::
+
+::: warning Set `mem_fraction_static` in shared mode
+In shared mode the two SGLang engines live on the same GPUs. You **must** size their `mem_fraction_static` so that the sum is < 1.0 (≤ 0.9 recommended; the rest covers cuda graphs and activations). Rollout reads `--sglang-mem-fraction-static` (or YAML overrides via `--sglang-config`); GenRM reads `mem_fraction_static` inside `--genrm-engine-config`.
 :::
 
 **Fully-Async mode**:
@@ -309,11 +366,15 @@ print(response)  # "1" or "0"
 
 ## Best Practices
 
-1. **Prefer colocate mode**: In colocate mode, GenRM GPUs are offloaded back to training when not evaluating, so all 8 GPUs participate in gradient computation. This gives better GPU utilization than async mode, where GenRM GPUs sit idle during training
-2. **Set appropriate context length**: `max_context_len` in engine config should accommodate your longest prompt + response combination
-3. **Use low sampling temperature**: A temperature of 0.1 produces deterministic evaluations; increase only if evaluation diversity is desired
-4. **Monitor health**: Periodically check the `/health` endpoint to ensure GenRM engines are running properly
-5. **Match GPU allocation to model size**: For large GenRM models (e.g., 30B), allocate more GPUs per engine via `--genrm-num-gpus-per-engine`
+1. **Prefer colocate mode**: In colocate mode, GenRM GPUs are offloaded back to training when not evaluating, so all GPUs participate in gradient computation. This gives better GPU utilization than async mode, where GenRM GPUs sit idle during training.
+2. **Choose the right colocate sub-mode**:
+   - Use **split** when GenRM is small enough to run on a partial slice (e.g., a 4B reward model on 4 GPUs).
+   - Use **shared** when GenRM is large and benefits from cluster-wide TP (e.g., a 30B MoE on TP=8). Shared mode also avoids the "GenRM is too small to use a dedicated bundle and Rollout is starved for GPUs" tradeoff.
+3. **Size `mem_fraction_static` carefully in shared mode**: Sum across engines should be ≤ 0.9. Common starting point: rollout 0.6, genrm 0.3.
+4. **Set appropriate context length**: `max_context_len` in engine config should accommodate your longest prompt + response combination.
+5. **Use low sampling temperature**: A temperature of 0.1 produces deterministic evaluations; increase only if evaluation diversity is desired.
+6. **Monitor health**: Periodically check the `/health` endpoint to ensure GenRM engines are running properly.
+7. **Match GPU allocation to model size**: For large GenRM models (e.g., 30B), use shared mode with `--genrm-num-gpus-per-engine` set to the full cluster size.
 
 ## Troubleshooting
 
@@ -323,13 +384,16 @@ Ensure `--genrm-model-path` is set. GenRM is only activated when this argument i
 
 ### Resource Allocation Error in Colocated Mode
 
-In colocated mode with GenRM, total inference GPUs (rollout + genRM) must not exceed actor GPUs:
+In colocated mode with GenRM, GPU allocation must satisfy **exactly one** of:
 
-```
-rollout_num_gpus + genrm_num_gpus <= actor_total_gpus
-```
+- **Split**: `rollout_num_gpus + genrm_num_gpus == actor_total_gpus`
+- **Shared**: `rollout_num_gpus == genrm_num_gpus == actor_total_gpus`
 
-Adjust the `rollout` and/or `genrm` GPU allocation in `--resource` accordingly.
+Anything else (e.g., `rollout + genrm < actor_total`, or `rollout < actor_total < rollout + genrm`) is rejected at startup. Adjust `rollout` and/or `genrm` in `--resource` to one of the two valid layouts.
+
+### Shared Mode: OOM or Engine Init Fails
+
+If shared mode hits OOM during engine startup or cuda graph capture, lower `mem_fraction_static` for one or both engines so that the per-GPU sum stays ≤ 0.9. With large MoE GenRM models, you may also need to disable cuda graphs or reduce `max_context_len`.
 
 ### Engine Initialization Timeout
 

@@ -32,6 +32,13 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 - **Offload（卸载）**：在 Actor 训练前释放 GPU 显存
 - **Onload（加载）**：在 rollout 前将模型权重重新加载到 GPU
 
+根据 GPU 分配，框架会自动识别两种 colocate 子模式：
+
+- **Split**（`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`）：GenRM 与 Rollout 占用不重叠的 bundle。
+- **Shared**（`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`）：GenRM 与 Rollout 占用相同的 bundle，通过 SGLang 的 `mem_fraction_static` 切分每张 GPU 的显存。GenRM 的 `mem_fraction_static` 从 `--genrm-engine-config` 读取。GenRM 不会从 Actor 同步权重，onload 仅恢复 KV cache 和 CUDA graph。
+
+完整配置参见 [GenRM 示例](/zh/examples/generative-reward-model)。
+
 ## HTTP 端点
 
 <SwaggerUI specUrl="/Relax/openapi/genrm.json" />

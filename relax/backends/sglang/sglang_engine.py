@@ -859,6 +859,11 @@ def _compute_genrm_server_args(
         "enable_weights_cpu_backup": True,
     }
 
+    # Allow per-genrm SGLang mem_fraction_static via --genrm-engine-config; this overrides
+    # the global --sglang-mem-fraction-static below so rollout and genrm can share GPUs.
+    if "mem_fraction_static" in args.genrm_engine_config:
+        kwargs["mem_fraction_static"] = args.genrm_engine_config["mem_fraction_static"]
+
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
         kwargs["load_balance_method"] = "round_robin"
