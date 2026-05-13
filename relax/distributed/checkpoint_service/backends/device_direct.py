@@ -15,6 +15,7 @@ Features:
 
 import asyncio
 import logging
+import os
 import re
 import socket
 import time
@@ -41,6 +42,7 @@ from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
 
 
@@ -107,6 +109,9 @@ class DeviceDirectBackend(CommBackend):
 
         # For recv, we need to know tensor shapes in advance or use a metadata channel
         self._pending_recvs: Dict[str, asyncio.Future] = {}
+        self._group_name: Optional[str] = None
+        self._rollout_group_generation = 0
+        self._rollout_topology_signature: Optional[tuple[tuple[int, str, int, int], ...]] = None
         self._model_update_groups = None
         self._model_update_groups_for_actor_fwd_ref = None
 
@@ -145,6 +150,7 @@ class DeviceDirectBackend(CommBackend):
         if self._bridge_task_map is not None:
             return
 
+        ensure_megatron_bridge_importable()
         from megatron.bridge import AutoBridge
         from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
         from megatron.bridge.models.conversion.param_mapping import AutoMapping
@@ -566,6 +572,21 @@ class DeviceDirectBackend(CommBackend):
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
 
+    def _get_rollout_topology_signature(self) -> tuple[tuple[int, str, int, int], ...]:
+        default_gpus = self.args.rollout_num_gpus_per_engine
+        signature = []
+        for rank, role_info in sorted(self.rollout_topology.items(), key=lambda kv: int(kv[0])):
+            metadata = role_info.get("metadata") if isinstance(role_info, dict) else {}
+            signature.append(
+                (
+                    int(rank),
+                    str(role_info.get("ip")),
+                    int(role_info.get("port")),
+                    int((metadata or {}).get("num_gpus_per_engine", default_gpus)),
+                )
+            )
+        return tuple(signature)
+
     @staticmethod
     def _find_free_port_in_range(port_min: int, port_max: int) -> int:
         """Find a free port within [port_min, port_max] by attempting to bind.
@@ -576,13 +597,23 @@ class DeviceDirectBackend(CommBackend):
 
         ports = list(range(port_min, port_max + 1))
         random.shuffle(ports)
+        skipped_ports: list[tuple[int, int | None, str]] = []
         for port in ports:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.bind(("", port))
+                    logger.info(
+                        "Selected rollout weight update master port %s from range [%s, %s] after skipping %s ports",
+                        port,
+                        port_min,
+                        port_max,
+                        len(skipped_ports),
+                    )
+                    if skipped_ports:
+                        logger.info("Skipped rollout weight update master ports sample: %s", skipped_ports[:10])
                     return port
-            except OSError:
+            except OSError as exc:
+                skipped_ports.append((port, exc.errno, exc.strerror or str(exc)))
                 continue
         raise RuntimeError(f"No free port available in range [{port_min}, {port_max}]")
 
@@ -598,29 +629,51 @@ class DeviceDirectBackend(CommBackend):
         if self._is_pp_src_rank:
             pp_rank = mpu.get_pipeline_model_parallel_rank()
             master_address = ray._private.services.get_node_ip_address()
-            self._group_name = f"slime-pp_{pp_rank}"
+            base_group_name = f"slime-pp_{pp_rank}"
 
             if topology_data is None:
                 raise RuntimeError("topology_data is required for init_process_group_for_rollout")
 
             self.rollout_topology = topology_data.get("nodes", {}).get("rollout", {})
+            rollout_topology_signature = self._get_rollout_topology_signature()
 
             self._create_rollout_engines(self.rollout_topology)
             self._update_rollout_engines()
 
+            reuse_enabled = os.getenv("RELAX_ROLLOUT_PG_REUSE", "1").lower() not in ("0", "false", "no")
+            if (
+                reuse_enabled
+                and self._model_update_groups is not None
+                and self._rollout_topology_signature == rollout_topology_signature
+            ):
+                logger.info(
+                    "Reusing rollout process group: group_name=%s, topology_signature=%s",
+                    self._group_name,
+                    rollout_topology_signature,
+                )
+                return
+
             if self._model_update_groups is not None:
+                old_group_name = self._group_name or base_group_name
                 try:
-                    logger.info("Destroying old process group...")
-                    destroy_payload = {"group_name": self._group_name}
+                    logger.info(
+                        "Destroying old rollout process group: group_name=%s, local_group=%s, rollout_ranks=%s",
+                        old_group_name,
+                        self._model_update_groups,
+                        sorted(self.rollout_engines),
+                    )
+                    destroy_payload = {"group_name": old_group_name}
                     futures = self._batch_request("/destroy_weights_update_group", destroy_payload)
                     dist.destroy_process_group(self._model_update_groups)
                     ray.get(futures)
+                    logger.info("Destroyed old rollout process group: group_name=%s", old_group_name)
                     self._model_update_groups = None
                     # Wait for NCCL socket ports to be released by the OS
                     time.sleep(2.0)
                 except Exception as e:
                     logger.warning(f"Error destroying old process group: {e}")
                     self._model_update_groups = None
+                    self._rollout_topology_signature = None
 
             default_gpus = self.args.rollout_num_gpus_per_engine
             cumulative_offset = 1
@@ -1005,6 +1058,15 @@ class DeviceDirectBackend(CommBackend):
             "weight_version": str(self.weight_version),
             "flush_cache": False,
         }
+        logger.info(
+            "Sending rollout distributed weight bucket: group_name=%s, weight_version=%s, tensors=%s, "
+            "first_tensor=%s, rollout_ranks=%s",
+            self._group_name,
+            self.weight_version,
+            len(converted_named_tensors),
+            converted_named_tensors[0][0] if converted_named_tensors else None,
+            sorted(self.rollout_engines),
+        )
         # Send weight update to all rollout nodes via Ray actors
         futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
@@ -1015,6 +1077,12 @@ class DeviceDirectBackend(CommBackend):
         for handle in handles:
             handle.wait()
         ray.get(futures)  # Ensure remote update completes
+        logger.info(
+            "Completed rollout distributed weight bucket: group_name=%s, weight_version=%s, tensors=%s",
+            self._group_name,
+            self.weight_version,
+            len(converted_named_tensors),
+        )
 
         ray.get(self.lock.release.remote())
         if pbar is not None:

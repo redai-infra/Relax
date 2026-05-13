@@ -3,6 +3,7 @@
 import dataclasses
 
 from relax.utils import megatron_bridge_utils
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.misc import chunk_named_params_by_size
 
 from ..misc_utils import strip_param_name_prefix
@@ -15,6 +16,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        ensure_megatron_bridge_importable()
         from megatron.bridge import AutoBridge
 
         self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)

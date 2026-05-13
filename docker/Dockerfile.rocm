@@ -1,0 +1,157 @@
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG BASE_IMAGE=rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+ARG GPU_ARCH=gfx942
+ARG PYTORCH_ROCM_ARCH="gfx942;gfx950"
+ARG AITER_REPO=https://github.com/ROCm/aiter.git
+ARG AITER_COMMIT=v0.1.11.post1
+ARG AITER_GPU_ARCHS="gfx942;gfx950"
+ARG TRAIN_IMAGE=train
+
+FROM ${BASE_IMAGE} AS base
+
+ARG GPU_ARCH
+ARG PYTORCH_ROCM_ARCH
+
+ENV PYVER=3.12 \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+    TZ=Asia/Shanghai \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    MAX_JOBS=64 \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    SGLANG_DISABLE_CUDNN_CHECK=1 \
+    HIP_FORCE_DEV_KERNARG=1 \
+    HSA_NO_SCRATCH_RECLAIM=1 \
+    SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+    SGLANG_INT4_WEIGHT=0 \
+    SGLANG_MOE_PADDING=1 \
+    SGLANG_ROCM_DISABLE_LINEARQUANT=0 \
+    SGLANG_ROCM_FUSED_DECODE_MLA=1 \
+    SGLANG_SET_CPU_AFFINITY=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential patchelf tmux net-tools htop nano iputils-ping \
+    autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
+    libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync \
+    locales tzdata jq git git-lfs ca-certificates wget && \
+    locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /sgl-workspace && \
+    cd /tmp && git clone -b update-transformers-v5 https://github.com/sgl-project/sglang.git && \
+    mv /tmp/sglang /sgl-workspace/sglang
+
+FROM base AS sglang
+
+ARG GPU_ARCH
+ARG AITER_REPO
+ARG AITER_COMMIT
+ARG AITER_GPU_ARCHS
+
+WORKDIR /sgl-workspace/sglang
+
+# SGLang's ROCm image builds sgl-kernel from source. Installing only
+# python[srt_hip] leaves sgl_kernel missing at runtime.
+RUN python -m pip install --upgrade pip setuptools wheel setuptools_scm scikit-build-core pybind11 && \
+    cd sgl-kernel && \
+    rm -f pyproject.toml && \
+    cp pyproject_rocm.toml pyproject.toml && \
+    SGL_KERNEL_ARCH="${GPU_ARCH%%-*}" && \
+    AMDGPU_TARGET="${SGL_KERNEL_ARCH}" python setup_rocm.py install
+
+# AITER kernels are needed by SGLang's ROCm runtime. Build both MI300 and
+# MI350 targets by default so one image can run on gfx942 and gfx950 hosts.
+RUN python -m pip uninstall -y aiter amd-aiter && \
+    python -m pip install flydsl==0.0.1.dev95158637 psutil pybind11 && \
+    cd /sgl-workspace && \
+    git clone "${AITER_REPO}" aiter && \
+    cd aiter && \
+    git checkout "${AITER_COMMIT}" && \
+    git submodule update --init --recursive && \
+    sed -i '459 s/if.*:/if False:/' aiter/ops/triton/attention/pa_mqa_logits.py && \
+    sed -i '/c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)/i\    config = dict(config)' aiter/ops/triton/gemm/fused/fused_gemm_afp4wfp4_split_cat.py && \
+    PREBUILD_KERNELS=1 GPU_ARCHS="${AITER_GPU_ARCHS}" python setup.py develop
+
+# SGLang keeps ROCm-specific dependency metadata in pyproject_other.toml.
+# Installing the CUDA-default pyproject would pull cu12 wheels into the image.
+RUN cp python/pyproject_other.toml python/pyproject.toml && \
+    pip install -e "python[srt_hip]" --no-build-isolation
+
+FROM sglang AS train
+
+ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
+ARG MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862
+
+RUN cd /root && git clone "${MEGATRON_REPO}" --recursive && \
+    cd /root/Megatron-LM && \
+    git checkout "${MEGATRON_COMMIT}" && \
+    git submodule update --init --recursive && \
+    pip install -e . --no-deps
+
+ARG TRAIN_IMAGE=train
+FROM ${TRAIN_IMAGE} AS relax
+
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
+
+WORKDIR /root
+
+COPY docker/requirements-rocm.txt /tmp/requirements-rocm.txt
+RUN pip install -r /tmp/requirements-rocm.txt && \
+    pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps
+
+RUN pip install git+https://github.com/redai-infra/megatron-bridge.git@f13bec09 --no-build-isolation --no-deps --force-reinstall && \
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
+
+ARG TE_VERSION=2.4.0
+ARG TE_ROCM_RELEASE=rocm-rel-7.2
+
+# Megatron's TE spec needs ROCm TransformerEngine at runtime. Install the
+# ROCm manylinux wheels that match the ROCm 7.2 PyTorch base image.
+RUN mkdir -p /tmp/te-rocm && \
+    cd /tmp/te-rocm && \
+    wget -q "https://repo.radeon.com/rocm/manylinux/${TE_ROCM_RELEASE}/transformer_engine-${TE_VERSION}-py3-none-any.whl" && \
+    wget -q "https://repo.radeon.com/rocm/manylinux/${TE_ROCM_RELEASE}/transformer_engine_rocm-${TE_VERSION}-py3-none-manylinux_2_28_x86_64.whl" && \
+    wget -q "https://repo.radeon.com/rocm/manylinux/${TE_ROCM_RELEASE}/transformer_engine_torch-${TE_VERSION}.tar.gz" && \
+    pip install \
+        "./transformer_engine-${TE_VERSION}-py3-none-any.whl" \
+        "./transformer_engine_rocm-${TE_VERSION}-py3-none-manylinux_2_28_x86_64.whl" \
+        "./transformer_engine_torch-${TE_VERSION}.tar.gz" \
+        --no-build-isolation && \
+    rm -rf /tmp/te-rocm
+
+# Qwen3.5 GatedDeltaNet in Megatron imports the FLA Python package.
+RUN pip install flash-linear-attention==0.5.0
+
+COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+RUN cd /root/Megatron-LM && \
+    git update-index --refresh && \
+    git apply megatron.patch --3way && \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    rm megatron.patch
+
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+    cd /sgl-workspace/sglang && git add . && \
+    git update-index --refresh && \
+    git apply sglang.patch --3way && \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    rm sglang.patch; \
+fi
+
+# TODO(zty): remove this comment after testing
+# WORKDIR /root/
+# COPY . .
+# RUN pip install -e . --no-deps

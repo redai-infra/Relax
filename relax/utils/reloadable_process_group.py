@@ -1,7 +1,12 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
 import time
+import socket
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -70,10 +75,16 @@ def monkey_patch_torch_dist(args=None):
         """Wrap communication functions with memory check."""
 
         def new_function(*args, **kwargs):
-            args = tuple([arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args])
+            original_args = args
+            original_kwargs = kwargs
+            args = tuple(arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args)
             kwargs = {k: (v.group if isinstance(v, ReloadableProcessGroup) else v) for k, v in kwargs.items()}
             with _wrap_low_level_call():
-                return func(*args, **kwargs)
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    _log_distributed_exception(func.__name__, original_args, original_kwargs, exc)
+                    raise
 
         return new_function
 
@@ -238,7 +249,11 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         if inner is None:
             raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
         with _wrap_low_level_call():
-            return getattr(inner, method)(*args, **kwargs)
+            try:
+                return getattr(inner, method)(*args, **kwargs)
+            except Exception as exc:
+                _log_distributed_exception(method, (self, *args), kwargs, exc)
+                raise
 
     def _fwd_query(self, method, *args, **kwargs):
         """Forward non-communication calls without memory check."""

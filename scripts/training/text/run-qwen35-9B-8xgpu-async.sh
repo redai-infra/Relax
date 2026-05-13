@@ -133,7 +133,7 @@ MISC_ARGS=(
 )
 
 mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:${RAY_DASHBOARD_PORT:-8265}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \

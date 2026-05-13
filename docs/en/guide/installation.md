@@ -17,6 +17,44 @@ Since Relax may include temporary patches for sglang/megatron, we strongly recom
 
 The current image supports H-series GPUs.
 
+For AMD Instinct MI355/MI350 class systems, use the experimental ROCm build path in `docker/Dockerfile.rocm`. The default Docker image remains CUDA-only.
+
+Build the ROCm image first:
+
+```bash
+cd Relax
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.rocm \
+  --target relax \
+  -t relax:rocm-relax-smoke \
+  .
+```
+
+The reference configuration validated during MI355 enablement uses
+`rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1` as the base
+image.
+
+For MI355/MI350 development, prefer bind-mounting the host checkout into the
+container so code changes live on the physical machine instead of only inside
+the image:
+
+```bash
+cd Relax
+chmod +x docker/run-rocm-bind.sh
+CONTAINER_NAME=relax_rocm_bind docker/run-rocm-bind.sh
+docker exec -it relax_rocm_bind bash
+```
+
+To run a real-model 2-GPU training smoke inside that container:
+
+```bash
+cd /root/Relax
+CUDA_VISIBLE_DEVICES=6,7 \
+REAL_HF_MODEL_DIR=/mnt/dcgpuval/models/meta-llama/Meta-Llama-3-8B-Instruct \
+NUM_GPUS=2 \
+bash scripts/training/text/run-llama3-8b-2xgpu-debug.sh
+```
+
 Run the following commands to clone the repository, pull the latest image, and start an interactive container:
 
 ```bash

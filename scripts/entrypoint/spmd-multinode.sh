@@ -49,6 +49,7 @@ set -x
 
 # ── environment setup ───────────────────────────────────────────────────────
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "${DIR}/device_env.sh"
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
@@ -56,17 +57,12 @@ export RELAX=${RELAX:-${DIR}/../../}
 export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
 
-# ── NVLink detection ────────────────────────────────────────────────────────
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
-if [ "$NVLINK_COUNT" -gt 0 ]; then
-    export HAS_NVLINK=1
-else
-    export HAS_NVLINK=0
-fi
+# ── fast interconnect detection ────────────────────────────────────────────
+export HAS_NVLINK="$(relax_detect_fast_interconnect)"
 if [ -n "$NCCL_NVLS_ENABLE" ] && [ "$NCCL_NVLS_ENABLE" -eq 0 ]; then
     export HAS_NVLINK=0
 fi
-echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+echo "HAS_NVLINK: $HAS_NVLINK"
 
 # ── multi-node parameters ──────────────────────────────────────────────────
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -113,6 +109,9 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
    \"PYTHONUNBUFFERED\": \"1\",
    \"PYTHONPATH\": \"${PYTHONPATH}\",
    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+   \"ROCR_VISIBLE_DEVICES\": \"${ROCR_VISIBLE_DEVICES:-}\",
+   \"HIP_VISIBLE_DEVICES\": \"${HIP_VISIBLE_DEVICES:-}\",
+   \"CUDA_VISIBLE_DEVICES\": \"${CUDA_VISIBLE_DEVICES:-}\",
    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
    \"MASTER_ADDR\": \"${HOST_IP}\"

@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from relax.utils.device_utils import detect_fast_interconnect
 from relax.utils.external.typer_utils import dataclass_cli
 from relax.utils.misc import exec_command
 
@@ -181,8 +182,7 @@ def _parse_extra_env_vars(text: str):
 
 
 def check_has_nvlink():
-    output = exec_command("nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l", capture_output=True)
-    return int(output) > 0
+    return detect_fast_interconnect()
 
 
 def get_default_wandb_args(test_file: str, run_name_prefix: str | None = None, run_id: str | None = None):

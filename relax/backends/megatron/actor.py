@@ -17,7 +17,6 @@ import torch.distributed as dist
 import transfer_queue as tq
 from megatron.core import mpu
 from tensordict import TensorDict
-from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
@@ -31,6 +30,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.external.torch_memory_saver import torch_memory_saver
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
@@ -65,6 +65,32 @@ from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _warmup_actor_reduce_scatter_once(rollout_id: int) -> None:
+    if rollout_id != 0:
+        return
+
+    group = mpu.get_data_parallel_group(with_context_parallel=True)
+    world_size = dist.get_world_size(group=group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    output = torch.empty(8, device=device, dtype=torch.float32)
+    input_tensor = torch.ones(8 * world_size, device=device, dtype=torch.float32)
+
+    logger.info(
+        "Running actor dummy reduce-scatter warmup for rollout_id=%s, rank=%s, group_world_size=%s",
+        rollout_id,
+        dist.get_rank(group=group),
+        world_size,
+    )
+    try:
+        opts = dist.ReduceScatterOptions()
+        opts.reduceOp = dist.ReduceOp.SUM
+        group.reduce_scatter_tensor_coalesced([output], [input_tensor], opts).wait()
+    except AttributeError:
+        dist.reduce_scatter_tensor(output, input_tensor, op=dist.ReduceOp.SUM, group=group)
+    torch.cuda.synchronize()
+    logger.info("Actor dummy reduce-scatter warmup completed for rollout_id=%s", rollout_id)
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -692,6 +718,8 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+
+        _warmup_actor_reduce_scatter_once(rollout_id)
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train step.")
         data_fields = [

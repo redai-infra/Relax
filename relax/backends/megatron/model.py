@@ -25,6 +25,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.utils import tracking_utils
+from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
 from relax.utils.timer import timer
@@ -802,6 +803,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
     )
 
     try:
+        ensure_megatron_bridge_importable()
         from megatron.bridge import AutoBridge
 
         from relax.utils.megatron_bridge_utils import patch_megatron_model

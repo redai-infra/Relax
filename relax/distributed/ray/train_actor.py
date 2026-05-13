@@ -20,12 +20,36 @@ from relax.utils.memory_utils import clear_memory, print_memory
 logger = get_logger(__name__)
 
 
+def _assigned_gpu_ids() -> list[str]:
+    gpu_ids = []
+    for gpu_id in ray.get_gpu_ids():
+        if isinstance(gpu_id, float) and gpu_id.is_integer():
+            gpu_ids.append(str(int(gpu_id)))
+        else:
+            gpu_ids.append(str(gpu_id))
+    return gpu_ids
+
+
+def _configure_visible_devices_for_current_actor() -> None:
+    assigned_gpu_ids = _assigned_gpu_ids()
+    if not assigned_gpu_ids:
+        return
+
+    joined_ids = ",".join(assigned_gpu_ids)
+    if torch.version.hip is not None:
+        # On ROCm, Ray must not rewrite HIP_VISIBLE_DEVICES. Keep the full
+        # visible device list and select the assigned device with set_device().
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = joined_ids
+
+
 def get_local_gpu_id():
     cvd = os.environ.get(device_utils.get_visible_devices_env_var(), None)
     if cvd is None:
         return ray.get_gpu_ids()[0]
-    else:
-        return cvd.split(",").index(str(ray.get_gpu_ids()[0]))
+    return to_local_visible_device_index(int(ray.get_gpu_ids()[0]))
 
 
 class TrainRayActor(RayActor):
@@ -44,6 +68,7 @@ class TrainRayActor(RayActor):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
+        _configure_visible_devices_for_current_actor()
         # TODO: currently this doesn't work as ray has already set torch.cuda.device_count().
         # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import logging
 import os
 from typing import Any
 
@@ -8,6 +9,13 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.utils.external.torch_memory_saver import (
+    TORCH_MEMORY_SAVER_AVAILABLE,
+    TORCH_MEMORY_SAVER_IMPORT_ERROR,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class RayTrainGroup:
@@ -62,17 +70,23 @@ class RayTrainGroup:
         }
 
         if self.args.offload_train and self.args.train_backend == "megatron":
-            import torch_memory_saver
+            if TORCH_MEMORY_SAVER_AVAILABLE:
+                import torch_memory_saver
 
-            dynlib_path = os.path.join(
-                os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
-                "torch_memory_saver_hook_mode_preload.abi3.so",
-            )
-            assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+                dynlib_path = os.path.join(
+                    os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+                    "torch_memory_saver_hook_mode_preload.abi3.so",
+                )
+                assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
 
-            env_vars["LD_PRELOAD"] = dynlib_path
-            env_vars["TMS_INIT_ENABLE"] = "1"
-            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+                env_vars["LD_PRELOAD"] = dynlib_path
+                env_vars["TMS_INIT_ENABLE"] = "1"
+                env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+            else:
+                logger.warning(
+                    "torch_memory_saver is unavailable, skip LD_PRELOAD offload hooks: %s",
+                    TORCH_MEMORY_SAVER_IMPORT_ERROR,
+                )
 
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":

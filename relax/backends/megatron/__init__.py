@@ -3,22 +3,16 @@
 import logging
 
 
-try:
-    import relax.models  # noqa
-except BaseException as e:
-    print(f"failed to import relax.models, error={e}")
-
-from relax.utils import device as device_utils
+from relax.utils.external.torch_memory_saver import TORCH_MEMORY_SAVER_AVAILABLE, torch_memory_saver
 
 
 try:
     import deep_ep
-    from torch_memory_saver import torch_memory_saver
 
     old_init = deep_ep.Buffer.__init__
 
     def new_init(self, *args, **kwargs):
-        if torch_memory_saver._impl is not None:
+        if TORCH_MEMORY_SAVER_AVAILABLE and torch_memory_saver._impl is not None:
             torch_memory_saver._impl._binary_wrapper.cdll.tms_set_interesting_region(False)
         old_init(self, *args, **kwargs)
         device_utils.synchronize()

@@ -11,6 +11,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.utils.external.torch_memory_saver import torch_memory_saver
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
@@ -204,8 +205,6 @@ def named_params_and_buffers(
 
 
 def _maybe_get_cpu_backup(x: torch.Tensor):
-    from torch_memory_saver import torch_memory_saver
-
     if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
         return cpu_tensor
 

@@ -581,6 +581,16 @@ def log_rollout_data(
     - Non-tensor lists are averaged elementwise.
     - Scalars are converted to Python numbers.
     """
+    required_metric_keys = ("response_lengths", "loss_masks", "total_lengths")
+    missing_metric_keys = [key for key in required_metric_keys if key not in rollout_data]
+    if missing_metric_keys:
+        logger.warning(
+            "Skip rollout metric logging for rollout_id %s because rollout_data is missing keys: %s",
+            rollout_id,
+            missing_metric_keys,
+        )
+        return
+
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         cp_size = mpu.get_context_parallel_world_size()
         log_dict = {}
@@ -678,6 +688,9 @@ def log_rollout_data(
                     else:
                         val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
+                elif isinstance(val[0], dict):
+                    logger.info(f"Skip rollout metric aggregation for {key}: dict-valued payload is not reducible.")
+                    continue
                 else:
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):

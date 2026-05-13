@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import fcntl
+import ipaddress
 import os
 import socket
+import struct
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -251,6 +254,57 @@ def _resolve_to_ip(addr: str) -> str:
         return "127.0.0.1"
 
 
+def _find_interface_name_by_ip(addr: str) -> str | None:
+    """Best-effort resolve an IPv4 address to its local interface name."""
+    try:
+        target_ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+
+    if target_ip.version != 4:
+        return None
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, iface_name in socket.if_nameindex():
+            if iface_name == "lo":
+                continue
+            ifreq = struct.pack("256s", iface_name.encode("utf-8")[:15])
+            try:
+                res = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+            except OSError:
+                continue
+            iface_ip = ipaddress.ip_address(socket.inet_ntoa(res[20:24]))
+            if iface_ip == target_ip:
+                return iface_name
+    finally:
+        sock.close()
+
+    return None
+
+
+def _first_non_loopback_ipv4() -> tuple[str | None, str | None]:
+    """Return the first non-loopback interface/IP pair visible to the
+    process."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, iface_name in socket.if_nameindex():
+            if iface_name == "lo":
+                continue
+            ifreq = struct.pack("256s", iface_name.encode("utf-8")[:15])
+            try:
+                res = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+            except OSError:
+                continue
+            iface_ip = socket.inet_ntoa(res[20:24])
+            if not ipaddress.ip_address(iface_ip).is_loopback:
+                return iface_name, iface_ip
+    finally:
+        sock.close()
+
+    return None, None
+
+
 def post_process_env(args, env):
     """Set and return environment variables required for rollout workers.
 
@@ -264,7 +318,18 @@ def post_process_env(args, env):
 
     env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(args.rollout_batch_size * args.n_samples_per_prompt)
     env["env_vars"]["TQ_ZERO_COPY_SERIALIZATION"] = "true"
-    env["env_vars"]["SLIME_HOST_IP"] = _resolve_to_ip(os.getenv("MASTER_ADDR", "127.0.0.1"))
+    host_ip = _resolve_to_ip(os.getenv("MASTER_ADDR", "127.0.0.1"))
+    iface_name = _find_interface_name_by_ip(host_ip)
+    if ipaddress.ip_address(host_ip).is_loopback or iface_name is None:
+        fallback_iface, fallback_ip = _first_non_loopback_ipv4()
+        iface_name = iface_name or fallback_iface
+        host_ip = fallback_ip or host_ip
+
+    env["env_vars"]["SLIME_HOST_IP"] = host_ip
+
+    if iface_name:
+        env["env_vars"]["GLOO_SOCKET_IFNAME"] = iface_name
+        env["env_vars"]["TP_SOCKET_IFNAME"] = iface_name
 
     if os.getenv("RAY_DEBUG", "0") == "1":
         env["env_vars"]["RAY_DEBUG_POST_MORTEM"] = "1"
@@ -432,7 +497,8 @@ def get_serve_url(route_prefix: str = "") -> str:
     if route_prefix and not route_prefix.startswith("/"):
         route_prefix = "/" + route_prefix
 
-    serve_url = f"http://{head_ip}:{8000}{route_prefix}"
+    serve_port = int(os.environ.get("RELAX_SERVE_PORT", "8000"))
+    serve_url = f"http://{head_ip}:{serve_port}{route_prefix}"
     logger.info("Serve URL: %s", serve_url)
     return serve_url
 

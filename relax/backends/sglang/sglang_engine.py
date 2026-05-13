@@ -22,6 +22,7 @@ from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run
+from relax.utils.device_utils import to_local_visible_device_index
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
 
