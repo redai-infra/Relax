@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 
-IMAGE="${IMAGE:-relax:rocm-relax-smoke}"
+IMAGE="${IMAGE:-relax:rocm-gfx942}"
 CONTAINER_NAME="${CONTAINER_NAME:-relax_rocm_bind}"
 RELAX_DIR="${RELAX_DIR:-${REPO_ROOT}}"
 MODEL_DIR="${MODEL_DIR:-/mnt/dcgpuval/models}"
