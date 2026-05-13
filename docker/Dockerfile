@@ -58,7 +58,7 @@ RUN MAX_JOBS=64 \
     rm -rf /opt/flash-attention/
 
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@dc6876905830430b5054325fa4211ff302169c6b --no-cache-dir --force-reinstall && \
+    TMS_CUDA_MAJOR=12 pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
