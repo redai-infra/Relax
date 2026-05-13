@@ -6,11 +6,35 @@ import torch.nn.functional as F
 from megatron.core import mpu
 
 
+def maybe_padded_total_lengths(
+    total_lengths: list[int],
+    qkv_format: str,
+    is_vl_model: bool,
+) -> list[int] | None:
+    """Per-sample tp*cp*2 padded lengths for the bridge VL+CP+thd path.
+
+    Bridge's `preprocess_packed_seqs` (Qwen3-VL et al.) pads each sample to a
+    multiple of `tp*cp*2` before zigzag-splitting along CP, so the local logits
+    returned by the bridge index per-sample chunks at `padded_len // (2*cp)`.
+    Relax helpers that re-derive those chunks must agree.
+
+    Returns None for non-VL/non-CP/non-thd paths so callers fall back to the
+    standard `ceil(total_length / (2*cp))` formula.
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    if not (is_vl_model and cp_size > 1 and qkv_format == "thd"):
+        return None
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    align = tp_size * cp_size * 2
+    return [(t + align - 1) // align * align for t in total_lengths]
+
+
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
     response_length: int,
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
+    padded_total_length: int | None = None,
 ):
     """All offsets start from the begining of the prompt."""
     cp_rank = mpu.get_context_parallel_rank()
@@ -18,7 +42,13 @@ def get_logits_and_tokens_offset_with_cp(
     assert cp_size > 1
 
     prompt_length = total_length - response_length
-    if qkv_format == "thd":
+    if padded_total_length is not None:
+        # Bridge VL+CP+thd: per-sample padded length is already aligned to tp*cp*2.
+        assert padded_total_length % (2 * cp_size) == 0, (
+            f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}"
+        )
+        chunk_size = padded_total_length // (2 * cp_size)
+    elif qkv_format == "thd":
         chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
     else:
         assert max_seq_len is not None, "max_seq_len must be provided for qkv_format=bshd"
@@ -55,6 +85,7 @@ def get_sum_of_sample_mean(
     calculate_per_token_loss: bool = False,
     qkv_format: str = "thd",
     max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
     cp_size = mpu.get_context_parallel_world_size()
@@ -84,9 +115,10 @@ def get_sum_of_sample_mean(
             zip(total_lengths, response_lengths, loss_masks, strict=False)
         ):
             max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+            padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
             prompt_length = total_length - response_length
             _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, max_seq_len
+                total_length, response_length, qkv_format, max_seq_len, padded_total_length
             )
             loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
             loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
@@ -116,7 +148,12 @@ def get_sum_of_sample_mean(
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
 
-def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
+def all_gather_with_cp(
+    tensor: torch.Tensor,
+    total_length: int,
+    response_length: int,
+    padded_total_length: int | None = None,
+) -> torch.Tensor:
     """Gather tensors across all ranks in the context parallel group.
 
     The first dimension of the output tensor will be the `response_length`.
@@ -127,7 +164,9 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
     if cp_size == 1:
         return tensor
 
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+        total_length, response_length, padded_total_length=padded_total_length
+    )
 
     prompt_length = total_length - response_length
 
@@ -218,6 +257,7 @@ def slice_log_prob_with_cp(
     response_length: int,
     qkv_format: str = "thd",
     max_token_len: int | None = None,
+    padded_total_length: int | None = None,
 ) -> list[float] | torch.Tensor:
     assert len(log_prob) == response_length
 
@@ -228,7 +268,7 @@ def slice_log_prob_with_cp(
 
     prompt_length = total_length - response_length
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, qkv_format, max_token_len
+        total_length, response_length, qkv_format, max_token_len, padded_total_length
     )
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]

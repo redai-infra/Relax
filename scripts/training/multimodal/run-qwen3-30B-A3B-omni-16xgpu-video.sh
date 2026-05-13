@@ -86,7 +86,7 @@ GRPO_ARGS=(
    --kl-loss-coef 0.001
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --eps-clip 3.0
+   --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
 )

@@ -20,6 +20,7 @@ from urllib3.exceptions import NewConnectionError
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.utils import device as device_utils
 from relax.utils.async_utils import run
 from relax.utils.device_utils import to_local_visible_device_index
 from relax.utils.http_utils import get_host_info
@@ -43,7 +44,22 @@ def get_base_gpu_id(args, rank):
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
-    return to_local_visible_device_index(physical_gpu_id)
+    visible_env = device_utils.get_visible_devices_env_var()
+    cvd = os.environ.get(visible_env)
+    if not cvd:
+        return physical_gpu_id  # no remapping
+    # Visible devices can be like "4,5,6,7"
+    visible = [int(x) for x in cvd.split(",") if x.strip() != ""]
+    # In a remapped process, valid torch device indices are 0..len(visible)-1
+    if physical_gpu_id in visible:
+        return visible.index(physical_gpu_id)
+    # If we're already getting local IDs, allow them
+    if 0 <= physical_gpu_id < len(visible):
+        return physical_gpu_id
+    raise RuntimeError(
+        f"Device id {physical_gpu_id} is not valid under {visible_env}={cvd}. "
+        f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
+    )
 
 
 def _patched_run_scheduler_process(*args, **kwargs):
@@ -720,40 +736,6 @@ class SGLangEngine(RayActor):
                 "post_process_quantization": post_process_quantization,
             },
         )
-
-    def start_profile(
-        self,
-        # The output directory
-        output_dir: str | None = None,
-        # If set, it profile as many as this number of steps.
-        # If it is set, profiling is automatically stopped after this step, and
-        # the caller doesn't need to run stop_profile.
-        start_step: int | None = None,
-        num_steps: int | None = None,
-        activities: list[str] | None = None,
-        profile_by_stage: bool = False,
-        with_stack: bool | None = None,
-        record_shapes: bool | None = None,
-    ):
-        response = requests.post(
-            f"http://{self.server_host}:{self.server_port}/start_profile",
-            json={
-                "output_dir": output_dir,
-                "start_step": start_step,
-                "num_steps": num_steps,
-                "activities": activities,
-                "profile_by_stage": profile_by_stage,
-                "with_stack": with_stack,
-                "record_shapes": record_shapes,
-            },
-        )
-        response.raise_for_status()
-        return response
-
-    def stop_profile(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/stop_profile", json={})
-        response.raise_for_status()
-        return response
 
     def simulate_crash(self):
         if self.args.rollout_external or not getattr(self, "process", None):

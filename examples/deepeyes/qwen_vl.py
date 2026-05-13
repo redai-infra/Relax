@@ -279,6 +279,53 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "mrope_position_delta": mrope_position_delta,
         }
 
+    @staticmethod
+    def _strip_image_token(input_ids, image_token_id: int = 151655):
+        """Collapse consecutive ``<|image_pad|>`` tokens into a single
+        placeholder.
+
+        Transform::
+
+            <|vision_start|><|image_pad|><|image_pad|>...<|image_pad|><|vision_end|>
+            -> <|vision_start|><|image_pad|><|vision_end|>
+
+        Why: the caller may pass pre-tokenized ``input_ids`` in which each image
+        has already been expanded into N ``<|image_pad|>`` tokens (one per visual
+        patch). However ``load_mm_data`` downstream expects exactly *one*
+        ``<|image_pad|>`` placeholder per image and re-expands it itself based on
+        the actual patch count. Without this collapse the pipeline would see
+        ``N x M`` image-pad tokens and miscount positions, breaking mrope
+        bookkeeping. Raw text prompts are returned unchanged.
+
+        Args:
+            input_ids: List of token ids, or any non-list value (passed through).
+            image_token_id: Id of ``<|image_pad|>`` (151655 for Qwen-VL family).
+
+        Returns:
+            ``input_ids`` with each run of consecutive ``image_token_id`` reduced
+            to a single occurrence, or the input untouched if it is not a list.
+        """
+        # Raw text prompts (str) and other non-list inputs require no rewrite.
+        if not isinstance(input_ids, list):
+            return input_ids
+
+        import numpy as np
+
+        input_id_arr = np.array(input_ids)
+
+        # mask[i] == True means "keep token at index i"; start by keeping all.
+        mask = np.ones(len(input_id_arr), dtype=bool)
+
+        # Boolean array marking every <|image_pad|> position.
+        is_value = input_id_arr == image_token_id
+
+        # A token at index i is a redundant duplicate iff both it and its left
+        # neighbour are <|image_pad|>. Dropping those keeps the first occurrence
+        # in each run and removes the rest. Index 0 has no left neighbour so it
+        # is always kept (mask[0] stays True).
+        mask[1:] &= ~(is_value[1:] & is_value[:-1])
+        return input_id_arr[mask].tolist()
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -299,7 +346,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             original_input_ids = input_text
 
         base_output = self.load_mm_data(
-            prompt=input_text,
+            prompt=self._strip_image_token(input_text),
             image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,

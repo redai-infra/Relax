@@ -126,6 +126,11 @@ python scripts/tools/process_avqa.py \
   --input-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train.json \
   --output-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
   --md-dir /root/AVQA-R1-6K/AVQA_R1/train
+
+python scripts/tools/process_avqa.py \
+  --input-dir /root/AVQA-R1-6K/AVQA_R1/valid/omni_rl_format_valid.json \
+  --output-dir /root/AVQA-R1-6K/AVQA_R1/valid/small_valid.jsonl \
+  --md-dir /root/AVQA-R1-6K/AVQA_R1/valid
 ```
 
 转换脚本读取原始 JSON 文件，提取问题、选项、图片和音频字段，生成包含 `prompt`、`image`、`audio` 和 `label` 列的 `.jsonl` 文件。
@@ -134,6 +139,10 @@ python scripts/tools/process_avqa.py \
 
 ```bash
 hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /root/Qwen3-Omni-30B-A3B-Instruct
+
+# Qwen3-Omni 的 chat_template 单独存放在 chat_template.json 中，
+# AutoTokenizer 不会自动加载，需要合并到 tokenizer_config.json（已存在则跳过）
+python -c "import json,sys; m=sys.argv[1]; p=f'{m}/tokenizer_config.json'; tc=json.load(open(p)); ('chat_template' in tc) or (tc.update(chat_template=json.load(open(f'{m}/chat_template.json'))['chat_template']) or json.dump(tc, open(p,'w'), indent=2, ensure_ascii=False))" /root/Qwen3-Omni-30B-A3B-Instruct
 ```
 
 ### 启动训练
@@ -184,6 +193,10 @@ python scripts/tools/process_nextqa.py \
 
 ```bash
 hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /root/Qwen3-Omni-30B-A3B-Instruct
+
+# Qwen3-Omni 的 chat_template 单独存放在 chat_template.json 中，
+# AutoTokenizer 不会自动加载，需要合并到 tokenizer_config.json（已存在则跳过）
+python -c "import json,sys; m=sys.argv[1]; p=f'{m}/tokenizer_config.json'; tc=json.load(open(p)); ('chat_template' in tc) or (tc.update(chat_template=json.load(open(f'{m}/chat_template.json'))['chat_template']) or json.dump(tc, open(p,'w'), indent=2, ensure_ascii=False))" /root/Qwen3-Omni-30B-A3B-Instruct
 ```
 
 ### 启动训练

@@ -10,6 +10,7 @@ from sglang_router.launch_router import RouterArgs
 
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 
@@ -62,7 +63,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
-                default="nccl",
+                default=device_utils.get_dist_backend(),
                 help=("Backend for checkpoint engine."),
             )
             parser.add_argument(
@@ -184,7 +185,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
-            reset_arg(parser, "--distributed-backend", type=str, default="nccl")
+            reset_arg(parser, "--distributed-backend", type=str, default=device_utils.get_dist_backend())
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=30)
 
             return parser
@@ -681,6 +682,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=10000,
                 help="Buffer size for streaming dataset.",
             )
+            parser.add_argument(
+                "--prefetch-chunk-size",
+                type=int,
+                default=32,
+                help="Number of samples to dispatch to the thread-pool in each prefetch round. "
+                "Larger values increase throughput but also memory pressure. Only effective when "
+                "--use-streaming-dataset is set and the dataset contains multimodal data.",
+            )
+            parser.add_argument(
+                "--prefetch-max-cached",
+                type=int,
+                default=256,
+                help="Maximum number of pre-loaded samples kept in the prefetch cache. "
+                "When the cache is full the background prefetch thread pauses until consumers "
+                "free space. Set to 0 to disable prefetching. Only effective when "
+                "--use-streaming-dataset is set and the dataset contains multimodal data.",
+            )
+            parser.add_argument(
+                "--prefetch-num-workers",
+                type=int,
+                default=1,
+                help="Number of parallel worker threads inside the prefetch buffer for "
+                "I/O-bound media decoding (video/image). Set to 1 to serialise all "
+                "decoding (safest for FFmpeg which is not fully thread-safe). "
+                "Higher values increase parallelism but may trigger EAGAIN errors "
+                "on some platforms. Only effective when prefetching is enabled.",
+            )
             # TODO: maybe add an num_epoch and calculate the num_rollout from buffer
             parser.add_argument(
                 "--num-rollout",
@@ -815,7 +843,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "for true parallelism without GIL contention."
                 ),
             )
-
             parser.add_argument("--metadata-key", type=str, default="metadata", help="JSON dataset key")
             parser.add_argument(
                 "--tool-key",
@@ -1530,12 +1557,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--memory-snapshot-dir",
                 type=str,
-                default=".",
+                default=None,
+                help=("Directory for memory snapshot dumps. Defaults to traces/<tb_experiment_name>/memory_snapshot."),
             )
             parser.add_argument(
                 "--memory-snapshot-num-steps",
                 type=int,
                 default=None,
+                help="Number of rollout steps after which to dump the memory snapshot. "
+                "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
             )
             parser.add_argument(
                 "--profile-target",
@@ -1905,6 +1935,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             default=None,
             help="Path to the YAML config for custom function arguments.",
         )
+        parser.add_argument(
+            "--normalize-bbox",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Convert model-output bbox coordinates from normalized [0, 1000] to absolute pixels. "
+                "Required for Qwen-VL/Qwen2-VL/Qwen3-VL (default True). "
+                "Set --no-normalize-bbox for Qwen2.5-VL which outputs absolute pixel coordinates."
+            ),
+        )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
 
         return parser
@@ -2018,6 +2058,10 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    # Backward compatibility: old scripts may pass --enable-gloo-process-groups
+    if not hasattr(args, "use_gloo_process_groups"):
+        args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
+
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.max_staleness < 0:

@@ -28,6 +28,7 @@ from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
+    maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
 
@@ -40,6 +41,7 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -84,6 +86,7 @@ def get_responses(
         zip(unconcat_tokens, total_lengths, response_lengths, strict=False)
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
 
         if cp_size == 1:
             if qkv_format == "bshd":
@@ -120,7 +123,7 @@ def get_responses(
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, max_seq_len
+                total_length, response_length, qkv_format, max_seq_len, padded_total_length
             )
 
             logits_0, logits_1 = logits[end : end + chunk_size], logits[end + chunk_size : end + 2 * chunk_size]
@@ -151,6 +154,7 @@ def _allgather_cp_redistribute(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
 ) -> None:
     """Redistribute response tensors from allgather-CP layout to zigzag ring-
     attn layout.
@@ -217,8 +221,16 @@ def _allgather_cp_redistribute(
             zip(all_cat.split(response_lengths, dim=0), total_lengths, response_lengths, strict=False)
         ):
             max_seq_len = max_seq_lens[idx] if max_seq_lens is not None else None
+            padded_total_length = padded_total_lengths[idx] if padded_total_lengths is not None else None
             new_values.append(
-                slice_log_prob_with_cp(full_resp, total_length, response_length, args.qkv_format, max_seq_len)
+                slice_log_prob_with_cp(
+                    full_resp,
+                    total_length,
+                    response_length,
+                    args.qkv_format,
+                    max_seq_len,
+                    padded_total_length,
+                )
             )
 
         res[key] = new_values
@@ -236,6 +248,7 @@ def get_log_probs_and_entropy(
     topk_k: int | None = None,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Compute per-token log-probabilities (and optionally entropy) on
     responses.
@@ -274,6 +287,7 @@ def get_log_probs_and_entropy(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
     ):
         log_prob, entropy = calculate_log_probs_and_entropy(
             logits_chunk,
@@ -307,6 +321,7 @@ def get_log_probs_and_entropy(
             total_lengths=total_lengths,
             response_lengths=response_lengths,
             max_seq_lens=max_seq_lens,
+            padded_total_lengths=padded_total_lengths,
         )
 
     return torch.empty((0,), device=logits.device), res
@@ -322,6 +337,7 @@ def get_values(
     with_entropy: bool = False,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Extract per-token value predictions over response tokens.
 
@@ -352,6 +368,7 @@ def get_values(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
@@ -368,6 +385,7 @@ def get_values(
             total_lengths=total_lengths,
             response_lengths=response_lengths,
             max_seq_lens=max_seq_lens,
+            padded_total_lengths=padded_total_lengths,
         )
 
     return torch.empty((0,), device=logits.device), res
@@ -444,6 +462,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
     total_lengths: list[int] = rollout_data.get("total_lengths")
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
+    padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
+        total_lengths,
+        args.qkv_format,
+        rollout_data.get("multimodal_train_inputs") is not None,
+    )
 
     # return when not the last pp stage.
     if not mpu.is_pipeline_last_stage():
@@ -539,9 +562,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 response_len = response_lengths[i]
                 prompt_len = total_len - response_len
                 max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+                padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
 
                 _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(
-                    total_len, response_len, args.qkv_format, max_seq_len
+                    total_len, response_len, args.qkv_format, max_seq_len, padded_total_length
                 )
 
                 # Convert global offsets to response-space offsets
@@ -678,6 +702,7 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
+    padded_total_lengths = batch.get("padded_total_lengths", None)
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -687,6 +712,7 @@ def policy_loss_function(
         response_lengths=response_lengths,
         with_entropy=True,
         max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -697,16 +723,20 @@ def policy_loss_function(
     full_log_probs = None
     full_old_log_probs = None
     if need_full_log_probs:
+        if padded_total_lengths is None:
+            padded_iter = [None] * len(log_probs)
+        else:
+            padded_iter = padded_total_lengths
         full_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(
-                log_probs, total_lengths, response_lengths, strict=False
+            all_gather_with_cp(log_prob, total_length, response_length, padded_total_length)
+            for log_prob, total_length, response_length, padded_total_length in zip(
+                log_probs, total_lengths, response_lengths, padded_iter, strict=False
             )
         ]
         full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length)
-            for old_log_prob, total_length, response_length in zip(
-                old_log_probs, total_lengths, response_lengths, strict=False
+            all_gather_with_cp(old_log_prob, total_length, response_length, padded_total_length)
+            for old_log_prob, total_length, response_length, padded_total_length in zip(
+                old_log_probs, total_lengths, response_lengths, padded_iter, strict=False
             )
         ]
 
@@ -788,6 +818,7 @@ def policy_loss_function(
             args.calculate_per_token_loss,
             args.qkv_format,
             max_seq_lens,
+            padded_total_lengths,
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
@@ -908,6 +939,7 @@ def value_loss_function(
         total_lengths=batch["total_lengths"],
         response_lengths=batch["response_lengths"],
         max_seq_lens=batch.get("max_seq_lens", None),
+        padded_total_lengths=batch.get("padded_total_lengths", None),
     )
     values = torch.cat([value.flatten() for value in values["values"]], dim=0)
 
@@ -967,6 +999,7 @@ def sft_loss_function(
         response_lengths=response_lengths,
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
+        padded_total_lengths=batch.get("padded_total_lengths", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1024,6 +1057,7 @@ def loss_function(
         args.calculate_per_token_loss,
         args.qkv_format,
         batch.get("max_seq_lens", None),
+        batch.get("padded_total_lengths", None),
     )
 
     match args.loss_type:

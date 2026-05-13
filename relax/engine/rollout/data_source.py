@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import abc
-import copy
 import os
 from pathlib import Path
 
@@ -16,6 +15,25 @@ from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
+
+
+def _shallow_copy_sample(src: Sample) -> Sample:
+    """Create a lightweight copy of a Sample that *shares* heavy read-only
+    payloads (``multimodal_inputs``) with the source."""
+    new = Sample.__new__(Sample)
+    new.__dict__.update(src.__dict__)
+    # Shallow-copy mutable containers that downstream code mutates in-place.
+    new.tokens = list(src.tokens)
+    new.rollout_tokens = list(src.rollout_tokens)
+    new.weight_versions = list(src.weight_versions)
+    new.metadata = dict(src.metadata)
+    # Per-sample accumulators — create fresh instances.
+    new.spec_info = Sample.SpecInfo()
+    new.prefix_cache_info = Sample.PrefixCacheInfo()
+    # ``multimodal_inputs`` is read-only downstream — share the reference.
+    # ``multimodal_train_inputs`` is *set* (not mutated) per-sample by the
+    # processor, so sharing the initial ``None`` is fine.
+    return new
 
 
 def _create_dataset(args, tokenizer, processor, multimodal_config=None):
@@ -39,8 +57,15 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         buffer_size = getattr(args, "streaming_buffer_size", 10000)
+        prefetch_chunk_size = getattr(args, "prefetch_chunk_size", 32)
+        prefetch_max_cached = getattr(args, "prefetch_max_cached", 256)
+        prefetch_num_workers = getattr(args, "prefetch_num_workers", 1)
 
-        logger.info(f"Using StreamingDataset with buffer_size={buffer_size}")
+        logger.info(
+            f"Using StreamingDataset with buffer_size={buffer_size}, "
+            f"prefetch_chunk_size={prefetch_chunk_size}, prefetch_max_cached={prefetch_max_cached}, "
+            f"prefetch_num_workers={prefetch_num_workers}"
+        )
         return StreamingDataset(
             path=args.prompt_data,
             tokenizer=tokenizer,
@@ -57,6 +82,9 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             use_audio_in_video=args.use_audio_in_video,
             seed=args.rollout_seed,
             buffer_size=buffer_size,
+            prefetch_chunk_size=prefetch_chunk_size,
+            prefetch_max_cached=prefetch_max_cached,
+            prefetch_num_workers=prefetch_num_workers,
             multimodal_config=multimodal_config,
         )
     else:
@@ -172,7 +200,7 @@ class RolloutDataSource(DataSource):
         for prompt_sample in prompt_samples:
             group = []
             for _ in range(self.args.n_samples_per_prompt):
-                sample = copy.deepcopy(prompt_sample)
+                sample = _shallow_copy_sample(prompt_sample)
                 sample.group_index = self.sample_group_index
                 sample.index = self.sample_index
                 self.sample_index += 1

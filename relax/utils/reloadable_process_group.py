@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import os
+import time
 import socket
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import available_memory, clear_memory, print_memory
 
@@ -18,124 +20,6 @@ logger = get_logger(__name__)
 
 old_new_group_dict = {}
 _wrap_low_level_call_enabled = False
-
-
-def _safe_call(value_fn: Callable[[], Any]) -> Any:
-    try:
-        return value_fn()
-    except Exception as exc:  # noqa: BLE001
-        return f"<error: {type(exc).__name__}: {exc}>"
-
-
-def _describe_process_group(group: Any) -> dict[str, Any]:
-    if isinstance(group, ReloadableProcessGroup):
-        inner_group = group.group
-        return {
-            "type": type(group).__name__,
-            "inner_type": type(inner_group).__name__ if inner_group is not None else None,
-            "ranks": group.group_info.get("ranks"),
-            "rank": _safe_call(lambda: group.rank()),
-            "size": _safe_call(lambda: group.size()),
-        }
-
-    if isinstance(group, torch.distributed.ProcessGroup):
-        return {
-            "type": type(group).__name__,
-            "rank": _safe_call(lambda: group.rank()),
-            "size": _safe_call(lambda: group.size()),
-        }
-
-    return {"type": type(group).__name__}
-
-
-def _collect_distributed_debug_context(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    env_keys = [
-        "RANK",
-        "LOCAL_RANK",
-        "WORLD_SIZE",
-        "LOCAL_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "CUDA_VISIBLE_DEVICES",
-        "HIP_VISIBLE_DEVICES",
-        "ROCR_VISIBLE_DEVICES",
-        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-        "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
-        "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
-        "NCCL_SOCKET_IFNAME",
-        "RCCL_SOCKET_IFNAME",
-        "GLOO_SOCKET_IFNAME",
-        "NCCL_DEBUG",
-        "TORCH_DISTRIBUTED_DEBUG",
-    ]
-
-    process_groups = [
-        _describe_process_group(arg)
-        for arg in args
-        if isinstance(arg, (ReloadableProcessGroup, torch.distributed.ProcessGroup))
-    ]
-    process_groups.extend(
-        _describe_process_group(value)
-        for value in kwargs.values()
-        if isinstance(value, (ReloadableProcessGroup, torch.distributed.ProcessGroup))
-    )
-
-    context: dict[str, Any] = {
-        "pid": os.getpid(),
-        "hostname": socket.gethostname(),
-        "env": {key: os.environ.get(key) for key in env_keys if os.environ.get(key) is not None},
-        "torch_hip": torch.version.hip,
-        "process_groups": process_groups,
-        "dist_available": _safe_call(dist.is_available),
-        "dist_initialized": _safe_call(dist.is_initialized),
-    }
-
-    if dist.is_available() and dist.is_initialized():
-        context["dist"] = {
-            "rank": _safe_call(dist.get_rank),
-            "world_size": _safe_call(dist.get_world_size),
-            "backend": _safe_call(dist.get_backend),
-        }
-
-    if torch.cuda.is_available():
-        current_device = _safe_call(torch.cuda.current_device)
-        context["cuda"] = {
-            "device_count": _safe_call(torch.cuda.device_count),
-            "current_device": current_device,
-            "current_device_name": _safe_call(lambda: torch.cuda.get_device_name(current_device)),
-        }
-        if isinstance(current_device, int):
-            props = _safe_call(lambda: torch.cuda.get_device_properties(current_device))
-            if not isinstance(props, str):
-                context["cuda"]["current_device_properties"] = {
-                    "name": getattr(props, "name", None),
-                    "uuid": getattr(props, "uuid", None),
-                    "pci_bus_id": getattr(props, "pci_bus_id", None),
-                    "gcn_arch_name": getattr(props, "gcnArchName", None),
-                    "total_memory": getattr(props, "total_memory", None),
-                    "multi_processor_count": getattr(props, "multi_processor_count", None),
-                }
-
-    try:
-        import ray
-
-        context["ray"] = {
-            "is_initialized": ray.is_initialized(),
-            "gpu_ids": _safe_call(ray.get_gpu_ids),
-            "node_id": _safe_call(lambda: ray.get_runtime_context().get_node_id()),
-            "actor_id": _safe_call(lambda: ray.get_runtime_context().get_actor_id()),
-        }
-    except Exception as exc:  # noqa: BLE001
-        context["ray"] = f"<unavailable: {type(exc).__name__}: {exc}>"
-
-    return context
-
-
-def _log_distributed_exception(func_name: str, args: tuple[Any, ...], kwargs: dict[str, Any], exc: Exception) -> None:
-    context = _collect_distributed_debug_context(args, kwargs)
-    logger.exception("torch.distributed.%s failed with context: %s", func_name, context)
-    if hasattr(exc, "add_note"):
-        exc.add_note(f"torch.distributed.{func_name} debug context: {context}")
 
 
 def monkey_patch_torch_dist(args=None):
@@ -278,13 +162,15 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         return getattr(self.group, name)
 
     @staticmethod
-    def destroy_process_groups():
+    def destroy_process_groups(post_destroy_delay: float = 2.0):
         pid = os.getpid()
+        destroyed_count = 0
         for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
             if reloadable_group.group is None:
                 continue
             try:
                 dist.destroy_process_group(reloadable_group.group)
+                destroyed_count += 1
             except ValueError as e:
                 logger.warning(
                     f"Process group already invalid/destroyed; skipping cleanup. Exception: {e}",
@@ -294,21 +180,52 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
             del reloadable_group.group
             reloadable_group.group = None
 
+        if destroyed_count > 0 and post_destroy_delay > 0:
+            # Wait for OS to release NCCL socket ports (TCP TIME_WAIT),
+            # preventing "Address already in use" on subsequent reload.
+            logger.info(
+                f"Destroyed {destroyed_count} process groups, waiting {post_destroy_delay}s "
+                "for NCCL socket port release"
+            )
+            time.sleep(post_destroy_delay)
+
     @staticmethod
-    def reload_process_groups(timeout_minutes: int = 30):
+    def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
         pid = os.getpid()
         reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
         logger.info(f"Reloading {len(reloadable_groups)} process groups in pid {pid}")
         old_new_group = old_new_group_dict.get(pid)
-        for reloadable_group in reloadable_groups:
+        for idx, reloadable_group in enumerate(reloadable_groups):
             if reloadable_group.group is not None:
                 continue
-            group = old_new_group(
-                ranks=reloadable_group.group_info["ranks"],
-                backend="nccl",
-                timeout=timedelta(minutes=timeout_minutes),
-            )
-            reloadable_group.group = group
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    group = old_new_group(
+                        ranks=reloadable_group.group_info["ranks"],
+                        backend=device_utils.get_dist_backend(),
+                        timeout=timedelta(minutes=timeout_minutes),
+                    )
+                    reloadable_group.group = group
+                    if attempt > 1:
+                        logger.info(f"Process group {idx} reloaded successfully on attempt {attempt}")
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Failed to reload process group {idx} (attempt {attempt}/{max_retries}): {e}",
+                        exc_info=(attempt == max_retries),
+                    )
+                    if attempt < max_retries:
+                        sleep_time = retry_delay * attempt
+                        logger.info(f"Retrying in {sleep_time}s...")
+                        time.sleep(sleep_time)
+            if last_error is not None:
+                raise RuntimeError(
+                    f"Failed to reload process group {idx} after {max_retries} attempts "
+                    f"(ranks={reloadable_group.group_info['ranks']})"
+                ) from last_error
 
     def rank(self) -> int:
         return self.group.rank()
@@ -426,14 +343,16 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         self.group.bound_device_id = dev
 
 
-def destroy_process_groups():
+def destroy_process_groups(post_destroy_delay: float = 2.0):
     """Destroy all reloadable process groups."""
-    ReloadableProcessGroup.destroy_process_groups()
+    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
 
 
-def reload_process_groups(timeout_minutes: int = 30):
+def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
     """Reload all reloadable process groups."""
-    ReloadableProcessGroup.reload_process_groups(timeout_minutes=timeout_minutes)
+    ReloadableProcessGroup.reload_process_groups(
+        timeout_minutes=timeout_minutes, max_retries=max_retries, retry_delay=retry_delay
+    )
 
 
 @contextmanager

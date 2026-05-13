@@ -27,12 +27,16 @@ class DeepeyesEnv(BaseInteractionEnv):
 
     MIN_DIMENSION = 28
 
-    def __init__(self, *, max_turns: int | None = None, image=None):
+    def __init__(self, *, max_turns: int | None = None, image=None, normalize_bbox: bool = True):
         self.max_turns = max_turns
         self.turn = 0
         self.tool_calls: list[dict[str, Any]] = []
         self.current_image = image
         self.origin_image = image
+        # Whether to convert bbox coordinates from normalized [0, 1000] to absolute pixels.
+        # Qwen-VL / Qwen2-VL / Qwen3-VL output 0-1000 normalized coords → set True (default).
+        # Qwen2.5-VL outputs absolute pixel coords → set False.
+        self.normalize_bbox = normalize_bbox
 
     def reset(self):
         self.turn = 0
@@ -119,13 +123,21 @@ class DeepeyesEnv(BaseInteractionEnv):
         image_height = self.current_image.height
         left, top, right, bottom = bbox_2d
 
-        # 1. Clamp the initial bounding box to the image dimensions.
+        # 1. Convert normalized [0, 1000] coordinates to absolute pixel coordinates.
+        # Qwen-VL / Qwen2-VL / Qwen3-VL use 0-1000 normalized coords; Qwen2.5-VL uses absolute pixels.
+        if self.normalize_bbox:
+            left = left / 1000.0 * image_width
+            top = top / 1000.0 * image_height
+            right = right / 1000.0 * image_width
+            bottom = bottom / 1000.0 * image_height
+
+        # 2. Clamp the bounding box to the image dimensions.
         left = max(0.0, float(left))
         top = max(0.0, float(top))
         right = min(float(image_width), float(right))
         bottom = min(float(image_height), float(bottom))
 
-        # 2. If clamped bbox is invalid, return immediately.
+        # 3. If clamped bbox is invalid, return immediately.
         if not self._validate_bbox(left, top, right, bottom):
             return None
 
@@ -133,7 +145,7 @@ class DeepeyesEnv(BaseInteractionEnv):
         height = bottom - top
         width = right - left
 
-        # 3. If the box is too small, attempt to resize it.
+        # 4. If the box is too small, attempt to resize it.
         if height < self.MIN_DIMENSION or width < self.MIN_DIMENSION:
             logger.info(f"Bbox {width}x{height} is smaller than {self.MIN_DIMENSION}, attempting resize.")
             center_x = (left + right) / 2.0
@@ -182,7 +194,7 @@ class DeepeyesEnv(BaseInteractionEnv):
             # Use floor and ceil for final integer coordinates.
             current_bbox = [floor(new_left), floor(new_top), ceil(new_right), ceil(new_bottom)]
 
-        # 4. Final validation on the resulting bounding box (either original or resized).
+        # 5. Final validation on the resulting bounding box (either original or resized).
         final_left, final_top, final_right, final_bottom = current_bbox
         if not self._validate_bbox(final_left, final_top, final_right, final_bottom):
             logger.warning(f"Final bbox is invalid after processing: {current_bbox}")
@@ -288,7 +300,8 @@ def build_env(sample: Sample | None = None, args: Any | None = None, **_: Any) -
     max_turns = args.max_turns
     if max_turns is None:
         raise ValueError("max_turns must be set via --custom-config-path in the custom config file.")
+    normalize_bbox = getattr(args, "normalize_bbox", True)
     image = _extract_initial_image(sample)
     if image is None:
         logger.warning("No image found in sample.multimodal_inputs or metadata.")
-    return DeepeyesEnv(max_turns=max_turns, image=image)
+    return DeepeyesEnv(max_turns=max_turns, image=image, normalize_bbox=normalize_bbox)

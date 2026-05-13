@@ -28,8 +28,11 @@ Usage:
 import json
 import os
 import random
+import threading
+import time
 from bisect import bisect_right
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterator, Optional
 
 
@@ -57,6 +60,7 @@ __all__ = [
     "CompositeStreamingReader",
     "SampleBuffer",
     "IndexManager",
+    "PrefetchBuffer",
 ]
 
 
@@ -441,6 +445,241 @@ class IndexManager:
         self.reset(position=position, epoch_id=epoch_id)
 
 
+class PrefetchBuffer:
+    """Background prefetch buffer for multimodal data loading.
+
+    Run a background thread that pre-loads and pre-processes samples
+    (including heavy video/image I/O) **in the exact order** they will be consumed.
+
+    Key design:
+    - ``set_index_order(indices)`` is called once (at ``shuffle`` time) with
+      the **entire** upcoming index sequence.  The background thread starts
+      fetching immediately, well before ``get_batch`` is called.
+    - ``get(idx)`` pops from the cache (near-zero latency on hit) or falls
+      back to a synchronous single-sample fetch on miss.
+    - The cache is bounded by ``max_cached``; when full the prefetch thread
+      pauses until consumers free space via ``get()`` calls.
+    - A ``ThreadPoolExecutor`` is used inside the prefetch thread to
+      parallelize video/image decoding across multiple files within a chunk,
+      since PyAV/FFmpeg releases the GIL during C-level decoding.
+
+    Lifecycle::
+
+        buf = PrefetchBuffer(process_fn, chunk_size=16, max_cached=256, num_workers=4)
+        buf.set_index_order([3, 7, 1, 5, ...])  # triggers background loading
+        sample = buf.get(3)  # instant cache hit
+    """
+
+    def __init__(
+        self,
+        process_fn,
+        chunk_size: int = 32,
+        max_cached: int = 256,
+        num_workers: int = 4,
+    ):
+        """Initialize the prefetch buffer.
+
+        Args:
+            process_fn: ``fn(idx: int) -> Optional[Sample]`` — load and
+                process a single sample by index.
+            chunk_size: Number of indices to submit to the thread-pool at
+                a time inside the prefetch loop.
+            max_cached: Maximum number of samples to keep in the cache
+                before the prefetch thread pauses.
+            num_workers: Number of parallel workers in the internal
+                ``ThreadPoolExecutor`` for I/O-bound decoding.
+        """
+        self._process_fn = process_fn
+        self._chunk_size = chunk_size
+        self._max_cached = max_cached
+        self._num_workers = num_workers
+
+        # Thread-safe cache: idx -> Optional[Sample]
+        self._cache: dict[int, Optional[Sample]] = {}
+        self._lock = threading.Lock()
+
+        # Ordered index sequence set by set_index_order
+        self._indices: list[int] = []
+        self._pos: int = 0
+
+        # Flow control: cleared when cache is full, set when space is freed
+        self._space_available = threading.Event()
+        self._space_available.set()
+
+        # Stats
+        self._prefetch_hits = 0
+        self._prefetch_misses = 0
+
+        # Thread lifecycle
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        logger.info(
+            f"PrefetchBuffer created: max_cached={max_cached}, chunk_size={chunk_size}, num_workers={num_workers}"
+        )
+
+    # -- Public API --------------------------------------------------------
+
+    def set_index_order(self, indices: list[int]) -> None:
+        """Reset the cache and start prefetching in *indices* order.
+
+        Called at the beginning of each epoch (from
+        ``StreamingDataset.shuffle``) with the full upcoming index sequence.
+        The prefetch thread starts loading immediately so that later ``get()``
+        calls hit the cache.
+        """
+        # Stop any running prefetch thread
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning("Previous prefetch thread did not stop within 10s; it will exit on its own stop-event")
+
+        with self._lock:
+            self._cache.clear()
+            self._indices = list(indices)
+            self._pos = 0
+
+        # Create a fresh stop-event for the new thread so the old thread
+        # (if still draining) keeps seeing its own set() signal and exits.
+        self._stop = threading.Event()
+        self._space_available.set()
+        stop_event = self._stop
+        self._thread = threading.Thread(target=self._run, args=(stop_event,), daemon=True, name="prefetch-worker")
+        self._thread.start()
+        logger.info(f"PrefetchBuffer: started prefetching {len(indices)} samples")
+
+    def get(self, idx: int) -> Optional[Sample]:
+        """Return the sample for *idx*.
+
+        Pops from the prefetch cache on hit.  On miss, performs a blocking
+        single-index fetch via ``process_fn``.
+        """
+        with self._lock:
+            if idx in self._cache:
+                sample = self._cache.pop(idx)
+                self._prefetch_hits += 1
+                # Signal prefetch thread that space is available
+                self._space_available.set()
+                return sample
+
+        # Cache miss — synchronous fallback
+        self._prefetch_misses += 1
+        try:
+            return self._process_fn(idx)
+        except Exception:
+            logger.exception(f"Prefetch fallback failed for index {idx}")
+            return None
+
+    def stop(self) -> None:
+        """Signal the prefetch thread to stop."""
+        self._stop.set()
+        # Unblock if waiting on space
+        self._space_available.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=15)
+            if self._thread.is_alive():
+                logger.warning("Prefetch thread did not terminate within 15s")
+
+    def clear(self) -> None:
+        """Clear the cache and reset position (without stopping the thread)."""
+        with self._lock:
+            self._cache.clear()
+        self._space_available.set()
+
+    @property
+    def hit_rate(self) -> float:
+        """Return prefetch cache hit rate."""
+        total = self._prefetch_hits + self._prefetch_misses
+        return self._prefetch_hits / total if total > 0 else 0.0
+
+    @property
+    def cache_size(self) -> int:
+        """Return current cache size."""
+        with self._lock:
+            return len(self._cache)
+
+    # -- Background thread -------------------------------------------------
+
+    def _run(self, stop_event: threading.Event) -> None:
+        """Background prefetch loop.
+
+        Iterates through ``self._indices`` in order, loading chunks in parallel
+        via a ``ThreadPoolExecutor``.  Pauses when the cache is full and
+        resumes when ``get()`` frees space.
+
+        Args:
+            stop_event: Thread-local stop signal.  Each thread receives its
+                own ``Event`` so that ``set_index_order`` can replace
+                ``self._stop`` for the next thread without accidentally
+                un-stopping this one.
+        """
+        _MAX_SUBMIT_RETRIES = 3
+        consecutive_failures = 0
+
+        with ThreadPoolExecutor(max_workers=self._num_workers, thread_name_prefix="pf") as pool:
+            while not stop_event.is_set():
+                # 1. Get next chunk of indices
+                with self._lock:
+                    if self._pos >= len(self._indices):
+                        break  # All indices have been dispatched
+                    chunk = self._indices[self._pos : self._pos + self._chunk_size]
+                    self._pos += len(chunk)
+
+                # 2. Filter out indices already in cache
+                with self._lock:
+                    to_fetch = [i for i in chunk if i not in self._cache]
+                if not to_fetch:
+                    continue
+
+                # 3. Wait until cache has room for this chunk
+                while not stop_event.is_set():
+                    with self._lock:
+                        if len(self._cache) + len(to_fetch) <= self._max_cached:
+                            break
+                        self._space_available.clear()
+                    # Wait for consumers to pop entries
+                    if not self._space_available.wait(timeout=0.1):
+                        continue
+
+                if stop_event.is_set():
+                    return
+
+                # 4. Parallel-fetch all samples in the chunk
+                try:
+                    futures = {idx: pool.submit(self._process_fn, idx) for idx in to_fetch}
+                    results = {}
+                    for idx, fut in futures.items():
+                        try:
+                            results[idx] = fut.result(timeout=120)
+                        except Exception:
+                            logger.warning(f"Prefetch failed for index {idx}", exc_info=True)
+                            results[idx] = None
+                    consecutive_failures = 0
+                except Exception:
+                    consecutive_failures += 1
+                    logger.exception(
+                        f"Prefetch chunk submission failed (attempt {consecutive_failures}/{_MAX_SUBMIT_RETRIES})"
+                    )
+                    if consecutive_failures >= _MAX_SUBMIT_RETRIES:
+                        logger.error("Prefetch thread aborting after too many consecutive submission failures")
+                        break
+                    time.sleep(0.5)
+                    with self._lock:
+                        self._pos -= len(chunk)
+                    continue
+
+                # 5. Store results in cache
+                with self._lock:
+                    for idx, sample in results.items():
+                        self._cache[idx] = sample
+
+        logger.info(
+            f"Prefetch thread finished. Hit rate: {self.hit_rate:.1%} "
+            f"(hits={self._prefetch_hits}, misses={self._prefetch_misses})"
+        )
+
+
 class StreamingDataset(BaseDataset):
     """Memory-efficient streaming dataset with on-demand loading.
 
@@ -449,6 +688,7 @@ class StreamingDataset(BaseDataset):
     Features:
     - Lazy loading: Only loads data when accessed
     - LRU caching: Caches recently accessed samples
+    - Background prefetching: Pre-loads multimodal data in background thread
     - Shuffle support: Epoch-based reproducible shuffling
     - Filter support: Length filtering done at access time
 
@@ -481,7 +721,9 @@ class StreamingDataset(BaseDataset):
         apply_chat_template_kwargs: Optional[dict] = None,
         use_audio_in_video: bool = False,
         buffer_size: int = 10000,
-        prefetch_size: int = 100,
+        prefetch_chunk_size: int = 32,
+        prefetch_max_cached: int = 256,
+        prefetch_num_workers: int = 1,
         multimodal_config: MultimodalConfig = None,
     ):
         """Initialize the streaming dataset.
@@ -501,8 +743,15 @@ class StreamingDataset(BaseDataset):
             apply_chat_template: Whether to apply chat template
             apply_chat_template_kwargs: Additional kwargs for chat template
             use_audio_in_video: Whether to extract audio from video files for multimodal processing
-            buffer_size: Maximum samples to cache
-            prefetch_size: Number of samples to prefetch (not implemented yet)
+            buffer_size: Maximum samples to cache in LRU buffer
+            prefetch_chunk_size: Number of samples dispatched to the thread-pool
+                in each prefetch round
+            prefetch_max_cached: Maximum number of pre-loaded samples in the
+                prefetch cache. Set to 0 to disable prefetching.
+            prefetch_num_workers: Number of parallel worker threads inside the
+                prefetch buffer for I/O-bound media decoding.  Set to 1 to
+                serialise decoding (avoids FFmpeg thread-safety issues).
+            multimodal_config: MultimodalConfig for multimodal processing
         """
         # Initialize base class
         super().__init__(
@@ -534,6 +783,41 @@ class StreamingDataset(BaseDataset):
         self._filter_count = 0
         self._total_processed = 0
 
+        # Prefetch buffer for overlapping multimodal I/O with compute.
+        # Only enabled when multimodal_keys are set and prefetch_max_cached > 0.
+        self._prefetch_buffer: Optional[PrefetchBuffer] = None
+        if multimodal_keys and prefetch_max_cached > 0:
+            self._prefetch_buffer = PrefetchBuffer(
+                process_fn=self._prefetch_process_single,
+                chunk_size=prefetch_chunk_size,
+                max_cached=prefetch_max_cached,
+                num_workers=prefetch_num_workers,
+            )
+            logger.info(
+                f"StreamingDataset: prefetch enabled with "
+                f"chunk_size={prefetch_chunk_size}, max_cached={prefetch_max_cached}, "
+                f"num_workers={prefetch_num_workers}"
+            )
+        self._prefetch_hits_log_counter = 0
+
+    def _prefetch_process_single(self, idx: int) -> Optional[Sample]:
+        """Process a single index for prefetching.
+
+        Called by the PrefetchBuffer's worker threads.  Each call loads
+        a single sample (including heavy video/image I/O) and returns it.
+
+        NOTE: We intentionally do NOT access ``self.buffer`` (SampleBuffer)
+        here because SampleBuffer is not thread-safe and these calls run
+        in parallel worker threads.
+        """
+        try:
+            raw_data = self.reader[idx]
+            sample = self._process_raw_data(raw_data)
+            return sample
+        except Exception as e:
+            logger.warning(f"Prefetch: error processing index {idx}: {e}")
+            return None
+
     def __len__(self) -> int:
         """Return total number of samples in the dataset."""
         return len(self.reader)
@@ -541,11 +825,24 @@ class StreamingDataset(BaseDataset):
     def shuffle(self, epoch_id: int) -> None:
         """Shuffle the dataset for a new epoch.
 
+        When prefetch is enabled, passes the **remaining** shuffled index
+        sequence (from the current position onward) to the
+        ``PrefetchBuffer`` so the background thread starts loading
+        immediately — well before ``get_batch`` is called.
+
         Args:
             epoch_id: Epoch identifier
         """
         self.index_manager.shuffle(epoch_id)
         self.epoch_id = epoch_id
+        # Trigger prefetch with the remaining upcoming index order
+        if self._prefetch_buffer is not None and self.index_manager.indices is not None:
+            remaining = self.index_manager.indices[self.index_manager.position :]
+            self._prefetch_buffer.set_index_order(list(remaining))
+            logger.info(
+                f"Prefetch: triggered for epoch {epoch_id}, "
+                f"{len(remaining)} indices remaining (position={self.index_manager.position})"
+            )
 
     def _process_raw_data(self, data: dict) -> Optional[Sample]:
         """Process raw data into a Sample.
@@ -580,40 +877,97 @@ class StreamingDataset(BaseDataset):
 
         Automatically skips filtered samples and handles epoch boundaries.
 
+        When prefetch is enabled, indices are consumed **one at a time** so
+        that ``IndexManager.position`` stays exactly in sync with the index
+        sequence given to ``PrefetchBuffer.set_index_order()``.
+
+        Without prefetch, indices are fetched in small batches for
+        efficiency (acceptable since there is no ordering contract to
+        honour with a background thread).
+
         Args:
             n: Number of samples to get
 
         Returns:
             (samples, crossed_epoch): List of samples and whether an epoch boundary was crossed
         """
-        samples = []
+        if self._prefetch_buffer is not None:
+            return self._get_batch_prefetch(n)
+        return self._get_batch_no_prefetch(n)
+
+    def _get_batch_prefetch(self, n: int) -> tuple[list[Sample], bool]:
+        """Prefetch-aware path: consume indices one-by-one to stay aligned."""
+        samples: list[Sample] = []
         crossed_epoch = False
-        max_attempts = n * 10  # Prevent infinite loop if too many filtered
+        max_attempts = n * 10
+
+        for _ in range(max_attempts):
+            if len(samples) >= n:
+                break
+
+            indices, epoch_crossed = self.index_manager.get_next_indices(1)
+            if epoch_crossed and not crossed_epoch:
+                crossed_epoch = True
+                # IndexManager already shuffled the new epoch internally.
+                # Re-trigger prefetch immediately for the remaining indices
+                # so subsequent get() calls hit the cache instead of falling
+                # back to synchronous loading.
+                remaining = self.index_manager.indices[self.index_manager.position :]
+                self._prefetch_buffer.set_index_order(list(remaining))
+                logger.info(
+                    f"Prefetch: epoch crossing detected, re-triggered with "
+                    f"{len(remaining)} indices (epoch={self.index_manager.current_epoch})"
+                )
+            idx = indices[0]
+
+            sample = self._prefetch_buffer.get(idx)
+
+            if sample is None:
+                # Prefetch returned None — either the sample was filtered
+                # out during prefetch or prefetch failed; skip it.
+                continue
+
+            samples.append(sample)
+
+        if len(samples) < n:
+            logger.warning(
+                f"Could only get {len(samples)}/{n} samples after {max_attempts} attempts. "
+                f"Filter rate: {self._filter_count}/{self._total_processed}"
+            )
+
+        if self._prefetch_hits_log_counter % 10 == 0:
+            logger.info(
+                f"Prefetch stats: hit_rate={self._prefetch_buffer.hit_rate:.1%}, "
+                f"cache_size={self._prefetch_buffer.cache_size}"
+            )
+        self._prefetch_hits_log_counter += 1
+
+        return samples, crossed_epoch
+
+    def _get_batch_no_prefetch(self, n: int) -> tuple[list[Sample], bool]:
+        """Non-prefetch path: fetch indices in small batches for efficiency."""
+        samples: list[Sample] = []
+        crossed_epoch = False
+        max_attempts = n * 10
         attempts = 0
 
         while len(samples) < n and attempts < max_attempts:
-            # Calculate how many more we need (with some buffer for filtered samples)
             need = n - len(samples)
-            fetch_size = min(need * 2, 100)  # Fetch extra to account for filtering
+            fetch_size = min(need * 2, 100)
 
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed
 
             for idx in indices:
                 if len(samples) >= n:
-                    # Put back unused indices
                     break
 
                 attempts += 1
 
-                # Check cache first
                 sample = self.buffer.get(idx)
-
                 if sample is None:
-                    # Load and process
                     raw_data = self.reader[idx]
                     sample = self._process_raw_data(raw_data)
-
                     if sample is not None:
                         self.buffer.put(idx, sample)
 

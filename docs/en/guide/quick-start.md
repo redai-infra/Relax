@@ -126,6 +126,11 @@ python scripts/tools/process_avqa.py \
   --input-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train.json \
   --output-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
   --md-dir /root/AVQA-R1-6K/AVQA_R1/train
+
+python scripts/tools/process_avqa.py \
+  --input-dir /root/AVQA-R1-6K/AVQA_R1/valid/omni_rl_format_valid.json \
+  --output-dir /root/AVQA-R1-6K/AVQA_R1/valid/small_valid.jsonl \
+  --md-dir /root/AVQA-R1-6K/AVQA_R1/valid
 ```
 
 The conversion script reads the raw JSON, extracts problem, options, image, and audio fields, and produces a `.jsonl` file with `prompt`, `image`, `audio`, and `label` columns.
@@ -134,6 +139,10 @@ The conversion script reads the raw JSON, extracts problem, options, image, and 
 
 ```bash
 hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /root/Qwen3-Omni-30B-A3B-Instruct
+
+# Qwen3-Omni ships its chat_template in a standalone chat_template.json that
+# AutoTokenizer does not auto-load. Merge it into tokenizer_config.json (skipped if already present).
+python -c "import json,sys; m=sys.argv[1]; p=f'{m}/tokenizer_config.json'; tc=json.load(open(p)); ('chat_template' in tc) or (tc.update(chat_template=json.load(open(f'{m}/chat_template.json'))['chat_template']) or json.dump(tc, open(p,'w'), indent=2, ensure_ascii=False))" /root/Qwen3-Omni-30B-A3B-Instruct
 ```
 
 ### Launch Training
@@ -184,6 +193,10 @@ The conversion script reads the original JSON file, extracts the question, optio
 
 ```bash
 hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /root/Qwen3-Omni-30B-A3B-Instruct
+
+# Qwen3-Omni ships its chat_template in a standalone chat_template.json that
+# AutoTokenizer does not auto-load. Merge it into tokenizer_config.json (skipped if already present).
+python -c "import json,sys; m=sys.argv[1]; p=f'{m}/tokenizer_config.json'; tc=json.load(open(p)); ('chat_template' in tc) or (tc.update(chat_template=json.load(open(f'{m}/chat_template.json'))['chat_template']) or json.dump(tc, open(p,'w'), indent=2, ensure_ascii=False))" /root/Qwen3-Omni-30B-A3B-Instruct
 ```
 
 ### Launch Training

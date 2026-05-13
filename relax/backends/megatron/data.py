@@ -12,6 +12,7 @@ from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from torch.nn.utils.rnn import pad_sequence
 
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
@@ -22,7 +23,7 @@ from relax.utils.training import train_metric_utils
 from relax.utils.training.flops_utils import calculate_fwd_flops
 from relax.utils.types import RolloutBatch
 
-from .cp_utils import get_sum_of_sample_mean, slice_with_cp
+from .cp_utils import get_sum_of_sample_mean, maybe_padded_total_lengths, slice_with_cp
 
 
 logger = get_logger(__name__)
@@ -151,11 +152,59 @@ def get_batch(
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
+
+        # For VL models with CP > 1, Bridge expects UNSPLIT tokens (it handles CP
+        # splitting internally after vision embedding).  Save padded-but-unsplit
+        # tokens so model.py can pass them to Bridge instead of the CP-split ones.
+        if cp_size > 1:
+            chunk_size = (max_seqlen + 2 * cp_size - 1) // (2 * cp_size)
+            padded_len = 2 * cp_size * chunk_size
+            unsplit = [F.pad(t, (0, padded_len - t.size(0)), value=pad_token_id) for t in tokens]
+            batch["unsplit_tokens"] = torch.stack(unsplit)
+
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
         packed_seq_params = None
 
     elif qkv_format == "thd":
+        # VL + CP > 1: bridge's Qwen3VLModel.forward expects per-sample
+        # BSHD-padded input_ids + attention_mask, and re-derives the THD
+        # packing internally with align_size = tp*cp*2.  Provide unsplit
+        # inputs and a matching packed_seq_params so the caller-side cu_seqlens
+        # agrees with what the bridge derives from attention_mask.
+        # Mirrors verl's build_vlm_attn_mask_thd + preprocess_thd_engine.
+        is_vl_model = batch.get("multimodal_train_inputs") is not None
+        if is_vl_model and cp_size > 1:
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            align_size = tp_size * cp_size * 2
+            device = device_utils.make_current_torch_device()
+
+            seqlens = torch.tensor([t.size(0) for t in tokens], dtype=torch.int32, device=device)
+            seqlens_padded = (seqlens + align_size - 1) // align_size * align_size
+            cu_seqlens_padded = torch.zeros(len(tokens) + 1, dtype=torch.int32, device=device)
+            cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
+            max_seqlen_padded = int(seqlens_padded.max().item())
+
+            unsplit_tokens = pad_sequence(tokens, batch_first=True, padding_value=pad_token_id)
+            unsplit_attention_mask = torch.zeros_like(unsplit_tokens, dtype=torch.bool)
+            for i, s in enumerate(seqlens.tolist()):
+                unsplit_attention_mask[i, :s] = True
+
+            batch["unsplit_tokens"] = unsplit_tokens
+            batch["unsplit_attention_mask"] = unsplit_attention_mask
+            batch["vlm_packed_seq_params"] = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens_padded,
+                cu_seqlens_kv=cu_seqlens_padded,
+                max_seqlen_q=max_seqlen_padded,
+                max_seqlen_kv=max_seqlen_padded,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+            )
+            # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
+            # their per-sample chunking matches bridge's preprocess_packed_seqs.
+            batch["padded_total_lengths"] = seqlens_padded.tolist()
+
         if allgather_cp:
             # DSA mode: concatenate all sequences first, then slice once with CP.
             # We also pad the *global* concatenated stream to make per-rank chunks equal.
@@ -173,7 +222,9 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=torch.cuda.current_device())
+            cu_seqlens = torch.tensor(
+                cu_seqlens_list, dtype=torch.int, device=device_utils.make_current_torch_device()
+            )
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
@@ -191,7 +242,9 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
+            cu_seqlens = (
+                torch.tensor(cu_seqlens, dtype=torch.int).to(device_utils.make_current_torch_device()) * cp_size
+            )
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         packed_seq_params = PackedSeqParams(
@@ -440,7 +493,9 @@ def get_data_iterator(
     # across DP ranks so that all ranks execute the same number of training steps
     # (required by collective operations in the training loop).
     if getattr(args, "balance_data", False):
-        steps_tensor = torch.tensor([num_steps_per_rollout], dtype=torch.int, device=torch.cuda.current_device())
+        steps_tensor = torch.tensor(
+            [num_steps_per_rollout], dtype=torch.int, device=device_utils.make_current_torch_device()
+        )
         dist.all_reduce(steps_tensor, op=dist.ReduceOp.MAX, group=dp_group)
         num_steps_per_rollout = steps_tensor.item()
 
@@ -472,7 +527,9 @@ def get_data_iterator(
                 get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
             )
 
-        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
+        num_microbatches = torch.tensor(
+            num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
+        )
         dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
 
         if vpp_size > 1:
@@ -541,6 +598,11 @@ def log_rollout_data(
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
         max_seq_lens = rollout_data.get("max_seq_lens", None)
+        padded_total_lengths = maybe_padded_total_lengths(
+            total_lengths,
+            args.qkv_format,
+            rollout_data.get("multimodal_train_inputs") is not None,
+        )
 
         # OPD dynamic metric: overlap ratio on top-k token sets.
         student_topk_ids = rollout_data.get("topk_token_ids", None)
@@ -574,6 +636,7 @@ def log_rollout_data(
                     loss_masks_t,
                     qkv_format=args.qkv_format,
                     max_seq_lens=max_seq_lens,
+                    padded_total_lengths=padded_total_lengths,
                 )
                 overlap_ratio_value = cp_size * sum_of_sample_mean(overlap_ratio_flat) / len(loss_masks_t)
                 log_dict["opd_overlap_ratio"] = overlap_ratio_value.item()
@@ -619,6 +682,7 @@ def log_rollout_data(
                             loss_masks,
                             qkv_format=args.qkv_format,
                             max_seq_lens=max_seq_lens,
+                            padded_total_lengths=padded_total_lengths,
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
@@ -693,12 +757,22 @@ def log_rollout_data(
             correct_total_lengths = []
             correct_loss_masks = []
             correct_entropy = []
+            correct_padded_total_lengths_full = maybe_padded_total_lengths(
+                total_lengths,
+                args.qkv_format,
+                rollout_data.get("multimodal_train_inputs") is not None,
+            )
+            correct_padded_total_lengths: list[int] | None = (
+                [] if correct_padded_total_lengths_full is not None else None
+            )
             for i, raw_reward in enumerate(raw_rewards):
                 if raw_reward == 1:
                     correct_response_lengths.append(response_lengths[i])
                     correct_total_lengths.append(total_lengths[i])
                     correct_loss_masks.append(loss_masks[i])
                     correct_entropy.append(-rollout_data["log_probs"][i])
+                    if correct_padded_total_lengths is not None:
+                        correct_padded_total_lengths.append(correct_padded_total_lengths_full[i])
             num_correct_responses = len(correct_total_lengths)
             rollout_data["correct_response_lengths"] = correct_response_lengths
             correct_response_length_percentile = quantile(
@@ -708,7 +782,10 @@ def log_rollout_data(
                 rollout_data[f"correct_length/{p}"] = [val] * num_correct_responses
             if len(correct_entropy) > 0:
                 sum_of_sample_mean = get_sum_of_sample_mean(
-                    correct_total_lengths, correct_response_lengths, correct_loss_masks
+                    correct_total_lengths,
+                    correct_response_lengths,
+                    correct_loss_masks,
+                    padded_total_lengths=correct_padded_total_lengths,
                 )
                 correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
                 rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses

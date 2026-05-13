@@ -60,11 +60,11 @@ CKPT_ARGS=(
 #                                  DATASETS                                   #
 ###############################################################################
 
-TRAIN_FILES=()
-for i in {0..9}; do
-    TRAIN_FILES+=("'${DATA_DIR}/deepeyes/train/v0.1.2.parquet/partition=${i}/3ce23f4945e8498085ac5f72f0afc133-0.parquet'")
-done
-TEST_FILES=("${DATA_DIR}/deepeyes/test.parquet")
+TRAIN_FILES=(
+    "'${DATA_DIR}/deepeyes-v1/data_0.1.2_visual_toolbox_v2.parquet@[0:5000]'"
+    "'${DATA_DIR}/deepeyes-v1/data_v0.8_visual_toolbox_v2.parquet@[0:5000]'"
+)
+TEST_FILES=("${DATA_DIR}/deepeyes-v1/data_thinklite_reasoning_acc.parquet@[0:256]")
 PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 ###############################################################################
@@ -109,6 +109,7 @@ ROUTING_REPLAY_ARGS=(
 ###############################################################################
 
 EVAL_ARGS=(
+    --skip-eval-before-train
     --eval-interval 100
     --eval-prompt-data vstar ${TEST_FILES}
     --n-samples-per-eval-prompt 8

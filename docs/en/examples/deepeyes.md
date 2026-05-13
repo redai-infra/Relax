@@ -49,24 +49,11 @@ The HF Image dict format (`{"bytes": ...}`) is natively supported by Relax's ima
 ### Download the Model
 
 ```bash
-hf download Qwen/Qwen3-VL-4B-Instruct \
-  --local-dir /root/Qwen3-VL-4B-Instruct
+hf download Qwen/Qwen3-VL-30B-A3B-Thinking \
+  --local-dir /root/Qwen3-VL-30B-A3B-Thinking
 ```
-
-For the full-scale configuration, use `Qwen/Qwen3-VL-30B-A3B-Thinking`.
 
 ## Quick Start
-
-### 4B Model (8 GPUs)
-
-```bash
-export MODEL_DIR=/root
-export DATA_DIR=/root
-export SAVE_DIR=/root/save
-
-cd /root/Relax
-bash examples/deepeyes/run_deepeyes_4b.sh
-```
 
 ### 30B-A3B Model (8 GPUs, MoE)
 
@@ -91,7 +78,7 @@ bash examples/deepeyes/run_deepeyes.sh
 ```bash
 WORKING_DIR="./" RAY_ADDRESS=<RAY_HEAD_IP>:6379 \
   MODEL_DIR=/root DATA_DIR=/root SAVE_DIR=/root/save \
-  bash -x scripts/entrypoint/ray-job.sh examples/deepeyes/run_deepeyes_4b.sh
+  bash -x scripts/entrypoint/ray-job.sh examples/deepeyes/run_deepeyes.sh
 ```
 
 ## Architecture
@@ -101,7 +88,6 @@ WORKING_DIR="./" RAY_ADDRESS=<RAY_HEAD_IP>:6379 \
 ```
 examples/deepeyes/
 ├── run_deepeyes.sh            # Launch script (Qwen3-VL-30B-A3B, full config)
-├── run_deepeyes_4b.sh         # Launch script (Qwen3-VL-4B, lightweight)
 ├── deepeyes_config.yaml       # Task config (max_turns, env path)
 ├── rollout.py                 # Multi-turn rollout logic
 ├── env_deepeyes.py            # DeepEyes tool-use environment

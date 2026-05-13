@@ -50,6 +50,7 @@ ROLLOUT_ARGS=(
    # --rollout-max-prompt-len 2048
    --rollout-temperature 0.8
    --global-batch-size 512
+   --use-streaming-dataset
    --balance-data
    --use-fault-tolerance
    --system-prompt "${SYSTEM_PROMPT}"
@@ -88,7 +89,7 @@ GRPO_ARGS=(
    --kl-loss-coef 0.001
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --eps-clip 3.0
+   --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
 )

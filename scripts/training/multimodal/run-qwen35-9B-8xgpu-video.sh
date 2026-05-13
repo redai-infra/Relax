@@ -86,7 +86,7 @@ GRPO_ARGS=(
    --kl-loss-coef 0.001
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --eps-clip 3.0
+   --eps-clip 0.2
    --eps-clip-high 0.28
    --use-tis
 )
@@ -101,7 +101,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
 )
 

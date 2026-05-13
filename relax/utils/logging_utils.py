@@ -107,6 +107,10 @@ def configure_logger(prefix: str = "") -> None:
         handler.setLevel(LOG_LEVEL)
         handler.setFormatter(get_formatter(prefix))
         root_logger.addHandler(handler)
+
+        # Silence noisy third-party DEBUG loggers (PIL dumps PNG chunk metadata per image)
+        for noisy in ("PIL",):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     except Exception:
         # Silently ignore configuration errors to prevent breaking the application
         pass

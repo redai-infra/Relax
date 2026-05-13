@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 import numpy as np
 
+from relax.utils.types import Sample
+
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,48 @@ def compute_statistics(values: list[float]) -> dict[str, float]:
         "max": np.max(values).item(),
         "min": np.min(values).item(),
     }
+
+
+def is_rollout_numeric_metric_value(value) -> bool:
+    return isinstance(value, (int, float, np.integer, np.floating))
+
+
+def append_rollout_numeric_metric_values(metric_values: dict[str, list[float]], *, key: str, value) -> None:
+    if isinstance(value, (list, tuple)):
+        flattened = [float(item) for item in value if is_rollout_numeric_metric_value(item)]
+        if flattened:
+            metric_values.setdefault(key, []).extend(flattened)
+        return
+    if is_rollout_numeric_metric_value(value):
+        metric_values.setdefault(key, []).append(float(value))
+
+
+def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]]) -> dict[str, float]:
+    log_dict: dict[str, float] = {}
+    for metric_name, values in metric_values.items():
+        if values:
+            log_dict |= dict_add_prefix(compute_statistics(values), f"{metric_name}/")
+    return log_dict
+
+
+def compute_rollout_explicit_reward_metrics(args, samples: list[Sample]) -> dict[str, float]:
+    reward_metric_values: dict[str, list[float]] = {}
+    primary_reward_key = getattr(args, "reward_key", None)
+    for sample in samples:
+        reward = sample.reward
+        if not isinstance(reward, dict):
+            continue
+        for key, value in reward.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or key == primary_reward_key
+                or key == "raw_reward"
+                or key.startswith("_")
+            ):
+                continue
+            append_rollout_numeric_metric_values(reward_metric_values, key=key, value=value)
+    return finalize_rollout_explicit_metric_values(reward_metric_values)
 
 
 def compression_ratio(

@@ -57,18 +57,11 @@ RUN MAX_JOBS=64 \
     cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
     rm -rf /opt/flash-attention/
 
-ARG MEGATRON_COMMIT=3714d81d418c9f1bca4594fc35f9e8289f652862
-
-RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.10.0" && \
-    cd /root && git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
-    cd Megatron-LM && \
-    git checkout ${MEGATRON_COMMIT} && \
-    pip install -e . --no-deps && \
+RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@dc6876905830430b5054325fa4211ff302169c6b --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
-    pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir
-
-RUN NVCC_APPEND_FLAGS="--threads 4" \
+    pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
+    NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
@@ -82,19 +75,27 @@ ARG ENABLE_SGLANG_PATCH=1
 
 WORKDIR /root
 
+ARG MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
+ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
+    PYTHONPATH=/root/Megatron-LM/
+
+RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && \
+    cd /root/Megatron-Bridge/ && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev && \
+    mkdir /root/Megatron-LM &&\
+    cp -r /root/Megatron-Bridge/src/megatron /root/Megatron-LM/ && \
+    rsync -avP /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
+    rm -rf /root/Megatron-Bridge
+
 COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
-    apt-get install -y jq
-
-RUN pip install git+https://github.com/redai-infra/megatron-bridge.git@f13bec09 --no-build-isolation --no-deps --force-reinstall --no-cache-dir && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
-    git update-index --refresh && \
-    git apply megatron.patch --3way && \
+    patch -p1 < /root/Megatron-LM/megatron.patch && \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \

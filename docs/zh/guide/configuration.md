@@ -88,6 +88,9 @@
 | `--rollout-seed` | int | 42 | Rollout 的随机种子，用于打乱 Prompt 和随机采样 |
 | `--use-streaming-dataset` | flag | False | 使用流式数据集以节省内存 |
 | `--streaming-buffer-size` | int | 10000 | 流式数据集的缓冲区大小 |
+| `--prefetch-chunk-size` | int | 32 | 每轮预取时分派到线程池的样本数。较大的值可以提高吞吐量但也会增加内存压力。仅在设置了 `--use-streaming-dataset` 且数据集包含多模态数据时生效 |
+| `--prefetch-max-cached` | int | 256 | 预取缓存中保留的最大预加载样本数。缓存满时后台预取线程会暂停，直到消费者释放空间。设为 0 可禁用预取。仅在设置了 `--use-streaming-dataset` 且数据集包含多模态数据时生效 |
+| `--prefetch-num-workers` | int | 1 | 预取缓冲区中用于 I/O 密集型媒体解码（视频/图像）的并行工作线程数。设为 1 可序列化所有解码操作（对 FFmpeg 非线程安全问题最安全）。较高值可提高并行度，但在某些平台上可能触发 EAGAIN 错误。仅在启用预取时生效 |
 | `--data-source-path` | str | `relax.engine.rollout.data_source.RolloutDataSourceWithBuffer` | Rollout 数据源类路径 |
 | `--start-rollout-id` | int | None | 起始 Rollout 步数。未设置时会尝试从 `--load` 的检查点中读取 |
 
@@ -168,6 +171,16 @@
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--sglang-mem-fraction-static` | float | - | SGLang 静态内存分配比例 |
+| `--sglang-profile` | flag | False | 启用 SGLang 引擎的 torch profiling。在 Rollout 推理期间触发，每步保存 profile trace |
+| `--sglang-profile-steps` | int (列表) | None | 指定要进行 SGLang profiling 的绝对 rollout step ID（0-indexed）列表。优先级高于 `--sglang-profile-step-start/end`。例如 `--sglang-profile-steps 3 10 50` |
+| `--sglang-profile-step-start` | int | None | SGLang profiling 的起始 rollout step（**inclusive**，0-indexed）。与 `--sglang-profile-step-end` 配合指定连续范围。设置了 `--sglang-profile-steps` 时被忽略 |
+| `--sglang-profile-step-end` | int | None | SGLang profiling 的结束 rollout step（**inclusive**，0-indexed）。与 `--sglang-profile-step-start` 配合指定连续范围。设置了 `--sglang-profile-steps` 时被忽略。例如 start=2, end=4 会采集 step 2, 3, 4 |
+| `--sglang-profile-output-dir` | str | None | SGLang profile trace 的输出目录。默认使用 `traces/<tb_experiment_name>/sglang_trace` |
+| `--sglang-profile-num-steps` | int | 3 | 每轮 Rollout 中要 profile 的 SGLang 前向步数。-1 表示 profile 整个 Rollout 步，直到调用 `stop_profile` |
+| `--sglang-profile-activities` | str (列表) | ["CPU", "GPU"] | 要 profile 的活动类型（例如 `CPU GPU`） |
+| `--sglang-profile-by-stage` | flag | False | 按阶段（prefill/decode）分别进行 profile |
+| `--sglang-profile-with-stack` | flag | False | 在 profile trace 中记录调用栈 |
+| `--sglang-profile-record-shapes` | flag | False | 在 profile trace 中记录张量形状 |
 
 ### 自定义 Rollout 函数
 
@@ -498,7 +511,9 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 
 ---
 
-## 调试参数
+## 调试与性能分析参数
+
+### 调试
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -510,14 +525,33 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 | `--save-debug-train-data` | str | None | 保存训练数据，路径支持 `{rollout_id}` 占位符 |
 | `--dump-details` | str | None | 导出所有训练细节用于事后分析 |
 | `--check-weight-update-equal` | flag | False | 检查权重更新是否相等 |
-| `--memory-snapshot-dir` | str | . | 内存快照目录 |
-| `--memory-snapshot-num-steps` | int | None | 内存快照步数 |
+| `--enable-cuda-memory-check` | flag | False | 在底层 NCCL 通信调用周围启用内存检查。在每次集合通信前记录可用 GPU 显存，通信失败时将内存信息附加到异常中 |
+
+### 训练性能 Profiling
+
+以下参数控制训练过程的 PyTorch Profiler 采集。Trace 文件默认保存到 `traces/<tb_experiment_name>/train_trace/` 目录下。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--use-pytorch-profiler` | flag | False | 启用 PyTorch 内置 profiler 记录训练步骤的 CUDA kernel、CPU op 和通信操作（来自 Megatron） |
+| `--profile-step-start` | int | 10 | 开始 profiling 的步数偏移（**inclusive**，来自 Megatron）。指从本次训练启动后的第 N 步开始采集，非绝对 rollout ID；断点续训时计数从 0 重新开始 |
+| `--profile-step-end` | int | 12 | 停止 profiling 的步数偏移（**inclusive**，来自 Megatron）。含义同上。例如 start=10, end=12 会采集 step 10, 11, 12（共 3 步） |
 | `--profile-target` | str (列表) | train_overall | 性能分析目标：`train_overall`、`train_actor`、`train_log_probs` |
 | `--profile-with-stack` | flag | False | 在 profiler trace 中记录调用栈信息 |
 | `--profile-with-memory` | flag | False | 在 profiler trace 中记录内存信息 |
 | `--profile-with-flops` | flag | False | 在 profiler trace 中估算 FLOPs |
-| `--memory-recorder` | str | torch | 内存记录器：`torch`、`memray` |
-| `--enable-cuda-memory-check` | flag | False | 在底层 NCCL 通信调用周围启用内存检查。在每次集合通信前记录可用 GPU 显存，通信失败时将内存信息附加到异常中 |
+
+### GPU 内存 Profiling
+
+以下参数控制 GPU 内存快照采集，用于诊断显存泄漏和 OOM 问题。Snapshot 文件可用 PyTorch Memory Viz 工具（`torch.cuda.memory._viz`）查看。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--record-memory-history` | flag | False | 启用 CUDA 内存分配历史记录（来自 Megatron）。开启后会记录每次分配/释放的调用栈和张量信息，并在发生 OOM 时自动 dump snapshot |
+| `--memory-snapshot-path` | str | snapshot.pickle | 内存快照文件名（来自 Megatron） |
+| `--memory-snapshot-dir` | str | None | 内存快照保存目录。默认使用 `traces/<tb_experiment_name>/memory_snapshot` |
+| `--memory-snapshot-num-steps` | int | None | 在指定步数后主动 dump 内存快照（0-indexed，即设为 3 表示在第 2 步后 dump） |
+| `--memory-recorder` | str | torch | 内存记录器后端：`torch`（PyTorch 内置）、`memray`（需要 `pip install memray`） |
 
 ### 网络
 

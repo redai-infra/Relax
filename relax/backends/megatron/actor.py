@@ -21,6 +21,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (
@@ -631,6 +632,13 @@ class MegatronTrainRayActor(TrainRayActor):
             except Exception as e:
                 logger.warning(f"Error triggering evaluation for rollout_id {rollout_id}: {e}")
 
+        # On the final training step the rollout component has already exited
+        # its main loop, so nothing else awaits the eval handler. Block here
+        # until eval finishes; otherwise the controller's atexit shutdown
+        # races with eval and tears down the SGLang engines mid-flight.
+        if is_train_done:
+            self._wait_for_previous_eval()
+
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -785,12 +793,19 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.warning(
                     f"Error during async weight update: {e}, maybe cause by rollout server failure. Will continue without async update for this step."
                 )
+            # On the final training step the rollout component has already
+            # exited its main loop, so the eval just triggered above will not
+            # be awaited anywhere. Block until it finishes; otherwise the
+            # controller's atexit shutdown races with eval and tears down the
+            # SGLang engines mid-flight.
+            if (rollout_id + 1) == self.args.num_rollout:
+                self._wait_for_previous_eval()
             if self.args.use_routing_replay:
                 RoutingReplay.clear_all()
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=True)
+            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
@@ -949,7 +964,7 @@ class MegatronTrainRayActor(TrainRayActor):
         flags = torch.tensor(
             [int(rollout_only), int(actor_fwd_only)],
             dtype=torch.int32,
-            device=torch.cuda.current_device(),
+            device=device_utils.make_current_torch_device(),
         )
         dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
         rollout_only = bool(flags[0].item())
@@ -1059,11 +1074,19 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = model_tag
 
     def all_consumed(self, task_name, rollout_id):
-        if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0:
+        # Only (TP=0, PP=0, CP=0) queries the transfer queue; otherwise different cp_ranks
+        # may observe different consumption status due to concurrent fetches and diverge,
+        # leaving some ranks idle while others enter the next collective and hang.
+        if (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        ):
             status = [run(self.data_system_client.async_check_consumption_status(task_name, f"train_{rollout_id}"))]
         else:
             status = [True]
-        status = torch.tensor(status, device=torch.cuda.current_device())
+        status = torch.tensor(status, device=device_utils.make_current_torch_device())
+        dist.broadcast(status, group=mpu.get_context_parallel_group(), group_src=0)
         dist.broadcast(status, group=mpu.get_tensor_model_parallel_group(), group_src=0)
         dist.broadcast(status, group=mpu.get_pipeline_model_parallel_group(), group_src=0)
 

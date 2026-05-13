@@ -40,6 +40,7 @@ from relax.backends.megatron.weight_update.common import all_gather_param, named
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
+from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.external.megatron_bridge_compat import ensure_megatron_bridge_importable
 from relax.utils.logging_utils import get_logger
@@ -100,7 +101,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
-        self.device = next(model[0].parameters()).device if model else torch.cuda.current_device()
+        self.device = next(model[0].parameters()).device if model else device_utils.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
@@ -119,12 +120,13 @@ class DeviceDirectBackend(CommBackend):
 
         # Ray actors for rollout communication
         self.rollout_engines: Dict[int, Any] = {}  # rank -> Ray actor handle
-        torch.cuda.set_device(self.device)
+        device_utils.set_device(self.device)
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
         self._bridge_task_map: Optional[Dict[str, Any]] = None  # global_param_name -> WeightConversionTask
         self._bridge_mapping_registry = None  # MegatronMappingRegistry for dynamic lookups
+        self._bridge_expert_transposes_down: bool = True  # set in _init_bridge_tasks
 
     def _init_bridge_tasks(self) -> None:
         """Lazily initialize Bridge conversion tasks and build a lookup table.
@@ -208,6 +210,16 @@ class DeviceDirectBackend(CommBackend):
                 if task.megatron_module is not None:
                     inner_tp._detected_type = inner_tp._detect_parallelism_type(task.megatron_module)
                     inner_tp._mapping = inner_tp._get_or_create_mapping(inner_tp._detected_type)
+
+        # Detect whether the Bridge's ExpertMLPDownProjMapping applies a
+        # transpose in megatron_to_hf (Qwen3-VL does, Qwen3.5 does not).
+        # Used by _convert_to_hf_bridge to decide whether to undo the transpose.
+        self._bridge_expert_transposes_down = False
+        for task in self._bridge_task_map.values():
+            cls = type(task.mapping)
+            if cls.__name__ == "ExpertMLPDownProjMapping":
+                self._bridge_expert_transposes_down = "megatron_to_hf" in cls.__dict__
+                break
 
         logger.info(f"Bridge task map initialized with {len(self._bridge_task_map)} local tasks")
 
@@ -396,16 +408,21 @@ class DeviceDirectBackend(CommBackend):
 
         # ── Post-process expert weights ──────────────────────────────────
         # Bridge's ExpertMLPGateUpProjMapping and ExpertMLPDownProjMapping
-        # (used by Qwen3-VL MoE) apply an extra ``.transpose(-1, -2)`` in
-        # their ``megatron_to_hf`` methods, assuming Megatron stores expert
-        # weights in column-major order.  However, the raw ``convert_to_hf``
-        # does NOT transpose expert weights — Megatron's expert weights are
-        # already in the same layout as HF.  We must undo Bridge's transpose
-        # to match the format that SGLang / ``convert_to_hf`` expects.
+        # apply transformations that differ by model family:
+        #
+        # **Qwen3-VL** (qwen3_vl_bridge.py):
+        #   gate_up_proj: transpose each half then stack → [2, D_out, D_in]
+        #   down_proj: transpose → [D_in, D_out]
+        #   We must undo the transpose.
+        #
+        # **Qwen3.5** (qwen35_vl_bridge.py):
+        #   gate_up_proj: cat without transpose → [2*H, D]  (2-D)
+        #   down_proj: no transpose (AutoMapping) → [H, D]  (2-D)
+        #   No un-transpose needed; just split the fused tensor.
         #
         # Additionally, Bridge outputs fused names without expert_id:
-        #   - ``...experts.gate_up_proj`` with shape [2, D_out, D_in]
-        #   - ``...experts.down_proj`` with shape [D_in, D_out]
+        #   - ``...experts.gate_up_proj``
+        #   - ``...experts.down_proj``
         # We split into per-expert format with correct names and shapes:
         #   - ``...experts.{E}.gate_proj.weight`` [H, D]
         #   - ``...experts.{E}.up_proj.weight``   [H, D]
@@ -416,19 +433,28 @@ class DeviceDirectBackend(CommBackend):
             postprocessed: list[tuple[str, torch.Tensor]] = []
             for hf_name, tensor in converted_named_tensors:
                 if hf_name.endswith(".experts.gate_up_proj"):
-                    # Bridge output: [2, D_out, D_in] (transposed by Bridge)
-                    # Undo transpose on each slice: [D_out, D_in] -> [D_in, D_out]
-                    gate_tensor = tensor[0].transpose(-1, -2).contiguous()
-                    up_tensor = tensor[1].transpose(-1, -2).contiguous()
                     base = hf_name[: -len(".gate_up_proj")]
+                    if tensor.ndim == 3:
+                        # Qwen3-VL style: [2, D_out, D_in] (transposed by Bridge)
+                        # Undo transpose on each slice: [D_out, D_in] -> [D_in, D_out]
+                        gate_tensor = tensor[0].transpose(-1, -2).contiguous()
+                        up_tensor = tensor[1].transpose(-1, -2).contiguous()
+                    else:
+                        # Qwen3.5 style: [2*H, D] (cat, no transpose by Bridge)
+                        # Split along dim 0 into two [H, D] tensors
+                        gate_tensor, up_tensor = tensor.chunk(2, dim=0)
                     postprocessed.append((f"{base}.{expert_id}.gate_proj.weight", gate_tensor))
                     postprocessed.append((f"{base}.{expert_id}.up_proj.weight", up_tensor))
                 elif hf_name.endswith(".experts.down_proj"):
-                    # Bridge output: transposed — undo to match raw convert_to_hf
                     base = hf_name[: -len(".down_proj")]
-                    postprocessed.append(
-                        (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
-                    )
+                    if tensor.ndim == 2 and not self._bridge_expert_transposes_down:
+                        # Qwen3.5 style: AutoMapping, no transpose — already [H, D]
+                        postprocessed.append((f"{base}.{expert_id}.down_proj.weight", tensor))
+                    else:
+                        # Qwen3-VL style: transposed — undo to match raw convert_to_hf
+                        postprocessed.append(
+                            (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
+                        )
                 else:
                     postprocessed.append((hf_name, tensor))
             converted_named_tensors = postprocessed
@@ -642,14 +668,8 @@ class DeviceDirectBackend(CommBackend):
                     ray.get(futures)
                     logger.info("Destroyed old rollout process group: group_name=%s", old_group_name)
                     self._model_update_groups = None
-                    self._rollout_topology_signature = None
-                    reinit_sleep_seconds = float(os.getenv("RELAX_ROLLOUT_PG_REINIT_SLEEP_SECONDS", "5"))
-                    if reinit_sleep_seconds > 0:
-                        logger.info(
-                            "Sleeping %.1fs before reinitializing rollout process group to let RCCL sockets close",
-                            reinit_sleep_seconds,
-                        )
-                        time.sleep(reinit_sleep_seconds)
+                    # Wait for NCCL socket ports to be released by the OS
+                    time.sleep(2.0)
                 except Exception as e:
                     logger.warning(f"Error destroying old process group: {e}")
                     self._model_update_groups = None
@@ -665,59 +685,59 @@ class DeviceDirectBackend(CommBackend):
                 cumulative_offset += gpus_for_node
             world_size = cumulative_offset
 
-            master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
-            self._rollout_group_generation += 1
-            self._group_name = f"{base_group_name}-g{self._rollout_group_generation}"
-            logger.info(
-                "Preparing rollout process group: group_name=%s, master=%s:%s, world_size=%s, rank_offsets=%s, "
-                "rollout_ranks=%s",
-                self._group_name,
-                master_address,
-                master_port,
-                world_size,
-                rank_offsets,
-                sorted(int(rank) for rank in self.rollout_topology),
-            )
+            max_retries = 3
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                master_port = self._find_free_port_in_range(self._MASTER_PORT_MIN, self._MASTER_PORT_MAX)
 
-            # Prepare init payloads for each rollout node
-            init_payloads = {}
-            for rank, role_info in self.rollout_topology.items():
-                init_payloads[int(rank)] = {
-                    "master_address": master_address,
-                    "master_port": master_port,
-                    "rank_offset": rank_offsets[int(rank)],
-                    "world_size": world_size,
-                    "group_name": self._group_name,
-                    "backend": self.backend_type,
-                }
+                init_payloads = {}
+                for rank, role_info in self.rollout_topology.items():
+                    init_payloads[int(rank)] = {
+                        "master_address": master_address,
+                        "master_port": master_port,
+                        "rank_offset": rank_offsets[int(rank)],
+                        "world_size": world_size,
+                        "group_name": self._group_name,
+                        "backend": self.backend_type,
+                    }
 
-            logger.info(
-                "Sending init_weights_update_group to %s rollout nodes: %s",
-                len(self.rollout_topology),
-                init_payloads,
-            )
-            futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
+                logger.info(
+                    f"Sending init_weights_update_group to {len(self.rollout_topology)} rollout nodes "
+                    f"(attempt {attempt}/{max_retries}, port={master_port})..."
+                )
+                futures = self._batch_request("/init_weights_update_group", init_payloads, get_rank=True)
 
-            logger.info(
-                "Initializing local rollout process group: init_method=tcp://%s:%s, world_size=%s, rank=0, "
-                "group_name=%s, backend=%s",
-                master_address,
-                master_port,
-                world_size,
-                self._group_name,
-                self.backend_type,
-            )
-            self._model_update_groups = init_process_group(
-                backend=self.backend_type,
-                init_method=f"tcp://{master_address}:{master_port}",
-                world_size=world_size,
-                rank=0,
-                group_name=self._group_name,
-                timeout=timedelta(seconds=180),
-            )
-            ray.get(futures)
-            self._rollout_topology_signature = rollout_topology_signature
-            logger.info("Initialized rollout process group: group_name=%s, master_port=%s", self._group_name, master_port)
+                try:
+                    self._model_update_groups = init_process_group(
+                        backend=self.backend_type,
+                        init_method=f"tcp://{master_address}:{master_port}",
+                        world_size=world_size,
+                        rank=0,
+                        group_name=self._group_name,
+                        timeout=timedelta(seconds=180),
+                    )
+                    ray.get(futures)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Failed to init process group for rollout (attempt {attempt}/{max_retries}, "
+                        f"port={master_port}): {e}",
+                        exc_info=(attempt == max_retries),
+                    )
+                    self._model_update_groups = None
+                    try:
+                        ray.get(futures, timeout=5)
+                    except Exception:
+                        pass
+                    if attempt < max_retries:
+                        time.sleep(5.0 * attempt)
+
+            if last_error is not None:
+                raise RuntimeError(
+                    f"Failed to init process group for rollout after {max_retries} attempts"
+                ) from last_error
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
@@ -892,7 +912,7 @@ class DeviceDirectBackend(CommBackend):
         # allocator keeps large reserved blocks that are internally
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
-        torch.cuda.empty_cache()
+        device_utils.empty_cache()
 
     def _update_weight_from_distributed(
         self,
