@@ -111,9 +111,52 @@ def configure_logger(prefix: str = "") -> None:
         # Silence noisy third-party DEBUG loggers (PIL dumps PNG chunk metadata per image)
         for noisy in ("PIL",):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+
+        install_asyncio_noise_filter()
     except Exception:
         # Silently ignore configuration errors to prevent breaking the application
         pass
+
+
+_ASYNCIO_FILTER_INSTALLED = False
+
+
+class _ChainFutureFilter(logging.Filter):
+    """Drop the spurious uvloop + Py3.12 `_chain_future._set_state`
+    AssertionError that Ray's ServeController emits when a proxy health-check
+    response arrives after the controller has already cancelled the awaiting
+    future.
+
+    The error is harmless but pollutes every run.
+    """
+
+    def filter(self, record):
+        try:
+            return "_chain_future" not in record.getMessage()
+        except Exception:
+            return True
+
+
+def install_asyncio_noise_filter() -> None:
+    """Attach the _chain_future filter to the asyncio logger in the current
+    process.
+
+    Idempotent. Safe to call from a Ray `worker_process_setup_hook` so that
+    every worker (driver, training actor, SGLang engine, **and**
+    ServeController) suppresses the noise even though Ray internals never
+    import relax.
+    """
+    global _ASYNCIO_FILTER_INSTALLED
+    if _ASYNCIO_FILTER_INSTALLED:
+        return
+    try:
+        logging.getLogger("asyncio").addFilter(_ChainFutureFilter())
+        _ASYNCIO_FILTER_INSTALLED = True
+    except Exception:
+        pass
+
+
+install_asyncio_noise_filter()
 
 
 class LazyConfiguredLogger(logging.Logger):

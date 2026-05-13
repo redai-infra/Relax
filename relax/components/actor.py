@@ -151,7 +151,7 @@ class Actor(Base):
                     self._logger.info("All training steps finished")
                     break
 
-                if not self.config.fully_async and self.config.colocate:
+                if not self.config.fully_async and self.config.colocate and not self.config.debug_train_only:
                     if not self._wait_for_rollout_data():
                         continue
 

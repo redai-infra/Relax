@@ -1966,6 +1966,7 @@ def _pre_parse_mode():
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
+    temp_parser.add_argument("--skip-hf-validate", action="store_true", default=False)
     temp_args, _ = temp_parser.parse_known_args()
     return temp_args
 
@@ -1992,7 +1993,7 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only,
+        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
     )
 
     # Merge pre-parsed args into the main namespace

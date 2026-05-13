@@ -3414,10 +3414,23 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     if not force_new and args.sglang_router_ip is not None:
         return args.sglang_router_ip, args.sglang_router_port
 
-    if env_overwrite_local_ip := os.getenv(SLIME_HOST_IP_ENV, None):
-        router_ip = _wrap_ipv6(env_overwrite_local_ip)
+    # Determine the bind address (can be 0.0.0.0 / wildcard) and the connection
+    # address (must be a reachable IP for engines).  When SLIME_HOST_IP is set
+    # to a wildcard ("0.0.0.0" / "::") the bind is fine but the wildcard is not
+    # a usable connection target, so fall back to the real local IP for the
+    # cross-node connection.  For any other explicit value (including the
+    # single-node default 127.0.0.1) honor it for both bind and connect so the
+    # two stay consistent.
+    real_local_ip = _wrap_ipv6(get_host_info()[1])
+    env_overwrite_local_ip = os.getenv(SLIME_HOST_IP_ENV, None)
+    if env_overwrite_local_ip:
+        bind_ip = _wrap_ipv6(env_overwrite_local_ip)
+        is_wildcard = env_overwrite_local_ip.strip("[]") in ("0.0.0.0", "::")
+        router_ip = real_local_ip if is_wildcard else bind_ip
     else:
-        router_ip = _wrap_ipv6(get_host_info()[1])
+        bind_ip = real_local_ip
+        router_ip = real_local_ip
+
     if force_new:
         router_port = find_available_port(random.randint(3000, 4000))
     else:
@@ -3432,7 +3445,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         from relax.engine.router.router import run_router
 
         router_args = copy.copy(args)
-        router_args.sglang_router_ip = router_ip
+        router_args.sglang_router_ip = bind_ip
         router_args.sglang_router_port = router_port
 
     else:
@@ -3441,7 +3454,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         from relax.utils.http_utils import run_router
 
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        router_args.host = router_ip
+        router_args.host = bind_ip
         router_args.port = router_port
         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
         router_args.log_level = "warn"
@@ -3463,7 +3476,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     process.start()
     time.sleep(3)
     assert process.is_alive()
-    logger.info(f"Router launched locally at {router_ip}:{router_port}")
+    logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
 
     return router_ip, router_port
 

@@ -108,14 +108,25 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
     export RELAX_ENTRYPOINT_MODE="spmd-multinode"
 
     # Runtime env for multi-node (includes MASTER_ADDR)
+    NVSHMEM_LIB_PATH="${NVSHMEM_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
+    CURRENT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NVSHMEM_LIB_PATH}"
+
     export RUNTIME_ENV_JSON="{
+\"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",
 \"env_vars\": {
    \"PYTHONUNBUFFERED\": \"1\",
    \"PYTHONPATH\": \"${PYTHONPATH}\",
    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-   \"MASTER_ADDR\": \"${HOST_IP}\"
+   \"MASTER_ADDR\": \"${HOST_IP}\",
+   \"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK\": \"${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-32}\",
+   \"NVSHMEM_DISABLE_NCCL\": \"${NVSHMEM_DISABLE_NCCL:-1}\",
+   \"SGLANG_HEALTH_CHECK_TIMEOUT\": \"${SGLANG_HEALTH_CHECK_TIMEOUT:-180}\",
+   \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\",
+   \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
+   \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
+
 }
 }"
     exec bash "$RUN_SCRIPT" "$@"

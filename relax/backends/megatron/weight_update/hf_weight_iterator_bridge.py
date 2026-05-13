@@ -1,14 +1,28 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+from collections import OrderedDict
+
+import torch
 
 from relax.utils import megatron_bridge_utils
-from relax.utils.misc import chunk_named_params_by_size
+from relax.utils.logging_utils import get_logger
 
 from ..misc_utils import strip_param_name_prefix
 from ..weight_conversion import postprocess_hf_param
 from ..weight_conversion.processors import quantize_params
 from .hf_weight_iterator_base import HfWeightIteratorBase
+
+
+logger = get_logger(__name__)
+
+# Weight names that must appear in the same chunk for SGLang's MLA fusion.
+# SGLang's `do_load_weights` caches q_a_proj and kv_a_proj_with_mqa in a
+# per-call local dict (`cached_a_proj`) and fuses them into
+# `fused_qkv_a_proj_with_mqa` only when *both* are present.  If they land
+# in different chunks (each chunk triggers a separate `load_weights` call),
+# the fusion never happens and the attention weights are silently stale.
+_MLA_PAIRED_SUFFIXES = ("q_a_proj.weight", "kv_a_proj_with_mqa.weight")
 
 
 class HfWeightIteratorBridge(HfWeightIteratorBase):
@@ -74,7 +88,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
                     yield from quantized_batch
 
-            yield from chunk_named_params_by_size(
+            yield from _chunk_with_mla_pairing(
                 iter_quantized_named_weights(),
                 chunk_size=self.args.update_weight_buffer_size,
             )
@@ -126,6 +140,77 @@ def _build_hf_to_megatron_mapping(conversion_tasks):
     return hf_to_megatron_mapping
 
 
+def _chunk_with_mla_pairing(named_params, chunk_size):
+    """Chunk weights by size while keeping MLA weight pairs together.
+
+    SGLang's ``do_load_weights`` fuses ``q_a_proj`` and ``kv_a_proj_with_mqa``
+    into ``fused_qkv_a_proj_with_mqa`` using a per-call ``cached_a_proj`` dict.
+    Each chunk triggers a separate ``load_weights`` call, so the two weights
+    **must** be in the same chunk for the fusion to succeed.
+
+    Strategy: buffer any unpaired MLA weight and flush it together with its
+    partner when the partner arrives.  All other weights pass through to the
+    normal size-based chunking logic.
+    """
+    bucket: list[tuple[str, torch.Tensor]] = []
+    bucket_size = 0
+    # layer_prefix -> (name, tensor) for the first MLA weight seen
+    pending_mla: OrderedDict[str, tuple[str, torch.Tensor]] = OrderedDict()
+
+    for name, tensor in named_params:
+        is_mla = any(name.endswith(suffix) for suffix in _MLA_PAIRED_SUFFIXES)
+
+        if is_mla:
+            # Derive a layer key so we can match the pair.
+            # e.g. "model.layers.5.self_attn.q_a_proj.weight" -> "model.layers.5.self_attn."
+            for suffix in _MLA_PAIRED_SUFFIXES:
+                if name.endswith(suffix):
+                    layer_key = name[: -len(suffix)]
+                    break
+
+            if layer_key in pending_mla:
+                # Partner found — emit both together.
+                partner_name, partner_tensor = pending_mla.pop(layer_key)
+                pair = [(partner_name, partner_tensor), (name, tensor)]
+                pair_size = partner_tensor.nbytes + tensor.nbytes
+
+                # If adding the pair would overflow, flush current bucket first.
+                if bucket and (bucket_size + pair_size) >= chunk_size:
+                    yield bucket
+                    bucket = []
+                    bucket_size = 0
+
+                bucket.extend(pair)
+                bucket_size += pair_size
+            else:
+                # First of the pair — hold it.
+                pending_mla[layer_key] = (name, tensor)
+        else:
+            obj_size = tensor.nbytes
+            if bucket and (bucket_size + obj_size) >= chunk_size:
+                yield bucket
+                bucket = []
+                bucket_size = 0
+
+            bucket.append((name, tensor))
+            bucket_size += obj_size
+
+    # Flush any remaining unpaired MLA weights (shouldn't happen in practice).
+    for layer_key, (name, tensor) in pending_mla.items():
+        if torch.distributed.get_rank() == 0:
+            logger.warning(f"[Bridge Export] Unpaired MLA weight: {name} (layer_key={layer_key})")
+        obj_size = tensor.nbytes
+        if bucket and (bucket_size + obj_size) >= chunk_size:
+            yield bucket
+            bucket = []
+            bucket_size = 0
+        bucket.append((name, tensor))
+        bucket_size += obj_size
+
+    if bucket:
+        yield bucket
+
+
 def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
     """Replace param_weight in each conversion task with the latest trained
     weights.
@@ -136,6 +221,8 @@ def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
     """
 
     def _handle_one(task):
+        if task is None:
+            return None
         if task.param_weight is None:
             return task
 

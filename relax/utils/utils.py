@@ -79,7 +79,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
-    if any(sample.multimodal_train_inputs is not None for sample in samples):
+    if args.multimodal_keys is not None:
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
     if samples[0].teacher_log_probs is not None:

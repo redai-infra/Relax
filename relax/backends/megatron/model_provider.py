@@ -218,6 +218,7 @@ def get_model_provider_func(
             "moe_router_dtype",
             "moe_aux_loss_coeff",
             "moe_token_dispatcher_type",
+            "moe_shared_expert_overlap",
             "moe_enable_deepep",
             "moe_flex_dispatcher_backend",
             "use_audio_in_video",
@@ -227,6 +228,9 @@ def get_model_provider_func(
             # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
             "calculate_per_token_loss",
+            # Allow CLI to override layer count / MoE frequency for layer-reduced training
+            "num_layers",
+            "moe_layer_freq",
         ]
 
         args_dict = vars(args)

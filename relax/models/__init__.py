@@ -11,6 +11,18 @@ except (ImportError, AttributeError):
     from relax.models.qwen_omni.qwen3_omni_bridge import Qwen3OmniMoEBridge  # noqa: F811
     from relax.models.qwen_omni.qwen3_omni_provider import Qwen3OmniModelProvider  # noqa: F811
 
+# Import glm_moe_dsa in its own try/except so a failure above does not block
+# the GLM5Bridge @register_bridge decorator from running. Without this, an
+# unrelated qwen_omni circular-import error prevents GLM5Bridge from being
+# registered, and AutoBridge silently falls back to the generic MLA bridge,
+# bypassing the fused DSAMLASelfAttention spec.
+try:
+    from relax.models import glm_moe_dsa  # noqa: F401
+except Exception as _e:
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning("Failed to import relax.models.glm_moe_dsa: %s", _e)
+
 
 __all__ = [
     "Qwen3OmniMoEBridge",

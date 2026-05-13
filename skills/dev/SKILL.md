@@ -36,6 +36,38 @@ ______________________________________________________________________
 
 The goal is to submit a training run to a remote Ray cluster via `scripts/entrypoint/ray-job.sh`, monitor it via `ray job logs`, and either confirm it works or fix errors and retry.
 
+______________________________________________________________________
+
+### Standard launch flow (canonical)
+
+Every training launch — the **first** one and every **resubmit after a fix** — follows the same three steps. Do not skip the pre-flight cleanup; stale Ray Serve apps from a failed previous job will silently break the new job at Router startup.
+
+**Step A — Pre-flight cleanup (always run first):**
+
+```bash
+ray serve shutdown -y
+```
+
+Drops all stale Ray Serve applications/deployments left behind by a previous run. This is **NOT** a forbidden destructive op (see `skills/ssh-ray-cluster/SKILL.md`) — `ray serve shutdown` only tears down Serve state, not the Ray runtime, not training processes, and not other tenants' jobs. Always run it before resubmitting.
+
+**Step B — Submit the training job:**
+
+```bash
+bash scripts/entrypoint/ray-job.sh scripts/training/text/<run-script>.sh
+```
+
+(or whichever subdirectory matches the run script). The entrypoint handles residual python/sglang cleanup, env setup, and `ray job submit` for you. Capture the JOB_ID and the log file path that the run script writes to (typically `log/<EXPERIMENT>-<TIMESTAMP>.log`).
+
+**Step C — Monitor the new log file:**
+
+Tail/grep the log file for progress (`step`, `iteration`) and errors (`Error`, `Traceback`, `Exception`, `OOM`). Apply the noise-filter pattern from "Step 2: Monitor the job" below.
+
+**On error → fix → resubmit:** loop back to Step A (the `ray serve shutdown -y` is mandatory each time). Stop after 3 consecutive failed resubmits and report to the user.
+
+**Strictly forbidden during this flow** (per `skills/ssh-ray-cluster/SKILL.md`): `ray stop`, `pkill -9 python`, `bash scripts/tools/kill_for_ray.sh`, `ray job stop` against unrelated jobs, `rm -rf /tmp/ray/`. `ray serve shutdown -y` and `ray job stop <our-job-id>` are the **only** state-changing operations allowed without explicit user approval.
+
+______________________________________________________________________
+
 > **⚠️ MANDATORY**: All `ray job submit` commands in this debugging workflow **MUST** include `RAY_NO_WAIT=1` so the submission is non-blocking. This allows you to immediately proceed to monitoring via `ray job logs` without the shell hanging on the submit call. Every command example below already includes it — do not omit it.
 
 ### Workflow overview
@@ -196,6 +228,19 @@ curl -s -X DELETE http://${CLUSTER_IP}:8265/api/serve/applications/
 ### RuntimeEnv key conflicts
 
 If both `ray job submit --runtime-env-json '{"env_vars": {"KEY": "val"}}'` and `ray.init(runtime_env={"env_vars": {"KEY": "val2"}})` set the same env var key, Ray raises a `ValueError`. Workaround: use the `bash -c` wrapper (Pattern B above) to export env vars in the shell instead.
+
+### Diagnostic env vars leak into ALL Ray actors via `RUNTIME_ENV_JSON`
+
+Anything you put in `RUNTIME_ENV_JSON.env_vars` (in `scripts/entrypoint/ray-job.sh`) is propagated to **every** Ray worker and **every** Ray Serve infrastructure actor — `ProxyActor`, `ServeController`, `DCSCoordinator`, `MetricsService`, `SimpleStorageUnit`, `TransferQueueController`, `Lock`, `HealthStatus`, etc. — not just GPU train workers. This bites diagnostic flags hard:
+
+- A faulthandler / py-spy / NCCL-trace flag intended for the train actor will fire in the no-GPU Serve infra actors too, flooding the controller log and often crashing the Serve controller itself (the symptom looks like the training run died, but the diagnostic killed the controller).
+- **`CUDA_VISIBLE_DEVICES` is NOT a usable GPU-only gate** in `worker_process_setup_hook`. Ray sets `CUDA_VISIBLE_DEVICES=""` on non-GPU actors (you can confirm via Ray's own FutureWarning), so a check like `if cvd: enable_diag()` still passes on `ProxyActor`. Don't use it.
+
+Correct pattern for opt-in diagnostics that must run only in train actors:
+
+1. Keep the env var as the activation gate in `RUNTIME_ENV_JSON` (e.g. `RELAX_FAULTHANDLER_INTERVAL_SEC=15`).
+2. Read the env var and call `faulthandler.enable()` / `dump_traceback_later()` from inside `MegatronTrainRayActor.init()` (or a sibling actor's `__init__`) — **never** from `relax/utils/logging_utils.install_asyncio_noise_filter`, which is the Ray `worker_process_setup_hook` and runs in every actor.
+3. Reference: `relax/backends/megatron/actor.py::_install_faulthandler_periodic_dump` is the canonical example.
 
 ### MASTER_ADDR defaults to 127.0.0.1
 
