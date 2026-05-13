@@ -174,8 +174,11 @@ def get_dist_backend() -> str:
     """Return the default distributed communication backend name.
 
     Returns ``'nccl'`` for NVIDIA/AMD, ``'hccl'`` for Ascend NPU, etc.
+
+    Uses :func:`_current_accelerator` so callers on a CPU-only Ray driver/head
+    (e.g. argparse defaults) get the cluster's backend rather than ``'gloo'``.
     """
-    return _DIST_BACKEND_MAP.get(_detect_accelerator(), "nccl")
+    return _DIST_BACKEND_MAP.get(_current_accelerator(), "nccl")
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +201,11 @@ def get_visible_devices_env_var() -> str:
 
     E.g. ``'CUDA_VISIBLE_DEVICES'`` for NVIDIA, ``'ASCEND_RT_VISIBLE_DEVICES'``
     for Ascend NPU.
+
+    Uses :func:`_current_accelerator` so a CPU-only Ray driver/head still gets
+    the right env var name to read (e.g. when forwarding it to actors).
     """
-    return _VISIBLE_DEVICES_ENV_MAP.get(_detect_accelerator(), "CUDA_VISIBLE_DEVICES")
+    return _VISIBLE_DEVICES_ENV_MAP.get(_current_accelerator(), "CUDA_VISIBLE_DEVICES")
 
 
 def get_visible_devices() -> Optional[str]:
@@ -224,13 +230,102 @@ _RAY_RESOURCE_MAP = {
     AcceleratorType.CPU: "CPU",
 }
 
+# Ray resource name → AcceleratorType, used for cluster-based detection.
+_RAY_RESOURCE_TO_ACCEL = {
+    "NPU": AcceleratorType.NPU,
+    "XPU": AcceleratorType.XPU,
+    "PPU": AcceleratorType.PPU,
+    "GPU": AcceleratorType.CUDA,
+}
+
+
+def _detect_accelerator_from_ray_cluster() -> Optional[AcceleratorType]:
+    """Infer the accelerator type from Ray cluster resources.
+
+    Used as a fallback when the local process has no accelerator (e.g. the Ray
+    head node).  Queries ``ray.cluster_resources()`` and maps the first
+    non-zero accelerator resource back to an :class:`AcceleratorType`.
+
+    Returns ``None`` if Ray is not initialised or the cluster has no
+    accelerator resources.
+    """
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return None
+        resources = ray.cluster_resources()
+        # Priority order matches _detect_accelerator(): NPU > XPU > PPU > GPU.
+        for ray_key in ("NPU", "XPU", "PPU", "GPU"):
+            if resources.get(ray_key, 0) > 0:
+                accel = _RAY_RESOURCE_TO_ACCEL[ray_key]
+                logger.info(
+                    f"Local process has no accelerator; detected '{ray_key}' "
+                    f"from Ray cluster resources — using {accel.value}"
+                )
+                return accel
+        return None
+    except Exception as e:
+        logger.debug(f"Ray cluster accelerator detection failed: {e}")
+        return None
+
+
+def _current_accelerator() -> AcceleratorType:
+    """Detect accelerator with Ray-cluster fallback, for actor-configuration
+    values.
+
+    Use this for values that configure REMOTE actors (dist backend, Ray
+    resource name, visible-devices env var). On a CPU-only Ray driver/head,
+    the local probe returns CPU but the cluster usually has GPUs/NPUs/etc.;
+    we query ``ray.cluster_resources()`` to recover the right answer.
+
+    LOCAL operations (set_device, synchronize, current_device, ...) must keep
+    using :func:`_detect_accelerator` so they don't pretend the local process
+    owns a GPU.
+
+    Resolution order:
+    1. Local accelerator if present.
+    2. Ray cluster resources if Ray is initialised.
+    3. CUDA default — Relax trains on GPUs, and the typical "neither fires"
+       case is the driver at parse-args time, before ``ray.init()`` runs.
+
+    Not cached: a call before ``ray.init`` must not poison later calls that
+    happen after the cluster is up.
+    """
+    accel = _detect_accelerator()
+    if accel != AcceleratorType.CPU:
+        return accel
+
+    try:
+        import ray
+
+        ray_initialized = ray.is_initialized()
+    except Exception:
+        ray_initialized = False
+
+    if ray_initialized:
+        cluster_accel = _detect_accelerator_from_ray_cluster()
+        if cluster_accel is not None:
+            return cluster_accel
+        # Ray is up and the cluster is genuinely accelerator-free.
+        return AcceleratorType.CPU
+
+    # Ray not initialised yet — common at parse-args time on the driver.
+    # Default to CUDA so actor-configuration values stay usable.
+    return AcceleratorType.CUDA
+
 
 def get_ray_accelerator_name() -> str:
     """Return the Ray resource name for the current accelerator.
 
     E.g. ``'GPU'`` for NVIDIA/AMD, ``'NPU'`` for Ascend.
+
+    When the local process has no accelerator (e.g. a CPU-only Ray head node),
+    falls back to querying Ray cluster resources via
+    :func:`_current_accelerator` so placement groups are created with the
+    correct resource type.
     """
-    return _RAY_RESOURCE_MAP.get(_detect_accelerator(), "GPU")
+    return _RAY_RESOURCE_MAP.get(_current_accelerator(), "GPU")
 
 
 # ---------------------------------------------------------------------------

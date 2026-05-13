@@ -59,12 +59,20 @@ ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K
 set -x
 
 # ── environment setup ───────────────────────────────────────────────────────
-# Use the first GPU node as MASTER_ADDR (prefer head node)
-export MASTER_ADDR=$(ray list nodes --format json | jq -r '
+# Use the first GPU node as MASTER_ADDR (prefer head node).
+# NOTE: assignment is split from `export` on purpose — `export VAR=$(...)`
+# always returns 0 (export's own exit code), which would mask failures of
+# the command substitution and defeat `set -eo pipefail` set above.
+MASTER_ADDR=$(ray list nodes --format json | jq -r '
   map(select(.state == "ALIVE" and (.resources_total.GPU // 0) > 0)) |
   sort_by(.is_head_node | not) |
   .[0].node_ip
 ')
+if [ -z "$MASTER_ADDR" ] || [ "$MASTER_ADDR" = "null" ]; then
+    echo "ERROR: failed to resolve MASTER_ADDR (no ALIVE GPU node returned by 'ray list nodes')." >&2
+    exit 1
+fi
+export MASTER_ADDR
 
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1

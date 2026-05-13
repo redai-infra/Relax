@@ -100,7 +100,8 @@ RUN cd Megatron-LM && \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    rm megatron.patch
+    rm megatron.patch && \
+    apt update && apt install -y jq
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
