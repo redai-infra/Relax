@@ -21,12 +21,14 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3.5-35B-A3B/
-   # --ref-load ${EXP_DIR}/Qwen3.5-35B-A3B/
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B/
+   # --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B/
    --megatron-to-hf-mode bridge
 
    --load ${EXP_DIR}/Qwen3-35B-A3B_mcore_16xgpu/
@@ -35,7 +37,7 @@ CKPT_ARGS=(
    --max-actor-ckpt-to-keep 1
 )
 
-PROMPT_SET=${EXP_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
@@ -58,7 +60,7 @@ EVAL_ARGS=(
    --log-passrate
    --skip-eval-before-train
    --eval-interval 20
-   --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 8192
    --eval-top-p 0.7

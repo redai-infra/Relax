@@ -195,10 +195,10 @@ This section provides Megatron with the required hyperparameters. Since Megatron
 ```bash
 CKPT_ARGS=(
   # Used to load tokenizer and other info; model weights from this HF path are not actually used
-  --hf-checkpoint ${EXP_DIR}/Qwen3-VL-4B-Instruct/
+  --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
   # Reference model checkpoint
   # When --load is not set, this will be used as the initial checkpoint for training
-  --ref-load ${EXP_DIR}/Qwen3-VL-4B-Instruct/
+  --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
   # Enable megatron bridge automatic weight conversion
   --megatron-to-hf-mode bridge
   # Actor model load path. If empty or no valid checkpoint exists, loads from --ref-load
@@ -210,6 +210,16 @@ CKPT_ARGS=(
   --save-interval 20
 )
 ```
+
+::: tip Path variable convention
+The launcher scripts define three path variables at the top:
+
+- `MODEL_DIR` — model paths such as HF weights and `--ref-load`
+- `DATA_DIR` — dataset paths such as `PROMPT_SET` and `--eval-prompt-data`
+- `EXP_DIR` — training output paths such as `--load` / `--save`
+
+Each one can be overridden independently via environment variable. `MODEL_DIR` and `DATA_DIR` fall back to `EXP_DIR` when unset, so a single `export EXP_DIR=/root` still drives all three paths.
+:::
 
 ### Data Generation and Training Parameters
 

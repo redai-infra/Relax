@@ -194,10 +194,10 @@ source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 ```bash
 CKPT_ARGS=(
   # 用于加载 tokenizer 等其他信息；实际上不会使用 HF 路径中的模型权重参数
-  --hf-checkpoint ${EXP_DIR}/Qwen3-VL-4B-Instruct/
+  --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
   # 参考模型的检查点
   # 当 --load 未设置时，将使用此作为训练的初始检查点
-  --ref-load ${EXP_DIR}/Qwen3-VL-4B-Instruct/
+  --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
   # 启用 megatron bridge 自动权重转换
   --megatron-to-hf-mode bridge
   # Actor 模型的加载路径。若为空或不存在有效的 checkpoint，则从 --ref-load 加载
@@ -209,6 +209,16 @@ CKPT_ARGS=(
   --save-interval 20
 )
 ```
+
+::: tip 路径变量约定
+脚本顶部统一定义了三个路径变量：
+
+- `MODEL_DIR` —— HF 权重 / `--ref-load` 等模型相关路径
+- `DATA_DIR` —— `PROMPT_SET`、`--eval-prompt-data` 等数据集路径
+- `EXP_DIR` —— `--load` / `--save` 等训练输出路径
+
+三者均可单独通过环境变量覆盖：`MODEL_DIR` / `DATA_DIR` 未设置时回落到 `EXP_DIR`，因此只设置 `export EXP_DIR=/root` 即可同时控制三个路径。
+:::
 
 ### 数据生成与训练参数
 

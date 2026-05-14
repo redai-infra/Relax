@@ -25,21 +25,23 @@ source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 # source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/fully_async_openr1mm}"
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3.5-9B
-   --ref-load ${EXP_DIR}/Qwen3.5-9B
-   # --hf-checkpoint ${EXP_DIR}/Qwen3-VL-4B-Instruct
-   # --ref-load ${EXP_DIR}/Qwen3-VL-4B-Instruct
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
+   --ref-load ${MODEL_DIR}/Qwen3.5-9B
+   # --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct
+   # --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct
    --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save-interval 100
    --megatron-to-hf-mode bridge
 )
 
-PROMPT_SET=${EXP_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
+PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 
 SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
 

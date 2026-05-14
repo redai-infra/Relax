@@ -22,18 +22,20 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen3-omni-30B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/omni}"
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3-Omni-30B-A3B-Instruct
-   --ref-load ${EXP_DIR}/Qwen3-Omni-30B-A3B-Instruct
+   --hf-checkpoint ${MODEL_DIR}/Qwen3-Omni-30B-A3B-Instruct
+   --ref-load ${MODEL_DIR}/Qwen3-Omni-30B-A3B-Instruct
    --megatron-to-hf-mode bridge
 )
 
 SYSTEM_PROMPT="Please think about this question as if you were a human pondering deeply, carefully considering both the visual and audio information before answering, engaging in an internal dialogue using expressions such as let me think, wait, hmm, oh I see, or let's break it down, including self-reflection or verification in the reasoning process, providing the detailed reasoning between the <think> </think> tags, and finally giving only the single option letter (e.g., A, B, C, D, etc.) as the final answer within the <answer> </answer> tags."
 
-PROMPT_SET=${EXP_DIR}/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl
+PROMPT_SET=${DATA_DIR}/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
@@ -60,7 +62,7 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=(
    --log-passrate
    --eval-interval 20
-   --eval-prompt-data avqa ${EXP_DIR}/AVQA/AVQA_R1/valid/small_valid.jsonl
+   --eval-prompt-data avqa ${DATA_DIR}/AVQA/AVQA_R1/valid/small_valid.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 2048
    --eval-top-p 0.7

@@ -20,17 +20,19 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 # Support setting env from outside
-EXP_DIR="${MODEL_DIR:=/root/exps}"
+EXP_DIR="${EXP_DIR:-/root/exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=4}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3-4B/
-   --ref-load ${EXP_DIR}/Qwen3-4B/
+   --hf-checkpoint ${MODEL_DIR}/Qwen3-4B/
+   --ref-load ${MODEL_DIR}/Qwen3-4B/
    --megatron-to-hf-mode bridge
 )
 
-PROMPT_SET=${EXP_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 ROLLOUT_ARGS=(
    --use-streaming-dataset

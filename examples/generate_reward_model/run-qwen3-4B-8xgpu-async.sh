@@ -24,8 +24,9 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/genrm-async}"
-EXP_DIR="${EXP_DIR:=${SCRIPT_DIR}/../../exps}"
-MODEL_DIR=${MODEL_DIR:=${EXP_DIR}}
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
@@ -34,7 +35,7 @@ CKPT_ARGS=(
    --megatron-to-hf-mode bridge
 )
 
-PROMPT_SET=${EXP_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 # ============================================
 # ROLLOUT ARGS - Using dapo-genrm rm-type
@@ -64,7 +65,7 @@ EVAL_ARGS=(
    --skip-eval-before-train
    --log-passrate
    --eval-interval 20
-   --eval-prompt-data aime ${EXP_DIR}/aime-2024/aime-2024.jsonl
+   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 16384
    --eval-top-p 0.7
@@ -147,7 +148,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --resource '{"actor": [1, 2], "rollout": [1, 3], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0], "genrm": [1, 1]}' \
    --fully-async \
    --ref-actor-config '{"tensor_model_parallel_size": 1, "max_tokens_per_gpu": 16384, "sequence_parallel": false, "only_load_weight": true}' \
-   --genrm-model-path ${EXP_DIR}/Qwen3-VL-30B-A3B-Instruct/ \
+   --genrm-model-path ${MODEL_DIR}/Qwen3-VL-30B-A3B-Instruct/ \
    --genrm-num-gpus-per-engine 1 \
    --genrm-engine-config '{"max_context_len": 10240}' \
    --genrm-sampling-config '{"temperature": 0.1, "top_p": 1.0, "top_k": -1, "max_response_len": 1024}' \
