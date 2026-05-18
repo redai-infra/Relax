@@ -161,16 +161,15 @@ def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
     if processor:
         processor_output = processor(text=sample.prompt, **(sample.multimodal_inputs or {}))
         prompt_ids = processor_output["input_ids"][0]
-        sample.multimodal_train_inputs = {
-            k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
-        } or None
+        init_mm_train = {k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]} or None
     else:
         prompt_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)
+        init_mm_train = None
 
     image_data = []
     if sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
         image_data = [encode_image_for_rollout_engine(img) for img in sample.multimodal_inputs["images"]]
-    return prompt_ids, image_data, sample.multimodal_train_inputs
+    return prompt_ids, image_data, init_mm_train
 
 
 async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict, is_resuming: bool = False):
@@ -279,31 +278,13 @@ def _append_to_sample(
 
 
 def _update_multimodal_state(
-    sample: Sample,
     current_image_data,
     obs_image_data,
-    obs_multimodal_inputs,
     obs_multimodal_train_inputs,
     multimodal_train_inputs_buffer: list[dict | None],
 ):
     if obs_image_data:
         current_image_data = (current_image_data or []) + obs_image_data
-
-    if obs_multimodal_inputs:
-        if not sample.multimodal_inputs:
-            sample.multimodal_inputs = obs_multimodal_inputs
-        elif isinstance(sample.multimodal_inputs, dict) and isinstance(obs_multimodal_inputs, dict):
-            for key, val in obs_multimodal_inputs.items():
-                if val is None:
-                    continue
-                if (
-                    key in sample.multimodal_inputs
-                    and isinstance(sample.multimodal_inputs[key], list)
-                    and isinstance(val, list)
-                ):
-                    sample.multimodal_inputs[key].extend(val)
-        else:
-            sample.multimodal_inputs = obs_multimodal_inputs
 
     if obs_multimodal_train_inputs:
         multimodal_train_inputs_buffer.append(obs_multimodal_train_inputs)
@@ -451,7 +432,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             stop_reason = "budget_exhausted"
             _record_rollout_stats(stop_reason)
-            return sample
+            return _finalize_sample(sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer)
 
         cur_sampling_params = sampling_params
         trace_recorder = _RolloutTraceRecorder(state.tokenizer)
@@ -523,10 +504,8 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             budget = _update_budget(budget, len(obs_prompt_ids))
 
             current_image_data = _update_multimodal_state(
-                sample,
                 current_image_data,
                 obs_image_data,
-                obs_multimodal_inputs,
                 obs_multimodal_train_inputs,
                 multimodal_train_inputs_buffer,
             )
