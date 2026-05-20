@@ -176,6 +176,32 @@ class TestOpenR1MMEdgeCases:
         assert get_openr1mm_rule_based_reward(response, "12") == 1.0
 
 
+class TestOpenR1MMRewardHacking:
+    """Reject responses that repeat the <think>/<answer> structure to game the
+    reward (only one think/answer pair should score)."""
+
+    def test_repeated_answer_blocks_rejected(self):
+        response = "reasoning</think>\n<answer>9</answer>\n</think>\n<answer>9</answer>\n</think>\n<answer>9</answer>"
+        label = "<think>compute</think>\n<answer>9</answer>"
+        assert get_openr1mm_rule_based_reward(response, label) == 0.0
+
+    def test_repeated_close_think_rejected(self):
+        response = "x</think>\ny</think>\n<answer>9</answer>"
+        assert get_openr1mm_rule_based_reward(response, "9") == 0.0
+
+    def test_repeated_open_answer_rejected(self):
+        response = "<answer>9</answer><answer>9</answer>"
+        assert get_openr1mm_rule_based_reward(response, "9") == 0.0
+
+    def test_repeated_close_answer_rejected(self):
+        response = "<answer>9</answer></answer>"
+        assert get_openr1mm_rule_based_reward(response, "9") == 0.0
+
+    def test_single_pair_still_scores(self):
+        response = "reasoning</think>\n<answer>9</answer>"
+        assert get_openr1mm_rule_based_reward(response, "9") == 1.0
+
+
 # ===========================================================================
 # Full-pipeline tests (rm_hub/__init__.py: RewardWorker / RewardExecutor)
 # ===========================================================================

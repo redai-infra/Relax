@@ -6,6 +6,11 @@ from math_verify import parse, verify
 
 
 def get_openr1mm_rule_based_reward(response, label):
+    # Reject reward-hacking: model repeats </think>/<answer> blocks to inflate
+    # match probability. Only a single think/answer pair is allowed.
+    if response.count("</think>") > 1 or response.count("<answer>") > 1 or response.count("</answer>") > 1:
+        return 0.0
+
     # -------------------------
     # 1. symbolic verification
     # -------------------------

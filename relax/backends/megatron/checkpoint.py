@@ -105,13 +105,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
     if exist and _is_megatron_checkpoint(load_path):
-        return _load_checkpoint_megatron(
-            ddp_model=ddp_model,
-            optimizer=optimizer,
-            opt_param_scheduler=opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
-        )
+        try:
+            return _load_checkpoint_megatron(
+                ddp_model=ddp_model,
+                optimizer=optimizer,
+                opt_param_scheduler=opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+            )
+        except AssertionError as e:
+            if "OptimizerParamScheduler" in str(e):
+                raise RuntimeError(_format_opt_param_scheduler_error(args, e)) from e
+            raise
     else:
         if not exist:
             load_path = None
@@ -128,6 +133,34 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             args=args,
             load_path=load_path,
         )
+
+
+def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
+    # lr_decay_steps = num_rollout * rollout_batch_size * n_samples_per_prompt
+    # (see relax/backends/megatron/model.py:get_optimizer_param_scheduler).
+    # When any of those args change vs. the saved checkpoint, Megatron's
+    # OptimizerParamScheduler refuses to load. Tell the user exactly what to do.
+    return (
+        f"Resume failed: {original}\n\n"
+        f"Megatron's OptimizerParamScheduler rejects mismatched LR/WD schedule values "
+        f"between the current run and the loaded checkpoint. This is almost always caused "
+        f"by changing one of the args that feed into `lr_decay_steps` / `wd_incr_steps`:\n"
+        f"    lr_decay_steps = num_rollout * rollout_batch_size * n_samples_per_prompt\n"
+        f"Current values:\n"
+        f"    --num-rollout            {getattr(args, 'num_rollout', None)}\n"
+        f"    --rollout-batch-size     {getattr(args, 'rollout_batch_size', None)}\n"
+        f"    --n-samples-per-prompt   {getattr(args, 'n_samples_per_prompt', None)}\n"
+        f"    --global-batch-size      {getattr(args, 'global_batch_size', None)}\n"
+        f"    --lr-decay-iters         {getattr(args, 'lr_decay_iters', None)}\n"
+        f"    --lr-warmup-iters        {getattr(args, 'lr_warmup_iters', None)}\n"
+        f"    --lr-warmup-fraction     {getattr(args, 'lr_warmup_fraction', None)}\n\n"
+        f"Pick one:\n"
+        f"  (a) Revert the changed arg to match the checkpoint, OR\n"
+        f"  (b) Add `--override-opt_param-scheduler` to keep the NEW schedule "
+        f"(class values overwrite checkpoint values), OR\n"
+        f"  (c) Add `--use-checkpoint-opt_param-scheduler` to keep the OLD schedule "
+        f"(checkpoint values overwrite class values)."
+    )
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:

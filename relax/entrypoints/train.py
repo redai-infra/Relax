@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import atexit
+import importlib
 import os
 import signal
 import sys
@@ -10,10 +11,22 @@ import ray
 import yaml
 from ray import serve
 
-from relax.core.controller import Controller
-from relax.utils.arguments import parse_args
-from relax.utils.logging_utils import get_logger
-from relax.utils.utils import post_process_env
+
+# Optional telemetry hook: if the RELAX_TELEMETRY_HOOK env var names an
+# importable module, import it here so it can install any patches it needs
+# (e.g. a metrics-forwarding shim) before Controller is referenced below.
+# Silent no-op when the env var is unset or the named module is unavailable.
+_telemetry_hook = os.environ.get("RELAX_TELEMETRY_HOOK")
+if _telemetry_hook:
+    try:
+        importlib.import_module(_telemetry_hook)
+    except ImportError:
+        pass
+
+from relax.core.controller import Controller  # noqa: E402
+from relax.utils.arguments import parse_args  # noqa: E402
+from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.utils import post_process_env  # noqa: E402
 
 
 cur_file_dir = Path(__file__).absolute().parent.parent.parent

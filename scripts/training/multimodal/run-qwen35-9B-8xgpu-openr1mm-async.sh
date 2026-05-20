@@ -38,6 +38,7 @@ CKPT_ARGS=(
    --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save-interval 100
+   --max-actor-ckpt-to-keep 1
    --megatron-to-hf-mode bridge
 )
 
@@ -114,7 +115,7 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9b-GRPO-gpu8-fully-${MODE}-${now}
+   --tb-experiment-name qwen35-9b-GRPO-gpu8-${MODE}-${now}
 )
 
 SGLANG_ARGS=(
@@ -153,7 +154,7 @@ if [ ${MODE} = "async" ]; then
         "${WANDB_ARGS[@]}" \
         "${PERF_ARGS[@]}" \
         "${SGLANG_ARGS[@]}" \
-        "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-fully-async-${now}.log
+        "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-async-${now}.log
 else
     ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
          --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -172,5 +173,5 @@ else
          "${WANDB_ARGS[@]}" \
          "${PERF_ARGS[@]}" \
          "${SGLANG_ARGS[@]}" \
-         "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-fully-sync-${now}.log
+         "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-colocate-${now}.log
 fi
