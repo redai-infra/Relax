@@ -697,7 +697,11 @@ def policy_loss_function(
     else:
         advantages = batch["advantages"]
 
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
+    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    # In true on-policy mode, actor_fwd is absent so batch["log_probs"] is missing;
+    # old_log_probs is derived inline from this forward (assigned after the pass below).
+    if not true_on_policy:
+        old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -716,6 +720,13 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    if true_on_policy:
+        # Same weights + deterministic Megatron forward ⇒ old_log_probs == log_probs.
+        # Detaching makes ratio = exp(log_probs - log_probs.detach()) ≡ 1 with the
+        # gradient of log_probs flowing through pg_loss, recovering vanilla PG.
+        # TIS (which compares train-engine vs rollout-engine log_probs) still works
+        # because train_log_probs is numerically identical to what actor_fwd produced.
+        old_log_probs = [lp.detach() for lp in log_probs]
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
@@ -793,10 +804,16 @@ def policy_loss_function(
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
         ois = (-ppo_kl).exp()
+        # In true on-policy mode batch["log_probs"] is absent; old_log_probs (detached
+        # list of this-step forward) is numerically identical to what actor_fwd produced,
+        # so TIS measures the same train-engine vs rollout-engine mismatch.
+        tis_train_log_probs = (
+            [lp.detach() for lp in log_probs_and_entropy["log_probs"]] if true_on_policy else batch["log_probs"]
+        )
         tis_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
-            "train_log_probs": batch["log_probs"],
+            "train_log_probs": tis_train_log_probs,
             "rollout_log_probs": batch["rollout_log_probs"],
             "loss_masks": batch["loss_masks"],
             "total_lengths": total_lengths,

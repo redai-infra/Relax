@@ -75,12 +75,14 @@ PERF_ARGS=(
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu 10240
+   --log-probs-max-tokens-per-gpu 40960
+
    # --micro-batch-size 1 # avoid OOM
 
    --no-rope-fusion
@@ -105,9 +107,9 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
 
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
-   --use-precision-aware-optimizer
+   # --optimizer-cpu-offload
+   # --overlap-cpu-optimizer-d2h-h2d
+   # --use-precision-aware-optimizer
 )
 
 SGLANG_ARGS=(

@@ -414,12 +414,11 @@ class Controller:
                 await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
 
                 if self.config.fully_async:
-                    handle1 = self.serve_dict[ROLES.actor].update_weights_fully_async()
-                    handle2 = self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async()
-                    handles = [handle1, handle2]
+                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async()]
+                    if ROLES.actor_fwd in self.serve_dict:
+                        handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
                     if ROLES.reference in self.serve_dict:
-                        handle3 = self.serve_dict[ROLES.reference].recv_weight_fully_async()
-                        handles.append(handle3)
+                        handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
                     [await handle for handle in handles]
                 step = await self.serve_dict[ROLES.actor].get_step()
                 for service in self.serve_dict.values():

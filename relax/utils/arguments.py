@@ -203,7 +203,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--true-on-policy-mode",
                 action="store_true",
                 default=False,
-                help="Whether to enable true-on-policy mode.",
+                help=(
+                    "Skip the actor_fwd role and reuse the train forward's log_probs as "
+                    "old_log_probs (ppo_kl ≡ 0, ratio ≡ 1), saving the dedicated actor_fwd "
+                    "GPU group and one weight-sync per step. "
+                    "Auto-enabled when --fully-async and "
+                    "rollout_batch_size * n_samples_per_prompt == global_batch_size; no need "
+                    "to pass this flag explicitly. The caller is responsible for ensuring the "
+                    "regime is actually on-policy (e.g. --max-staleness=0, "
+                    "--num-iters-per-train-update=1); off-policy use yields incorrect gradients. "
+                    "TIS (--use-tis) and --get-mismatch-metrics remain valid in this mode."
+                ),
             )
             parser.add_argument(
                 "--train-env-vars",
@@ -2181,6 +2191,18 @@ def slime_validate_args(args):
             "On-policy distillation with megatron teacher is not supported in fully-async mode (--fully-async)."
             " Please set --opd-type to sglang or remove --use-opd."
         )
+
+    # Auto-enable true_on_policy_mode when the per-step rollout output exactly fills
+    # one global batch in fully-async mode. In this regime the train forward's
+    # log_probs equal what actor_fwd would have produced, so the actor_fwd role
+    # can be skipped (see relax/backends/megatron/loss.py:policy_loss_function).
+    if args.fully_async and args.rollout_batch_size * args.n_samples_per_prompt == args.global_batch_size:
+        if not args.true_on_policy_mode:
+            logger.info(
+                "Auto-enabling --true-on-policy-mode: rollout_batch_size * n_samples_per_prompt "
+                f"== global_batch_size ({args.global_batch_size}). actor_fwd will be skipped."
+            )
+        args.true_on_policy_mode = True
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."

@@ -72,19 +72,20 @@ EVAL_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 2
-   --context-parallel-size 2
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
 
    --calculate-per-token-loss
    #--micro-batch-size 16 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 10240
+   --log-probs-max-tokens-per-gpu 30720
 )
 
 GRPO_ARGS=(
@@ -109,7 +110,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
+   --rollout-num-gpus-per-engine 8
    --sglang-mem-fraction-static 0.8
 )
 

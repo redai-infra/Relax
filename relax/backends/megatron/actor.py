@@ -699,13 +699,16 @@ class MegatronTrainRayActor(TrainRayActor):
             "total_lengths",
             "response_lengths",
             "loss_masks",
-            "log_probs",
             "advantages",
             "returns",
             "rollout_log_probs",
             "rewards",
             "raw_reward",
         ]
+        # In true on-policy mode, actor_fwd is absent and old_log_probs is
+        # recomputed inline from the train forward (see policy_loss_function).
+        if not getattr(self.args, "true_on_policy_mode", False):
+            data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
             data_fields.append("ref_log_probs")
         if self.args.multimodal_keys is not None:
@@ -909,6 +912,11 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_only = False
         actor_fwd_only = False
 
+        # When true_on_policy_mode is enabled, actor_fwd is intentionally absent
+        # (its log_probs are recomputed inline by the train forward). Force
+        # rollout-only weight update and skip the actor_fwd HTTP probe.
+        actor_fwd_absent = getattr(self.args, "true_on_policy_mode", False)
+
         if dist.get_rank() == 0:
             # Check rollout service
             try:
@@ -930,17 +938,20 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
                 actor_fwd_only = True
 
-            # Check actor_fwd service
-            try:
-                actor_fwd_serve_url = get_serve_url("actor_fwd")
-                response = requests.get(f"{actor_fwd_serve_url}/get_step")
-                response.raise_for_status()
-            except Exception as e:
-                logger.warning(
-                    f"Error checking actor_fwd service: {e}, maybe caused by actor_fwd server failure. "
-                    "Will continue without actor_fwd update for this step."
-                )
+            # Check actor_fwd service (skip when intentionally absent)
+            if actor_fwd_absent:
                 rollout_only = True
+            else:
+                try:
+                    actor_fwd_serve_url = get_serve_url("actor_fwd")
+                    response = requests.get(f"{actor_fwd_serve_url}/get_step")
+                    response.raise_for_status()
+                except Exception as e:
+                    logger.warning(
+                        f"Error checking actor_fwd service: {e}, maybe caused by actor_fwd server failure. "
+                        "Will continue without actor_fwd update for this step."
+                    )
+                    rollout_only = True
 
         # Broadcast results from rank 0 to all ranks via allreduce
         # Encode booleans as integers: 1 = skip, 0 = healthy

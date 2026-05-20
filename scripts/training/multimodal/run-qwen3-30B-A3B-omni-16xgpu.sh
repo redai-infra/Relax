@@ -77,12 +77,14 @@ PERF_ARGS=(
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
-   # --recompute-granularity full
-   # --recompute-method uniform
-   # --recompute-num-layers 1
-   --micro-batch-size 2 # avoid OOM
-   # --use-dynamic-batch-size
-   # --max-tokens-per-gpu 8192
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
+   # --micro-batch-size 2 # avoid OOM
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 4096
+   --log-probs-max-tokens-per-gpu 8192
+
 )
 
 GRPO_ARGS=(

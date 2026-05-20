@@ -140,11 +140,10 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 6], "actor_fwd": [1, 2], "advantages": [1, 0]}'\
+   --resource '{"actor": [1, 8], "rollout": [1, 8], "advantages": [1, 0]}'\
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 32 \
-   --ref-actor-config '{"tensor_model_parallel_size": 2, "pipeline_model_parallel_size": 1, "expert_model_parallel_size": 2, "max_tokens_per_gpu": 10240, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
     --use-health-check \
     "${MODEL_ARGS[@]}" \

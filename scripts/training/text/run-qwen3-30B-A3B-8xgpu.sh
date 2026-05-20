@@ -74,7 +74,7 @@ PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
@@ -85,11 +85,13 @@ PERF_ARGS=(
    # --micro-batch-size 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
+   --log-probs-max-tokens-per-gpu 40960
 
    # use deepep for megatron
    --moe-flex-dispatcher-backend deepep
    --moe-token-dispatcher-type flex
    --moe-router-dtype fp32
+   --calculate-per-token-loss
 
    # --use-pytorch-profiler
    # --profile-step-start 1

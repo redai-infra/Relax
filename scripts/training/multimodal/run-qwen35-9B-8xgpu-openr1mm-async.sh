@@ -67,26 +67,28 @@ ROLLOUT_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 1
-   --context-parallel-size 2
+   --pipeline-model-parallel-size 3
+   # --decoder-last-pipeline-num-layers 
+   --decoder-first-pipeline-num-layers 8
+   
+   --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
-
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
    --calculate-per-token-loss
-   # --micro-batch-size 16
+   --micro-batch-size 2
    # --qkv-format bshd
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --max-tokens-per-gpu 16384
 
    --no-rope-fusion
 )
 
 GRPO_ARGS=(
-   --use-kl-loss
+   # --use-kl-loss
    --advantage-estimator grpo
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
@@ -137,11 +139,10 @@ if [ ${MODE} = "async" ]; then
      ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
         --runtime-env-json="${RUNTIME_ENV_JSON}" \
         -- python3 -m relax.entrypoints.train \
-        --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}'\
-   --max-staleness 2 \
+        --resource '{"actor": [1, 6], "rollout": [1, 2], "advantages": [1, 0]}'\
+        --max-staleness 2 \
         --num-data-storage-units 1 \
-        --num-iters-per-train-update 8 \
-        --ref-actor-config '{"context_parallel_size": 1, "tensor_model_parallel_size": 1, "max_tokens_per_gpu": 16384, "sequence_parallel": false, "only_load_weight": true}' \
+        --num-iters-per-train-update 16 \
         --fully-async \
         --use-health-check \
         "${MODEL_ARGS[@]}" \

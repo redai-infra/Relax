@@ -756,12 +756,16 @@ def log_rollout_data(
             correct_padded_total_lengths: list[int] | None = (
                 [] if correct_padded_total_lengths_full is not None else None
             )
+            # true_on_policy_mode skips actor_fwd so log_probs is unavailable here;
+            # fall back to rollout_log_probs (numerically close, used only for logging).
+            entropy_source = rollout_data.get("log_probs") or rollout_data.get("rollout_log_probs")
             for i, raw_reward in enumerate(raw_rewards):
                 if raw_reward == 1:
                     correct_response_lengths.append(response_lengths[i])
                     correct_total_lengths.append(total_lengths[i])
                     correct_loss_masks.append(loss_masks[i])
-                    correct_entropy.append(-rollout_data["log_probs"][i])
+                    if entropy_source is not None:
+                        correct_entropy.append(-entropy_source[i])
                     if correct_padded_total_lengths is not None:
                         correct_padded_total_lengths.append(correct_padded_total_lengths_full[i])
             num_correct_responses = len(correct_total_lengths)

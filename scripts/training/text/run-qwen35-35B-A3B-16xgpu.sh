@@ -75,12 +75,16 @@ PERF_ARGS=(
    --expert-model-parallel-size 8
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method uniform
-   --recompute-num-layers 1
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu 20480
+   --log-probs-max-tokens-per-gpu 40960
+
+   --moe-flex-dispatcher-backend deepep
+   --moe-token-dispatcher-type flex
 )
 
 GRPO_ARGS=(
@@ -113,7 +117,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 8
    --sglang-mem-fraction-static 0.7
    # --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )

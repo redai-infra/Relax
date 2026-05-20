@@ -61,9 +61,12 @@ class Advantages(Base):
                         "response_lengths",
                         "loss_masks",
                         "rollout_log_probs",
-                        "log_probs",
                         "rewards",
                     ]
+                    # log_probs is only needed for KL divergence; in true on-policy mode
+                    # the actor_fwd role is absent and log_probs is not produced upstream.
+                    if not getattr(self.config, "true_on_policy_mode", False):
+                        adv_data_fields.append("log_probs")
                     if self.config.kl_coef != 0 or self.config.use_kl_loss:
                         adv_data_fields.append("ref_log_probs")
                     if getattr(self.config, "use_opd", False):
@@ -126,14 +129,17 @@ class Advantages(Base):
         response_lengths: list[int] = rollout_data.get("response_lengths")
         loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
         total_lengths: list[int] = rollout_data.get("total_lengths")
+        # In true on-policy mode log_probs is not fetched (actor_fwd absent);
+        # rollout_log_probs has identical shape and serves as a kl-zero template.
+        rollout_log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs")
 
         # return when not the last pp stage.
-        if log_probs is None and values is None:
+        if log_probs is None and values is None and rollout_log_probs is None:
             return
 
         if self.config.kl_coef == 0 or not log_probs:
             # when kl_coef is 0, we won't compute ref_log_prob
-            xs = log_probs if log_probs is not None else values
+            xs = log_probs if log_probs is not None else (values if values is not None else rollout_log_probs)
             kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
         else:
             kl = [
