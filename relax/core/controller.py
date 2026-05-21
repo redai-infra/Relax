@@ -296,10 +296,12 @@ class Controller:
 
         self._validate_gpu_resources(roles_to_create, colocate, ACTOR_ROLLOUT_PG_ROLES)
 
-        if colocate:
+        if colocate and not self.config.hybrid:
+            # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
             num_gpus = self.config.resource.get(ROLES.actor)[1]
             actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
         else:
+            # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
 
         # Choose creation strategy based on config
@@ -413,7 +415,10 @@ class Controller:
                 rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
                 await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
 
-                if self.config.fully_async:
+                if self.config.fully_async and not self.config.hybrid:
+                    # Pure fully_async: actor sends weights to separate actor_fwd/reference services
+                    # via checkpoint engine. Hybrid mode skips this because the actor handles
+                    # ref/actor_fwd internally via _switch_model.
                     handles = [self.serve_dict[ROLES.actor].update_weights_fully_async()]
                     if ROLES.actor_fwd in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())

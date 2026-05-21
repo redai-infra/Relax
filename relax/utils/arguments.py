@@ -61,6 +61,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=("Whether to use fully asynchronous training pipeline."),
             )
             parser.add_argument(
+                "--hybrid",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable hybrid training mode. Combines the fully-async streaming data pipeline "
+                    "(transfer queue + max-staleness) with colocate-style weight sharing "
+                    "(TensorBackuper + _switch_model), so the actor handles ref / actor_fwd / advantages "
+                    "internally on its own GPUs while rollout runs on a separate GPU placement group. "
+                    "Mutually exclusive with passing --fully-async and --colocate together."
+                ),
+            )
+            parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
                 default=device_utils.get_dist_backend(),
@@ -2312,14 +2324,30 @@ def slime_validate_args(args):
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
             args.train_memory_margin_bytes = 0
 
-    if args.fully_async and args.colocate:
-        args.colocate = False
-
-    if args.fully_async and args.balance_data:
+    # Resolve --hybrid into the underlying execution flags so downstream
+    # machinery (StreamDataLoader broadcast_pp, UpdateWeightFromTensor
+    # selection, sglang_engine DCS gating) keeps a single semantic axis.
+    # `args.hybrid` remains the canonical switch for hybrid-specific
+    # branches (registry, controller dispatch, train_hybrid call site).
+    if args.hybrid:
+        args.fully_async = True
+        args.colocate = True
+        logger.info(
+            "hybrid mode: actor/reference/actor_fwd/advantages will share GPUs "
+            "via offload/onload role switching, while rollout uses separate GPUs."
+        )
+    elif args.fully_async and args.colocate:
         raise ValueError(
-            "--balance-data is not supported in fully-async mode (--fully-async). "
-            "In fully-async training, the component consumes rollout data via transfer queue "
-            "which is incompatible with data balancing. Please remove --balance-data from your command."
+            "--fully-async and --colocate cannot be combined directly. "
+            "Use --hybrid instead, which is the supported public flag for hybrid training mode."
+        )
+
+    if args.fully_async and args.balance_data and not args.hybrid:
+        raise ValueError(
+            "--balance-data is not supported in pure fully-async mode (--fully-async without --hybrid). "
+            "In pure fully-async training, the actor consumes rollout data via StreamDataLoader "
+            "which is incompatible with data balancing. Use --hybrid mode "
+            "or remove --balance-data from your command."
         )
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
@@ -2331,7 +2359,17 @@ def slime_validate_args(args):
     args._genrm_colocate_with_rollout = False
 
     # always true on offload for colocate at the moment.
-    if args.colocate and not genrm_enabled:
+    if args.hybrid:
+        # hybrid mode: actor and rollout use SEPARATE GPUs,
+        # so no offload needed between them. Actor internally handles
+        # ref/actor_fwd via _switch_model (same model, weight swap only).
+        if args.offload_train is None:
+            args.offload_train = False
+        if args.offload_rollout is None:
+            args.offload_rollout = False
+        # Mark that actor should compute advantages and ref/actor_fwd internally
+        args.compute_advantages_and_returns = True
+    elif args.colocate and not genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:

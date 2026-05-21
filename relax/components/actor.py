@@ -77,9 +77,9 @@ class Actor(Base):
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
-        # Only call update_weights in non-fully_async mode
-        # In fully_async mode, weight_updater is not created and weights are synced via DCS
-        if not self.config.fully_async:
+        # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
+        # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
+        if not self.config.fully_async or self.config.hybrid:
             self.actor_model.update_weights()
 
     def set_genrm_manager(self, genrm_manager: Any) -> None:
@@ -208,7 +208,10 @@ class Actor(Base):
             return
 
         # Use appropriate training method based on mode
-        if self.config.fully_async:
+        if self.config.hybrid:
+            # hybrid mode: actor handles ref/actor_fwd/adv internally
+            ray.get(self.actor_model.train_hybrid(self.step))
+        elif self.config.fully_async:
             ray.get(self.actor_model.train_fully_async(self.step))
             # Save model checkpoint if needed
             self._maybe_save_model()

@@ -126,6 +126,10 @@ class RayTrainGroup:
         """Do one rollout training without ref log prob computation."""
         return [actor.train_async.remote(rollout_id) for actor in self._actor_handlers]
 
+    def train_hybrid(self, rollout_id):
+        """Hybrid mode: actor handles ref/actor_fwd/adv internally."""
+        return [actor.train_hybrid.remote(rollout_id) for actor in self._actor_handlers]
+
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model."""
         ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
