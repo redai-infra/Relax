@@ -139,7 +139,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
 
-        (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
+        self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
 
@@ -256,6 +256,18 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
+        # In disaggregate PPO (use_critic + not colocate), the actor's NCCL
+        # weight-sync groups to rollout engines do not survive a sleep, so we
+        # must explicitly tear them down before destroy_process_groups() and
+        # reconnect on wake_up()/update_weights().
+        if (
+            self.role == "actor"
+            and self.args.use_critic
+            and not self.args.colocate
+            and hasattr(self, "weight_updater")
+            and hasattr(self.weight_updater, "disconnect_rollout_engines")
+        ):
+            self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
         if self._torch_memory_saver_enabled:
@@ -791,9 +803,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
-        # torch dist may trigger nccl communication during saving.
+        # torch dist may trigger nccl communication during saving; resume the
+        # paused model (process groups + tms) so save can issue collectives and
+        # touch GPU tensors.
         if self.args.offload_train:
-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            self.wake_up()
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
@@ -816,7 +830,7 @@ class MegatronTrainRayActor(TrainRayActor):
             save_hf_model(self.args, rollout_id, self.model)
 
         if self.args.offload_train:
-            destroy_process_groups()
+            self.sleep()
 
     @timer
     def update_weights(self) -> None:
@@ -849,10 +863,17 @@ class MegatronTrainRayActor(TrainRayActor):
             self.rollout_manager.get_rollout_engines_and_lock.remote()
         )
 
-        if self.args.offload_train:
+        # Disaggregate PPO tears down the actor↔rollout NCCL groups on sleep(),
+        # so we must wake_up() fully (not just reload_process_groups) and force
+        # a reconnect here, then sleep() at the end.
+        reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
+
+        if reconnect_rollout_engines:
+            self.wake_up()
+        elif self.args.offload_train:
             reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
 
-        if num_new_engines > 0:
+        if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
                 rollout_engines,
                 rollout_engine_lock,
@@ -890,7 +911,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
-        if self.args.offload_train:
+        if reconnect_rollout_engines:
+            self.sleep()
+        elif self.args.offload_train:
             destroy_process_groups()
 
         if self.args.offload_rollout and dist.get_rank() == 0:

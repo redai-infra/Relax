@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import ast
+
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 
@@ -66,6 +68,35 @@ def validate_args(args):
     return args
 
 
+def _has_dense_moe_layers(args):
+    moe_layer_freq = getattr(args, "moe_layer_freq", None)
+    if moe_layer_freq is None:
+        return True
+
+    if isinstance(moe_layer_freq, str):
+        try:
+            moe_layer_freq = ast.literal_eval(moe_layer_freq)
+        except (SyntaxError, ValueError):
+            return "0" in moe_layer_freq
+
+    try:
+        return any(int(layer_freq) == 0 for layer_freq in moe_layer_freq)
+    except TypeError:
+        return int(moe_layer_freq) == 0
+
+
+def _is_moe_config(hf_config):
+    return any(
+        hasattr(hf_config, attr)
+        for attr in (
+            "moe_intermediate_size",
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+        )
+    )
+
+
 def _hf_validate_args(args, hf_config):
     def equal(x, y):
         return x == y
@@ -92,12 +123,16 @@ def _hf_validate_args(args, hf_config):
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
 
+    validate_dense_ffn = not _is_moe_config(hf_config) or _has_dense_moe_layers(args)
+
     for hf_config_name, megatron_config_name, compare_fn in (
         [
             ("hidden_size", "hidden_size", equal),
             ("num_attention_heads", "num_attention_heads", equal),
             ("num_hidden_layers", "num_layers", equal),
             ("intermediate_size", "ffn_hidden_size", equal),
+            ("moe_intermediate_size", "moe_ffn_hidden_size", equal),
+            ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", equal),
             ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
             ("rope_theta", "rotary_base", equal),
         ]
@@ -105,6 +140,9 @@ def _hf_validate_args(args, hf_config):
         if hasattr(args, "norm_epsilon")
         else [("rms_norm_eps", "layernorm_epsilon", equal)]
     ):
+        if hf_config_name == "intermediate_size" and not validate_dense_ffn:
+            continue
+
         if hasattr(hf_config, hf_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(
