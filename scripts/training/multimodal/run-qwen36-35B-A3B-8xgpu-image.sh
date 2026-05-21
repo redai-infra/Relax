@@ -1,13 +1,15 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.6-35B-A3B 8xGPU colocate training script.
+# Qwen3.6-35B-A3B 8xGPU training script (colocate / fully-async).
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen36-35B-A3B-8xgpu.sh
+#   bash scripts/training/multimodal/run-qwen36-35B-A3B-8xgpu-image.sh [sync|async]
 
 set -ex
 set -o pipefail
+
+MODE=${1:-"sync"}
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
@@ -54,7 +56,6 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
    --global-batch-size 256
    --use-streaming-dataset
-   --balance-data
    --use-fault-tolerance
    --system-prompt "${SYSTEM_PROMPT}"
    --multimodal-keys '{"image":"image"}'
@@ -64,7 +65,7 @@ ROLLOUT_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size 1
    --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
@@ -79,7 +80,6 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
@@ -103,18 +103,20 @@ OPTIMIZER_ARGS=(
    # NOTE(wuhuan): to avoid algorithm performance degradation
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
+
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.8
+   --sglang-load-format dummy
 )
 
 WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen36-35B-A3B-${now}
+   --tb-experiment-name qwen36-35B-A3B-${MODE}-${now}
 )
 
 MISC_ARGS=(
@@ -129,21 +131,43 @@ MISC_ARGS=(
 )
 
 mkdir -p log
-
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
-   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
-   --max-staleness 0 \
-   --num-data-storage-units 1 \
-   --colocate \
-   "${MODEL_ARGS[@]}" \
-   "${CKPT_ARGS[@]}" \
-   "${ROLLOUT_ARGS[@]}" \
-   "${OPTIMIZER_ARGS[@]}" \
-   "${GRPO_ARGS[@]}" \
-   "${WANDB_ARGS[@]}" \
-   "${PERF_ARGS[@]}" \
-   "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen36-35B-A3B-GRPO-gpu8-${now}.log
+if [ ${MODE} = "async" ]; then
+    ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+       ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+       --runtime-env-json="${RUNTIME_ENV_JSON}" \
+       -- python3 -m relax.entrypoints.train \
+       --resource '{"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}'\
+       --max-staleness 2 \
+       --num-data-storage-units 1 \
+       --num-iters-per-train-update 16 \
+       --fully-async \
+       --use-health-check \
+       "${MODEL_ARGS[@]}" \
+       "${CKPT_ARGS[@]}" \
+       "${ROLLOUT_ARGS[@]}" \
+       "${OPTIMIZER_ARGS[@]}" \
+       "${GRPO_ARGS[@]}" \
+       "${WANDB_ARGS[@]}" \
+       "${PERF_ARGS[@]}" \
+       "${SGLANG_ARGS[@]}" \
+       "${MISC_ARGS[@]}"  2>&1 | tee log/qwen36-35B-A3B-GRPO-gpu8-async-${now}.log
+else
+    ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+       ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+       --runtime-env-json="${RUNTIME_ENV_JSON}" \
+       -- python3 -m relax.entrypoints.train \
+       --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+       --max-staleness 0 \
+       --num-data-storage-units 1 \
+       --balance-data \
+       --colocate \
+       "${MODEL_ARGS[@]}" \
+       "${CKPT_ARGS[@]}" \
+       "${ROLLOUT_ARGS[@]}" \
+       "${OPTIMIZER_ARGS[@]}" \
+       "${GRPO_ARGS[@]}" \
+       "${WANDB_ARGS[@]}" \
+       "${PERF_ARGS[@]}" \
+       "${SGLANG_ARGS[@]}" \
+       "${MISC_ARGS[@]}"  2>&1 | tee log/qwen36-35B-A3B-GRPO-gpu8-colocate-${now}.log
+fi

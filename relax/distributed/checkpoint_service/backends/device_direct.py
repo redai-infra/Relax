@@ -553,15 +553,42 @@ class DeviceDirectBackend(CommBackend):
                 logger.warning(f"Error killing RolloutEngine #{rank}: {e}")
         self.rollout_engines.clear()
 
-    def _update_rollout_engines(self):
-        failed_ranks = self._healthcheck_rollout_engines()
-        if failed_ranks:
-            logger.warning(f"Healthcheck failed for engines: {failed_ranks}, removing and recreating...")
-            self._remove_failed_engines(failed_ranks)
-            self._create_rollout_engines(self.rollout_topology)
+    def _update_rollout_engines(self, max_retries: int = 30, retry_interval: float = 10.0):
+        """Wait for rollout engines to be ready with retries.
 
+        In fully-async mode, Rollout engines may still be initializing (loading model)
+        when Actor attempts to sync weights. This method retries health checks until
+        engines are ready, without modifying topology during retries.
+
+        Args:
+            max_retries: Maximum number of retry attempts (default: 30).
+            retry_interval: Seconds to wait between retries (default: 2.0).
+
+        Raises:
+            RuntimeError: If no healthy engines are available after all retries.
+        """
         if not self.rollout_topology:
-            raise RuntimeError("No healthy rollout engines available after healthcheck")
+            raise RuntimeError("No rollout engines configured")
+
+        for attempt in range(max_retries):
+            failed_ranks = self._healthcheck_rollout_engines()
+
+            if not failed_ranks:
+                if attempt > 0:
+                    logger.info(f"Rollout engines ready after {attempt + 1} attempts")
+                return
+
+            logger.warning(
+                f"Healthcheck failed for engines: {failed_ranks}, "
+                f"retrying in {retry_interval}s (attempt {attempt + 1}/{max_retries})"
+            )
+            time.sleep(retry_interval)
+
+        # All retries exhausted, remove failed engines and report error
+        logger.error(f"Removing failed engines after {max_retries} retries: {failed_ranks}")
+        self._remove_failed_engines(failed_ranks)
+
+        raise RuntimeError(f"No healthy rollout engines available after {max_retries} retries")
 
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999

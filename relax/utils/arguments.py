@@ -2204,6 +2204,25 @@ def slime_validate_args(args):
             )
         args.true_on_policy_mode = True
 
+    # Validate --resource has the producer roles the trainer will fetch from
+    # TransferQueue in fully-async mode. Without these, train_async would poll
+    # forever for a field nobody writes (see backends/megatron/actor.py:train_async).
+    if args.fully_async and args.resource is not None:
+        if (args.use_kl_loss or args.kl_coef != 0) and "reference" not in args.resource:
+            raise ValueError(
+                "--use-kl-loss / --kl-coef != 0 requires a 'reference' entry in --resource "
+                "(produces ref_log_probs via TransferQueue in fully-async mode). "
+                f"Current --resource keys: {sorted(args.resource.keys())}."
+            )
+        if not args.true_on_policy_mode and "actor_fwd" not in args.resource:
+            raise ValueError(
+                "actor_fwd is required in --resource when true_on_policy_mode is False "
+                "(produces log_probs via TransferQueue in fully-async mode). "
+                "true_on_policy_mode is auto-enabled only when "
+                "rollout_batch_size * n_samples_per_prompt == global_batch_size. "
+                f"Current --resource keys: {sorted(args.resource.keys())}."
+            )
+
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
