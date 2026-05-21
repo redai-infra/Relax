@@ -9,7 +9,7 @@ import numpy as np
 import requests
 from PIL import Image
 
-from .config import MultimodalConfig, get_image_max_token_num, get_image_min_token_num
+from .config import MultimodalConfig, get_image_max_token_num, get_image_min_token_num, get_image_resize_scale_factor
 
 
 SPATIAL_MERGE_SIZE = 2
@@ -209,12 +209,22 @@ def fetch_image(
     image = to_rgb(image_obj)
 
     # resize
+    config_scale_factor = get_image_resize_scale_factor(config)
+    if config_scale_factor is None:
+        resize_scale_factor = patch_factor
+    elif config_scale_factor == 0:
+        resize_scale_factor = None
+    else:
+        resize_scale_factor = config_scale_factor
+
     if "resized_height" in info and "resized_width" in info:
         image = image_smart_resize(
             image,
             info["resized_height"],
             info["resized_width"],
-            scale_factor=patch_factor,
+            scale_factor=resize_scale_factor,
+            image_min_pixels=get_image_min_token_num(config) * patch_factor**2,
+            image_max_pixels=get_image_max_token_num(config) * patch_factor**2,
             config=config,
         )
     else:
@@ -225,7 +235,7 @@ def fetch_image(
             image,
             height,
             width,
-            scale_factor=patch_factor,
+            scale_factor=resize_scale_factor,
             image_min_pixels=min_pixels,
             image_max_pixels=max_pixels,
             config=config,

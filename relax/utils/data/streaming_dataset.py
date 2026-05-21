@@ -725,6 +725,7 @@ class StreamingDataset(BaseDataset):
         prefetch_max_cached: int = 256,
         prefetch_num_workers: int = 1,
         multimodal_config: MultimodalConfig = None,
+        custom_prompt_func=None,
     ):
         """Initialize the streaming dataset.
 
@@ -769,6 +770,7 @@ class StreamingDataset(BaseDataset):
             apply_chat_template_kwargs=apply_chat_template_kwargs,
             use_audio_in_video=use_audio_in_video,
             multimodal_config=multimodal_config,
+            custom_prompt_func=custom_prompt_func,
         )
 
         # Streaming-specific components

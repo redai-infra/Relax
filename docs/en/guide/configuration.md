@@ -91,6 +91,7 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--prefetch-chunk-size` | int | 32 | Number of samples to dispatch to the thread-pool in each prefetch round. Larger values increase throughput but also memory pressure. Only effective when `--use-streaming-dataset` is set and the dataset contains multimodal data |
 | `--prefetch-max-cached` | int | 256 | Maximum number of pre-loaded samples kept in the prefetch cache. When the cache is full the background prefetch thread pauses until consumers free space. Set to 0 to disable prefetching. Only effective when `--use-streaming-dataset` is set and the dataset contains multimodal data |
 | `--prefetch-num-workers` | int | 1 | Number of parallel worker threads inside the prefetch buffer for I/O-bound media decoding (video/image). Set to 1 to serialise all decoding (safest for FFmpeg which is not fully thread-safe). Higher values increase parallelism but may trigger EAGAIN errors on some platforms. Only effective when prefetching is enabled |
+| `--custom-prompt-path` | str | None | Dotted import path to a custom function that transforms the prompt before conversation/multimodal processing. Function signature: `def custom_fn(prompt, data: dict) -> prompt`. Example: `my_package.prompt_utils.add_prefix` |
 | `--data-source-path` | str | `relax.engine.rollout.data_source.RolloutDataSourceWithBuffer` | Rollout data source class path |
 | `--start-rollout-id` | int | None | Starting Rollout step. If not set, attempts to read from checkpoint specified by `--load` |
 
@@ -107,6 +108,7 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--video-fps` | float | None | Target FPS for video processing. Default is 2.0 if not set |
 | `--video-fps-min-frames` | int | None | Minimum frames for video processing. Default is 4 if not set |
 | `--video-fps-max-frames` | int | None | Maximum frames for video processing. Default is 768 if not set |
+| `--image-resize-scale-factor` | int | None | Scale factor for image resize dimension alignment. Default uses `patch_size * spatial_merge_size` (typically 28). Set to 0 to disable alignment |
 | `--audio-sample-rate` | int | None | Sample rate for audio processing. Default is 16000 if not set |
 | `--frame-factor` | int | None | Frame alignment factor. Default is 2 if not set |
 | `--mm-processor-pool-size` | int | 0 | Size of the multimodal processor pool. 0 (default) disables the pool and uses ThreadPoolExecutor. When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers for true parallelism without GIL contention |

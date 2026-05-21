@@ -43,6 +43,7 @@ class Dataset(BaseDataset):
         apply_chat_template_kwargs=None,
         use_audio_in_video=False,
         multimodal_config=None,
+        custom_prompt_func=None,
     ):
         # Initialize base class
         super().__init__(
@@ -60,6 +61,7 @@ class Dataset(BaseDataset):
             apply_chat_template_kwargs=apply_chat_template_kwargs,
             use_audio_in_video=use_audio_in_video,
             multimodal_config=multimodal_config,
+            custom_prompt_func=custom_prompt_func,
         )
 
         # Load all samples into memory

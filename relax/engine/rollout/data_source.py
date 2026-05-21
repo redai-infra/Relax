@@ -51,6 +51,9 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
     Returns:
         Dataset or StreamingDataset instance
     """
+    custom_prompt_path = getattr(args, "custom_prompt_path", None)
+    custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
+
     use_streaming = getattr(args, "use_streaming_dataset", False)
 
     if use_streaming:
@@ -86,6 +89,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             prefetch_max_cached=prefetch_max_cached,
             prefetch_num_workers=prefetch_num_workers,
             multimodal_config=multimodal_config,
+            custom_prompt_func=custom_prompt_func,
         )
     else:
         logger.info("Using traditional Dataset (eager loading)")
@@ -105,6 +109,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             use_audio_in_video=args.use_audio_in_video,
             seed=args.rollout_seed,
             multimodal_config=multimodal_config,
+            custom_prompt_func=custom_prompt_func,
         )
 
 

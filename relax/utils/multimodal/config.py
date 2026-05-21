@@ -32,6 +32,7 @@ class MultimodalConfig:
 
     image_max_token_num: int = 16384
     image_min_token_num: int = 4
+    image_resize_scale_factor: Optional[int] = None
     video_min_token_num: int = 128
     video_max_token_num: int = 768
     video_fps: float = 2.0
@@ -57,6 +58,8 @@ class MultimodalConfig:
             kwargs["image_max_token_num"] = args.image_max_token_num
         if hasattr(args, "image_min_token_num") and args.image_min_token_num is not None:
             kwargs["image_min_token_num"] = args.image_min_token_num
+        if hasattr(args, "image_resize_scale_factor") and args.image_resize_scale_factor is not None:
+            kwargs["image_resize_scale_factor"] = args.image_resize_scale_factor
 
         # Video params
         if hasattr(args, "video_min_token_num") and args.video_min_token_num is not None:
@@ -130,6 +133,11 @@ def get_video_fps_max_frames(config: Optional[MultimodalConfig] = None) -> int:
 def get_audio_sample_rate(config: Optional[MultimodalConfig] = None) -> int:
     """Get audio sample rate from config or default."""
     return config.audio_sample_rate if config else DEFAULT_AUDIO_SAMPLE_RATE
+
+
+def get_image_resize_scale_factor(config: Optional[MultimodalConfig] = None) -> Optional[int]:
+    """Get image resize scale factor from config, or None if not set."""
+    return config.image_resize_scale_factor if config else None
 
 
 def get_frame_factor(config: Optional[MultimodalConfig] = None) -> int:

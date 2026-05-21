@@ -91,6 +91,7 @@
 | `--prefetch-chunk-size` | int | 32 | 每轮预取时分派到线程池的样本数。较大的值可以提高吞吐量但也会增加内存压力。仅在设置了 `--use-streaming-dataset` 且数据集包含多模态数据时生效 |
 | `--prefetch-max-cached` | int | 256 | 预取缓存中保留的最大预加载样本数。缓存满时后台预取线程会暂停，直到消费者释放空间。设为 0 可禁用预取。仅在设置了 `--use-streaming-dataset` 且数据集包含多模态数据时生效 |
 | `--prefetch-num-workers` | int | 1 | 预取缓冲区中用于 I/O 密集型媒体解码（视频/图像）的并行工作线程数。设为 1 可序列化所有解码操作（对 FFmpeg 非线程安全问题最安全）。较高值可提高并行度，但在某些平台上可能触发 EAGAIN 错误。仅在启用预取时生效 |
+| `--custom-prompt-path` | str | None | 自定义 Prompt 转换函数的 Python 点分导入路径。该函数在对话/多模态处理之前调用。函数签名：`def custom_fn(prompt, data: dict) -> prompt`。示例：`my_package.prompt_utils.add_prefix` |
 | `--data-source-path` | str | `relax.engine.rollout.data_source.RolloutDataSourceWithBuffer` | Rollout 数据源类路径 |
 | `--start-rollout-id` | int | None | 起始 Rollout 步数。未设置时会尝试从 `--load` 的检查点中读取 |
 
@@ -107,6 +108,7 @@
 | `--video-fps` | float | None | 视频处理的目标 FPS。未设置时使用默认值 2.0 |
 | `--video-fps-min-frames` | int | None | 视频处理的最少帧数。未设置时使用默认值 4 |
 | `--video-fps-max-frames` | int | None | 视频处理的最多帧数。未设置时使用默认值 768 |
+| `--image-resize-scale-factor` | int | None | 图像缩放尺寸对齐因子。默认使用 `patch_size * spatial_merge_size`（通常为 28）。设为 0 可禁用对齐 |
 | `--audio-sample-rate` | int | None | 音频处理的采样率。未设置时使用默认值 16000 |
 | `--frame-factor` | int | None | 帧数对齐因子。未设置时使用默认值 2 |
 | `--mm-processor-pool-size` | int | 0 | 多模态处理器池大小。0（默认）禁用进程池，使用 ThreadPoolExecutor。设置为正整数时，创建指定数量 worker 的 ProcessPoolExecutor，实现无 GIL 竞争的真正并行 |

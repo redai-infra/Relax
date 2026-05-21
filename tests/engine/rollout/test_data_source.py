@@ -95,6 +95,7 @@ class TestDataSourceIntegration:
         args.apply_chat_template = False
         args.apply_chat_template_kwargs = None
         args.rollout_seed = 42
+        args.custom_prompt_path = None
 
         tokenizer = MagicMock()
 
@@ -123,6 +124,7 @@ class TestDataSourceIntegration:
         args.apply_chat_template = False
         args.apply_chat_template_kwargs = None
         args.rollout_seed = 42
+        args.custom_prompt_path = None
 
         tokenizer = MagicMock()
 
@@ -160,6 +162,7 @@ class TestDataSourceIntegration:
             args.apply_chat_template = False
             args.apply_chat_template_kwargs = None
             args.rollout_seed = 42
+            args.custom_prompt_path = None
 
             tokenizer = MagicMock()
             dataset = _create_dataset(args, tokenizer, processor=None)

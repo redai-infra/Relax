@@ -26,7 +26,7 @@ import os
 import re
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import tqdm
@@ -86,6 +86,7 @@ def build_messages(
     system_prompt: Optional[str],
     as_conversation: bool,
     multimodal_keys: Optional[dict] = None,
+    custom_prompt_func: Optional[Callable[[Any, dict], Any]] = None,
 ) -> Any:
     """Build message format from raw data.
 
@@ -98,11 +99,17 @@ def build_messages(
         system_prompt: System prompt key or content
         as_conversation: Whether to convert to conversation format
         multimodal_keys: Mapping of multimodal types to data keys
+        custom_prompt_func: Optional callable ``(prompt, data) -> prompt`` applied
+            immediately after extracting the prompt from *data*, before any
+            conversation / multimodal processing.
 
     Returns:
         Processed prompt (string or list of message dicts)
     """
     prompt = data.get(prompt_key)
+
+    if custom_prompt_func is not None:
+        prompt = custom_prompt_func(prompt, data)
 
     if isinstance(prompt, str):
         # If prompt is a string and we don't apply chat template, return as is
@@ -192,6 +199,7 @@ def process_raw_sample(
     apply_chat_template_kwargs: Optional[dict] = None,
     use_audio_in_video: Optional[bool] = False,
     multimodal_config: MultimodalConfig = None,
+    custom_prompt_func: Optional[Callable[[Any, dict], Any]] = None,
 ) -> Sample:
     """Process a raw data dictionary into a Sample object.
 
@@ -214,7 +222,7 @@ def process_raw_sample(
     """
     # Both chat templates and multimodal inputs require conversation format
     as_conversation = apply_chat_template or (multimodal_keys is not None)
-    prompt = build_messages(data, prompt_key, system_prompt, as_conversation, multimodal_keys)
+    prompt = build_messages(data, prompt_key, system_prompt, as_conversation, multimodal_keys, custom_prompt_func)
 
     metadata = data.get(metadata_key) or {}
     tools = None
@@ -554,6 +562,7 @@ class BaseDataset(abc.ABC):
         apply_chat_template_kwargs: Optional[dict] = None,
         use_audio_in_video: bool = False,
         multimodal_config: MultimodalConfig = None,
+        custom_prompt_func: Optional[Callable[[Any, dict], Any]] = None,
     ):
         """Initialize base dataset configuration.
 
@@ -586,6 +595,7 @@ class BaseDataset(abc.ABC):
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self.use_audio_in_video = use_audio_in_video
         self.multimodal_config = multimodal_config
+        self.custom_prompt_func = custom_prompt_func
 
         self.epoch_id = -1
 
@@ -623,4 +633,5 @@ class BaseDataset(abc.ABC):
             apply_chat_template_kwargs=self.apply_chat_template_kwargs,
             use_audio_in_video=self.use_audio_in_video,
             multimodal_config=self.multimodal_config,
+            custom_prompt_func=self.custom_prompt_func,
         )

@@ -831,6 +831,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Maximum number of frames for video processing. If not set, uses default value (768).",
             )
             parser.add_argument(
+                "--image-resize-scale-factor",
+                type=int,
+                default=None,
+                help=(
+                    "Scale factor for image resize dimension alignment. "
+                    "Default uses patch_size * spatial_merge_size. Set to 0 to disable alignment."
+                ),
+            )
+            parser.add_argument(
                 "--audio-sample-rate",
                 type=int,
                 default=None,
@@ -851,6 +860,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
                     "When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers "
                     "for true parallelism without GIL contention."
+                ),
+            )
+            parser.add_argument(
+                "--custom-prompt-path",
+                type=str,
+                default=None,
+                help=(
+                    "Dotted import path to a custom function that transforms the prompt before "
+                    "conversation/multimodal processing. The function signature must be "
+                    "`def custom_fn(prompt, data: dict) -> prompt`, where `prompt` is the raw "
+                    "value from the dataset and `data` is the full sample dict. "
+                    "Example: my_package.prompt_utils.add_prefix"
                 ),
             )
             parser.add_argument("--metadata-key", type=str, default="metadata", help="JSON dataset key")
