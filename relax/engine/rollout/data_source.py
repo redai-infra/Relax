@@ -234,7 +234,7 @@ class RolloutDataSource(DataSource):
         if self._use_streaming and self.dataset is not None:
             state_dict["streaming_state"] = self.dataset.get_state()
 
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
 
@@ -248,10 +248,16 @@ class RolloutDataSource(DataSource):
         if rollout_id < 0:
             return
 
-        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = os.path.join(self.args.load, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
         if not os.path.exists(path):
-            logger.error(f"Checkpoint {path} does not exist.")
-            return
+            # Backwards compat: older checkpoints wrote to rollout/ instead of dataset/.
+            legacy_path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+            if os.path.exists(legacy_path):
+                logger.warning(f"Loading dataset state from legacy path {legacy_path} (new path: dataset/)")
+                path = legacy_path
+            else:
+                logger.error(f"Checkpoint {path} does not exist.")
+                return
 
         logger.info(f"load metadata from {path}")
         state_dict = torch.load(path)

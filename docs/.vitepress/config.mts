@@ -276,7 +276,8 @@ export default defineConfig({
               text: 'Development',
               items: [
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
-                { text: 'Debugging Guide', link: '/en/guide/debugging' }
+                { text: 'Debugging Guide', link: '/en/guide/debugging' },
+                { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' }
               ]
             }
           ],
@@ -374,7 +375,8 @@ export default defineConfig({
               text: '开发指南',
               items: [
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
-                { text: '调试指南', link: '/zh/guide/debugging' }
+                { text: '调试指南', link: '/zh/guide/debugging' },
+                { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' }
               ]
             }
           ],
