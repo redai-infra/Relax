@@ -65,6 +65,10 @@ class RewardWorker:
         """
         if rm_type == "deepscaler":
             return get_deepscaler_rule_based_reward(response, label)
+        elif rm_type == "geo3k":
+            from .geo3k import get_geo3k_reward
+
+            return get_geo3k_reward(response, label)
         elif rm_type == "openr1mm":
             return get_openr1mm_rule_based_reward(response, label)
         elif rm_type == "multiple_choice":
@@ -151,6 +155,7 @@ class RewardExecutor:
     _SYNC_RM_TYPES = frozenset(
         {
             "deepscaler",
+            "geo3k",
             "openr1mm",
             "multiple_choice",
             "dapo",

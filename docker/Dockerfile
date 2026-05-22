@@ -90,7 +90,7 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
 COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
+    pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/

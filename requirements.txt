@@ -37,3 +37,4 @@ dool
 pystack
 py-spy
 ipdb
+mathruler==0.1.0
