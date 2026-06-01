@@ -359,7 +359,8 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
     )
 
-    _warm_hf_checkpoint_page_cache(source_path)
+    if getattr(args, "warm_hf_checkpoint_page_cache", False):
+        _warm_hf_checkpoint_page_cache(source_path)
 
     with megatron_bridge_utils.patch_megatron_model(ddp_model):
         bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)

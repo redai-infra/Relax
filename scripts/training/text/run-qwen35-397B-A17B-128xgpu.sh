@@ -2,16 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-30B-A3B FP8 QAT 8xGPU colocate training script.
-#
-# FP8 QAT 说明：
-#   - 训练侧：Megatron-LM 原生 FP8 训练（--fp8-format e4m3 --fp8-recipe blockwise）
-#   - Rollout 侧：sglang 使用真实 FP8 权重推理
-#   - 每个 step 结束，训练权重经 blockwise FP8 量化后通过 NCCL 同步到 rollout engine
-#   - 前提：--hf-checkpoint 需指向已量化好的 FP8 HF checkpoint
+# Qwen3.5-397B-A17B 128xGPU (16-node) fully sync training script for DAPO math dataset.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen3-30B-A3B-8xgpu-fp8.sh
+#   bash scripts/training/text/run-qwen35-397B-A17B-128xgpu.sh
 
 set -ex
 set -o pipefail
@@ -20,12 +14,11 @@ now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-echo "SCRIPT_DIR: $SCRIPT_DIR"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen3-30B-A3B.sh"
+source "${MODEL_CONFIG_DIR}/qwen35-397B-A17B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
@@ -34,14 +27,18 @@ DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3-30B-A3B-FP8
-   --ref-load ${MODEL_DIR}/Qwen3-30B-A3B-FP8
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-397B-A17B/
+   --ref-load ${MODEL_DIR}/Qwen3.5-397B-A17B/
    --megatron-to-hf-mode bridge
-   --warm-hf-checkpoint-page-cache
 
-   --load ${EXP_DIR}/Qwen3-30B-A3B
-   --save ${EXP_DIR}/Qwen3-30B-A3B
+   --load ${EXP_DIR}/Qwen3.5-397B-A17B_mcore_128xgpu/
+   --save ${EXP_DIR}/Qwen3.5-397B-A17B_mcore_128xgpu/
    --save-interval 100
+   --max-actor-ckpt-to-keep 1
+   --no-save-optim
+   --no-save-rng
+   --no-load-optim
+   --no-load-rng
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
@@ -59,49 +56,45 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 1
-
    --global-batch-size 128
-   --balance-data
    --use-fault-tolerance
-   --train-iters 200
+   --balance-data
+   --rollout-health-check-timeout 120
 )
 
 EVAL_ARGS=(
-   --skip-eval-before-train
    --log-passrate
+   --skip-eval-before-train
    --eval-interval 20
    --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
-   --eval-max-response-len 16384
+   --eval-max-response-len 8192
    --eval-top-p 0.7
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
-   --pipeline-model-parallel-size 1
-   --context-parallel-size 1
-   --expert-model-parallel-size 8
+   --pipeline-model-parallel-size 4
+   --context-parallel-size 4
+   --expert-model-parallel-size 32
    --expert-tensor-parallel-size 1
+   --decoder-first-pipeline-num-layers 15
+   --decoder-last-pipeline-num-layers 5
 
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
 
+   --calculate-per-token-loss
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
+   # --vision-dp-when-tp
 
-   # MoE dispatcher
+   --max-tokens-per-gpu 16384
+   --log-probs-max-tokens-per-gpu 32768
+
    --moe-flex-dispatcher-backend deepep
    --moe-token-dispatcher-type flex
-   --moe-router-dtype fp32
-
-   # FP8 训练：使用 TransformerEngine blockwise e4m3 方案
-   # NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1 需同步设置在 env_vars 中
-   --transformer-impl transformer_engine
-   --bf16
-   --fp8-format e4m3
-   --fp8-recipe blockwise
 )
 
 GRPO_ARGS=(
@@ -127,21 +120,36 @@ OPTIMIZER_ARGS=(
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
 
+   # NOTE(wuhuan): to avoid algorithm performance degradation
+   --no-rope-fusion
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
+   --update-weight-buffer-size $(( 4 * 512 * 1024 * 1024 )) \
+
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.6
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --rollout-num-gpus-per-engine 32
+   --sglang-mem-fraction-static 0.7
+   # dp attention
+   --sglang-enable-dp-attention
+   --sglang-dp-size 32
+   --sglang-moe-dense-tp-size 1
+   --sglang-enable-dp-lm-head
+   --sglang-ep-size 32
+   --sglang-load-format dummy
+
+   --sglang-cuda-graph-max-bs 8
+   --sglang-server-concurrency 1024
+   --sglang-watchdog-timeout 3600
+   --sglang-enable-nan-detection
 )
 
 WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen3-30B-A3B-fp8-r3${now}
+   --tb-experiment-name qwen35-397B-A17B-128x-sync-${now}
 )
 
 MISC_ARGS=(
@@ -149,25 +157,33 @@ MISC_ARGS=(
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
+   # gated delta net does not support flash attention backend
    --attention-backend flash
 )
+RUNTIME_ENV_JSON=$(python3 -c '
+import json, os
+d = json.loads(os.environ["RUNTIME_ENV_JSON"])
+d.setdefault("env_vars", {}).update({
+    "TORCH_DIST_INIT_BARRIER": "1",
+    "TORCH_NCCL_BLOCKING_WAIT": "0",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    "TORCH_DISTRIBUTED_DEFAULT_TIMEOUT": "3600",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+})
+print(json.dumps(d))
+')
+export RUNTIME_ENV_JSON
 
-_EXTRA_ENV="{
-   \"NVTE_FP8_BLOCK_SCALING_FP32_SCALES\": \"1\"
-}"
-
-export RUNTIME_ENV_JSON=$(echo "${RUNTIME_ENV_JSON}" | jq --argjson extra "${_EXTRA_ENV}" '.env_vars += $extra')
 
 mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
-   --max-staleness 0 \
-   --num-data-storage-units 1 \
-   --use-health-check \
+   --resource '{"actor": [1, 128], "rollout": [1, 128]}' \
+   --num-data-storage-units 16 \
    --colocate \
+   --max-staleness 0 \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
@@ -177,4 +193,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${PERF_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-30B-A3B-fp8-GRPO-gpu8-${now}.log
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-397B-A17B-GRPO-gpu128-sync-${now}.log

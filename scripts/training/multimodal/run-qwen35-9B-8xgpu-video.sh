@@ -30,6 +30,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
    --ref-load ${MODEL_DIR}/Qwen3.5-9B
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
 SYSTEM_PROMPT="'Please think about this question as if you were a human pondering deeply, carefully considering the video information before answering, engaging in an internal dialogue using expressions such as let me think, wait, hmm, oh I see, or let's break it down, including self-reflection or verification in the reasoning process, providing the detailed reasoning between the <think> </think> tags, and finally giving only the single option letter (e.g., A, B, C, D, etc.) as the final answer within the <answer> </answer> tags.'"

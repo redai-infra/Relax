@@ -29,6 +29,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B
    --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
 PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
@@ -60,8 +61,8 @@ PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 2
-   --context-parallel-size 1
-   --expert-model-parallel-size 4
+   --context-parallel-size 4
+   --expert-model-parallel-size 16
    --expert-tensor-parallel-size 1
    --recompute-granularity full
    --recompute-method uniform
@@ -133,7 +134,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+   --resource '{"actor": [1, 128], "rollout": [1, 128]}'\
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \

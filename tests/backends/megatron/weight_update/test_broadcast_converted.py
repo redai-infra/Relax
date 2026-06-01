@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tests for _broadcast_quantized_phase and _broadcast_quantized_bucket.
+"""Tests for _broadcast_converted_phase and _broadcast_converted_bucket.
 
-These functions broadcast already-quantized INT4 expert tensors across PP and
-EP process groups using only NCCL (``dist.all_reduce`` for metadata,
-``dist.broadcast`` for data tensors).  We mock ``torch.distributed`` and
-``mpu`` to simulate multi-rank scenarios.
+These functions broadcast converted expert tensors across PP and EP process
+groups using only NCCL (``dist.all_reduce`` for metadata, ``dist.broadcast``
+for data tensors).  We mock ``torch.distributed`` and ``mpu`` to simulate
+multi-rank scenarios.
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ for _mod in _MEGATRON_MODULES:
 pytest.importorskip("triton")
 
 from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
-    _broadcast_quantized_bucket,
-    _broadcast_quantized_phase,
+    _broadcast_converted_bucket,
+    _broadcast_converted_phase,
     _compute_slot_size,
     _decode_metadata,
     _encode_metadata,
@@ -193,12 +193,12 @@ class TestMetadataEncodeDecode:
 
 
 # ---------------------------------------------------------------------------
-# _broadcast_quantized_phase tests
+# _broadcast_converted_phase tests
 # ---------------------------------------------------------------------------
 
 
 class TestBroadcastQuantizedPhase:
-    """Test _broadcast_quantized_phase with various group configurations."""
+    """Test _broadcast_converted_phase with various group configurations."""
 
     @staticmethod
     def _run_phase(bucket_infos, all_converted_per_rank, group_ranks, current_rank):
@@ -210,7 +210,7 @@ class TestBroadcastQuantizedPhase:
             patch("torch.distributed.all_reduce", side_effect=fake_ar),
             patch("torch.distributed.broadcast", side_effect=fake_bcast),
         ):
-            return _broadcast_quantized_phase(
+            return _broadcast_converted_phase(
                 bucket_infos,
                 all_converted_per_rank[current_rank],
                 device="cpu",
@@ -305,12 +305,12 @@ class TestBroadcastQuantizedPhase:
 
 
 # ---------------------------------------------------------------------------
-# _broadcast_quantized_bucket tests
+# _broadcast_converted_bucket tests
 # ---------------------------------------------------------------------------
 
 
 class TestBroadcastQuantizedBucket:
-    """Test _broadcast_quantized_bucket end-to-end."""
+    """Test _broadcast_converted_bucket end-to-end."""
 
     @staticmethod
     def _run_bucket(bucket_infos, all_converted, pp_size, ep_size):
@@ -324,7 +324,7 @@ class TestBroadcastQuantizedBucket:
             mock_mpu.get_pipeline_model_parallel_group.return_value = MagicMock()
             mock_mpu.get_expert_model_parallel_group.return_value = MagicMock()
 
-            return _broadcast_quantized_bucket(bucket_infos, all_converted, device="cpu")
+            return _broadcast_converted_bucket(bucket_infos, all_converted, device="cpu")
 
     def test_no_broadcast_pp1_ep1(self):
         """PP=1, EP=1: just flatten all_converted."""
@@ -387,7 +387,7 @@ class TestBroadcastQuantizedBucket:
             patch("torch.distributed.broadcast_object_list", side_effect=capture_gloo),
             patch("torch.distributed.all_gather_object", side_effect=capture_gloo),
         ):
-            _broadcast_quantized_phase(infos, [converted], "cpu", rank=0, group=group)
+            _broadcast_converted_phase(infos, [converted], "cpu", rank=0, group=group)
 
         assert len(allreduce_calls) == 2
         assert len(broadcast_calls) > 0
@@ -444,7 +444,7 @@ class TestPPxEPIntegration:
             patch("torch.distributed.all_reduce", side_effect=fake_ar_pp),
             patch("torch.distributed.broadcast", side_effect=fake_bcast_pp),
         ):
-            all_converted = _broadcast_quantized_phase(
+            all_converted = _broadcast_converted_phase(
                 self.BUCKET_INFOS, all_converted, "cpu", rank=rank, group=pp_group_mock
             )
 
@@ -468,7 +468,7 @@ class TestPPxEPIntegration:
             patch("torch.distributed.all_reduce", side_effect=fake_ar_ep),
             patch("torch.distributed.broadcast", side_effect=fake_bcast_ep),
         ):
-            all_converted = _broadcast_quantized_phase(
+            all_converted = _broadcast_converted_phase(
                 self.BUCKET_INFOS, all_converted, "cpu", rank=rank, group=ep_group_mock
             )
 

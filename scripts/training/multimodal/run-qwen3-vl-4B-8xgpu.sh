@@ -30,6 +30,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
    --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
 PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet

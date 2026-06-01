@@ -1,11 +1,15 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import dataclasses
 import re
 from argparse import Namespace
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.distributed as dist
+from megatron.core import mpu
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
@@ -41,6 +45,7 @@ class BridgeConverter:
         self._bridge_task_map: dict[str, Any] | None = None
         self._bridge_mapping_registry: Any = None
         self._bridge_expert_transposes_down: bool = True
+        self._configs_broadcast_done: bool = False
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -107,6 +112,24 @@ class BridgeConverter:
                     inner_tp._detected_type = inner_tp._detect_parallelism_type(task.megatron_module)
                     inner_tp._mapping = inner_tp._get_or_create_mapping(inner_tp._detected_type)
 
+        self._config_map: dict[str, Any] = {}
+        for task in self._bridge_task_map.values():
+            if task.megatron_module is not None:
+                prefix = task.global_param_name.split(".")[0]
+                if prefix not in self._config_map:
+                    self._config_map[prefix] = task.megatron_module.config
+
+        # Patch local tasks that have megatron_module=None (Phase 2 tasks
+        # from named_params_and_buffers that AutoBridge didn't produce).
+        for name, task in list(self._bridge_task_map.items()):
+            if task.megatron_module is None:
+                prefix = name.split(".")[0]
+                config = self._config_map.get(prefix)
+                if config is not None:
+                    self._bridge_task_map[name] = dataclasses.replace(
+                        task, megatron_module=SimpleNamespace(config=config)
+                    )
+
         self._bridge_expert_transposes_down = False
         for task in self._bridge_task_map.values():
             cls = type(task.mapping)
@@ -115,6 +138,40 @@ class BridgeConverter:
                 break
 
         logger.info("Bridge task map initialized with %d local tasks", len(self._bridge_task_map))
+
+    def broadcast_and_apply_configs(self) -> None:
+        """Broadcast ``_config_map`` across PP ranks and patch remaining tasks.
+
+        Must be called by all PP ranks after :meth:`init_tasks`.  After this
+        call every task in ``_bridge_task_map`` has a non-None
+        ``megatron_module`` with the correct ``.config`` for QKV split.
+
+        Safe to call multiple times; the broadcast only runs once.
+        """
+        if self._configs_broadcast_done:
+            return
+        self._configs_broadcast_done = True
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            all_config_maps: list[dict[str, Any] | None] = [None] * pp_size
+            dist.all_gather_object(
+                obj=self._config_map,
+                object_list=all_config_maps,
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+            for remote_map in all_config_maps:
+                for prefix, cfg in remote_map.items():
+                    if prefix not in self._config_map:
+                        self._config_map[prefix] = cfg
+
+        for name, task in list(self._bridge_task_map.items()):
+            if task.megatron_module is None:
+                prefix = name.split(".")[0]
+                config = self._config_map.get(prefix)
+                if config is not None:
+                    self._bridge_task_map[name] = dataclasses.replace(
+                        task, megatron_module=SimpleNamespace(config=config)
+                    )
 
     # ------------------------------------------------------------------
     # Mapping collection
@@ -174,11 +231,16 @@ class BridgeConverter:
                 f"Bridge mapping registry has no entry for '{global_name}'. "
                 f"Available task map keys: {list(self._bridge_task_map.keys())[:10]}..."
             )
+            prefix = global_name.split(".")[0]
+            config = self._config_map.get(prefix)
+            if config is None:
+                config = next(iter(self._config_map.values()), None)
+            donor = SimpleNamespace(config=config) if config is not None else None
             task = WeightConversionTask(
                 param_name=global_name,
                 global_param_name=global_name,
                 mapping=mapping,
-                megatron_module=None,
+                megatron_module=donor,
                 param_weight=None,
             )
             if isinstance(mapping, AutoMapping) and mapping._mapping is None:
@@ -213,7 +275,17 @@ class BridgeConverter:
                     patched_classes.add(cls)
 
             param = remove_padding(name, param, self._args.vocab_size)
-            converted_dict = mapping.megatron_to_hf(param, task.megatron_module)
+            try:
+                converted_dict = mapping.megatron_to_hf(param, task.megatron_module)
+            except Exception:
+                logger.error(
+                    "megatron_to_hf failed: name=%s mapping=%s param.shape=%s module=%s",
+                    global_name,
+                    type(mapping).__name__,
+                    tuple(param.shape),
+                    type(task.megatron_module).__name__ if task.megatron_module else "None",
+                )
+                raise
         finally:
             for m, (pp, tp, etp, ep) in zip(all_mappings, saved_groups):
                 m.pp_group = pp

@@ -252,6 +252,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The method to convert megatron weights to hugging face weights for SGLang.",
             )
             parser.add_argument(
+                "--warm-hf-checkpoint-page-cache",
+                action="store_true",
+                default=False,
+                help="Pre-read HF checkpoint files into OS page cache before bridge loading to speed up NFS-backed mmap.",
+            )
+            parser.add_argument(
                 "--custom-model-provider-path",
                 type=str,
                 default=None,

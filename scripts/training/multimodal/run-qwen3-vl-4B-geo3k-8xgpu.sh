@@ -30,6 +30,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
    --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
 PROMPT_SET=${DATA_DIR}/geo3k/train.parquet

@@ -71,7 +71,7 @@ echo "=== Reserving sglang port ranges on all GPU nodes ==="
 python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-16800,30000-30300" || echo "reserve_ports failed (non-fatal)"
 
 # kill old tasks
-ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K[^']+" | xargs ray job stop || true
+ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K[^']+" | xargs --no-run-if-empty ray job stop || true
 
 set -x
 
