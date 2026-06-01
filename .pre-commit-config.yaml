@@ -76,3 +76,5 @@ repos:
     rev: v8.24.2
     hooks:
       - id: gitleaks
+        entry: gitleaks dir --redact --verbose .
+        pass_filenames: false

@@ -109,13 +109,13 @@ class TestParseHostPort:
 class TestCollectExistingEngineAddrs:
     def test_all_live_engines(self, patch_ray_get):
         e1 = make_mock_engine(url="http://10.0.0.1:30000")
-        e2 = make_mock_engine(url="http://10.0.0.2:30000")
+        e2 = make_mock_engine(url="http://192.0.2.2:30000")
         group = make_engine_group(engines=[e1, e2])
         srv = make_rollout_server(engine_groups=[group])
         manager = create_test_manager(servers={"default": srv})
 
         addrs = manager._collect_existing_engine_addrs(srv)
-        assert addrs == {"10.0.0.1:30000", "10.0.0.2:30000"}
+        assert addrs == {"10.0.0.1:30000", "192.0.2.2:30000"}
 
     def test_dead_engines_excluded(self, patch_ray_get):
         e1 = make_mock_engine(url="http://10.0.0.1:30000")

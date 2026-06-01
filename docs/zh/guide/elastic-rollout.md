@@ -146,7 +146,7 @@ curl -X POST http://<rollout-host>/rollout/scale_out \
   -d '{
     "engine_urls": [
       "http://192.168.1.100:30000",
-      "http://192.168.1.101:30000"
+      "http://198.51.100.101:30000"
     ]
   }'
 ```
@@ -387,13 +387,13 @@ curl http://<rollout-host>/rollout/engines
       "engines": [
         {
           "engine_id": "engine_0",
-          "url": "http://192.168.1.10:30000",
+          "url": "http://198.51.100.10:30000",
           "status": "ACTIVE",
           "is_healthy": true
         },
         {
           "engine_id": "engine_1",
-          "url": "http://192.168.1.11:30000",
+          "url": "http://198.51.100.11:30000",
           "status": "ACTIVE",
           "is_healthy": true
         }
@@ -473,8 +473,8 @@ curl -X POST http://localhost:8000/rollout/scale_out \
   -H "Content-Type: application/json" \
   -d '{
     "engine_urls": [
-      "http://10.0.1.50:30000",
-      "http://10.0.1.51:30000"
+      "http://192.0.2.50:30000",
+      "http://192.0.2.51:30000"
     ]
   }'
 ```
