@@ -40,7 +40,14 @@ from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
-from relax.utils.utils import get_debug_data, get_serve_url, merge_dict_list, process_args
+from relax.utils.utils import (
+    _extract_audio_seqlens,
+    _extract_images_seqlens,
+    get_debug_data,
+    get_serve_url,
+    merge_dict_list,
+    process_args,
+)
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
@@ -110,6 +117,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
+
+        from relax.utils.training.flops_counter import FlopsCounter
+
+        self.flops_counter = FlopsCounter(self.hf_config)
 
         self.train_parallel_config = {
             "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
@@ -463,6 +474,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
+
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
                     if self.args.opd_log_prob_top_k > 0:
@@ -623,7 +635,21 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
-        log_perf_data(rollout_id, self.args)
+        mm_inputs = rollout_data.get("multimodal_train_inputs")
+        if mm_inputs is not None:
+            images_seqlens = _extract_images_seqlens(mm_inputs)
+            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().images_seqlens = sum(all_images_seqlens, [])
+            audio_seqlens = _extract_audio_seqlens(mm_inputs)
+            all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().audio_seqlens = sum(all_audio_seqlens, [])
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
             self.args.rotate_ckpt
@@ -896,7 +922,21 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
-        log_perf_data(rollout_id, self.args)
+        mm_inputs = rollout_data.get("multimodal_train_inputs")
+        if mm_inputs is not None:
+            images_seqlens = _extract_images_seqlens(mm_inputs)
+            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().images_seqlens = sum(all_images_seqlens, [])
+            audio_seqlens = _extract_audio_seqlens(mm_inputs)
+            all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().audio_seqlens = sum(all_audio_seqlens, [])
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -1036,7 +1076,21 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
-        log_perf_data(rollout_id, self.args)
+        mm_inputs = rollout_data.get("multimodal_train_inputs")
+        if mm_inputs is not None:
+            images_seqlens = _extract_images_seqlens(mm_inputs)
+            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().images_seqlens = sum(all_images_seqlens, [])
+            audio_seqlens = _extract_audio_seqlens(mm_inputs)
+            all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().audio_seqlens = sum(all_audio_seqlens, [])
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
 
     @timer

@@ -20,6 +20,76 @@ logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
 
 
+def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
+    """Extract per-image ViT token counts from multimodal_train_inputs.
+
+    Accepts either:
+      - ``list[dict | None]``: per-sample dicts (pre-batch format)
+      - ``dict``: concatenated tensors (post-``prepare_batch`` format)
+
+    For each image, the ViT input sequence length = H * W (repeated T times
+    along the temporal axis).
+    """
+    if isinstance(multimodal_train_inputs, dict):
+        grid_thw = multimodal_train_inputs.get("image_grid_thw")
+        if grid_thw is None:
+            return []
+        if isinstance(grid_thw, torch.Tensor):
+            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+            return seqlens.tolist()
+        return [int(h * w) for t, h, w in grid_thw for _ in range(int(t))]
+
+    images_seqlens: list[int] = []
+    for mm_input in multimodal_train_inputs:
+        if mm_input is None:
+            continue
+        grid_thw = mm_input.get("image_grid_thw")
+        if grid_thw is None:
+            continue
+        if isinstance(grid_thw, torch.Tensor):
+            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
+            images_seqlens.extend(seqlens.tolist())
+        elif isinstance(grid_thw, (list, np.ndarray)):
+            for t, h, w in grid_thw:
+                images_seqlens.extend([int(h * w)] * int(t))
+    return images_seqlens
+
+
+def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
+    """Extract per-audio raw mel feature lengths from multimodal_train_inputs.
+
+    Accepts either:
+      - ``list[dict | None]``: per-sample dicts (pre-batch format)
+      - ``dict``: concatenated tensors (post-``prepare_batch`` format)
+
+    Returns the effective mel frame count for each audio clip, derived from
+    ``feature_attention_mask.sum(-1)``.
+    """
+    if isinstance(multimodal_train_inputs, dict):
+        feat_mask = multimodal_train_inputs.get("feature_attention_mask")
+        if feat_mask is None:
+            return []
+        if isinstance(feat_mask, torch.Tensor):
+            return feat_mask.sum(-1).tolist()
+        return torch.tensor(feat_mask).sum(-1).tolist()
+
+    audio_seqlens: list[int] = []
+    for mm_input in multimodal_train_inputs:
+        if mm_input is None:
+            continue
+        feat_mask = mm_input.get("feature_attention_mask")
+        if feat_mask is None:
+            continue
+        if isinstance(feat_mask, torch.Tensor):
+            lengths = feat_mask.sum(-1)
+            audio_seqlens.extend(lengths.tolist())
+        elif isinstance(feat_mask, (list, np.ndarray)):
+            feat_mask_t = torch.tensor(feat_mask)
+            lengths = feat_mask_t.sum(-1)
+            audio_seqlens.extend(lengths.tolist())
+    return audio_seqlens
+
+
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
     raw_rewards, rewards = post_process_rewards(args, samples)

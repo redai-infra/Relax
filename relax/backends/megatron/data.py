@@ -21,7 +21,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
-from relax.utils.training.flops_utils import calculate_fwd_flops
+from relax.utils.training.flops_counter import FlopsCounter
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import get_sum_of_sample_mean, maybe_padded_total_lengths, slice_with_cp
@@ -875,7 +875,7 @@ def log_perf_data_fwd(args, rollout_id):
     tracking_utils.log(args, log_dict, step_key="actor_fwd/step")
 
 
-def log_perf_data(rollout_id: int, args: Namespace) -> None:
+def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter | None = None) -> None:
     train_metric_utils.log_perf_data_raw(
         rollout_id=rollout_id,
         args=args,
@@ -884,9 +884,8 @@ def log_perf_data(rollout_id: int, args: Namespace) -> None:
             and mpu.is_pipeline_last_stage()
             and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
         ),
-        compute_total_fwd_flops=lambda seq_lens: (
-            calculate_fwd_flops(seqlens=seq_lens, args=args) / dist.get_world_size() / 1e12
-        ),
+        flops_counter=flops_counter,
+        world_size=dist.get_world_size(),
     )
 
 
