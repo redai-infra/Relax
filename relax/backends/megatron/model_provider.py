@@ -273,6 +273,7 @@ def get_model_provider_func(
             "freeze_vision_projection",
             # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
+            "vision_dp_when_cp",
             "calculate_per_token_loss",
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",

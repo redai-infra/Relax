@@ -37,20 +37,22 @@ fi
 source "${MODEL_CONFIG_DIR}/qwen3-30B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3-30B-A3B-int4
+   --hf-checkpoint ${MODEL_DIR}/Qwen3-30B-A3B-int4
    # Megatron BF16 checkpoint
-   --ref-load ${EXP_DIR}/Qwen3-30B-A3B
+   --ref-load ${MODEL_DIR}/Qwen3-30B-A3B
    --megatron-to-hf-mode bridge
    --load ${EXP_DIR}/Qwen3-30B-A3B_dist
    --save ${EXP_DIR}/Qwen3-30B-A3B_dist
    --save-interval 100
 )
 
-PROMPT_SET=${EXP_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
@@ -75,7 +77,7 @@ EVAL_ARGS=(
    --skip-eval-before-train
    --log-passrate
    --eval-interval 2000
-   --eval-prompt-data aime ${EXP_DIR}/dapo-math-17k/dapo-100.jsonl
+   --eval-prompt-data aime ${DATA_DIR}/dapo-math-17k/dapo-100.jsonl
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 16384
    --eval-top-p 0.7
