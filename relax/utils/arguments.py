@@ -18,34 +18,6 @@ from relax.utils.training.eval_config import EvalDatasetConfig, build_eval_datas
 logger = get_logger(__name__)
 
 
-def _resolve_global_batch_size(args):
-    rollout_samples = args.rollout_batch_size * args.n_samples_per_prompt
-    if args.num_steps_per_rollout is not None:
-        assert args.num_steps_per_rollout > 0, "num_steps_per_rollout must be positive."
-        assert rollout_samples % args.num_steps_per_rollout == 0, (
-            f"rollout_batch_size * n_samples_per_prompt ({args.rollout_batch_size} * {args.n_samples_per_prompt} "
-            f"= {rollout_samples}) must be divisible by num_steps_per_rollout ({args.num_steps_per_rollout})."
-        )
-        global_batch_size = rollout_samples // args.num_steps_per_rollout
-        if args.global_batch_size is not None:
-            assert args.global_batch_size == global_batch_size, (
-                f"global_batch_size {args.global_batch_size} is not equal to "
-                f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
-                f"// num_steps_per_rollout {args.num_steps_per_rollout}"
-            )
-        args.global_batch_size = global_batch_size
-
-    # num_steps_per_rollout in create_stream_dataloader is computed as
-    # rollout_batch_size * n_samples_per_prompt // global_batch_size; a zero
-    # or non-divisible result silently produces an empty train loop and the
-    # downstream log_rollout_data hits KeyError on the empty buffer.
-    assert args.global_batch_size is not None and args.global_batch_size > 0, "global_batch_size must be positive."
-    assert rollout_samples >= args.global_batch_size and rollout_samples % args.global_batch_size == 0, (
-        f"rollout_batch_size * n_samples_per_prompt ({args.rollout_batch_size} * {args.n_samples_per_prompt} "
-        f"= {rollout_samples}) must be a positive multiple of global_batch_size ({args.global_batch_size})."
-    )
-
-
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -2494,7 +2466,15 @@ def slime_validate_args(args):
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
-    _resolve_global_batch_size(args)
+    if args.num_steps_per_rollout is not None:
+        global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
+        if args.global_batch_size is not None:
+            assert args.global_batch_size == global_batch_size, (
+                f"global_batch_size {args.global_batch_size} is not equal to "
+                f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
+                f"// num_steps_per_rollout {args.num_steps_per_rollout}"
+            )
+        args.global_batch_size = global_batch_size
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
