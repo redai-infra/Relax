@@ -61,6 +61,7 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
+        self.distributed_rollout_engines: list[ActorHandle] = []
 
     def connect_rollout_engines(
         self,
@@ -86,23 +87,22 @@ class UpdateWeightFromTensor:
                 engine_gpu_offsets.append(offset)
                 offset += c
 
-        # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
-        # Hybrid mode gives actor and rollout separate placement groups (see
-        # controller.py: actor_rollout_pgs is None when hybrid), so rollout
-        # engine_gpu_offsets are local to rollout's pg and start at 0. The
-        # numeric `gpu_offset < total_actor_gpus` check below would then
-        # mis-classify cross-node engines as colocated and route weights via
-        # CUDA IPC handles, which are not valid across nodes
-        # (cudaErrorMapBufferObjectFailed in _rebuild_cuda_tensor).
-        if self.args.hybrid:
-            colocate_engine_nums = 0
-        else:
-            total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
-            colocate_engine_nums = 0
-            for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
-                if gpu_offset + gpu_count > total_actor_gpus:
-                    break
-                colocate_engine_nums += 1
+        # Route via CUDA IPC only for engines on the same Ray node as the actor;
+        # cross-node IPC fails with cudaErrorMapBufferObjectFailed.
+        engine_node_ids = [
+            info.get("node_id", "")
+            for info in ray.get([engine.get_pid_and_node_id.remote() for engine in rollout_engines])
+        ]
+        local_actor_node_id = ray.get_runtime_context().get_node_id()
+        gathered_actor_node_ids: list[str | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_actor_node_ids, local_actor_node_id, group=get_gloo_group())
+        actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
+
+        colocate_engine_nums = 0
+        for engine_node_id in engine_node_ids:
+            if not engine_node_id or engine_node_id not in actor_node_id_set:
+                break
+            colocate_engine_nums += 1
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
@@ -160,15 +160,19 @@ class UpdateWeightFromTensor:
         """
         self.weight_version += 1
 
+        # Pause/flush must cover both IPC and distributed-broadcast engines,
+        # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
+        all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
+
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            ray.get([engine.pause_generation.remote() for engine in all_engines])
+            ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=all_engines,
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -205,9 +209,9 @@ class UpdateWeightFromTensor:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=all_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
