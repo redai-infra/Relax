@@ -57,6 +57,22 @@ class RoutingReplay:
             replay.clear_forward()
 
 
+def _align_top_indices(top_indices, scores_len):
+    """Slice or pad top_indices along dim-0 to match scores_len.
+
+    VLM bridge models with CP may use different sequence alignment than
+    fill_routing_replay, causing a padding mismatch.  The extra (or missing)
+    entries correspond to padding tokens that are zeroed out by the loss mask,
+    so truncating or zero-padding is safe.
+    """
+    if top_indices.shape[0] == scores_len:
+        return top_indices
+    if top_indices.shape[0] > scores_len:
+        return top_indices[:scores_len]
+    pad_rows = scores_len - top_indices.shape[0]
+    return torch.nn.functional.pad(top_indices, (0, 0, 0, pad_rows), value=0)
+
+
 def get_routing_replay_compute_topk(old_compute_topk):
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # ROUTING_REPLAY is None for routers that opt out of replay (e.g. MTP),
@@ -70,14 +86,16 @@ def get_routing_replay_compute_topk(old_compute_topk):
                 ROUTING_REPLAY.record(top_indices)
             elif routing_replay_stage == "replay_forward":
                 top_indices = ROUTING_REPLAY.pop_forward()
-                assert top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk, (
-                    f"[{torch.distributed.get_rank()}] top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
+                top_indices = _align_top_indices(top_indices, scores.shape[0])
+                assert top_indices.shape[1] == topk, (
+                    f"[{torch.distributed.get_rank()}] top_indices topk {top_indices.shape[1]} does not match expected topk {topk}"
                 )
                 probs = scores.gather(1, top_indices)
             elif routing_replay_stage == "replay_backward":
                 top_indices = ROUTING_REPLAY.pop_backward()
-                assert top_indices.shape[0] == scores.shape[0] and top_indices.shape[1] == topk, (
-                    f"top_indices shape {top_indices.shape} does not match scores shape {scores.shape} and topk {topk}"
+                top_indices = _align_top_indices(top_indices, scores.shape[0])
+                assert top_indices.shape[1] == topk, (
+                    f"top_indices topk {top_indices.shape[1]} does not match expected topk {topk}"
                 )
                 probs = scores.gather(1, top_indices)
             return probs, top_indices
