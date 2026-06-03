@@ -39,6 +39,7 @@ RUN pip config set global.index-url ${PIP_INDEX_URL} && \
     pip install -v -e .[all_npu] && \
     git clone https://github.com/sgl-project/sgl-kernel-npu.git /root/sgl-kernel-npu && \
     cd /root/sgl-kernel-npu && \
+    git checkout 2026.04.15.rc4 && \
     bash build.sh && \
     pip install output/*.whl && \
     cd /root/Relax && pip install -r requirements.txt && pip install -e .
