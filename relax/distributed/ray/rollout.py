@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import numpy as np
 import ray
-from relax.utils.utils import get_ray_accelerator_kwargs
 import transfer_queue as tq
 import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -47,6 +46,7 @@ from relax.utils.training.train_dump_utils import (
     save_rollout_result_jsonl,
 )
 from relax.utils.types import Sample
+from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
@@ -480,7 +480,7 @@ class EngineGroup:
                 runtime_env={
                     "env_vars": env_vars,
                 },
-                **accelerator_kwargs
+                **accelerator_kwargs,
             ).remote(
                 self.args,
                 rank=global_rank,
@@ -1631,7 +1631,7 @@ class RolloutManager(ReloadableMixin):
                             placement_group=pg,
                             placement_group_bundle_index=i,
                         ),
-                        **accelerator_kwargs
+                        **accelerator_kwargs,
                     ).remote()
                 )
             gpu_ids = await asyncio.gather(*[actor.get_ip_and_gpu_id.remote() for actor in info_actors])
@@ -1747,10 +1747,7 @@ class RolloutManager(ReloadableMixin):
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
                 RolloutRayActor = ray.remote(SGLangEngine)
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
-                engine = RolloutRayActor.options(
-                    num_cpus=0.2,
-                    **accelerator_kwargs
-                ).remote(
+                engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
                     self.args,
                     rank=total_engines + i,
                     worker_type="regular",

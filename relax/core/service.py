@@ -311,7 +311,7 @@ def create_placement_group(num_gpus):
                     placement_group=pg,
                     placement_group_bundle_index=i,
                 ),
-                **accelerator_kwargs
+                **accelerator_kwargs,
             ).remote()
         )
     gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])

@@ -2,8 +2,9 @@
 
 import logging
 
+
 try:
-    import mindspeed.megatron_adaptor # noqa
+    import mindspeed.megatron_adaptor  # noqa
 except ImportError:
     pass
 
