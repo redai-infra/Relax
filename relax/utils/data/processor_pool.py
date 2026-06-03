@@ -28,7 +28,12 @@ import torch
 import torch.multiprocessing as mp
 from PIL import Image
 
-from relax.utils.data.processing_utils import load_processor
+from relax.utils.data.processing_utils import (
+    adapt_processor_kwargs,
+    expand_kimi_k25_placeholders,
+    load_processor,
+    remap_mm_train_inputs,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -102,9 +107,16 @@ def process_sample_in_worker(
         # Videos arrive as shared-memory torch.Tensors — usable directly by the processor.
         # Audio arrives as numpy arrays — usable directly by the processor.
 
-        processor_output = _worker_processor(text=text, **restored, **processor_kwargs)
+        # Translate to the processor's native call shape (no-op for Qwen-VL etc.;
+        # rewrites images→medias and drops conflicting return_tensors for Kimi K2.x).
+        adapted = adapt_processor_kwargs(_worker_processor, restored, processor_kwargs)
+        processor_output = _worker_processor(text=text, **adapted)
 
         prompt_ids = processor_output["input_ids"][0]
+        # K2.x adapt_processor_kwargs forces return_tensors="pt", so
+        # input_ids is a 1D Tensor; downstream sample.tokens contract is list[int].
+        if isinstance(prompt_ids, torch.Tensor):
+            prompt_ids = prompt_ids.tolist()
 
         mm_train_inputs = {}
         for k, v in processor_output.items():
@@ -117,7 +129,9 @@ def process_sample_in_worker(
                 # contiguous() is required: share_memory_() does not support non-contiguous storage.
                 mm_train_inputs[k] = v.contiguous().share_memory_()
 
-        return prompt_ids, mm_train_inputs or None
+        train_inputs = remap_mm_train_inputs(_worker_processor, mm_train_inputs or None)
+        prompt_ids = expand_kimi_k25_placeholders(_worker_processor, prompt_ids, train_inputs)
+        return prompt_ids, train_inputs
 
     except Exception as e:
         import traceback

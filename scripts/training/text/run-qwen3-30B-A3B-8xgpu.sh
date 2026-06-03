@@ -33,6 +33,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-30B-A3B
    --ref-load ${MODEL_DIR}/Qwen3-30B-A3B
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 
    --load ${EXP_DIR}/Qwen3-30B-A3B-mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3-30B-A3B-mcore_8xgpu/

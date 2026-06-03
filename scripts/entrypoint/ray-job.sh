@@ -54,8 +54,24 @@ echo "=== Cleaning up residual python/sglang processes ==="
 ray serve shutdown -y
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 
+# ── reserve sglang port range from kernel ephemeral pool ────────────────────
+# Some worker nodes ship with net.ipv4.ip_local_port_range="10000 65500", which
+# includes sglang's well-known port range (15670-15900). Megatron's 294 process
+# groups grab ephemeral ports for NCCL/Gloo bootstrap; on those nodes a PG can
+# land on a port sglang wants and crash the engine with
+# "scheduler_input_port at 15855 is not available in 120 seconds. holder=ray::MegatronTrainRayActor".
+# Reserve sglang's range so the kernel never picks it for ephemeral.
+echo "=== Reserving sglang port ranges on all GPU nodes ==="
+# Reserve two ranges:
+#   15000-16800 — sglang port range. SGLang's dp-attention schedulers use ports
+#                 starting from ~15100 (base_port + offsets for DP/TP ranks), so
+#                 the range must start well below 15400 to cover all scheduler
+#                 input/output/NCCL bootstrap ports.
+#   30000-30300 — secondary safe zone (fallback if sglang port_base needs adjustment)
+python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-16800,30000-30300" || echo "reserve_ports failed (non-fatal)"
+
 # kill old tasks
-ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K[^']+" | xargs ray job stop || true
+ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K[^']+" | xargs --no-run-if-empty ray job stop || true
 
 set -x
 
@@ -102,7 +118,9 @@ RAY_DEBUG_POST_MORTEM=${RAY_DEBUG_POST_MORTEM:-"0"}
 
 # Runtime env for ray-job mode (env inherited from Ray cluster)
 NVSHMEM_LIB_PATH="${NVSHMEM_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
-CURRENT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NVSHMEM_LIB_PATH}"
+# torch lib path is required for fake_int4_quant_cuda.so to find libc10.so / libtorch.so
+TORCH_LIB_PATH="${TORCH_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/torch/lib}"
+CURRENT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NVSHMEM_LIB_PATH}:${TORCH_LIB_PATH}"
 
 export RUNTIME_ENV_JSON="{
 \"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",

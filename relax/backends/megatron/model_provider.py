@@ -3,15 +3,16 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import json
 import os
 import pickle
 import re
 from contextlib import nullcontext
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
-from megatron.core import tensor_parallel
+from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -28,6 +29,50 @@ from relax.utils.misc import load_function
 
 
 logger = get_logger(__name__)
+
+
+def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, dict):
+        return {str(k): _make_json_safe(v, seen) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_make_json_safe(v, seen) for v in value]
+
+    obj_id = id(value)
+    if obj_id in seen:
+        return str(value)
+
+    if hasattr(value, "__dict__"):
+        seen.add(obj_id)
+        try:
+            return {str(k): _make_json_safe(v, seen) for k, v in vars(value).items()}
+        finally:
+            seen.remove(obj_id)
+
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _dump_provider_config(provider: Any, save_path: str) -> None:
+    os.makedirs(save_path, exist_ok=True)
+
+    pkl_path = os.path.join(save_path, "transformer_config.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(provider, f)
+    logger.info(f"Provider config saved to {pkl_path}")
+
+    json_path = os.path.join(save_path, "transformer_config.json")
+    with open(json_path, "w") as f:
+        json.dump(_make_json_safe(provider), f, indent=2, ensure_ascii=False)
+    logger.info(f"Provider config saved to {json_path}")
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -202,6 +247,7 @@ def get_model_provider_func(
             "tensor_model_parallel_size",
             "sequence_parallel",
             "pipeline_model_parallel_size",
+            "virtual_pipeline_model_parallel_size",
             "context_parallel_size",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
@@ -228,10 +274,32 @@ def get_model_provider_func(
             "freeze_vision_projection",
             # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
+            "vision_dp_when_cp",
             "calculate_per_token_loss",
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
             "moe_layer_freq",
+            # Kimi K2 / MLA / MoE override surface — required because published K2 configs
+            # declare DeepseekV3ForCausalLM and route through DeepSeekV3Bridge, which has
+            # different defaults than what slime's K2 launch scripts assume.
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_head_dim",
+            "qk_pos_emb_head_dim",
+            "v_head_dim",
+            "rotary_scaling_factor",
+            "rotary_base",
+            "moe_router_pre_softmax",
+            "moe_router_enable_expert_bias",
+            "moe_permute_fusion",
+            "moe_grouped_gemm",
+            "moe_shared_expert_intermediate_size",
+            "moe_router_topk",
+            "moe_router_num_groups",
+            "moe_router_group_topk",
+            "moe_router_topk_scaling_factor",
+            "moe_router_score_function",
+            "moe_ffn_hidden_size",
         ]
 
         args_dict = vars(args)
@@ -268,11 +336,7 @@ def get_model_provider_func(
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_path = getattr(args, "save", None) or "/tmp/relax"
-            os.makedirs(save_path, exist_ok=True)
-            pkl_path = os.path.join(save_path, "transformer_config.pkl")
-            with open(pkl_path, "wb") as f:
-                pickle.dump(provider, f)
-            logger.info(f"Provider config saved to {pkl_path}")
+            _dump_provider_config(provider, save_path)
 
         original_provide = provider.provide
 
@@ -398,8 +462,14 @@ def get_model_provider_func(
 
 def wrap_model_provider_with_freeze(original_provider, args):
     def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
+        if vp_stage is None and mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
+            vp_stage = mpu.get_virtual_pipeline_model_parallel_rank()
+
         sig = inspect.signature(original_provider)
-        if "vp_stage" in sig.parameters:
+        accepts_vp_stage = "vp_stage" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if accepts_vp_stage:
             model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
         else:
             model = original_provider(pre_process=pre_process, post_process=post_process)

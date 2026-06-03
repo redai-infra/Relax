@@ -173,7 +173,7 @@ Content-Type: application/json
   // external 模式参数
   "external_engine_addrs": [   // 外部引擎地址列表
     "192.168.1.100:8000",
-    "192.168.1.101:8000"
+    "198.51.100.101:8000"
   ],
   
   // 通用参数
@@ -256,7 +256,7 @@ GET /rollout/engines
   "engines": [
     {
       "engine_id": "engine_0",
-      "url": "http://192.168.1.10:8000",
+      "url": "http://198.51.100.10:8000",
       "status": "ACTIVE",
       "weight_version": "42",
       "is_healthy": true,
@@ -264,7 +264,7 @@ GET /rollout/engines
     }
   ],
   "router_info": {
-    "ip": "192.168.1.1",
+    "ip": "198.51.100.1",
     "port": 30000,
     "policy": "cache_aware"
   }
@@ -709,7 +709,7 @@ Content-Type: application/json
     },
     {
       "engine_id": "engine_2",
-      "url": "http://192.168.1.101:8000",
+      "url": "http://198.51.100.101:8000",
       "engine_group_index": 1,
       "source": "external",
       "is_scaled_out": true,

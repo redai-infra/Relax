@@ -12,5 +12,6 @@ def quantize_params(args, megatron_name, converted_named_params, quantization_co
     elif quantization_config["quant_method"] == "fp8":
         return quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config)
     elif quantization_config["quant_method"] == "compressed-tensors":
-        # only int4 at the moment.
         return quantize_params_compressed_tensors(converted_named_params, quantization_config)
+    else:
+        raise ValueError(f"Unsupported quantization method: {quantization_config['quant_method']!r}")

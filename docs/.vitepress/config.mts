@@ -259,6 +259,7 @@ export default defineConfig({
               text: 'Advanced',
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
+                { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
@@ -304,7 +305,8 @@ export default defineConfig({
               items: [
                 { text: 'DeepEyes', link: '/en/examples/deepeyes' },
                 { text: 'On-Policy Distillation', link: '/en/examples/on-policy-distillation' },
-                { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' }
+                { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
+                { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' }
               ]
             }
           ]
@@ -358,6 +360,7 @@ export default defineConfig({
               text: '进阶指南',
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
+                { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
@@ -403,7 +406,8 @@ export default defineConfig({
               items: [
                 { text: 'DeepEyes', link: '/zh/examples/deepeyes' },
                 { text: '在线策略蒸馏', link: '/zh/examples/on-policy-distillation' },
-                { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' }
+                { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
+                { text: '低精度训练', link: '/zh/examples/low-precision-training' }
               ]
             }
           ]

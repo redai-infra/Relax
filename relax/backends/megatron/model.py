@@ -600,11 +600,10 @@ def train(
     config = get_model_config(model[0])
     config.grad_scale_func = optimizer.scale_loss
     config.timers = None
-    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
-            "a custom no_sync_func is not supported when overlapping grad-reduce"
-        )
+    # train() is invoked once per rollout in Relax (vs. once per run upstream),
+    # so guard the sync-func setup to be idempotent — re-assigning would trip
+    # Megatron's "no_sync_func must be None" assert on rollout 1+.
+    if isinstance(model[0], DDP) and args.overlap_grad_reduce and config.no_sync_func is None:
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
@@ -612,14 +611,13 @@ def train(
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
+    if args.overlap_param_gather and args.align_param_gather and config.param_sync_func is None:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
     pre_hook_enabled = False
-
     if args.reset_optimizer_states:
         if (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -759,9 +757,13 @@ def train(
                     rel_tol=0.01,
                     abs_tol=0.01,
                 ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
+
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
-        disable_forward_pre_hook(model)
+        # NOTE(wuhuan): Sync the latest distributed-optimizer parameters before exporting weights
+        # to rollout engines. this is important for --overlap-grad-reduce --overlap-param-gather
+        disable_forward_pre_hook(model, param_sync=True)
+        enable_forward_pre_hook(model)
 
 
 def save(

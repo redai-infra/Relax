@@ -144,3 +144,18 @@
 - **Why:** sync 模式 batch size 稳定，CUDA graph 能省每步 launch overhead 5-15%
 - **Fix:** 参考 async 脚本：`--sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)`
 - **Skip when:** rollout batch 高度动态、或 SGLang 版本 graph 有 bug
+
+### R-P13 — `--balance-data` 使用与模式约束
+- **Category:** performance (DP 负载均衡)
+- **Severity:** critical（纯 fully-async 误开）/ warn（sync/hybrid 漏开）
+- **Trigger:** 满足任一：
+  - **(critical)** 出现 `--fully-async` 且**没有** `--hybrid`，但 ARGS 里还有 `--balance-data` —— Relax 启动校验会直接 `ValueError` 退出（见 `relax/utils/arguments.py:2369`）
+  - **(warn)** `--colocate` 或 `--hybrid` 模式 + 数据是变长（开了 `--use-dynamic-batch-size` 或 `--rollout-max-response-len >= 4096`）+ DP（= world_size / TP / PP / CP）> 1，但**没**带 `--balance-data`
+- **Why:**
+  - `--balance-data` 用 SeqlenBalancedSampler（Karmarkar-Karp）按 token 数把 sample 均摊到各 DP rank，消掉 straggler，变长序列大 DP 场景下省 10~30% step 时间
+  - **纯 fully-async 模式下 actor 通过 StreamDataLoader 消费 rollout 流，和静态 balance 语义不兼容**，框架直接 raise（错误信息：`--balance-data is not supported in pure fully-async mode`）；想用 balance 必须切到 `--hybrid`
+  - 同 prompt 的不同 response 可能被分到不同 step，对纯算法精度影响通常可忽略，但对依赖"同 prompt 同 step"的算法（如某些 group-norm advantage）需要确认
+- **Fix:**
+  - 纯 fully-async：从 ARGS 里**删掉** `--balance-data`，或同时加 `--hybrid` 切到混合模式
+  - sync / hybrid 变长场景：加 `--balance-data`
+- **Skip when:** 数据定长（多选题 / 固定长度 eval）；DP=1；算法依赖 "同 prompt response 必须在同一 train step"；脚本注释里明确说明在做 baseline 对照实验

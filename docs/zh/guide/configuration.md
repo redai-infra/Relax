@@ -248,7 +248,19 @@
 | `--optimizer-cpu-offload` | flag | - | 启用 CPU offload 优化器状态（Megatron 原生参数） |
 | `--overlap-cpu-optimizer-d2h-h2d` | flag | - | 重叠 CPU 优化器 D2H/H2D 通信（Megatron 原生参数） |
 | `--use-precision-aware-optimizer` | flag | - | 使用精度感知优化器（Megatron 原生参数） |
+| `--use-distributed-optimizer` | flag | - | ZeRO-1 风格分片优化器状态（Megatron 原生参数） |
+| `--overlap-grad-reduce` | flag | - | 反向计算与 grad reduce-scatter 重叠（Megatron 原生参数） |
+| `--overlap-param-gather` | flag | - | reduce-scatter 与下一步 param all-gather 重叠，强制配合 `--overlap-grad-reduce`（Megatron 原生参数） |
 | `--calculate-per-token-loss` | flag | False | 按 Token 计算损失（Megatron 原生参数） |
+
+### 优化器 Flag 兼容性
+
+| 场景 | `--use-distributed-optimizer` | `--overlap-grad-reduce` / `--overlap-param-gather` |
+|---|---|---|
+| 纯文本 Dense | ✅ | ✅ |
+| Dense VL，CP = 1 | ✅ | ✅ |
+| Dense VL，CP > 1 | ✅ | ❌ |
+| MoE | ✅ | ❌ |
 
 ---
 

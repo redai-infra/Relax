@@ -6,7 +6,6 @@ All tests call **real** project functions or construct **real** Bridge mapping
 objects — no hand-written logic duplication.
 
 Covers:
-- ``_collect_all_mappings``: recursive mapping discovery with real Bridge mappings
 - Real Bridge mapping ``megatron_to_hf`` output + post-processing correctness
 - ``strip_param_name_prefix``, ``remove_padding``, ``quantize_params``
 """
@@ -25,23 +24,23 @@ import torch
 # and the DeviceDirectBackend, which imports ``megatron.core`` at module level.
 pytest.importorskip("megatron.core")
 pytest.importorskip("megatron.bridge")
+pytest.importorskip("megatron.bridge.models.conversion.param_mapping")
 
 # Real Bridge mapping classes. The model-specific ExpertMLP*ProjMapping
 # classes were unified into the generic Fused{,Gated}ExpertMapping classes
 # in megatron-bridge. We alias the new names to the old test-local names so
 # the rest of this file keeps reading naturally; the Qwen3-VL / Qwen3.5
 # variants now resolve to the *same* class object.
-from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
-    AutoMapping,
-    GatedMLPMapping,
-    MegatronParamMapping,
-    ReplicatedMapping,
-)
 from megatron.bridge.models.conversion.param_mapping import (
     FusedExpertMapping as ExpertMLPDownProjMapping,
 )
 from megatron.bridge.models.conversion.param_mapping import (
     FusedGatedExpertMapping as ExpertMLPGateUpProjMapping,
+)
+from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
+    GatedMLPMapping,
+    MegatronParamMapping,
+    ReplicatedMapping,
 )
 
 
@@ -50,7 +49,6 @@ Qwen35ExpertMLPGateUpProjMapping = ExpertMLPGateUpProjMapping
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix  # noqa: E402
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding  # noqa: E402
-from relax.distributed.checkpoint_service.backends.device_direct import DeviceDirectBackend  # noqa: E402
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -194,99 +192,6 @@ def _apply_expert_postprocessing(
                 postprocessed.append((hf_name, tensor))
         converted_named_tensors = postprocessed
     return converted_named_tensors
-
-
-# ─── Tests for _collect_all_mappings with REAL Bridge mappings ────────────────
-
-
-class TestCollectAllMappings:
-    """Test ``DeviceDirectBackend._collect_all_mappings`` with real Bridge
-    mapping objects."""
-
-    def test_replicated_mapping_single(self):
-        """A single ReplicatedMapping returns just itself."""
-        m = ReplicatedMapping("decoder.layers.0.weight", "model.layers.0.weight")
-        result = DeviceDirectBackend._collect_all_mappings(m)
-        assert len(result) == 1
-        assert result[0] is m
-        assert isinstance(result[0], MegatronParamMapping)
-
-    def test_gated_mlp_mapping_single(self):
-        """GatedMLPMapping has no sub-mappings, returns just itself."""
-        m = GatedMLPMapping(
-            "decoder.layers.0.mlp.linear_fc1.weight",
-            gate="model.layers.0.mlp.gate_proj.weight",
-            up="model.layers.0.mlp.up_proj.weight",
-        )
-        result = DeviceDirectBackend._collect_all_mappings(m)
-        assert len(result) == 1
-        assert isinstance(result[0], GatedMLPMapping)
-
-    def test_auto_mapping_with_initialized_inner(self):
-        """AutoMapping with eagerly initialized inner delegate collects
-        both."""
-        m = AutoMapping(
-            "decoder.layers.0.self_attention.linear_proj.weight",
-            "model.layers.0.self_attn.o_proj.weight",
-        )
-        m._detected_type = "replicated"
-        m._mapping = m._get_or_create_mapping("replicated")
-
-        result = DeviceDirectBackend._collect_all_mappings(m)
-        assert len(result) == 2
-        types = {type(r).__name__ for r in result}
-        assert types == {"AutoMapping", "ReplicatedMapping"}
-
-    def test_expert_gate_up_mapping_discovers_gated_inner(self):
-        """ExpertMLPGateUpProjMapping has a _gated_mapping sub-mapping."""
-        m = _make_expert_gate_up_mapping(layer_idx=0, expert_id=3)
-        result = DeviceDirectBackend._collect_all_mappings(m)
-        assert len(result) == 2
-        # The recursive walk must discover the outer fused-gated-expert mapping
-        # plus its inner GatedMLPMapping. The inner is a private subclass in
-        # current megatron-bridge (``_LooseGatedMLPMapping``), so assert by
-        # ``isinstance`` rather than name equality to stay resilient to
-        # bridge-internal renames.
-        outer = [r for r in result if isinstance(r, ExpertMLPGateUpProjMapping)]
-        inner = [r for r in result if not isinstance(r, ExpertMLPGateUpProjMapping)]
-        assert len(outer) == 1
-        assert len(inner) == 1
-        assert isinstance(inner[0], GatedMLPMapping)
-
-    def test_expert_down_mapping_discovers_replicated_inner(self):
-        """ExpertMLPDownProjMapping (AutoMapping subclass) with initialized
-        inner."""
-        m = _make_expert_down_mapping(layer_idx=0, expert_id=3)
-        result = DeviceDirectBackend._collect_all_mappings(m)
-        assert len(result) == 2
-        types = {type(r).__name__ for r in result}
-        assert types == {"FusedExpertMapping", "ReplicatedMapping"}
-
-    def test_no_duplicate_on_shared_reference(self):
-        """If two attributes point to the same mapping object, it's collected
-        once."""
-        inner = ReplicatedMapping("decoder.layers.0.weight", "model.layers.0.weight")
-        outer = AutoMapping("decoder.layers.0.weight2", "model.layers.0.weight2")
-        outer._detected_type = "replicated"
-        outer._mapping = inner
-        # Manually add another reference to the same object
-        outer._tp_mapping = inner
-
-        result = DeviceDirectBackend._collect_all_mappings(outer)
-        # outer + inner (deduplicated even though referenced twice)
-        assert len(result) == 2
-
-    def test_process_groups_are_none_in_test_env(self):
-        """Verify that real mappings have None process groups (mpu not
-        initialized)."""
-        m = ReplicatedMapping("decoder.layers.0.weight", "model.layers.0.weight")
-        assert m.pp_group is None
-        assert m._tp_group is None
-        assert m._etp_group is None
-        assert m.ep_group is None
-        assert m.pp_size == 1
-        assert m.tp_size == 1
-        assert m.ep_size == 1
 
 
 # ─── Tests for real Bridge mapping megatron_to_hf output ──────────────────────
@@ -525,76 +430,6 @@ class TestBridgePostProcessingCorrectness:
         assert postprocessed[1][0] == "model.layers.0.mlp.up_proj.weight"
         assert torch.equal(postprocessed[0][1], gate_expected)
         assert torch.equal(postprocessed[1][1], up_expected)
-
-
-# ─── Tests for process group patching with real mappings ──────────────────────
-
-
-class TestProcessGroupPatching:
-    """Test process group save/restore with real Bridge mapping objects."""
-
-    def test_groups_patched_and_restored_on_real_mappings(self):
-        """Process groups are set to None and restored on real mapping
-        objects."""
-        m = _make_expert_gate_up_mapping(layer_idx=0, expert_id=0)
-        all_mappings = DeviceDirectBackend._collect_all_mappings(m)
-        assert len(all_mappings) == 2  # ExpertMLPGateUpProjMapping + GatedMLPMapping
-
-        # Save originals (all None in test env, but the mechanism is what matters)
-        saved_groups = []
-        for mapping in all_mappings:
-            saved_groups.append((mapping.pp_group, mapping._tp_group, mapping._etp_group, mapping.ep_group))
-
-        # Patch
-        for mapping in all_mappings:
-            mapping.pp_group = None
-            mapping._tp_group = None
-            mapping._etp_group = None
-            mapping.ep_group = None
-
-        # Verify patched
-        for mapping in all_mappings:
-            assert mapping.pp_size == 1
-            assert mapping.tp_size == 1
-            assert mapping.ep_size == 1
-
-        # Restore
-        for mapping, (pp, tp, etp, ep) in zip(all_mappings, saved_groups):
-            mapping.pp_group = pp
-            mapping._tp_group = tp
-            mapping._etp_group = etp
-            mapping.ep_group = ep
-
-        # Verify restored
-        for mapping, (pp, tp, etp, ep) in zip(all_mappings, saved_groups):
-            assert mapping.pp_group == pp
-            assert mapping._tp_group == tp
-            assert mapping._etp_group == etp
-            assert mapping.ep_group == ep
-
-    def test_gather_from_ep_ranks_monkey_patch_lifecycle(self):
-        """gather_from_ep_ranks is monkey-patched and cleanly removed on real
-        classes."""
-        m = _make_expert_gate_up_mapping(layer_idx=0, expert_id=0)
-        all_mappings = DeviceDirectBackend._collect_all_mappings(m)
-
-        # Verify gather_from_ep_ranks is NOT in any subclass __dict__ initially
-        for mapping in all_mappings:
-            assert "gather_from_ep_ranks" not in type(mapping).__dict__
-
-        with _patch_gather_from_ep_ranks():
-            # During patch: method is in class __dict__
-            for mapping in all_mappings:
-                cls = type(mapping)
-                # At least one of the patched classes should match
-                if cls in {ExpertMLPGateUpProjMapping, GatedMLPMapping}:
-                    assert "gather_from_ep_ranks" in cls.__dict__
-
-        # After cleanup: method removed from class __dict__, inherited version restored
-        for mapping in all_mappings:
-            assert "gather_from_ep_ranks" not in type(mapping).__dict__
-            # But the inherited method still exists via MRO
-            assert hasattr(mapping, "gather_from_ep_ranks")
 
 
 # ─── Tests for strip_param_name_prefix (real function) ────────────────────────

@@ -166,20 +166,34 @@ async def _run_image_processor(
             processor_kwargs,
         )
     else:
+        from relax.utils.data.processing_utils import (
+            adapt_processor_kwargs,
+            expand_kimi_k25_placeholders,
+            remap_mm_train_inputs,
+        )
 
         def _run_processor():
-            processor_output = state.processor(
-                text=prompt,
-                use_audio_in_video=args.use_audio_in_video,
-                return_mm_token_type_ids=False,
-                **multimodal_inputs,
+            adapted = adapt_processor_kwargs(
+                state.processor,
+                multimodal_inputs,
+                {
+                    "use_audio_in_video": args.use_audio_in_video,
+                    "return_mm_token_type_ids": False,
+                },
             )
+            processor_output = state.processor(text=prompt, **adapted)
             prompt_ids = processor_output["input_ids"][0]
+            # K2.x adapt_processor_kwargs forces return_tensors="pt", so
+            # input_ids is a 1D Tensor; downstream sample.tokens contract is list[int].
+            if isinstance(prompt_ids, torch.Tensor):
+                prompt_ids = prompt_ids.tolist()
             train_inputs = {
                 k: (torch.from_numpy(v) if isinstance(v, np.ndarray) else v)
                 for k, v in processor_output.items()
                 if k not in ["input_ids", "attention_mask"]
             } or None
+            train_inputs = remap_mm_train_inputs(state.processor, train_inputs)
+            prompt_ids = expand_kimi_k25_placeholders(state.processor, prompt_ids, train_inputs)
             return prompt_ids, train_inputs
 
         processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(_ENCODE_EXECUTOR, _run_processor)
@@ -237,7 +251,15 @@ async def generate(
     tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
     _t_image_processor: float | None = None
-    if state.processor:
+    # K2.x ships a multimodal AutoProcessor even for text-only fine-tunes; the
+    # data loader always populates multimodal_inputs with empty-list placeholders
+    # in that case, so check for actual media content before routing through the
+    # image processor (which would otherwise raise on text-only K2.x) — and use
+    # the same gate downstream so SGLang's payload doesn't get empty media fields.
+    _has_media = sample.multimodal_inputs is not None and any(
+        sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
+    )
+    if state.processor and _has_media:
         processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
             state, args, sample.prompt, sample.multimodal_inputs
         )
@@ -264,7 +286,7 @@ async def generate(
         payload["return_routed_experts"] = True
 
     _t_mm_encode: float | None = None
-    if sample.multimodal_inputs:
+    if _has_media:
         # Use pre-encoded data from group-level de-dup if available; otherwise encode inline.
         pre_encoded = getattr(sample, "_pre_encoded_mm", None)
         if pre_encoded is not None:
@@ -330,6 +352,23 @@ async def generate(
             logger.warning(
                 "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
             )
+
+        # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
+        # for vision input slots. A hallucinated <|media_pad|> in the response
+        # inflates num_placeholders past sum(feature_lengths) in the bridge,
+        # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
+        # so positional accounting matches sglang's per-token logprobs.
+        if state.processor is not None:
+            from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
+
+            sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
+            if sanitized is not new_response_tokens:
+                replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
+                if replaced:
+                    logger.warning(
+                        f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
+                    )
+                new_response_tokens = sanitized
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
@@ -800,10 +839,6 @@ async def generate_rollout_async(
             f"Total yielded: {total_transfer_samples - num_old_samples}/{target_data_size - num_old_samples} for step: {rollout_id}"
         )
 
-    if not args.fully_async:
-        state.prefetched_samples_ref = data_source.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
-        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
-
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
@@ -1033,5 +1068,10 @@ def generate_rollout(
         return output
 
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
-    data_buffer.add_samples.remote(aborted_samples)
+    if aborted_samples:
+        ray.get(data_buffer.add_samples.remote(aborted_samples))
+    if not args.fully_async:
+        state = GenerateState(args)
+        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
+        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
     return output

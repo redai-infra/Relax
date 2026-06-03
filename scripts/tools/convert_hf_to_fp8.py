@@ -1,0 +1,296 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Convert HF safetensors checkpoints to FP8 (block / channel / tensor
+strategies).
+
+Shards are quantized in parallel via a thread pool. The output ``config.json``
+gets a ``quantization_config`` block written in either the fp8/e4m3 layout
+(block/tensor) or the compressed-tensors layout (channel). Non-quantizable
+modules (layernorm, embed, router, lm_head, …) are passed through and recorded
+in ``modules_to_not_convert`` / ``ignore`` so downstream loaders skip them.
+"""
+
+import argparse
+import gc
+import json
+import os
+import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import safetensors
+import safetensors.torch
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
+
+FP8_INFO = torch.finfo(torch.float8_e4m3fn)
+FP8_MAX, FP8_MIN = FP8_INFO.max, FP8_INFO.min
+
+
+def ceildiv(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def block_fp8(weight: torch.Tensor, block_size: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    block_n, block_k = block_size[0], block_size[1]
+
+    shape_0, shape_1 = weight.shape
+
+    n_tiles = ceildiv(shape_0, block_n)
+    k_tiles = ceildiv(shape_1, block_k)
+
+    q_weight = F.pad(
+        weight,
+        (0, k_tiles * block_k - shape_1, 0, n_tiles * block_n - shape_0),
+        mode="constant",
+        value=0.0,
+    )
+
+    qweight = q_weight.reshape(n_tiles, block_n, k_tiles, block_k)
+    block_max = torch.max(torch.abs(qweight), dim=1, keepdim=True)[0]
+    block_max = torch.max(block_max, dim=3, keepdim=True)[0]
+
+    scale = block_max.to(torch.float32) / FP8_MAX
+    qweight = (
+        (qweight / scale)
+        .clamp(min=FP8_MIN, max=FP8_MAX)
+        .reshape((n_tiles * block_n, k_tiles * block_k))
+        .to(torch.float8_e4m3fn)
+    )
+    qweight = qweight[:shape_0, :shape_1].clone().detach()
+    scale = scale.reshape(n_tiles, k_tiles)
+
+    return qweight, scale
+
+
+def channel_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    channel_max = torch.max(weight.abs(), dim=-1, keepdim=True)[0]
+    scale = channel_max.clamp(min=1e-12).to(torch.float32) / FP8_MAX
+    qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX)
+    qweight = qweight.to(torch.float8_e4m3fn)
+    return qweight, scale
+
+
+def tensor_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = weight.abs().max().clamp(min=1e-12).to(torch.float32) / FP8_MAX
+    qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX)
+    qweight = qweight.to(torch.float8_e4m3fn)
+    scale = scale.view(1)
+    return qweight, scale
+
+
+def quant_fp8(
+    weight: torch.Tensor,
+    strategy: str,
+    block_size: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if strategy == "tensor":
+        return tensor_fp8(weight)
+    elif strategy == "channel":
+        return channel_fp8(weight)
+    else:
+        return block_fp8(weight, block_size)
+
+
+class ConversionResult:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.weight_map: dict[str, str] = {}
+        self.param_count: int = 0
+        self.modules_to_not_convert: list[str] = []
+
+    def add_result(
+        self,
+        filename: str,
+        q_weights: dict[str, torch.Tensor],
+        module_names: list[str],
+    ) -> None:
+        with self.lock:
+            for k, v in q_weights.items():
+                self.weight_map[k] = filename
+                self.param_count += len(v)
+            self.modules_to_not_convert.extend(module_names)
+
+
+def _process_file(
+    input_path: str,
+    output_path: str,
+    filename: str,
+    strategy: str,
+    block_size: list[int] | None,
+    result_collector: ConversionResult,
+) -> None:
+    if not filename.endswith(".safetensors"):
+        return
+
+    logger.info(f"Processing {filename}, memory usage: {torch.cuda.memory_allocated()}")
+    weights: dict[str, torch.Tensor] = {}
+    q_weights: dict[str, torch.Tensor] = {}
+
+    with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device="cuda") as f:
+        for k in f.keys():
+            weights[k] = f.get_tensor(k)
+
+    modules_to_not_convert: list[str] = []
+    for key in weights.keys():
+        if (
+            "weight" in key
+            and "layernorm" not in key
+            and "embed" not in key
+            and "router" not in key
+            and "mlp.gate." not in key
+            and "norm" not in key
+            and "lm_head" not in key
+            and "eh_proj" not in key
+            and "weights_proj" not in key
+            and "conv1d" not in key
+            and "A_log" not in key
+            and "dt_bias" not in key
+            and "in_proj_a" not in key
+            and "in_proj_b" not in key
+        ):
+            qw, s = quant_fp8(weights[key], strategy, block_size)
+            q_weights[key] = qw
+            if block_size:
+                scale_name = key.replace(".weight", ".weight_scale_inv")
+            else:
+                scale_name = key.replace(".weight", ".weight_scale")
+            q_weights[scale_name] = s
+        else:
+            modules_to_not_convert.append(key.replace(".weight", ""))
+            q_weights[key] = weights[key]
+
+    safetensors.torch.save_file(q_weights, os.path.join(output_path, filename), metadata={"format": "pt"})
+
+    result_collector.add_result(filename, q_weights, modules_to_not_convert)
+
+
+def convert_fp8(
+    input_path: str,
+    output_path: str,
+    strategy: str,
+    block_size: list[int] | None = None,
+    max_workers: int = 4,
+    scale_fmt: str | None = None,
+) -> None:
+    input_path = os.path.abspath(input_path)
+    os.makedirs(output_path, exist_ok=True)
+
+    for filename in os.listdir(input_path):
+        if not filename.endswith(".safetensors") and not os.path.isdir(os.path.join(input_path, filename)):
+            shutil.copyfile(os.path.join(input_path, filename), os.path.join(output_path, filename))
+
+    safetensors_files = [f for f in os.listdir(input_path) if f.endswith(".safetensors")]
+
+    result_collector = ConversionResult()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for filename in safetensors_files:
+            future = executor.submit(
+                _process_file, input_path, output_path, filename, strategy, block_size, result_collector
+            )
+            futures.append(future)
+
+        for future in tqdm(futures, desc="Processing files"):
+            future.result()
+
+    if strategy == "block" or strategy == "tensor":
+        quantization_config: dict = {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+        }
+        if block_size:
+            quantization_config["weight_block_size"] = block_size
+            if scale_fmt is not None:
+                quantization_config["scale_fmt"] = scale_fmt
+        if len(result_collector.modules_to_not_convert) > 0:
+            quantization_config["modules_to_not_convert"] = list(set(result_collector.modules_to_not_convert))
+    else:
+        quant_group = {
+            "group_0": {
+                "input_activations": {
+                    "actorder": None,
+                    "block_structure": None,
+                    "dynamic": True,
+                    "group_size": None,
+                    "num_bits": 8,
+                    "observer": None,
+                    "observer_kwargs": {},
+                    "strategy": "token",
+                    "symmetric": True,
+                    "type": "float",
+                },
+                "output_activations": None,
+                "targets": ["Linear"],
+                "weights": {
+                    "actorder": None,
+                    "block_structure": None,
+                    "dynamic": False,
+                    "group_size": None,
+                    "num_bits": 8,
+                    "observer": "minmax",
+                    "observer_kwargs": {},
+                    "strategy": strategy,
+                    "symmetric": True,
+                    "type": "float",
+                },
+            },
+        }
+        quantization_config = {
+            "config_groups": quant_group,
+            "format": "float-quantized",
+            "ignore": list(set(result_collector.modules_to_not_convert)),
+            "quant_method": "compressed-tensors",
+            "quantization_status": "compressed",
+        }
+
+    config_path = Path(input_path) / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        cfg["quantization_config"] = quantization_config
+        with open(Path(output_path) / "config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
+
+    index_dict = {"weight_map": result_collector.weight_map, "metadata": {"total_size": result_collector.param_count}}
+    with open(Path(output_path) / "model.safetensors.index.json", "w") as f:
+        json.dump(index_dict, f, indent=2)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", type=str, help="Path to the directory of the HF safetensors model.")
+    parser.add_argument("--save-dir", type=str, help="Path to the directory to save the converted model.")
+    parser.add_argument("--strategy", type=str, default="block", choices=["block", "channel", "tensor"])
+    parser.add_argument("--block-size", type=int, nargs="*", default=None, help="eg. --block-size 128 128")
+    parser.add_argument("--max-workers", type=int, default=1, help="Number of worker threads for parallel processing")
+    parser.add_argument("--scale-fmt", type=str, default=None, choices=["ue8m0"])
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    if not os.path.exists(args.save_dir):
+        logger.info(f"Creating directory {args.save_dir}")
+        os.makedirs(args.save_dir)
+    elif not os.path.isdir(args.save_dir):
+        raise ValueError("The save_dir should be a directory.")
+
+    convert_fp8(args.model_dir, args.save_dir, args.strategy, args.block_size, args.max_workers, args.scale_fmt)
+
+
+if __name__ == "__main__":
+    main()

@@ -292,7 +292,10 @@ def check_sample_length(
 
     try:
         if processor and sample.multimodal_inputs:
-            processor_output = processor(text=sample.prompt, **sample.multimodal_inputs)
+            from relax.utils.data.processing_utils import adapt_processor_kwargs
+
+            adapted = adapt_processor_kwargs(processor, sample.multimodal_inputs)
+            processor_output = processor(text=sample.prompt, **adapted)
             input_ids = processor_output["input_ids"][0]
         else:
             input_ids = tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]

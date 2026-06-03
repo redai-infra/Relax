@@ -75,6 +75,12 @@ ARG ENABLE_SGLANG_PATCH=1
 
 WORKDIR /root
 
+# Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
+COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
+RUN cd /tmp/int4_qat && \
+    pip install . --no-build-isolation --no-cache-dir && \
+    rm -rf /tmp/int4_qat
+
 ARG MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
@@ -90,7 +96,7 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
 COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --no-cache-dir tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
+    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
@@ -115,11 +121,3 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     fi && \
     rm sglang.patch; \
 fi
-
-# FROM relax as relax-release
-
-# WORKDIR /root/Relax
-
-# COPY . .
-
-# RUN pip install -e . --no-deps

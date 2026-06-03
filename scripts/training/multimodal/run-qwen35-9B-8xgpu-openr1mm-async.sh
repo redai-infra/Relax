@@ -40,6 +40,7 @@ CKPT_ARGS=(
    --save-interval 100
    --max-actor-ckpt-to-keep 1
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
 PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet

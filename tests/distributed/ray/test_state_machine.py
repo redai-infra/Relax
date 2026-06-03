@@ -325,6 +325,7 @@ class TestModelConfig:
             {
                 "rollout_num_gpus_per_engine": 4,
                 "hf_checkpoint": "/default/model",
+                "sglang_hf_checkpoint": None,
             },
         )()
         cfg = ModelConfig(
@@ -344,6 +345,7 @@ class TestModelConfig:
             {
                 "rollout_num_gpus_per_engine": 4,
                 "hf_checkpoint": "/default/model",
+                "sglang_hf_checkpoint": None,
             },
         )()
         cfg = ModelConfig(

@@ -71,6 +71,7 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
     from rich.text import Text
     from textual import on
     from textual.app import App, ComposeResult
+    from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.widgets import Footer, Header, Input, Select, SelectionList, Static
 
@@ -102,10 +103,10 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
             ("left", "focus_previous", "Focus Previous"),
             ("right", "focus_next", "Focus Next"),
             ("s", "switch_render", "switch render"),
-            ("n", "next_sample", "Next Sample"),
-            ("N", "next_step", "Next Step"),
-            ("p", "previous_sample", "Previous Sample"),
-            ("P", "previous_step", "Previous Step"),
+            Binding("n", "next_sample", "Next Sample", key_display="n"),
+            Binding("N", "next_step", "Next Step", key_display="N"),
+            Binding("p", "previous_sample", "Previous Sample", key_display="p"),
+            Binding("P", "previous_step", "Previous Step", key_display="P"),
             ("r", "refresh_page", "Refresh"),
             ("f", "toggle_search", "Find"),
             ("enter", "next_search", "Find next"),
@@ -114,8 +115,8 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
             ("k", "page_up", "page up"),
             ("h", "page_left", "page left"),
             ("l", "page_right", "page right"),
-            ("g", "page_home", "top"),
-            ("G", "page_end", "bottom"),
+            Binding("g", "page_home", "top", key_display="g"),
+            Binding("G", "page_end", "bottom", key_display="G"),
         ]
         TITLE = "Relax Rollout Result Viewer (TUI)"
         CSS = """

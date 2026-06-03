@@ -40,6 +40,7 @@ ______________________________________________________________________
 - 🌐 **Full Omni-Modal Training** — One unified framework for text, vision, and audio RL — one of the few systems capable of end-to-end Omni model (Qwen3-Omni) post-training
 - ⚙️ **Service-Oriented Six-Layer Architecture** — Every role is an independent Ray Serve deployment, with native service-level elastic scheduling and fault recovery
 - ⚡ **Fully Async via TransferQueue** — Rollout, Actor, ActorFwd, Reference, and Advantages run on independent GPU clusters with streaming data exchange and configurable staleness
+- 🔁 **Hybrid Mode** — Separate Actor/Rollout placement groups with TransferQueue streaming, while ref / actor_fwd / advantages run in-process on the actor — pairs `--balance-data` with sub-batched forward to minimize GPU waste
 - 🤖 **Agentic RL** — Multi-turn interaction, loss masking, flexible termination, and VLM multimodal context carry-over for closed-loop "execute → observe → decide" training
 - 🔀 **Elastic Rollout Scaling** — Dynamically grow/shrink inference engines mid-training via HTTP REST API, with same-cluster (`ray_native`) and cross-cluster (`external`) federation modes
 - 🧠 **Rich Algorithm Suite** — GRPO, GSPO, SAPO, and On-Policy Distillation out of the box, with pluggable rewards and built-in **GenRM** (LLM-as-judge) mode
@@ -50,10 +51,11 @@ ______________________________________________________________________
 
 ## 📢 News
 
-| 📣 Updates                                                            |
-| :-------------------------------------------------------------------- |
-| **\[05/11/2026\]** 🚀 Support for Qwen3.6 series models (text + VLM)! |
-| **\[04/15/2026\]** 🎉 Relax is now open-source!                       |
+| 📣 Updates                                                                                                                                                                                         |
+| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **\[05/26/2026\]** 🔁 New **Hybrid** execution mode — streaming data + in-process ref/actor_fwd, with `--balance-data` support. See the [Hybrid Training Guide](docs/en/guide/hybrid-training.md). |
+| **\[05/11/2026\]** 🚀 Support for Qwen3.6 series models (text + VLM)!                                                                                                                              |
+| **\[04/15/2026\]** 🎉 Relax is now open-source!                                                                                                                                                    |
 
 ______________________________________________________________________
 
@@ -74,12 +76,13 @@ Relax adopts a **six-layer service-oriented architecture** where every role is d
 | **Backends**      | **Megatron-LM** training backend (TP/PP/CP/EP) and **SGLang** inference engine                                               |
 | **Distributed**   | Ray Actor groups (RolloutManager / GenRMManager) and **DCS** (Distributed Checkpoint Service) for NCCL/GLOO weight sync      |
 
-**Two execution modes** are supported:
+**Three execution modes** are supported:
 
 - **Colocate (Sync)** — Actor and Rollout time-share the same GPUs; Rollout writes a full batch to TransferQueue, then yields GPUs for training. Memory-efficient for constrained hardware and strict on-policy (`max_staleness=0`).
 - **Fully Async** — Actor, Rollout, ActorFwd, Reference, and Advantages run on **independent GPU clusters** in parallel, exchanging data through TransferQueue and syncing weights asynchronously through DCS for maximum throughput with configurable staleness.
+- **Hybrid** — Actor and Rollout sit on **separate GPU placement groups** (like Fully Async) and exchange data via TransferQueue with configurable staleness, but ref / actor_fwd / advantages run **in-process on the actor's own GPUs** via `TensorBackuper` + `_switch_model` (like Colocate). Enables streaming pipelines plus `--balance-data` without paying for standalone ref/actor_fwd services.
 
-> 📖 Learn more: [Architecture Guide](docs/en/guide/architecture.md) · [Fully Async Training](docs/en/guide/fully-async-training.md) · [Elastic Rollout Scaling](docs/en/guide/elastic-rollout.md)
+> 📖 Learn more: [Architecture Guide](docs/en/guide/architecture.md) · [Fully Async Training](docs/en/guide/fully-async-training.md) · [Hybrid Training](docs/en/guide/hybrid-training.md) · [Elastic Rollout Scaling](docs/en/guide/elastic-rollout.md)
 
 ______________________________________________________________________
 
@@ -106,6 +109,9 @@ Relax is designed for **omni-modal RL training** — text, vision, and audio in 
 | **Qwen3-VL**   | 4B, 30B-A3B       | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
 | **Qwen3.5**    | 30B-A3B           | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
 | **Qwen3-Omni** | 30B-A3B           | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
+| **Qwen3.6**    | 35B-A3B (MoE)     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **GLM5**       | 744B-A40B (MoE)   | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
+| **Kimi K2.6**  | ~1T-A32B (MoE)    | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
 
 > 📖 New architectures are integrated via [Megatron Bridge](relax/backends/megatron/mbridge/) for automatic HF ↔ Megatron weight conversion.
 
@@ -247,9 +253,36 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## 🧩 Projects Built upon Relax
+
+| Project                                                  | Description                                                                                                                                                             |
+| :------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [HyperEyes](https://github.com/DeepExperience/HyperEyes) | A parallel multimodal search agent that uses Relax for efficient RL training, combining visual grounding and retrieval to search across multiple entities concurrently. |
+
+______________________________________________________________________
+
 ## 🤝 Contributing
 
 We welcome contributions of all kinds! Please read our [Contributing Guide](docs/en/guide/how-to-contribute.md) to get started.
+
+______________________________________________________________________
+
+## 🛠️ AI Coding Skills
+
+Relax ships a set of [Claude Code](https://claude.ai/code) slash-command skills under `skills/` to accelerate development and operations. Invoke them in Claude Code with `/skill-name`.
+
+| Skill                | Description                                                                                     |
+| :------------------- | :---------------------------------------------------------------------------------------------- |
+| `/code-review`       | Expert review of git changes — SOLID violations, security risks, ML/distributed training issues |
+| `/debug-hang`        | Automatically diagnose Ray distributed training hangs — collects call stacks and actor states   |
+| `/dev`               | Develop and debug Relax code; submit and monitor jobs on a remote Ray cluster                   |
+| `/doc-writer`        | Write and maintain bilingual (English + Chinese) VitePress documentation                        |
+| `/git-commit`        | Create Conventional Commits with rich markdown body and auto-run pre-commit hooks               |
+| `/model-integration` | Step-by-step guide for integrating new model architectures into the training pipeline           |
+| `/perf-doctor`       | Audit training launch scripts for performance and GPU memory misconfiguration                   |
+| `/ssh-ray-cluster`   | SSH into a remote Ray cluster head node to inspect status, logs, and debug jobs                 |
+| `/verl-to-relax`     | Migrate RL recipes from verl to Relax (rewards, tool envs, launch scripts)                      |
+| `/creating-skills`   | Guide for authoring new Claude Code skills following Anthropic best practices                   |
 
 ______________________________________________________________________
 

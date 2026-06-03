@@ -15,7 +15,6 @@ Features:
 
 import asyncio
 import logging
-import re
 import socket
 import time
 from collections.abc import Sequence
@@ -32,9 +31,7 @@ from megatron.core import mpu
 from tqdm import tqdm
 from urllib3.exceptions import NewConnectionError
 
-from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.backends.megatron.weight_conversion import convert_to_hf
-from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding
 from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
@@ -119,342 +116,10 @@ class DeviceDirectBackend(CommBackend):
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
-        self._bridge_task_map: Optional[Dict[str, Any]] = None  # global_param_name -> WeightConversionTask
-        self._bridge_mapping_registry = None  # MegatronMappingRegistry for dynamic lookups
-        self._bridge_expert_transposes_down: bool = True  # set in _init_bridge_tasks
+        if self._use_bridge:
+            from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
-    def _init_bridge_tasks(self) -> None:
-        """Lazily initialize Bridge conversion tasks and build a lookup table.
-
-        Builds a mapping from global_param_name (unwrapped, e.g.
-        ``decoder.layers.0.self_attention.linear_qkv.weight``) to the
-        corresponding ``WeightConversionTask``.  Only tasks that belong to the
-        current PP rank (i.e. ``task.param_weight is not None``) are indexed.
-
-        After building the task map, eagerly initializes any lazily-created
-        inner mappings (e.g. ``AutoMapping._mapping``) so that
-        ``_collect_all_mappings`` can discover and patch them later.
-
-        When embeddings are tied, Bridge's ``build_conversion_tasks`` filters
-        out ``output_layer`` from its task list.  However,
-        ``named_params_and_buffers`` still yields ``output_layer.weight`` on
-        the last PP stage.  We detect such missing parameters and supplement
-        the task map using the mapping registry so that every local parameter
-        has a corresponding Bridge task.
-        """
-        if self._bridge_task_map is not None:
-            return
-
-        from megatron.bridge import AutoBridge
-        from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
-        from megatron.bridge.models.conversion.param_mapping import AutoMapping
-
-        from relax.utils.megatron_bridge_utils import patch_megatron_model
-
-        bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
-        with patch_megatron_model(self.model):
-            tasks = bridge.get_conversion_tasks(self.model)
-
-        self._bridge_task_map = {}
-        for task in tasks:
-            if task.param_weight is not None:
-                self._bridge_task_map[task.global_param_name] = task
-
-        # Supplement tasks for local parameters that Bridge filtered out
-        # (e.g. ``output_layer`` when embeddings are tied).  Walk the local
-        # model parameters and, for any that are missing from the task map,
-        # look up the mapping from the registry and create a synthetic task.
-        self._bridge_mapping_registry = bridge._model_bridge.mapping_registry()
-        mapping_registry = self._bridge_mapping_registry
-        for name, param in named_params_and_buffers(self.args, self.model):
-            global_name = strip_param_name_prefix(name)
-            if global_name not in self._bridge_task_map:
-                mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-                if mapping is not None:
-                    self._bridge_task_map[global_name] = WeightConversionTask(
-                        param_name=global_name,
-                        global_param_name=global_name,
-                        mapping=mapping,
-                        megatron_module=None,
-                        param_weight=param,
-                    )
-
-        # Eagerly initialize inner mappings of AutoMapping instances.
-        # AutoMapping lazily creates a delegate ``_mapping`` (ColumnParallel /
-        # RowParallel / Replicated) on first use.  That delegate has its own
-        # process groups obtained from ``mpu`` at construction time.  We must
-        # trigger this initialization now so that ``_collect_all_mappings`` can
-        # find and patch them before ``megatron_to_hf`` is called.
-        for task in self._bridge_task_map.values():
-            mapping = task.mapping
-            if isinstance(mapping, AutoMapping) and mapping._mapping is None:
-                if task.megatron_module is not None:
-                    mapping._detected_type = mapping._detect_parallelism_type(task.megatron_module)
-                    mapping._mapping = mapping._get_or_create_mapping(mapping._detected_type)
-                else:
-                    # Supplementary tasks (e.g. tied ``output_layer``) have no
-                    # ``megatron_module``, so we cannot detect parallelism type.
-                    # These parameters are always replicated (that's why Bridge
-                    # filtered them out in the first place).
-                    mapping._detected_type = "replicated"
-                    mapping._mapping = mapping._get_or_create_mapping("replicated")
-            # Also handle AutoMapping nested inside _tp_mapping (e.g. QKVMapping)
-            inner_tp = getattr(mapping, "_tp_mapping", None)
-            if isinstance(inner_tp, AutoMapping) and inner_tp._mapping is None:
-                if task.megatron_module is not None:
-                    inner_tp._detected_type = inner_tp._detect_parallelism_type(task.megatron_module)
-                    inner_tp._mapping = inner_tp._get_or_create_mapping(inner_tp._detected_type)
-
-        # Detect whether the Bridge's ExpertMLPDownProjMapping applies a
-        # transpose in megatron_to_hf (Qwen3-VL does, Qwen3.5 does not).
-        # Used by _convert_to_hf_bridge to decide whether to undo the transpose.
-        self._bridge_expert_transposes_down = False
-        for task in self._bridge_task_map.values():
-            cls = type(task.mapping)
-            if cls.__name__ == "ExpertMLPDownProjMapping":
-                self._bridge_expert_transposes_down = "megatron_to_hf" in cls.__dict__
-                break
-
-        logger.info(f"Bridge task map initialized with {len(self._bridge_task_map)} local tasks")
-
-    @staticmethod
-    def _collect_all_mappings(mapping) -> list:
-        """Recursively collect a mapping and all its inner sub-mappings.
-
-        Bridge mapping objects may contain inner attributes that are themselves
-        ``MegatronParamMapping`` instances with their own process groups.
-        Known examples:
-        - ``AutoMapping._mapping`` (lazily-created delegate)
-        - ``QKVMapping._tp_mapping`` / ``MambaInProjMapping._tp_mapping``
-        - ``Qwen3VLMoEGateUpProjMapping._gated_mapping``
-
-        Rather than hard-coding attribute names, we scan all instance
-        attributes of each mapping to discover sub-mappings generically.
-        This ensures new model-specific wrappers are handled automatically.
-        """
-        from megatron.bridge.models.conversion.param_mapping import MegatronParamMapping
-
-        result: list = []
-        visited: set = set()
-        stack = [mapping]
-        while stack:
-            m = stack.pop()
-            if id(m) in visited:
-                continue
-            visited.add(id(m))
-            if isinstance(m, MegatronParamMapping):
-                result.append(m)
-                # Scan all instance attributes for nested MegatronParamMapping
-                for attr_val in vars(m).values():
-                    if isinstance(attr_val, MegatronParamMapping):
-                        stack.append(attr_val)
-        return result
-
-    def _convert_to_hf_bridge(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
-        """Convert a single TP-gathered parameter to HF format using Bridge.
-
-        This is a drop-in replacement for ``convert_to_hf()`` that uses
-        megatron-bridge's mapping logic instead of hand-written per-model
-        converters.  All collective communication (PP broadcast, TP gather,
-        EP gather) is disabled by temporarily setting the process groups to
-        ``None``, because the caller has already performed TP gather via
-        ``all_gather_param`` and this method runs only on ``_is_pp_src_rank``.
-
-        Args:
-            name: Global parameter name with ``module.module.`` prefix
-                  (as yielded by ``named_params_and_buffers``).
-            param: The TP-gathered parameter tensor.
-
-        Returns:
-            List of ``(hf_name, hf_tensor)`` tuples, same interface as
-            ``convert_to_hf``.
-        """
-        self._init_bridge_tasks()
-
-        # Strip the ``module.module.`` prefix to get Bridge's global_param_name
-        global_name = strip_param_name_prefix(name)
-        # named_params_and_buffers yields names like "vp_stages.0.decoder.layers.0...."
-        # Bridge's global_param_name is "decoder.layers.0...."
-        # Remove the "vp_stages.{N}." prefix if present
-        if global_name.startswith("vp_stages."):
-            # "vp_stages.0.decoder..." -> "decoder..."
-            parts = global_name.split(".", 2)
-            if len(parts) >= 3:
-                global_name = parts[2]
-
-        task = self._bridge_task_map.get(global_name)
-
-        # When EP > 1, ``_update_expert_bucket_weights_from_distributed``
-        # gathers expert params from ALL EP ranks.  The task map only contains
-        # the current EP rank's experts, so params from other EP ranks will be
-        # missing.  Dynamically look them up via the mapping registry, create a
-        # synthetic task, eagerly initialize its inner mapping, and cache it.
-        if task is None:
-            from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
-            from megatron.bridge.models.conversion.param_mapping import AutoMapping
-
-            mapping = self._bridge_mapping_registry.megatron_to_hf_lookup(global_name)
-            assert mapping is not None, (
-                f"Bridge mapping registry has no entry for '{global_name}'. "
-                f"Available task map keys: {list(self._bridge_task_map.keys())[:10]}..."
-            )
-            # Do NOT pass param_weight=param here — the param_weight field is
-            # only used for HF→Megatron (load) direction, not Megatron→HF
-            # (export).  Storing the EP-gathered tensor in the cached task
-            # would prevent ~20 GB from being freed on _is_pp_src_rank for
-            # MoE models with many experts.
-            task = WeightConversionTask(
-                param_name=global_name,
-                global_param_name=global_name,
-                mapping=mapping,
-                megatron_module=None,
-                param_weight=None,
-            )
-            # Eagerly initialize AutoMapping inner delegate (same logic as
-            # ``_init_bridge_tasks``).  Since ``megatron_module`` is None and
-            # all groups will be patched to None anyway, default to replicated.
-            if isinstance(mapping, AutoMapping) and mapping._mapping is None:
-                mapping._detected_type = "replicated"
-                mapping._mapping = mapping._get_or_create_mapping("replicated")
-            inner_tp = getattr(mapping, "_tp_mapping", None)
-            if isinstance(inner_tp, AutoMapping) and inner_tp._mapping is None:
-                inner_tp._detected_type = "replicated"
-                inner_tp._mapping = inner_tp._get_or_create_mapping("replicated")
-            # Cache for future iterations (task has no tensor references)
-            self._bridge_task_map[global_name] = task
-
-        mapping = task.mapping
-
-        # Collect the top-level mapping **and** any inner sub-mappings
-        # (e.g. AutoMapping._mapping, QKVMapping._tp_mapping) so that we
-        # disable collective ops on every level of the delegation chain.
-        all_mappings = self._collect_all_mappings(mapping)
-
-        # Save original process groups for every mapping
-        saved_groups: list[tuple] = []
-        for m in all_mappings:
-            saved_groups.append((m.pp_group, m._tp_group, m._etp_group, m.ep_group))
-
-        # For expert parameters, ``megatron_to_hf`` calls
-        # ``gather_from_ep_ranks`` when ``is_expert`` is True.  That method
-        # needs ``megatron_module`` to compute ``num_experts_per_rank``, but
-        # our synthetic tasks have ``megatron_module = None``.  Since we have
-        # already performed EP gather externally and set ``ep_group = None``
-        # (``ep_size == 1``), the EP gather inside Bridge is redundant.
-        #
-        # We must monkey-patch ``gather_from_ep_ranks`` on the concrete class
-        # of **every** mapping in the delegation chain, not just the top-level
-        # one.  For example, ``AutoMapping.megatron_to_hf`` delegates to
-        # ``self._mapping.megatron_to_hf`` (a ``RowParallelMapping``), which
-        # calls ``self.gather_from_ep_ranks`` on the *inner* mapping instance.
-        # If we only patch the outer ``AutoMapping`` class, the inner
-        # ``RowParallelMapping`` class still has the original method.
-        #
-        # ``gather_from_ep_ranks`` is only defined on the base
-        # ``MegatronParamMapping`` class and no subclass overrides it, so
-        # deleting the monkey-patch in ``finally`` restores the inherited
-        # version via MRO.
-        patched_classes: set[type] = set()
-
-        def _noop_gather_from_ep_ranks(self_m, megatron_weights, megatron_module, hf_param_name):
-            return {str(hf_param_name): megatron_weights}
-
-        try:
-            # Disable all collective ops on every mapping: set groups to None
-            # so that pp_size/tp_size/ep_size all return 1 (via get_pg_size(None) == 1)
-            for m in all_mappings:
-                m.pp_group = None
-                m._tp_group = None
-                m._etp_group = None
-                m.ep_group = None
-
-            # Patch gather_from_ep_ranks on every unique mapping class in the
-            # delegation chain so that inner delegates also get the no-op.
-            for m in all_mappings:
-                cls = type(m)
-                if cls not in patched_classes:
-                    cls.gather_from_ep_ranks = _noop_gather_from_ep_ranks
-                    patched_classes.add(cls)
-
-            # Apply remove_padding before conversion (same as convert_to_hf)
-            param = remove_padding(name, param, self.args.vocab_size)
-
-            # Call Bridge's megatron_to_hf — now a pure local format conversion.
-            # With all groups set to None, tp_size/pp_size/ep_size are all 1,
-            # so no collective communication occurs and the tensor is treated
-            # as already gathered.
-            converted_dict = mapping.megatron_to_hf(param, task.megatron_module)
-        finally:
-            # Restore original process groups for every mapping
-            for m, (pp, tp, etp, ep) in zip(all_mappings, saved_groups):
-                m.pp_group = pp
-                m._tp_group = tp
-                m._etp_group = etp
-                m.ep_group = ep
-            # Remove the monkey-patch from every patched class; the inherited
-            # base-class method is automatically restored via MRO.
-            for cls in patched_classes:
-                if "gather_from_ep_ranks" in cls.__dict__:
-                    del cls.gather_from_ep_ranks
-
-        # Convert Dict[str, Tensor] -> List[Tuple[str, Tensor]]
-        converted_named_tensors = list(converted_dict.items())
-
-        # ── Post-process expert weights ──────────────────────────────────
-        # Bridge's ExpertMLPGateUpProjMapping and ExpertMLPDownProjMapping
-        # apply transformations that differ by model family:
-        #
-        # **Qwen3-VL** (qwen3_vl_bridge.py):
-        #   gate_up_proj: transpose each half then stack → [2, D_out, D_in]
-        #   down_proj: transpose → [D_in, D_out]
-        #   We must undo the transpose.
-        #
-        # **Qwen3.5** (qwen35_vl_bridge.py):
-        #   gate_up_proj: cat without transpose → [2*H, D]  (2-D)
-        #   down_proj: no transpose (AutoMapping) → [H, D]  (2-D)
-        #   No un-transpose needed; just split the fused tensor.
-        #
-        # Additionally, Bridge outputs fused names without expert_id:
-        #   - ``...experts.gate_up_proj``
-        #   - ``...experts.down_proj``
-        # We split into per-expert format with correct names and shapes:
-        #   - ``...experts.{E}.gate_proj.weight`` [H, D]
-        #   - ``...experts.{E}.up_proj.weight``   [H, D]
-        #   - ``...experts.{E}.down_proj.weight``  [D, H]
-        expert_id_match = re.search(r"weight(\d+)", global_name)
-        if expert_id_match is not None:
-            expert_id = expert_id_match.group(1)
-            postprocessed: list[tuple[str, torch.Tensor]] = []
-            for hf_name, tensor in converted_named_tensors:
-                if hf_name.endswith(".experts.gate_up_proj"):
-                    base = hf_name[: -len(".gate_up_proj")]
-                    if tensor.ndim == 3:
-                        # Qwen3-VL style: [2, D_out, D_in] (transposed by Bridge)
-                        # Undo transpose on each slice: [D_out, D_in] -> [D_in, D_out]
-                        gate_tensor = tensor[0].transpose(-1, -2).contiguous()
-                        up_tensor = tensor[1].transpose(-1, -2).contiguous()
-                    else:
-                        # Qwen3.5 style: [2*H, D] (cat, no transpose by Bridge)
-                        # Split along dim 0 into two [H, D] tensors
-                        gate_tensor, up_tensor = tensor.chunk(2, dim=0)
-                    postprocessed.append((f"{base}.{expert_id}.gate_proj.weight", gate_tensor))
-                    postprocessed.append((f"{base}.{expert_id}.up_proj.weight", up_tensor))
-                elif hf_name.endswith(".experts.down_proj"):
-                    base = hf_name[: -len(".down_proj")]
-                    if tensor.ndim == 2 and not self._bridge_expert_transposes_down:
-                        # Qwen3.5 style: AutoMapping, no transpose — already [H, D]
-                        postprocessed.append((f"{base}.{expert_id}.down_proj.weight", tensor))
-                    else:
-                        # Qwen3-VL style: transposed — undo to match raw convert_to_hf
-                        postprocessed.append(
-                            (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
-                        )
-                else:
-                    postprocessed.append((hf_name, tensor))
-            converted_named_tensors = postprocessed
-
-        # Apply quantization (same as convert_to_hf)
-        return quantize_params(self.args, name, converted_named_tensors, self.quantization_config)
+            self._bridge_converter = BridgeConverter(args=args, model=model, quantization_config=quantization_config)
 
     def _create_rollout_engines(self, rollout_topology: Dict[int, Dict[str, Any]]) -> None:
         """Create Ray actors for each rollout node.
@@ -920,7 +585,7 @@ class DeviceDirectBackend(CommBackend):
         origin_named_tensors += [(name, param)]
         if not actor_fwd_only:
             if self._use_bridge:
-                converted_named_tensors += self._convert_to_hf_bridge(name, param)
+                converted_named_tensors += self._bridge_converter.convert(name, param)
             else:
                 converted_named_tensors += convert_to_hf(
                     self.args, self.model_name, name, param, self.quantization_config
@@ -1002,7 +667,7 @@ class DeviceDirectBackend(CommBackend):
             converted_hf_tensors = []
             for name, param in all_gathered_params:
                 if self._use_bridge:
-                    converted_hf_tensors += self._convert_to_hf_bridge(name, param)
+                    converted_hf_tensors += self._bridge_converter.convert(name, param)
                 else:
                     converted_hf_tensors += convert_to_hf(
                         self.args, self.model_name, name, param, self.quantization_config

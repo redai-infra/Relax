@@ -20,7 +20,7 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/geo3k}"
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/openr1mm}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
@@ -30,19 +30,20 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
    --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
    --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
-PROMPT_SET=${DATA_DIR}/geo3k/train.parquet
-# SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
+PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
+SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
-   --label-key reward_model
+   --label-key label
    --apply-chat-template
-   --rollout-shuffle
+   # --rollout-shuffle
    --balance-data
-   --rm-type geo3k
+   --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 32
    --n-samples-per-prompt 8
@@ -50,16 +51,8 @@ ROLLOUT_ARGS=(
    --rollout-max-prompt-len 2048
    --rollout-temperature 0.8
    --global-batch-size 256
-   --multimodal-keys '{"image":"images"}'
-   # --system-prompt "${SYSTEM_PROMPT}"
-)
-
-EVAL_ARGS=(
-   # --skip-eval-before-train
-   --eval-interval 20
-   --eval-prompt-data geo3k ${DATA_DIR}/geo3k/test.parquet
-   --eval-max-response-len 2048
-   --eval-temperature 0.8
+   --multimodal-keys '{"image":"image"}'
+    --system-prompt "${SYSTEM_PROMPT}"
 )
 
 PERF_ARGS=(
@@ -144,7 +137,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
-   "${EVAL_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${GRPO_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \

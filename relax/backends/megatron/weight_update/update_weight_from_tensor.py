@@ -11,6 +11,7 @@ from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
+from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
@@ -60,6 +61,7 @@ class UpdateWeightFromTensor:
         self._ipc_gather_src = None
         self._ipc_engine = None
         self._model_update_groups = None
+        self.distributed_rollout_engines: list[ActorHandle] = []
 
     def connect_rollout_engines(
         self,
@@ -85,11 +87,20 @@ class UpdateWeightFromTensor:
                 engine_gpu_offsets.append(offset)
                 offset += c
 
-        # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
-        total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
+        # Route via CUDA IPC only for engines on the same Ray node as the actor;
+        # cross-node IPC fails with cudaErrorMapBufferObjectFailed.
+        engine_node_ids = [
+            info.get("node_id", "")
+            for info in ray.get([engine.get_pid_and_node_id.remote() for engine in rollout_engines])
+        ]
+        local_actor_node_id = ray.get_runtime_context().get_node_id()
+        gathered_actor_node_ids: list[str | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_actor_node_ids, local_actor_node_id, group=get_gloo_group())
+        actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
+
         colocate_engine_nums = 0
-        for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
-            if gpu_offset + gpu_count > total_actor_gpus:
+        for engine_node_id in engine_node_ids:
+            if not engine_node_id or engine_node_id not in actor_node_id_set:
                 break
             colocate_engine_nums += 1
 
@@ -149,15 +160,19 @@ class UpdateWeightFromTensor:
         """
         self.weight_version += 1
 
+        # Pause/flush must cover both IPC and distributed-broadcast engines,
+        # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
+        all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
+
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            ray.get([engine.pause_generation.remote() for engine in all_engines])
+            ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
                     post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=all_engines,
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -183,15 +198,21 @@ class UpdateWeightFromTensor:
             ray.get(prev_refs)
         del prev_long_lived_tensors
 
+        # All ranks must finish sending before rank 0 triggers Marlin repack,
+        # otherwise engines in slower gather groups may still be processing
+        # weight chunks when their parameters get reshaped by post_process.
+        dist.barrier(group=get_gloo_group())
+
         # int4/fp4 post_process
         if rank == 0:
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=False,
                     post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
+                    rollout_engines=all_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            ray.get([engine.continue_generation.remote() for engine in all_engines])
+        dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
@@ -234,8 +255,19 @@ def _send_to_colocated_engine(
     if ipc_gather_group is None:
         return [], None
 
-    # TODO improve
     long_live_tensors = []
+
+    # Colocated IPC requires accelerator tensors (uses device IPC handles via
+    # shared memory). The bridge usually returns device tensors, but for K2.x
+    # multi-modal wrappers some text-backbone tensors leak through on cpu —
+    # coerce here so FlattenedTensorBucket's torch.cat doesn't see mixed
+    # devices. Synchronous copy: this runs on the weight-update path (not the
+    # rollout/train hot path) and FlattenedTensorBucket may flatten on a
+    # different stream — correctness over a few µs.
+    cur_device = make_current_torch_device()
+    hf_named_tensors = [
+        (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
+    ]
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}

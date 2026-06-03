@@ -202,14 +202,165 @@ def _patch_scatter_dtype_cast():
         dist.scatter = original_scatter
 
 
+def _warm_hf_checkpoint_page_cache(source_path: str) -> None:
+    """Pre-fault the HF checkpoint into the Linux page cache, once per node.
+
+    NFS-backed safetensors files are accessed via mmap by the bridge, so the
+    first per-page touch incurs a synchronous small-read round-trip (we have
+    measured ~20 MB/s effective throughput from ``aten::cat``). Reading the
+    files end-to-end once promotes them to the page cache, after which the
+    bridge's lazy tensor reads are memory-fast.
+
+    Implementation is pure-Python (``open(...).read()`` in chunks) — no shell
+    invocation, so dynamic paths cannot inject commands.
+
+    Coordination — explicit per-node rank-0 pattern:
+
+    - ``LOCAL_RANK == 0`` (the first GPU actor on each host) does the read
+      and writes a done-marker under ``/dev/shm`` (tmpfs, so it naturally
+      clears on reboot — avoiding stale-marker / cleared-cache mismatches).
+    - All other local ranks poll for the marker with a generous timeout.
+      They never touch NFS themselves.
+    - An advisory ``flock`` still wraps the rank-0 path so that two
+      independent Relax jobs sharing a host and the same checkpoint don't
+      both warm — only the first acquires the lock, the second sees the
+      marker and skips.
+    - Errors (missing path, read failure, timeout) are logged and swallowed:
+      warmup is a best-effort optimization, never a correctness gate.
+    """
+    import fcntl
+    import glob
+    import hashlib
+    import time
+
+    if not source_path:
+        return
+    abs_path = os.path.abspath(source_path)
+    if not os.path.isdir(abs_path):
+        return
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    digest = hashlib.sha1(abs_path.encode()).hexdigest()[:16]
+    marker_dir = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+    lock_path = f"{marker_dir}/relax_hf_warmup_{digest}.lock"
+    done_path = f"{marker_dir}/relax_hf_warmup_{digest}.done"
+
+    def _marker_says_warm() -> bool:
+        try:
+            with open(done_path) as df:
+                return df.read().strip() == abs_path
+        except OSError:
+            return False
+
+    def _stream_files_to_devnull(files: list[str]) -> int:
+        """Read each file end-to-end so the kernel pulls every page into the
+        page cache.
+
+        Pure-Python — no shell, no command injection surface. Returns total
+        bytes read. Shows a per-file tqdm progress bar.
+        """
+        from tqdm import tqdm
+
+        chunk = 8 * 1024 * 1024  # 8 MiB, large enough that read syscall overhead is negligible
+        total = 0
+        pbar = tqdm(files, desc="warming HF ckpt", unit="file", dynamic_ncols=True)
+        for fp in pbar:
+            pbar.set_postfix_str(os.path.basename(fp))
+            try:
+                with open(fp, "rb") as fh:
+                    while True:
+                        data = fh.read(chunk)
+                        if not data:
+                            break
+                        total += len(data)
+            except OSError as exc:
+                logger.warning(f"HF checkpoint warmup: skipping {fp} due to read error: {exc}")
+        pbar.close()
+        return total
+
+    if local_rank == 0:
+        try:
+            lf = open(lock_path, "w")
+        except OSError as e:
+            logger.warning(f"HF checkpoint warmup: cannot open lock file {lock_path}: {e}")
+            return
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                if _marker_says_warm():
+                    logger.info(f"HF checkpoint page cache already warm on this node: {abs_path}")
+                    return
+                files = sorted(
+                    glob.glob(os.path.join(abs_path, "*.safetensors")) + glob.glob(os.path.join(abs_path, "*.bin"))
+                )
+                if not files:
+                    logger.info(f"HF checkpoint warmup: no *.safetensors / *.bin under {abs_path}, skipping")
+                    return
+                t0 = time.time()
+                logger.info(
+                    f"[local_rank=0] Warming HF checkpoint page cache on this node: {abs_path} ({len(files)} files)"
+                )
+                total_bytes = _stream_files_to_devnull(files)
+                elapsed = time.time() - t0
+                throughput_mb = total_bytes / max(elapsed, 1e-6) / (1024 * 1024)
+                try:
+                    with open(done_path, "w") as df:
+                        df.write(abs_path)
+                except OSError as e:
+                    logger.warning(f"HF checkpoint warmup: cannot write marker {done_path}: {e}")
+                logger.info(
+                    f"[local_rank=0] HF checkpoint page cache warmed in {elapsed:.1f}s "
+                    f"({total_bytes / (1024 * 1024):.0f} MiB, {throughput_mb:.0f} MiB/s)"
+                )
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        finally:
+            lf.close()
+    else:
+        # Other local ranks just wait for rank 0's marker.
+        timeout_s = float(os.environ.get("RELAX_HF_WARMUP_TIMEOUT_S", "1800"))
+        poll_interval_s = 1.0
+        t0 = time.time()
+        logged_waiting = False
+        while time.time() - t0 < timeout_s:
+            if _marker_says_warm():
+                if logged_waiting:
+                    logger.info(
+                        f"[local_rank={local_rank}] HF checkpoint warmup ready after waiting {time.time() - t0:.1f}s"
+                    )
+                return
+            if not logged_waiting and time.time() - t0 > 5.0:
+                logger.info(
+                    f"[local_rank={local_rank}] waiting for local_rank=0 to warm HF checkpoint page cache: {abs_path}"
+                )
+                logged_waiting = True
+            time.sleep(poll_interval_s)
+        logger.warning(
+            f"[local_rank={local_rank}] HF checkpoint warmup wait timed out after {timeout_s:.0f}s; "
+            f"proceeding without confirmation (load may still succeed, just slower)"
+        )
+
+
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
-    source_path = load_path or args.hf_checkpoint
+    # Prefer ref_load (if it's an HF dir) over hf_checkpoint on fallback. INT4 QAT
+    # runs set --hf-checkpoint to a compressed-tensors packed dir that the bridge
+    # cannot read; --ref-load points at the BF16 HF dir that it can. Mirrors the
+    # `args.load = args.ref_load or args.hf_checkpoint` remap in arguments.py.
+    if load_path is not None:
+        source_path = load_path
+    elif args.ref_load and _is_hf_checkpoint(args.ref_load):
+        source_path = args.ref_load
+    else:
+        source_path = args.hf_checkpoint
     logger.info(
         f"Load checkpoint from HuggingFace model into Megatron (requested_path={load_path}, source_path={source_path})"
     )
+
+    if getattr(args, "warm_hf_checkpoint_page_cache", False):
+        _warm_hf_checkpoint_page_cache(source_path)
 
     with megatron_bridge_utils.patch_megatron_model(ddp_model):
         bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)

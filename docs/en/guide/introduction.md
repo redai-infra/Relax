@@ -14,8 +14,8 @@ Relax natively supports multimodal RL training across text, images, videos, and 
 
 | Modality | Capabilities | Representative Models |
 |----------|--------------|----------------------|
-| **Text** | Math reasoning, code generation, multi-turn dialogue, tool use | Qwen3 |
-| **Vision** | Visual QA, image understanding, multimodal reasoning | Qwen3-VL, Qwen3.5 |
+| **Text** | Math reasoning, code generation, multi-turn dialogue, tool use | Qwen3, GLM5 |
+| **Vision** | Visual QA, image understanding, multimodal reasoning | Qwen3-VL, Qwen3.5, Qwen3.6, Kimi K2.6 |
 | **Omni** | Joint image, text, and audio understanding | Qwen3-Omni |
 
 Multimodal data is flexibly configured via the `--multimodal-keys` parameter. The framework includes complete image, video, and audio processing pipelines (`relax/utils/multimodal/`), supporting fine-grained control over image token counts, video frame sampling, audio sample rates, and more.

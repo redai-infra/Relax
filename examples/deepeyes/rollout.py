@@ -203,12 +203,14 @@ async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params
     sample.rollout_log_probs = sample.rollout_log_probs or []
     sample.response_length = len(response_tokens)
 
-    budget = None
-    if args.rollout_max_context_len is not None:
-        budget = args.rollout_max_context_len - len(sample.tokens)
-    elif sample.response_length > 0 and sampling_params.get("max_new_tokens") is not None:
-        budget = sampling_params["max_new_tokens"] - sample.response_length
-    return current_image_data, response_tokens, budget, multimodal_train_inputs_buffer
+    context_budget = (
+        args.rollout_max_context_len - len(sample.tokens) if args.rollout_max_context_len is not None else None
+    )
+    generation_budget = None
+    if is_resuming and sampling_params.get("max_new_tokens") is not None:
+        current_turn_used = _current_turn_generated_token_count(sample, sample.response_length)
+        generation_budget = max(0, int(sampling_params["max_new_tokens"]) - current_turn_used)
+    return current_image_data, response_tokens, context_budget, generation_budget, multimodal_train_inputs_buffer
 
 
 async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, args=None):
@@ -307,6 +309,11 @@ def _update_budget(budget, consumed: int):
     return None if budget is None else budget - consumed
 
 
+def _current_turn_generated_token_count(sample: Sample, response_length: int) -> int:
+    turn_start = sample.metadata.get("_current_turn_response_start") if sample.metadata else None
+    return response_length - turn_start if isinstance(turn_start, int) and 0 <= turn_start <= response_length else 0
+
+
 def _update_routed_experts(sample: Sample, meta_info: dict, args: Any) -> None:
     """Decode and store routed experts from meta_info for routing replay (MoE
     models).
@@ -391,18 +398,23 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
     env, env_module, config, state, url = _initialize_resources(args, sample)
     sampling_params = sampling_params.copy()
 
-    is_resuming = (
-        getattr(args, "partial_rollout", False)
-        and sample.status == Sample.Status.ABORTED
-        and sample.response_length > 0
-    )
+    is_resuming = sample.status == Sample.Status.ABORTED and sample.response_length > 0
 
-    if is_resuming and getattr(args, "mask_offpolicy_in_partial_rollout", False) and sample.response_length > 0:
+    if (
+        getattr(args, "partial_rollout", False)
+        and is_resuming
+        and getattr(args, "mask_offpolicy_in_partial_rollout", False)
+        and sample.response_length > 0
+    ):
         sample.loss_mask = [0] * sample.response_length
 
-    current_image_data, response_tokens, budget, multimodal_train_inputs_buffer = await _prepare_start_state(
-        sample, state, args, sampling_params, is_resuming=is_resuming
-    )
+    (
+        current_image_data,
+        response_tokens,
+        context_budget,
+        generation_budget,
+        multimodal_train_inputs_buffer,
+    ) = await _prepare_start_state(sample, state, args, sampling_params, is_resuming=is_resuming)
     rollout_traces = sample.metadata.setdefault("rollout_traces", [])
 
     resume_turn = 0
@@ -410,8 +422,8 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
         resume_turn = sample.metadata.get("rollout_turns", len(rollout_traces))
         sample.status = Sample.Status.PENDING
 
-    def _is_budget_exhausted() -> bool:
-        return budget is not None and budget <= 0
+    def _is_context_budget_exhausted() -> bool:
+        return context_budget is not None and context_budget <= 0
 
     def _record_rollout_stats(stop_reason: str) -> None:
         sample.metadata["rollout_turns"] = turns_executed
@@ -428,21 +440,32 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             if saved_image is not None:
                 env.current_image = saved_image
 
-        if _is_budget_exhausted():
+        if _is_context_budget_exhausted() or (generation_budget is not None and generation_budget <= 0):
             sample.status = Sample.Status.TRUNCATED
             stop_reason = "budget_exhausted"
+            sample.metadata.pop("_current_turn_response_start", None)
             _record_rollout_stats(stop_reason)
             return _finalize_sample(sample, state.tokenizer, response_tokens, multimodal_train_inputs_buffer)
 
-        cur_sampling_params = sampling_params
         trace_recorder = _RolloutTraceRecorder(state.tokenizer)
         for turn_idx in range(resume_turn, config["max_turns"]):
             turns_executed = turn_idx + 1
-            if budget is not None:
-                cur_sampling_params["max_new_tokens"] = budget
+            cur_sampling_params = sampling_params.copy()
+            active_budget = context_budget
+            if generation_budget is not None:
+                active_budget = generation_budget if active_budget is None else min(active_budget, generation_budget)
+            if active_budget is not None:
+                active_budget = max(0, int(active_budget))
+                if cur_sampling_params.get("max_new_tokens") is not None:
+                    active_budget = min(active_budget, int(cur_sampling_params["max_new_tokens"]))
+                cur_sampling_params["max_new_tokens"] = active_budget
+
+            turn_start = sample.metadata.get("_current_turn_response_start")
+            if not isinstance(turn_start, int) or not 0 <= turn_start <= len(response_tokens):
+                sample.metadata["_current_turn_response_start"] = len(response_tokens)
 
             turn_record = trace_recorder.start(
-                turn_idx, sample.tokens, cur_sampling_params, current_image_data, budget
+                turn_idx, sample.tokens, cur_sampling_params, current_image_data, active_budget
             )
 
             inference_start_ts = time.time()
@@ -460,20 +483,27 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)
             )
             _append_to_sample(sample, response_tokens, new_response_tokens, new_response_log_probs, loss_mask_val=1)
-            budget = _update_budget(budget, len(new_response_tokens))
+            context_budget = _update_budget(context_budget, len(new_response_tokens))
+            generation_budget = _update_budget(generation_budget, len(new_response_tokens))
 
             _update_routed_experts(sample, meta_info, args)
 
             finish_reason = _should_stop_on_finish(sample, finish_type)
             if finish_reason:
                 stop_reason = finish_reason
+                if finish_reason == "finish_abort":
+                    turns_executed = turn_idx
+                else:
+                    sample.metadata.pop("_current_turn_response_start", None)
                 rollout_traces.append(turn_record)
                 break
-            if _is_budget_exhausted():
+            if _is_context_budget_exhausted():
                 sample.status = Sample.Status.TRUNCATED
                 stop_reason = stop_reason or "budget_exhausted"
+                sample.metadata.pop("_current_turn_response_start", None)
                 rollout_traces.append(turn_record)
                 break
+            generation_budget = None
 
             env_start_ts = time.time()
             (
@@ -496,12 +526,14 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             if done:
                 sample.status = Sample.Status.COMPLETED
                 stop_reason = stop_reason or "env_done"
+                sample.metadata.pop("_current_turn_response_start", None)
                 rollout_traces.append(turn_record)
                 break
 
             obs_log_probs = [0.0] * len(obs_prompt_ids)
             _append_to_sample(sample, response_tokens, obs_prompt_ids, obs_log_probs, loss_mask_val=0)
-            budget = _update_budget(budget, len(obs_prompt_ids))
+            context_budget = _update_budget(context_budget, len(obs_prompt_ids))
+            sample.metadata.pop("_current_turn_response_start", None)
 
             current_image_data = _update_multimodal_state(
                 current_image_data,
@@ -510,16 +542,15 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 multimodal_train_inputs_buffer,
             )
 
-            # Snapshot state for partial rollout resumption.
+            # Snapshot state for aborted rollout resumption.
             # Must be AFTER _update_multimodal_state so current_image_data
             # includes images from this turn's observation.
-            if getattr(args, "partial_rollout", False):
-                if hasattr(env, "current_image"):
-                    sample.metadata["_env_current_image"] = env.current_image
-                sample.metadata["_multimodal_train_inputs_buffer"] = multimodal_train_inputs_buffer
-                sample.metadata["_current_image_data"] = current_image_data
+            if hasattr(env, "current_image"):
+                sample.metadata["_env_current_image"] = env.current_image
+            sample.metadata["_multimodal_train_inputs_buffer"] = multimodal_train_inputs_buffer
+            sample.metadata["_current_image_data"] = current_image_data
 
-            if _is_budget_exhausted():
+            if _is_context_budget_exhausted():
                 sample.status = Sample.Status.TRUNCATED
                 stop_reason = stop_reason or "budget_exhausted"
                 rollout_traces.append(turn_record)

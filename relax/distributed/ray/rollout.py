@@ -106,7 +106,10 @@ class ModelConfig:
         """Resolve per-group defaults from model-level then args-level
         values."""
         default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine
-        default_model_path = self.model_path or args.hf_checkpoint
+        # `args.sglang_hf_checkpoint` lets INT4 QAT runs point SGLang at the
+        # source compressed-tensors directory while training-side consumers
+        # keep using the auto-cast `args.hf_checkpoint` (BF16 cache).
+        default_model_path = self.model_path or args.sglang_hf_checkpoint or args.hf_checkpoint
         for g in self.engine_groups:
             if g.num_gpus_per_engine is None:
                 g.num_gpus_per_engine = default_gpus_per_engine
@@ -3483,6 +3486,58 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     return router_ip, router_port
 
 
+def _wait_engine_init_with_progress(
+    init_handles: list,
+    model_name: str,
+    timeout: float,
+    log_interval: float,
+) -> None:
+    """Soft barrier across all engine init() handles with periodic progress
+    logs.
+
+    Acts as a single rendezvous point at training startup: blocks until every
+    engine has finished server launch + weight loading, so that stragglers
+    caused by storage/IO jitter do not leak into downstream NCCL collectives.
+    Logs the remaining engine ranks every ``log_interval`` seconds so slow
+    nodes are visible without grepping per-engine logs.
+    """
+    total = len(init_handles)
+    pending = {h: rank for rank, h in enumerate(init_handles)}
+    deadline = time.monotonic() + timeout
+    next_log = time.monotonic() + log_interval
+
+    logger.info(f"[engine-init-barrier:{model_name}] waiting for {total} engines (timeout={timeout:.0f}s)")
+
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"[engine-init-barrier:{model_name}] timed out after {timeout:.0f}s; "
+                f"{len(pending)}/{total} engines still initializing, "
+                f"slow ranks={sorted(pending.values())}"
+            )
+        wait_slice = min(remaining, max(0.1, next_log - time.monotonic()))
+        done, _ = ray.wait(list(pending.keys()), num_returns=len(pending), timeout=wait_slice)
+        for h in done:
+            try:
+                ray.get(h)
+            except Exception as e:
+                slow = sorted(pending.values())
+                raise RuntimeError(
+                    f"[engine-init-barrier:{model_name}] engine rank={pending[h]} init failed: {e}; "
+                    f"other ranks still pending={slow}"
+                ) from e
+            pending.pop(h)
+        if time.monotonic() >= next_log and pending:
+            ready = total - len(pending)
+            slow = sorted(pending.values())
+            preview = slow if len(slow) <= 10 else slow[:10] + ["..."]
+            logger.info(f"[engine-init-barrier:{model_name}] ready {ready}/{total}, still-waiting ranks={preview}")
+            next_log = time.monotonic() + log_interval
+
+    logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
+
+
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
@@ -3543,7 +3598,12 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             gpu_offset += group_cfg.num_gpus
 
         if all_init_handles:
-            ray.get(all_init_handles)
+            _wait_engine_init_with_progress(
+                all_init_handles,
+                model_name=model_cfg.name,
+                timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+                log_interval=60.0,
+            )
 
         servers[model_cfg.name] = RolloutServer(
             engine_groups=engine_groups,

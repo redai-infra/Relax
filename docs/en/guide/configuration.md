@@ -248,7 +248,19 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--optimizer-cpu-offload` | flag | - | Enable CPU offload for optimizer state (native Megatron parameter) |
 | `--overlap-cpu-optimizer-d2h-h2d` | flag | - | Overlap CPU optimizer D2H/H2D communication (native Megatron parameter) |
 | `--use-precision-aware-optimizer` | flag | - | Use precision-aware optimizer (native Megatron parameter) |
+| `--use-distributed-optimizer` | flag | - | Shard optimizer state, ZeRO-1 style (native Megatron parameter) |
+| `--overlap-grad-reduce` | flag | - | Overlap backward compute with grad reduce-scatter (native Megatron parameter) |
+| `--overlap-param-gather` | flag | - | Overlap reduce-scatter with next-step param all-gather; requires `--overlap-grad-reduce` (native Megatron parameter) |
 | `--calculate-per-token-loss` | flag | False | Calculate loss per token (native Megatron parameter) |
+
+### Optimizer Flag Compatibility
+
+| Scenario | `--use-distributed-optimizer` | `--overlap-grad-reduce` / `--overlap-param-gather` |
+|---|---|---|
+| Text-only dense | ✅ | ✅ |
+| Dense VL, CP = 1 | ✅ | ✅ |
+| Dense VL, CP > 1 | ✅ | ❌ |
+| MoE | ✅ | ❌ |
 
 ---
 

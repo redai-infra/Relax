@@ -234,34 +234,23 @@ def if_quant(name, patterns):
 
 
 def pack_layer(weight, group_size, sym=True):
+    # fake_int4_quant_cuda returns quantized integers as float:
+    #   sym:  rintf(val / scale)      in [-7, 7]
+    #   asym: rintf(val / scale) + zp in [0, 15]
     w, scale, zp = fake_int4_quant_cuda.fake_int4_quant_cuda(weight, (1, group_size), sym)
-    w = w.view(weight.shape[0], 1, weight.shape[1] // group_size, group_size)
-    scale = scale.view(weight.shape[0], 1, weight.shape[1] // group_size, 1)
-    zp = zp.view(weight.shape[0], 1, weight.shape[1] // group_size, 1)
-    if sym:
-        w = w * scale
-    else:
-        w = (w - zp) * scale
-    w = w.view(weight.shape)
     scale = scale.view(weight.shape[0], -1).contiguous()
-    if not sym:
+
+    if sym:
+        packed_zp = None
+    else:
         zp = zp.view(weight.shape[0], -1)
-        zeros = zp.t().contiguous().to(torch.float32)
-        zeros = zeros.to(dtype=torch.int32, device=w.device)
+        zeros = zp.t().contiguous().to(torch.int32)
         zeros = zeros.reshape(-1, zeros.shape[1] // 8, 8)
         new_order_map = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], device=zeros.device) * 4
         zeros = zeros << new_order_map
         packed_zp = torch.sum(zeros, dim=-1).to(torch.int32)
-    else:
-        zp = None
-        packed_zp = None
 
-    quantized_weight = quantize(
-        x=w,
-        scale=scale,
-        zero_point=zp,
-        dtype=torch.int8 if sym else torch.uint8,
-    )
+    quantized_weight = w.to(torch.int8 if sym else torch.uint8)
     packed_weight = pack_to_int32(quantized_weight, 4, sym=sym)
     return packed_weight, scale, packed_zp
 
@@ -270,7 +259,10 @@ def quantize_params_compressed_tensors(converted_named_params, quantization_conf
     w_cfg = quantization_config["config_groups"]["group_0"]["weights"]
     group_size = w_cfg["group_size"]
     is_symmetric = w_cfg["symmetric"]
-    ignore_rules = quantization_config.get("ignore", [])
+    # The cast pipeline (`relax/tools/quant_cast/convert_moe_int4_to_bf16.py`)
+    # augments the sidecar's ignore list with non-quantized top-level namespaces
+    # so this stays purely config-driven (no K2-specific name knowledge here).
+    ignore_rules = list(quantization_config.get("ignore", []))
 
     results = []
 
@@ -279,11 +271,29 @@ def quantize_params_compressed_tensors(converted_named_params, quantization_conf
             (r.startswith("re:") and re.match(r[3:], name)) or r == name or name.startswith(r) for r in ignore_rules
         )
 
-        if is_ignored or not name.endswith(".weight") or param.dim() < 2:
+        # `dim() != 2` (not `< 2`): the W4A16 packer in `pack_layer` only
+        # supports 2D matrices. K2.6 has 3D positional-embedding tensors
+        # whose ``.weight`` shape is (T, H, W) — passthrough rather than
+        # crash inside `pack_layer`. Pre-K2.6 callers had no 3D `.weight`
+        # tensors so the broader filter has no behavior change for them.
+        if is_ignored or not name.endswith(".weight") or param.dim() != 2:
             results.append((name, param))
             continue
 
-        qw, s, zp = pack_layer(param, group_size, is_symmetric)
+        if param.shape[-1] % group_size != 0:
+            logger.warning(
+                f"[quantize] passthrough non-divisible param {name} shape={tuple(param.shape)} group_size={group_size}"
+            )
+            results.append((name, param))
+            continue
+
+        try:
+            qw, s, zp = pack_layer(param, group_size, is_symmetric)
+        except RuntimeError as e:
+            logger.error(
+                f"[quantize] pack_layer failed for {name} shape={tuple(param.shape)} group_size={group_size}: {e}"
+            )
+            raise
         qweight_name = name.replace(".weight", ".weight_packed")
         scale_name = name.replace(".weight", ".weight_scale")
         weight_shape = torch.tensor(param.shape, dtype=torch.int32, device=device_utils.get_device_name())

@@ -40,6 +40,7 @@ ______________________________________________________________________
 - 🌐 **全模态统一训练** — 单一框架覆盖文本、视觉、音频强化学习，业界少数能够在统一架构下完成 Omni 模型（Qwen3-Omni）后训练的系统
 - ⚙️ **面向服务的六层架构** — 所有角色均作为独立 Ray Serve 服务部署，原生支持服务级别的弹性调度与故障恢复
 - ⚡ **基于 TransferQueue 的全异步训练** — Rollout、Actor、ActorFwd、Reference、Advantages 运行在独立 GPU 集群，流式数据交换，可配置 staleness
+- 🔁 **Hybrid 混合模式** — Actor 与 Rollout 独立 Placement Group + TransferQueue 流式数据，ref / actor_fwd / advantages 在 Actor 本机进程内完成；配合 `--balance-data` 与子批 forward，避免独立 ref/actor_fwd 服务的 GPU 浪费
 - 🤖 **Agentic RL** — 多轮交互、loss masking、灵活的终止条件以及 VLM 多模态上下文累积，构建"执行 → 观察 → 决策"闭环训练
 - 🔀 **Rollout 弹性扩缩容** — 通过 HTTP REST API 在训练过程中动态增减推理引擎，支持同集群（`ray_native`）和跨集群联邦（`external`）两种模式
 - 🧠 **丰富的算法矩阵** — 开箱即用的 GRPO、GSPO、SAPO 与 On-Policy Distillation，配合可插拔奖励函数和内置 **GenRM**（LLM-as-judge）模式
@@ -50,10 +51,11 @@ ______________________________________________________________________
 
 ## 📢 最新动态
 
-| 📣 更新                                                      |
-| :----------------------------------------------------------- |
-| **\[05/11/2026\]** 🚀 支持 Qwen3.6 系列模型（纯文本+多模）！ |
-| **\[04/15/2026\]** 🎉 Relax 正式开源！                       |
+| 📣 更新                                                                                                                                                              |
+| :------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **\[05/26/2026\]** 🔁 新增 **Hybrid** 执行模式 —— 流式数据 + 进程内 ref/actor_fwd，支持 `--balance-data`，详见 [Hybrid 训练指南](docs/zh/guide/hybrid-training.md)。 |
+| **\[05/11/2026\]** 🚀 支持 Qwen3.6 系列模型（纯文本+多模）！                                                                                                         |
+| **\[04/15/2026\]** 🎉 Relax 正式开源！                                                                                                                               |
 
 ______________________________________________________________________
 
@@ -74,12 +76,13 @@ Relax 采用**面向服务的六层架构**，每个角色均作为独立的 [Ra
 | **Backends（后端层）**      | **Megatron-LM** 训练后端（TP/PP/CP/EP）与 **SGLang** 推理引擎                                                  |
 | **Distributed（分布式层）** | Ray Actor Groups（RolloutManager / GenRMManager）与 **DCS**（分布式 Checkpoint 服务，支持 NCCL/GLOO 权重同步） |
 
-支持**两种执行模式**：
+支持**三种执行模式**：
 
 - **Colocate（同步模式）** — Actor 与 Rollout 共享同一组 GPU，Rollout 将整批数据写入 TransferQueue 后释放 GPU 供训练使用；显存友好，严格 on-policy（`max_staleness=0`）。
 - **Fully Async（全异步模式）** — Actor、Rollout、ActorFwd、Reference、Advantages 运行在**独立 GPU 集群**上完全并行，通过 TransferQueue 交换数据，通过 DCS 异步同步权重，在可配置 staleness 下实现最大吞吐。
+- **Hybrid（混合模式）** — Actor 与 Rollout 使用**独立的 Placement Group**（与全异步一致），通过 TransferQueue 流式交换数据并支持可配置 staleness；但 ref / actor_fwd / advantages 通过 `TensorBackuper` + `_switch_model` 在 Actor 自身 GPU 上**进程内复用权重**（与 Colocate 一致）。在不为独立 ref/actor_fwd 服务付出额外 GPU 的前提下，同时获得流式数据管线与 `--balance-data` 支持。
 
-> 📖 了解更多：[架构指南](docs/zh/guide/architecture.md) · [全异步训练](docs/zh/guide/fully-async-training.md) · [Rollout 弹性扩缩容](docs/zh/guide/elastic-rollout.md)
+> 📖 了解更多：[架构指南](docs/zh/guide/architecture.md) · [全异步训练](docs/zh/guide/fully-async-training.md) · [Hybrid 训练](docs/zh/guide/hybrid-training.md) · [Rollout 弹性扩缩容](docs/zh/guide/elastic-rollout.md)
 
 ______________________________________________________________________
 
@@ -100,12 +103,15 @@ ______________________________________________________________________
 
 Relax 专为**全模态强化学习训练**设计 —— 文本、视觉、音频统一框架。通过 `--multimodal-keys` 参数灵活配置多模态数据，框架内置了完整的图像、视频、音频处理管线（`relax/utils/multimodal/`），支持图像 token 数量控制、视频帧率采样、音频采样率等精细调节。
 
-| 模型系列       | 规模              | 模态               | 典型任务                               | 后端     |
-| :------------- | :---------------- | :----------------- | :------------------------------------- | :------- |
-| **Qwen3**      | 4B, 30B-A3B (MoE) | 文本               | 数学推理、代码生成、多轮对话、工具调用 | Megatron |
-| **Qwen3-VL**   | 4B, 30B-A3B       | 视觉 + 语言        | 视觉问答、图像理解、多模态推理         | Megatron |
-| **Qwen3.5**    | 30B-A3B           | 视觉 + 语言        | 视觉问答、图像理解、多模态推理         | Megatron |
-| **Qwen3-Omni** | 30B-A3B           | 文本 + 视觉 + 音频 | 图文音频联合问答、全模态理解           | Megatron |
+| 模型系列       | 规模              | 模态               | 典型任务                                 | 后端     |
+| :------------- | :---------------- | :----------------- | :--------------------------------------- | :------- |
+| **Qwen3**      | 4B, 30B-A3B (MoE) | 文本               | 数学推理、代码生成、多轮对话、工具调用   | Megatron |
+| **Qwen3-VL**   | 4B, 30B-A3B       | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
+| **Qwen3.5**    | 30B-A3B           | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
+| **Qwen3-Omni** | 30B-A3B           | 文本 + 视觉 + 音频 | 图文音频联合问答、全模态理解             | Megatron |
+| **Qwen3.6**    | 35B-A3B (MoE)     | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
+| **GLM5**       | 744B-A40B (MoE)   | 文本               | 数学推理、代码生成、多轮对话             | Megatron |
+| **Kimi K2.6**  | ~1T-A32B (MoE)    | 视觉 + 语言        | 视觉问答、多模态推理；支持 INT4 QAT 训练 | Megatron |
 
 > 📖 新模型架构通过 [Megatron Bridge](relax/backends/megatron/mbridge/) 接入，自动完成 HF ↔ Megatron 权重转换。
 
@@ -247,9 +253,36 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## 🧩 基于 Relax 构建的项目
+
+| 项目                                                     | 描述                                                                                              |
+| :------------------------------------------------------- | :------------------------------------------------------------------------------------------------ |
+| [HyperEyes](https://github.com/DeepExperience/HyperEyes) | 一个并行多模态搜索智能体，使用 Relax 进行高效的 RL 训练，结合视觉定位与检索能力并发搜索多个实体。 |
+
+______________________________________________________________________
+
 ## 🤝 参与贡献
 
 欢迎各种形式的贡献！请阅读 [贡献指南](docs/zh/guide/how-to-contribute.md) 了解详情。
+
+______________________________________________________________________
+
+## 🛠️ AI 编程技能（Skills）
+
+Relax 在 `skills/` 目录下内置了一套 [Claude Code](https://claude.ai/code) 斜杠命令技能，用于加速开发和运维工作。在 Claude Code 中以 `/技能名` 方式调用。
+
+| 技能                 | 描述                                                           |
+| :------------------- | :------------------------------------------------------------- |
+| `/code-review`       | 专业代码审查 —— 检测 SOLID 违规、安全风险、ML/分布式训练问题   |
+| `/debug-hang`        | 自动排查 Ray 分布式训练 hang 问题，收集调用栈与 Actor 状态     |
+| `/dev`               | 开发调试 Relax 代码；向远程 Ray 集群提交并监控训练任务         |
+| `/doc-writer`        | 编写和维护中英双语 VitePress 文档                              |
+| `/git-commit`        | 生成 Conventional Commits 格式提交，自动运行 pre-commit 钩子   |
+| `/model-integration` | 新模型架构接入训练管线的分步指南                               |
+| `/perf-doctor`       | 审查训练启动脚本中的性能与显存配置问题                         |
+| `/ssh-ray-cluster`   | SSH 连接远程 Ray 集群 Head 节点，检查状态、日志和调试任务      |
+| `/verl-to-relax`     | 将 RL 配方从 verl 迁移到 Relax（奖励函数、工具环境、启动脚本） |
+| `/creating-skills`   | 按 Anthropic 最佳实践编写新 Claude Code 技能的指南             |
 
 ______________________________________________________________________
 

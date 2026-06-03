@@ -562,7 +562,7 @@ manager = TopologyManager(
 
 # 注册节点
 manager.register(RoleInfo(role_name="actor", rank=0, ip="10.0.0.1", port=20000))
-manager.register(RoleInfo(role_name="rollout", rank=0, ip="10.0.0.2", port=20001))
+manager.register(RoleInfo(role_name="rollout", rank=0, ip="192.0.2.2", port=20001))
 
 # 获取对等体
 peer = manager.get_peer("actor", 0, "rollout")
