@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import math
+import sys
+import types
 
 import pytest
 
@@ -44,6 +46,20 @@ def test_get_device_peak_flops_known_gpus(device_name, expected_raw_flops):
 def test_get_device_peak_flops_unknown_gpu():
     result = get_device_peak_flops(unit="T", device_name="SomeUnknownGPU-XYZ")
     assert result == float("inf")
+
+
+def test_get_device_peak_flops_defaults_to_cpu_when_device_properties_unavailable(monkeypatch):
+    device_module = types.ModuleType("relax.utils.device")
+
+    def get_device_properties():
+        raise AttributeError("module 'torch.cpu' has no attribute 'get_device_properties'")
+
+    device_module.get_device_properties = get_device_properties
+    monkeypatch.setitem(sys.modules, "relax.utils.device", device_module)
+
+    result = get_device_peak_flops(unit="T")
+
+    assert math.isclose(result, _DEVICE_FLOPS["CPU"] / 1e12, rel_tol=1e-6)
 
 
 def test_get_device_peak_flops_unit_conversion():

@@ -48,9 +48,12 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
     Returns ``float('inf')`` for unknown GPUs (MFU silently skipped).
     """
     if device_name is None:
-        from relax.utils.device import get_device_properties
+        try:
+            from relax.utils.device import get_device_properties
 
-        device_name = get_device_properties().name
+            device_name = get_device_properties().name
+        except (AttributeError, ImportError):
+            device_name = "CPU"
 
     flops = float("inf")
     for key, value in sorted(_DEVICE_FLOPS.items(), key=lambda x: len(x[0]), reverse=True):
