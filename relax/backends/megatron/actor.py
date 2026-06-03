@@ -17,6 +17,7 @@ import torch.distributed as dist
 import transfer_queue as tq
 from megatron.core import mpu
 
+
 try:
     # NPU patch
     from mindspeed.megatron_adaptor import repatch

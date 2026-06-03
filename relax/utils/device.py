@@ -124,12 +124,14 @@ def get_accelerator_type() -> AcceleratorType:
     """Return the detected :class:`AcceleratorType`."""
     return _detect_accelerator()
 
+
 def ray_get_device_ids():
     import ray
 
     if get_accelerator_type() == AcceleratorType.NPU:
         return ray.get_runtime_context().get_accelerator_ids()["NPU"]
     return ray.get_gpu_ids()
+
 
 def get_device_name() -> str:
     """Return the PyTorch device type string (``'cuda'``, ``'npu'``, ``'xpu'``,
