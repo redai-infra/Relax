@@ -515,9 +515,10 @@ def get_serve_url(route_prefix: str = "") -> str:
 def recovery_load_path(args: Namespace) -> Optional[str]:
     """Determine the checkpoint path to load for recovery, if applicable."""
     if args.save is not None and os.path.exists(os.path.join(args.save, "latest_checkpointed_iteration.txt")):
-        args.no_load_optim = False
-        args.no_load_rng = False
+        args.no_load_optim = args.no_save_optim
+        args.no_load_rng = args.no_save_rng
         args.finetune = False
+        args.start_rollout_id = None
         args.load = args.save
 
 
