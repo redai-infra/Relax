@@ -1,0 +1,2 @@
+max_turns: 10
+normalize_bbox: true

@@ -1015,6 +1015,59 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The final message will be <system_prompt> + <dataset_prompt>."
                 ),
             )
+            parser.add_argument(
+                "--use-agentic-rollout",
+                action="store_true",
+                default=False,
+                help="Enable agentic rollout mode. Automatically sets --rollout-function-path to the agentic rollout entry point.",
+            )
+            parser.add_argument(
+                "--agent-command",
+                type=str,
+                default=None,
+                help=(
+                    "Managed-command agent entry command for agentic rollout. "
+                    "Required when --use-agentic-rollout is set."
+                ),
+            )
+            parser.add_argument(
+                "--agent-cwd",
+                type=str,
+                default=None,
+                help=(
+                    "Working directory for the managed-command agent process. "
+                    "Required when --use-agentic-rollout is set."
+                ),
+            )
+            parser.add_argument(
+                "--agent-timeout",
+                type=float,
+                default=1800.0,
+                help=(
+                    "Active runtime budget in seconds for each managed-command agent session. "
+                    "The clock runs while the session is admitted and pauses while it is gated; "
+                    "on timeout, SIGTERM is sent to the managed agent process group."
+                ),
+            )
+            parser.add_argument(
+                "--agent-env",
+                nargs="+",
+                default=[],
+                help=(
+                    "Extra environment variables for the managed-command agent process, formatted as KEY=VALUE. "
+                    "Examples: --agent-env FOO=bar ; --agent-env FOO=bar BAZ=qux ; "
+                    "--agent-env 'FOO=value with spaces' BAZ=qux."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-prepare-pool-size",
+                type=int,
+                default=None,
+                help=(
+                    "Target size of the agentic prepare pool in groups. "
+                    "If unset, defaults to over_sampling_batch_size."
+                ),
+            )
             return parser
 
         def add_eval_arguments(parser):
@@ -2145,6 +2198,17 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    if getattr(args, "use_agentic_rollout", False):
+        args.rollout_function_path = "relax.agentic.rollout.generate_rollout"
+        args.eval_function_path = "relax.agentic.rollout.generate_rollout"
+        args.apply_chat_template = False
+        if not isinstance(getattr(args, "agent_command", None), str) or not args.agent_command.strip():
+            raise ValueError("--agent-command is required when --use-agentic-rollout is set.")
+        if not isinstance(getattr(args, "agent_cwd", None), str) or not args.agent_cwd.strip():
+            raise ValueError("--agent-cwd is required when --use-agentic-rollout is set.")
+        if args.agent_timeout <= 0:
+            raise ValueError("--agent-timeout must be > 0.")
 
     if args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(

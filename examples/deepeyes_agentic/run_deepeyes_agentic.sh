@@ -22,8 +22,8 @@ source "${MODEL_CONFIG_DIR}/qwen3-vl-30B-A3B.sh"
 #                                    DIRS                                     #
 ###############################################################################
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/deepeyes_pr}"
-EXP_NAME="qwen3vl-deepeyes-pr-${TIMESTAMP}"
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/deepeyes}"
+EXP_NAME="qwen3vl-deepeyes-agentic-${TIMESTAMP}"
 
 # Require MODEL_DIR, DATA_DIR, SAVE_DIR from environment or set defaults
 if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; then
@@ -49,8 +49,7 @@ CKPT_ARGS=(
     --save ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
     --megatron-to-hf-mode bridge
     --save-interval 100
-    --max-actor-ckpt-to-keep 3
-    # --load ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
+    --max-actor-ckpt-to-keep 1
 )
 
 ###############################################################################
@@ -68,7 +67,7 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 #                               ROLLOUT CONFIG                                #
 ###############################################################################
 
-NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -77,10 +76,10 @@ ROLLOUT_ARGS=(
     --multimodal-keys '{"image":"images"}'
     --reward-key score
     --metadata-key extra_info
-    --apply-chat-template
-    --custom-generate-function-path examples.deepeyes.rollout.generate
-    --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
-    --custom-config-path examples/deepeyes/deepeyes_config.yaml
+    --custom-rm-path examples.deepeyes_agentic.reward_deepeyes.reward_func
+    --use-agentic-rollout
+    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-cwd "${SCRIPT_DIR}"
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size 32
     --micro-batch-size 1
@@ -91,12 +90,8 @@ ROLLOUT_ARGS=(
     --global-batch-size 256
     --use-fault-tolerance
     --rollout-shuffle
-)
-
-PARTIAL_ROLLOUT_ARGS=(
-   --partial-rollout
-   --over-sampling-batch-size 48
-   --partial-rollout-max-aborted-count 3
+    --use-streaming-dataset
+    # --sglang-router-policy consistent_hashing
 )
 
 ###############################################################################
@@ -148,6 +143,7 @@ OPTIMIZER_ARGS=(
 ###############################################################################
 
 SGLANG_ARGS=(
+    --rollout-num-gpus-per-engine 2
     --sglang-mem-fraction-static 0.8
 )
 
@@ -195,10 +191,10 @@ MEGATRON_ARGS=(
 ###############################################################################
 
 RAY_RESOURCE_ARGS=(
-    --rollout-num-gpus-per-engine 1
     --resource '{"actor": [1, 8], "rollout": [1, 8]}'
     --max-staleness 0
     --num-data-storage-units 1
+    --use-health-check
     --colocate
 )
 
@@ -214,7 +210,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
-    "${PARTIAL_ROLLOUT_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \

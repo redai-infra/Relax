@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import base64
 import math
 import os
 from io import BytesIO
@@ -131,6 +132,15 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
     Returns
     - A `PIL.Image` instance opened from the provided path/URL.
     """
+    if image.startswith("data:image/"):
+        header, _, encoded = image.partition(",")
+        if ";base64" not in header or not encoded:
+            raise ValueError("data:image payload must use 'data:image/...;base64,...' format")
+        with BytesIO(base64.b64decode(encoded)) as bio:
+            image_obj = Image.open(bio)
+            image_obj.load()
+        return image_obj
+
     if image.startswith(("http://", "https://")):
         with requests.get(image, stream=True) as response:
             response.raise_for_status()

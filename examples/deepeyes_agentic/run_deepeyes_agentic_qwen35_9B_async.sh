@@ -1,6 +1,14 @@
 #!/bin/bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+#
+# Qwen3.5-9B 8xGPU single-node fully-async DeepEyes agentic training script.
+#
+# Resource layout (8 GPUs, fully-async):
+#   actor:     4 GPUs (TP=4)
+#   rollout:   2 GPUs (1 engine × 2 GPUs)
+#   reference: 1 GPU  (TP=1, weight-only)
+#   actor_fwd: 1 GPU
 
 set -ex
 set -o pipefail
@@ -12,20 +20,18 @@ set -o pipefail
 TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-# Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen3-vl-30B-A3B.sh"
+source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 
 ###############################################################################
 #                                    DIRS                                     #
 ###############################################################################
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/deepeyes_pr}"
-EXP_NAME="qwen3vl-deepeyes-pr-${TIMESTAMP}"
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/deepeyes}"
+EXP_NAME="qwen35-9B-deepeyes-agentic-async-${TIMESTAMP}"
 
-# Require MODEL_DIR, DATA_DIR, SAVE_DIR from environment or set defaults
 if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; then
     echo "ERROR: MODEL_DIR, DATA_DIR, and SAVE_DIR must be set."
     echo "Example: MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/save bash $0"
@@ -44,13 +50,12 @@ source "${SCRIPT_DIR}/sglang_judge_service.sh"
 ###############################################################################
 
 CKPT_ARGS=(
-    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-30B-A3B-Thinking
-    --ref-load ${MODEL_DIR}/Qwen3-VL-30B-A3B-Thinking
-    --save ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
+    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
+    --ref-load ${MODEL_DIR}/Qwen3.5-9B
+    --save ${SAVE_DIR}/Qwen3.5-9B-DeepEyes-Checkpoint
     --megatron-to-hf-mode bridge
     --save-interval 100
-    --max-actor-ckpt-to-keep 3
-    # --load ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
+    --max-actor-ckpt-to-keep 1
 )
 
 ###############################################################################
@@ -68,7 +73,7 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 #                               ROLLOUT CONFIG                                #
 ###############################################################################
 
-NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -77,13 +82,12 @@ ROLLOUT_ARGS=(
     --multimodal-keys '{"image":"images"}'
     --reward-key score
     --metadata-key extra_info
-    --apply-chat-template
-    --custom-generate-function-path examples.deepeyes.rollout.generate
-    --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
-    --custom-config-path examples/deepeyes/deepeyes_config.yaml
+    --custom-rm-path examples.deepeyes_agentic.reward_deepeyes.reward_func
+    --use-agentic-rollout
+    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-cwd "${SCRIPT_DIR}"
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size 32
-    --micro-batch-size 1
     --n-samples-per-prompt 8
     --rollout-max-response-len 2048
     --rollout-max-prompt-len 2048
@@ -91,12 +95,7 @@ ROLLOUT_ARGS=(
     --global-batch-size 256
     --use-fault-tolerance
     --rollout-shuffle
-)
-
-PARTIAL_ROLLOUT_ARGS=(
-   --partial-rollout
-   --over-sampling-batch-size 48
-   --partial-rollout-max-aborted-count 3
+    --use-streaming-dataset
 )
 
 ###############################################################################
@@ -140,7 +139,6 @@ OPTIMIZER_ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
-    --no-rope-fusion
 )
 
 ###############################################################################
@@ -148,7 +146,8 @@ OPTIMIZER_ARGS=(
 ###############################################################################
 
 SGLANG_ARGS=(
-    --sglang-mem-fraction-static 0.8
+    --rollout-num-gpus-per-engine 2
+    --sglang-mem-fraction-static 0.6
 )
 
 ###############################################################################
@@ -160,11 +159,6 @@ LOG_ARGS=(
     --use-metrics-service
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name ${EXP_NAME}
-    # --dump-details dump_details_8k_0204
-    # --use-wandb
-    # --wandb-project slime-dev
-    # --wandb-group qwen3-4B-test
-    # --wandb-key ${WANDB_KEY}
 )
 
 ###############################################################################
@@ -176,18 +170,19 @@ MEGATRON_ARGS=(
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
-    --expert-model-parallel-size 8
+    --expert-model-parallel-size 1
     --expert-tensor-parallel-size 1
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
-    --max-tokens-per-gpu 8192
+    --use-dynamic-batch-size
+    --max-tokens-per-gpu 9216
+    --no-rope-fusion
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
     --attention-softmax-in-fp32
     --attention-backend flash
-    --use-dynamic-batch-size
 )
 
 ###############################################################################
@@ -195,11 +190,13 @@ MEGATRON_ARGS=(
 ###############################################################################
 
 RAY_RESOURCE_ARGS=(
-    --rollout-num-gpus-per-engine 1
-    --resource '{"actor": [1, 8], "rollout": [1, 8]}'
-    --max-staleness 0
+    --resource '{"actor": [1, 4], "rollout": [1, 2], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}'
+    --max-staleness 2
     --num-data-storage-units 1
-    --colocate
+    --num-iters-per-train-update 8
+    --ref-actor-config '{"tensor_model_parallel_size": 1, "max_tokens_per_gpu": 16384, "sequence_parallel": false, "only_load_weight": true}'
+    --fully-async
+    --use-health-check
 )
 
 ###############################################################################
@@ -209,12 +206,11 @@ RAY_RESOURCE_ARGS=(
 mkdir -p logs
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-    -- python3 relax/entrypoints/train.py \
+    -- python3 -m relax.entrypoints.train \
     "${RAY_RESOURCE_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
-    "${PARTIAL_ROLLOUT_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \

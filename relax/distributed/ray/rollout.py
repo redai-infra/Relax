@@ -762,6 +762,11 @@ class RolloutManager(ReloadableMixin):
                 self.args.custom_convert_samples_to_train_data_path
             )
 
+        if self.args.use_agentic_rollout:
+            from relax.agentic.rollout import init_agentic_resident_pipeline
+
+            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
+
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
         else:

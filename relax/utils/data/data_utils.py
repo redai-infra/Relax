@@ -274,6 +274,8 @@ def check_sample_length(
     tokenizer: Any,
     processor: Any,
     max_length: int,
+    *,
+    apply_chat_template_kwargs: Optional[dict] = None,
 ) -> bool:
     """Check if a sample's prompt length is within the allowed limit.
 
@@ -286,20 +288,43 @@ def check_sample_length(
     Returns:
         True if sample is valid (not too long), False otherwise
     """
-    if not isinstance(sample.prompt, str):
-        # Cannot check length for non-string prompts
-        return True
-
     try:
+        tools = sample.metadata.get("tools") if isinstance(sample.metadata, dict) else None
+        if isinstance(sample.prompt, str):
+            prompt_text = sample.prompt
+            input_ids = None
+        elif isinstance(sample.prompt, list):
+            if not hasattr(tokenizer, "apply_chat_template"):
+                logger.warning("Skipping max_length check for list prompt because tokenizer has no chat template.")
+                return True
+            prompt_text = tokenizer.apply_chat_template(
+                sample.prompt,
+                tools=tools,
+                tokenize=False,
+                add_generation_prompt=True,
+                **(apply_chat_template_kwargs or {}),
+            )
+            input_ids = None
+        else:
+            return True
+
         if processor and sample.multimodal_inputs:
             from relax.utils.data.processing_utils import adapt_processor_kwargs
 
             adapted = adapt_processor_kwargs(processor, sample.multimodal_inputs)
-            processor_output = processor(text=sample.prompt, **adapted)
+            processor_output = processor(text=prompt_text, **adapted)
             input_ids = processor_output["input_ids"][0]
-        else:
-            input_ids = tokenizer(sample.prompt, add_special_tokens=False)["input_ids"]
-
+        elif input_ids is None:
+            if isinstance(sample.prompt, list):
+                input_ids = tokenizer.apply_chat_template(
+                    sample.prompt,
+                    tools=tools,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **(apply_chat_template_kwargs or {}),
+                )
+            else:
+                input_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         return len(input_ids) <= max_length
 
     except Exception as e:
@@ -310,19 +335,33 @@ def check_sample_length(
 # Global variables for multiprocessing workers (required for ProcessPoolExecutor initializer)
 _worker_tokenizer = None
 _worker_processor = None
+_worker_apply_chat_template_kwargs = None
 
 
-def _init_check_length_worker(tokenizer: Any, processor: Any) -> None:
+def _init_check_length_worker(
+    tokenizer: Any,
+    processor: Any,
+    apply_chat_template_kwargs: Optional[dict],
+) -> None:
     """Initialize worker process with tokenizer and processor."""
     global _worker_tokenizer, _worker_processor
+    global _worker_apply_chat_template_kwargs
     _worker_tokenizer = tokenizer
     _worker_processor = processor
+    _worker_apply_chat_template_kwargs = apply_chat_template_kwargs
 
 
 def _check_sample_length_worker(sample: Sample, max_length: int) -> tuple[Sample, bool]:
     """Worker function for parallel sample length checking."""
     global _worker_tokenizer, _worker_processor
-    is_valid = check_sample_length(sample, _worker_tokenizer, _worker_processor, max_length)
+    global _worker_apply_chat_template_kwargs
+    is_valid = check_sample_length(
+        sample,
+        _worker_tokenizer,
+        _worker_processor,
+        max_length,
+        apply_chat_template_kwargs=_worker_apply_chat_template_kwargs,
+    )
     return sample, is_valid
 
 
@@ -332,6 +371,8 @@ def filter_long_prompts(
     processor: Any,
     max_length: int,
     num_workers: int = 0,
+    *,
+    apply_chat_template_kwargs: Optional[dict] = None,
 ) -> list[Sample]:
     """Filter out samples that exceed the maximum length.
 
@@ -350,10 +391,8 @@ def filter_long_prompts(
     if not samples:
         return samples
 
-    if not isinstance(samples[0].prompt, str):
-        logger.warning(
-            "Skipping max_length check for list prompt. Set apply_chat_template=True to enable length filtering."
-        )
+    if not isinstance(samples[0].prompt, (str, list)):
+        logger.warning("Skipping max_length check for unsupported prompt type.")
         return samples
 
     if processor:
@@ -364,7 +403,7 @@ def filter_long_prompts(
             with ProcessPoolExecutor(
                 max_workers=actual_workers,
                 initializer=_init_check_length_worker,
-                initargs=(tokenizer, processor),
+                initargs=(tokenizer, processor, apply_chat_template_kwargs),
             ) as executor:
                 futures = {
                     executor.submit(_check_sample_length_worker, sample, max_length): sample for sample in samples
@@ -386,16 +425,36 @@ def filter_long_prompts(
         else:
             filtered_samples = []
             for sample in tqdm.tqdm(samples, desc="check sample length..."):
-                if check_sample_length(sample, tokenizer, processor, max_length):
+                if check_sample_length(
+                    sample,
+                    tokenizer,
+                    processor,
+                    max_length,
+                    apply_chat_template_kwargs=apply_chat_template_kwargs,
+                ):
                     filtered_samples.append(sample)
                 else:
                     logger.debug(f"Filtered sample exceeding max_length={max_length}")
     else:
-        prompts = [sample.prompt for sample in samples]
-        input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
-        filtered_samples = [
-            sample for sample, input_ids in zip(samples, input_ids_list, strict=True) if len(input_ids) <= max_length
-        ]
+        if isinstance(samples[0].prompt, list):
+            filtered_samples = []
+            for sample in samples:
+                if check_sample_length(
+                    sample,
+                    tokenizer,
+                    processor,
+                    max_length,
+                    apply_chat_template_kwargs=apply_chat_template_kwargs,
+                ):
+                    filtered_samples.append(sample)
+        else:
+            prompts = [sample.prompt for sample in samples]
+            input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
+            filtered_samples = [
+                sample
+                for sample, input_ids in zip(samples, input_ids_list, strict=True)
+                if len(input_ids) <= max_length
+            ]
 
     filtered_count = len(samples) - len(filtered_samples)
     if filtered_count > 0:

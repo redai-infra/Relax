@@ -12,6 +12,11 @@ from omegaconf import OmegaConf
 from ray import serve
 from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
 
+from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
+from relax.agentic.session.service import (
+    deploy_agentic_chat_api_services,
+    shutdown_agentic_chat_api_services,
+)
 from relax.components.genrm import register_genrm
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
@@ -60,6 +65,11 @@ class Controller:
         if self._metrics_service_enabled:
             self._deploy_metrics_service()
 
+        if self.config.use_agentic_rollout:
+            deploy_agentic_chat_api_services(
+                config=self.config,
+                runtime_env=self.runtime_env,
+            )
         self._autoscaler_config = None
         try:
             self.register_all_serve()
@@ -400,6 +410,15 @@ class Controller:
         except Exception as e:
             logger.error(f"Failed to report error to metrics service: {e}")
 
+    def _shutdown_agentic_rollout_services(self, *, warning_prefix: str = "") -> None:
+        if not self.config.use_agentic_rollout:
+            return
+        shutdown_agentic_chat_api_services()
+        try:
+            clear_agentic_runtime_caches()
+        except Exception as e:
+            logger.warning(f"{warning_prefix}Failed to clear agentic runtime caches: {e}")
+
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
@@ -506,6 +525,8 @@ class Controller:
                 logger.info("RolloutManager disposed — SGLang engines shut down.")
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
+
+        self._shutdown_agentic_rollout_services()
 
         logger.info("Controller shutdown complete.")
 
@@ -677,6 +698,8 @@ class Controller:
                 logger.info("[Global Restart] Deleted metrics deployment")
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete metrics deployment: {e}")
+
+        self._shutdown_agentic_rollout_services(warning_prefix="[Global Restart] ")
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:

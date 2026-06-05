@@ -864,7 +864,13 @@ class StreamingDataset(BaseDataset):
 
             # Filter by length if max_length is set
             if self.max_length is not None:
-                if not check_sample_length(sample, self.tokenizer, self.processor, self.max_length):
+                if not check_sample_length(
+                    sample,
+                    self.tokenizer,
+                    self.processor,
+                    self.max_length,
+                    apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+                ):
                     self._filter_count += 1
                     return None
 

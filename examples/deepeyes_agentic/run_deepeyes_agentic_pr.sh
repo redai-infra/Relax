@@ -23,7 +23,7 @@ source "${MODEL_CONFIG_DIR}/qwen3-vl-30B-A3B.sh"
 ###############################################################################
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/deepeyes_pr}"
-EXP_NAME="qwen3vl-deepeyes-pr-${TIMESTAMP}"
+EXP_NAME="qwen3vl-deepeyes-agentic-pr-${TIMESTAMP}"
 
 # Require MODEL_DIR, DATA_DIR, SAVE_DIR from environment or set defaults
 if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; then
@@ -77,10 +77,10 @@ ROLLOUT_ARGS=(
     --multimodal-keys '{"image":"images"}'
     --reward-key score
     --metadata-key extra_info
-    --apply-chat-template
-    --custom-generate-function-path examples.deepeyes.rollout.generate
-    --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
-    --custom-config-path examples/deepeyes/deepeyes_config.yaml
+    --custom-rm-path examples.deepeyes_agentic.reward_deepeyes.reward_func
+    --use-agentic-rollout
+    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-cwd "${SCRIPT_DIR}"
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size 32
     --micro-batch-size 1
@@ -147,9 +147,7 @@ OPTIMIZER_ARGS=(
 #                               SGLANG CONFIG                                 #
 ###############################################################################
 
-SGLANG_ARGS=(
-    --sglang-mem-fraction-static 0.8
-)
+SGLANG_ARGS=(--sglang-mem-fraction-static 0.8)
 
 ###############################################################################
 #                               LOGGING CONFIG                                #
