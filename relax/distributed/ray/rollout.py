@@ -38,6 +38,7 @@ from relax.utils.metrics.metric_utils import (
     has_repetition,
 )
 from relax.utils.misc import group_by, load_function
+from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
@@ -3702,9 +3703,14 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
+    multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    log_dict |= _compute_min_mean_max_stats([s["image_count"] for s in multimodal_stats], "image_count/")
+    log_dict |= _compute_min_mean_max_stats(
+        [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
+    )
     log_dict |= compute_rollout_explicit_reward_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
@@ -3716,6 +3722,16 @@ def compute_metrics_from_samples(args, samples):
     log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     return log_dict
+
+
+def _compute_min_mean_max_stats(values: list[int], prefix: str) -> dict[str, float]:
+    if not values:
+        return {}
+    return {
+        f"{prefix}mean": np.mean(values).item(),
+        f"{prefix}max": np.max(values).item(),
+        f"{prefix}min": np.min(values).item(),
+    }
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):

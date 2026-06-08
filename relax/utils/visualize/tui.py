@@ -15,6 +15,7 @@ Requires the optional dependencies ``textual`` and ``rich``::
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 import threading
@@ -26,6 +27,59 @@ from typing import Optional
 _INDEX_KEY = "__IDX"
 _FILE_SUFFIX = ".jsonl"
 _DEFAULT_MASK_STR = r"<\|image_pad\|>|<\|imgpad\|>|<\|audio_comp_pad\|>"
+_NO_SORT_VALUE = "__no_sort__"
+_SORT_ASC_SUFFIX = ":asc"
+_SORT_DESC_SUFFIX = ":desc"
+
+
+def _parse_numeric_value(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text or text[0] in "[{":
+        return None
+    if text.lower() in {"true", "false", "none", "null", "nan", "inf", "+inf", "-inf", "infinity"}:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _numeric_fields(samples: list[dict]) -> list[str]:
+    fields: list[str] = []
+    seen: set[str] = set()
+    for sample in samples:
+        for key, value in sample.items():
+            if key == _INDEX_KEY or key in seen:
+                continue
+            if _parse_numeric_value(value) is not None:
+                fields.append(key)
+                seen.add(key)
+    return fields
+
+
+def _sort_options(samples: list[dict]) -> list[tuple[str, str]]:
+    options = [("no sort", _NO_SORT_VALUE)]
+    for field in _numeric_fields(samples):
+        options.append((f"{field} asc", f"{field}{_SORT_ASC_SUFFIX}"))
+        options.append((f"{field} desc", f"{field}{_SORT_DESC_SUFFIX}"))
+    return options
+
+
+def _sort_value_to_field(sort_value: str) -> tuple[str, bool] | None:
+    if sort_value.endswith(_SORT_ASC_SUFFIX):
+        return sort_value[: -len(_SORT_ASC_SUFFIX)], False
+    if sort_value.endswith(_SORT_DESC_SUFFIX):
+        return sort_value[: -len(_SORT_DESC_SUFFIX)], True
+    return None
 
 
 def _require_textual():
@@ -150,7 +204,7 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
                 self.datasets = []
             self.datasets.insert(0, "all datasets")
 
-            self.sort_mode = 0
+            self.sort_mode = _NO_SORT_VALUE
             self.ds_index = 0
 
         def compose(self) -> ComposeResult:
@@ -183,15 +237,9 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
                     )
                     yield Select(
                         id="sample-sort",
-                        value=0,
+                        value=_NO_SORT_VALUE,
                         prompt="sort",
-                        options=[
-                            ("no sort", 0),
-                            ("reward asc", 1),
-                            ("reward desc", 2),
-                            ("resp len asc", 3),
-                            ("resp len desc", 4),
-                        ],
+                        options=[("no sort", _NO_SORT_VALUE)],
                         allow_blank=False,
                     )
                     yield SelectionList[int](("Select ALL", 1, True), id="fields-select-all")
@@ -218,9 +266,10 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
                 self.sample_select.set_options([(f"sample: {i + 1}", i) for i in range(self.sample_num)])
                 self.ds_select.set_options([(f"{ds}", i) for i, ds in enumerate(self.datasets)])
                 self.step_select.focus()
+                await self.update_options(self.sort_mode, self.ds_index)
                 await self.update_content()
 
-        async def update_options(self, sort_mode: int, ds_index: int, offset: int = 0) -> None:
+        async def update_options(self, sort_mode: str, ds_index: int, offset: int = 0) -> None:
             if self.selected_step_index not in self.data:
                 self.selected_sample_index = offset
                 return
@@ -233,28 +282,25 @@ def _build_app(step_num: int, data: dict, file_idx_map: dict):
                 want = self.datasets[ds_index]
                 samples = [s for s in samples if s.get("dataset") == want]
 
-            def _resp_len(x):
-                try:
-                    return int(x.get("response_length", 0))
-                except (TypeError, ValueError):
-                    return 0
+            sort_options = _sort_options(samples)
+            option_values = {value for _, value in sort_options}
+            if sort_mode not in option_values:
+                sort_mode = _NO_SORT_VALUE
+            self.sample_sort.set_options(sort_options)
 
-            def _reward(x):
-                try:
-                    return float(x.get("reward", 0))
-                except (TypeError, ValueError):
-                    return 0.0
-
-            if sort_mode == 1:
-                samples.sort(key=_reward)
-            elif sort_mode == 2:
-                samples.sort(key=_reward, reverse=True)
-            elif sort_mode == 3:
-                samples.sort(key=_resp_len)
-            elif sort_mode == 4:
-                samples.sort(key=_resp_len, reverse=True)
-            else:
+            sort_field = _sort_value_to_field(sort_mode)
+            if sort_field is None:
                 samples.sort(key=lambda x: x[_INDEX_KEY])
+            else:
+                field, descending = sort_field
+
+                def _numeric_key(x):
+                    value = _parse_numeric_value(x.get(field))
+                    if value is None:
+                        return (1, 0.0, x[_INDEX_KEY])
+                    return (0, -value if descending else value, x[_INDEX_KEY])
+
+                samples.sort(key=_numeric_key)
 
             options = [(f"sample: {r[_INDEX_KEY] + 1}", r[_INDEX_KEY]) for r in samples]
             self.sample_select.set_options(options or [("(empty)", 0)])
