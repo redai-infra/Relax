@@ -236,14 +236,20 @@ def process_raw_sample(
         assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
         metadata["tools"] = tools
 
-    # Apply chat template if needed
+    # Apply chat template if needed.
+    # Per-sample override: a sample may carry its own ``apply_chat_template_kwargs``
+    # in ``metadata`` (e.g. per-sample ``enable_thinking``). It is merged on top of
+    # the global kwargs so the global value is the default and the per-sample value
+    # wins. Samples without this metadata key keep the global behavior unchanged.
+    per_sample_kwargs = metadata.get("apply_chat_template_kwargs") if isinstance(metadata, dict) else None
+    merged_chat_template_kwargs = {**(apply_chat_template_kwargs or {}), **(per_sample_kwargs or {})}
     if apply_chat_template:
         output_prompt = tokenizer.apply_chat_template(
             prompt,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
-            **(apply_chat_template_kwargs or {}),
+            **merged_chat_template_kwargs,
         )
     else:
         output_prompt = prompt
@@ -290,6 +296,12 @@ def check_sample_length(
     """
     try:
         tools = sample.metadata.get("tools") if isinstance(sample.metadata, dict) else None
+        # Honor per-sample apply_chat_template_kwargs (same merge as process_raw_sample)
+        # so length filtering renders the prompt exactly as the rollout will.
+        per_sample_kwargs = (
+            sample.metadata.get("apply_chat_template_kwargs") if isinstance(sample.metadata, dict) else None
+        )
+        merged_chat_template_kwargs = {**(apply_chat_template_kwargs or {}), **(per_sample_kwargs or {})}
         if isinstance(sample.prompt, str):
             prompt_text = sample.prompt
             input_ids = None
@@ -302,7 +314,7 @@ def check_sample_length(
                 tools=tools,
                 tokenize=False,
                 add_generation_prompt=True,
-                **(apply_chat_template_kwargs or {}),
+                **merged_chat_template_kwargs,
             )
             input_ids = None
         else:
@@ -321,7 +333,7 @@ def check_sample_length(
                     tools=tools,
                     tokenize=True,
                     add_generation_prompt=True,
-                    **(apply_chat_template_kwargs or {}),
+                    **merged_chat_template_kwargs,
                 )
             else:
                 input_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
