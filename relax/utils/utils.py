@@ -353,6 +353,28 @@ def post_process_env(args, env):
     python_paths = list(dict.fromkeys(python_paths))
 
     env["env_vars"]["PYTHONPATH"] = ":".join(python_paths)
+
+    # Propagate the extension-module hook so every Ray actor that loads
+    # ``relax.backends.megatron`` re-runs the imports listed here (analogue
+    # of ``--custom-generate-function-path``). Downstream packages register
+    # Megatron-Bridge converters / family-token tables this way.
+    extra_modules = os.environ.get("RELAX_EXTRA_MODULES")
+    if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
+        env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
+
+    # Generic env-var passthrough for overlay packages. Comma-separated list
+    # of env-var names the driver wants forwarded to every Ray actor. Each
+    # name is copied from the driver's os.environ; missing names are
+    # silently skipped.
+    propagate_list = os.environ.get("RELAX_PROPAGATE_ENV_VARS", "")
+    for var in propagate_list.split(","):
+        var = var.strip()
+        if not var or var in env["env_vars"]:
+            continue
+        val = os.environ.get(var)
+        if val is not None:
+            env["env_vars"][var] = val
+
     logger.info(f"Ray runtime env: {env['env_vars']}")
     return env
 

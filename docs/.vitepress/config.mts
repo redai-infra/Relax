@@ -243,6 +243,7 @@ export default defineConfig({
                 { text: 'Installation', link: '/en/guide/installation' },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
+                { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
             },
@@ -345,6 +346,7 @@ export default defineConfig({
                 { text: '安装', link: '/zh/guide/installation' },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
+                { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]
             },

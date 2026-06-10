@@ -3,6 +3,7 @@
 import base64
 import math
 import os
+import urllib.parse
 from io import BytesIO
 from typing import Any, ByteString, Dict, Optional, Tuple, Union
 
@@ -168,23 +169,55 @@ def load_image_from_bytes(image: bytes, **kwargs: Any) -> Image.Image:
     return Image.open(BytesIO(image))
 
 
+def decode_data_uri(uri: str) -> bytes:
+    """Decode an RFC 2397 `data:` URI to raw bytes.
+
+    Handles both `;base64` and URL-encoded payloads. Caller is responsible for
+    confirming the input starts with `data:`.
+    """
+    head, _, body = uri.partition(",")
+    if not body:
+        raise ValueError(f"Malformed data URI: {uri[:32]!r}")
+    if "base64" in head.lower():
+        return base64.b64decode(body)
+    return urllib.parse.unquote_to_bytes(body)
+
+
 def load_image(image: ImageInput, **kwargs: Any) -> Image.Image:
     """Generic loader for different image input types.
 
     Parameters
-    - image: One of `PIL.Image`, `np.ndarray`, raw bytes, or a string path/URL.
+    - image: One of:
+        - `PIL.Image.Image`: returned as-is.
+        - `str`: a path, URL, or `data:` URI.
+        - `bytes`: raw image bytes.
+        - `dict`: with one of `bytes`, `base64`, or `path` fields
+          (HF `datasets` / OpenAI-style payloads).
 
     Returns
     - A `PIL.Image` instance.
     """
+    if isinstance(image, Image.Image):
+        return image
     if isinstance(image, str):
+        if image.startswith("data:"):
+            return load_image_from_bytes(decode_data_uri(image), **kwargs)
         return load_image_from_path(image, **kwargs)
-    elif isinstance(image, bytes) or (isinstance(image, dict) and isinstance(image.get("bytes", None), bytes)):
-        if isinstance(image, dict):
-            image = image["bytes"]
-        return load_image_from_bytes(image, **kwargs)
-    else:
-        raise NotImplementedError
+    if isinstance(image, (bytes, bytearray)):
+        return load_image_from_bytes(bytes(image), **kwargs)
+    if isinstance(image, dict):
+        raw = image.get("bytes")
+        if isinstance(raw, (bytes, bytearray)):
+            return load_image_from_bytes(bytes(raw), **kwargs)
+        b64 = image.get("base64")
+        if isinstance(b64, str):
+            return load_image_from_bytes(base64.b64decode(b64), **kwargs)
+        path = image.get("path")
+        if isinstance(path, str):
+            if path.startswith("data:"):
+                return load_image_from_bytes(decode_data_uri(path), **kwargs)
+            return load_image_from_path(path, **kwargs)
+    raise NotImplementedError(f"Unsupported image input type: {type(image)}")
 
 
 def fetch_image(

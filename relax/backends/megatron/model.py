@@ -38,6 +38,30 @@ from .model_provider import get_model_provider_func, wrap_model_provider_with_fr
 logger = get_logger(__name__)
 
 
+def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dict) -> None:
+    """Attach Megatron MTP kwargs for training forwards."""
+    if not getattr(args, "enable_mtp_training", False):
+        return
+
+    # Use the packed text-model labels. Qwen3/VL bridge forwards may receive
+    # unsplit input_ids, then convert them to this layout internally.
+    forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+    if forward_kwargs.get("loss_mask") is None:
+        forward_kwargs["loss_mask"] = batch["full_loss_masks"]
+
+
+def _main_loss_has_tokens(batch: dict) -> bool:
+    """Return whether the current CI batch still has any main-loss tokens."""
+    loss_mask = batch.get("full_loss_masks")
+    if loss_mask is None:
+        return True
+
+    num_tokens = loss_mask.detach().sum()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(num_tokens, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    return bool(num_tokens.item() > 0)
+
+
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
@@ -237,6 +261,7 @@ def forward_only(
         assert not return_schedule_plan, "forward_only step should never return schedule plan"
 
         # Get the batch.
+        is_vl_model = getattr(args, "is_vl_model", False)
         batch = get_batch(
             data_iterator,
             [
@@ -250,6 +275,7 @@ def forward_only(
             args.data_pad_size_multiplier,
             args.qkv_format,
             args.allgather_cp,
+            is_vl_model,
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -257,9 +283,12 @@ def forward_only(
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
 
-        is_vl_model = batch.get("multimodal_train_inputs", None) is not None
-        mm_kwargs = batch["multimodal_train_inputs"] if is_vl_model else {}
-        needs_unsplit = is_vl_model or getattr(args, "uses_unsplit_forward", False)
+        # VL model with text-only batch: is_vl_model=True but no
+        # multimodal_train_inputs in batch — keep mm_kwargs empty so bridge
+        # takes the image_grid_thw=None branch.
+        mm_kwargs = batch.get("multimodal_train_inputs") or {}
+        has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
+        needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
 
         # Bridge Qwen3VLModel.forward (VL or text-only Qwen3.6) does CP+SP
         # splitting internally, so pass unsplit tokens.
@@ -282,15 +311,16 @@ def forward_only(
             forward_attention_mask = None
             forward_loss_mask = batch["full_loss_masks"]
 
-        output_tensor = model(
-            input_ids=forward_input_ids,
-            position_ids=None,
-            attention_mask=forward_attention_mask,
-            labels=None,
-            packed_seq_params=forward_packed_seq_params,
-            loss_mask=forward_loss_mask,
+        forward_kwargs = {
+            "input_ids": forward_input_ids,
+            "position_ids": None,
+            "attention_mask": forward_attention_mask,
+            "labels": None,
+            "packed_seq_params": forward_packed_seq_params,
+            "loss_mask": forward_loss_mask,
             **mm_kwargs,
-        )
+        }
+        output_tensor = model(**forward_kwargs)
 
         return output_tensor, partial(
             f,
@@ -301,6 +331,7 @@ def forward_only(
             with_entropy=args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
+            loss_masks=batch.get("loss_masks", None),
         )
 
     # Turn on evaluation mode which disables dropout.
@@ -346,11 +377,18 @@ def forward_only(
             if args.use_dynamic_batch_size:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
-                origin_values = [None] * len(values)
                 origin_indices = sum(data_iterator[0].micro_batch_indices, [])
-                for value, origin_index in zip(values, origin_indices, strict=False):
-                    origin_values[origin_index] = value
-                values = origin_values
+                # Per-sample callbacks (log_probs/values) emit one tensor per
+                # sample, so values aligns with origin_indices and we can
+                # restore the pre-balance order. Per-microbatch callbacks
+                # (e.g. compute_sft_eval_step) emit one aggregate per
+                # microbatch — len(values) == num_microbatches, not
+                # num_samples — and have no per-sample order to restore.
+                if len(values) == len(origin_indices):
+                    origin_values = [None] * len(values)
+                    for value, origin_index in zip(values, origin_indices, strict=False):
+                        origin_values[origin_index] = value
+                    values = origin_values
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 
@@ -397,6 +435,8 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    main_loss_has_tokens = False
+
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
     ) -> tuple[
@@ -415,6 +455,8 @@ def train_one_step(
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
 
+        nonlocal main_loss_has_tokens
+        is_vl_model = getattr(args, "is_vl_model", False)
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             batch = get_batch(
@@ -438,7 +480,10 @@ def train_one_step(
                 args.data_pad_size_multiplier,
                 args.qkv_format,
                 args.allgather_cp,
+                is_vl_model,
             )
+        if args.ci_test and args.enable_mtp_training:
+            main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
@@ -455,8 +500,8 @@ def train_one_step(
                 loss_mask=batch["full_loss_masks"],
             )
         else:
-            is_vl_model = batch.get("multimodal_train_inputs", None) is not None
-            needs_unsplit = is_vl_model or getattr(args, "uses_unsplit_forward", False)
+            has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
+            needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
             use_unsplit = needs_unsplit and "unsplit_tokens" in batch
 
             forward_kwargs = {
@@ -477,11 +522,13 @@ def train_one_step(
                 forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
                 forward_kwargs["loss_mask"] = None
 
-            if args.enable_mtp_training:
-                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+            _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
 
-            if is_vl_model:
-                forward_kwargs.update(batch["multimodal_train_inputs"])
+            # VL model with text-only batch has is_vl_model=True but no
+            # multimodal_train_inputs in batch — no kwargs to splice in.
+            mm_inputs = batch.get("multimodal_train_inputs")
+            if is_vl_model and mm_inputs:
+                forward_kwargs.update(mm_inputs)
 
             output_tensor = model(**forward_kwargs)
 
@@ -521,7 +568,7 @@ def train_one_step(
     if args.ci_test and args.enable_mtp_training:
         from relax.backends.megatron.ci_utils import check_mtp_only_grad
 
-        check_mtp_only_grad(model, step_id)
+        check_mtp_only_grad(model, step_id, require_non_mtp_zero=not main_loss_has_tokens)
 
     if valid_step:
         # Update parameters.
@@ -726,6 +773,11 @@ def train(
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
             log_dict["train/step"] = accumulated_step_id
+            num_per_epoch = getattr(args, "num_rollout_per_epoch", None)
+            if num_per_epoch:
+                log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
+                    num_per_epoch * num_steps_per_rollout
+                )
             tracking_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and not args.ci_disable_kl_checker:

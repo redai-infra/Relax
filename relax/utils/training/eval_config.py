@@ -93,6 +93,14 @@ def _ensure_metadata_overrides(value: Any) -> dict[str, Any]:
 
 
 @dataclass
+class NamedPromptDataConfig:
+    """Name/path pair passed by --eval-prompt-data."""
+
+    name: str
+    path: str
+
+
+@dataclass
 class EvalDatasetConfig:
     """Configuration for a single evaluation dataset."""
 
@@ -178,6 +186,21 @@ def ensure_dataset_list(config: Any) -> list[dict[str, Any]]:
         return datasets
 
     raise TypeError("eval.datasets must be either a list or a mapping.")
+
+
+def build_named_prompt_data_configs(
+    values: Any, *, flag_name: str = "--eval-prompt-data"
+) -> list[NamedPromptDataConfig]:
+    """Normalize Relax prompt-data CLI values into name/path pairs."""
+
+    if not values:
+        return []
+    items = list(values) if isinstance(values, (list, tuple)) else [values]
+    if len(items) == 1:
+        items = ["aime", items[0]]
+    if len(items) % 2 != 0:
+        raise ValueError(f"{flag_name} must be provided as name/path pairs.")
+    return [NamedPromptDataConfig(name=str(items[i]), path=str(items[i + 1])) for i in range(0, len(items), 2)]
 
 
 def _apply_dataset_field_overrides(

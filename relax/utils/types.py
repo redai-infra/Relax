@@ -193,6 +193,23 @@ class ParamInfo:
 # before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
 RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
 
+SFTBatch = dict[str, list[torch.Tensor] | list[int] | list[str] | dict | None]
+"""SFT 训练 batch 的 dict alias。
+
+Required keys（producer 必须填、consumer 必读）:
+    - "input_ids":        list[torch.Tensor]    # packed token IDs，每条样本一个 1D tensor
+    - "position_ids":     list[torch.Tensor]    # 每个 sample 的 position id
+    - "loss_mask":        list[torch.Tensor]    # 1=参与 loss（assistant token），0=不参与
+    - "cu_seqlens":       list[torch.Tensor]    # packing 边界，shape=(num_samples_in_pack+1,) int32
+    - "total_lengths":    list[int]             # 每个 pack 的总 token 数（含 padding）
+    - "response_lengths": list[int]             # 每个 pack 的 assistant token 数（用于 metric）
+    - "metadata":         list[dict]            # sample-level 元信息（source_dataset、原始行号等）
+
+Optional keys:
+    - "multimodal_inputs":       list[dict] | None  # 图像/视频/音频特征（非多模态时为 None）
+    - "multimodal_train_inputs": list[dict] | None  # processor_pool 处理后的可入模张量
+"""
+
 
 @dataclass
 class MultimodalType:

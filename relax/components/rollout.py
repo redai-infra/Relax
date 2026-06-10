@@ -375,6 +375,12 @@ class Rollout(Base):
         return self.rollout_manager
 
     async def _async_run(self) -> None:
+        from relax.engine.sft.runtime import is_sft_mode
+
+        # SFT-with-rollout: Rollout is a passive SGLang server that responds to
+        # HTTP /predict and /evaluate driven by the Actor. No RL rollout loop.
+        if is_sft_mode(self.config):
+            return
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
                 await self.rollout_manager.eval.remote(rollout_id=0)
@@ -511,6 +517,17 @@ class Rollout(Base):
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("rollout", error_msg)
             return {"status": "error", "message": error_msg}
+
+    @app.get("/predict")
+    async def predict(self, train_step: int):
+        """Periodic SFT predict pass — symmetric with /evaluate.
+
+        Body lives in ``relax.engine.sft.predict.runner.handle_predict``;
+        this method is the thin HTTP-decoration shell.
+        """
+        from relax.engine.sft.predict.runner import handle_predict
+
+        return await handle_predict(self, train_step)
 
     @app.get("/can_do_update_weight_for_async")
     async def can_do_update_weight_for_async(self):

@@ -30,6 +30,16 @@ from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.sft.eval.runner import run_sft_eval
+from relax.engine.sft.predict.runner import run_sft_predict
+from relax.engine.sft.runtime import (
+    build_data_fields,
+    is_sft_mode,
+    sft_partition_id,
+    sft_task_name,
+    should_run_sft_eval,
+    should_run_sft_predict,
+)
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
@@ -83,6 +93,12 @@ logger = logging.getLogger(__name__)
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    @property
+    def _per_step_rollout(self) -> bool:
+        """RL: rollout consumes weights every train step. SFT: only on
+        periodic predict steps; Megatron stays awake between."""
+        return not is_sft_mode(self.args)
+
     def init(
         self,
         args: Namespace,
@@ -127,6 +143,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
+
+        # Single source of truth for VL-model routing across data prep, forward,
+        # and CP helpers. Detected by the presence of processor/preprocessor
+        # config in the HF checkpoint dir — only multimodal models ship one.
+        # This way VL models with text-only batches (no --multimodal-keys) still
+        # take the bridge VL+CP+thd path.
+        args.is_vl_model = any(
+            os.path.exists(os.path.join(args.hf_checkpoint, name))
+            for name in ("processor_config.json", "preprocessor_config.json")
+        )
 
         from relax.utils.training.flops_counter import FlopsCounter
 
@@ -282,7 +308,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
-            self.sleep()
+            if self._per_step_rollout:
+                self.sleep()
 
         self.rollout_engines = None
 
@@ -294,6 +321,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof.on_init_end()
         self.data_iterator = None
+
+        if dist.get_rank() == 0:
+            logger.info(
+                "[per_rank_fetch] enabled=%s (effective when rollout_routed_experts not in data_fields)",
+                self.args.per_rank_fetch,
+            )
 
         return start_rollout_id
 
@@ -450,7 +483,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_rollout and dist.get_rank() == 0 and self.genrm_manager is not None:
             ray.get(self.genrm_manager.offload.remote())
 
-        if self.args.offload_train:
+        if self.args.offload_train and self._per_step_rollout:
             self.wake_up()
 
         if self.args.debug_train_only:
@@ -465,36 +498,28 @@ class MegatronTrainRayActor(TrainRayActor):
                 return self.train_actor(rollout_id, rollout_data)
         else:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train with mcore.")
-            batch_size = (
-                self.args.rollout_batch_size
-                * self.args.n_samples_per_prompt
-                // mpu.get_data_parallel_world_size(with_context_parallel=False)
-            )
+            if is_sft_mode(self.args):
+                batch_size = self.args.global_batch_size // mpu.get_data_parallel_world_size(
+                    with_context_parallel=False
+                )
+            else:
+                batch_size = (
+                    self.args.rollout_batch_size
+                    * self.args.n_samples_per_prompt
+                    // mpu.get_data_parallel_world_size(with_context_parallel=False)
+                )
             batch_index = 0
-            while not self.all_consumed("train", rollout_id):
-                data_fields = [
-                    "tokens",
-                    "total_lengths",
-                    "response_lengths",
-                    "loss_masks",
-                    "rollout_log_probs",
-                    "rewards",
-                    "raw_reward",
-                ]
-                data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
-                if self.args.multimodal_keys is not None:
-                    data_fields.append("multimodal_train_inputs")
-
-                if self.args.use_opd and self.args.opd_type == "sglang":
-                    data_fields.append("teacher_log_probs")
-                    if self.args.opd_log_prob_top_k > 0:
-                        data_fields.append("teacher_topk_token_ids")
-                        data_fields.append("teacher_topk_k")
+            task_name = sft_task_name(self.args, component="backend")
+            empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
+            while not self.all_consumed(task_name, rollout_id):
+                data_fields = build_data_fields(self.args)
                 with timer("train_get_data"):
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
-                        "train", rollout_id, data_fields, batch_size, batch_index
+                        task_name, rollout_id, data_fields, batch_size, batch_index
                     )
                 if rollout_data is None:
+                    if empty_poll_sleep_s > 0:
+                        time.sleep(empty_poll_sleep_s)
                     continue
                 batch_index += 1
                 if self.role == "critic":
@@ -645,6 +670,20 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
+        # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
+        # assistant-only tokens; for RL it's the response-only mask sum. Avoids
+        # the SFT `response_length == total_length` convention (see data.py:296).
+        response_token_counts = [
+            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
+        ]
+        all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+        dist.all_gather_object(
+            all_response_token_counts,
+            response_token_counts,
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
+        )
+        all_response_token_counts = sum(all_response_token_counts, [])  # flatten
+        Timer().response_lens = all_response_token_counts
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
             images_seqlens = _extract_images_seqlens(mm_inputs)
@@ -667,18 +706,47 @@ class MegatronTrainRayActor(TrainRayActor):
             and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
         ):
             self.save_model(rollout_id, force_sync=is_train_done)
-        if self.args.offload_train:
-            self.sleep()
-        self.update_weights()
+        has_rollout = getattr(self, "rollout_manager", None) is not None
+        # SFT bundles sleep + update_weights into the predict block below.
+        if self._per_step_rollout:
+            if self.args.offload_train:
+                self.sleep()
+            if has_rollout:
+                self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
+        # uses run_sft_eval (PPL) and /predict (generative) below instead.
         dist.barrier(group=get_gloo_group())
-        if dist.get_rank() == 0:
+        if self._per_step_rollout:
+            if dist.get_rank() == 0:
+                try:
+                    response = requests.get(f"{get_serve_url('rollout')}/evaluate", params={"train_step": rollout_id})
+                    response.raise_for_status()
+                except Exception as e:
+                    logger.warning(f"Error triggering evaluation for rollout_id {rollout_id}: {e}")
+
+        # SFT periodic PPL eval — runs entirely inside Megatron actor (no
+        # SGLang/Rollout). Producer pushes the eval set serially in chunks
+        # to `sft_eval_<rollout_id>_n<N>_<i>`; the runner discovers N,
+        # consumes each chunk, runs forward-only, aggregates and logs.
+        if should_run_sft_eval(self.args, rollout_id):
+            # Free `sft_<rollout_id>` from TQ before entering eval. The
+            # Actor component clears it only after `_execute_training`
+            # returns, which won't fire until we exit train_actor — and the
+            # producer's serial eval push gates on this partition draining.
+            if dist.get_rank() == 0:
+                run(
+                    self.data_system_client.async_clear_partition(partition_id=sft_partition_id(self.args, rollout_id))
+                )
+            dist.barrier(group=get_gloo_group())
             try:
-                rollout_serve_url = get_serve_url("rollout")
-                response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
-                response.raise_for_status()
+                run_sft_eval(self, rollout_id)
             except Exception as e:
-                logger.warning(f"Error triggering evaluation for rollout_id {rollout_id}: {e}")
+                logger.warning(f"SFT eval at rollout_id {rollout_id} failed: {e}")
+                raise
+
+        if has_rollout and should_run_sft_predict(self.args, rollout_id):
+            run_sft_predict(self, rollout_id)
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here
@@ -1086,6 +1154,17 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
+        response_token_counts = [
+            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
+        ]
+        all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+        dist.all_gather_object(
+            all_response_token_counts,
+            response_token_counts,
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
+        )
+        all_response_token_counts = sum(all_response_token_counts, [])  # flatten
+        Timer().response_lens = all_response_token_counts
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
             images_seqlens = _extract_images_seqlens(mm_inputs)
@@ -1110,7 +1189,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # torch dist may trigger nccl communication during saving; resume the
         # paused model (process groups + tms) so save can issue collectives and
         # touch GPU tensors.
-        if self.args.offload_train:
+        if self.args.offload_train and self._per_step_rollout:
             self.wake_up()
 
         if self.args.async_save:
@@ -1133,7 +1212,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             save_hf_model(self.args, rollout_id, self.model)
 
-        if self.args.offload_train:
+        if self.args.offload_train and self._per_step_rollout:
             self.sleep()
 
     @timer
@@ -1220,7 +1299,9 @@ class MegatronTrainRayActor(TrainRayActor):
         elif self.args.offload_train:
             destroy_process_groups()
 
-        if self.args.offload_rollout and dist.get_rank() == 0:
+        # RL warms KV here for the next per-step generate. SFT's /predict
+        # calls onload_kv itself.
+        if self.args.offload_rollout and dist.get_rank() == 0 and self._per_step_rollout:
             ray.get(self.rollout_manager.onload_kv.remote())
 
     @timer("wait update_weights_fully_async")
@@ -1397,16 +1478,18 @@ class MegatronTrainRayActor(TrainRayActor):
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
 
-    def all_consumed(self, task_name, rollout_id):
+    def all_consumed(self, task_name, rollout_id, partition_id: str | None = None):
         # Only (TP=0, PP=0, CP=0) queries the transfer queue; otherwise different cp_ranks
         # may observe different consumption status due to concurrent fetches and diverge,
         # leaving some ranks idle while others enter the next collective and hang.
+        if partition_id is None:
+            partition_id = sft_partition_id(self.args, rollout_id)
         if (
             mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == 0
             and mpu.get_context_parallel_rank() == 0
         ):
-            status = [run(self.data_system_client.async_check_consumption_status(task_name, f"train_{rollout_id}"))]
+            status = [run(self.data_system_client.async_check_consumption_status(task_name, partition_id))]
         else:
             status = [True]
         status = torch.tensor(status, device=device_utils.make_current_torch_device())
@@ -1416,14 +1499,36 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return status[0]
 
-    def _get_data_from_transfer_queue(self, task_name, rollout_id, data_fields, batch_size, batch_index):
+    def _get_data_from_transfer_queue(
+        self, task_name, rollout_id, data_fields, batch_size, batch_index, partition_id: str | None = None
+    ):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will recieve the data.
-        partition_id = f"train_{rollout_id}"
+        if partition_id is None:
+            partition_id = sft_partition_id(self.args, rollout_id)
         sampling_config = {
-            "dp_rank": mpu.get_data_parallel_rank(),
+            # CP partners share one logical DP slot: they must present the same
+            # dp_rank to the TQ sampler so its (partition_id, task_name, dp_rank,
+            # batch_index) cache deduplicates their fetches. Otherwise CP=2 turns
+            # 4 logical shards into 8 competing consumers and one of them gets
+            # starved at the producer→consumer boundary (e.g. after sft-predict).
+            "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
             "task_name": task_name,
         }
+        # Skip the PP broadcast when PP world size is 1: it's a self-broadcast
+        # but still pays the full pickle cost on every TP rank-0 fetcher
+        # (multimodal pixel_values can be hundreds of MB → seconds per call).
+        broadcast_pp = mpu.get_pipeline_model_parallel_world_size() > 1
+        # Per-rank fetch (opt-in via --per-rank-fetch) lets every TP/PP
+        # rank pull its own copy from TQ in parallel instead of paying one
+        # rank-0 pickle + one TP/PP broadcast.  Cross-rank consistency relies
+        # on the TQ sampler's ``(partition_id, task_name, dp_rank, batch_index)``
+        # cache (transfer_queue/sampler/{base,grpo_group_n,seqlen_balanced}.py),
+        # which is PP/TP-invariant, so all ranks within a DP group receive
+        # byte-identical sample ids regardless of PP world size.  The only
+        # remaining incompatibility is ``rollout_routed_experts`` — it relies on
+        # the NestedTensor jagged bcast path that this mode bypasses.
+        per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
         rollout_data, batch_meta = get_data_from_transfer_queue(
             self.args,
             self.data_system_client,
@@ -1433,6 +1538,8 @@ class MegatronTrainRayActor(TrainRayActor):
             task_name,
             sampling_config,
             batch_index,
+            broadcast_pp=broadcast_pp,
+            per_rank_fetch=per_rank_fetch,
         )
 
         return rollout_data, batch_meta

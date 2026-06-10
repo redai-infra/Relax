@@ -31,6 +31,7 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--num-data-storage-units` | int | 1 | Number of TransferQueue SimpleStorageUnit actors |
+| `--per-rank-fetch` | flag | False | Let every TP/PP rank pull its own copy from TransferQueue in parallel instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank consistency relies on the TQ sampler's `(partition_id, task_name, dp_rank, batch_index)` cache, which is PP/TP-invariant. Auto-disabled when `rollout_routed_experts` is in `data_fields` (jagged NestedTensor broadcast path is incompatible). Recommended for multi-GPU training together with `--num-data-storage-units >= TP world size`. Wins when pickle dominates `tgd_bcast_tp_time`. |
 | `--max-staleness` | int | 0 | Maximum staleness for TransferQueue data system (0=on-policy) |
 | `--polling-mode` | bool | True | Whether to use polling mode when fetching metadata |
 | `--num-iters-per-train-update` | int | 1 | Number of iterations per global batch in fully async pipeline |
@@ -79,6 +80,7 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--prompt-data` | str | None | Training prompt dataset path |
 | `--input-key` | str | input | Key for input field in dataset |
 | `--label-key` | str | None | Key for label field in dataset |
+| `--conversation-key-map` | json | None | JSON map that rewrites non-OpenAI conversation messages into the `{role, content}` shape SFT expects. A single flat map covers two distinct renames: **field-name rename** (applied to every message-dict key, e.g. `from`→`role`, `value`→`content`) and **role-value rename** (applied only to the value of the resulting `role` field, e.g. `human`→`user`, `gpt`→`assistant` — so message bodies that happen to contain the same words are left untouched). Only consulted when `--label-key` is unset (i.e., `--input-key` holds a full messages list). Sharegpt example: `'{"from":"role","value":"content","human":"user","gpt":"assistant"}'` |
 | `--metadata-key` | str | metadata | Key for metadata field in dataset |
 | `--tool-key` | str | tools | Key for tools field when applying Chat Template |
 | `--apply-chat-template` | flag | False | Apply Chat Template to input as OpenAI message format |
@@ -280,7 +282,7 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--loss-type` | str | policy_loss | `policy_loss`, `custom_loss` | Loss type. When `custom_loss`, must set `--custom-loss-function-path` |
+| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `custom_loss` | Loss type. `policy_loss` runs PPO/GRPO/etc. RL training; `sft` runs supervised fine-tuning (see [SFT Configuration](#sft-configuration)); `custom_loss` requires `--custom-loss-function-path`. `sft_loss` is a deprecated alias for `sft`. |
 | `--custom-loss-function-path` | str | None | - | Custom loss function path |
 | `--eps-clip` | float | 0.2 | - | PPO clipping range (lower bound) |
 | `--eps-clip-high` | float | None | - | PPO clipping upper bound. When None, equals `--eps-clip` |
@@ -351,6 +353,42 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 |-----------|------|---------|-------------|
 | `--only-train-params-name-list` | str (list) | None | List of regex patterns for parameters to train. Other parameters are frozen. Cannot be used simultaneously with `--freeze-params-name-list`. Example: `--only-train-params-name-list experts` |
 | `--freeze-params-name-list` | str (list) | None | List of regex patterns for parameters to freeze. Other parameters remain trainable. Example: `--freeze-params-name-list embedding output_layer` |
+
+---
+
+## SFT Configuration
+
+These flags only apply under `--loss-type sft`. The SFT pipeline runs an `SFTStreamingDataset` producer that pushes packed samples into the TransferQueue under partition `sft_<rollout_id>`, and an `MegatronTrainRayActor` consumer that trains, periodically evaluates (PPL), and optionally runs generative prediction.
+
+### Training Control
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--eval-size` | float | None | Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → last 5%); a value ≥1 is treated as an absolute sample count. The reserved tail is removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
+| `--sft-predict-interval` | int | None | Every N rollout steps run a generative predict pass over the eval set and write completions to `<save>/predict/predictions_step_<rollout_id>.jsonl`. Setting this flag implicitly spins up the Rollout role under SFT (SGLang must be online). Controls the generative complement to the always-on PPL eval (`--eval-interval`). **Requires** `--save` (writes under `<save>/predict/`) and at least one eval source (`--eval-prompt-data` / `--eval-config` / `--eval-size`). |
+
+### Streaming Dataset Prefetch
+
+The SFT producer uses its own `PrefetchBuffer` independent from the rollout data source's `--prefetch-*` knobs.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--sft-prefetch-buffer-size` | int | 256 | Max pre-loaded samples held by the SFT streaming dataset's PrefetchBuffer. Set to 0 to disable prefetching; the producer then falls back to an `asyncio.gather` path over the ProcessorPool for batch-level parallelism. |
+| `--sft-prefetch-chunk-size` | int | 32 | Chunk size dispatched to the SFT prefetch thread-pool per round. |
+| `--sft-prefetch-num-workers` | int | 4 | Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding (video/image). |
+
+### Oversize Sample Handling
+
+How the SFT producer handles samples whose tokenized + media-expanded length exceeds the per-GPU capacity (`--max-tokens-per-gpu × --context-parallel-size`). All branches log a WARNING per oversized sample.
+
+| Parameter | Type | Default | Options | Description |
+|-----------|------|---------|---------|-------------|
+| `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` drops the sample; `keep` returns it unchanged (may OOM downstream); `truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first `capacity` tokens; `custom` delegates to `--sft-oversize-custom-function-path`. ⚠ Truncating multimodal samples in-place may misalign `multimodal_train_inputs` — use `custom` if you also need to trim media inputs. |
+| `--sft-oversize-custom-function-path` | str | None | - | Required when `--sft-oversize-strategy custom`. Importable path to a function with signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`. Returning `None` is treated as `skip`. |
+
+::: tip Related dataset flags
+SFT also uses the general dataset flags from [Data Configuration](#data-configuration), in particular `--input-key`, `--label-key`, `--conversation-key-map` (for sharegpt-style datasets), `--multimodal-keys`, `--system-prompt`, and `--tool-key`.
+:::
 
 ---
 

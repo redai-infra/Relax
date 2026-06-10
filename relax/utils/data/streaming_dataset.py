@@ -390,13 +390,18 @@ class IndexManager:
     def get_next_indices(self, n: int) -> tuple[list[int], bool]:
         """Get next n indices from the current epoch.
 
-        If we reach the end of the epoch, wraps around and increments epoch.
+        If we reach the end of the epoch and still need more samples, lazily
+        advances to the next epoch (re-shuffles).  Exhausting the current epoch
+        exactly (n == remaining) does NOT count as crossing — the boundary is
+        only crossed when at least one returned sample comes from the next
+        epoch's permutation.
 
         Args:
             n: Number of indices to get
 
         Returns:
-            (indices, crossed_epoch): List of indices and whether we crossed an epoch boundary
+            (indices, crossed_epoch): List of indices and whether at least one
+            sample was drawn from the next epoch.
         """
         if self.indices is None:
             self.shuffle(0)
@@ -406,18 +411,17 @@ class IndexManager:
 
         remaining = n
         while remaining > 0:
+            if self.position >= self.total_size:
+                new_epoch = self.current_epoch + 1
+                self.shuffle(new_epoch)
+                crossed_epoch = True
+
             available = self.total_size - self.position
             take = min(remaining, available)
 
             indices.extend(self.indices[self.position : self.position + take])
             self.position += take
             remaining -= take
-
-            if self.position >= self.total_size:
-                # Epoch boundary reached
-                crossed_epoch = True
-                new_epoch = self.current_epoch + 1
-                self.shuffle(new_epoch)
 
         return indices, crossed_epoch
 

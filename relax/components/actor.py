@@ -13,6 +13,7 @@ from ray import serve
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
+from relax.engine.sft.runtime import is_sft_mode, sft_partition_id, sft_task_name
 from relax.utils.async_utils import run
 
 
@@ -79,7 +80,14 @@ class Actor(Base):
 
         # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
         # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
-        if not self.config.fully_async or self.config.hybrid:
+        # SFT: skip the init-time weight sync. SFT only sync weights to SGLang
+        # right before periodic predict (gated in `train_actor`); between
+        # predicts SGLang stays fully offloaded. Sync-at-init would leave
+        # SGLang with `weights` resumed but no follow-up offload, causing
+        # the first predict-step `onload_weights` to crash on a non-idempotent
+        # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
+        # fires on the first real `update_weights` instead.
+        if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
             self.actor_model.update_weights()
 
     def set_genrm_manager(self, genrm_manager: Any) -> None:
@@ -109,7 +117,10 @@ class Actor(Base):
             if self._done_event is not None:
                 await self._done_event.wait()
             return
-        self.data_system_client.reset_consumption(partition_id=f"train_{self.step}", task_name="train_actor")
+        self.data_system_client.reset_consumption(
+            partition_id=sft_partition_id(self.config, self.step),
+            task_name=sft_task_name(self.config, component="actor"),
+        )
         # Create an asyncio.Event bound to the current event loop so the
         # background thread can signal completion without blocking the loop.
         loop = asyncio.get_running_loop()
@@ -160,7 +171,11 @@ class Actor(Base):
 
                 self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
 
-                run(self.data_system_client.async_clear_partition(partition_id=f"train_{local_step}"))
+                run(
+                    self.data_system_client.async_clear_partition(
+                        partition_id=sft_partition_id(self.config, local_step)
+                    )
+                )
                 self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -187,11 +202,19 @@ class Actor(Base):
             False if should continue waiting (caller should skip this iteration)
         """
         partition_list = run(self.data_system_client.async_get_partition_list())
-        if partition_list is None or f"train_{self.step}" not in partition_list:
+        if partition_list is None or sft_partition_id(self.config, self.step) not in partition_list:
             time.sleep(1)
             return False
 
-        # Offload rollout if configured
+        # RL: poll rollout status — RL rollout runs async on the same GPUs, so
+        # we must wait for it to free them before training. SFT: skip the
+        # poll. The Megatron actor's per-step `requests.get("/predict")` is
+        # synchronous (rank 0 blocks until run_predict + offload returns), so
+        # by the time `_execute_training` returns there's no in-flight rollout
+        # work. Polling here would just deadlock if status ever drifted from
+        # "offload" — which has happened repeatedly across this debug session.
+        if is_sft_mode(self.config):
+            return True
         if self.config.offload_rollout and ray.get(self.rollout_manager.get_status.remote()) == "onload":
             time.sleep(1)
             return False
@@ -252,7 +275,7 @@ class Actor(Base):
 
         try:
             # Check if rollout data is available for this step
-            partition_id = f"train_{step}"
+            partition_id = sft_partition_id(self.config, step)
             partition_list = run(self.data_system_client.async_get_partition_list())
 
             if partition_list is not None and partition_id in partition_list:

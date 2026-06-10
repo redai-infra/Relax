@@ -1,6 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import logging
+import os
+import pickle
+import time
 from argparse import Namespace
 from functools import partial
 from typing import Any, Dict, List, Tuple
@@ -14,9 +17,131 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.timer import timer
 
 
 logger = logging.getLogger(__name__)
+
+# Throttle counter for the opt-in pickle-size diagnostic.  See
+# ``_maybe_log_tgd_pickle_diag`` below for usage.
+_tgd_diag_call_count = 0
+
+# Same-purpose throttle for the per_rank_fetch byte-size diagnostic; kept
+# separate so the two paths' counters don't interfere when toggling modes.
+_per_rank_fetch_diag_call_count = 0
+
+
+def _maybe_log_per_rank_fetch_diag(rollout_data: list) -> None:
+    """Cheap payload-size diagnostic for the ``per_rank_fetch`` path.
+
+    Unlike ``_maybe_log_tgd_pickle_diag`` this never calls ``pickle.dumps``
+    (which would re-introduce the multi-second cost we use this path to
+    avoid).  Instead it sums ``element_size * numel`` over every tensor it
+    can reach so the operator can see how much data each rank just pulled
+    from TQ and judge whether SimpleStorageUnit bandwidth is the new
+    bottleneck.
+
+    Gated by env var ``RELAX_TGD_PROFILE`` (default ``0``); same throttle
+    schedule (first 3 calls then every ``RELAX_TGD_PROFILE_EVERY``).  Only
+    logs from global rank 0 to avoid N-rank-duplicated noise — payload size
+    is identical across ranks in this mode (TQ sampler cache guarantees
+    byte-identical sample ids per dp_rank).
+    """
+    if rollout_data[0] is None:
+        return
+    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    global _per_rank_fetch_diag_call_count
+    _per_rank_fetch_diag_call_count += 1
+    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    if _per_rank_fetch_diag_call_count > 3 and _per_rank_fetch_diag_call_count % every != 0:
+        return
+
+    def _tensor_bytes(obj) -> int:
+        if isinstance(obj, torch.Tensor):
+            return obj.element_size() * obj.numel()
+        if isinstance(obj, dict):
+            return sum(_tensor_bytes(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(_tensor_bytes(v) for v in obj)
+        return 0
+
+    td = rollout_data[0]
+    per_field: list[tuple[str, float]] = []
+    if isinstance(td, TensorDict):
+        for k in td.keys():
+            try:
+                size_mb = _tensor_bytes(td.get(k)) / 1024 / 1024
+            except Exception:  # noqa: BLE001
+                size_mb = -1.0
+            per_field.append((k, size_mb))
+    else:
+        per_field.append((f"<{type(td).__name__}>", _tensor_bytes(td) / 1024 / 1024))
+    per_field.sort(key=lambda x: x[1], reverse=True)
+    total_mb = sum(mb for _, mb in per_field if mb > 0)
+    top = ", ".join(f"{k}={mb:.1f}MB" for k, mb in per_field[:5])
+
+    logger.info(
+        "[per_rank_fetch_diag] call=%d payload_total=%.1fMB top_fields: %s",
+        _per_rank_fetch_diag_call_count,
+        total_mb,
+        top,
+    )
+
+
+def _maybe_log_tgd_pickle_diag(rollout_data: list, should_fetch: bool) -> None:
+    """Opt-in diagnostic: log pickle cost and per-field byte size on the
+    tp_rank-0 fetcher so we can see how much of ``broadcast_object_list`` is
+    pickle vs NCCL, and which TensorDict field dominates the payload.
+
+    Gated by env var ``RELAX_TGD_PROFILE=1``.  Logs the first 3 calls then
+    every ``RELAX_TGD_PROFILE_EVERY`` (default 50) calls thereafter.  Only
+    fires on the rank that actually holds non-empty data — empty-poll cycles
+    (``batch_meta.size == 0`` → ``rollout_data[0] is None``) are skipped so the
+    log isn't drowned by hundreds of empty polls per second.
+    """
+    if not should_fetch:
+        return
+    if rollout_data[0] is None:
+        return
+    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+        return
+
+    global _tgd_diag_call_count
+    _tgd_diag_call_count += 1
+    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    if _tgd_diag_call_count > 3 and _tgd_diag_call_count % every != 0:
+        return
+
+    td = rollout_data[0]
+    t0 = time.perf_counter()
+    full_bytes = pickle.dumps(rollout_data, protocol=pickle.HIGHEST_PROTOCOL)
+    pickle_ms = (time.perf_counter() - t0) * 1000.0
+    pickle_mb = len(full_bytes) / 1024 / 1024
+
+    if isinstance(td, TensorDict):
+        per_field: list[tuple[str, float]] = []
+        for k in td.keys():
+            try:
+                size_mb = len(pickle.dumps(td.get(k), protocol=pickle.HIGHEST_PROTOCOL)) / 1024 / 1024
+            except Exception:  # noqa: BLE001
+                size_mb = -1.0
+            per_field.append((k, size_mb))
+        per_field.sort(key=lambda x: x[1], reverse=True)
+        top = ", ".join(f"{k}={mb:.1f}MB" for k, mb in per_field[:5])
+    else:
+        top = f"<not-a-tensordict: {type(td).__name__}>"
+
+    logger.info(
+        "[tgd_profile] call=%d pickle_total=%.1fMB pickle_ms=%.1f top_fields: %s",
+        _tgd_diag_call_count,
+        pickle_mb,
+        pickle_ms,
+        top,
+    )
 
 
 def create_stream_dataloader(
@@ -249,6 +374,7 @@ def get_data_from_transfer_queue(
     sampling_config,
     batch_index,
     broadcast_pp: bool = True,
+    per_rank_fetch: bool = False,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -277,6 +403,15 @@ def get_data_from_transfer_queue(
         batch_index: Index of the batch to request (used for replay semantics).
         broadcast_pp: Whether to broadcast across pipeline parallel ranks.
             True for colocate mode, False for fully async mode.
+        per_rank_fetch: When True, every TP/PP rank independently calls
+            ``get_meta`` + ``get_data`` (relying on the TQ sampler's
+            ``(partition_id, task_name, dp_rank, batch_index)`` cache to
+            return identical sample id lists across ranks), and all TP/PP
+            broadcasts are skipped.  Trades a single rank-0 pickle + one
+            NCCL bcast for N parallel ZMQ deserialises — wins when pickle
+            dominates ``tgd_bcast_tp_time``.  Caller must ensure
+            ``rollout_routed_experts`` is not in ``data_fields`` (its bcast
+            path is incompatible) — actor.py guards this.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
@@ -286,31 +421,45 @@ def get_data_from_transfer_queue(
     # Compose request configuration and ask the queue for metadata.
     config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
 
-    # Determine which rank should fetch data based on broadcast_pp
-    if broadcast_pp:
+    # Determine which rank should fetch data
+    if per_rank_fetch:
+        # Each rank pulls its own copy from TQ; broadcasts are skipped below.
+        # Safe because the TQ sampler caches the meta on
+        # (partition_id, task_name, dp_rank, batch_index) so all ranks within
+        # a DP group receive byte-identical samples (see transfer_queue
+        # sampler/*_sampler.py).
+        should_fetch = True
+    elif broadcast_pp:
         # Colocate mode: only tp_rank==0 AND pp_rank==0 fetches data
         should_fetch = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0
     else:
         # Fully async mode: only tp_rank==0 fetches data (each PP stage independently)
         should_fetch = mpu.get_tensor_model_parallel_rank() == 0
 
-    if should_fetch:
-        batch_meta = tq_client.get_meta(
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_id,
-            sampling_config=config,
-            task_name=task_name,
-        )  # type: ignore
+    # tgd_fetch: time spent in the Ray transfer-queue RPC on the fetching rank.
+    # Non-fetching ranks record ~0s, which by itself confirms whether the
+    # collective is waiting on fetch (rank0 large, others ~0) or on broadcast.
+    # In per_rank_fetch mode every rank records a real value (no broadcast
+    # below) so the metric becomes wall-clock fetch+deserialise per rank.
+    fetch_timer_name = "per_rank_fetch" if per_rank_fetch else "tgd_fetch"
+    with timer(fetch_timer_name):
+        if should_fetch:
+            batch_meta = tq_client.get_meta(
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                sampling_config=config,
+                task_name=task_name,
+            )  # type: ignore
 
-        if batch_meta.size == 0:
-            rollout_data = [None, None]
+            if batch_meta.size == 0:
+                rollout_data = [None, None]
+            else:
+                rollout_data = [tq_client.get_data(batch_meta), batch_meta]
         else:
-            rollout_data = [tq_client.get_data(batch_meta), batch_meta]
-    else:
-        # Non-fetching ranks start with an empty placeholder and
-        # will receive the real data via broadcast.
-        rollout_data = [None, None]
+            # Non-fetching ranks start with an empty placeholder and
+            # will receive the real data via broadcast.
+            rollout_data = [None, None]
 
     # Use an explicit device so the communication backend (e.g. NCCL)
     # can bind to a known device context.
@@ -326,7 +475,7 @@ def get_data_from_transfer_queue(
     routed_experts_values = None
     routed_experts_offsets = None
 
-    if has_routed_experts and should_fetch and rollout_data[0] is not None:
+    if has_routed_experts and not per_rank_fetch and should_fetch and rollout_data[0] is not None:
         td = rollout_data[0]
         if isinstance(td, TensorDict) and "rollout_routed_experts" in td.keys():
             nt = td["rollout_routed_experts"]
@@ -337,22 +486,30 @@ def get_data_from_transfer_queue(
             del td["rollout_routed_experts"]
             rollout_data[0] = td
 
-    # Always broadcast across tensor parallel ranks (now without routed_experts)
-    dist.broadcast_object_list(
-        rollout_data,
-        device=cuda_dev,
-        group=mpu.get_tensor_model_parallel_group(),
-        group_src=0,
-    )
+    if per_rank_fetch:
+        # Cheap byte-only diagnostic; never pickles (that would defeat the
+        # whole point of per_rank_fetch).
+        _maybe_log_per_rank_fetch_diag(rollout_data)
+    if not per_rank_fetch:
+        # Always broadcast across tensor parallel ranks (now without routed_experts)
+        _maybe_log_tgd_pickle_diag(rollout_data, should_fetch)
+        with timer("tgd_bcast_tp"):
+            dist.broadcast_object_list(
+                rollout_data,
+                device=cuda_dev,
+                group=mpu.get_tensor_model_parallel_group(),
+                group_src=0,
+            )
 
-    # Conditionally broadcast across pipeline parallel ranks
-    if broadcast_pp:
-        dist.broadcast_object_list(
-            rollout_data,
-            device=cuda_dev,
-            group=mpu.get_pipeline_model_parallel_group(),
-            group_src=0,
-        )
+        # Conditionally broadcast across pipeline parallel ranks
+        if broadcast_pp:
+            with timer("tgd_bcast_pp"):
+                dist.broadcast_object_list(
+                    rollout_data,
+                    device=cuda_dev,
+                    group=mpu.get_pipeline_model_parallel_group(),
+                    group_src=0,
+                )
 
     # Unpack the broadcasted pair.
     rollout_data, batch_meta = rollout_data[0], rollout_data[1]
@@ -361,15 +518,19 @@ def get_data_from_transfer_queue(
         return None, None
 
     # --- Broadcast routed_experts tensors via efficient dist.broadcast ---
-    if has_routed_experts:
-        routed_experts_values, routed_experts_offsets = _broadcast_routed_experts(
-            routed_experts_values,
-            routed_experts_offsets,
-            should_fetch,
-            cuda_dev,
-            broadcast_pp,
-            keep_on_gpu=getattr(args, "optimize_routing_replay", False),
-        )
+    # Skipped entirely in per_rank_fetch mode: each rank already received the
+    # NestedTensor inside its own get_data() return value; the conversion to
+    # per-sample list happens below.
+    if has_routed_experts and not per_rank_fetch:
+        with timer("tgd_bcast_rexp"):
+            routed_experts_values, routed_experts_offsets = _broadcast_routed_experts(
+                routed_experts_values,
+                routed_experts_offsets,
+                should_fetch,
+                cuda_dev,
+                broadcast_pp,
+                keep_on_gpu=getattr(args, "optimize_routing_replay", False),
+            )
 
     # If the received object is a Tensordict, convert it into a plain Python
     # dict so downstream code can mix tensors and Python lists freely.
@@ -413,8 +574,12 @@ def get_data_from_transfer_queue(
 
         rollout_data = new_rollout_data
 
-    # Re-attach routed_experts as a list of 2D tensors (per-sample)
-    if has_routed_experts:
+    # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
+    # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
+    # before broadcast.  per_rank_fetch never strips it (each rank pulls its own
+    # copy from TQ), so the TensorDict→dict conversion above already produced
+    # the per-sample list under "rollout_routed_experts".
+    if has_routed_experts and not per_rank_fetch:
         rollout_data["rollout_routed_experts"] = [
             routed_experts_values[routed_experts_offsets[i] : routed_experts_offsets[i + 1]]
             for i in range(len(routed_experts_offsets) - 1)

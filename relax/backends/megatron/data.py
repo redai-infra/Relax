@@ -117,6 +117,7 @@ def get_batch(
     pad_multiplier: int = 128,
     qkv_format: str = "thd",
     allgather_cp: bool = False,
+    is_vl_model: bool = False,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -182,8 +183,11 @@ def get_batch(
         # inputs and a matching packed_seq_params so the caller-side cu_seqlens
         # agrees with what the bridge derives from attention_mask.
         # Mirrors verl's build_vlm_attn_mask_thd + preprocess_thd_engine.
-        is_vl_model = batch.get("multimodal_train_inputs") is not None
-        needs_unsplit_input = is_vl_model or getattr(get_args(), "uses_unsplit_forward", False)
+        # Routed by `is_vl_model` (set from hf_config) rather than presence of
+        # multimodal_train_inputs, so VL models with text-only batches still
+        # land here — bridge skips vision embedding when image_grid_thw is None.
+        has_mm_inputs = batch.get("multimodal_train_inputs") is not None
+        needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
@@ -272,22 +276,24 @@ def get_batch(
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
 
-    # loss masks
-    loss_masks = []
+    from relax.utils.sft_utils import align_loss_mask_for_sft
+
+    loss_masks: list[torch.Tensor] = []
+    per_sample_loss_masks: list[torch.Tensor] = []
     for loss_mask, total_length, response_length in zip(
-        batch["loss_masks"],
-        batch["total_lengths"],
-        batch["response_lengths"],
-        strict=True,
+        batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
     ):
-        prompt_length = total_length - response_length
-        # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
-        loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
-        if allgather_cp:
-            loss_masks.append(loss_mask)
-            continue
-        loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
+        if response_length == total_length:
+            loss_mask = align_loss_mask_for_sft(loss_mask)
+            per_sample_loss_masks.append(loss_mask)
+        else:
+            per_sample_loss_masks.append(loss_mask)
+            prompt_length = total_length - response_length
+            loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+        if not allgather_cp:
+            loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
         loss_masks.append(loss_mask)
+    batch["loss_masks"] = per_sample_loss_masks
 
     if qkv_format == "bshd":
         loss_masks = torch.stack(loss_masks)

@@ -35,6 +35,9 @@ def log_perf_data_raw(
 
     log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
 
+    if timer_instance.seq_lens:
+        log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)
+
     if ("perf/actor_train_time" in log_dict) and (flops_counter is not None):
         seq_lens = timer_instance.seq_lens
         images_seqlens = getattr(timer_instance, "images_seqlens", None) or None
@@ -73,6 +76,11 @@ def log_perf_data_raw(
         if total_time > 0:
             log_dict["perf/step_time"] = total_time
             log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
+            if timer_instance.seq_lens:
+                log_dict["perf/step_token_per_s"] = sum(timer_instance.seq_lens) / total_time
+            response_lens = getattr(timer_instance, "response_lens", None)
+            if response_lens:
+                log_dict["perf/step_resp_token_per_s"] = sum(response_lens) / total_time
 
     logger.info(f"perf {rollout_id}: {log_dict}")
 

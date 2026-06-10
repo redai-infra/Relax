@@ -92,8 +92,14 @@ def get_responses(
             else:
                 end += total_length
                 start = end - response_length
-            logits_chunk = logits[start - 1 : end - 1]
-            tokens_chunk = tokens[-response_length:]
+            if response_length == total_length:
+                # SFT branch; see relax.utils.sft_utils.compute_sft_response_chunk.
+                from relax.utils.sft_utils import compute_sft_response_chunk
+
+                logits_chunk, tokens_chunk = compute_sft_response_chunk(logits, tokens, start, end)
+            else:
+                logits_chunk = logits[start - 1 : end - 1]
+                tokens_chunk = tokens[-response_length:]
         elif args.allgather_cp:
             # DSA: global concat then contiguous CP split. Each rank owns logits for
             # global positions [chunk_start, chunk_end).
@@ -251,6 +257,7 @@ def get_log_probs_and_entropy(
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Compute per-token log-probabilities (and optionally entropy) on
     responses.
@@ -340,6 +347,7 @@ def get_values(
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Extract per-token value predictions over response tokens.
 
@@ -1056,7 +1064,7 @@ def loss_function(
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
-    Selects one of "policy_loss", "value_loss", "sft_loss", or a custom loss
+    Selects one of "policy_loss", "value_loss", "sft", or a custom loss
     function based on `args.loss_type`, computes the loss and metrics, then
     rescales the loss by micro-batch and parallelism factors to integrate with
     Megatron's gradient accumulation.
@@ -1095,7 +1103,7 @@ def loss_function(
             func = policy_loss_function
         case "value_loss":
             func = value_loss_function
-        case "sft_loss":
+        case "sft":
             func = sft_loss_function
         case "custom_loss":
             func = load_function(args.custom_loss_function_path)

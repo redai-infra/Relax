@@ -26,7 +26,15 @@ from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.health_monitor import RolloutHealthMonitor
-from relax.utils.http_utils import SLIME_HOST_IP_ENV, _wrap_ipv6, find_available_port, get_host_info, init_http_client
+from relax.utils.http_utils import (
+    SLIME_HOST_IP_ENV,
+    _wrap_ipv6,
+    find_available_port,
+    get,
+    get_host_info,
+    init_http_client,
+    post,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import (
@@ -958,6 +966,88 @@ class RolloutManager(ReloadableMixin):
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+
+    async def run_predict(self, train_step: int) -> None:
+        """Periodic SFT predict pass entry point.
+
+        Ensures KV/cuda-graph is onloaded (no-op if already on), then delegates
+        to ``run_predict_loop`` which renders the eval set, batches calls to
+        ``self.generate_predict``, and writes
+        ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
+
+        Mirrors the ``eval`` method: does NOT proactively offload afterward —
+        the next training step's actor↔rollout coordination drives state
+        transitions, same as PPL eval.
+        """
+        from relax.engine.sft.predict.loop import run_predict_loop
+
+        await self.onload_kv()
+        await run_predict_loop(self, self.args, train_step)
+
+    async def generate_predict(
+        self,
+        prompts: list[str],
+        multimodal_inputs_list: list[dict | None] | None = None,
+    ) -> list[str]:
+        """Generate completions for ``prompts`` concurrently.
+
+        POSTs all prompts at once in round-robin order directly to engine
+        workers, bypassing the router. Predict prompts share a long fixed
+        prefix (``<|vision_start|><|image_pad|><|vision_end|>...``); cache-
+        aware routing would pin every request to the engine that first
+        cached the prefix, defeating multi-engine throughput.
+
+        ``multimodal_inputs_list`` is a parallel list of dicts (or ``None``)
+        carrying images/videos/audio for each prompt; encoded inline and
+        merged into the payload, mirroring the RL ``generate()`` path.
+        """
+        import sglang_router
+        from packaging.version import parse
+
+        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+
+        self.health_monitoring_resume()
+
+        router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
+        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
+            response = await get(f"{router_base}/list_workers")
+            worker_urls = response["urls"]
+        else:
+            response = await get(f"{router_base}/workers")
+            worker_urls = [w["url"] for w in response["workers"]]
+        if not worker_urls:
+            worker_urls = [router_base]
+
+        # Reuse the shared --eval-* sampling args (no SFT-predict-specific
+        # flags). Defaults preserve the original SFT predict behaviour
+        # (greedy, max_new_tokens=512) when --eval-* is not provided.
+        eval_temperature = getattr(self.args, "eval_temperature", None)
+        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
+        eval_top_p = getattr(self.args, "eval_top_p", None)
+        sampling_params = {
+            "temperature": 0.0 if eval_temperature is None else eval_temperature,
+            "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
+            "top_p": 1.0 if eval_top_p is None else eval_top_p,
+        }
+        if multimodal_inputs_list is None:
+            multimodal_inputs_list = [None] * len(prompts)
+
+        async def _one(idx: int, prompt: str, mm: dict | None) -> str:
+            url = f"{worker_urls[idx % len(worker_urls)]}/generate"
+            payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
+            if mm:
+                encoded_mm, _ = await _encode_multimodal_inputs(mm)
+                payload.update(encoded_mm)
+            output = await post(url, payload)
+            if isinstance(output, dict) and "text" in output:
+                return output["text"]
+            if isinstance(output, str):
+                return output
+            return str(output)
+
+        return await asyncio.gather(
+            *[_one(i, p, m) for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))]
+        )
 
     async def save(self, rollout_id):
         await self.data_source.save.remote(rollout_id)

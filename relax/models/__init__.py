@@ -19,9 +19,9 @@ except (ImportError, AttributeError):
 try:
     from relax.models import glm_moe_dsa  # noqa: F401
 except Exception as _e:
-    import logging as _logging
+    from relax.utils.logging_utils import get_logger
 
-    _logging.getLogger(__name__).warning("Failed to import relax.models.glm_moe_dsa: %s", _e)
+    get_logger(__name__).warning("Failed to import relax.models.glm_moe_dsa: %s", _e)
 
 
 __all__ = [

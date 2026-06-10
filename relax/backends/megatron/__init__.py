@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import importlib
 import logging
+import os
 
 
 try:
@@ -13,7 +15,18 @@ try:
 except BaseException as e:
     print(f"failed to import relax.models, error={e}")
 
-from relax.utils import device as device_utils
+# Extension hook (analogue of ``--custom-generate-function-path``): every
+# Megatron actor / driver loads this module, so any module names listed in
+# ``RELAX_EXTRA_MODULES`` (comma-separated) are imported here for their
+# side effects — typically downstream packages registering Megatron-Bridge
+# converters, model providers, or family-token tables.
+for _mod in filter(None, (m.strip() for m in os.environ.get("RELAX_EXTRA_MODULES", "").split(","))):
+    try:
+        importlib.import_module(_mod)
+    except BaseException as e:
+        print(f"failed to import RELAX_EXTRA_MODULES entry {_mod!r}, error={e}")
+
+from relax.utils import device as device_utils  # noqa
 
 
 try:

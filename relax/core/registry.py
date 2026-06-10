@@ -14,6 +14,7 @@ from relax.components.actor import Actor
 from relax.components.actor_fwd import ActorFwd
 from relax.components.advantages import Advantages
 from relax.components.rollout import Rollout
+from relax.components.sft import SFT
 
 
 # NOTE(dev): Use StrEnum and keep visiting order with definition order
@@ -24,6 +25,7 @@ class ROLES(StrEnum):
     advantages: str = "advantages"
     reference: str = "reference"
     actor_fwd: str = "actor_fwd"
+    sft: str = "sft"
 
 
 class ROLES_TRAIN_ONLY(StrEnum):
@@ -38,6 +40,11 @@ class ROLES_COLOCATE(StrEnum):
     actor: str = "actor"
     critic: str = "critic"
     rollout: str = "rollout"
+
+
+class ROLES_SFT_ONLY(StrEnum):
+    sft: str = "sft"
+    actor: str = "actor"
 
 
 class ROLES_FULLY_ASYNC_ON_POLICY(StrEnum):
@@ -70,6 +77,10 @@ ALGOS = {
         ROLES.reference: ActorFwd,
         ROLES.actor_fwd: ActorFwd,
     },
+    "sft": {
+        ROLES.sft: SFT,
+        ROLES.actor: Actor,
+    },
 }
 
 
@@ -78,6 +89,8 @@ def process_role(config):
         return ROLES_ROLLOUT_ONLY
     if config.debug_train_only:
         return ROLES_TRAIN_ONLY
+    if getattr(config, "loss_type", None) == "sft":
+        return ROLES_SFT_ONLY
     if config.hybrid:
         # hybrid mode: actor handles ref/actor_fwd internally
         # via _switch_model, only need actor + rollout services

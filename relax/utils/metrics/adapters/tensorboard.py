@@ -35,17 +35,23 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
         assert args.use_tensorboard, f"{args.use_tensorboard=}"
         tb_project_name = args.tb_project_name
         tb_experiment_name = args.tb_experiment_name
-        if tb_project_name is not None or os.environ.get("TENSORBOARD_DIR", None):
+        save_dir = getattr(args, "save", None)
+        if tb_project_name is not None or os.environ.get("TENSORBOARD_DIR", None) or save_dir:
             if tb_project_name is not None and tb_experiment_name is None:
                 tb_experiment_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._initialize(tb_project_name, tb_experiment_name)
+            self._initialize(tb_project_name, tb_experiment_name, save_dir)
         else:
-            raise ValueError("tb_project_name and tb_experiment_name, or TENSORBOARD_DIR are required")
+            raise ValueError("tb_project_name and tb_experiment_name, TENSORBOARD_DIR, or args.save are required")
 
-    def _initialize(self, tb_project_name, tb_experiment_name):
+    def _initialize(self, tb_project_name, tb_experiment_name, save_dir):
         """Actual initialization logic."""
-        # Get tensorboard directory from environment variable or use default path
-        tensorboard_dir = os.environ.get("TENSORBOARD_DIR", f"tensorboard_log/{tb_project_name}/{tb_experiment_name}")
+        # Priority: TENSORBOARD_DIR env > args.save > default project/experiment path
+        tensorboard_dir = os.environ.get("TENSORBOARD_DIR")
+        if not tensorboard_dir:
+            if save_dir:
+                tensorboard_dir = os.path.join(save_dir, "tensorboard_log")
+            else:
+                tensorboard_dir = f"tensorboard_log/{tb_project_name}/{tb_experiment_name}"
         os.makedirs(tensorboard_dir, exist_ok=True)
         logger.info(f"Saving tensorboard log to {tensorboard_dir}.")
         self._writer = SummaryWriter(tensorboard_dir)

@@ -272,10 +272,15 @@ def get_model_provider_func(
             "freeze_language_model",
             "freeze_vision_model",
             "freeze_vision_projection",
+            "freeze_audio_model",
+            "freeze_audio_projection",
             # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
+            "mtp_num_layers",
+            "mtp_loss_scaling_factor",
+            # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
             "moe_layer_freq",
@@ -300,6 +305,7 @@ def get_model_provider_func(
             "moe_router_topk_scaling_factor",
             "moe_router_score_function",
             "moe_ffn_hidden_size",
+            # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
         ]
 
         args_dict = vars(args)

@@ -1,0 +1,5 @@
+{"messages":[{"role":"user","content":"What is the capital of France?"},{"role":"assistant","content":"Paris"}]}
+{"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4"}]}
+{"messages":[{"role":"user","content":"What color is the sky on a clear day?"},{"role":"assistant","content":"Blue"}]}
+{"messages":[{"role":"user","content":"Translate to Spanish: hello"},{"role":"assistant","content":"Hola"}]}
+{"messages":[{"role":"user","content":"Largest planet in the solar system?"},{"role":"assistant","content":"Jupiter"}]}
