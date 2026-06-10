@@ -329,7 +329,7 @@ async def generate(
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
-            new_response_tokens = state.tokenizer.encode(output["text"], add_special_tokens=False)
+            new_response_tokens = output["output_ids"]
             new_response_log_probs = []
 
         while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:

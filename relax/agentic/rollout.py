@@ -945,6 +945,7 @@ class AgenticResidentPipeline:
             await self._seal_step(step_handle, shutdown_all_irs=True)
             await self.stop_resident_dataflow()
             await self._discard_resident_tail()
+            await self.runtime_domain.trim_agentic_session_shards(reason="cleanup")
             if step_handle.progress is not None:
                 step_handle.progress.close()
                 step_handle.progress = None
@@ -967,6 +968,7 @@ class AgenticResidentPipeline:
         await self._seal_step(step_handle, shutdown_all_irs=shutdown_all_irs)
         if terminal_step or not (self.runtime_domain.args.partial_rollout or self.runtime_domain.args.fully_async):
             await self._discard_resident_tail()
+        await self.runtime_domain.trim_agentic_session_shards(reason=f"close_step_{step_handle.rollout_id}")
         async with self._dataflow_lock():
             accounting_end_snapshot = self._compact_accounting_snapshot(step_handle, phase="accounting_end")
         runtime_snapshot = self.runtime_domain.debug_snapshot()
@@ -1403,9 +1405,11 @@ def _eval_sampling_params(args, dataset_cfg: EvalDatasetConfig, *, sample_slot_i
         "stop": args.rollout_stop,
         "stop_token_ids": args.rollout_stop_token_ids,
         "skip_special_tokens": args.rollout_skip_special_tokens,
+        "no_stop_trim": True,
+        "spaces_between_special_tokens": False,
     }
     if args.sglang_enable_deterministic_inference:
-        sampling_params["seed"] = args.rollout_seed + sample_slot_idx
+        sampling_params["sampling_seed"] = args.rollout_seed + sample_slot_idx
     return sampling_params
 
 

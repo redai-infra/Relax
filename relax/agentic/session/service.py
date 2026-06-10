@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import ctypes
 import threading
 import time
 import zlib
@@ -56,6 +57,10 @@ logger = get_logger(__name__)
 AGENTIC_SESSION_SHARD_NAME_PREFIX = "agentic_session_shard"
 _DEFAULT_SESSION_SHARD_COUNT = 16
 _STALE_SESSION_SHARD_CLEANUP_LIMIT = 64
+_AGENTIC_SHARD_ALLOCATOR_ENV = {
+    "MALLOC_ARENA_MAX": "2",
+    "MALLOC_TRIM_THRESHOLD_": "0",
+}
 
 
 def agentic_session_shard_name(index: int) -> str:
@@ -527,6 +532,26 @@ class AgenticSessionShard:
         }
 
     @ray.method(concurrency_group="sglang_request_control")
+    async def trim_memory(self) -> dict[str, Any]:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            trimmed = int(libc.malloc_trim(0))
+        except Exception as exc:
+            logger.warning("AgenticSessionShard malloc_trim failed: %s", exc)
+            return {
+                "ok": False,
+                "error": str(exc)[:500],
+                "active_sessions": len(self._session_records),
+                "active_requests": sum(len(record.irs_by_id) for record in self._session_records.values()),
+            }
+        return {
+            "ok": True,
+            "trimmed": trimmed,
+            "active_sessions": len(self._session_records),
+            "active_requests": sum(len(record.irs_by_id) for record in self._session_records.values()),
+        }
+
+    @ray.method(concurrency_group="sglang_request_control")
     async def debug_state(self, *, sample_limit: int = 8) -> dict[str, Any]:
         state_counts: Counter[str | None] = Counter()
         state_irs: Counter[str | None] = Counter()
@@ -725,7 +750,7 @@ class AgenticSessionShard:
             messages,
             tools=tools or [],
             chat_template_kwargs=chat_template_kwargs,
-            multimodal_inputs_override=multimodal_inputs,
+            multimodal_inputs=multimodal_inputs,
         )
 
     async def _register_session(
@@ -976,7 +1001,7 @@ class AgenticSessionShard:
             obs_delta,
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
-            multimodal_inputs_override=_message_multimodal_inputs(obs_delta),
+            multimodal_inputs=_message_multimodal_inputs(obs_delta),
         )
         parent_tools = forest.subtree_tools(parent_state_hash)
         if normalize_tools(tools) != parent_tools:
@@ -1018,7 +1043,7 @@ class AgenticSessionShard:
             "spaces_between_special_tokens": False,
         }
         if self.args.sglang_enable_deterministic_inference:
-            sampling_params["seed"] = self.args.rollout_seed + int(sample_index or 0)
+            sampling_params["sampling_seed"] = self.args.rollout_seed + int(sample_index or 0)
         return {key: value for key, value in sampling_params.items() if value is not None}
 
     def _budget_sampling_params(
@@ -1152,6 +1177,7 @@ class AgenticSessionShard:
         session_id: str,
         parent_state_hash: str,
         sampling_params: dict[str, Any],
+        logprobs: bool,
         chat_request_arrive_at: float,
         chat_lock_acquired_at: float,
         bootstrap_compiler_timing: dict[str, float] | None,
@@ -1177,6 +1203,7 @@ class AgenticSessionShard:
             kind=RequestKind.PROTECTED if record.protected_until_finalize else request_kind,
             abort_count=parent_abort_count,
             sampling_params=copy.deepcopy(sampling_params),
+            logprobs=bool(logprobs),
             history_train_token_prefix=prefix.train_token_prefix,
             history_rollout_token_prefix=prefix.rollout_token_prefix,
             history_backend_image_data=prefix.backend_image_data,
@@ -1337,7 +1364,7 @@ class AgenticSessionShard:
                 },
             )
             entry["total_sessions"] += 1
-            if record.irs_by_id or record.pending_chat_waiters:
+            if record.irs_by_id:
                 entry["ready_sessions"] += 1
         return list(counts.values())
 
@@ -1434,10 +1461,14 @@ class AgenticSessionShard:
         return {
             "request_id": ir.request_id,
             "message": {"role": "assistant", "content": response_text},
-            "logprobs": _openai_token_logprobs_payload(
-                tokenizer=self.backend.tokenizer,
-                token_ids=ir.pending_train_token_delta,
-                token_logprobs=ir.pending_logprob_delta,
+            "logprobs": (
+                _openai_token_logprobs_payload(
+                    tokenizer=self.backend.tokenizer,
+                    token_ids=ir.pending_train_token_delta,
+                    token_logprobs=ir.pending_logprob_delta,
+                )
+                if ir.logprobs
+                else None
             ),
             "finish_reason": finish_reason,
             "usage": usage,
@@ -1494,6 +1525,7 @@ class AgenticSessionShard:
                 image_data=ir.history_backend_image_data,
                 audio_data=ir.history_backend_audio_data,
                 video_data=ir.history_backend_video_data,
+                return_logprob=record.scope_id == "train" or ir.logprobs,
             )
         except BackendContextLengthExceededError as exc:
             lock = self._get_session_lock(session_id)
@@ -1797,6 +1829,7 @@ class AgenticSessionShard:
         max_completion_tokens: int | None,
         stop: list[str] | str | None,
         seed: int | None,
+        logprobs: bool = False,
     ) -> dict[str, Any]:
         chat_request_arrive_at = time.time()
         try:
@@ -1831,7 +1864,7 @@ class AgenticSessionShard:
                 if stop is not None:
                     sampling_params["stop"] = stop
                 if seed is not None:
-                    sampling_params["seed"] = int(seed)
+                    sampling_params["sampling_seed"] = int(seed)
                 parent_state_hash, obs_delta = self._match_parent_state_hash(
                     forest=record.forest,
                     messages=normalized_messages,
@@ -1856,6 +1889,7 @@ class AgenticSessionShard:
                     session_id=session_id,
                     parent_state_hash=generation_parent_hash,
                     sampling_params=sampling_params,
+                    logprobs=logprobs,
                     chat_request_arrive_at=chat_request_arrive_at,
                     chat_lock_acquired_at=chat_lock_acquired_at,
                     bootstrap_compiler_timing=bootstrap_compiler_timing,
@@ -2113,7 +2147,11 @@ def create_agentic_session_shards(config: Namespace):
     for idx in range(shard_count):
         shard_name = agentic_session_shard_name(idx)
         shard_handles.append(
-            AgenticSessionShard.options(num_cpus=0.25, name=shard_name).remote(
+            AgenticSessionShard.options(
+                num_cpus=0.25,
+                name=shard_name,
+                runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
+            ).remote(
                 config,
                 sglang_request_capacity=request_capacity if idx == 0 else None,
                 sglang_request_limiter=shard_handles[0] if idx > 0 else None,
@@ -2351,6 +2389,30 @@ class AgenticChatAPIService:
         counts = await asyncio.gather(*(handle.exit_eval.remote() for handle in self._shard_handles))
         return sum(int(count or 0) for count in counts)
 
+    async def trim_memory(self) -> dict[str, Any]:
+        results = await asyncio.gather(
+            *(handle.trim_memory.remote() for handle in self._shard_handles),
+            return_exceptions=True,
+        )
+        snapshots = []
+        for idx, result in enumerate(results):
+            snapshot = {"slot_index": idx}
+            if isinstance(result, BaseException):
+                snapshot.update({"ok": False, "error": str(result)[:500]})
+            elif isinstance(result, dict):
+                snapshot.update(result)
+            else:
+                snapshot.update({"ok": False, "error": f"Unexpected trim result: {result!r}"[:500]})
+            snapshots.append(snapshot)
+        return {
+            "ok": all(bool(snapshot.get("ok")) for snapshot in snapshots),
+            "shard_count": len(snapshots),
+            "trimmed_count": sum(1 for snapshot in snapshots if int(snapshot.get("trimmed") or 0)),
+            "active_sessions": sum(int(snapshot.get("active_sessions") or 0) for snapshot in snapshots),
+            "active_requests": sum(int(snapshot.get("active_requests") or 0) for snapshot in snapshots),
+            "shards": snapshots,
+        }
+
     async def _chat_completions_impl(self, request: Request) -> JSONResponse:
         request_arrive_at = time.time()
         try:
@@ -2395,6 +2457,7 @@ class AgenticChatAPIService:
                 max_completion_tokens=request_payload["max_completion_tokens"],
                 stop=request_payload["stop"],
                 seed=request_payload["seed"],
+                logprobs=request_payload["logprobs"],
             )
         except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as exc:
             if isinstance(exc, ray.exceptions.RayTaskError) and not isinstance(

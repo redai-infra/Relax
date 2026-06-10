@@ -355,19 +355,9 @@ class PrepareDomain:
         if not self.warming_group_ids:
             return 0
         with self._lock:
-            warming_group_states = [
-                group_state
-                for group_id in self.warming_group_ids
-                if (group_state := self.prepare_groups_by_id.get(group_id)) is not None
-            ]
             runtime_driver = self.runtime_driver
-        completed_session_counts_by_group_key: dict[tuple[str, int], int] = {}
-        if warming_group_states:
-            if runtime_driver is None:
-                raise RuntimeError("PrepareDomain cannot refresh warming groups before runtime driver is bound.")
-            completed_session_counts_by_group_key = await runtime_driver.completed_prepare_session_counts(
-                group_states=warming_group_states
-            )
+        if runtime_driver is None:
+            raise RuntimeError("PrepareDomain cannot refresh warming groups before runtime driver is bound.")
         snapshots = await status_fetcher()
         ready_count = 0
         status_by_key = {(str(item["group_id"]), int(item["group_generation"])): item for item in snapshots}
@@ -385,11 +375,9 @@ class PrepareDomain:
                 group_state = self.prepare_groups_by_id.get(group_id)
             if group_state is None or group_state.status != "warming":
                 continue
-            group_key = (group_state.group_id, group_state.group_generation)
             snapshot = status_by_key.get((group_state.group_id, group_state.group_generation))
             expected_sessions = len(group_state.request_handles)
             ready_sessions = int(snapshot.get("ready_sessions") or 0) if snapshot else 0
-            ready_sessions += completed_session_counts_by_group_key.get(group_key, 0)
             total_sessions = int(snapshot.get("total_sessions") or 0) if snapshot else 0
             if total_sessions >= expected_sessions and ready_sessions >= expected_sessions:
                 with self._lock:
@@ -397,6 +385,11 @@ class PrepareDomain:
                     self.ready_group_ids.append(group_id)
                 ready_count += 1
                 continue
+            runtime_driver.raise_if_prepare_group_completed_before_ready(
+                group_state=group_state,
+                total_sessions=total_sessions,
+                ready_sessions=ready_sessions,
+            )
             still_warming.append(group_id)
         # Re-insert still-warming ids at the front (before any newly appended
         # ids from the pump thread) so they are checked first next time.

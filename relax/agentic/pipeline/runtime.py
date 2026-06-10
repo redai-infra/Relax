@@ -1348,6 +1348,9 @@ class _ServeHandleChatControlClient:
     async def exit_eval(self) -> int:
         return int(await self._handle.exit_eval.remote())
 
+    async def trim_memory(self) -> dict[str, Any]:
+        return dict(await self._handle.trim_memory.remote())
+
     async def debug_state(self, *, sample_limit: int = 0) -> dict[str, Any]:
         return dict(await self._handle.debug_state.remote(sample_limit=int(sample_limit)))
 
@@ -2054,30 +2057,50 @@ class RuntimeDomain:
         client = self._ensure_service_client()
         return await client.prepare_group_status(scope_id=self.scope_id)
 
-    async def completed_prepare_session_counts(
-        self, *, group_states: list[PrepareGroupState]
-    ) -> dict[tuple[str, int], int]:
-        if not group_states:
-            return {}
+    def raise_if_prepare_group_completed_before_ready(
+        self,
+        *,
+        group_state: PrepareGroupState,
+        total_sessions: int,
+        ready_sessions: int,
+    ) -> None:
+        if not group_state.request_handles:
+            return
         runner_pool = self._session_runner_pool
         if runner_pool is None:
-            raise RuntimeError("RuntimeDomain cannot check prepare-owned managed sessions without a runner pool.")
-        handle_to_group_key: dict[ManagedSessionHandle, tuple[str, int]] = {}
-        for group_state in group_states:
-            for request_handle in group_state.request_handles:
-                managed_handle = request_handle.managed_session_handle
-                if not isinstance(managed_handle, ManagedSessionHandle):
-                    raise RuntimeError(
-                        "Prepare-owned request is missing a managed session handle; "
-                        f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
-                    )
-                handle_to_group_key[managed_handle] = (group_state.group_id, group_state.group_generation)
-        completed_handles = runner_pool.completed_session_handles(session_handles=list(handle_to_group_key))
-        counts_by_group_key: dict[tuple[str, int], int] = {}
-        for managed_handle in completed_handles:
-            group_key = handle_to_group_key[managed_handle]
-            counts_by_group_key[group_key] = counts_by_group_key.get(group_key, 0) + 1
-        return counts_by_group_key
+            raise RuntimeError("RuntimeDomain cannot validate prepare-owned managed sessions without a runner pool.")
+        handle_to_request: dict[ManagedSessionHandle, tuple[str, str]] = {}
+        for request_handle in group_state.request_handles:
+            managed_handle = request_handle.managed_session_handle
+            if not isinstance(managed_handle, ManagedSessionHandle):
+                raise RuntimeError(
+                    "Prepare-owned request is missing a managed session handle; "
+                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
+                )
+            try:
+                envelope = group_state.request_group[request_handle.slot_idx]
+            except IndexError as exc:
+                raise RuntimeError(
+                    f"Prepare group {group_state.group_id} has inconsistent slot indexing "
+                    f"at slot={request_handle.slot_idx}."
+                ) from exc
+            handle_to_request[managed_handle] = (envelope.session_id, envelope.request_id)
+        completed_handles = runner_pool.completed_session_handles(session_handles=list(handle_to_request))
+        if not completed_handles:
+            return
+        completed_requests = [
+            {
+                "session_id": handle_to_request[managed_handle][0],
+                "request_id": handle_to_request[managed_handle][1],
+            }
+            for managed_handle in completed_handles
+        ]
+        raise RuntimeError(
+            "Prepare-owned managed agent session completed before producing a chat IR: "
+            f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "
+            f"expected_sessions={len(group_state.request_handles)}, total_sessions={total_sessions}, "
+            f"ready_sessions={ready_sessions}, completed_requests={completed_requests[:8]}."
+        )
 
     async def activate_group_sessions(
         self,
@@ -2317,7 +2340,7 @@ class RuntimeDomain:
             "spaces_between_special_tokens": False,
         }
         if self.args.sglang_enable_deterministic_inference:
-            sampling_params["seed"] = self.args.rollout_seed + slot_idx
+            sampling_params["sampling_seed"] = self.args.rollout_seed + slot_idx
         return {key: value for key, value in sampling_params.items() if value is not None}
 
     async def _register_managed_sessions_batch(self, entries: list[dict[str, Any]]) -> None:
@@ -2400,6 +2423,20 @@ class RuntimeDomain:
     async def abort_rollout_requests(self) -> dict[str, int]:
         client = self._ensure_service_client()
         result = dict(await client.abort_rollout_requests(rollout_id=self.require_rollout_id()))
+        await self._refresh_session_debug_state(client=client)
+        return result
+
+    async def trim_agentic_session_shards(self, *, reason: str = "manual") -> dict[str, Any]:
+        client = self._ensure_service_client()
+        result = dict(await client.trim_memory())
+        logger.info(
+            "Agentic session shard trim completed reason=%s ok=%s trimmed=%s active_sessions=%s active_requests=%s",
+            reason,
+            result.get("ok"),
+            result.get("trimmed_count"),
+            result.get("active_sessions"),
+            result.get("active_requests"),
+        )
         await self._refresh_session_debug_state(client=client)
         return result
 
@@ -3125,7 +3162,7 @@ def _processing_utils():
     return processing_utils
 
 
-def _normalize_multimodal_inputs_override_sync(multimodal_inputs: dict[str, Any] | None) -> dict[str, Any] | None:
+def _normalize_multimodal_inputs_sync(multimodal_inputs: dict[str, Any] | None) -> dict[str, Any] | None:
     if not multimodal_inputs:
         return None
 
@@ -3353,11 +3390,23 @@ class SGLangMessageCompiler:
         else:
 
             def _run_processor_sync():
+                from relax.utils.data.processing_utils import (
+                    adapt_processor_kwargs,
+                    expand_kimi_k25_placeholders,
+                    remap_mm_train_inputs,
+                )
+
+                processor_kwargs = adapt_processor_kwargs(
+                    self.processor,
+                    multimodal_inputs,
+                    {
+                        "use_audio_in_video": self.use_audio_in_video,
+                        "return_mm_token_type_ids": False,
+                    },
+                )
                 processor_output = self.processor(
                     text=prompt_text,
-                    use_audio_in_video=self.use_audio_in_video,
-                    return_mm_token_type_ids=False,
-                    **multimodal_inputs,
+                    **processor_kwargs,
                 )
                 prompt_ids = list(processor_output["input_ids"][0])
                 train_inputs = {
@@ -3365,6 +3414,8 @@ class SGLangMessageCompiler:
                     for key, value in processor_output.items()
                     if key not in {"input_ids", "attention_mask"}
                 } or None
+                train_inputs = remap_mm_train_inputs(self.processor, train_inputs)
+                prompt_ids = expand_kimi_k25_placeholders(self.processor, prompt_ids, train_inputs)
                 return prompt_ids, train_inputs
 
             train_prompt_ids, multimodal_train_inputs = await loop.run_in_executor(
@@ -3435,7 +3486,7 @@ class SGLangMessageCompiler:
         *,
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None = None,
-        multimodal_inputs_override: dict[str, Any] | None = None,
+        multimodal_inputs: dict[str, Any] | None = None,
     ) -> EncodedMessages:
         total_started_at = time.monotonic()
         normalized_messages = check_messages(messages)
@@ -3449,16 +3500,16 @@ class SGLangMessageCompiler:
             normalized_tools,
             chat_template_kwargs,
         )
-        if self.processor and multimodal_inputs_override is None:
+        if self.processor and multimodal_inputs is None:
             multimodal_future = asyncio.create_task(self._compute_multimodal_inputs_async(normalized_messages))
         else:
             multimodal_future = None
         normalized_override_future = None
-        if multimodal_inputs_override is not None:
+        if multimodal_inputs is not None:
             normalized_override_future = loop.run_in_executor(
                 self.cpu_executor,
-                _normalize_multimodal_inputs_override_sync,
-                multimodal_inputs_override,
+                _normalize_multimodal_inputs_sync,
+                multimodal_inputs,
             )
         prompt_text, backend_prompt_ids, prompt_timing = await prompt_future
         multimodal_inputs = None
@@ -3506,7 +3557,7 @@ class SGLangMessageCompiler:
         *,
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None = None,
-        multimodal_inputs_override: dict[str, Any] | None = None,
+        multimodal_inputs: dict[str, Any] | None = None,
     ) -> EncodedMessages:
         total_started_at = time.monotonic()
         normalized_messages = check_messages(messages_delta)
@@ -3520,16 +3571,16 @@ class SGLangMessageCompiler:
             normalized_tools,
             chat_template_kwargs,
         )
-        if self.processor and multimodal_inputs_override is None:
+        if self.processor and multimodal_inputs is None:
             multimodal_future = asyncio.create_task(self._compute_multimodal_inputs_async(normalized_messages))
         else:
             multimodal_future = None
         normalized_override_future = None
-        if multimodal_inputs_override is not None:
+        if multimodal_inputs is not None:
             normalized_override_future = loop.run_in_executor(
                 self.cpu_executor,
-                _normalize_multimodal_inputs_override_sync,
-                multimodal_inputs_override,
+                _normalize_multimodal_inputs_sync,
+                multimodal_inputs,
             )
 
         formatted_prompt, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
@@ -3578,25 +3629,24 @@ class SGLangMessageCompiler:
 def _extract_output_tokens_and_log_probs(
     meta_info: dict[str, Any],
     *,
-    text: str | None = None,
-    tokenizer: Any | None = None,
+    output_ids: list[int],
+    tokenizer: Any,
+    processor: Any | None = None,
 ) -> tuple[list[int], list[float]]:
-    token_log_probs = meta_info.get("output_token_logprobs") or []
-    if token_log_probs:
-        new_tokens = [int(item[1]) for item in token_log_probs if isinstance(item, (list, tuple)) and len(item) >= 2]
-        new_log_probs = [
-            float(item[0]) for item in token_log_probs if isinstance(item, (list, tuple)) and len(item) >= 2
-        ]
-        return _sanitize_multimodal_output_tokens(new_tokens, tokenizer=tokenizer), new_log_probs
-    if text and tokenizer is not None:
-        return _sanitize_multimodal_output_tokens(
-            list(tokenizer.encode(text, add_special_tokens=False)),
-            tokenizer=tokenizer,
-        ), []
-    return [], []
+    output_token_logprobs = meta_info.get("output_token_logprobs")
+    if output_token_logprobs:
+        tokens = [item[1] for item in output_token_logprobs]
+        log_probs = [item[0] for item in output_token_logprobs]
+        return _sanitize_multimodal_output_tokens(tokens, tokenizer=tokenizer, processor=processor), log_probs
+    return _sanitize_multimodal_output_tokens(output_ids, tokenizer=tokenizer, processor=processor), []
 
 
-def _sanitize_multimodal_output_tokens(tokens: list[int], *, tokenizer: Any | None) -> list[int]:
+def _sanitize_multimodal_output_tokens(
+    tokens: list[int],
+    *,
+    tokenizer: Any | None,
+    processor: Any | None = None,
+) -> list[int]:
     if tokenizer is None or not tokens:
         return tokens
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
@@ -3620,6 +3670,18 @@ def _sanitize_multimodal_output_tokens(tokens: list[int], *, tokenizer: Any | No
                 warning_label,
                 token_name,
             )
+    if processor is not None:
+        from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
+
+        kimi_sanitized = sanitize_kimi_k25_response_tokens(processor, sanitized)
+        if kimi_sanitized is not sanitized:
+            replaced = sum(1 for old, new in zip(sanitized, kimi_sanitized, strict=True) if old != new)
+            if replaced:
+                logger.warning(
+                    "K2.x: replaced %s stray <|media_pad|> token(s) in rollout response with pad_token_id.",
+                    replaced,
+                )
+            sanitized = kimi_sanitized
     return sanitized
 
 
@@ -3666,6 +3728,7 @@ class SGLangBackendAdapter:
         image_data: list[str] | None = None,
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
+        return_logprob: bool = True,
     ) -> BackendGenerateResult:
         router_ip, router_port = self._resolved_router_ip, self._resolved_router_port
         if not router_ip or not router_port:
@@ -3673,7 +3736,7 @@ class SGLangBackendAdapter:
         payload = {
             "input_ids": list(input_ids),
             "sampling_params": dict(sampling_params),
-            "return_logprob": True,
+            "return_logprob": bool(return_logprob),
         }
         if request_id:
             payload["request_id"] = request_id
@@ -3700,8 +3763,9 @@ class SGLangBackendAdapter:
         meta_info = dict(output.get("meta_info", {}))
         new_tokens, new_log_probs = _extract_output_tokens_and_log_probs(
             meta_info,
-            text=output.get("text"),
+            output_ids=output["output_ids"],
             tokenizer=self.tokenizer,
+            processor=self.compiler.processor,
         )
         finish_type = str(meta_info.get("finish_reason", {}).get("type", "stop"))
         return BackendGenerateResult(

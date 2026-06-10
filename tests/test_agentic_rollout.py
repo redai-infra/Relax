@@ -274,12 +274,13 @@ def test_session_shard_prepare_gate_activation_and_logprobs() -> None:
     shard_cls, shard, record, _initial_obs = _make_chat_test_shard()
     record.group_id = "group-prepare"
     record.group_generation = 3
-    record.scope_id = "test-scope"
+    record.scope_id = "train"
     record.gate_reason = "prepare"
     backend_calls = {"count": 0}
+    backend_return_logprobs = []
 
     async def _generate(**kwargs):
-        del kwargs
+        backend_return_logprobs.append(kwargs["return_logprob"])
         backend_calls["count"] += 1
         return BackendGenerateResult(
             new_tokens=_chars("ok"), new_log_probs=[-0.1, -0.2], finish_type="stop", meta_info={}, elapsed=0.1
@@ -300,6 +301,7 @@ def test_session_shard_prepare_gate_activation_and_logprobs() -> None:
                 max_completion_tokens=None,
                 stop=None,
                 seed=None,
+                logprobs=False,
             )
         )
         for _ in range(20):
@@ -307,12 +309,12 @@ def test_session_shard_prepare_gate_activation_and_logprobs() -> None:
             if record.ir_queue:
                 break
         assert backend_calls["count"] == 0
-        assert await shard_cls.prepare_group_status(shard, scope_id="test-scope") == [
+        assert await shard_cls.prepare_group_status(shard, scope_id="train") == [
             {"group_id": "group-prepare", "group_generation": 3, "total_sessions": 1, "ready_sessions": 1}
         ]
         activation = await shard_cls.activate_group_sessions(
             shard,
-            scope_id="test-scope",
+            scope_id="train",
             groups=[{"group_id": "group-prepare", "group_generation": 3}],
             rollout_id=7,
         )
@@ -321,7 +323,8 @@ def test_session_shard_prepare_gate_activation_and_logprobs() -> None:
 
     payload = asyncio.run(_run())
     assert payload["message"]["content"] == "ok"
-    assert [item["logprob"] for item in payload["logprobs"]["content"]] == [-0.1, -0.2]
+    assert payload["logprobs"] is None
+    assert backend_return_logprobs == [True]
     assert backend_calls["count"] == 1
     assert record.rollout_id == 7
 

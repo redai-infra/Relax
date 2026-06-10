@@ -330,6 +330,7 @@ class InflightRequest:
     kind: RequestKind
     abort_count: int
     sampling_params: dict[str, Any] = field(default_factory=dict)
+    logprobs: bool = False
     history_train_token_prefix: list[int] = field(default_factory=list)
     history_rollout_token_prefix: list[int] = field(default_factory=list)
     history_backend_image_data: list[str] = field(default_factory=list)
