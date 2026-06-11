@@ -10,6 +10,7 @@ import torch
 
 from relax.engine.sft.dataset.streaming import (
     SFTStreamingDataset,
+    _canonicalize_messages,
     _expand_loss_mask_via_alignment,
     pack_samples_for_tq,
 )
@@ -300,3 +301,22 @@ def test_expand_loss_mask_alignment_trailing_mismatch_raises():
             expanded_ids=expanded,
             pad_token_ids=frozenset(),
         )
+
+
+def test_canonicalize_messages_extracts_tool_calls():
+    """Raw OpenAI-style assistant messages may carry a ``tool_calls`` field;
+    ``_canonicalize_messages`` must propagate it onto ``CanonicalMessage`` so
+    the chat template can render the tool calls.
+
+    Messages without the field stay None.
+    """
+    tool_call = {"type": "function", "function": {"name": "f", "arguments": {"x": 1}}}
+    raw = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+        {"role": "tool", "content": "ok"},
+    ]
+    msgs = _canonicalize_messages(raw, require_response=True)
+    assert msgs[0].tool_calls is None
+    assert msgs[1].tool_calls == [tool_call]
+    assert msgs[2].tool_calls is None

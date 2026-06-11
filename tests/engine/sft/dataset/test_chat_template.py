@@ -8,6 +8,7 @@ import torch
 
 from relax.engine.sft.dataset.chat_template import (
     HAS_GENERATION_MARKER,
+    _to_chat_messages,
     render_with_loss_mask,
 )
 from relax.engine.sft.dataset.sample import (
@@ -169,3 +170,159 @@ def test_fallback_loss_mask_only_on_learn_messages():
     # All earlier positions (system + user turns) should be 0.
     assert loss_mask[:-learn_span].sum().item() == 0
     assert input_ids.shape == loss_mask.shape
+
+
+class _FakeQwenStyleTokenizer:
+    """Fake fast tokenizer that mimics Qwen3.5 chat-template behavior for tool
+    data:
+
+    * ``tool`` messages are wrapped in ``<|im_start|>user\\n<tool_response>...</tool_response>``
+      and consecutive tools share one ``user`` wrapper (closed by ``<|im_end|>\\n`` after the
+      last one).
+    * ``assistant.tool_calls`` are rendered inline as
+      ``<tool_call>\\n<function=NAME>...</function>\\n</tool_call>`` between the assistant
+      content and ``<|im_end|>``.
+    * Chat template lacks ``{% generation %}`` so the fallback path is exercised.
+    * Tokenization is char-by-char with offset_mapping support.
+    """
+
+    chat_template = "{{ messages[0]['content'] }}"  # no {% generation %}
+
+    @staticmethod
+    def _render(messages):
+        out = ""
+        prev_role = None
+        for i, m in enumerate(messages):
+            role = m["role"]
+            content = m.get("content", "")
+            if role == "tool":
+                if prev_role != "tool":
+                    out += "<|im_start|>user"
+                out += "\n<tool_response>\n" + content + "\n</tool_response>"
+                next_role = messages[i + 1]["role"] if i + 1 < len(messages) else None
+                if next_role != "tool":
+                    out += "<|im_end|>\n"
+            else:
+                out += f"<|im_start|>{role}\n{content}"
+                if role == "assistant":
+                    for tc in m.get("tool_calls") or []:
+                        fn = tc.get("function", tc)
+                        name = fn["name"]
+                        args = fn.get("arguments") or {}
+                        out += f"\n<tool_call>\n<function={name}>"
+                        for k, v in args.items():
+                            out += f"\n<parameter={k}>\n{v}\n</parameter>"
+                        out += "\n</function>\n</tool_call>"
+                out += "<|im_end|>\n"
+            prev_role = role
+        return out
+
+    @staticmethod
+    def _tokenize(text):
+        return [ord(c) for c in text], [(i, i + 1) for i in range(len(text))]
+
+    def apply_chat_template(self, messages, *, tools=None, tokenize=True, **kwargs):  # noqa: ARG002
+        text = self._render(messages)
+        if not tokenize:
+            return text
+        ids, _ = self._tokenize(text)
+        return ids
+
+    def __call__(self, text, *, add_special_tokens=False, return_offsets_mapping=False, **kwargs):  # noqa: ARG002
+        ids, offsets = self._tokenize(text)
+        result = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+
+def _learned_text(input_ids: torch.Tensor, loss_mask: torch.Tensor) -> str:
+    return "".join(chr(int(c)) for c, m in zip(input_ids.tolist(), loss_mask.tolist()) if m == 1)
+
+
+def test_to_chat_messages_includes_tool_calls():
+    """Plan C: CanonicalMessage.tool_calls propagates into the chat-template
+    dict."""
+    tool_call = {"type": "function", "function": {"name": "f", "arguments": {"x": 1}}}
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="q", learn=False),
+            CanonicalMessage(role="assistant", content="", learn=True, tool_calls=[tool_call]),
+            CanonicalMessage(role="tool", content="r", learn=False),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    msgs = _to_chat_messages(sample)
+    assert msgs[0] == {"role": "user", "content": "q"}
+    assert msgs[1] == {"role": "assistant", "content": "", "tool_calls": [tool_call]}
+    # tool_calls absent on messages that don't carry it
+    assert "tool_calls" not in msgs[2]
+
+
+def test_fallback_handles_tool_role_wrapped_in_user_block():
+    """Plan A: role=='tool' is rendered inside a user wrapper by Qwen3.5;
+    fallback must scan ``<tool_response>...</tool_response>`` rather than a
+    ``<|im_start|>tool`` header and not raise."""
+    tok = _FakeQwenStyleTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="q", learn=False),
+            CanonicalMessage(role="assistant", content="A", learn=True),
+            CanonicalMessage(role="tool", content="RESPONSE_X", learn=False),
+            CanonicalMessage(role="assistant", content="B", learn=True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    input_ids, loss_mask = render_with_loss_mask(sample, tokenizer=tok)
+    learned = _learned_text(input_ids, loss_mask)
+    assert "A" in learned and "B" in learned
+    assert "RESPONSE_X" not in learned
+
+
+def test_fallback_handles_consecutive_tool_messages_in_one_wrapper():
+    """Two adjacent tool messages share a single ``<|im_start|>user`` wrapper —
+    fallback must locate each ``<tool_response>`` independently and not get
+    confused by the missing per-tool header."""
+    tok = _FakeQwenStyleTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="assistant", content="A", learn=True),
+            CanonicalMessage(role="tool", content="R1", learn=False),
+            CanonicalMessage(role="tool", content="R2", learn=False),
+            CanonicalMessage(role="user", content="U", learn=False),
+            CanonicalMessage(role="assistant", content="Z", learn=True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    input_ids, loss_mask = render_with_loss_mask(sample, tokenizer=tok)
+    learned = _learned_text(input_ids, loss_mask)
+    assert "A" in learned and "Z" in learned
+    assert "R1" not in learned and "R2" not in learned
+    assert "U" not in learned
+
+
+def test_fallback_assistant_tool_calls_are_inlined_into_loss():
+    """Plan C end-to-end: assistant.tool_calls are rendered inline and the
+    resulting ``<tool_call>...</tool_call>`` XML lands inside the assistant
+    loss region."""
+    tok = _FakeQwenStyleTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="q", learn=False),
+            CanonicalMessage(
+                role="assistant",
+                content="",
+                learn=True,
+                tool_calls=[{"type": "function", "function": {"name": "MY_FN", "arguments": {"k": "v"}}}],
+            ),
+            CanonicalMessage(role="tool", content="ok", learn=False),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    input_ids, loss_mask = render_with_loss_mask(sample, tokenizer=tok)
+    learned = _learned_text(input_ids, loss_mask)
+    assert "<tool_call>" in learned
+    assert "MY_FN" in learned
+    assert "</tool_call>" in learned
+    # Tool response stays out of the loss
+    assert "ok" not in learned

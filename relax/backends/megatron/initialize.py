@@ -1,4 +1,5 @@
 import random
+import socket
 
 import numpy as np
 import torch
@@ -52,6 +53,19 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         create_gloo_process_groups=args.use_gloo_process_groups,
+    )
+
+    try:
+        host_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        host_ip = "unknown"
+    logger.info(
+        f"[mpu] rank={torch.distributed.get_rank()} "
+        f"tp={mpu.get_tensor_model_parallel_rank()} "
+        f"cp={mpu.get_context_parallel_rank()} "
+        f"pp={mpu.get_pipeline_model_parallel_rank()} "
+        f"ep={mpu.get_expert_model_parallel_rank()} "
+        f"ip={host_ip}"
     )
 
 

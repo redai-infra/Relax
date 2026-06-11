@@ -102,7 +102,14 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
             raise ValueError(f"SFT message missing content: {raw}")
         learn = bool(raw.get("learn", role in _LEARN_ROLES))
         has_learn = has_learn or learn
-        messages.append(CanonicalMessage(role=role, content=raw["content"], learn=learn))
+        messages.append(
+            CanonicalMessage(
+                role=role,
+                content=raw["content"],
+                learn=learn,
+                tool_calls=raw.get("tool_calls"),
+            )
+        )
     if require_response and not has_learn:
         raise ValueError("SFT training row has no assistant/function_call response tokens.")
     return messages

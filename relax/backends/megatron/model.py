@@ -43,6 +43,18 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
     if not getattr(args, "enable_mtp_training", False):
         return
 
+    # VL+THD+CP unsplit path: bridge's preprocess_packed_seqs repacks
+    # hidden_states with per-sample align=tp*cp*2, which does not match the
+    # legacy `batch["tokens"]` / `batch["full_loss_masks"]` layout (per-sample
+    # align=2*cp_size + global pad). data.py builds these bridge-aligned
+    # tensors when the unsplit path is taken with MTP enabled; use them so
+    # the rolled labels/mask line up with the MTP chunked hidden_states.
+    if batch.get("unsplit_mtp_labels") is not None:
+        forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["unsplit_mtp_labels"]}
+        if forward_kwargs.get("loss_mask") is None:
+            forward_kwargs["loss_mask"] = batch["unsplit_mtp_loss_mask"]
+        return
+
     # Use the packed text-model labels. Qwen3/VL bridge forwards may receive
     # unsplit input_ids, then convert them to this layout internally.
     forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}

@@ -221,6 +221,18 @@ In colocate mode, SGLang and training share GPU memory. Reduce SGLang's allocati
 --sglang-mem-fraction-static 0.7  # down from 0.8
 ```
 
+### 12. Rebalance Pipeline Parallel Layers Across Stages
+
+When PP is enabled and you see clearly uneven per-stage memory usage, the last stage is usually the heaviest — it carries extra cost from loss computation and output embedding. Shift layers onto the first stage to relieve the last stage:
+
+```bash
+# Example: Qwen3.5 35B has 40 layers, PP=2
+# Even split assigns 20 layers per stage; the last stage tends to OOM
+--decoder-first-pipeline-num-layers 30
+```
+
+`--decoder-last-pipeline-num-layers` is also available if you'd rather reduce the last stage explicitly. Adjust in small steps — move 1–2 layers at a time and watch the per-stage memory water mark.
+
 ---
 
 ## OOM in Specific Phases
@@ -235,6 +247,7 @@ In colocate mode, SGLang and training share GPU memory. Reduce SGLang's allocati
 3. Lower `--max-tokens-per-gpu`
 4. Enable `--recompute-loss-function`
 5. Try `--optimizer-cpu-offload`
+6. If PP is enabled and the last stage is clearly heavier, use `--decoder-first-pipeline-num-layers` to shift layers onto the first stage
 
 ### Log Probs Computation OOM
 
@@ -283,6 +296,7 @@ In colocate mode, SGLang and training share GPU memory. Reduce SGLang's allocati
 | Profile memory usage | `--profile-with-memory` |
 | Adjust memory margin | `--train-memory-margin-bytes <bytes>` |
 | SGLang memory (colocate) | `--sglang-mem-fraction-static <fraction>` |
+| Rebalance PP stage layers | `--decoder-first-pipeline-num-layers <count>` |
 
 ---
 

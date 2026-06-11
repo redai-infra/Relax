@@ -36,7 +36,10 @@ def _to_chat_messages(sample: CanonicalSample) -> list[dict[str, Any]]:
     apply_chat_template."""
     out = []
     for m in sample.messages:
-        out.append({"role": m.role, "content": m.content})
+        d: dict[str, Any] = {"role": m.role, "content": m.content}
+        if m.tool_calls is not None:
+            d["tool_calls"] = m.tool_calls
+        out.append(d)
     return out
 
 
@@ -63,6 +66,11 @@ def _render_with_assistant_mask(sample: CanonicalSample, *, tokenizer) -> tuple[
 
 _THINK_OPEN = "<think>\n"
 _IM_END = "<|im_end|>"
+# Qwen3.5 wraps tool messages inside a user block as
+# `<tool_response>\n{content}\n</tool_response>`, so role=="tool" has no
+# `<|im_start|>tool\n` header — scan the wrapper instead.
+_TOOL_RESPONSE_OPEN = "<tool_response>\n"
+_TOOL_RESPONSE_CLOSE = "\n</tool_response>"
 
 
 def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
@@ -90,7 +98,7 @@ def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple
     Qwen-style ChatML wrapping — non-ChatML templates should expose
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
-    msgs = [{"role": m.role, "content": m.content} for m in sample.messages]
+    msgs = _to_chat_messages(sample)
     rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False)
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
@@ -121,20 +129,34 @@ def _render_per_message_fallback(sample: CanonicalSample, *, tokenizer) -> tuple
     char_mask = bytearray(len(rendered_text))  # zeros
     cursor = 0
     for msg in sample.messages:
-        header = f"<|im_start|>{msg.role}\n"
-        header_pos = rendered_text.find(header, cursor)
-        if header_pos < 0:
-            raise RuntimeError(
-                f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat template output"
-            )
-        content_start = header_pos + len(header)
-        end_pos = rendered_text.find(_IM_END, content_start)
-        if end_pos < 0:
-            raise RuntimeError(f"could not locate <|im_end|> for {msg.role!r} message")
-        span_end = end_pos + len(_IM_END)
-        if span_end < len(rendered_text) and rendered_text[span_end] == "\n":
-            span_end += 1
-        cursor = span_end
+        if msg.role == "tool":
+            open_pos = rendered_text.find(_TOOL_RESPONSE_OPEN, cursor)
+            if open_pos < 0:
+                raise RuntimeError(
+                    f"could not locate <tool_response> for tool message after cursor {cursor} "
+                    f"in rendered chat template output"
+                )
+            content_start = open_pos + len(_TOOL_RESPONSE_OPEN)
+            close_pos = rendered_text.find(_TOOL_RESPONSE_CLOSE, content_start)
+            if close_pos < 0:
+                raise RuntimeError("could not locate </tool_response> for tool message")
+            span_end = close_pos
+            cursor = close_pos + len(_TOOL_RESPONSE_CLOSE)
+        else:
+            header = f"<|im_start|>{msg.role}\n"
+            header_pos = rendered_text.find(header, cursor)
+            if header_pos < 0:
+                raise RuntimeError(
+                    f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat template output"
+                )
+            content_start = header_pos + len(header)
+            end_pos = rendered_text.find(_IM_END, content_start)
+            if end_pos < 0:
+                raise RuntimeError(f"could not locate <|im_end|> for {msg.role!r} message")
+            span_end = end_pos + len(_IM_END)
+            if span_end < len(rendered_text) and rendered_text[span_end] == "\n":
+                span_end += 1
+            cursor = span_end
 
         if not msg.learn:
             continue

@@ -16,6 +16,10 @@ class CanonicalMessage:
     role: str
     content: str | list[dict]
     learn: bool
+    # OpenAI-style assistant tool calls, e.g.
+    # [{"type": "function", "function": {"name": ..., "arguments": {...}}}].
+    # Passed through to the chat template unchanged.
+    tool_calls: list[dict] | None = None
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:

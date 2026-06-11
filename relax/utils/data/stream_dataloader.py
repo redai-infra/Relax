@@ -283,6 +283,23 @@ def _broadcast_routed_experts(
     Using ``dist.broadcast`` on contiguous GPU tensors is orders of magnitude
     faster than ``broadcast_object_list`` which pickles everything (~14 s for
     377 MB vs sub-second via NCCL).
+
+    TODO(yangrui6): missing CP broadcast. After the CP=0 guard added to
+    ``get_data_from_transfer_queue.should_fetch`` (to fix the CP fetch race
+    that hangs SFT/RL with CP>1), only (TP=0, PP=0, CP=0) holds the source
+    data. The PP→TP chain below assumes (TP=0, PP=0) — i.e. *all* CP partners
+    of (TP=0, PP=0) — has the data, but with the CP=0 guard only CP=0 of
+    (TP=0, PP=0) actually does. For RL paths that set
+    ``rollout_routed_experts`` in ``data_fields`` with CP>1, this routes wrong
+    data to CP=1..* partners (or hangs at the bcast meta exchange because
+    senders/receivers disagree on shape).
+    Fix: prepend a CP bcast step that fans the tensor from (TP=0, PP=0, CP=0)
+    to (TP=0, PP=0, CP=*) before the existing PP/TP bcasts, gated on
+    ``is_tp_rank0 and is_pp_rank0`` (mirror what we added at
+    ``get_data_from_transfer_queue`` for ``broadcast_object_list``). SFT does
+    NOT exercise this path (``rollout_routed_experts`` only set in RL with
+    ``--use-rollout-routing-replay``), so the bug is latent; user can
+    reproduce by running GRPO/GSPO + routing_replay + CP>1.
     """
 
     def _bcast_tensor(tensor, is_sender, dtype):
@@ -422,6 +439,18 @@ def get_data_from_transfer_queue(
     config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
 
     # Determine which rank should fetch data
+    #
+    # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
+    # partner of (TP=0, PP=0) independently calls tq_client.get_meta / get_data
+    # and they race the producer: a fetcher arriving before the producer fills
+    # `ready_indexes` gets back `[], []` and the sampler does NOT cache an
+    # empty result, while a fetcher arriving after gets the real samples and
+    # writes the cache. So 8 CP partners → split into "got data" and "got None"
+    # subsets. With downstream TP/PP broadcast, each CP rank's result fans out
+    # to its (TP, PP) cohort: half the world enters train_actor and hangs at
+    # the first cross-rank collective, the other half loops, sees
+    # all_consumed=True (because the winners consumed the partition), and
+    # returns to main_loop → 16 idle + 16 hung on TP2/PP2/CP8/DP1.
     if per_rank_fetch:
         # Each rank pulls its own copy from TQ; broadcasts are skipped below.
         # Safe because the TQ sampler caches the meta on
@@ -430,11 +459,15 @@ def get_data_from_transfer_queue(
         # sampler/*_sampler.py).
         should_fetch = True
     elif broadcast_pp:
-        # Colocate mode: only tp_rank==0 AND pp_rank==0 fetches data
-        should_fetch = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0
+        # Colocate mode: only (tp_rank, pp_rank, cp_rank) == (0, 0, 0) fetches data
+        should_fetch = (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        )
     else:
-        # Fully async mode: only tp_rank==0 fetches data (each PP stage independently)
-        should_fetch = mpu.get_tensor_model_parallel_rank() == 0
+        # Fully async mode: only (tp_rank, cp_rank) == (0, 0) fetches data per PP stage
+        should_fetch = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0
 
     # tgd_fetch: time spent in the Ray transfer-queue RPC on the fetching rank.
     # Non-fetching ranks record ~0s, which by itself confirms whether the
@@ -493,6 +526,17 @@ def get_data_from_transfer_queue(
     if not per_rank_fetch:
         # Always broadcast across tensor parallel ranks (now without routed_experts)
         _maybe_log_tgd_pickle_diag(rollout_data, should_fetch)
+        # CP broadcast must come FIRST: only (TP=0, PP=0, CP=0) fetched, so we
+        # need to fan out the result to the other CP partners of (TP=0, PP=0)
+        # before TP / PP broadcasts can propagate it across the rest of the
+        # world. Skipping this is what caused the 16-idle / 16-hung split.
+        with timer("tgd_bcast_cp"):
+            dist.broadcast_object_list(
+                rollout_data,
+                device=cuda_dev,
+                group=mpu.get_context_parallel_group(),
+                group_src=0,
+            )
         with timer("tgd_bcast_tp"):
             dist.broadcast_object_list(
                 rollout_data,

@@ -280,6 +280,7 @@ def get_batch(
 
     loss_masks: list[torch.Tensor] = []
     per_sample_loss_masks: list[torch.Tensor] = []
+    full_per_sample_loss_masks: list[torch.Tensor] = []
     for loss_mask, total_length, response_length in zip(
         batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
     ):
@@ -290,6 +291,9 @@ def get_batch(
             per_sample_loss_masks.append(loss_mask)
             prompt_length = total_length - response_length
             loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+        # Pre-CP, per-sample full-length mask used for the bridge-aligned MTP
+        # labels/mask below (built after this loop closes).
+        full_per_sample_loss_masks.append(loss_mask)
         if not allgather_cp:
             loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
         loss_masks.append(loss_mask)
@@ -309,6 +313,32 @@ def get_batch(
 
     assert loss_masks.shape == tokens.shape, f"loss_masks.shape: {loss_masks.shape}, tokens.shape: {tokens.shape}"
     batch["full_loss_masks"] = loss_masks
+
+    # Bridge-aligned MTP labels/loss_mask for the VL+THD+CP unsplit path.
+    # Legacy `batch["tokens"]` / `batch["full_loss_masks"]` use per-sample
+    # align=2*cp_size + global pad, but the bridge's preprocess_packed_seqs
+    # repacks hidden_states with per-sample align=tp*cp*2 (matching
+    # vlm_packed_seq_params). The two per-rank lengths diverge, so MTP labels
+    # must mirror the bridge layout: per-sample pad to seqlens_padded[i],
+    # then CP-slice with the standard 2-chunk pattern, then concat.
+    if qkv_format == "thd" and "vlm_packed_seq_params" in batch and getattr(get_args(), "enable_mtp_training", False):
+        orig_tokens = batch["unconcat_tokens"]
+        seqlens_padded_list = batch["padded_total_lengths"]
+        mtp_label_chunks: list[torch.Tensor] = []
+        mtp_loss_chunks: list[torch.Tensor] = []
+        for sample_tokens, sample_mask, pad_to in zip(
+            orig_tokens, full_per_sample_loss_masks, seqlens_padded_list, strict=True
+        ):
+            pad_to = int(pad_to)
+            t_padded = F.pad(sample_tokens, (0, pad_to - sample_tokens.size(0)), value=pad_token_id)
+            m_padded = F.pad(sample_mask, (0, pad_to - sample_mask.size(0)), value=0)
+            chunk = pad_to // (2 * cp_size)
+            s1, e1 = chunk * cp_rank, chunk * (cp_rank + 1)
+            s2, e2 = chunk * (2 * cp_size - cp_rank - 1), chunk * (2 * cp_size - cp_rank)
+            mtp_label_chunks.append(torch.cat([t_padded[s1:e1], t_padded[s2:e2]]))
+            mtp_loss_chunks.append(torch.cat([m_padded[s1:e1], m_padded[s2:e2]]))
+        batch["unsplit_mtp_labels"] = torch.cat(mtp_label_chunks).unsqueeze(0)
+        batch["unsplit_mtp_loss_mask"] = torch.cat(mtp_loss_chunks).unsqueeze(0)
 
     # Process multimodal training tensors if present
     multimodal_train_inputs = batch.get("multimodal_train_inputs", None)
