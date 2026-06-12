@@ -53,8 +53,34 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 echo "=== Cleaning up residual python/sglang processes ==="
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 
-# kill old tasks
-ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K[^']+" | xargs ray job stop || true
+# kill old tasks, but never kill ourselves.
+# Resolve our own submission_id with two strategies:
+#   1) RAY_JOB_SUBMISSION_ID env var — set by Ray ≥ 2.6 via `ray job submit`,
+#      but empty on some platforms (e.g. QS wrappers that strip env vars).
+#   2) Fallback: Ray's job_supervisor redirects driver stdout/stderr to
+#      /tmp/ray/session_latest/logs/job-driver-<sub_id>.log, so readlink fd 1/2
+#      recovers <sub_id>.
+# If both fail, SKIP cleanup — never kill blindly, because that suicides the job.
+SELF_SUB_ID="${RAY_JOB_SUBMISSION_ID:-}"
+if [ -z "$SELF_SUB_ID" ]; then
+    for _fd in 1 2; do
+        _path=$(readlink -f "/proc/self/fd/${_fd}" 2>/dev/null || true)
+        if [[ "$_path" =~ /job-driver-(.+)\.(log|out|err)$ ]]; then
+            SELF_SUB_ID="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
+fi
+echo "=== Own ray submission_id: ${SELF_SUB_ID:-<unknown>} ==="
+if [ -z "$SELF_SUB_ID" ]; then
+    echo "WARNING: could not detect own submission_id; skipping old-job cleanup to avoid suicide."
+else
+    ray job list \
+      | grep RUNNING \
+      | grep -oP "submission_id='\\K[^']+" \
+      | grep -vFx "$SELF_SUB_ID" \
+      | xargs --no-run-if-empty -n1 ray job stop || true
+fi
 
 set -x
 
