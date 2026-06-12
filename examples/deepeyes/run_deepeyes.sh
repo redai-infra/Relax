@@ -86,6 +86,7 @@ ROLLOUT_ARGS=(
     --n-samples-per-prompt 8
     --rollout-max-response-len 8192
     --rollout-max-prompt-len 2048
+    --rollout-max-context-len 10240
     --rollout-temperature 1
     --global-batch-size 512
     --use-fault-tolerance
@@ -136,8 +137,6 @@ OPTIMIZER_ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
-    --no-pin-cpu-grads
-    --no-pin-cpu-params
     --no-rope-fusion
 )
 
@@ -182,7 +181,6 @@ MEGATRON_ARGS=(
     --recompute-method uniform
     --recompute-num-layers 1
     --max-tokens-per-gpu 8192
-    --log-probs-chunk-size 32
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32

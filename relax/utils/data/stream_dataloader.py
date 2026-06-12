@@ -382,29 +382,34 @@ def _broadcast_routed_experts(
 
 
 def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
-    """Broadcast a single tensor of *known* dtype/shape across PP then TP."""
-    is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
+    """Broadcast a single tensor of *known* dtype/shape across CP, TP, then
+    PP."""
 
-    # --- Step 1: PP broadcast (only among tp_rank==0 ranks) ---
-    if broadcast_pp and is_tp_rank0:
-        pp_group = mpu.get_pipeline_model_parallel_group()
-        pp_src_global = dist.get_global_rank(pp_group, 0)
-        if is_src and tensor is not None:
-            buf = tensor.to(device=cuda_dev, dtype=dtype).contiguous()
+    def _bcast(t, contribute, group):
+        # The group's rank-0 contributes its current buffer when it holds real
+        # data; otherwise every member allocates a (correctly shaped)
+        # placeholder that a later stage overwrites.
+        if contribute and t is not None:
+            buf = t.to(device=cuda_dev, dtype=dtype).contiguous()
         else:
             buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-        dist.broadcast(buf, src=pp_src_global, group=pp_group)
-        tensor = buf
+        dist.broadcast(buf, src=dist.get_global_rank(group, 0), group=group)
+        return buf
+
+    # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
+    # Only the global source's CP group has real data on its rank-0; the rest
+    # broadcast a placeholder that the TP / PP stages below overwrite.
+    if mpu.get_context_parallel_world_size() > 1:
+        tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
 
     # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
-    tp_group = mpu.get_tensor_model_parallel_group()
-    tp_src_global = dist.get_global_rank(tp_group, 0)
-    if is_tp_rank0 and tensor is not None:
-        buf = tensor.to(device=cuda_dev, dtype=dtype).contiguous()
-    else:
-        buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-    dist.broadcast(buf, src=tp_src_global, group=tp_group)
-    return buf
+    tensor = _bcast(tensor, mpu.get_tensor_model_parallel_rank() == 0, mpu.get_tensor_model_parallel_group())
+
+    # --- Step 3: PP broadcast (pp_rank==0 -> others in each PP group) ---
+    if broadcast_pp:
+        tensor = _bcast(tensor, mpu.get_pipeline_model_parallel_rank() == 0, mpu.get_pipeline_model_parallel_group())
+
+    return tensor
 
 
 def _encode_multimodal_inputs(mm_list):
