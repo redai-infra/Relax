@@ -81,16 +81,17 @@ ROLLOUT_ARGS=(
     --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
     --custom-config-path examples/deepeyes/deepeyes_config.yaml
     --num-rollout ${NUM_ROLLOUT}
-    --rollout-batch-size 32
+    --rollout-batch-size 64
     --micro-batch-size 1
     --n-samples-per-prompt 8
-    --rollout-max-response-len 2048
+    --rollout-max-response-len 8192
     --rollout-max-prompt-len 2048
     --rollout-temperature 1
-    --global-batch-size 256
+    --global-batch-size 512
     --use-fault-tolerance
     --rollout-shuffle
     --use-streaming-dataset
+    --balance-data
 )
 
 ###############################################################################
@@ -103,6 +104,7 @@ EVAL_ARGS=(
     --n-samples-per-eval-prompt 8
     --eval-max-response-len 2048
     --eval-top-p 0.7
+    --skip-eval-before-train
 )
 
 ###############################################################################
@@ -134,6 +136,8 @@ OPTIMIZER_ARGS=(
     --optimizer-cpu-offload
     --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
+    --no-pin-cpu-grads
+    --no-pin-cpu-params
     --no-rope-fusion
 )
 
@@ -144,6 +148,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 2
     --sglang-mem-fraction-static 0.8
+    --sglang-load-format dummy
 )
 
 ###############################################################################
@@ -167,7 +172,7 @@ LOG_ARGS=(
 ###############################################################################
 
 MEGATRON_ARGS=(
-    --tensor-model-parallel-size 4
+    --tensor-model-parallel-size 2
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
@@ -177,6 +182,7 @@ MEGATRON_ARGS=(
     --recompute-method uniform
     --recompute-num-layers 1
     --max-tokens-per-gpu 8192
+    --log-probs-chunk-size 32
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32

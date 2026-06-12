@@ -381,6 +381,99 @@ def _broadcast_routed_experts(
     return values_gpu.cpu(), offsets_gpu.cpu()
 
 
+def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
+    """Broadcast a single tensor of *known* dtype/shape across PP then TP."""
+    is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
+
+    # --- Step 1: PP broadcast (only among tp_rank==0 ranks) ---
+    if broadcast_pp and is_tp_rank0:
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        pp_src_global = dist.get_global_rank(pp_group, 0)
+        if is_src and tensor is not None:
+            buf = tensor.to(device=cuda_dev, dtype=dtype).contiguous()
+        else:
+            buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+        dist.broadcast(buf, src=pp_src_global, group=pp_group)
+        tensor = buf
+
+    # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tp_src_global = dist.get_global_rank(tp_group, 0)
+    if is_tp_rank0 and tensor is not None:
+        buf = tensor.to(device=cuda_dev, dtype=dtype).contiguous()
+    else:
+        buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+    dist.broadcast(buf, src=tp_src_global, group=tp_group)
+    return buf
+
+
+def _encode_multimodal_inputs(mm_list):
+    """Split a per-sample multimodal list into a tiny pickle-able spec and a
+    flat, traversal-ordered list of the raw tensors to stream via NCCL.
+
+    Returns ``(spec, tensors)`` where *spec* mirrors ``mm_list`` but replaces
+    every tensor with its ``{"dtype", "shape"}`` descriptor (a few bytes), and
+    *tensors* is the ordered list of tensors referenced by the spec. Tensors
+    are deliberately kept out of the pickle so ``broadcast_object_list`` only
+    serialises kilobytes instead of gigabytes.
+    """
+    spec: List[Any] = []
+    tensors: List[torch.Tensor] = []
+    for sample in mm_list:
+        if sample is None:
+            spec.append(None)
+            continue
+        entry: Dict[str, Any] = {}
+        for key, val in sample.items():
+            if isinstance(val, torch.Tensor):
+                entry[key] = {"t": "tensor", "dtype": val.dtype, "shape": tuple(val.shape)}
+                tensors.append(val)
+            elif isinstance(val, list) and val and all(isinstance(x, torch.Tensor) for x in val):
+                entry[key] = {"t": "list", "items": [{"dtype": x.dtype, "shape": tuple(x.shape)} for x in val]}
+                tensors.extend(val)
+            else:
+                # Non-tensor (python scalar / small list); carry it inline.
+                entry[key] = {"t": "raw", "value": val}
+        spec.append(entry)
+    return spec, tensors
+
+
+def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast_pp):
+    """Reconstruct ``multimodal_train_inputs`` on every rank by streaming the
+    raw tensors via NCCL (zero pickle) instead of through
+    ``broadcast_object_list``."""
+    if spec is None:
+        return None
+
+    out: List[Any] = []
+    idx = 0
+    for entry in spec:
+        if entry is None:
+            out.append(None)
+            continue
+        sample: Dict[str, Any] = {}
+        for key, enc in entry.items():
+            if enc["t"] == "tensor":
+                src_t = send_tensors[idx] if is_src else None
+                idx += 1
+                sample[key] = _bcast_known_tensor(
+                    src_t, is_src, enc["dtype"], enc["shape"], cuda_dev, broadcast_pp
+                ).cpu()
+            elif enc["t"] == "list":
+                items: List[Any] = []
+                for sub in enc["items"]:
+                    src_t = send_tensors[idx] if is_src else None
+                    idx += 1
+                    items.append(
+                        _bcast_known_tensor(src_t, is_src, sub["dtype"], sub["shape"], cuda_dev, broadcast_pp).cpu()
+                    )
+                sample[key] = items
+            else:  # raw
+                sample[key] = enc["value"]
+        out.append(sample)
+    return out
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -519,6 +612,39 @@ def get_data_from_transfer_queue(
             del td["rollout_routed_experts"]
             rollout_data[0] = td
 
+    # --- Extract multimodal_train_inputs BEFORE broadcast_object_list ---
+    # Only on the broadcast path: in per_rank_fetch mode every rank already
+    # pulled its own multimodal_train_inputs from TQ, so it stays inside the
+    # TensorDict and is converted to a per-sample list below (mirrors the
+    # routed_experts handling).
+    has_multimodal = "multimodal_train_inputs" in data_fields
+    mm_spec = None
+    mm_send_tensors: List[torch.Tensor] = []
+
+    if has_multimodal and not per_rank_fetch and should_fetch and rollout_data[0] is not None:
+        td = rollout_data[0]
+        if isinstance(td, TensorDict) and "multimodal_train_inputs" in td.keys():
+            from tensordict.tensorclass import NonTensorData
+
+            mm_list: List[Any] = []
+            for item in list(td["multimodal_train_inputs"]):
+                raw = item.data if isinstance(item, NonTensorData) else item
+                if raw is None:
+                    mm_list.append(None)
+                elif isinstance(raw, dict):
+                    mm_list.append(raw)
+                else:
+                    mm_list.append(dict(raw.items()) if hasattr(raw, "items") else dict(raw.data))
+            mm_spec, mm_send_tensors = _encode_multimodal_inputs(mm_list)
+            # Remove from TensorDict so broadcast_object_list only pickles the spec.
+            del td["multimodal_train_inputs"]
+            rollout_data[0] = td
+
+    # Carry the (tiny) multimodal spec alongside the payload so every rank
+    # learns the dtype/shape of each tensor it is about to receive via NCCL.
+    # In per_rank_fetch mode this is None (each rank reconstructs locally).
+    rollout_data.append(mm_spec)
+
     if per_rank_fetch:
         # Cheap byte-only diagnostic; never pickles (that would defeat the
         # whole point of per_rank_fetch).
@@ -555,11 +681,16 @@ def get_data_from_transfer_queue(
                     group_src=0,
                 )
 
-    # Unpack the broadcasted pair.
-    rollout_data, batch_meta = rollout_data[0], rollout_data[1]
+    # Unpack the broadcasted triple.
+    rollout_data, batch_meta, mm_spec = rollout_data[0], rollout_data[1], rollout_data[2]
 
     if rollout_data is None:
         return None, None
+
+    # --- Stream multimodal tensors via NCCL (zero-copy, CPU-resident result) ---
+    mm_inputs = None
+    if has_multimodal:
+        mm_inputs = _broadcast_multimodal_inputs(mm_spec, mm_send_tensors, should_fetch, cuda_dev, broadcast_pp)
 
     # --- Broadcast routed_experts tensors via efficient dist.broadcast ---
     # Skipped entirely in per_rank_fetch mode: each rank already received the
@@ -585,9 +716,11 @@ def get_data_from_transfer_queue(
             if "lengths" in k or "reward" in k:
                 new_rollout_data[k] = v.tolist()
             elif k == "multimodal_train_inputs":
-                # multimodal inputs are stored as a list of tensordicts / dicts;
-                # some entries may be None for text-only samples in a multimodal
-                # batch.  Turn each non-None entry into a plain dict.
+                # Only reached on the per_rank_fetch path (the broadcast path
+                # extracts and NCCL-streams these before broadcast). Stored as a
+                # list of tensordicts / dicts; some entries may be None for
+                # text-only samples in a multimodal batch. Turn each non-None
+                # entry into a plain dict.
                 from tensordict.tensorclass import NonTensorData
 
                 new_rollout_data[k] = []
@@ -629,6 +762,11 @@ def get_data_from_transfer_queue(
             for i in range(len(routed_experts_offsets) - 1)
         ]
 
+    # Re-attach the NCCL-streamed multimodal inputs (CPU-resident; moved to GPU
+    # per micro-batch by get_batch).
+    if has_multimodal and mm_inputs is not None:
+        rollout_data["multimodal_train_inputs"] = mm_inputs
+
     post_process_rollout_data(args, rollout_data)
 
     return rollout_data, batch_meta
@@ -644,22 +782,8 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
-    if "multimodal_train_inputs" in rollout_data:
-        # Move multimodal training tensors to GPU in advance.
-        # Values may be a single Tensor (e.g. image pixel_values) or a list
-        # of Tensors (e.g. video frames), so handle both cases.
-        def _to_cuda(v):
-            if isinstance(v, torch.Tensor):
-                return v.to(device=cuda_dev)
-            if isinstance(v, list):
-                return [_to_cuda(item) for item in v]
-            return v
-
-        rollout_data["multimodal_train_inputs"] = [
-            ({key: _to_cuda(val) for key, val in mm_dict.items()} if mm_dict is not None else None)
-            for mm_dict in rollout_data["multimodal_train_inputs"]
-        ]
-
+    # NOTE: multimodal_train_inputs are intentionally left on CPU here. Moving
+    # the whole batch's pixel tensors to GPU up front would spike memory
     if args.qkv_format == "bshd":
         # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
         max_seq_len = max(rollout_data["total_lengths"])
