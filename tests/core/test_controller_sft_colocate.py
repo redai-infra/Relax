@@ -9,6 +9,7 @@ so even when ``register_sft_rollout`` injected ``ROLES.rollout`` via
 inspect the union of ``list(ROLES) + extra_roles``.
 """
 
+import sys
 from argparse import Namespace
 
 import pytest
@@ -43,6 +44,7 @@ def test_register_sft_rollout_noop_without_predict_interval():
     assert algo == {}
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum stringifies differently before Python 3.11")
 def test_sft_role_set_with_extra_rollout_supports_colocate():
     """Mirrors register_all_serve's colocate check post-fix."""
     ROLES, ROLES_SFT_ONLY = _registry_or_skip()

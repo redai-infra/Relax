@@ -307,6 +307,7 @@ class TestBatchedAsyncRM:
         RewardExecutor._instance = None
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="requires Python 3.11+")
     async def test_batch_all_correct(self):
         args = _make_args()
         samples = [_make_sample(response=f"\\boxed{{{i}}}", label=str(i)) for i in range(10)]
