@@ -1,0 +1,553 @@
+--- a/relax/backends/megatron/actor.py	2026-06-05 11:05:27.591671910 +0800
++++ b/relax/backends/megatron/actor.py	2026-06-08 11:21:41.462566333 +0800
+@@ -61,6 +61,7 @@
+ from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
+ from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
+ 
++from hydrax.Hydra import TensorState
+ 
+ logging.getLogger("megatron").setLevel(logging.WARNING)
+ 
+@@ -133,6 +134,8 @@
+                 else:
+                     raise
+ 
++        self._offload_train_enabled = bool(args.offload_train)
++
+         if role == "critic":
+             self.args.load = self.args.critic_load
+             self.args.save = self.args.critic_save
+@@ -254,13 +257,12 @@
+     def sleep(self) -> None:
+         assert self.args.offload_train
+ 
+-        clear_memory(clear_host_memory=True)
+         print_memory("before offload model")
+-        destroy_process_groups()
+ 
+-        if self._torch_memory_saver_enabled:
+-            torch_memory_saver.pause()
++        if self._offload_train_enabled:
++            self._offload_train_to_cpu()
+ 
++        clear_memory(clear_host_memory=True)
+         print_memory("after offload model")
+ 
+     @timer
+@@ -268,14 +270,144 @@
+         assert self.args.offload_train
+         print_memory("before wake_up model")
+ 
+-        if self._torch_memory_saver_enabled:
+-            torch_memory_saver.resume()
++        if self._offload_train_enabled:
++            self._reload_train_to_gpu()
+ 
+         clear_memory()
+-        reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+         print_memory("after wake_up model")
+ 
++    # ------------------------------------------------------------------
++    # Explicit CPU offload for XPU (torch_memory_saver VMM pause is unsafe here).
++    # Reference: verl/utils/megatron_utils.py (offload_megatron_model_to_cpu, etc.)
++    # Uses typed storage API (.storage()) and attaches cpu_data to buffer objects,
++    # matching the pattern used by both Megatron-LM and verl.
++    # ------------------------------------------------------------------
++
++    def _iter_megatron_optimizers(self):
++        """Yield every Megatron DistributedOptimizer (unwrap ChainedOptimizer)."""
++        from megatron.core.optimizer import ChainedOptimizer
++
++        opt = self.optimizer
++        if isinstance(opt, ChainedOptimizer):
++            yield from opt.chained_optimizers
++        else:
++            yield opt
++
++    def _offload_train_to_cpu(self) -> None:
++        """Move model param/grad flat buffers, optimizer master params and state to CPU."""
++        import gc
++
++        # When Megatron's --optimizer-cpu-offload is active, HybridDeviceOptimizer
++        # manages its own CPU/GPU tensor placement. We must NOT move optimizer state
++        # ourselves or we break its invariants (_fused_adam device mismatch).
++        megatron_cpu_offload = getattr(self.args, "optimizer_cpu_offload", False)
++
++        # 1. Model DDP flat buffers
++        if self.model is not None:
++            for ddp_model in self.model:
++                for buffers in [
++                    getattr(ddp_model, "buffers", []) or [],
++                    getattr(ddp_model, "expert_parallel_buffers", []) or [],
++                ]:
++                    for buffer in buffers:
++                        # param_data: copy to CPU, then free GPU storage
++                        if buffer.param_data is not None and buffer.param_data.storage().size() > 0:
++                            buffer.param_data.cpu_data = buffer.param_data.data.cpu()
++                            buffer.param_data_size = buffer.param_data.storage().size()
++                            buffer.param_data.storage().resize_(0)
++                        # grad_data: just free GPU storage (contents discarded)
++                        if buffer.grad_data is not None and buffer.grad_data.storage().size() > 0:
++                            buffer.grad_data_size = buffer.grad_data.storage().size()
++                            buffer.grad_data.storage().resize_(0)
++
++        if not megatron_cpu_offload:
++            # 2. Optimizer fp32 master params (shard_fp32_from_float16_groups)
++            for _opt in self._iter_megatron_optimizers():
++                if hasattr(_opt, "shard_fp32_from_float16_groups"):
++                    for group in _opt.shard_fp32_from_float16_groups:
++                        if isinstance(group, list):
++                            for p in group:
++                                if p is not None and p.device.type != "cpu":
++                                    p.data = p.data.to("cpu", non_blocking=False)
++                        elif group is not None and group.device.type != "cpu":
++                            group.data = group.data.to("cpu", non_blocking=False)
++
++            # 3. Optimizer Adam state (exp_avg, exp_avg_sq, etc.)
++            for _opt in self._iter_megatron_optimizers():
++                if _opt.optimizer is None:
++                    continue
++                for v in _opt.optimizer.state.values():
++                    if "exp_avg" in v:
++                        v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=False)
++                    if "exp_avg_sq" in v:
++                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=False)
++
++        gc.collect()
++        torch.cuda.empty_cache()
++
++    @torch.no_grad()
++    def _reload_train_to_gpu(self) -> None:
++        """Reverse of :meth:`_offload_train_to_cpu`."""
++        import gc
++        device = device_utils.make_current_torch_device()
++        megatron_cpu_offload = getattr(self.args, "optimizer_cpu_offload", False)
++
++        # 1. Model DDP flat buffers
++        if self.model is not None:
++            for ddp_model in self.model:
++                for buffers in [
++                    getattr(ddp_model, "buffers", []) or [],
++                    getattr(ddp_model, "expert_parallel_buffers", []) or [],
++                ]:
++                    for buffer in buffers:
++                        # grad_data: reallocate and zero
++                        if (
++                            buffer.grad_data is not None
++                            and hasattr(buffer, "grad_data_size")
++                            and buffer.grad_data.storage().size() == 0
++                        ):
++                            buffer.grad_data.storage().resize_(buffer.grad_data_size)
++                            buffer.grad_data.zero_()
++                            delattr(buffer, "grad_data_size")
++                        # param_data: reallocate and copy back from CPU
++                        if (
++                            buffer.param_data is not None
++                            and hasattr(buffer, "param_data_size")
++                            and buffer.param_data.storage().size() == 0
++                        ):
++                            buffer.param_data.storage().resize_(buffer.param_data_size)
++                            buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=False)
++                            delattr(buffer, "param_data_size")
++                            delattr(buffer.param_data, "cpu_data")
++
++        if not megatron_cpu_offload:
++            # 2. Optimizer fp32 master params
++            for _opt in self._iter_megatron_optimizers():
++                if hasattr(_opt, "shard_fp32_from_float16_groups"):
++                    for group in _opt.shard_fp32_from_float16_groups:
++                        if isinstance(group, list):
++                            for p in group:
++                                if p is not None and p.device.type == "cpu":
++                                    p.data = p.data.to(device, non_blocking=False)
++                        elif group is not None and group.device.type == "cpu":
++                            group.data = group.data.to(device, non_blocking=False)
++
++            # 3. Optimizer Adam state
++            for _opt in self._iter_megatron_optimizers():
++                if _opt.optimizer is None:
++                    continue
++                for v in _opt.optimizer.state.values():
++                    if "exp_avg" in v:
++                        v["exp_avg"] = v["exp_avg"].to(device, non_blocking=False)
++                    if "exp_avg_sq" in v:
++                        v["exp_avg_sq"] = v["exp_avg_sq"].to(device, non_blocking=False)
++        gc.collect()
++        torch.cuda.empty_cache()
++
+     def _switch_model(self, target_tag: str) -> None:
++        # Reinitialize Hydrax weight cache before restoring
++        # a different model tag, so stale quantized weights are not reused.
++        TensorState.reinitialize_all()
+         if target_tag not in self.weights_backuper.backup_tags:
+             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
+         self.weights_backuper.restore(target_tag)
+@@ -789,8 +921,8 @@
+         if self.args.debug_rollout_only:
+             return
+         # torch dist may trigger nccl communication during saving.
+-        if self.args.offload_train:
+-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
++        # if self.args.offload_train:
++        #     reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+ 
+         if self.args.async_save:
+             from megatron.training.async_utils import maybe_finalize_async_save
+@@ -812,8 +944,8 @@
+ 
+             save_hf_model(self.args, rollout_id, self.model)
+ 
+-        if self.args.offload_train:
+-            destroy_process_groups()
++        # if self.args.offload_train:
++        #     destroy_process_groups()
+ 
+     @timer
+     def update_weights(self) -> None:
+@@ -835,8 +967,8 @@
+             self.rollout_manager.get_rollout_engines_and_lock.remote()
+         )
+ 
+-        if self.args.offload_train:
+-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
++        # if self.args.offload_train:
++        #     reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+ 
+         if num_new_engines > 0:
+             self.weight_updater.connect_rollout_engines(
+@@ -849,13 +981,17 @@
+             if dist.get_rank() == 0:
+                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
+ 
++        # XPU don't support torch_memory_saver.disable() yet;
++        # set RELAX_SKIP_TORCH_MEMORY_SAVER=1 to force-skip it.
++        skip_tms_disable = os.environ.get("RELAX_SKIP_TORCH_MEMORY_SAVER", "0") == "1"
+         with (
+             torch_memory_saver.disable()
+-            if self.args.offload_train and self._torch_memory_saver_enabled
++            if (self.args.offload_train and self._torch_memory_saver_enabled and not skip_tms_disable)
+             else nullcontext()
+         ):
+             print_memory("before update_weights")
+             self.weight_updater.update_weights()
++            clear_memory()
+             print_memory("after update_weights")
+ 
+             if self.args.ci_test and len(rollout_engines) > 0:
+@@ -876,8 +1015,8 @@
+                     self.weights_backuper.backup("rollout_actor")
+                 else:
+                     self.weights_backuper.backup("old_actor")
+-        if self.args.offload_train:
+-            destroy_process_groups()
++        # if self.args.offload_train:
++        #     destroy_process_groups()
+ 
+         if self.args.offload_rollout and dist.get_rank() == 0:
+             ray.get(self.rollout_manager.onload_kv.remote())
+--- a/relax/backends/megatron/sglang.py	2026-05-08 19:17:00.008664319 +0800
++++ b/relax/backends/megatron/sglang.py	2026-06-08 11:21:41.462566333 +0800
+@@ -1,11 +1,11 @@
+ # the file to manage all sglang deps in the megatron actor
+-try:
+-    from sglang.srt.layers.quantization.fp8_utils import quant_weight_ue8m0, transform_scale_ue8m0
+-    from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+-except ImportError:
+-    quant_weight_ue8m0 = None
+-    transform_scale_ue8m0 = None
+-    should_deepgemm_weight_requant_ue8m0 = None
++# try:
++#     from sglang.srt.layers.quantization.fp8_utils import quant_weight_ue8m0, transform_scale_ue8m0
++#     from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
++# except ImportError:
++quant_weight_ue8m0 = None
++transform_scale_ue8m0 = None
++should_deepgemm_weight_requant_ue8m0 = None
+ 
+ try:
+     from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+--- a/relax/backends/megatron/weight_conversion/processors/__init__.py	2026-05-08 19:17:00.056663295 +0800
++++ b/relax/backends/megatron/weight_conversion/processors/__init__.py	2026-06-08 11:21:41.462566333 +0800
+@@ -1,16 +1,21 @@
+ from .padding_remover import remove_padding
+-from .quantizer_compressed_tensors import quantize_params_compressed_tensors
+-from .quantizer_fp8 import quantize_params_fp8
++# from .quantizer_compressed_tensors import quantize_params_compressed_tensors
++# from .quantizer_fp8 import quantize_params_fp8
+ 
+ 
+-__all__ = ["remove_padding", "quantize_params", "quantize_params_fp8", "quantize_params_compressed_tensors"]
++# __all__ = ["remove_padding", "quantize_params", "quantize_params_fp8", "quantize_params_compressed_tensors"]
++__all__ = ["remove_padding", "quantize_params"]
+ 
+ 
+ def quantize_params(args, megatron_name, converted_named_params, quantization_config):
+     if quantization_config is None:
+         return converted_named_params
+-    elif quantization_config["quant_method"] == "fp8":
+-        return quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config)
+-    elif quantization_config["quant_method"] == "compressed-tensors":
+-        # only int4 at the moment.
+-        return quantize_params_compressed_tensors(converted_named_params, quantization_config)
++    # elif quantization_config["quant_method"] == "fp8":
++    #     return quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config)
++    # elif quantization_config["quant_method"] == "compressed-tensors":
++    #     # only int4 at the moment.
++    #     return quantize_params_compressed_tensors(converted_named_params, quantization_config)
++    raise NotImplementedError(
++        f"Quantization method '{quantization_config['quant_method']}' is not supported on XPU. "
++        "quant imports are disabled."
++    )
+--- a/relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py	2026-06-05 11:05:27.591671910 +0800
++++ b/relax/backends/megatron/weight_update/hf_weight_iterator_bridge.py	2026-06-08 11:21:41.462566333 +0800
+@@ -2,6 +2,8 @@
+ 
+ import dataclasses
+ 
++import torch
++
+ from relax.utils import megatron_bridge_utils
+ from relax.utils.misc import chunk_named_params_by_size
+ 
+@@ -20,6 +22,11 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+         self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+ 
+     def get_hf_weight_chunks(self, megatron_local_weights):
++        # Drain pending async H2D/D2H ops (e.g. from train-step backup or
++        # offload->onload) before bridge starts collective weight export.
++        # Without this, the first ``.cuda()`` inside ``_handle_one`` may hit
++        # a stale device context on XPU and raise cudaErrorUnknown.
++        torch.cuda.synchronize()
+         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
+         with megatron_bridge_utils.patch_megatron_model(self.model):
+             conversion_tasks = self._bridge.get_conversion_tasks(self.model)
+@@ -28,40 +35,35 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
+             named_weights = self._bridge.export_hf_weights(self.model, cpu=False, conversion_tasks=conversion_tasks)
+ 
+             def iter_quantized_named_weights():
+-                hf_to_megatron_mapping = None
+-
+                 for item in named_weights:
+-                    # Compatibility shim: old megatron-bridge yields 3-tuples
+-                    # ``(hf_param_name, weight, megatron_param_name)`` while
+-                    # the official bridge yields 2-tuples ``(hf_param_name, weight)``.
+-                    # Dispatch per-item so the same code path supports both.
++                    # Support both 2-tuple (hf_name, weight) and 3-tuple (hf_name, weight, megatron_name)
+                     if len(item) == 3:
+                         hf_param_name, weight, megatron_param_name = item
+-                    elif len(item) == 2:
+-                        hf_param_name, weight = item
+-                        if hf_to_megatron_mapping is None:
+-                            hf_to_megatron_mapping = _build_hf_to_megatron_mapping(conversion_tasks)
+-                        # With PP > 1, export_hf_weights yields params from ALL
+-                        # PP ranks (via internal PP broadcast), but
+-                        # hf_to_megatron_mapping only contains params from this
+-                        # rank's conversion tasks.  For remote PP rank params
+-                        # we fall back to hf_param_name — this is safe because
+-                        # remove_padding checks megatron-style names and
+-                        # quantize_params_fp8 regex won't match HF-style names.
+-                        megatron_param_name = hf_to_megatron_mapping.get(hf_param_name, hf_param_name)
+                     else:
+-                        raise ValueError(
+-                            f"Unexpected named_weights tuple length {len(item)} from "
+-                            f"megatron-bridge.export_hf_weights(); expected 2 (new) or 3 (old). "
+-                            f"Item: {item!r}"
+-                        )
+-
++                        hf_param_name, weight = item
++                        megatron_param_name = hf_param_name
+                     processed_weight = postprocess_hf_param(
+                         args=self.args,
+                         megatron_param_name=megatron_param_name,
+                         hf_param_name=hf_param_name,
+                         param=weight,
+                     )
++                    # Megatron stores layernorm-1p / zero-centered gamma as (weight - 1).
++                    # SGLang's snapshot stores (HF_disk + 1) after process_weights_after_loading,
++                    # so we must add +1 here to satisfy weights_checker.
++                    _apply_1p = getattr(self.args, "layernorm_zero_centered_gamma", False)
++                    if _apply_1p:
++                        is_layernorm = hf_param_name.endswith(".weight") and (
++                            "layernorm" in hf_param_name
++                            or hf_param_name.endswith("model.norm.weight")
++                            or hf_param_name.endswith("q_norm.weight")
++                            or hf_param_name.endswith("k_norm.weight")
++                        )
++                        if is_layernorm:
++                            processed_weight = processed_weight + 1.0
++
++                    # Remove 'language_model.' prefix for SGLang compatibility
++                    hf_param_name = hf_param_name.replace("model.language_model.", "model.")
+ 
+                     converted_named_params = [(hf_param_name, processed_weight)]
+ 
+--- a/relax/backends/megatron/weight_update/update_weight_from_tensor.py	2026-05-08 19:17:00.140661503 +0800
++++ b/relax/backends/megatron/weight_update/update_weight_from_tensor.py	2026-06-08 11:21:41.462566333 +0800
+@@ -178,6 +178,7 @@
+             del prev_long_lived_tensors
+             prev_refs = refs
+             prev_long_lived_tensors = long_lived_tensors
++            dist.barrier(group=get_gloo_group())
+         # Drain the last chunk.
+         if prev_refs:
+             ray.get(prev_refs)
+--- a/relax/components/actor.py	2026-05-08 19:17:00.172660820 +0800
++++ b/relax/components/actor.py	2026-06-08 11:21:41.462566333 +0800
+@@ -81,6 +81,8 @@
+         # In fully_async mode, weight_updater is not created and weights are synced via DCS
+         if not self.config.fully_async:
+             self.actor_model.update_weights()
++            if getattr(self.config, "check_weight_update_equal", False):
++                ray.get(self.rollout_manager.check_weights.remote(action="compare"))
+ 
+     def set_genrm_manager(self, genrm_manager: Any) -> None:
+         """Set the genRM manager for coordinated offload/onload.
+--- a/relax/distributed/ray/actor_group.py	2026-05-08 19:17:00.284658431 +0800
++++ b/relax/distributed/ray/actor_group.py	2026-06-08 11:21:41.466566243 +0800
+@@ -71,8 +71,8 @@
+             assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+ 
+             env_vars["LD_PRELOAD"] = dynlib_path
+-            env_vars["TMS_INIT_ENABLE"] = "1"
+-            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
++            # env_vars["TMS_INIT_ENABLE"] = "1"
++            # env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+ 
+         # We cannot do routing replay for critic.
+         if self.args.use_routing_replay and self.role == "actor":
+--- a/relax/entrypoints/train.py	2026-05-08 19:17:00.464654591 +0800
++++ b/relax/entrypoints/train.py	2026-06-08 11:21:41.470566154 +0800
+@@ -13,6 +13,7 @@
+ from relax.core.controller import Controller
+ from relax.utils.arguments import parse_args
+ from relax.utils.logging_utils import get_logger
++from relax.utils.tracking_utils import init_tracking
+ from relax.utils.utils import post_process_env
+ 
+ 
+@@ -59,6 +60,7 @@
+         runtime_env = yaml.safe_load(file)
+ 
+     runtime_env = post_process_env(args, runtime_env)
++    init_tracking(args, primary=True)
+     if not ray.is_initialized():
+         # this is for local ray cluster
+         ray.init(runtime_env=runtime_env)
+--- a/relax/utils/tracking_utils.py	2026-05-08 19:17:00.740648704 +0800
++++ b/relax/utils/tracking_utils.py	2026-06-08 11:21:41.474566065 +0800
+@@ -2,11 +2,13 @@
+ 
+ import wandb
+ 
++from relax.utils.logging_utils import get_logger
+ from relax.utils.metrics.adapters.apprise import _AppriseAdapter
+ from relax.utils.metrics.adapters.clearml import _ClearMLAdapter
+ from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
+ from relax.utils.metrics.adapters.wandb import init_wandb_primary, init_wandb_secondary
+ from relax.utils.metrics.metrics_service_adapter import get_metrics_service_adapter, init_metrics_service_adapter
++logger = get_logger(__name__)
+ 
+ 
+ def init_tracking(args, primary: bool = True, **kwargs):
+@@ -31,7 +33,13 @@
+ 
+     # Fall back to direct logging if metrics service is not used or not available
+     if args.use_wandb:
+-        wandb.log(metrics)
++        if wandb.run is None:
++            logger.warning(
++                "W&B logging is enabled but wandb.init() was not called "
++                "in this process; skipping wandb.log()."
++            )
++        else:
++            wandb.log(metrics)
+ 
+     if args.use_tensorboard:
+         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
+--- a/relax/utils/training/tensor_backper.py	2026-05-08 19:17:00.792647594 +0800
++++ b/relax/utils/training/tensor_backper.py	2026-06-08 11:21:41.474566065 +0800
+@@ -59,8 +59,8 @@
+         backup_dict = self._backups[tag]
+         for name, param in self._source_getter():
+             if name not in backup_dict:
+-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+-            backup_dict[name].copy_(param.detach(), non_blocking=True)
++                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"))
++            backup_dict[name].copy_(param.detach(), non_blocking=False)
+         device_utils.synchronize()
+ 
+     @torch.no_grad()
+@@ -73,7 +73,7 @@
+         backup_dict = self._backups[tag]
+         for name, param in self._source_getter():
+             assert name in backup_dict
+-            param.copy_(backup_dict[name], non_blocking=True)
++            param.copy_(backup_dict[name], non_blocking=False)
+         device_utils.synchronize()
+ 
+ 
+--- a/scripts/entrypoint/local.sh	2026-06-10 15:46:08.585492936 +0800
++++ b/scripts/entrypoint/local.sh	2026-06-10 16:00:00.000000000 +0800
+@@ -39,9 +39,9 @@
+     return 0 2>/dev/null || exit 0
+ fi
+ 
+-set -eo pipefail
++# set -eo pipefail
+ 
+-# ── process cleanup ─────────────────────────────────────────────────────────
++# # ── process cleanup ─────────────────────────────────────────────────────────
+ echo "=== Cleaning up stale processes ==="
+ pkill -9 sglang 2>/dev/null || true
+ sleep 3
+@@ -64,16 +64,16 @@
+ export MODEL_CONFIG_DIR="${_LOCAL_SH_DIR}/../models"
+ 
+ # ── NVLink detection ────────────────────────────────────────────────────────
+-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+-if [ "$NVLINK_COUNT" -gt 0 ]; then
+-    export HAS_NVLINK=1
+-else
+-    export HAS_NVLINK=0
+-fi
+-if [ -n "$NCCL_NVLS_ENABLE" ] && [ "$NCCL_NVLS_ENABLE" -eq 0 ]; then
+-    export HAS_NVLINK=0
+-fi
+-echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
++# NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
++# if [ "$NVLINK_COUNT" -gt 0 ]; then
++#     export HAS_NVLINK=1
++# else
++#     export HAS_NVLINK=0
++# fi
++# if [ -n "$NCCL_NVLS_ENABLE" ] && [ "$NCCL_NVLS_ENABLE" -eq 0 ]; then
++#     export HAS_NVLINK=0
++# fi
++# echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+ 
+ # ── GPU count detection ───────────────────────────────────────────────────────
+ # Priority: NUM_GPUS env > CUDA_VISIBLE_DEVICES > default 8
+@@ -101,14 +101,14 @@
+ export RELAX_ENTRYPOINT_MODE="local"
+ 
+ # Runtime env for single-node (empty, env inherited from Ray cluster)
+-export RUNTIME_ENV_JSON="{
+-\"env_vars\": {
+-   \"PYTHONUNBUFFERED\": \"1\",
+-   \"PYTHONPATH\": \"${PYTHONPATH}\",
+-   \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+-   \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
+-   \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+-}
+-}"
++# export RUNTIME_ENV_JSON="{
++# \"env_vars\": {
++#    \"PYTHONUNBUFFERED\": \"1\",
++#    \"PYTHONPATH\": \"${PYTHONPATH}\",
++#    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
++#    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
++#    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
++# }
++# }"
+ 
+ echo "=== Local environment ready ==="
