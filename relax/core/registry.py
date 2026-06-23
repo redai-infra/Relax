@@ -7,7 +7,8 @@ except ImportError:
     from enum import Enum
 
     class StrEnum(str, Enum):
-        pass
+        def __str__(self) -> str:
+            return self.value
 
 
 from relax.components.actor import Actor
