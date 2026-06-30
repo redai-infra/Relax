@@ -11,6 +11,7 @@ from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
 
+from relax.utils import device as device_utils
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 
@@ -193,6 +194,9 @@ class UpdateWeightFromTensor:
             del prev_long_lived_tensors
             prev_refs = refs
             prev_long_lived_tensors = long_lived_tensors
+            # Backend-specific per-chunk synchronization is handled in device
+            # utils so this path stays hardware-agnostic.
+            device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
         # Drain the last chunk.
         if prev_refs:
             ray.get(prev_refs)

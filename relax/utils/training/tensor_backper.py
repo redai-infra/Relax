@@ -9,6 +9,9 @@ from relax.utils import device as device_utils
 
 _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 
+_NON_BLOCKING = device_utils.use_non_blocking_copy()
+_PIN_MEMORY = device_utils.use_pinned_host_memory()
+
 
 class TensorBackuper(ABC):
     @staticmethod
@@ -59,8 +62,8 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
-            backup_dict[name].copy_(param.detach(), non_blocking=True)
+                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+            backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_utils.synchronize()
 
     @torch.no_grad()
@@ -73,7 +76,7 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             assert name in backup_dict
-            param.copy_(backup_dict[name], non_blocking=True)
+            param.copy_(backup_dict[name], non_blocking=_NON_BLOCKING)
         device_utils.synchronize()
 
 

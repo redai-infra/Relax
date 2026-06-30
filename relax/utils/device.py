@@ -38,6 +38,7 @@ class AcceleratorType(str, Enum):
     NPU = "npu"  # Ascend NPU (Huawei)
     XPU = "xpu"  # Intel / Kunlunxin XPU
     PPU = "ppu"  # PPU (Enflame / custom)
+    KLX = "klx"  # Kunlunxin (P800; masquerades as CUDA: torch.cuda + nccl)
     ROCM = "rocm"  # AMD ROCm (uses 'cuda' device in PyTorch but HIP backend)
     CPU = "cpu"  # CPU fallback
 
@@ -49,7 +50,7 @@ class AcceleratorType(str, Enum):
 def _detect_accelerator() -> AcceleratorType:
     """Detect the available hardware accelerator.
 
-    Detection order follows specificity: NPU > XPU > PPU > CUDA/ROCm > CPU.
+    Detection order follows specificity: NPU > XPU > PPU > CUDA/ROCm/KLX > CPU.
     Environment variable ``RELAX_DEVICE_TYPE`` can override auto-detection.
     """
     # Allow explicit override via environment variable
@@ -73,10 +74,12 @@ def _detect_accelerator() -> AcceleratorType:
     if _is_ppu_available():
         return AcceleratorType.PPU
 
-    # NVIDIA CUDA or AMD ROCm (both expose torch.cuda)
+    # NVIDIA CUDA / AMD ROCm / Kunlunxin KLX (all expose torch.cuda)
     if torch.cuda.is_available():
         if _is_rocm():
             return AcceleratorType.ROCM
+        if _is_klx():
+            return AcceleratorType.KLX
         return AcceleratorType.CUDA
 
     return AcceleratorType.CPU
@@ -112,6 +115,16 @@ def _is_ppu_available() -> bool:
         return False
 
 
+def _is_klx() -> bool:
+    """Check if a Kunlunxin (KLX) accelerator is available.
+
+    The Kunlunxin runtime masquerades as CUDA (``torch.cuda`` / ``nccl``), so
+    it can't be detected via ``torch.xpu``.  Probe the ``/dev/xpuctrl`` device
+    node, which is present on Kunlunxin XPU hosts.
+    """
+    return os.path.exists("/dev/xpuctrl")
+
+
 def _is_rocm() -> bool:
     """Check if the current CUDA build is actually AMD ROCm/HIP."""
     return getattr(torch.version, "hip", None) is not None
@@ -143,6 +156,8 @@ def get_device_name() -> str:
     accel = _detect_accelerator()
     if accel == AcceleratorType.ROCM:
         return "cuda"  # ROCm uses torch.cuda namespace
+    if accel == AcceleratorType.KLX:
+        return "cuda"  # Kunlunxin KLX masquerades as CUDA
     if accel == AcceleratorType.CPU:
         return "cpu"
     return accel.value
@@ -174,6 +189,7 @@ _DIST_BACKEND_MAP = {
     AcceleratorType.NPU: "hccl",
     AcceleratorType.XPU: "xccl",
     AcceleratorType.PPU: "eccl",
+    AcceleratorType.KLX: "nccl",  # Kunlunxin KLX masquerades as CUDA
     AcceleratorType.CPU: "gloo",
 }
 
@@ -200,6 +216,7 @@ _VISIBLE_DEVICES_ENV_MAP = {
     AcceleratorType.NPU: "ASCEND_RT_VISIBLE_DEVICES",
     AcceleratorType.XPU: "XPU_VISIBLE_DEVICES",
     AcceleratorType.PPU: "PPU_VISIBLE_DEVICES",
+    AcceleratorType.KLX: "CUDA_VISIBLE_DEVICES",  # Kunlunxin KLX masquerades as CUDA
     AcceleratorType.CPU: "",
 }
 
@@ -235,6 +252,7 @@ _RAY_RESOURCE_MAP = {
     AcceleratorType.NPU: "NPU",
     AcceleratorType.XPU: "XPU",
     AcceleratorType.PPU: "PPU",
+    AcceleratorType.KLX: "GPU",  # Kunlunxin KLX masquerades as CUDA → Ray sees it as GPU
     AcceleratorType.CPU: "CPU",
 }
 
@@ -537,6 +555,53 @@ def set_expandable_segments(enable: bool) -> None:
 def is_available() -> bool:
     """Return True if any accelerator device is available (not CPU-only)."""
     return _detect_accelerator() != AcceleratorType.CPU
+
+
+def is_klx() -> bool:
+    """Return True if running on a Kunlunxin (KLX) accelerator (detected via.
+
+    /dev/xpuctrl).
+    """
+    return _is_klx()
+
+
+def use_non_blocking_copy() -> bool:
+    """Whether host<->device copies may be asynchronous
+    (``non_blocking=True``)."""
+    return not _is_klx()
+
+
+def use_pinned_host_memory() -> bool:
+    """Whether host-side backup tensors may use pinned memory."""
+    return not _is_klx()
+
+
+# ---------------------------------------------------------------------------
+# Public API — backend-specific hooks
+# ---------------------------------------------------------------------------
+def maybe_backend_process_on_model_switch() -> None:
+    """Run backend-specific bookkeeping before switching the active model tag.
+
+    Keeps hardware-specific logic out of the framework code: callers in the
+    training path invoke this unconditionally and the per-backend behavior is
+    decided here.
+    """
+    if _is_klx():
+        from hydrax.Hydra import TensorState
+
+        TensorState.reinitialize_all()
+
+
+def maybe_backend_barrier_on_weight_chunk(group) -> None:
+    """Run a backend-required barrier after sending a weight chunk.
+
+    Keeps hardware-specific synchronization out of the framework code: callers
+    in the chunked weight-send loop invoke this unconditionally.
+    """
+    if _is_klx():
+        import torch.distributed as dist
+
+        dist.barrier(group=group)
 
 
 # ---------------------------------------------------------------------------

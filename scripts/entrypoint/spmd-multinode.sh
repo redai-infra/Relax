@@ -57,7 +57,11 @@ export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
 
 # ── NVLink detection ────────────────────────────────────────────────────────
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+if [ -e /dev/xpuptcl ]; then
+    NVLINK_COUNT=0
+else
+    NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+fi
 if [ "$NVLINK_COUNT" -gt 0 ]; then
     export HAS_NVLINK=1
 else
