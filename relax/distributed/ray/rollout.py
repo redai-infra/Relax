@@ -474,8 +474,14 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                    "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                    # The TP memory-imbalance check is overly conservative under
+                    # colocate (the actor occupies GPUs at engine init and is
+                    # offloaded before rollout), so disable it. Recent SGLang reads
+                    # SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK (default True); the old
+                    # SGL(ANG)_DISABLE_* vars are no longer honored — worse, the
+                    # deprecation shim value-copies SGL_DISABLE_* into the ENABLE var,
+                    # so setting them re-enables the check. Set ENABLE=false directly.
+                    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
                     "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",

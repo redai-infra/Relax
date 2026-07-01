@@ -370,6 +370,9 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:
+        # Backend-specific bookkeeping is handled in device utils so this
+        # framework path stays hardware-agnostic.
+        device_utils.maybe_backend_process_on_model_switch()
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
