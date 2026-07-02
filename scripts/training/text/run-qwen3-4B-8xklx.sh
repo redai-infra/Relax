@@ -250,7 +250,9 @@ RUNTIME_ENV_JSON="{
     \"XMLIR_MATMUL_FAST_MODE\": \"1\",
     \"XMLIR_ENABLE_FAST_FC\": \"1\",
     \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"XSGL_INT8_LM_HEAD\": \"0\"
+    \"XSGL_INT8_LM_HEAD\": \"0\",
+    \"NVTE_DEBUG\": \"1\",
+    \"NVTE_DEBUG_LEVEL\": \"1\"
   }
 }"
 

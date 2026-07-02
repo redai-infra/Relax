@@ -197,7 +197,7 @@ MISC_ARGS=(
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}\",
+    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM:${WORKDIR}/Megatron-Bridge/src:${SCRIPT_DIR}:${PYTHONPATH}\",
     \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENBLAS_NUM_THREADS\": \"64\",
@@ -295,7 +295,9 @@ RUNTIME_ENV_JSON="{
     \"XPU_SET_SIGMOID_GATING_DELTA_RULE_UPDATE_FP16_FAST_OPT\": \"${XPU_SET_SIGMOID_GATING_DELTA_RULE_UPDATE_FP16_FAST_OPT}\",
     \"HYDRAX_USE_PROTEUS\": \"0\",
     \"GLOO_SOCKET_IFNAME\": \"eth0\",
-    \"TP_SOCKET_IFNAME\": \"eth0\"
+    \"TP_SOCKET_IFNAME\": \"eth0\",
+    \"NVTE_DEBUG\": \"1\",
+    \"NVTE_DEBUG_LEVEL\": \"1\"
    }
 }"
 
