@@ -87,7 +87,7 @@ export MEGATRON="your megatron path"
 export PYTHONPATH=your_megatron_path:$PYTHONPATH
 ```
 
-此外 Relax 依赖 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 进行权重转换。安装方式参考 `docker/Dockerfile`，将 Bridge 源码与 Megatron-LM submodule 合并到同一目录后加入 `PYTHONPATH`：
+此外 Relax 依赖 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 进行权重转换。安装方式参考 [`docker/Dockerfile`](https://github.com/redai-infra/Relax/blob/main/docker/Dockerfile)，将 Bridge 源码与 Megatron-LM submodule 合并到同一目录后加入 `PYTHONPATH`：
 
 ```bash
 export MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
