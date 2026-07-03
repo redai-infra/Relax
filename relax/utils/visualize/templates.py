@@ -1858,7 +1858,11 @@ def get_jsonl_viewer_html(data_dir: str, base_path: str = "") -> str:
                     <select class="sort-select" id="sort-field" onchange="updateSorting()">
                         <option value="sample_index">Index</option>
                         <option value="reward">Reward</option>
+                        <option value="prompt_token_count">Prompt Tokens</option>
                         <option value="response_length">Response Length</option>
+                        <option value="total_token_count">Total Tokens</option>
+                        <option value="image_token_count">Image Tokens</option>
+                        <option value="agent_turns">Agent Turns</option>
                     </select>
                     <select class="sort-select" id="sort-order" onchange="updateSorting()">
                         <option value="asc">Ascending</option>
@@ -1914,8 +1918,10 @@ def get_jsonl_viewer_html(data_dir: str, base_path: str = "") -> str:
 
             // Scalar fields for compact display (in Sample Info card)
             const SCALAR_FIELDS = [
-                'rollout_id', 'sample_index', 'reward', 'response_length',
-                'total_length', 'status', 'group_index', 'dataset'
+                'rollout_id', 'sample_index', 'reward', 'prompt_token_count',
+                'response_token_count', 'total_token_count', 'image_count',
+                'image_token_count', 'multimodal_token_count', 'agent_turns',
+                'response_length', 'total_length', 'status', 'group_index', 'dataset'
             ];
 
             // Metric fields to consolidate into Metrics card (number/boolean flags)

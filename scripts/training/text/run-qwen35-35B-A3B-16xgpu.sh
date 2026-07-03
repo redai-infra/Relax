@@ -30,8 +30,8 @@ CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B/
    --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B/
    --megatron-to-hf-mode bridge
-
-   --load ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
+   --warm-hf-checkpoint-page-cache
+   # --load ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
    --save ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
    --save-interval 100
    --max-actor-ckpt-to-keep 1

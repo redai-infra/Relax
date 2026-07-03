@@ -72,7 +72,13 @@ class Dataset(BaseDataset):
 
         # Apply length filtering
         if max_length is not None:
-            self.origin_samples = filter_long_prompts(origin_samples, tokenizer, processor, max_length)
+            self.origin_samples = filter_long_prompts(
+                origin_samples,
+                tokenizer,
+                processor,
+                max_length,
+                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            )
         else:
             logger.warning("max_length is not set. Skipping filter_long_prompts.")
             self.origin_samples = origin_samples

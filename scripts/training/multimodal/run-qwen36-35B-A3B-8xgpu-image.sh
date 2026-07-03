@@ -32,57 +32,58 @@ CKPT_ARGS=(
    --ref-load ${MODEL_DIR}/Qwen3.6-35B-A3B
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
-
-   --load ${EXP_DIR}/save/Qwen3.6-35B_mcore_8xgpu/
-   --save ${EXP_DIR}/save/Qwen3.6-35B_mcore_8xgpu/
-   --max-actor-ckpt-to-keep 1
-   --save-interval 100
 )
 
-PROMPT_SET="${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet"
+PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
    --label-key label
+   --multimodal-keys '{"image":"image"}'
+   --system-prompt "${SYSTEM_PROMPT}"
    --apply-chat-template
    --rollout-shuffle
+   --balance-data
    --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 64
    --n-samples-per-prompt 8
-   --rollout-max-response-len 2048
+   --global-batch-size 512
+   --rollout-max-response-len 8192
    --rollout-max-prompt-len 2048
-   --rollout-temperature 1
-   --global-batch-size 256
-   --use-streaming-dataset
+   --rollout-temperature 1.0
    --use-fault-tolerance
-   --system-prompt "${SYSTEM_PROMPT}"
-   --multimodal-keys '{"image":"image"}'
-   --no-rope-fusion
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
-   --pipeline-model-parallel-size 1
+   --pipeline-model-parallel-size 2
    --context-parallel-size 1
    --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
+
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
+
    # --qkv-format bshd
    # --micro-batch-size 1 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 6144
+   --max-tokens-per-gpu 20480
+   --log-probs-max-tokens-per-gpu 40960
+
+   --no-rope-fusion
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
+   --kl-coef 0.00
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -96,15 +97,17 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+   --clip-grad 1.0
 
    --optimizer-cpu-offload
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
 
+   --moe-flex-dispatcher-backend deepep
+   --moe-token-dispatcher-type flex
    # NOTE(wuhuan): to avoid algorithm performance degradation
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
-
 )
 
 SGLANG_ARGS=(
@@ -114,9 +117,10 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=(
+   # --use-tensorboard
    --use-clearml
    --use-metrics-service
-   --tb-project-name  ${PROJECT_NAME}
+   --tb-project-name ${PROJECT_NAME}
    --tb-experiment-name qwen36-35B-A3B-${MODE}-${now}
 )
 
@@ -160,8 +164,8 @@ else
        --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
        --max-staleness 0 \
        --num-data-storage-units 1 \
-       --balance-data \
        --colocate \
+       --use-health-check \
        "${MODEL_ARGS[@]}" \
        "${CKPT_ARGS[@]}" \
        "${ROLLOUT_ARGS[@]}" \

@@ -34,25 +34,28 @@ _MEGATRON_MODULES = [
     "megatron.bridge.models",
 ]
 
+_MISSING = object()
 _saved = {}
 for _mod in _MEGATRON_MODULES:
-    if _mod in sys.modules:
-        _saved[_mod] = sys.modules[_mod]
+    _saved[_mod] = sys.modules.get(_mod, _MISSING)
     sys.modules[_mod] = MagicMock()
 
-pytest.importorskip("triton")
+try:
+    pytest.importorskip("triton")
 
-from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
-    _broadcast_converted_bucket,
-    _broadcast_converted_phase,
-    _compute_slot_size,
-    _decode_metadata,
-    _encode_metadata,
-)
-
-
-for _mod, _orig in _saved.items():
-    sys.modules[_mod] = _orig
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
+        _broadcast_converted_bucket,
+        _broadcast_converted_phase,
+        _compute_slot_size,
+        _decode_metadata,
+        _encode_metadata,
+    )
+finally:
+    for _mod, _orig in _saved.items():
+        if _orig is _MISSING:
+            sys.modules.pop(_mod, None)
+        else:
+            sys.modules[_mod] = _orig
 
 
 # ---------------------------------------------------------------------------

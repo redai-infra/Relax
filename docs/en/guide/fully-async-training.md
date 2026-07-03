@@ -354,6 +354,54 @@ For production, `max_staleness=1~2` is recommended to balance throughput and tra
 
 ______________________________________________________________________
 
+## Dynamic Batch Size (Streaming Token Budget)
+
+### Concept
+
+When sample lengths vary widely, a fixed micro-batch count wastes GPU. With `--use-dynamic-batch-size`, the Actor no longer splits a fixed number of micro-batches; instead it packs each micro-batch up to a **token budget** (`--max-tokens-per-gpu`), accumulating samples until close to the limit.
+
+Under fully-async, this is **streaming**: the Actor pulls the next micro-batch from TransferQueue on demand while training, without waiting for the whole rollout batch to be ready.
+
+```bash
+--use-dynamic-batch-size       # enable dynamic batch size
+--max-tokens-per-gpu 20480     # per-GPU token budget per micro-batch
+```
+
+### How It Works
+
+```
+Rollout produces samples → TransferQueue
+                      │
+   ┌──────────────────┴──────────────────────────┐
+   │ StreamingTokenBudgetSampler (TQ controller) │
+   │ · groups samples by full GRPO group         │
+   │ · balances token totals across DP ranks     │
+   │ · emits one mb once a token budget is filled│
+   └──────────────────┬──────────────────────────┘
+                      │ cached per batch_index (all DPs prepared at once)
+   ┌──────────────────┴───────────────────────┐
+   │ StreamingTQIterator (Actor side)         │
+   │ · pulls mbs until StopIteration          │
+   │ · after mb N, prefetches mb N+1's cache  │
+   └──────────────────┬───────────────────────┘
+                      │
+     streaming schedule (streaming_schedules.py, PP=1 / PP>1)
+```
+
+- **Sampler (`StreamingTokenBudgetSampler`)**: runs on the TransferQueue controller. It accumulates ready samples by full GRPO group (`n_samples_per_prompt` each), balances token totals across DP ranks, and emits a micro-batch once a token budget is filled.
+- **Per-`batch_index` cache**: the first request for a `batch_index` prepares and caches **every DP rank's slice at once**. Any later request — from any DP rank or PP stage, in any order — gets identical data, so under PP>1 all stages stay in lockstep and end at the same micro-batch count.
+- **Iterator (`StreamingTQIterator`)**: runs on the Actor side, pulling micro-batches one by one until the partition is fully consumed (`StopIteration`). After pulling mb N it **prefetches** mb N+1's cache in the background so the next pull is a cache hit with less wait.
+
+### With the Streaming Schedule
+
+The micro-batch count is not known upfront — the Iterator drives it until `StopIteration`. So fully-async + dynamic batch uses dedicated streaming forward/backward schedules (`relax/backends/megatron/streaming_schedules.py`) for PP=1 and PP>1; all micro-batches accumulate gradients with a single gradient sync at the end.
+
+::: tip
+Dynamic batch mainly improves MFU by packing variable-length samples to fill the GPU. Note that with `max_staleness=0`, each training step still waits for Rollout to produce the first complete GRPO groups; use `max_staleness>=1` to let Rollout run ahead and remove that wait.
+:::
+
+______________________________________________________________________
+
 ## Training Loop
 
 ### Actor Training Loop
@@ -457,6 +505,8 @@ ______________________________________________________________________
 | `--checkpoint-engine-backend`  | `nccl`  | DCS communication backend (`nccl` or `gloo`)                                      |
 | `--polling-mode`               | `true`  | TransferQueue Controller uses polling for metadata                                |
 | `--ref-update-interval`        | `None`  | Reference model update period (None=no update)                                    |
+| `--use-dynamic-batch-size`     | `false` | Stream-pack micro-batches by token budget (see "Dynamic Batch Size")             |
+| `--max-tokens-per-gpu`         | `None`  | Per-GPU token budget per micro-batch (required when dynamic batch is enabled)     |
 | `--resource`                   | -       | JSON role resource allocation, e.g. `'{"actor": [1, 2], "rollout": [1, 4], ...}'` |
 
 ### Example Configuration

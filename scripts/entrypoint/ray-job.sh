@@ -51,7 +51,6 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # ── clean up residual python/sglang processes (NOT ray) ─────────────────────
 # IMPORTANT: Do NOT pkill ray or run ray stop — the cluster is managed externally.
 echo "=== Cleaning up residual python/sglang processes ==="
-ray serve shutdown -y
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 
 # ── reserve sglang port range from kernel ephemeral pool ────────────────────
@@ -70,8 +69,74 @@ echo "=== Reserving sglang port ranges on all GPU nodes ==="
 #   30000-30300 — secondary safe zone (fallback if sglang port_base needs adjustment)
 python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-16800,30000-30300" || echo "reserve_ports failed (non-fatal)"
 
-# kill old tasks
-ray job list | grep RUNNING | grep -v job_id=None | grep -oP "submission_id='\\K[^']+" | xargs --no-run-if-empty ray job stop || true
+# Two run scenarios, distinguished by whether we are inside a ray job driver:
+#   A) Entry-point mode — `bash ray-job.sh <run-script>`: this script runs in the
+#      launcher shell BEFORE our own `ray job submit`, so every RUNNING relax job
+#      in the list is a stale prior job — none is us. Safe to stop them all.
+#   B) Driver mode — `ray job submit -- bash ray-job.sh ...`: this script runs
+#      inside our own driver, so we MUST exclude our own submission_id or we
+#      suicide. Resolve it with two strategies:
+#        1) RAY_JOB_SUBMISSION_ID env var — set by Ray ≥ 2.6 via `ray job submit`.
+#        2) Fallback: Ray's job_supervisor redirects driver stdout/stderr to
+#           /tmp/ray/session_latest/logs/job-driver-<sub_id>.log, so readlink
+#           fd 1/2 recovers <sub_id>.
+SELF_SUB_ID="${RAY_JOB_SUBMISSION_ID:-}"
+if [ -z "$SELF_SUB_ID" ]; then
+    for _fd in 1 2; do
+        _path=$(readlink -f "/proc/self/fd/${_fd}" 2>/dev/null || true)
+        if [[ "$_path" =~ /job-driver-(.+)\.(log|out|err)$ ]]; then
+            SELF_SUB_ID="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
+fi
+echo "=== Own ray submission_id: ${SELF_SUB_ID:-<none — pre-submit entry-point mode>} ==="
+# Collect submission_ids of RUNNING relax training jobs (skip placeholder jobs).
+# `ray job list` emits one JobDetails(...) per line; jq is unavailable for this
+# Python-repr output, so match on the same line: status RUNNING + entrypoint
+# contains `relax.entrypoints.train`, then extract submission_id.
+_OLD_RELAX_JOBS=$(ray job list 2>/dev/null \
+    | grep RUNNING \
+    | grep -F 'relax.entrypoints.train' \
+    | grep -oP "submission_id='\\K[^']+" || true)
+if [ -n "$SELF_SUB_ID" ]; then
+    # Driver mode: never stop ourselves.
+    _OLD_RELAX_JOBS=$(printf '%s\n' "$_OLD_RELAX_JOBS" | grep -vFx "$SELF_SUB_ID" || true)
+fi
+if [ -z "$_OLD_RELAX_JOBS" ]; then
+    echo "=== No stale relax training jobs to stop ==="
+else
+    echo "=== Stopping stale relax training jobs ==="
+    printf '%s\n' "$_OLD_RELAX_JOBS" | xargs --no-run-if-empty -n1 ray job stop || true
+fi
+ray serve shutdown -y
+
+# ── remove orphan placement groups ──────────────────────────────────────────
+# `ray job stop` / `ray serve shutdown` do NOT delete placement groups. When a
+# prior driver dies abnormally (e.g. SIGKILL leaving a zombie), its PGs stay in
+# CREATED state forever — GCS still thinks the owner is alive — and keep the GPUs
+# reserved, so the next training's PG request hangs in Pending Demands and this
+# script's process/job cleanup above cannot free it. At this point (before our
+# own `ray job submit`) every CREATED PG is necessarily stale, so remove them.
+echo "=== Removing orphan placement groups ==="
+python - <<'PY' || echo "orphan PG cleanup failed (non-fatal)"
+import ray
+from ray.util.placement_group import remove_placement_group, placement_group_table, PlacementGroup
+
+ray.init(address="auto", log_to_driver=False)
+try:
+    removed = 0
+    for pg_id, info in placement_group_table().items():
+        if info.get("state") == "CREATED":
+            try:
+                remove_placement_group(PlacementGroup(ray._raylet.PlacementGroupID(bytes.fromhex(pg_id))))
+                removed += 1
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                print(f"  failed to remove PG {pg_id}: {exc!r}")
+    print(f"  removed {removed} orphan placement group(s)")
+finally:
+    ray.shutdown()
+PY
 
 set -x
 
@@ -122,6 +187,7 @@ NVSHMEM_LIB_PATH="${NVSHMEM_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/nv
 TORCH_LIB_PATH="${TORCH_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/torch/lib}"
 CURRENT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NVSHMEM_LIB_PATH}:${TORCH_LIB_PATH}"
 
+# Cap OMP/MKL/OpenBLAS threads (default 24) to avoid CPU oversubscription when colocating multiple Ray actors per node.
 export RUNTIME_ENV_JSON="{
 \"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",
 \"env_vars\": {
@@ -129,6 +195,9 @@ export RUNTIME_ENV_JSON="{
    \"PYTHONPATH\": \"${PYTHONPATH}\",
    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\": \"1\",
+   \"OMP_NUM_THREADS\": \"${OMP_NUM_THREADS:-24}\",
+   \"MKL_NUM_THREADS\": \"${MKL_NUM_THREADS:-24}\",
+   \"OPENBLAS_NUM_THREADS\": \"${OPENBLAS_NUM_THREADS:-24}\",
    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
    \"MASTER_ADDR\": \"${MASTER_ADDR}\",
    \"RAY_DEBUG\": \"${RAY_DEBUG}\",
@@ -138,6 +207,8 @@ export RUNTIME_ENV_JSON="{
    \"SGLANG_HEALTH_CHECK_TIMEOUT\": \"${SGLANG_HEALTH_CHECK_TIMEOUT:-180}\",
    \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\",
    \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
+   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-1}\",
+   \"NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK\": \"${NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK:-1}\",
    \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
 }
 }"

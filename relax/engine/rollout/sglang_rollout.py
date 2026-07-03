@@ -123,6 +123,12 @@ class GenerateState(metaclass=SingletonMeta):
         # step N is consumed at the beginning of step N+1.
         if not hasattr(self, "prefetched_samples_ref"):
             self.prefetched_samples_ref: ray.ObjectRef | None = None
+        # How many groups the previous step left short of its transfer-queue target
+        # (rollout_batch_size - committed_current). The next step backfills exactly this
+        # many into rollout_id-1. Persisted across reset() like prefetched_samples_ref;
+        # 0 before the first step / when the previous step met its target. fully_async only.
+        if not hasattr(self, "last_step_current_deficit"):
+            self.last_step_current_deficit = 0
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
@@ -329,7 +335,7 @@ async def generate(
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
-            new_response_tokens = state.tokenizer.encode(output["text"], add_special_tokens=False)
+            new_response_tokens = output["output_ids"]
             new_response_log_probs = []
 
         while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
@@ -690,8 +696,28 @@ async def generate_rollout_async(
 
     metric_gatherer = MetricGatherer()
 
-    # target_data_size is the total number of valid samples to get
-    target_data_size = args.rollout_batch_size
+    # Backfill debt for the previous step = the deficit it recorded at close
+    # (rollout_batch_size - committed_current), NOT the buffer carryover size. Known up
+    # front (no longer derived from how much get_samples returned), so target_data_size
+    # is fixed here instead of being mutated mid-loop.
+    num_old_samples = state.last_step_current_deficit if args.fully_async else 0
+
+    # target_data_size = how many groups this step COMMITS to the transfer queue:
+    # current-partition target (rollout_batch_size) + previous-partition backfill
+    # (num_old_samples). Completed groups beyond this are over-sampling surplus, kept for
+    # the next step. NOTE this is the commit cap; the number of tasks SUBMITTED is the
+    # (larger) over_sampling envelope so the fast groups can fill the target without
+    # waiting on the slow tail.
+    target_data_size = args.rollout_batch_size + num_old_samples
+
+    # Inner-loop top-up threshold = the commit target. Each submit_generate_tasks call
+    # admits a full over_sampling_batch_size of groups, so one round already puts more
+    # tasks in flight than target_data_size (the over-sampling envelope). Gating top-up on
+    # target_data_size (not over_sampling_batch_size) keeps the over-sample surplus as slack
+    # that absorbs aborted/filtered groups; gating on over_sampling_batch_size removes that
+    # slack when over_sampling_batch_size == rollout_batch_size and deadlocks the outer loop
+    # on an empty pending set once any group aborts.
+    submit_target = target_data_size
 
     data = []
     do_print = True
@@ -699,14 +725,35 @@ async def generate_rollout_async(
     transfer_tasks = []
     batch_to_transfer = []
     aborted_samples = []
-    num_old_samples = 0
+    # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
+    # the buffer for the next step instead of being dropped, so no samples are lost.
+    oversample_surplus = []
     total_transfer_samples = 0
     get_samples_times: list[float] = []
 
+    # is_last bookkeeping: a partition train_X is filled across two steps (step X
+    # commits committed_current, step X+1 backfills the deficit). Mark is_last on
+    # the transfer that brings a partition's cumulative commits to its final target:
+    #   - prev partition (train_{rollout_id-1}): closed by this step's num_old_samples backfill
+    #   - cur partition (train_{rollout_id}): only if this step fully meets rollout_batch_size
+    #     (no deficit carried); otherwise its tail is backfilled next step.
+    committed_prev = 0  # groups committed to train_{rollout_id-1} this step
+    committed_curr = 0  # groups committed to train_{rollout_id} this step
+    prev_target = num_old_samples
+    curr_target = args.rollout_batch_size
+
+    logger.info(
+        f"Starting rollout step {rollout_id}: target(commit)={target_data_size} "
+        f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples}), submit_target={submit_target}"
+    )
+
     loop = asyncio.get_running_loop()
 
+    # Outer loop stops once we've COMMITTED target_data_size groups; inner loop tops up
+    # submissions whenever in-flight admitted groups drop below the commit target, each
+    # round admitting a full over_sampling_batch_size so the surplus absorbs aborts.
     while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
+        while state.remaining_batch_size < submit_target:
             _t_get_samples = monotonic()
 
             if state.prefetched_samples_ref is not None:
@@ -714,20 +761,11 @@ async def generate_rollout_async(
                 state.prefetched_samples_ref = None
                 logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
             else:
-                ref = data_source.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
+                ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
             samples = await loop.run_in_executor(None, ray.get, ref)
 
             get_samples_times.append(monotonic() - _t_get_samples)
-            num_old_samples = len(samples) - args.over_sampling_batch_size
-            logger.info(
-                f"Starting rollout step {rollout_id}, but had {num_old_samples} old samples for step {rollout_id - 1}"
-            )
-            target_data_size += num_old_samples
-
-            if args.fully_async and num_old_samples != 0:
-                pbar.close()
-                pbar = tqdm(total=len(samples) * args.n_samples_per_prompt, desc="Rollout generation")
             state.submit_generate_tasks(samples)
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
@@ -751,8 +789,10 @@ async def generate_rollout_async(
                 state.remaining_batch_size -= 1
                 continue
 
-            # add the samples to the data
-            # NOTE: here we have not stored all the unused samples back to the data buffer.
+            # Classify each finished group. Nothing is dropped: aborted groups carry to
+            # the buffer for partial resume; completed groups beyond target_data_size are
+            # over-sampling surplus carried to the buffer (reused next step); completed
+            # groups within target are committed to the transfer queue.
             if any(sample.status == Sample.Status.ABORTED for sample in group):
                 for sample in group:
                     if sample.response and "start_rollout_id" not in sample.metadata:
@@ -761,82 +801,105 @@ async def generate_rollout_async(
             elif len(data) < target_data_size:
                 batch_to_transfer.append(group)
                 total_transfer_samples += 1
+            else:
+                # Over-sampling surplus: target already met. Keep it for the next step
+                # (added back to the buffer after this step) instead of dropping it.
+                oversample_surplus.append(group)
 
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
-                # When batch is ready, spawn background transfer task (don't block generator)
-                # Create background task for transfer (don't await here!)
+
         # Only spawn a transfer task when there are samples to transfer.
         transfer_batch_size = (
             args.global_batch_size // args.num_iters_per_train_update // args.n_samples_per_prompt
-            if not args.colocate
+            if args.fully_async
             else args.rollout_batch_size
         )  # Samples per batch to transfer
         # in fully async mode, we transfer all remaining samples when we reach the target size
         if len(batch_to_transfer) >= transfer_batch_size:
             if total_transfer_samples <= num_old_samples:
+                n = len(batch_to_transfer)
+                # is_last: this backfill closes the previous partition's debt.
+                prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
                     transfer_batch_to_data_system(
                         args,
                         batch_to_transfer,
-                        len(batch_to_transfer),
+                        n,
                         rollout_id - 1,
                         data_system_client,
+                        is_last=prev_is_last,
                     )
                 )
+                committed_prev += n
                 transfer_tasks.append(transfer_task)
                 batch_to_transfer = []
-                logger.info(
-                    f"Total yielded: {target_data_size - 2 * num_old_samples + total_transfer_samples}/{target_data_size - num_old_samples} for step: {rollout_id - 1}"
-                )
+                logger.info(f"Total yielded: {total_transfer_samples}/{num_old_samples} for step: {rollout_id - 1}")
             else:
                 if len(batch_to_transfer) > total_transfer_samples - num_old_samples:
                     cutoff_batch = len(batch_to_transfer) - total_transfer_samples + num_old_samples
+                    n_prev = len(batch_to_transfer[:cutoff_batch])
+                    # This split sends the remaining backfill to the previous partition;
+                    # it always closes the debt, so it is the previous partition's last.
+                    prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
                         transfer_batch_to_data_system(
                             args,
                             batch_to_transfer[:cutoff_batch],
-                            len(batch_to_transfer[:cutoff_batch]),
+                            n_prev,
                             rollout_id - 1,
                             data_system_client,
+                            is_last=prev_is_last,
                         )
                     )
+                    committed_prev += n_prev
                     transfer_tasks.append(transfer_task)
                     batch_to_transfer = batch_to_transfer[cutoff_batch:]
                     logger.info(
-                        f"{num_old_samples} old samples completed! Total yielded: {target_data_size - num_old_samples}/{target_data_size - num_old_samples} for step: {rollout_id - 1}"
+                        f"{num_old_samples} old samples completed! Total yielded: {num_old_samples}/{num_old_samples} for step: {rollout_id - 1}"
                     )
                 else:
+                    n = len(batch_to_transfer)
+                    # is_last for the current partition ONLY if this step fully meets its
+                    # target (no deficit carried) — otherwise the tail is backfilled next step.
+                    curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
                         transfer_batch_to_data_system(
                             args,
                             batch_to_transfer,
-                            len(batch_to_transfer),
+                            n,
                             rollout_id,
                             data_system_client,
+                            is_last=curr_is_last,
                         )
                     )
+                    committed_curr += n
                     transfer_tasks.append(transfer_task)
                     batch_to_transfer = []
                     logger.info(
-                        f"Total yielded: {total_transfer_samples - num_old_samples}/{target_data_size - num_old_samples} for step: {rollout_id}"
+                        f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
                     )
 
     if len(batch_to_transfer) > 0:
+        n = len(batch_to_transfer)
+        # Tail flush to the current partition: last only if it completes this step's target.
+        curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
         transfer_task = asyncio.create_task(
             transfer_batch_to_data_system(
                 args,
                 batch_to_transfer,
-                len(batch_to_transfer),
+                n,
                 rollout_id,
                 data_system_client,
+                is_last=curr_is_last,
             )
         )
+        committed_curr += n
         transfer_tasks.append(transfer_task)
         batch_to_transfer = []
         logger.info(
-            f"Total yielded: {total_transfer_samples - num_old_samples}/{target_data_size - num_old_samples} for step: {rollout_id}"
+            f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
         )
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
@@ -881,6 +944,22 @@ async def generate_rollout_async(
         )
     else:
         logger.info(f"Rollout fully completed for rollout_id: {rollout_id}.")
+
+    # Record this step's current-partition deficit for the next step's backfill debt.
+    # committed_current = groups committed to rollout_id (current partition); the first
+    # num_old_samples committed went to rollout_id-1 (previous-partition backfill).
+    committed_current = max(total_transfer_samples - num_old_samples, 0)
+    state.last_step_current_deficit = max(args.rollout_batch_size - committed_current, 0) if args.fully_async else 0
+
+    # Carry over-sampling surplus back to the buffer (reused next step, committed first
+    # via the completed-group fast path in generate_and_rm_group). Surplus groups are
+    # complete (length == n_samples_per_prompt), satisfying add_samples' assertion.
+    aborted_samples.extend(oversample_surplus)
+    logger.info(
+        f"Rollout step {rollout_id} carry-over: committed_current={committed_current} "
+        f"next_step_deficit={state.last_step_current_deficit} "
+        f"oversample_surplus={len(oversample_surplus)} aborted={len(aborted_samples) - len(oversample_surplus)}"
+    )
 
     state.reset()
 
@@ -1072,6 +1151,6 @@ def generate_rollout(
         ray.get(data_buffer.add_samples.remote(aborted_samples))
     if not args.fully_async:
         state = GenerateState(args)
-        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size, args.fully_async)
+        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
     return output

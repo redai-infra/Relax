@@ -6,7 +6,7 @@ from argparse import Namespace
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from relax.utils import tracking_utils
+from relax.utils import telemetry, tracking_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.timer import Timer
@@ -35,6 +35,10 @@ def log_perf_data_raw(
 
     log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
 
+    if timer_instance.seq_lens:
+        log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)
+
+    per_gpu_tflops: float | None = None
     if ("perf/actor_train_time" in log_dict) and (flops_counter is not None):
         seq_lens = timer_instance.seq_lens
         images_seqlens = getattr(timer_instance, "images_seqlens", None) or None
@@ -73,9 +77,22 @@ def log_perf_data_raw(
         if total_time > 0:
             log_dict["perf/step_time"] = total_time
             log_dict["perf/wait_time_ratio"] = log_dict["perf/train_wait_time"] / total_time
+            if timer_instance.seq_lens:
+                log_dict["perf/step_token_per_s"] = sum(timer_instance.seq_lens) / total_time
+            response_lens = getattr(timer_instance, "response_lens", None)
+            if response_lens:
+                log_dict["perf/step_resp_token_per_s"] = sum(response_lens) / total_time
 
     logger.info(f"perf {rollout_id}: {log_dict}")
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
+    telemetry.mark_step_end(
+        rollout_id,
+        role="actor",
+        world_size=world_size,
+        tokens_per_gpu=log_dict.get("perf/actor_train_tokens", 0) / world_size,
+        mfu=log_dict.get("perf/mfu/actor_train", 0),
+        tflops_per_gpu=log_dict.get("perf/actor_train_tflops", 0),
+    )

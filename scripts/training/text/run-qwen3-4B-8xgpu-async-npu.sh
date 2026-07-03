@@ -24,9 +24,9 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
-EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+PROJECT_NAME="${PROJECT_NAME:-Relax/dev/dapo-math}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 
 
 

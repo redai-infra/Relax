@@ -27,7 +27,7 @@ from .config import (
     get_video_max_token_num,
     get_video_min_token_num,
 )
-from .image_utils import SPATIAL_MERGE_SIZE, get_resize_height_width
+from .image_utils import SPATIAL_MERGE_SIZE, decode_data_uri, get_resize_height_width
 
 
 logger = get_logger(__name__)
@@ -286,17 +286,33 @@ def load_video(
 ) -> Tuple[torch.Tensor, Dict[str, int], Optional[np.ndarray], Optional[Dict[str, int]]]:
     """Dispatch loader based on `video` input type.
 
-    Supports local path/URL (`str`), raw bytes (`bytes`), or list/array of
-    frame bytes. Returns `(video, video_meta, audio, audio_meta)`.
+    Supports local path/URL (`str`), `data:` URI string, raw bytes (`bytes`),
+    list/array of frame bytes, or a `{path|bytes|base64}` dict. Returns
+    `(video, video_meta, audio, audio_meta)`.
     """
     if isinstance(video, str):
+        if video.startswith("data:"):
+            return load_video_from_bytes(decode_data_uri(video), use_audio_in_video, **kwargs)
         return load_video_from_path(video, use_audio_in_video, **kwargs)
-    elif isinstance(video, bytes):
-        return load_video_from_bytes(video, use_audio_in_video, **kwargs)
-    elif isinstance(video, (list, np.ndarray)):
+    if isinstance(video, (bytes, bytearray)):
+        return load_video_from_bytes(bytes(video), use_audio_in_video, **kwargs)
+    if isinstance(video, (list, np.ndarray)):
         return load_video_from_bytes_list(video, use_audio_in_video, **kwargs)
-    else:
-        raise NotImplementedError(f"Unsupported video input type: {type(video)}")
+    if isinstance(video, dict):
+        raw = video.get("bytes")
+        if isinstance(raw, (bytes, bytearray)):
+            return load_video_from_bytes(bytes(raw), use_audio_in_video, **kwargs)
+        b64 = video.get("base64")
+        if isinstance(b64, str):
+            import base64 as _b64
+
+            return load_video_from_bytes(_b64.b64decode(b64), use_audio_in_video, **kwargs)
+        path = video.get("path")
+        if isinstance(path, str):
+            if path.startswith("data:"):
+                return load_video_from_bytes(decode_data_uri(path), use_audio_in_video, **kwargs)
+            return load_video_from_path(path, use_audio_in_video, **kwargs)
+    raise NotImplementedError(f"Unsupported video input type: {type(video)}")
 
 
 def fetch_video(

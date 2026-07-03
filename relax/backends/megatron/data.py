@@ -117,6 +117,7 @@ def get_batch(
     pad_multiplier: int = 128,
     qkv_format: str = "thd",
     allgather_cp: bool = False,
+    is_vl_model: bool = False,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -182,8 +183,11 @@ def get_batch(
         # inputs and a matching packed_seq_params so the caller-side cu_seqlens
         # agrees with what the bridge derives from attention_mask.
         # Mirrors verl's build_vlm_attn_mask_thd + preprocess_thd_engine.
-        is_vl_model = batch.get("multimodal_train_inputs") is not None
-        needs_unsplit_input = is_vl_model or getattr(get_args(), "uses_unsplit_forward", False)
+        # Routed by `is_vl_model` (set from hf_config) rather than presence of
+        # multimodal_train_inputs, so VL models with text-only batches still
+        # land here — bridge skips vision embedding when image_grid_thw is None.
+        has_mm_inputs = batch.get("multimodal_train_inputs") is not None
+        needs_unsplit_input = is_vl_model or has_mm_inputs or getattr(get_args(), "uses_unsplit_forward", False)
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
@@ -272,22 +276,28 @@ def get_batch(
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
 
-    # loss masks
-    loss_masks = []
+    from relax.utils.sft_utils import align_loss_mask_for_sft
+
+    loss_masks: list[torch.Tensor] = []
+    per_sample_loss_masks: list[torch.Tensor] = []
+    full_per_sample_loss_masks: list[torch.Tensor] = []
     for loss_mask, total_length, response_length in zip(
-        batch["loss_masks"],
-        batch["total_lengths"],
-        batch["response_lengths"],
-        strict=True,
+        batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
     ):
-        prompt_length = total_length - response_length
-        # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
-        loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
-        if allgather_cp:
-            loss_masks.append(loss_mask)
-            continue
-        loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
+        if response_length == total_length:
+            loss_mask = align_loss_mask_for_sft(loss_mask)
+            per_sample_loss_masks.append(loss_mask)
+        else:
+            per_sample_loss_masks.append(loss_mask)
+            prompt_length = total_length - response_length
+            loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
+        # Pre-CP, per-sample full-length mask used for the bridge-aligned MTP
+        # labels/mask below (built after this loop closes).
+        full_per_sample_loss_masks.append(loss_mask)
+        if not allgather_cp:
+            loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
         loss_masks.append(loss_mask)
+    batch["loss_masks"] = per_sample_loss_masks
 
     if qkv_format == "bshd":
         loss_masks = torch.stack(loss_masks)
@@ -303,6 +313,32 @@ def get_batch(
 
     assert loss_masks.shape == tokens.shape, f"loss_masks.shape: {loss_masks.shape}, tokens.shape: {tokens.shape}"
     batch["full_loss_masks"] = loss_masks
+
+    # Bridge-aligned MTP labels/loss_mask for the VL+THD+CP unsplit path.
+    # Legacy `batch["tokens"]` / `batch["full_loss_masks"]` use per-sample
+    # align=2*cp_size + global pad, but the bridge's preprocess_packed_seqs
+    # repacks hidden_states with per-sample align=tp*cp*2 (matching
+    # vlm_packed_seq_params). The two per-rank lengths diverge, so MTP labels
+    # must mirror the bridge layout: per-sample pad to seqlens_padded[i],
+    # then CP-slice with the standard 2-chunk pattern, then concat.
+    if qkv_format == "thd" and "vlm_packed_seq_params" in batch and getattr(get_args(), "enable_mtp_training", False):
+        orig_tokens = batch["unconcat_tokens"]
+        seqlens_padded_list = batch["padded_total_lengths"]
+        mtp_label_chunks: list[torch.Tensor] = []
+        mtp_loss_chunks: list[torch.Tensor] = []
+        for sample_tokens, sample_mask, pad_to in zip(
+            orig_tokens, full_per_sample_loss_masks, seqlens_padded_list, strict=True
+        ):
+            pad_to = int(pad_to)
+            t_padded = F.pad(sample_tokens, (0, pad_to - sample_tokens.size(0)), value=pad_token_id)
+            m_padded = F.pad(sample_mask, (0, pad_to - sample_mask.size(0)), value=0)
+            chunk = pad_to // (2 * cp_size)
+            s1, e1 = chunk * cp_rank, chunk * (cp_rank + 1)
+            s2, e2 = chunk * (2 * cp_size - cp_rank - 1), chunk * (2 * cp_size - cp_rank)
+            mtp_label_chunks.append(torch.cat([t_padded[s1:e1], t_padded[s2:e2]]))
+            mtp_loss_chunks.append(torch.cat([m_padded[s1:e1], m_padded[s2:e2]]))
+        batch["unsplit_mtp_labels"] = torch.cat(mtp_label_chunks).unsqueeze(0)
+        batch["unsplit_mtp_loss_mask"] = torch.cat(mtp_loss_chunks).unsqueeze(0)
 
     # Process multimodal training tensors if present
     multimodal_train_inputs = batch.get("multimodal_train_inputs", None)
@@ -454,13 +490,14 @@ def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
+    max_tokens_per_gpu: int | None = None,
 ) -> tuple[list[DataIterator], list[int]]:
     """Create iterators and a micro-batch schedule for a rollout step.
 
     - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
       micro-batches of `micro_batch_size`.
     - If True, computes the number of micro-batches per local step based on
-      `max_tokens_per_gpu` and per-sample lengths, all-reduces to a DP-wide
+      `max_tokens_per_gpu` (or the override passed via the parameter) and per-sample lengths, all-reduces to a DP-wide
       maximum, optionally enforces divisibility for Virtual Pipeline Parallelism (VPP), and builds a balanced
       index schedule to equalize token counts across micro-batches.
 
@@ -525,7 +562,8 @@ def get_data_iterator(
         num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
         data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:
-        assert args.max_tokens_per_gpu is not None
+        _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
+        assert _max_tokens is not None
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
@@ -533,9 +571,7 @@ def get_data_iterator(
         for i in range(num_steps_per_rollout):
             start = i * num_local_gbs
             end = min((i + 1) * num_local_gbs, num_local_samples)
-            num_microbatches.append(
-                get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
-            )
+            num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size))
 
         num_microbatches = torch.tensor(
             num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
@@ -652,6 +688,9 @@ def log_rollout_data(
                 "teacher_topk_token_ids",
                 "teacher_topk_log_probs",
                 "teacher_topk_k",
+                "packed_seq_params",
+                "vlm_packed_seq_params",
+                "__loss_scale__",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -683,14 +722,21 @@ def log_rollout_data(
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
-                        val = torch.cat(val).clone().detach()
+                        try:
+                            val = torch.cat(val).clone().detach().float()
+                        except RuntimeError:
+                            # Tensors have mismatched shapes (e.g. variable-length mbs in
+                            # streaming mode) — fall back to per-mb mean then average.
+                            val = torch.stack([v.float().mean() for v in val])
                         val = val.mean() * cp_size
                 else:
+                    if not isinstance(val[0], (int, float)):
+                        continue
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
-                raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
+                continue
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
@@ -711,7 +757,18 @@ def log_rollout_data(
     if args.log_multi_turn:
         log_multi_turn_data(rollout_id, args, rollout_data)
     if args.log_passrate:
-        log_passrate(rollout_id, args, rollout_data, ignore_num_groups=True)
+        # On the fully-async dynamic-batch (streaming) path the sampler balances
+        # GRPO groups across DP ranks PER SAMPLE (groups are intentionally split),
+        # so this DP rank's ``rollout_data`` holds an arbitrary, non-group-aligned
+        # subset (count not a multiple of n_samples_per_prompt).  Train-time
+        # per-DP pass@k is therefore neither computable nor meaningful here —
+        # reshaping into [num_groups, group_size] would mix unrelated prompts (or
+        # assert on the ragged count).  Skip it on this path; eval pass@k (with
+        # complete groups, rollout side) is unaffected.
+        if getattr(args, "use_dynamic_batch_size", False) and getattr(args, "fully_async", False):
+            pass
+        else:
+            log_passrate(rollout_id, args, rollout_data, ignore_num_groups=True)
 
     if args.log_correct_samples:
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():

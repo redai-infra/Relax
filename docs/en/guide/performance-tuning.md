@@ -433,6 +433,23 @@ See [Fully Async Training](./fully-async-training.md) for the complete setup gui
 
 ---
 
+## GPU Utilization After Tuning
+
+The table below summarizes measured GPU utilization for each launch script after performance tuning. Use it as a health baseline for the corresponding configuration.
+
+| Task | GPU UTIL (%) (after tuning) | GPU SM (%) (after tuning) |
+|---|---|---|
+| `run-qwen3-4B-8xgpu` | 87 | 61 |
+| `run-qwen3-30B-A3B-int4-8xgpu` | 71 | 47 |
+| `run-qwen3-vl-4B-8xgpu` | 70 | 32 |
+| `run_deepeyes` | 66 | 32 |
+| `run-qwen35-9B-8xgpu-openr1mm-hybrid-async` | 69 | 42 |
+| `run-qwen35-35B-A3B-16xgpu` | 64 | 35 |
+| `run-qwen35-9B-8xgpu` | 78 | 64 |
+| `run-qwen36-35B-A3B-8xgpu-image` | 63 | 35 |
+
+---
+
 ## Next Steps
 
 - [OOM Troubleshooting](./oom-troubleshooting.md) — when tuning causes memory issues

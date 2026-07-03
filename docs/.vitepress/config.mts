@@ -243,6 +243,7 @@ export default defineConfig({
                 { text: 'Installation', link: '/en/guide/installation' },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
+                { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
             },
@@ -259,6 +260,7 @@ export default defineConfig({
               text: 'Advanced',
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
+                { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
@@ -270,7 +272,8 @@ export default defineConfig({
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
-                { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' }
+                { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
+                { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
               ]
             },
             {
@@ -306,7 +309,8 @@ export default defineConfig({
                 { text: 'DeepEyes', link: '/en/examples/deepeyes' },
                 { text: 'On-Policy Distillation', link: '/en/examples/on-policy-distillation' },
                 { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
-                { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' }
+                { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' },
+                { text: 'Algorithms', link: '/en/examples/algorithms' }
               ]
             }
           ]
@@ -344,6 +348,7 @@ export default defineConfig({
                 { text: '安装', link: '/zh/guide/installation' },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
+                { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]
             },
@@ -360,6 +365,7 @@ export default defineConfig({
               text: '进阶指南',
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
+                { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
@@ -371,7 +377,8 @@ export default defineConfig({
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
-                { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' }
+                { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
+                { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
               ]
             },
             {
@@ -407,7 +414,8 @@ export default defineConfig({
                 { text: 'DeepEyes', link: '/zh/examples/deepeyes' },
                 { text: '在线策略蒸馏', link: '/zh/examples/on-policy-distillation' },
                 { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
-                { text: '低精度训练', link: '/zh/examples/low-precision-training' }
+                { text: '低精度训练', link: '/zh/examples/low-precision-training' },
+                { text: '算法参考', link: '/zh/examples/algorithms' }
               ]
             }
           ]

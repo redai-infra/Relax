@@ -10,21 +10,25 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def check_mtp_only_grad(model: Sequence[DDP], step_id: int) -> None:
-    """Check that only MTP parameters have non-zero gradients.
+def check_mtp_only_grad(model: Sequence[DDP], step_id: int, require_non_mtp_zero: bool = True) -> None:
+    """Check MTP gradients and optionally require only MTP parameters to have
+    gradients.
 
     This is used for CI testing to verify that when all outputs are truncated,
-    only the MTP layers receive gradients (since only mtp_loss contributes).
+    only the MTP layers receive gradients (since only mtp_loss contributes). For
+    normal SFT batches, non-MTP parameters are expected to receive main-loss gradients.
 
     Args:
         model: Sequence of DDP-wrapped model chunks.
         step_id: Current step index for logging.
+        require_non_mtp_zero: Whether non-MTP gradients should be rejected.
 
     Raises:
         AssertionError: If any non-MTP parameter has a non-zero gradient.
     """
     non_mtp_nonzero_grads = []
     mtp_nonzero_grads = []
+    mtp_param_count = 0
 
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
@@ -39,6 +43,7 @@ def check_mtp_only_grad(model: Sequence[DDP], step_id: int) -> None:
             is_mtp = ".mtp." in name
 
             if is_mtp:
+                mtp_param_count += 1
                 if grad_norm > 0:
                     mtp_nonzero_grads.append((name, grad_norm))
             else:
@@ -48,20 +53,26 @@ def check_mtp_only_grad(model: Sequence[DDP], step_id: int) -> None:
     # Log the results
     logger.info(
         f"[CI MTP Grad Check] Step {step_id}: "
+        f"MTP params on this rank: {mtp_param_count}, "
         f"MTP params with non-zero grad: {len(mtp_nonzero_grads)}, "
-        f"non-MTP params with non-zero grad: {len(non_mtp_nonzero_grads)}"
+        f"non-MTP params with non-zero grad: {len(non_mtp_nonzero_grads)}, "
+        f"require_non_mtp_zero={require_non_mtp_zero}"
     )
 
-    if non_mtp_nonzero_grads:
+    if require_non_mtp_zero and non_mtp_nonzero_grads:
         # Log the first few non-MTP params with non-zero gradients for debugging
         for name, grad_norm in non_mtp_nonzero_grads[:5]:
             logger.error(f"[CI MTP Grad Check] Non-MTP param with non-zero grad: {name}, max_grad={grad_norm}")
 
-    assert len(non_mtp_nonzero_grads) == 0, (
-        f"Expected all non-MTP parameters to have zero gradients, "
-        f"but found {len(non_mtp_nonzero_grads)} with non-zero gradients. "
-        f"First few: {non_mtp_nonzero_grads[:5]}"
-    )
+        assert len(non_mtp_nonzero_grads) == 0, (
+            f"Expected all non-MTP parameters to have zero gradients, "
+            f"but found {len(non_mtp_nonzero_grads)} with non-zero gradients. "
+            f"First few: {non_mtp_nonzero_grads[:5]}"
+        )
+
+    if mtp_param_count == 0:
+        logger.info(f"[CI MTP Grad Check] Step {step_id}: no local MTP parameters; skipping MTP grad assertion")
+        return
 
     # Also verify that MTP params do have gradients (otherwise the test is not valid)
     assert len(mtp_nonzero_grads) > 0, (

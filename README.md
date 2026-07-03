@@ -19,8 +19,11 @@
   <a href="https://redai-infra.github.io/Relax">
     <img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Documentation">
   </a>
-  <a href="https://my.feishu.cn/wiki/ZcTQwrmwbiWRhvkgcMxciefHn7f" target="_blank">
+  <a href="https://github.com/redai-infra/Relax/discussions/48" target="_blank">
     <img src="https://img.shields.io/badge/WeChat-green?logo=wechat" alt="WeChat QR">
+  </a>
+  <a href="https://github.com/redai-infra/Relax/discussions/30" target="_blank">
+    <img src="https://img.shields.io/badge/Docker-Image-blue?logo=docker" alt="Docker Image">
   </a>
 </p>
 
@@ -88,12 +91,13 @@ ______________________________________________________________________
 
 ## 🧠 Supported Algorithms
 
-| Algorithm                  | Type                | Description                             |
-| :------------------------- | :------------------ | :-------------------------------------- |
-| **GRPO**                   | Policy Optimization | Group Relative Policy Optimization      |
-| **GSPO**                   | Policy Optimization | Group Sample Policy Optimization        |
-| **SAPO**                   | Policy Optimization | Sample-Aware Policy Optimization        |
-| **On-Policy Distillation** | Knowledge Transfer  | Teacher-student KL penalty distillation |
+| Algorithm                  | Type                | Description                                       |
+| :------------------------- | :------------------ | :------------------------------------------------ |
+| **GRPO**                   | Policy Optimization | Group Relative Policy Optimization                |
+| **GSPO**                   | Policy Optimization | Group Sample Policy Optimization                  |
+| **SAPO**                   | Policy Optimization | Sample-Aware Policy Optimization                  |
+| **CISPO**                  | Policy Optimization | Clipped Importance-ratio Soft Policy Optimization |
+| **On-Policy Distillation** | Knowledge Transfer  | Teacher-student KL penalty distillation           |
 
 > 📖 Adding a new algorithm is straightforward — implement a service class, register it in the `ALGOS` registry, and you're done.
 
@@ -103,15 +107,16 @@ ______________________________________________________________________
 
 Relax is designed for **omni-modal RL training** — text, vision, and audio in one unified framework. Multimodal data is configured via the `--multimodal-keys` flag, with complete image/video/audio processing pipelines under `relax/utils/multimodal/` for fine-grained control over image token counts, video frame sampling, and audio sample rates.
 
-| Model Family   | Sizes             | Modality              | Typical Tasks                                        | Backend  |
-| :------------- | :---------------- | :-------------------- | :--------------------------------------------------- | :------- |
-| **Qwen3**      | 4B, 30B-A3B (MoE) | Text                  | Math reasoning, code, multi-turn dialogue, tool use  | Megatron |
-| **Qwen3-VL**   | 4B, 30B-A3B       | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **Qwen3.5**    | 30B-A3B           | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **Qwen3-Omni** | 30B-A3B           | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
-| **Qwen3.6**    | 35B-A3B (MoE)     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **GLM5**       | 744B-A40B (MoE)   | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
-| **Kimi K2.6**  | ~1T-A32B (MoE)    | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
+| Model Family   | Sizes                                                       | Modality              | Typical Tasks                                        | Backend  |
+| :------------- | :---------------------------------------------------------- | :-------------------- | :--------------------------------------------------- | :------- |
+| **Qwen3**      | 4B, 30B-A3B (MoE)                                           | Text                  | Math reasoning, code, multi-turn dialogue, tool use  | Megatron |
+| **Qwen3-VL**   | 4B, 30B-A3B                                                 | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **Qwen3.5**    | 30B-A3B                                                     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **Qwen3-Omni** | 30B-A3B                                                     | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
+| **Qwen3.6**    | 35B-A3B (MoE)                                               | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **GLM5**       | 744B-A40B (MoE)                                             | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
+| **Kimi K2.6**  | ~1T-A32B (MoE)                                              | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
+| **dots.mcore** | [dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr) | Vision + Language     | OCR, document understanding, multimodal reasoning    | Megatron |
 
 > 📖 New architectures are integrated via [Megatron Bridge](relax/backends/megatron/mbridge/) for automatic HF ↔ Megatron weight conversion.
 

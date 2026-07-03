@@ -1,0 +1,10 @@
+{"prompt": "What is the capital of France?", "reference": "Paris"}
+{"prompt": "What is 2 + 2?", "reference": "4"}
+{"prompt": "What color is the sky on a clear day?", "reference": "Blue"}
+{"prompt": "Translate to Spanish: hello", "reference": "Hola"}
+{"prompt": "Largest planet in the solar system?", "reference": "Jupiter"}
+{"prompt": "Year of the French Revolution?", "reference": "1789"}
+{"prompt": "Author of 1984?", "reference": "George Orwell"}
+{"prompt": "Square root of 144?", "reference": "12"}
+{"prompt": "Element with atomic number 1?", "reference": "Hydrogen"}
+{"prompt": "Fastest land animal?", "reference": "Cheetah"}

@@ -1,0 +1,31 @@
+diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
+--- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
++++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
+@@ -191,7 +191,7 @@
+         )
+         setattr(self.A_log, "tensor_model_parallel", True)
+
+-        if HAVE_FLA and self.use_triton_gdn:
++        if HAVE_FLA:
+             self.gated_delta_rule = chunk_gated_delta_rule
+         elif self.use_ascend_gdn:
+             self.gated_delta_rule = flash_gated_delta_rule
+diff --git a/mindspeed_bridge/models/conversion/utils.py b/mindspeed_bridge/models/conversion/utils.py
+--- a/mindspeed_bridge/models/conversion/utils.py
++++ b/mindspeed_bridge/models/conversion/utils.py
+@@ -56,6 +56,15 @@
+
+             # Recursively clean attribute
+             cleaned_value = remove_non_pickleables(attr_value, max_depth, current_depth + 1)
++            if hasattr(cleaned_obj, '__setattr__'):
++                try:
++                    setattr(cleaned_obj, attr_name, cleaned_value)
++                except (ValueError, TypeError) as e:
++                    # Skip OmegaConf unsupport type.
++                    if "Unions of containers" in str(e):
++                        print(f"Skipping attribute '{attr_name}' due to Union type")
++                        continue
++                    raise
+
+             # Set the cleaned value (or None if it was removed)
+             setattr(cleaned_obj, attr_name, cleaned_value)

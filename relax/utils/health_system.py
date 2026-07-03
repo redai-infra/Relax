@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,12 @@ class ServiceHealthState:
     current_step: int = 0
     task_running: bool = False
     restart_count: int = 0
+    # Set by ``report_error(fatal=True)`` for deterministic failures (e.g. SFT
+    # data schema mismatches) that won't recover from a restart. The
+    # HealthChecker short-circuits the retry ladder and exits the process when
+    # it sees this flag, instead of grinding through ~12 in-place restarts and
+    # 4 global restarts before ``_global_restart`` finally hits its limit.
+    fatal: bool = False
 
 
 @ray.remote
@@ -93,18 +100,24 @@ class HealthStatus:
             self.state[role] = ServiceHealthState()
         self.state[role].task_running = running
 
-    def report_error(self, role: str, error: str) -> None:
+    def report_error(self, role: str, error: str, fatal: bool = False) -> None:
         """Report an error for a service.
 
         Args:
             role: Service role name
             error: Error message
+            fatal: If True, the failure is non-recoverable (e.g. SFT data
+                schema mismatch). The HealthChecker will skip restart and
+                terminate the process instead of cycling through the retry
+                ladder.
         """
         if role not in self.state:
             self.state[role] = ServiceHealthState()
         self.state[role].healthy = False
         self.state[role].error = error
         self.state[role].task_running = False
+        if fatal:
+            self.state[role].fatal = True
 
     def get_service_health(self, role: str) -> Dict:
         """Get detailed health info for a service.
@@ -122,6 +135,7 @@ class HealthStatus:
                 "last_heartbeat": time.time(),
                 "current_step": 0,
                 "task_running": False,
+                "fatal": False,
             }
         state = self.state[role]
         return {
@@ -130,6 +144,7 @@ class HealthStatus:
             "last_heartbeat": state.last_heartbeat,
             "current_step": state.current_step,
             "task_running": state.task_running,
+            "fatal": state.fatal,
         }
 
     def get_all_health(self) -> Dict[str, Dict]:
@@ -202,6 +217,10 @@ class HealthChecker:
         health_status: Remote HealthStatus actor for querying health
         on_unhealthy: Callback function(role: str) when service becomes unhealthy
         check_interval: Seconds between health checks (default: 1.0)
+        on_fatal: Optional callback(role: str, error_msg: str) invoked when a
+            service reports a fatal (non-recoverable) error. After the callback
+            returns, the checker calls ``os._exit(1)`` to terminate the
+            process, bypassing the restart ladder.
     """
 
     def __init__(
@@ -209,9 +228,11 @@ class HealthChecker:
         health_status: HealthStatus,
         on_unhealthy: Callable[[str], None],
         check_interval: float = 1.0,
+        on_fatal: Optional[Callable[[str, str], None]] = None,
     ):
         self.health_status = health_status
         self.on_unhealthy = on_unhealthy
+        self.on_fatal = on_fatal
         self.check_interval = check_interval
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -265,6 +286,22 @@ class HealthChecker:
                 for role in unhealthy:
                     health_info = ray.get(self.health_status.get_service_health.remote(role))
                     error_msg = health_info.get("error", "Unknown error")
+                    if health_info.get("fatal"):
+                        # Skip the restart ladder entirely: this error is
+                        # deterministic, retrying just delays the inevitable
+                        # ``os._exit`` from ``_global_restart`` by ~12 wasted
+                        # service restarts. Notify metrics, then exit hard.
+                        logger.error(
+                            f"Service {role} reported FATAL error: {error_msg}. "
+                            f"Skipping restart and terminating process."
+                        )
+                        if self.on_fatal is not None:
+                            try:
+                                self.on_fatal(role, error_msg)
+                            except Exception as cb_exc:
+                                logger.exception(f"on_fatal callback raised, exiting anyway: {cb_exc}")
+                        self._stop_event.set()
+                        os._exit(1)
                     logger.warning(f"Service {role} is unhealthy: {error_msg}, triggering restart")
                     self.on_unhealthy(role)
                     # on_unhealthy may trigger _global_restart which sets
@@ -318,11 +355,18 @@ class HealthManager:
         self._check_interval = check_interval
         logger.info("HealthManager initialized")
 
-    def start(self, on_unhealthy: Callable[[str], None]) -> None:
+    def start(
+        self,
+        on_unhealthy: Callable[[str], None],
+        on_fatal: Optional[Callable[[str, str], None]] = None,
+    ) -> None:
         """Start the health management system.
 
         Args:
             on_unhealthy: Callback function(role: str) when service becomes unhealthy.
+            on_fatal: Optional callback(role, error_msg) invoked when a service
+                reports a fatal (non-recoverable) error, immediately before the
+                checker terminates the process.
         """
         if self._checker is not None:
             logger.warning("Health checker already running")
@@ -332,6 +376,7 @@ class HealthManager:
             health_status=self.status,
             on_unhealthy=on_unhealthy,
             check_interval=self._check_interval,
+            on_fatal=on_fatal,
         )
         self._checker.start()
         logger.info("Health management system started")
@@ -383,14 +428,16 @@ class HealthManager:
         """
         self.status.update_heartbeat.remote(role, step)
 
-    def report_error(self, role: str, error: str) -> None:
+    def report_error(self, role: str, error: str, fatal: bool = False) -> None:
         """Report an error for a service.
 
         Args:
             role: Service role name.
             error: Error message.
+            fatal: If True, mark the failure as non-recoverable so the
+                HealthChecker terminates the process instead of restarting.
         """
-        self.status.report_error.remote(role, error)
+        self.status.report_error.remote(role, error, fatal=fatal)
 
     def get_service_health(self, role: str) -> Dict:
         """Get detailed health info for a service.

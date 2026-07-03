@@ -31,6 +31,8 @@ ray list tasks --address="<address>" --filter "JOB_ID=<job_id>" --filter "state=
 
 **关键字段**: `name`（业务逻辑）、`actor_id`、`worker_pid`（调用栈用）、`node_id`（py-spy 必须在正确节点执行）。
 
+> **⚠️ 返回 `No resource in the cluster` / 空列表是常态，不是错误**。Actor 内部 `await` / `time.sleep` / `dist.barrier` 等阻塞**不会**显示为 RUNNING task — actor 主线程一直停在 `worker.main_loop`，业务逻辑跑在后台线程或 asyncio coroutine 里。**不要继续试 `state=SUBMITTED_TO_WORKER` / `PENDING_NODE_ASSIGNMENT` 等其他 state**，直接跳到 Phase 4 拉 actor 列表 + Phase 3 对 actor PID 跑 py-spy。
+
 ### Phase 3: 收集调用栈
 
 > **重要**: `py-spy dump --pid <pid>` 必须在目标进程所在的节点上执行。
@@ -50,6 +52,15 @@ ray job submit --working-dir "./" --address="<address>" -- \
 ```
 
 **重点关注**: 主线程阻塞点、后台线程状态、`[Has the GIL]` 标记。
+
+#### ⚠️ 反模式（实际踩过的坑）
+
+| 反模式 | 现象 | 正确做法 |
+|--------|------|----------|
+| 本地 `py-spy dump --pid <remote_pid>` | `Error: No such file or directory (os error 2)` | PID 来自远端 actor 的 `worker_pid`，必须通过 `ray job submit` + `run_on_each_ray_node.py -n <node_id>` 在对应节点执行 |
+| `RAY_ADDRESS=... python scripts/tools/run_on_each_ray_node.py --list` | 启了**新的本地 Ray 实例**，看不到目标集群 | `run_on_each_ray_node.py` 内部 `ray.init()` 不带 address，env var 不生效；必须 `ray job submit --address="<addr>" -- python scripts/tools/run_on_each_ray_node.py --list` |
+| `ray job submit -- bash -c 'for pid in 1 2 3; do py-spy --pid $pid; done'` | py-spy 收到空的 `--pid`，`$pid` 被 ray 的引号嵌套吃掉 | 把循环写到 `pyspy_dump.sh` 文件，再 `ray job submit --working-dir "./" -- bash pyspy_dump.sh`（脚本随 working-dir 一起上传） |
+| 一个 PID 一个 `ray job submit` | 每次 ~30-60s 启动开销 × N 个 PID | 写一个脚本文件循环 dump 所有 PID，**单次** `ray job submit` 跑完 |
 
 ### Phase 4: Actor 依赖链分析
 
@@ -149,6 +160,18 @@ Actor C (空闲，未生产数据 Y) ← 根因
 3. **验证假设**: 提出假设 → 检查相关状态 → 确认或否定
 4. **最小化改动**: 定位根因后，用最小改动修复
 5. **Ray address 默认端口**: 用户给出的 `RAY_ADDRESS` 若未显式指定端口，按 `6379` 处理（如 `x.x.x.x` → `x.x.x.x:6379`）
+
+## 常见踩坑速查（实战教训）
+
+下表汇总了实际 debug 中浪费时间的反模式，**遇到对应现象立即跳到「正确做法」**，不要重复试错。
+
+| 阶段 | 错误做法 | 现象 | 正确做法 |
+|------|---------|------|---------|
+| Phase 2 | `state=RUNNING` 返回空 → 继续试 `SUBMITTED_TO_WORKER` / `PENDING_NODE_ASSIGNMENT` | 一直查不到 task | actor-internal hang（await/sleep/barrier）**不显示为 RUNNING task**，直接跳 Phase 4 拉 actors，对 actor PID 跑 py-spy |
+| Phase 3 | 本地 `py-spy dump --pid <remote_pid>` | `Error: No such file or directory` | PID 是远端的，必须 `ray job submit` + `run_on_each_ray_node.py -n <node_id>` |
+| Phase 3 | `RAY_ADDRESS=... python scripts/tools/run_on_each_ray_node.py --list` | 启了新本地 Ray，看不到目标集群 | 该脚本内部 `ray.init()` 不带 address，env var 不生效；必须 `ray job submit --address="<addr>" -- python ...` |
+| Phase 3 | `ray job submit -- bash -c 'for pid in 1 2 3; do py-spy --pid $pid; done'` | py-spy 收到空 `--pid`，输出乱 | `$pid` 被 ray 的引号嵌套吞了；写脚本文件 `pyspy_dump.sh` 然后 `ray job submit --working-dir "./" -- bash pyspy_dump.sh` |
+| Phase 3 | 一个 PID 一次 `ray job submit` × N | 每次 30-60s 启动开销 | 写循环到 .sh 脚本里，**单次** submit 跑完所有 PID |
 
 ---
 

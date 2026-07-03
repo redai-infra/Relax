@@ -102,15 +102,34 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     # Add timeout protection to prevent indefinite blocking during initialization
     # The timeout is set to 120 seconds to allow sufficient time for:
 
-    # calculate num_rollout from num_epoch
-    num_rollout_per_epoch = ray.get(
-        rollout_manager.get_num_rollout_per_epoch.remote(),
-    )
-    logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
+    # Resolve num_rollout. Semantics:
+    #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
+    #   - only num_epoch   -> num_epoch * rollout_per_epoch
+    #   - only num_rollout -> use as-is
+    # SFT pre-resolves both num_rollout and num_rollout_per_epoch from the SFT
+    # dataset in controller.py before any role is launched; the injected Rollout
+    # has no RL global dataset, so trust those values and skip the RL-side
+    # computation (which would assert on rollout_global_dataset).
+    if getattr(args, "loss_type", None) == "sft":
+        num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
+        logger.info(
+            f"RolloutManager initialized successfully (SFT mode). "
+            f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
+        )
+    else:
+        num_rollout_per_epoch = ray.get(
+            rollout_manager.get_num_rollout_per_epoch.remote(),
+        )
+        logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
 
-    if args.num_rollout is None:
-        args.num_rollout = num_rollout_per_epoch * args.num_epoch
-        assert args.num_rollout > 0
+        args.num_rollout_per_epoch = num_rollout_per_epoch
+        if args.num_epoch is not None:
+            epoch_rollout = num_rollout_per_epoch * args.num_epoch
+            args.num_rollout = min(args.num_rollout, epoch_rollout) if args.num_rollout is not None else epoch_rollout
+        assert args.num_rollout is not None and args.num_rollout > 0, (
+            f"num_rollout resolved to {args.num_rollout}; "
+            f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
+        )
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))

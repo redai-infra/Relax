@@ -153,6 +153,8 @@ def all_gather_with_cp(
     total_length: int,
     response_length: int,
     padded_total_length: int | None = None,
+    qkv_format: str = "thd",
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Gather tensors across all ranks in the context parallel group.
 
@@ -165,7 +167,11 @@ def all_gather_with_cp(
         return tensor
 
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, padded_total_length=padded_total_length
+        total_length,
+        response_length,
+        qkv_format,
+        max_seq_len,
+        padded_total_length=padded_total_length,
     )
 
     prompt_length = total_length - response_length
@@ -179,7 +185,7 @@ def all_gather_with_cp(
             [len] + list(tensor.shape[1:]),
             dtype=tensor.dtype,
             device=tensor.device,
-            requires_grad=True,
+            requires_grad=tensor.requires_grad,
         )
 
     # logprob should be within the range of [prompt_length - 1, total_length - 1]

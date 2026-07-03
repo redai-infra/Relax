@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import base64
 import math
 import os
+import urllib.parse
 from io import BytesIO
 from typing import Any, ByteString, Dict, Optional, Tuple, Union
 
@@ -131,6 +133,15 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
     Returns
     - A `PIL.Image` instance opened from the provided path/URL.
     """
+    if image.startswith("data:image/"):
+        header, _, encoded = image.partition(",")
+        if ";base64" not in header or not encoded:
+            raise ValueError("data:image payload must use 'data:image/...;base64,...' format")
+        with BytesIO(base64.b64decode(encoded)) as bio:
+            image_obj = Image.open(bio)
+            image_obj.load()
+        return image_obj
+
     if image.startswith(("http://", "https://")):
         with requests.get(image, stream=True) as response:
             response.raise_for_status()
@@ -155,26 +166,67 @@ def load_image_from_bytes(image: bytes, **kwargs: Any) -> Image.Image:
     Returns
     - A `PIL.Image` instance.
     """
-    return Image.open(BytesIO(image))
+    # Fully decode before the backing buffer goes out of scope. `Image.open`
+    # is lazy and keeps a reference to the underlying file object; if the
+    # `BytesIO` is garbage-collected (or the decode is deferred onto another
+    # thread, as the Qwen-VL processor does), a later `.load()` fails with
+    # truncated-stream errors ("assert self.png is not None" / OSError:
+    # unrecognized data stream contents).
+    with BytesIO(image) as bio:
+        image_obj = Image.open(bio)
+        image_obj.load()
+    return image_obj
+
+
+def decode_data_uri(uri: str) -> bytes:
+    """Decode an RFC 2397 `data:` URI to raw bytes.
+
+    Handles both `;base64` and URL-encoded payloads. Caller is responsible for
+    confirming the input starts with `data:`.
+    """
+    head, _, body = uri.partition(",")
+    if not body:
+        raise ValueError(f"Malformed data URI: {uri[:32]!r}")
+    if "base64" in head.lower():
+        return base64.b64decode(body)
+    return urllib.parse.unquote_to_bytes(body)
 
 
 def load_image(image: ImageInput, **kwargs: Any) -> Image.Image:
     """Generic loader for different image input types.
 
     Parameters
-    - image: One of `PIL.Image`, `np.ndarray`, raw bytes, or a string path/URL.
+    - image: One of:
+        - `PIL.Image.Image`: returned as-is.
+        - `str`: a path, URL, or `data:` URI.
+        - `bytes`: raw image bytes.
+        - `dict`: with one of `bytes`, `base64`, or `path` fields
+          (HF `datasets` / OpenAI-style payloads).
 
     Returns
     - A `PIL.Image` instance.
     """
+    if isinstance(image, Image.Image):
+        return image
     if isinstance(image, str):
+        if image.startswith("data:"):
+            return load_image_from_bytes(decode_data_uri(image), **kwargs)
         return load_image_from_path(image, **kwargs)
-    elif isinstance(image, bytes) or (isinstance(image, dict) and isinstance(image.get("bytes", None), bytes)):
-        if isinstance(image, dict):
-            image = image["bytes"]
-        return load_image_from_bytes(image, **kwargs)
-    else:
-        raise NotImplementedError
+    if isinstance(image, (bytes, bytearray)):
+        return load_image_from_bytes(bytes(image), **kwargs)
+    if isinstance(image, dict):
+        raw = image.get("bytes")
+        if isinstance(raw, (bytes, bytearray)):
+            return load_image_from_bytes(bytes(raw), **kwargs)
+        b64 = image.get("base64")
+        if isinstance(b64, str):
+            return load_image_from_bytes(base64.b64decode(b64), **kwargs)
+        path = image.get("path")
+        if isinstance(path, str):
+            if path.startswith("data:"):
+                return load_image_from_bytes(decode_data_uri(path), **kwargs)
+            return load_image_from_path(path, **kwargs)
+    raise NotImplementedError(f"Unsupported image input type: {type(image)}")
 
 
 def fetch_image(

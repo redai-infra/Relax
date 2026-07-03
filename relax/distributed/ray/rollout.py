@@ -26,7 +26,15 @@ from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.health_monitor import RolloutHealthMonitor
-from relax.utils.http_utils import SLIME_HOST_IP_ENV, _wrap_ipv6, find_available_port, get_host_info, init_http_client
+from relax.utils.http_utils import (
+    SLIME_HOST_IP_ENV,
+    _wrap_ipv6,
+    find_available_port,
+    get,
+    get_host_info,
+    init_http_client,
+    post,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import (
@@ -38,6 +46,7 @@ from relax.utils.metrics.metric_utils import (
     has_repetition,
 )
 from relax.utils.misc import group_by, load_function
+from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
@@ -465,8 +474,14 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                    "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                    # The TP memory-imbalance check is overly conservative under
+                    # colocate (the actor occupies GPUs at engine init and is
+                    # offloaded before rollout), so disable it. Recent SGLang reads
+                    # SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK (default True); the old
+                    # SGL(ANG)_DISABLE_* vars are no longer honored — worse, the
+                    # deprecation shim value-copies SGL_DISABLE_* into the ENABLE var,
+                    # so setting them re-enables the check. Set ENABLE=false directly.
+                    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
                     "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
                     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                     "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
@@ -762,6 +777,11 @@ class RolloutManager(ReloadableMixin):
                 self.args.custom_convert_samples_to_train_data_path
             )
 
+        if self.args.use_agentic_rollout:
+            from relax.agentic.rollout import init_agentic_resident_pipeline
+
+            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
+
         if self.args.debug_train_only:
             self.servers: dict[str, RolloutServer] = {}
         else:
@@ -952,6 +972,88 @@ class RolloutManager(ReloadableMixin):
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+
+    async def run_predict(self, train_step: int) -> None:
+        """Periodic SFT predict pass entry point.
+
+        Ensures KV/cuda-graph is onloaded (no-op if already on), then delegates
+        to ``run_predict_loop`` which renders the eval set, batches calls to
+        ``self.generate_predict``, and writes
+        ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
+
+        Mirrors the ``eval`` method: does NOT proactively offload afterward —
+        the next training step's actor↔rollout coordination drives state
+        transitions, same as PPL eval.
+        """
+        from relax.engine.sft.predict.loop import run_predict_loop
+
+        await self.onload_kv()
+        await run_predict_loop(self, self.args, train_step)
+
+    async def generate_predict(
+        self,
+        prompts: list[str],
+        multimodal_inputs_list: list[dict | None] | None = None,
+    ) -> list[str]:
+        """Generate completions for ``prompts`` concurrently.
+
+        POSTs all prompts at once in round-robin order directly to engine
+        workers, bypassing the router. Predict prompts share a long fixed
+        prefix (``<|vision_start|><|image_pad|><|vision_end|>...``); cache-
+        aware routing would pin every request to the engine that first
+        cached the prefix, defeating multi-engine throughput.
+
+        ``multimodal_inputs_list`` is a parallel list of dicts (or ``None``)
+        carrying images/videos/audio for each prompt; encoded inline and
+        merged into the payload, mirroring the RL ``generate()`` path.
+        """
+        import sglang_router
+        from packaging.version import parse
+
+        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+
+        self.health_monitoring_resume()
+
+        router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
+        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
+            response = await get(f"{router_base}/list_workers")
+            worker_urls = response["urls"]
+        else:
+            response = await get(f"{router_base}/workers")
+            worker_urls = [w["url"] for w in response["workers"]]
+        if not worker_urls:
+            worker_urls = [router_base]
+
+        # Reuse the shared --eval-* sampling args (no SFT-predict-specific
+        # flags). Defaults preserve the original SFT predict behaviour
+        # (greedy, max_new_tokens=512) when --eval-* is not provided.
+        eval_temperature = getattr(self.args, "eval_temperature", None)
+        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
+        eval_top_p = getattr(self.args, "eval_top_p", None)
+        sampling_params = {
+            "temperature": 0.0 if eval_temperature is None else eval_temperature,
+            "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
+            "top_p": 1.0 if eval_top_p is None else eval_top_p,
+        }
+        if multimodal_inputs_list is None:
+            multimodal_inputs_list = [None] * len(prompts)
+
+        async def _one(idx: int, prompt: str, mm: dict | None) -> str:
+            url = f"{worker_urls[idx % len(worker_urls)]}/generate"
+            payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
+            if mm:
+                encoded_mm, _ = await _encode_multimodal_inputs(mm)
+                payload.update(encoded_mm)
+            output = await post(url, payload)
+            if isinstance(output, dict) and "text" in output:
+                return output["text"]
+            if isinstance(output, str):
+                return output
+            return str(output)
+
+        return await asyncio.gather(
+            *[_one(i, p, m) for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))]
+        )
 
     async def save(self, rollout_id):
         await self.data_source.save.remote(rollout_id)
@@ -3625,7 +3727,7 @@ def _resolve_sglang_config(args) -> SglangConfig:
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
         return config
 
-    if args.prefill_num_servers is not None:
+    if getattr(args, "prefill_num_servers", None) is not None:
         return SglangConfig.from_prefill_num_servers(args)
 
     # Default: single regular group.
@@ -3693,13 +3795,19 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
+    tracking_utils.flush_metrics(args, step)
 
 
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
+    multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    log_dict |= _compute_min_mean_max_stats([s["image_count"] for s in multimodal_stats], "image_count/")
+    log_dict |= _compute_min_mean_max_stats(
+        [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
+    )
     log_dict |= compute_rollout_explicit_reward_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
@@ -3711,6 +3819,16 @@ def compute_metrics_from_samples(args, samples):
     log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     return log_dict
+
+
+def _compute_min_mean_max_stats(values: list[int], prefix: str) -> dict[str, float]:
+    if not values:
+        return {}
+    return {
+        f"{prefix}mean": np.mean(values).item(),
+        f"{prefix}max": np.max(values).item(),
+        f"{prefix}min": np.min(values).item(),
+    }
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):

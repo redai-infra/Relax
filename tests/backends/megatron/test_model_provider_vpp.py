@@ -22,6 +22,7 @@ class _FakeProvider:
         self.fp16 = False
         self.bf16 = False
         self.params_dtype = None
+        self.vision_dp_when_cp = False
 
     def finalize(self):
         self.finalized = True
@@ -148,6 +149,7 @@ def _bridge_args(**overrides):
         "freeze_vision_model": False,
         "freeze_vision_projection": False,
         "vision_dp_when_tp": False,
+        "vision_dp_when_cp": False,
         "calculate_per_token_loss": False,
         "num_layers": 8,
         "moe_layer_freq": None,
@@ -170,6 +172,15 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.virtual_pipeline_model_parallel_size == 2
     assert provider.finalized
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model_provider = module.get_model_provider_func(_bridge_args(vision_dp_when_cp=True), role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert provider.vision_dp_when_cp is True
 
 
 def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):

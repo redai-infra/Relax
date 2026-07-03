@@ -1,9 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import logging
+import os
+import pickle
+import time
 from argparse import Namespace
 from functools import partial
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -14,9 +17,131 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.timer import timer
 
 
 logger = logging.getLogger(__name__)
+
+# Throttle counter for the opt-in pickle-size diagnostic.  See
+# ``_maybe_log_tgd_pickle_diag`` below for usage.
+_tgd_diag_call_count = 0
+
+# Same-purpose throttle for the per_rank_fetch byte-size diagnostic; kept
+# separate so the two paths' counters don't interfere when toggling modes.
+_per_rank_fetch_diag_call_count = 0
+
+
+def _maybe_log_per_rank_fetch_diag(rollout_data: list) -> None:
+    """Cheap payload-size diagnostic for the ``per_rank_fetch`` path.
+
+    Unlike ``_maybe_log_tgd_pickle_diag`` this never calls ``pickle.dumps``
+    (which would re-introduce the multi-second cost we use this path to
+    avoid).  Instead it sums ``element_size * numel`` over every tensor it
+    can reach so the operator can see how much data each rank just pulled
+    from TQ and judge whether SimpleStorageUnit bandwidth is the new
+    bottleneck.
+
+    Gated by env var ``RELAX_TGD_PROFILE`` (default ``0``); same throttle
+    schedule (first 3 calls then every ``RELAX_TGD_PROFILE_EVERY``).  Only
+    logs from global rank 0 to avoid N-rank-duplicated noise — payload size
+    is identical across ranks in this mode (TQ sampler cache guarantees
+    byte-identical sample ids per dp_rank).
+    """
+    if rollout_data[0] is None:
+        return
+    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+
+    global _per_rank_fetch_diag_call_count
+    _per_rank_fetch_diag_call_count += 1
+    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    if _per_rank_fetch_diag_call_count > 3 and _per_rank_fetch_diag_call_count % every != 0:
+        return
+
+    def _tensor_bytes(obj) -> int:
+        if isinstance(obj, torch.Tensor):
+            return obj.element_size() * obj.numel()
+        if isinstance(obj, dict):
+            return sum(_tensor_bytes(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(_tensor_bytes(v) for v in obj)
+        return 0
+
+    td = rollout_data[0]
+    per_field: list[tuple[str, float]] = []
+    if isinstance(td, TensorDict):
+        for k in td.keys():
+            try:
+                size_mb = _tensor_bytes(td.get(k)) / 1024 / 1024
+            except Exception:  # noqa: BLE001
+                size_mb = -1.0
+            per_field.append((k, size_mb))
+    else:
+        per_field.append((f"<{type(td).__name__}>", _tensor_bytes(td) / 1024 / 1024))
+    per_field.sort(key=lambda x: x[1], reverse=True)
+    total_mb = sum(mb for _, mb in per_field if mb > 0)
+    top = ", ".join(f"{k}={mb:.1f}MB" for k, mb in per_field[:5])
+
+    logger.info(
+        "[per_rank_fetch_diag] call=%d payload_total=%.1fMB top_fields: %s",
+        _per_rank_fetch_diag_call_count,
+        total_mb,
+        top,
+    )
+
+
+def _maybe_log_tgd_pickle_diag(rollout_data: list, should_fetch: bool) -> None:
+    """Opt-in diagnostic: log pickle cost and per-field byte size on the
+    tp_rank-0 fetcher so we can see how much of ``broadcast_object_list`` is
+    pickle vs NCCL, and which TensorDict field dominates the payload.
+
+    Gated by env var ``RELAX_TGD_PROFILE=1``.  Logs the first 3 calls then
+    every ``RELAX_TGD_PROFILE_EVERY`` (default 50) calls thereafter.  Only
+    fires on the rank that actually holds non-empty data — empty-poll cycles
+    (``batch_meta.size == 0`` → ``rollout_data[0] is None``) are skipped so the
+    log isn't drowned by hundreds of empty polls per second.
+    """
+    if not should_fetch:
+        return
+    if rollout_data[0] is None:
+        return
+    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+        return
+
+    global _tgd_diag_call_count
+    _tgd_diag_call_count += 1
+    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    if _tgd_diag_call_count > 3 and _tgd_diag_call_count % every != 0:
+        return
+
+    td = rollout_data[0]
+    t0 = time.perf_counter()
+    full_bytes = pickle.dumps(rollout_data, protocol=pickle.HIGHEST_PROTOCOL)
+    pickle_ms = (time.perf_counter() - t0) * 1000.0
+    pickle_mb = len(full_bytes) / 1024 / 1024
+
+    if isinstance(td, TensorDict):
+        per_field: list[tuple[str, float]] = []
+        for k in td.keys():
+            try:
+                size_mb = len(pickle.dumps(td.get(k), protocol=pickle.HIGHEST_PROTOCOL)) / 1024 / 1024
+            except Exception:  # noqa: BLE001
+                size_mb = -1.0
+            per_field.append((k, size_mb))
+        per_field.sort(key=lambda x: x[1], reverse=True)
+        top = ", ".join(f"{k}={mb:.1f}MB" for k, mb in per_field[:5])
+    else:
+        top = f"<not-a-tensordict: {type(td).__name__}>"
+
+    logger.info(
+        "[tgd_profile] call=%d pickle_total=%.1fMB pickle_ms=%.1f top_fields: %s",
+        _tgd_diag_call_count,
+        pickle_mb,
+        pickle_ms,
+        top,
+    )
 
 
 def create_stream_dataloader(
@@ -93,6 +218,65 @@ def create_stream_dataloader(
     return data_iterator, num_microbatches
 
 
+class MicroBatchListIterator:
+    """Thin iterator wrapping a fixed list of pre-packed (batch_dict,
+    batch_meta) tuples.
+
+    Used by the fully-async + dynamic-batch path in `actor.train_async` after
+    draining the per-DP bucket from `TokenBudgetPackedDataset`:
+
+    1. Drain produces `K_local` packed mbs.
+    2. Cross-DP `all_reduce(MAX)` gives `K_global`.
+    3. The bucket is padded with `K_global - K_local` copies of the shortest
+       real mb, marked with `__is_dummy__=True`.
+    4. The full list is wrapped in this iterator and passed to `train()`
+       (which Megatron iterates via `next(iter)` per micro-batch).
+
+    Interface intentionally mirrors `StreamingDataLoader` (`__iter__`/`__next__`
+    return `(batch_dict, batch_meta)`, plus `get_buffer()` for logging and a
+    no-op `step()` for API symmetry).
+    """
+
+    def __init__(
+        self,
+        mbs: List[Tuple[Dict[str, Any], Any]],
+        dummy_after: int | None = None,
+        loss_scale: float | None = None,
+    ) -> None:
+        self.mbs = mbs
+        self.dummy_after = dummy_after
+        self.loss_scale = loss_scale
+        self.offset = 0
+
+    def __iter__(self) -> "MicroBatchListIterator":
+        self.offset = 0
+        return self
+
+    def __next__(self) -> Tuple[Dict[str, Any], Any]:
+        if self.offset >= len(self.mbs):
+            raise StopIteration
+        batch, meta = self.mbs[self.offset]
+        # Shallow-copy so injected scalar fields don't mutate the cached entry
+        # (the same `mbs` list may be re-iterated via __iter__ → reset offset).
+        out = dict(batch)
+        if self.loss_scale is not None:
+            out["__loss_scale__"] = self.loss_scale
+        if self.dummy_after is not None and self.offset >= self.dummy_after:
+            out["__is_dummy__"] = True
+        self.offset += 1
+        return out, meta
+
+    def get_buffer(self) -> List[Tuple[Dict[str, Any], Any]]:
+        """Return the full mb list — used by actor for end-of-rollout
+        logging."""
+        return self.mbs
+
+    def step(self, partition_id: str) -> None:  # noqa: ARG002
+        """API parity with `StreamingDataLoader.step`; no-op for this iterator
+        (a fresh `MicroBatchListIterator` is constructed per rollout)."""
+        return
+
+
 def split_dict(data_dict: Dict[str, Any], batch_meta, micro_batch_size: int) -> List[Tuple[Dict[str, Any], Any]]:
     """Split a batched dictionary into a list of smaller micro-batch
     dictionaries.
@@ -158,6 +342,23 @@ def _broadcast_routed_experts(
     Using ``dist.broadcast`` on contiguous GPU tensors is orders of magnitude
     faster than ``broadcast_object_list`` which pickles everything (~14 s for
     377 MB vs sub-second via NCCL).
+
+    TODO(yangrui6): missing CP broadcast. After the CP=0 guard added to
+    ``get_data_from_transfer_queue.should_fetch`` (to fix the CP fetch race
+    that hangs SFT/RL with CP>1), only (TP=0, PP=0, CP=0) holds the source
+    data. The PP→TP chain below assumes (TP=0, PP=0) — i.e. *all* CP partners
+    of (TP=0, PP=0) — has the data, but with the CP=0 guard only CP=0 of
+    (TP=0, PP=0) actually does. For RL paths that set
+    ``rollout_routed_experts`` in ``data_fields`` with CP>1, this routes wrong
+    data to CP=1..* partners (or hangs at the bcast meta exchange because
+    senders/receivers disagree on shape).
+    Fix: prepend a CP bcast step that fans the tensor from (TP=0, PP=0, CP=0)
+    to (TP=0, PP=0, CP=*) before the existing PP/TP bcasts, gated on
+    ``is_tp_rank0 and is_pp_rank0`` (mirror what we added at
+    ``get_data_from_transfer_queue`` for ``broadcast_object_list``). SFT does
+    NOT exercise this path (``rollout_routed_experts`` only set in RL with
+    ``--use-rollout-routing-replay``), so the bug is latent; user can
+    reproduce by running GRPO/GSPO + routing_replay + CP>1.
     """
 
     def _bcast_tensor(tensor, is_sender, dtype):
@@ -168,12 +369,22 @@ def _broadcast_routed_experts(
         sends data to (tp_rank==0, pp_rank==1), then TP broadcast in
         each PP stage sends from tp_rank==0 to other tp_ranks.
         """
+        # Short-circuit: when both TP and PP groups are trivial (size 1),
+        # skip the GPU round-trip entirely and return the source tensor.
+        tp_trivial = mpu.get_tensor_model_parallel_world_size() <= 1
+        pp_trivial = (not broadcast_pp) or mpu.get_pipeline_model_parallel_world_size() <= 1
+        if tp_trivial and pp_trivial:
+            if is_sender and tensor is not None:
+                return tensor.to(dtype=dtype).contiguous()
+            # Shouldn't happen (sender has the tensor), but be safe.
+            return torch.empty(0, dtype=dtype)
+
         # After PP broadcast, every tp_rank==0 has the data.
         # After TP broadcast, every rank has the data.
         is_tp_rank0 = mpu.get_tensor_model_parallel_rank() == 0
 
         # --- Step 1: PP broadcast (only among tp_rank==0 ranks) ---
-        if broadcast_pp and is_tp_rank0:
+        if not pp_trivial and is_tp_rank0:
             pp_group = mpu.get_pipeline_model_parallel_group()
             pp_src_global = dist.get_global_rank(pp_group, 0)
 
@@ -200,43 +411,162 @@ def _broadcast_routed_experts(
             dist.broadcast(tensor, src=pp_src_global, group=pp_group)
 
         # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
-        tp_group = mpu.get_tensor_model_parallel_group()
-        tp_src_global = dist.get_global_rank(tp_group, 0)
+        if not tp_trivial:
+            tp_group = mpu.get_tensor_model_parallel_group()
+            tp_src_global = dist.get_global_rank(tp_group, 0)
 
-        # Now every tp_rank==0 has the tensor (from step 1 or original).
-        if is_tp_rank0 and tensor is not None:
-            ndim_t = torch.tensor([tensor.ndim], dtype=torch.long, device=cuda_dev)
-        else:
-            ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
-        dist.broadcast(ndim_t, src=tp_src_global, group=tp_group)
-        ndim = ndim_t.item()
+            # Now every tp_rank==0 has the tensor (from step 1 or original).
+            if is_tp_rank0 and tensor is not None:
+                ndim_t = torch.tensor([tensor.ndim], dtype=torch.long, device=cuda_dev)
+            else:
+                ndim_t = torch.tensor([0], dtype=torch.long, device=cuda_dev)
+            dist.broadcast(ndim_t, src=tp_src_global, group=tp_group)
+            ndim = ndim_t.item()
 
-        if is_tp_rank0 and tensor is not None:
-            shape_t = torch.tensor(list(tensor.shape), dtype=torch.long, device=cuda_dev)
-        else:
-            shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
-        dist.broadcast(shape_t, src=tp_src_global, group=tp_group)
-        shape = torch.Size(shape_t.tolist())
+            if is_tp_rank0 and tensor is not None:
+                shape_t = torch.tensor(list(tensor.shape), dtype=torch.long, device=cuda_dev)
+            else:
+                shape_t = torch.empty(ndim, dtype=torch.long, device=cuda_dev)
+            dist.broadcast(shape_t, src=tp_src_global, group=tp_group)
+            shape = torch.Size(shape_t.tolist())
 
-        if is_tp_rank0 and tensor is not None:
-            buf = tensor.to(dtype=dtype, device=cuda_dev).contiguous()
-        else:
-            buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
-        dist.broadcast(buf, src=tp_src_global, group=tp_group)
+            if is_tp_rank0 and tensor is not None:
+                buf = tensor.to(dtype=dtype, device=cuda_dev).contiguous()
+            else:
+                buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+            dist.broadcast(buf, src=tp_src_global, group=tp_group)
+            tensor = buf
 
-        return buf
+        return tensor
 
-    values_gpu = _bcast_tensor(values, is_src, torch.int32)
-    offsets_gpu = _bcast_tensor(offsets, is_src, torch.long)
+    values_out = _bcast_tensor(values, is_src, torch.int32)
+    offsets_out = _bcast_tensor(offsets, is_src, torch.long)
 
     if keep_on_gpu:
         # When optimize_routing_replay is enabled, keep tensors on GPU to
         # avoid a redundant GPU→CPU→GPU round-trip.  fill_routing_replay's
         # RoutingReplay.record() handles GPU→CPU-pinned copy automatically.
-        return values_gpu, offsets_gpu
+        # _bcast_tensor may short-circuit and return CPU tensors when all
+        # groups are trivial (size 1); ensure GPU residency in that case.
+        if not values_out.is_cuda:
+            values_out = values_out.to(device=cuda_dev)
+        if not offsets_out.is_cuda:
+            offsets_out = offsets_out.to(device=cuda_dev)
+        return values_out, offsets_out
 
     # Move back to CPU for downstream consumption (fill_routing_replay etc.)
-    return values_gpu.cpu(), offsets_gpu.cpu()
+    return values_out.cpu(), offsets_out.cpu()
+
+
+def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
+    """Broadcast a single tensor of *known* dtype/shape across CP, TP, then
+    PP."""
+
+    def _bcast(t, contribute, group):
+        # The group's rank-0 contributes its current buffer when it holds real
+        # data; otherwise every member allocates a (correctly shaped)
+        # placeholder that a later stage overwrites.
+        if contribute and t is not None:
+            buf = t.to(device=cuda_dev, dtype=dtype).contiguous()
+        else:
+            buf = torch.empty(shape, dtype=dtype, device=cuda_dev)
+        dist.broadcast(buf, src=dist.get_global_rank(group, 0), group=group)
+        return buf
+
+    # --- Short-circuit: skip all GPU round-trips when every group is trivial ---
+    cp_trivial = mpu.get_context_parallel_world_size() <= 1
+    tp_trivial = mpu.get_tensor_model_parallel_world_size() <= 1
+    pp_trivial = (not broadcast_pp) or mpu.get_pipeline_model_parallel_world_size() <= 1
+
+    if cp_trivial and tp_trivial and pp_trivial:
+        # No actual broadcast needed — return the source tensor on CPU directly,
+        # avoiding the costly CPU → GPU → NCCL self-send → GPU → CPU round-trip.
+        if tensor is not None:
+            return tensor.to(dtype=dtype).contiguous()
+        return torch.empty(shape, dtype=dtype)
+
+    # --- Step 1: CP broadcast (CP=0 -> other CP ranks of TP=0/PP=0) ---
+    # Only the global source's CP group has real data on its rank-0; the rest
+    # broadcast a placeholder that the TP / PP stages below overwrite.
+    if not cp_trivial:
+        tensor = _bcast(tensor, is_src, mpu.get_context_parallel_group())
+
+    # --- Step 2: TP broadcast (tp_rank==0 -> others in each TP group) ---
+    if not tp_trivial:
+        tensor = _bcast(tensor, mpu.get_tensor_model_parallel_rank() == 0, mpu.get_tensor_model_parallel_group())
+
+    # --- Step 3: PP broadcast (pp_rank==0 -> others in each PP group) ---
+    if not pp_trivial:
+        tensor = _bcast(tensor, mpu.get_pipeline_model_parallel_rank() == 0, mpu.get_pipeline_model_parallel_group())
+
+    return tensor
+
+
+def _encode_multimodal_inputs(mm_list):
+    """Split a per-sample multimodal list into a tiny pickle-able spec and a
+    flat, traversal-ordered list of the raw tensors to stream via NCCL.
+
+    Returns ``(spec, tensors)`` where *spec* mirrors ``mm_list`` but replaces
+    every tensor with its ``{"dtype", "shape"}`` descriptor (a few bytes), and
+    *tensors* is the ordered list of tensors referenced by the spec. Tensors
+    are deliberately kept out of the pickle so ``broadcast_object_list`` only
+    serialises kilobytes instead of gigabytes.
+    """
+    spec: List[Any] = []
+    tensors: List[torch.Tensor] = []
+    for sample in mm_list:
+        if sample is None:
+            spec.append(None)
+            continue
+        entry: Dict[str, Any] = {}
+        for key, val in sample.items():
+            if isinstance(val, torch.Tensor):
+                entry[key] = {"t": "tensor", "dtype": val.dtype, "shape": tuple(val.shape)}
+                tensors.append(val)
+            elif isinstance(val, list) and val and all(isinstance(x, torch.Tensor) for x in val):
+                entry[key] = {"t": "list", "items": [{"dtype": x.dtype, "shape": tuple(x.shape)} for x in val]}
+                tensors.extend(val)
+            else:
+                # Non-tensor (python scalar / small list); carry it inline.
+                entry[key] = {"t": "raw", "value": val}
+        spec.append(entry)
+    return spec, tensors
+
+
+def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast_pp):
+    """Reconstruct ``multimodal_train_inputs`` on every rank by streaming the
+    raw tensors via NCCL (zero pickle) instead of through
+    ``broadcast_object_list``."""
+    if spec is None:
+        return None
+
+    out: List[Any] = []
+    idx = 0
+    for entry in spec:
+        if entry is None:
+            out.append(None)
+            continue
+        sample: Dict[str, Any] = {}
+        for key, enc in entry.items():
+            if enc["t"] == "tensor":
+                src_t = send_tensors[idx] if is_src else None
+                idx += 1
+                sample[key] = _bcast_known_tensor(
+                    src_t, is_src, enc["dtype"], enc["shape"], cuda_dev, broadcast_pp
+                ).cpu()
+            elif enc["t"] == "list":
+                items: List[Any] = []
+                for sub in enc["items"]:
+                    src_t = send_tensors[idx] if is_src else None
+                    idx += 1
+                    items.append(
+                        _bcast_known_tensor(src_t, is_src, sub["dtype"], sub["shape"], cuda_dev, broadcast_pp).cpu()
+                    )
+                sample[key] = items
+            else:  # raw
+                sample[key] = enc["value"]
+        out.append(sample)
+    return out
 
 
 def get_data_from_transfer_queue(
@@ -249,6 +579,9 @@ def get_data_from_transfer_queue(
     sampling_config,
     batch_index,
     broadcast_pp: bool = True,
+    per_rank_fetch: bool = False,
+    token_budget: int | None = None,
+    allow_underfill: bool = True,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -277,6 +610,15 @@ def get_data_from_transfer_queue(
         batch_index: Index of the batch to request (used for replay semantics).
         broadcast_pp: Whether to broadcast across pipeline parallel ranks.
             True for colocate mode, False for fully async mode.
+        per_rank_fetch: When True, every TP/PP rank independently calls
+            ``get_meta`` + ``get_data`` (relying on the TQ sampler's
+            ``(partition_id, task_name, dp_rank, batch_index)`` cache to
+            return identical sample id lists across ranks), and all TP/PP
+            broadcasts are skipped.  Trades a single rank-0 pickle + one
+            NCCL bcast for N parallel ZMQ deserialises — wins when pickle
+            dominates ``tgd_bcast_tp_time``.  Caller must ensure
+            ``rollout_routed_experts`` is not in ``data_fields`` (its bcast
+            path is incompatible) — actor.py guards this.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
@@ -285,32 +627,76 @@ def get_data_from_transfer_queue(
 
     # Compose request configuration and ask the queue for metadata.
     config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
+    if token_budget is not None:
+        # Token-budget fetch mode: the streaming sampler needs dp_size and
+        # allow_underfill in sampling_config to decide bucket assignment and
+        # end-of-stream behaviour.  dp_rank is already in sampling_config.
+        config["allow_underfill"] = allow_underfill
 
-    # Determine which rank should fetch data based on broadcast_pp
-    if broadcast_pp:
-        # Colocate mode: only tp_rank==0 AND pp_rank==0 fetches data
-        should_fetch = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_pipeline_model_parallel_rank() == 0
+    # Determine which rank should fetch data
+    #
+    # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
+    # partner of (TP=0, PP=0) independently calls tq_client.get_meta / get_data
+    # and they race the producer: a fetcher arriving before the producer fills
+    # `ready_indexes` gets back `[], []` and the sampler does NOT cache an
+    # empty result, while a fetcher arriving after gets the real samples and
+    # writes the cache. So 8 CP partners → split into "got data" and "got None"
+    # subsets. With downstream TP/PP broadcast, each CP rank's result fans out
+    # to its (TP, PP) cohort: half the world enters train_actor and hangs at
+    # the first cross-rank collective, the other half loops, sees
+    # all_consumed=True (because the winners consumed the partition), and
+    # returns to main_loop → 16 idle + 16 hung on TP2/PP2/CP8/DP1.
+    if per_rank_fetch:
+        # Each rank pulls its own copy from TQ; broadcasts are skipped below.
+        # Safe because the TQ sampler caches the meta on
+        # (partition_id, task_name, dp_rank, batch_index) so all ranks within
+        # a DP group receive byte-identical samples (see transfer_queue
+        # sampler/*_sampler.py).
+        should_fetch = True
+    elif broadcast_pp:
+        # Colocate mode: only (tp_rank, pp_rank, cp_rank) == (0, 0, 0) fetches data
+        should_fetch = (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        )
     else:
-        # Fully async mode: only tp_rank==0 fetches data (each PP stage independently)
-        should_fetch = mpu.get_tensor_model_parallel_rank() == 0
+        # Fully async mode: only (tp_rank, cp_rank) == (0, 0) fetches data per PP stage
+        should_fetch = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0
 
-    if should_fetch:
-        batch_meta = tq_client.get_meta(
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_id,
-            sampling_config=config,
-            task_name=task_name,
-        )  # type: ignore
+    # tgd_fetch: time spent in the Ray transfer-queue RPC on the fetching rank.
+    # Non-fetching ranks record ~0s, which by itself confirms whether the
+    # collective is waiting on fetch (rank0 large, others ~0) or on broadcast.
+    # In per_rank_fetch mode every rank records a real value (no broadcast
+    # below) so the metric becomes wall-clock fetch+deserialise per rank.
+    fetch_timer_name = "per_rank_fetch" if per_rank_fetch else "tgd_fetch"
+    with timer(fetch_timer_name):
+        if should_fetch:
+            if token_budget is not None:
+                batch_meta = tq_client.get_meta(
+                    data_fields=data_fields,
+                    token_budget=token_budget,
+                    partition_id=partition_id,
+                    sampling_config=config,
+                    task_name=task_name,
+                )  # type: ignore
+            else:
+                batch_meta = tq_client.get_meta(
+                    data_fields=data_fields,
+                    batch_size=batch_size,
+                    partition_id=partition_id,
+                    sampling_config=config,
+                    task_name=task_name,
+                )  # type: ignore
 
-        if batch_meta.size == 0:
-            rollout_data = [None, None]
+            if batch_meta.size == 0:
+                rollout_data = [None, None]
+            else:
+                rollout_data = [tq_client.get_data(batch_meta), batch_meta]
         else:
-            rollout_data = [tq_client.get_data(batch_meta), batch_meta]
-    else:
-        # Non-fetching ranks start with an empty placeholder and
-        # will receive the real data via broadcast.
-        rollout_data = [None, None]
+            # Non-fetching ranks start with an empty placeholder and
+            # will receive the real data via broadcast.
+            rollout_data = [None, None]
 
     # Use an explicit device so the communication backend (e.g. NCCL)
     # can bind to a known device context.
@@ -326,7 +712,7 @@ def get_data_from_transfer_queue(
     routed_experts_values = None
     routed_experts_offsets = None
 
-    if has_routed_experts and should_fetch and rollout_data[0] is not None:
+    if has_routed_experts and not per_rank_fetch and should_fetch and rollout_data[0] is not None:
         td = rollout_data[0]
         if isinstance(td, TensorDict) and "rollout_routed_experts" in td.keys():
             nt = td["rollout_routed_experts"]
@@ -337,39 +723,103 @@ def get_data_from_transfer_queue(
             del td["rollout_routed_experts"]
             rollout_data[0] = td
 
-    # Always broadcast across tensor parallel ranks (now without routed_experts)
-    dist.broadcast_object_list(
-        rollout_data,
-        device=cuda_dev,
-        group=mpu.get_tensor_model_parallel_group(),
-        group_src=0,
-    )
+    # --- Extract multimodal_train_inputs BEFORE broadcast_object_list ---
+    # Only on the broadcast path: in per_rank_fetch mode every rank already
+    # pulled its own multimodal_train_inputs from TQ, so it stays inside the
+    # TensorDict and is converted to a per-sample list below (mirrors the
+    # routed_experts handling).
+    has_multimodal = "multimodal_train_inputs" in data_fields
+    mm_spec = None
+    mm_send_tensors: List[torch.Tensor] = []
 
-    # Conditionally broadcast across pipeline parallel ranks
-    if broadcast_pp:
-        dist.broadcast_object_list(
-            rollout_data,
-            device=cuda_dev,
-            group=mpu.get_pipeline_model_parallel_group(),
-            group_src=0,
-        )
+    if has_multimodal and not per_rank_fetch and should_fetch and rollout_data[0] is not None:
+        td = rollout_data[0]
+        if isinstance(td, TensorDict) and "multimodal_train_inputs" in td.keys():
+            from tensordict.tensorclass import NonTensorData
 
-    # Unpack the broadcasted pair.
-    rollout_data, batch_meta = rollout_data[0], rollout_data[1]
+            mm_list: List[Any] = []
+            for item in list(td["multimodal_train_inputs"]):
+                raw = item.data if isinstance(item, NonTensorData) else item
+                if raw is None:
+                    mm_list.append(None)
+                elif isinstance(raw, dict):
+                    mm_list.append(raw)
+                else:
+                    mm_list.append(dict(raw.items()) if hasattr(raw, "items") else dict(raw.data))
+            mm_spec, mm_send_tensors = _encode_multimodal_inputs(mm_list)
+            # Remove from TensorDict so broadcast_object_list only pickles the spec.
+            del td["multimodal_train_inputs"]
+            rollout_data[0] = td
+
+    # Carry the (tiny) multimodal spec alongside the payload so every rank
+    # learns the dtype/shape of each tensor it is about to receive via NCCL.
+    # In per_rank_fetch mode this is None (each rank reconstructs locally).
+    rollout_data.append(mm_spec)
+
+    if per_rank_fetch:
+        # Cheap byte-only diagnostic; never pickles (that would defeat the
+        # whole point of per_rank_fetch).
+        _maybe_log_per_rank_fetch_diag(rollout_data)
+    if not per_rank_fetch:
+        # Always broadcast across tensor parallel ranks (now without routed_experts)
+        _maybe_log_tgd_pickle_diag(rollout_data, should_fetch)
+        # CP broadcast must come FIRST: only (TP=0, PP=0, CP=0) fetched, so we
+        # need to fan out the result to the other CP partners of (TP=0, PP=0)
+        # before TP / PP broadcasts can propagate it across the rest of the
+        # world. Skipping this is what caused the 16-idle / 16-hung split.
+        if mpu.get_context_parallel_world_size() > 1:
+            with timer("tgd_bcast_cp"):
+                dist.broadcast_object_list(
+                    rollout_data,
+                    device=cuda_dev,
+                    group=mpu.get_context_parallel_group(),
+                    group_src=0,
+                )
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            with timer("tgd_bcast_tp"):
+                dist.broadcast_object_list(
+                    rollout_data,
+                    device=cuda_dev,
+                    group=mpu.get_tensor_model_parallel_group(),
+                    group_src=0,
+                )
+
+        # Conditionally broadcast across pipeline parallel ranks
+        if broadcast_pp and mpu.get_pipeline_model_parallel_world_size() > 1:
+            with timer("tgd_bcast_pp"):
+                dist.broadcast_object_list(
+                    rollout_data,
+                    device=cuda_dev,
+                    group=mpu.get_pipeline_model_parallel_group(),
+                    group_src=0,
+                )
+
+    # Unpack the broadcasted triple.
+    rollout_data, batch_meta, mm_spec = rollout_data[0], rollout_data[1], rollout_data[2]
 
     if rollout_data is None:
         return None, None
 
+    # --- Stream multimodal tensors via NCCL (zero-copy, CPU-resident result) ---
+    mm_inputs = None
+    if has_multimodal:
+        with timer("tgd_bcast_mm"):
+            mm_inputs = _broadcast_multimodal_inputs(mm_spec, mm_send_tensors, should_fetch, cuda_dev, broadcast_pp)
+
     # --- Broadcast routed_experts tensors via efficient dist.broadcast ---
-    if has_routed_experts:
-        routed_experts_values, routed_experts_offsets = _broadcast_routed_experts(
-            routed_experts_values,
-            routed_experts_offsets,
-            should_fetch,
-            cuda_dev,
-            broadcast_pp,
-            keep_on_gpu=getattr(args, "optimize_routing_replay", False),
-        )
+    # Skipped entirely in per_rank_fetch mode: each rank already received the
+    # NestedTensor inside its own get_data() return value; the conversion to
+    # per-sample list happens below.
+    if has_routed_experts and not per_rank_fetch:
+        with timer("tgd_bcast_rexp"):
+            routed_experts_values, routed_experts_offsets = _broadcast_routed_experts(
+                routed_experts_values,
+                routed_experts_offsets,
+                should_fetch,
+                cuda_dev,
+                broadcast_pp,
+                keep_on_gpu=getattr(args, "optimize_routing_replay", False),
+            )
 
     # If the received object is a Tensordict, convert it into a plain Python
     # dict so downstream code can mix tensors and Python lists freely.
@@ -380,9 +830,11 @@ def get_data_from_transfer_queue(
             if "lengths" in k or "reward" in k:
                 new_rollout_data[k] = v.tolist()
             elif k == "multimodal_train_inputs":
-                # multimodal inputs are stored as a list of tensordicts / dicts;
-                # some entries may be None for text-only samples in a multimodal
-                # batch.  Turn each non-None entry into a plain dict.
+                # Only reached on the per_rank_fetch path (the broadcast path
+                # extracts and NCCL-streams these before broadcast). Stored as a
+                # list of tensordicts / dicts; some entries may be None for
+                # text-only samples in a multimodal batch. Turn each non-None
+                # entry into a plain dict.
                 from tensordict.tensorclass import NonTensorData
 
                 new_rollout_data[k] = []
@@ -413,12 +865,21 @@ def get_data_from_transfer_queue(
 
         rollout_data = new_rollout_data
 
-    # Re-attach routed_experts as a list of 2D tensors (per-sample)
-    if has_routed_experts:
+    # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
+    # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``
+    # before broadcast.  per_rank_fetch never strips it (each rank pulls its own
+    # copy from TQ), so the TensorDict→dict conversion above already produced
+    # the per-sample list under "rollout_routed_experts".
+    if has_routed_experts and not per_rank_fetch:
         rollout_data["rollout_routed_experts"] = [
             routed_experts_values[routed_experts_offsets[i] : routed_experts_offsets[i + 1]]
             for i in range(len(routed_experts_offsets) - 1)
         ]
+
+    # Re-attach the NCCL-streamed multimodal inputs (CPU-resident; moved to GPU
+    # per micro-batch by get_batch).
+    if has_multimodal and mm_inputs is not None:
+        rollout_data["multimodal_train_inputs"] = mm_inputs
 
     post_process_rollout_data(args, rollout_data)
 
@@ -435,22 +896,8 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
-    if "multimodal_train_inputs" in rollout_data:
-        # Move multimodal training tensors to GPU in advance.
-        # Values may be a single Tensor (e.g. image pixel_values) or a list
-        # of Tensors (e.g. video frames), so handle both cases.
-        def _to_cuda(v):
-            if isinstance(v, torch.Tensor):
-                return v.to(device=cuda_dev)
-            if isinstance(v, list):
-                return [_to_cuda(item) for item in v]
-            return v
-
-        rollout_data["multimodal_train_inputs"] = [
-            ({key: _to_cuda(val) for key, val in mm_dict.items()} if mm_dict is not None else None)
-            for mm_dict in rollout_data["multimodal_train_inputs"]
-        ]
-
+    # NOTE: multimodal_train_inputs are intentionally left on CPU here. Moving
+    # the whole batch's pixel tensors to GPU up front would spike memory
     if args.qkv_format == "bshd":
         # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
         max_seq_len = max(rollout_data["total_lengths"])
@@ -547,3 +994,318 @@ def post_process_rollout_data(args, rollout_data):
             torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
             for r in rollout_data["rollout_routed_experts"]
         ]
+
+
+class StreamingTQIterator:
+    """Streaming iterator that pulls micro-batches from TransferQueue on
+    demand.
+
+    Each call to ``__next__`` blocks until a token-budget-sized micro-batch is
+    available, then returns a ``(batch_dict, batch_meta)`` tuple with
+    ``__loss_scale__`` injected.  ``StopIteration`` is raised when
+    ``all_consumed_fn()`` returns True and the queue is empty.
+
+    Every PP stage constructs its own instance.  The sampler result cache in
+    ``StreamingTokenBudgetSampler`` guarantees that identical
+    ``(dp_rank, batch_index)`` requests return the same indexes regardless of
+    which PP stage is asking, so all stages raise ``StopIteration`` at the same
+    micro-batch count — keeping p2p send/recv pairs aligned.
+
+    Args:
+        args: Runtime arguments (used for ``get_data_from_transfer_queue``).
+        tq_client: TransferQueue client with ``get_meta`` / ``get_data`` API.
+        data_fields: Field names to request from the queue.
+        rollout_id: Current rollout partition identifier.
+        token_budget: Target accumulated token count per micro-batch fetch.
+        loss_scale: Scalar injected as ``__loss_scale__`` into each batch dict.
+        all_consumed_fn: Callable returning True when the rollout is fully consumed.
+        dp_rank: Data-parallel rank of this worker.
+        dp_size: Data-parallel world size.
+        task_name: TQ task name (default ``"actor_train"``).
+        max_empty_sleep: Maximum sleep duration (seconds) between empty-poll retries.
+    """
+
+    def __init__(
+        self,
+        args,
+        tq_client,
+        data_fields: List[str],
+        rollout_id: int,
+        token_budget: int,
+        loss_scale: float,
+        all_consumed_fn: Callable[[], bool],
+        dp_rank: int,
+        dp_size: int,
+        task_name: str = "actor_train",
+        max_empty_sleep: float = 2.0,
+    ) -> None:
+        self.args = args
+        self.tq_client = tq_client
+        self.data_fields = data_fields
+        self.rollout_id = rollout_id
+        self.token_budget = token_budget
+        self.loss_scale = loss_scale
+        self.all_consumed_fn = all_consumed_fn
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.task_name = task_name
+        self.max_empty_sleep = max_empty_sleep
+
+        self._batch_index: int = 0
+        self._mb_count: int = 0
+        # Per-mb timing: (tq_wait_s, compute_start_s) — compute time logged externally.
+        self._tq_wait_times: List[float] = []
+        # Buffer of (batch_dict, meta) tuples — populated by __next__ so that
+        # get_buffer() can be used for end-of-rollout logging (mirrors MicroBatchListIterator).
+        self._buffer: List[Tuple[Dict[str, Any], Any]] = []
+
+        # ── cross-DP micro-batch alignment (dummy padding) ───────────────
+        # With dynamic batch + DP>1, each DP packs a different number of
+        # micro-batches (variable sample lengths → different token packing),
+        # but all DP ranks must run the SAME number of fwd/bwd so the gradient
+        # all-reduce stays in lockstep.  After real data is exhausted, the
+        # iterator MAX-reduces its real mb count across DP and yields dummy
+        # mbs (tagged __is_dummy__, zero gradient) up to that maximum.
+        self._last_batch: Optional[Tuple[Dict[str, Any], Any]] = None
+        self._dummies_remaining: Optional[int] = None  # computed at end-of-stream
+
+        # ── tail prefetch ────────────────────────────────────────────────
+        # While the trainer computes mb N, warm the controller-side sampler
+        # cache for batch_index N+1 (balance round + all-dp dispatch) so the
+        # next __next__ get_meta is a cache HIT instead of waiting on a balance
+        # round / poll.  This is a meta-only prefetch (NO get_data transfer) —
+        # it just populates the controller cache, keeping consumption marking
+        # idempotent and avoiding GPU/stream complexity.  Single worker so at
+        # most one warm-up is in flight; failures are best-effort (the real
+        # request falls back to the normal path on a cache miss).
+        self._prefetch_executor = None
+        self._prefetched_index: int = -1
+        if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-tq-prefetch")
+
+    def _warm_next_batch_index(self, next_index: int) -> None:
+        """Fire-and-forget controller cache warm-up for ``next_index``.
+
+        Runs the same token-budget ``get_meta`` the real fetch will issue (same
+        sampling_config / partition / batch_index) so the controller sampler
+        prepares & caches all dp slices.  Meta-only: result is discarded.
+        """
+        if self._prefetch_executor is None or next_index <= self._prefetched_index:
+            return
+        self._prefetched_index = next_index
+
+        def _task() -> None:
+            try:
+                config = {
+                    "dp_rank": self.dp_rank,
+                    "dp_size": self.dp_size,
+                    "task_name": self.task_name,
+                    "batch_index": next_index,
+                    "partition_id": f"train_{self.rollout_id}",
+                    "allow_underfill": True,
+                }
+                self.tq_client.get_meta(
+                    data_fields=self.data_fields,
+                    token_budget=self.token_budget,
+                    partition_id=f"train_{self.rollout_id}",
+                    sampling_config=config,
+                    task_name=self.task_name,
+                )
+            except Exception as e:  # best-effort; real fetch will retry on miss
+                logger.debug("[stream-prefetch] warm batch_idx=%d failed: %s", next_index, e)
+
+        try:
+            self._prefetch_executor.submit(_task)
+        except RuntimeError:
+            # Executor already shut down (iterator finishing) — ignore.
+            pass
+
+    def _shutdown_prefetch(self) -> None:
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.shutdown(wait=False)
+            self._prefetch_executor = None
+
+    def __iter__(self) -> "StreamingTQIterator":
+        return self
+
+    def _dp_max_microbatches(self, local_count: int) -> int:
+        """MAX-reduce the local real mb count across the data-parallel group.
+
+        All PP stages within a DP have the same real count (the sampler caches
+        per-(dp_rank, batch_index) results, so stages stay aligned), so each PP
+        stage's all-reduce over its DP-CP group yields the same global maximum.
+        """
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        t = torch.tensor([local_count], dtype=torch.int, device=device_utils.make_current_torch_device())
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=dp_cp_group)
+        return int(t.item())
+
+    def _make_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
+        """Build a dummy micro-batch from the last real one, tagged so the loss
+        contributes zero gradient (used to pad short DP ranks to the per-DP
+        max)."""
+        data, meta = self._last_batch
+        dummy = dict(data)
+        dummy["__is_dummy__"] = True
+        dummy["__loss_scale__"] = self.loss_scale
+        return dummy, meta
+
+    def __next__(self) -> Tuple[Dict[str, Any], Any]:
+        # Dummy-padding phase: real data exhausted, emit dummies up to k_global.
+        if self._dummies_remaining is not None:
+            if self._dummies_remaining <= 0:
+                self._shutdown_prefetch()
+                raise StopIteration
+            self._dummies_remaining -= 1
+            self._mb_count += 1
+            logger.info(
+                "[StreamingTQIterator] rollout=%s dp=%d dummy mb=%d (padding to k_global)",
+                self.rollout_id,
+                self.dp_rank,
+                self._mb_count,
+            )
+            return self._make_dummy_batch()
+
+        sampling_config = {
+            "dp_rank": self.dp_rank,
+            "dp_size": self.dp_size,
+            "task_name": self.task_name,
+        }
+        partition_id = f"train_{self.rollout_id}"
+
+        t0 = time.monotonic()
+        empty_streak = 0
+
+        while True:
+            data, meta = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.tq_client,
+                data_fields=self.data_fields,
+                batch_size=None,
+                partition_id=partition_id,
+                task_name=self.task_name,
+                sampling_config=sampling_config,
+                batch_index=self._batch_index,
+                broadcast_pp=False,
+                token_budget=self.token_budget,
+                allow_underfill=True,
+            )
+
+            if data is not None:
+                tq_wait = time.monotonic() - t0
+                self._tq_wait_times.append(tq_wait)
+                data["__loss_scale__"] = self.loss_scale
+                self._buffer.append((data, meta))
+                # Snapshot for dummy padding.  ``get_batch`` mutates the batch
+                # dict IN PLACE (e.g. reassigns ``batch["tokens"]`` to the
+                # concatenated+padded packed tensor), and the schedule passes
+                # this very ``data`` object to ``get_batch``.  If we kept a
+                # reference to it, a later ``_make_dummy_batch`` would copy the
+                # ALREADY-PACKED ``tokens`` while ``loss_masks`` / ``total_lengths``
+                # stay per-sample lists → loss_mask/token shape mismatch in
+                # ``get_batch`` (tok length = sum of two samples).  Store a
+                # shallow dict copy (new top-level dict, same per-sample list
+                # values, which get_batch does not mutate) so the dummy always
+                # rebuilds from the pristine raw fields.
+                self._last_batch = (dict(data), meta)
+                self._batch_index += 1
+                self._mb_count += 1
+                n_samples = len(data.get("tokens", []))
+                adv_info = ""
+                if "advantages" in data:
+                    advs = data["advantages"]
+                    if isinstance(advs, list) and len(advs) > 0:
+                        adv_vals = [a.float().mean().item() if hasattr(a, "mean") else float(a) for a in advs]
+                        adv_info = f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
+                logger.info(
+                    "[StreamingTQIterator] rollout=%s dp=%d/%d mb=%d tq_wait=%.3fs n_samples=%d loss_scale=%.6f%s",
+                    self.rollout_id,
+                    self.dp_rank,
+                    self.dp_size,
+                    self._mb_count,
+                    tq_wait,
+                    n_samples,
+                    self.loss_scale,
+                    adv_info,
+                )
+                # Warm the controller cache for the next mb while the trainer
+                # computes this one (tail prefetch; meta-only).
+                self._warm_next_batch_index(self._batch_index)
+                return data, meta
+
+            # Data not yet available — check if the rollout is fully consumed.
+            if self.all_consumed_fn():
+                # Real data exhausted.  Align mb count across DP ranks: MAX-reduce
+                # the real count, then enter the dummy-padding phase so every DP
+                # yields the same total number of micro-batches.
+                k_real = self._mb_count
+                k_global = self._dp_max_microbatches(k_real)
+                total_wait = sum(self._tq_wait_times)
+                logger.info(
+                    "[StreamingTQIterator] rollout=%s dp=%d real mbs=%d k_global=%d "
+                    "(pad %d dummy) total_tq_wait=%.3fs",
+                    self.rollout_id,
+                    self.dp_rank,
+                    k_real,
+                    k_global,
+                    max(0, k_global - k_real),
+                    total_wait,
+                )
+                pad = k_global - k_real
+                if pad > 0 and self._last_batch is None:
+                    # No real batch to template a dummy from.  Cannot pad — the
+                    # DP collective will hang.  Surface loudly.
+                    logger.error(
+                        "[StreamingTQIterator] rollout=%s dp=%d must pad %d dummy mbs "
+                        "but consumed ZERO real mbs — DP collective WILL desync.",
+                        self.rollout_id,
+                        self.dp_rank,
+                        pad,
+                    )
+                    self._shutdown_prefetch()
+                    raise StopIteration
+                self._dummies_remaining = pad
+                return self.__next__()
+
+            empty_streak += 1
+            if empty_streak % 20 == 0:
+                logger.info(
+                    "[StreamingTQIterator] rollout=%s dp=%d polling: empty_streak=%d "
+                    "batch_index=%d mb_count=%d elapsed=%.1fs",
+                    self.rollout_id,
+                    self.dp_rank,
+                    empty_streak,
+                    self._batch_index,
+                    self._mb_count,
+                    time.monotonic() - t0,
+                )
+            sleep_s = min(0.05 * empty_streak, self.max_empty_sleep)
+            time.sleep(sleep_s)
+
+    def __del__(self) -> None:
+        # Safety net: ensure the prefetch worker is released even if iteration
+        # ended without reaching the StopIteration branch.
+        try:
+            self._shutdown_prefetch()
+        except Exception:
+            pass
+
+    def get_buffer(self) -> List[Tuple[Dict[str, Any], Any]]:
+        """Return all micro-batches emitted so far — used for end-of-rollout
+        logging."""
+        return self._buffer
+
+    def step(self, partition_id: str) -> None:  # noqa: ARG002
+        """API parity with StreamingDataLoader.step; no-op (iterator is per-
+        rollout)."""
+        return
+
+    @property
+    def mb_count(self) -> int:
+        return self._mb_count
+
+    @property
+    def tq_wait_times(self) -> List[float]:
+        return self._tq_wait_times

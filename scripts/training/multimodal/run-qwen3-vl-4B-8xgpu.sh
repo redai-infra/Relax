@@ -40,26 +40,26 @@ ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
    --label-key label
+   --multimodal-keys '{"image":"image"}'
+   --system-prompt "${SYSTEM_PROMPT}"
    --apply-chat-template
-   # --rollout-shuffle
+   --rollout-shuffle
    --balance-data
    --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 64
    --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
+   --global-batch-size 512
+   --rollout-max-response-len 8192
    --rollout-max-prompt-len 2048
-   --rollout-temperature 0.8
-   --global-batch-size 256
-   --multimodal-keys '{"image":"image"}'
-    --system-prompt "${SYSTEM_PROMPT}"
+   --rollout-temperature 1.0
 )
 
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 4
+   --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -67,19 +67,19 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --calculate-per-token-loss
-   # --micro-batch-size 16
    # --qkv-format bshd
+   # --micro-batch-size 1 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
-   --log-probs-max-tokens-per-gpu 20480
+   --max-tokens-per-gpu 20480
+   --log-probs-max-tokens-per-gpu 40960
 
    --no-rope-fusion
+   --calculate-per-token-loss
 )
 
 GRPO_ARGS=(
-   --use-kl-loss
    --advantage-estimator grpo
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -99,17 +99,17 @@ OPTIMIZER_ARGS=(
    --clip-grad 1.0
 )
 
+SGLANG_ARGS=(
+   --rollout-num-gpus-per-engine 1
+   --sglang-mem-fraction-static 0.8
+)
+
 WANDB_ARGS=(
    # --use-tensorboard
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
    --tb-experiment-name qwen3-vl-4b-GRPO-gpu8-${now}
-)
-
-SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.8
 )
 
 MISC_ARGS=(
@@ -124,7 +124,6 @@ MISC_ARGS=(
 )
 
 mkdir -p log
-
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

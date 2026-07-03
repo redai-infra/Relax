@@ -292,26 +292,16 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         else:
             self.buffer_filter = load_function(self.args.buffer_filter_path)
 
-    def get_samples(self, num_samples: int, fully_async: bool = False) -> list[list[Sample]]:
-        """Return num_samples samples."""
-        if fully_async:
-            samples = self._get_all_samples_from_buffer()
-        else:
-            samples = self._get_samples_from_buffer(num_samples)
-            num_samples -= len(samples)
+    def get_samples(self, num_samples: int) -> list[list[Sample]]:
+        """Return exactly num_samples groups, buffer-first then dataset top-
+        up."""
+        samples = self._get_samples_from_buffer(num_samples)
+        num_samples -= len(samples)
 
         if num_samples == 0:
             return samples
 
         samples += super().get_samples(num_samples=num_samples)
-        return samples
-
-    def _get_all_samples_from_buffer(self) -> list[list[Sample]]:
-        if len(self.buffer) == 0:
-            return []
-
-        samples = self.buffer
-        self.buffer = []
         return samples
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:

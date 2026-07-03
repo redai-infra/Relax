@@ -272,10 +272,17 @@ def get_model_provider_func(
             "freeze_language_model",
             "freeze_vision_model",
             "freeze_vision_projection",
+            "freeze_audio_model",
+            "freeze_audio_projection",
             # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
+            "cross_entropy_loss_fusion",
+            "cross_entropy_fusion_impl",
+            "mtp_num_layers",
+            "mtp_loss_scaling_factor",
+            # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
             "moe_layer_freq",
@@ -300,6 +307,7 @@ def get_model_provider_func(
             "moe_router_topk_scaling_factor",
             "moe_router_score_function",
             "moe_ffn_hidden_size",
+            # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
         ]
 
         args_dict = vars(args)
@@ -316,7 +324,8 @@ def get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-
+        if hasattr(args, "gradient_accumulation_fusion"):
+            provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
         if is_npu_available:
             for key, value in vars(args).items():
                 if not hasattr(provider, key):

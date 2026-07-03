@@ -19,9 +19,18 @@ except (ImportError, AttributeError):
 try:
     from relax.models import glm_moe_dsa  # noqa: F401
 except Exception as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.glm_moe_dsa: %s", _e)
+
+# Register DotsOCR2 bridge. Importing the module triggers its
+# @MegatronModelBridge.register_bridge decorator.
+try:
+    from relax.models.dots_ocr import megatron as dots_ocr_megatron  # noqa: F401
+except Exception as _e:
     import logging as _logging
 
-    _logging.getLogger(__name__).warning("Failed to import relax.models.glm_moe_dsa: %s", _e)
+    _logging.getLogger(__name__).warning("Failed to import relax.models.dots_ocr.megatron: %s", _e)
 
 
 __all__ = [

@@ -236,21 +236,12 @@ class GenRM(Base):
         ray.get(self.genrm_manager.offload.remote())
 
 
-# ── GenRM registration helper (called by Controller) ──────────────────────
+# ── Compatibility wrapper for old imports ─────────────────────────────────
 GENRM_ROLE = "genrm"
 
 
 def register_genrm(config, algo: dict) -> list[str]:
-    """Conditionally register GenRM into *algo* dict.
+    """Compatibility wrapper; optional-role wiring lives in ``relax.core``."""
+    from relax.core.optional_roles import register_genrm as _register_genrm
 
-    If ``config.genrm_model_path`` is set, adds the :class:`GenRM` class to
-    *algo* under the ``"genrm"`` key and returns ``["genrm"]`` so the caller
-    can append it to the role iteration list.  Otherwise returns ``[]``.
-
-    This keeps all genRM-specific wiring inside ``relax/components/genrm.py`` so that
-    ``controller.py`` needs only a one-line call.
-    """
-    if getattr(config, "genrm_model_path", None) is not None:
-        algo[GENRM_ROLE] = GenRM
-        return [GENRM_ROLE]
-    return []
+    return _register_genrm(config, algo)

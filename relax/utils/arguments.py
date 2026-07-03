@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import warnings
 from typing import Any
 
 import yaml
@@ -12,7 +13,12 @@ from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
-from relax.utils.training.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
+from relax.utils.training.eval_config import (
+    EvalDatasetConfig,
+    build_eval_dataset_configs,
+    build_named_prompt_data_configs,
+    ensure_dataset_list,
+)
 
 
 logger = get_logger(__name__)
@@ -105,6 +111,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Number of TransferQueue SimpleStorageUnit actors.",
+            )
+            parser.add_argument(
+                "--per-rank-fetch",
+                action="store_true",
+                default=False,
+                help=(
+                    "Let every TP/PP rank pull its own copy from TransferQueue in parallel "
+                    "instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank "
+                    "consistency relies on the TQ sampler's (partition_id, task_name, dp_rank, "
+                    "batch_index) cache, which is PP/TP-invariant. Auto-disabled when "
+                    "'rollout_routed_experts' is in data_fields (jagged NestedTensor bcast "
+                    "path is incompatible). Recommended for multi-GPU training together with "
+                    "--num-data-storage-units >= TP world size."
+                ),
             )
             parser.add_argument(
                 "--max-staleness",
@@ -288,6 +308,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to freeze the vision projection parameters (used in bridge mode for multimodal models).",
             )
             parser.add_argument(
+                "--freeze-audio-model",
+                action="store_true",
+                default=False,
+                help="Whether to freeze the audio encoder backbone parameters "
+                "(used in bridge mode for multimodal models with an audio "
+                "encoder).  Does NOT freeze the audio projection — pass "
+                "--freeze-audio-projection for that.",
+            )
+            parser.add_argument(
+                "--freeze-audio-projection",
+                action="store_true",
+                default=False,
+                help="Whether to freeze the audio→LM projection parameters "
+                "(used in bridge mode for multimodal models with an audio "
+                "encoder).  Independent of --freeze-audio-model.",
+            )
+            parser.add_argument(
                 "--vision-dp-when-tp",
                 action="store_true",
                 default=False,
@@ -301,6 +338,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
+            )
+            parser.add_argument(
+                "--sft-logits-chunk-size",
+                type=int,
+                default=1024,
+                help="SFT only: chunk size for the lm_head + CE matmul under "
+                "sft_loss_function_chunked (avoids materializing full [B,S,V/TP] logits). "
+                "Independent from --log-probs-chunk-size, which only chunks the post-logits "
+                "log_prob reduce used by RL paths and SFT eval (PPL).",
+            )
+            parser.add_argument(
+                "--sft-chunked-logits",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
+                "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
+                "logits. Default off — legacy external-loss SFT path materializes full logits "
+                "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
+                "when --enable-mtp-training is set (MTP head needs the real output_layer; "
+                "bypass would break it) or when embeddings are tied "
+                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
+                "skip_weight_param_allocation=True so output_layer.weight is None and the "
+                "chunked path's lm_head matmul has nothing to multiply against; tied models "
+                "are small enough that the chunked path's memory win is marginal anyway).",
             )
             parser.add_argument(
                 "--only-train-params-name-list",
@@ -347,6 +408,111 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
             )
 
+            # ---- SFT / Predict ----
+            parser.add_argument(
+                "--custom-dataset-class",
+                "--custom-dataset-class-path",
+                dest="custom_dataset_class_path",
+                type=str,
+                default=None,
+                help=(
+                    "Import path to a custom SFT streaming dataset class. "
+                    "The class must define from_args(args, *, tokenizer, processor_pool, pad_token_ids) "
+                    "and expose the SFTStreamingDataset public methods."
+                ),
+            )
+            parser.add_argument(
+                "--eval-size",
+                type=float,
+                default=None,
+                help=(
+                    "Carve a held-out eval split from --prompt-data instead of providing a separate "
+                    "--eval-prompt-data. A value <1 is treated as a fraction of the train dataset "
+                    "(e.g. 0.05 → last 5%); a value ≥1 is treated as an absolute sample count. "
+                    "The reserved tail is removed from the train pool so train and eval samples never "
+                    "overlap. Mutually exclusive with --eval-prompt-data."
+                ),
+            )
+            parser.add_argument(
+                "--sft-max-in-flight-steps",
+                type=int,
+                default=None,
+                help=(
+                    "SFT-only name for the train-step TransferQueue buffer depth. "
+                    "This is the maximum number of sft_<step> partitions allowed in flight, "
+                    "including the current train step. When set, it maps to "
+                    "--max-staleness = sft_max_in_flight_steps - 1."
+                ),
+            )
+            parser.add_argument(
+                "--sft-prefetch-buffer-size",
+                type=int,
+                default=256,
+                help=(
+                    "Max pre-loaded samples held by the SFT streaming dataset's PrefetchBuffer. "
+                    "Set to 0 to disable prefetching; the producer will then fall back to an "
+                    "asyncio.gather path over the ProcessorPool for batch-level parallelism."
+                ),
+            )
+            parser.add_argument(
+                "--sft-prefetch-chunk-size",
+                type=int,
+                default=32,
+                help="Chunk size dispatched to the SFT prefetch thread-pool per round.",
+            )
+            parser.add_argument(
+                "--sft-prefetch-num-workers",
+                type=int,
+                default=4,
+                help="Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding.",
+            )
+            parser.add_argument(
+                "--sft-oversize-strategy",
+                type=str,
+                default="keep",
+                choices=["skip", "keep", "truncate_left", "truncate_right", "custom"],
+                help=(
+                    "How to handle SFT samples whose (expanded) length exceeds per-GPU capacity. "
+                    "All branches emit a WARNING log per oversized sample. "
+                    "`skip` drops the sample; `keep` (default) returns it unchanged (may OOM downstream); "
+                    "`truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first "
+                    "`capacity` tokens; `custom` delegates to --sft-oversize-custom-function-path. "
+                    "Note: truncating multimodal samples in-place may misalign multimodal_train_inputs — "
+                    "use `custom` if you need to also trim media inputs."
+                ),
+            )
+            parser.add_argument(
+                "--sft-oversize-custom-function-path",
+                type=str,
+                default=None,
+                help=(
+                    "Required when --sft-oversize-strategy custom. Importable path to a function with "
+                    "signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) | None`. "
+                    "Returning None is treated as skip."
+                ),
+            )
+            parser.add_argument(
+                "--sft-tq-timeout-minutes",
+                type=int,
+                default=None,
+                help=(
+                    "SFT-only timeout (in minutes) for the producer's TransferQueue waits. "
+                    "If the consumer dies, the SFT producer would otherwise spin forever on "
+                    "_wait_for_buffer_capacity. On timeout the producer raises TimeoutError "
+                    "and the job crashes. Defaults to --distributed-timeout-minutes."
+                ),
+            )
+            parser.add_argument(
+                "--sft-predict-interval",
+                type=int,
+                default=None,
+                help=(
+                    "When set under --loss-type sft, every N rollout steps run a predict pass "
+                    "over the eval dataset (--eval-prompt-data/--eval-config or --eval-size) and write "
+                    "completions to <save>/predict/predictions_step_<rollout_id>.jsonl. "
+                    "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
+                ),
+            )
             return parser
 
         # rollout
@@ -773,10 +939,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Number of epochs for the training. "
-                    "This is used to calculate the number of rollout steps from the dataset size. "
-                    "If set, we will calculate the number of rollout steps as `num_rollout = num_epoch * dataset_size // rollout_batch_size`."
-                    "If both `--num-epoch` and `--num-rollout` are set, `--num-epoch` will be ignored."
+                    "Number of epochs over the dataset. When set, "
+                    "`actual_num_rollout = num_epoch * dataset_size // rollout_batch_size`. "
+                    "If both --num-rollout and --num-epoch are set, the smaller of the two wins "
+                    "(epoch acts as a cap). At least one of --num-rollout / --num-epoch must be set. "
+                    "Applies to both RL and SFT."
                 ),
             )
 
@@ -804,8 +971,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "The path to the prompt data. "
-                    "Currently we only support jsonl format, and each line should contains --input-key and --label-key, "
-                    "which will be used as the prompt and the label respectively. "
+                    "Supports jsonl/parquet paths, directories, file lists, and row slices. "
+                    "Each row should contain --input-key; --label-key is used when the prompt row stores "
+                    "prompt and response separately. "
                     "If you want to use a custom template, you can set --apply-chat-template to true, in that case, "
                     "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
                 ),
@@ -821,6 +989,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     'JSON string for multimodal data mapping media types to data keys. Example: \'{"image": "image_file"}\''
+                ),
+            )
+            parser.add_argument(
+                "--conversation-key-map",
+                type=json.loads,
+                default=None,
+                help=(
+                    "JSON string that rewrites non-OpenAI conversation messages into the OpenAI "
+                    "{role, content} shape that SFT expects. A single flat map covers both "
+                    "field-name renames (applied to every message-dict key) and role-value "
+                    "renames (applied only to the resulting `role` field, so message bodies "
+                    "containing the same words are left untouched). "
+                    'Example for sharegpt: \'{"from":"role","value":"content","human":"user","gpt":"assistant"}\'. '
+                    "Only consulted when --label-key is unset (i.e., --input-key holds a full messages list)."
                 ),
             )
             parser.add_argument(
@@ -940,10 +1122,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rollout-batch-size",
                 type=int,
-                required=True,
+                default=None,
                 help=(
                     "The number of prompts in each rollout step. "
                     "The total data returned should be rollout_batch_size * n_samples_per_prompt. "
+                    "If omitted but --global-batch-size is set, it is derived as "
+                    "`global_batch_size // n_samples_per_prompt`."
                 ),
             )
             parser.add_argument(
@@ -971,7 +1155,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Balance the number of tokens between data parallel ranks with `karmarkar_karp` for verl. "
-                    "Note that this may allocate the different response of the same prompt into different training steps."
+                    "Note that this may allocate the different response of the same prompt into different training steps. "
+                    "In fully-async + --use-dynamic-batch-size mode this is effectively always on: the "
+                    "StreamingTokenBudgetSampler already balances tokens across DP ranks per sample, so the "
+                    "flag is accepted but has no additional effect there."
                 ),
             )
 
@@ -1013,6 +1200,80 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Optional system prompt added before user input."
                     "The final message will be <system_prompt> + <dataset_prompt>."
+                ),
+            )
+            parser.add_argument(
+                "--use-agentic-rollout",
+                action="store_true",
+                default=False,
+                help="Enable agentic rollout mode. Automatically sets --rollout-function-path to the agentic rollout entry point.",
+            )
+            parser.add_argument(
+                "--agent-command",
+                type=str,
+                default=None,
+                help=(
+                    "Managed-command agent entry command for agentic rollout. "
+                    "Required when --use-agentic-rollout is set."
+                ),
+            )
+            parser.add_argument(
+                "--agent-cwd",
+                type=str,
+                default=None,
+                help=(
+                    "Working directory for the managed-command agent process. "
+                    "Required when --use-agentic-rollout is set."
+                ),
+            )
+            parser.add_argument(
+                "--agent-timeout",
+                type=float,
+                default=1800.0,
+                help=(
+                    "Active runtime budget in seconds for each managed-command agent session. "
+                    "The clock runs while the session is admitted and pauses while it is gated; "
+                    "on timeout, SIGTERM is sent to the managed agent process group."
+                ),
+            )
+            parser.add_argument(
+                "--agent-env",
+                nargs="+",
+                default=[],
+                help=(
+                    "Extra environment variables for the managed-command agent process, formatted as KEY=VALUE. "
+                    "Examples: --agent-env FOO=bar; --agent-env FOO=bar BAZ=qux; "
+                    "--agent-env 'FOO=value with spaces' BAZ=qux."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-tool-call-parser",
+                type=str,
+                default=None,
+                help=("SGLang tool-call parser for agentic rollout. Runs only when tools are present."),
+            )
+            parser.add_argument(
+                "--agentic-reasoning-parser",
+                type=str,
+                default=None,
+                help="SGLang reasoning parser for agentic rollout.",
+            )
+            parser.add_argument(
+                "--agentic-prepare-pool-size",
+                type=int,
+                default=None,
+                help=(
+                    "Positive target size of the agentic prepare pool in groups, or 0 to start agent processes after "
+                    "rollout begins. If unset, defaults to over_sampling_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-eval-prepare-pool-size",
+                type=int,
+                default=None,
+                help=(
+                    "Target size of the agentic eval prepare pool in groups. "
+                    "If unset, derives from the train prepare pool session budget."
                 ),
             )
             return parser
@@ -1149,10 +1410,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft", "sft_loss", "sft-loss", "custom_loss"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
+                    "Choose loss type, currently support ppo policy_loss or sft (or deprecated sft_loss/sft-loss), "
                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
                 ),
             )
@@ -1182,6 +1443,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus_baseline",
                     "ppo",
                     "sapo",
+                    "cispo",
                 ],
                 default="grpo",
                 help=(
@@ -1755,9 +2017,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=64,
                 help=(
-                    "Maximum number of concurrent reward computations. "
-                    "This controls the global asyncio.Semaphore that limits how many "
-                    "reward tasks can run at the same time. Default: 64."
+                    "Maximum number of concurrent reward computations (per sample; "
+                    "group_rm=False scores by sample). This controls the global "
+                    "asyncio.Semaphore that limits how many reward tasks run at once. "
+                    "Reward counts by sample, so over_sampling=N groups x n_samples = N*ns "
+                    "samples per step flow through this gate. Each sample fans out to several "
+                    "LLM judges, so when raising this keep it within the upstream judge "
+                    "endpoint concurrency (see reward_config *.yaml max_concurrency). "
+                    "Default 64; set explicitly on the launch command when over-sampling."
                 ),
             )
             parser.add_argument(
@@ -2136,24 +2403,130 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
+    sft_max_in_flight_steps = getattr(args, "sft_max_in_flight_steps", None)
+    if sft_max_in_flight_steps is None:
+        return
+
+    if not is_sft:
+        raise ValueError("--sft-max-in-flight-steps is only meaningful under --loss-type sft.")
+    if sft_max_in_flight_steps < 1:
+        raise ValueError("--sft-max-in-flight-steps must be >= 1.")
+    args.max_staleness = sft_max_in_flight_steps - 1
+
+
+def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
+    if not is_sft:
+        return
+    timeout = getattr(args, "sft_tq_timeout_minutes", None)
+    if timeout is None:
+        args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
+    elif timeout <= 0:
+        raise ValueError("--sft-tq-timeout-minutes must be > 0.")
+
+
+def _validate_agentic_rollout_args(args) -> None:
+    if not args.use_agentic_rollout:
+        return
+    args.rollout_function_path = "relax.agentic.rollout.generate_rollout"
+    args.eval_function_path = "relax.agentic.rollout.generate_rollout"
+    args.apply_chat_template = False
+    if not isinstance(args.agent_command, str) or not args.agent_command.strip():
+        raise ValueError("--agent-command is required when --use-agentic-rollout is set.")
+    if not isinstance(args.agent_cwd, str) or not args.agent_cwd.strip():
+        raise ValueError("--agent-cwd is required when --use-agentic-rollout is set.")
+    if not os.path.isdir(os.path.expanduser(args.agent_cwd)):
+        raise ValueError(f"--agent-cwd must point to an existing directory, got {args.agent_cwd!r}.")
+    if args.agent_timeout <= 0:
+        raise ValueError("--agent-timeout must be > 0.")
+    if not isinstance(args.agent_env, list) or not all(isinstance(item, str) for item in args.agent_env):
+        raise TypeError("--agent-env must be provided as a list of KEY=VALUE strings.")
+    for item in args.agent_env:
+        if "=" not in item:
+            raise ValueError(f"--agent-env entry must be KEY=VALUE, got {item!r}.")
+        key = item.split("=", 1)[0].strip()
+        if not key:
+            raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
+        if key.startswith("RELAX_"):
+            raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
+    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size < 0:
+        raise ValueError("--agentic-prepare-pool-size must be >= 0.")
+    if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
+        raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
-    args.eval_datasets = _resolve_eval_datasets(args)
+    is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
+    if is_sft:
+        # Force-disable RL-only state so SFT users don't have to pass
+        # `--disable-compute-advantages-and-returns` and friends.
+        args.compute_advantages_and_returns = False
+        args.use_kl_loss = False
+        args.kl_coef = 0.0
+        args.kl_loss_coef = 0.0
+        args.use_opd = False
+        # SFT owns --prompt-data through components/sft.py. If predict is
+        # enabled, the injected Rollout role should not also build an RL global
+        # dataset from it.
+        args.rollout_global_dataset = False
+
+    if is_sft:
+        if args.eval_config is not None:
+            raise ValueError("--loss-type sft uses --eval-prompt-data for eval; --eval-config is not supported.")
+        if args.eval_prompt_data and len(args.eval_prompt_data) == 1:
+            logger.info("[legacy] only one eval_prompt_data detected, will assume it is data for aime")
+        eval_prompt_data = build_named_prompt_data_configs(args.eval_prompt_data)
+        args.eval_prompt_data = (
+            [item for dataset in eval_prompt_data for item in (dataset.name, dataset.path)]
+            if eval_prompt_data
+            else None
+        )
+        if hasattr(args, "eval_datasets"):
+            delattr(args, "eval_datasets")
+    else:
+        args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if args.partial_rollout and args.use_rollout_routing_replay:
+    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
+    # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
+    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
+    # response_length=1 for every sample and training silently degenerates.
+    if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    ):
+        raise ValueError(
+            "SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
+            "--sglang-speculative-algorithm in this build: spec_v2 EAGLE worker "
+            "does not populate output_token_logprobs, which collapses rollout "
+            "response_length to 1 and silently breaks training. "
+            "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
+            "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
+            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
+            "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
+            "spec_v2."
+        )
+
+    _normalize_sft_max_in_flight_steps(args, is_sft)
+    _normalize_sft_tq_timeout(args, is_sft)
+    _validate_agentic_rollout_args(args)
+
+    if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
             "The options 'partial_rollout' and 'use_rollout_routing_replay' cannot be enabled simultaneously. "
             "'use_rollout_routing_replay' addresses mismatch problem between training and inference, "
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
-    if args.kl_coef != 0 or args.use_kl_loss:
+    if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
         if not os.path.exists(args.ref_load):
             raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
 
@@ -2169,7 +2542,9 @@ def slime_validate_args(args):
     if args.opd_log_prob_top_k < 0:
         raise ValueError("--opd-log-prob-top-k must be >= 0.")
 
-    if args.use_opd:
+    if is_sft:
+        pass  # SFT skips OPD validation entirely.
+    elif args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
 
@@ -2235,77 +2610,125 @@ def slime_validate_args(args):
             args.start_rollout_id = 0
 
     if args.eval_interval is not None:
-        assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
+        if args.loss_type == "sft":
+            has_eval_source = bool(args.eval_prompt_data) or (args.eval_size is not None)
+            if has_eval_source:
+                assert bool(args.eval_prompt_data) ^ (args.eval_size is not None), (
+                    "Under --loss-type sft with --eval-interval set, at most one of "
+                    "--eval-prompt-data or --eval-size may be configured."
+                )
+            elif not getattr(args, "custom_dataset_class_path", None):
+                raise ValueError(
+                    "Under --loss-type sft with --eval-interval set, exactly one of "
+                    "--eval-prompt-data or --eval-size must be configured."
+                )
+        else:
+            assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
+
+    if args.eval_size is not None:
+        assert args.loss_type == "sft", "--eval-size is only meaningful under --loss-type sft."
+        assert args.eval_size > 0, "--eval-size must be positive."
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
 
+    if getattr(args, "sft_predict_interval", None) is not None:
+        assert args.loss_type == "sft", "--sft-predict-interval is only meaningful under --loss-type sft."
+        assert args.sft_predict_interval > 0, "--sft-predict-interval must be positive."
+        assert args.save is not None, "--sft-predict-interval requires --save (predictions land in <save>/predict/)."
+        has_eval_source = bool(getattr(args, "eval_prompt_data", None)) or (
+            getattr(args, "eval_size", None) is not None
+        )
+        assert has_eval_source, (
+            "--sft-predict-interval requires either --eval-prompt-data or --eval-size "
+            "(the predict pass reuses the SFT eval data source)."
+        )
+
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
-    if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
-        assert args.normalize_advantages, (
-            "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
-            "require advantage normalization. Please add `--normalize-advantages` to your command."
-        )
-
-    if args.fully_async:
-        assert not args.normalize_advantages, (
-            "Advantage normalization is not supported in fully-async mode (--fully-async). "
-            "Please remove --normalize-advantages from your command."
-        )
-        assert not args.opd_type == "megatron", (
-            "On-policy distillation with megatron teacher is not supported in fully-async mode (--fully-async)."
-            " Please set --opd-type to sglang or remove --use-opd."
-        )
-
-    # Auto-enable true_on_policy_mode when the per-step rollout output exactly fills
-    # one global batch in fully-async mode. In this regime the train forward's
-    # log_probs equal what actor_fwd would have produced, so the actor_fwd role
-    # can be skipped (see relax/backends/megatron/loss.py:policy_loss_function).
-    if args.fully_async and args.rollout_batch_size * args.n_samples_per_prompt == args.global_batch_size:
-        if not args.true_on_policy_mode:
-            logger.info(
-                "Auto-enabling --true-on-policy-mode: rollout_batch_size * n_samples_per_prompt "
-                f"== global_batch_size ({args.global_batch_size}). actor_fwd will be skipped."
-            )
-        args.true_on_policy_mode = True
-
-    # Validate --resource has the producer roles the trainer will fetch from
-    # TransferQueue in fully-async mode. Without these, train_async would poll
-    # forever for a field nobody writes (see backends/megatron/actor.py:train_async).
-    if args.fully_async and args.resource is not None:
-        if (args.use_kl_loss or args.kl_coef != 0) and "reference" not in args.resource:
-            raise ValueError(
-                "--use-kl-loss / --kl-coef != 0 requires a 'reference' entry in --resource "
-                "(produces ref_log_probs via TransferQueue in fully-async mode). "
-                f"Current --resource keys: {sorted(args.resource.keys())}."
-            )
-        if not args.true_on_policy_mode and "actor_fwd" not in args.resource:
-            raise ValueError(
-                "actor_fwd is required in --resource when true_on_policy_mode is False "
-                "(produces log_probs via TransferQueue in fully-async mode). "
-                "true_on_policy_mode is auto-enabled only when "
-                "rollout_batch_size * n_samples_per_prompt == global_batch_size. "
-                f"Current --resource keys: {sorted(args.resource.keys())}."
+    if not is_sft:
+        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
+            assert args.normalize_advantages, (
+                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
+                "require advantage normalization. Please add `--normalize-advantages` to your command."
             )
 
-    if args.use_rollout_logprobs:
-        assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+        if args.fully_async:
+            assert not args.normalize_advantages, (
+                "Advantage normalization is not supported in fully-async mode (--fully-async). "
+                "Please remove --normalize-advantages from your command."
+            )
+            assert not args.opd_type == "megatron", (
+                "On-policy distillation with megatron teacher is not supported in fully-async mode (--fully-async)."
+                " Please set --opd-type to sglang or remove --use-opd."
+            )
 
-    if args.get_mismatch_metrics:
-        assert args.custom_tis_function_path is not None, (
-            "custom_tis_function_path must be set when get_mismatch_metrics is set"
-        )
+        # Auto-enable true_on_policy_mode when the per-step rollout output exactly fills
+        # one global batch in fully-async mode. In this regime the train forward's
+        # log_probs equal what actor_fwd would have produced, so the actor_fwd role
+        # can be skipped (see relax/backends/megatron/loss.py:policy_loss_function).
+        if args.fully_async and args.rollout_batch_size * args.n_samples_per_prompt == args.global_batch_size:
+            if not args.true_on_policy_mode:
+                logger.info(
+                    "Auto-enabling --true-on-policy-mode: rollout_batch_size * n_samples_per_prompt "
+                    f"== global_batch_size ({args.global_batch_size}). actor_fwd will be skipped."
+                )
+            args.true_on_policy_mode = True
+
+        # Validate --resource has the producer roles the trainer will fetch from
+        # TransferQueue in fully-async mode. Without these, train_async would poll
+        # forever for a field nobody writes (see backends/megatron/actor.py:train_async).
+        if args.fully_async and args.resource is not None:
+            if (args.use_kl_loss or args.kl_coef != 0) and "reference" not in args.resource:
+                raise ValueError(
+                    "--use-kl-loss / --kl-coef != 0 requires a 'reference' entry in --resource "
+                    "(produces ref_log_probs via TransferQueue in fully-async mode). "
+                    f"Current --resource keys: {sorted(args.resource.keys())}."
+                )
+            if not args.true_on_policy_mode and "actor_fwd" not in args.resource:
+                raise ValueError(
+                    "actor_fwd is required in --resource when true_on_policy_mode is False "
+                    "(produces log_probs via TransferQueue in fully-async mode). "
+                    "true_on_policy_mode is auto-enabled only when "
+                    "rollout_batch_size * n_samples_per_prompt == global_batch_size. "
+                    f"Current --resource keys: {sorted(args.resource.keys())}."
+                )
 
         if args.use_rollout_logprobs:
-            logger.info(
-                "get_mismatch_metrics is set; For metrics calculation, the log probs will still be recomputed by training engine. One more forward pass will be applied."
+            assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+        if args.get_mismatch_metrics:
+            assert args.custom_tis_function_path is not None, (
+                "custom_tis_function_path must be set when get_mismatch_metrics is set"
             )
+
+            if args.use_rollout_logprobs:
+                logger.info(
+                    "get_mismatch_metrics is set; For metrics calculation, the log probs will still be recomputed by training engine. One more forward pass will be applied."
+                )
 
     if args.use_dynamic_batch_size:
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
+
+        # The token-budget sampler always emits at least one sample per micro-batch,
+        # even if that single sample exceeds the budget (otherwise the stream stalls).
+        # So the per-GPU token budget (max_tokens_per_gpu * context_parallel_size,
+        # since a sequence is split across CP ranks) must be able to hold the longest
+        # possible single sample (rollout_max_context_len). Otherwise an over-long
+        # sample produces an oversized micro-batch that OOMs mid-training.
+        max_ctx_len = getattr(args, "rollout_max_context_len", None)
+        if max_ctx_len is not None:
+            cp_size = getattr(args, "context_parallel_size", 1)
+            token_budget = args.max_tokens_per_gpu * cp_size
+            if token_budget < max_ctx_len:
+                raise ValueError(
+                    f"max_tokens_per_gpu * context_parallel_size ({args.max_tokens_per_gpu} * {cp_size} = "
+                    f"{token_budget}) must be >= rollout_max_context_len ({max_ctx_len}); otherwise a single "
+                    f"over-long sample forms an oversized micro-batch and OOMs. Increase max_tokens_per_gpu "
+                    f"(or context_parallel_size), or reduce rollout_max_context_len."
+                )
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
@@ -2329,6 +2752,41 @@ def slime_validate_args(args):
             "will not instantiate sglang servers and will only run the training process."
         )
         args.debug_train_only = True
+
+    if args.loss_type in ("sft_loss", "sft-loss"):
+        warnings.warn(
+            f"--loss-type {args.loss_type} is deprecated; use --loss-type sft instead. "
+            "This alias will be removed in the next minor release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        args.loss_type = "sft"
+
+    if args.loss_type == "sft":
+        if not args.custom_dataset_class_path and not args.prompt_data:
+            raise ValueError("--loss-type sft requires --prompt-data.")
+        if args.sft_oversize_strategy == "custom" and not args.sft_oversize_custom_function_path:
+            raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
+        # SFT does not use advantages / reference; force-disable to avoid wasted compute.
+        args.compute_advantages_and_returns = False
+        # SFT samples have highly variable length; only the dynamic-batch-size
+        # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
+        # balanced micro-batches. Static --micro-batch-size cannot do either,
+        # so we require --use-dynamic-batch-size.
+        if not args.use_dynamic_batch_size:
+            raise ValueError(
+                "--loss-type sft requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
+                "SFT relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
+                "samples that cannot fit on a single GPU."
+            )
+        # The controller always installs SeqlenBalancedSampler for SFT (see
+        # `core/controller.py:_initialize_data_system`). That sampler can hand
+        # different sample counts to each DP rank, which the Megatron data
+        # path only handles correctly when args.balance_data is True. Force it
+        # on so the two layers stay consistent.
+        if not args.balance_data:
+            logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
+            args.balance_data = True
 
     args.use_critic = args.advantage_estimator == "ppo"
     if args.critic_num_gpus_per_node is None:
@@ -2373,14 +2831,6 @@ def slime_validate_args(args):
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
-        )
-
-    if args.fully_async and args.balance_data and not args.hybrid:
-        raise ValueError(
-            "--balance-data is not supported in pure fully-async mode (--fully-async without --hybrid). "
-            "In pure fully-async training, the actor consumes rollout data via StreamDataLoader "
-            "which is incompatible with data balancing. Use --hybrid mode "
-            "or remove --balance-data from your command."
         )
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
@@ -2466,6 +2916,15 @@ def slime_validate_args(args):
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
+    if args.rollout_batch_size is None:
+        if args.global_batch_size is None:
+            raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
+        args.rollout_batch_size = args.global_batch_size // args.n_samples_per_prompt
+        logger.info(
+            f"--rollout-batch-size not set; derived as global_batch_size ({args.global_batch_size}) "
+            f"// n_samples_per_prompt ({args.n_samples_per_prompt}) = {args.rollout_batch_size}"
+        )
+
     if args.num_steps_per_rollout is not None:
         global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
         if args.global_batch_size is not None:
@@ -2488,22 +2947,69 @@ def slime_validate_args(args):
         f"rollout_batch_size {args.rollout_batch_size}"
     )
 
-    if args.num_epoch is not None:
-        if args.num_rollout is not None:
-            logger.info("Both num_epoch and num_rollout are set, num_epoch will be ignored.")
-        else:
-            assert args.rollout_global_dataset, (
-                "num_epoch is set, but rollout_global_dataset is not set, "
-                "please remove --disable-rollout-global-dataset to use num_epoch"
-            )
-    else:
-        # if num_epoch is not set, we should set num_rollout
-        assert args.num_rollout is not None, (
-            "num_epoch is not set, but num_rollout is not set, please set --num-rollout or --num-epoch"
+    if (
+        args.over_sampling_batch_size > args.rollout_batch_size
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "partial_rollout", False)
+    ):
+        # Without fully_async/partial_rollout there is no next-step carry path for the
+        # over-sampled surplus, so the extra completed groups are discarded each step
+        # rather than reused. Surface this so it is not mistaken for free throughput.
+        logger.warning(
+            "over_sampling_batch_size (%s) > rollout_batch_size (%s) without fully_async/partial_rollout; "
+            "surplus over-sampled groups are discarded per-step instead of carried to the next step.",
+            args.over_sampling_batch_size,
+            args.rollout_batch_size,
+        )
+
+    if args.num_epoch is None:
+        assert args.num_rollout is not None, "Neither --num-rollout nor --num-epoch is set; please set at least one."
+    elif getattr(args, "loss_type", None) != "sft":
+        assert args.rollout_global_dataset, (
+            "num_epoch is set, but rollout_global_dataset is not set, "
+            "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
+
+    # --sft-chunked-logits incompatibilities. All three are flagged here so
+    # downstream (model.py _should_use_sft_chunked + the three loss.py direct
+    # reads of args.sft_chunked_logits) sees a single, consistent truth.
+    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # from their script rather than have it silently flipped off.
+    if getattr(args, "sft_chunked_logits", False):
+        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
+        #    Output_layer is built with skip_weight_param_allocation=True →
+        #    output_layer.weight is None → chunked path's lm_head matmul
+        #    crashes on NoneType. The chunked memory win is marginal on the
+        #    small models that ship with tied embeddings anyway, so the user
+        #    should just drop the flag.
+        assert getattr(args, "untie_embeddings_and_output_weights", False), (
+            "--sft-chunked-logits is incompatible with tied embeddings "
+            "(HF config.tie_word_embeddings=true → "
+            "--untie-embeddings-and-output-weights not set; output_layer.weight "
+            "is None and the chunked path's lm_head matmul has nothing to "
+            "multiply against). Remove --sft-chunked-logits; the chunked "
+            "memory win is marginal on tied-weight models."
+        )
+        # 2) MTP. MTP's _postprocess reaches for self.output_layer directly;
+        #    _bypass_output_layer's passthrough would break the MTP head.
+        assert not getattr(args, "enable_mtp_training", False), (
+            "--sft-chunked-logits is incompatible with --enable-mtp-training "
+            "(MTP head needs the real output_layer; the chunked path's "
+            "passthrough would break it). Remove one of the two flags."
+        )
+        # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        #    forward through model.build_schedule_plan(), which does NOT call
+        #    model(**kwargs) and so never hits _bypass_output_layer — chunked
+        #    silently degrades to the full-logits path.
+        assert not getattr(args, "overlap_moe_expert_parallel_comm", False), (
+            "--sft-chunked-logits is incompatible with "
+            "--overlap-moe-expert-parallel-comm (combined-1f1b path bypasses "
+            "_bypass_output_layer; chunked would silently degrade). "
+            "Remove one of the two flags."
+        )
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
@@ -2539,6 +3045,13 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if args.advantage_estimator == "ppo":
+        raise ValueError(
+            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
+            "Please use one of the following advantage estimators instead: "
+            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
+        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."

@@ -6,23 +6,26 @@
 
 ## 模型支持
 
-| 模型     | 训练场景 | Sync | Async | 训练所需最小卡数 | 参考脚本                                                |
-| -------- | -------- | ---- | ----- | ---------------- | ------------------------------------------------------- |
-| Qwen3-4B | DAPO     | ×    | √     | 910C 4卡         | `scripts/training/text/run-qwen3-4B-8xgpu-async-npu.sh` |
+| 模型       | 训练场景 | Sync | Async | 训练所需最小卡数 | 参考脚本                                                |
+| ---------- | -------- | ---- | ----- | ---------------- | ------------------------------------------------------- |
+| Qwen3-4B   | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen3-4B-4xnpu-colocate.sh`  |
+| Qwen3.5-9B | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen35-9B-4xnpu-colocate.sh` |
 
 ## 环境准备
 
 ### 前置准备
 
 - 资源类型：`Ascend910 Snt9b23`
-- 驱动版本：`Software Version 25.2.1`
-- 固件版本：`Firmware Version 7.7.0.9.220`
-- 基础镜像：`quay.io/ascend/vllm-ascend:v0.18.0-a3`
+- 驱动版本：`Software Version 25.5.1`
+- 固件版本：`Firmware Version 7.8.0.6.201`
+- 基础镜像：`quay.io/ascend/cann:8.5.1-a3-ubuntu22.04-py3.11`
 
 ### 环境检查
 
 `npu-smi info`                    # 在每个实例节点上运行此命令可以看到NPU卡状态
+
 `npu-smi info -l | grep Total`    # 在每个实例节点上运行此命令可以看到总卡数，用来确认对应卡数已经挂载
+
 `npu-smi info -t board -i 1 | egrep -i "software|firmware"`   #查看驱动和固件版本
 
 ### 安装方法
@@ -108,5 +111,4 @@ bash scripts/training/text/run-qwen3-4B-8xgpu-async-npu.sh
 
 ## 下一步
 
-- [ ] 功能特性：共卡适配
-- [ ] 模型支持：Qwen3.5-9B
+- [ ] 模型支持：Qwen3.5-35B

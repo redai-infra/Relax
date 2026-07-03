@@ -354,6 +354,54 @@ def satisfy_staleness(partition_list, current_rollout_id, max_staleness):
 
 ______________________________________________________________________
 
+## 动态 Batch Size（流式 token 预算）
+
+### 概念
+
+样本长度差异很大时，固定 micro-batch 数会浪费 GPU。开启 `--use-dynamic-batch-size` 后，Actor 不再按固定数量切 micro-batch，而是按 **token 预算**（`--max-tokens-per-gpu`）打包：每个 micro-batch 累积样本直到接近预算上限。
+
+在 fully-async 下，这一过程是**流式**的——Actor 边训练边从 TransferQueue 按需拉取下一个 micro-batch，无需等整批 rollout 数据就绪。
+
+```bash
+--use-dynamic-batch-size       # 启用动态 batch size
+--max-tokens-per-gpu 20480     # 每张 GPU 每个 micro-batch 的 token 预算
+```
+
+### 工作流程
+
+```
+Rollout 产出样本 → TransferQueue
+                      │
+   ┌──────────────────┴────────────────────────┐
+   │ StreamingTokenBudgetSampler（TQ 控制器侧）│
+   │ · 按完整 GRPO 组（n_samples 个）攒样本    │
+   │ · 按 token 总量在各 DP 间均衡             │
+   │ · 凑够一个 token 预算 → 切出一个 mb       │
+   └──────────────────┬────────────────────────┘
+                      │ 按 batch_index 缓存（所有 DP 一次性算好）
+   ┌──────────────────┴────────────────────┐
+   │ StreamingTQIterator（Actor 侧）       │
+   │ · 逐个拉 mb，直到 StopIteration       │
+   │ · 拉到 mb N 后，后台预热 mb N+1 的缓存│
+   └──────────────────┬────────────────────┘
+                      │
+        流式调度（streaming_schedules.py，支持 PP=1 / PP>1）
+```
+
+- **Sampler（`StreamingTokenBudgetSampler`）**：运行在 TransferQueue 控制器侧。它把就绪样本按完整 GRPO 组（每组 `n_samples_per_prompt` 个）攒起来，按 token 总量在各 DP 间均衡后，凑够一个 token 预算就切出一个 micro-batch。
+- **按 `batch_index` 对齐缓存**：某个 `batch_index` 第一次被请求时，Sampler **一次性为所有 DP 算好各自的切片并缓存**。这样无论哪个 DP、哪个 PP stage、以什么顺序来取，拿到的数据都完全一致——保证 PP>1 时各 stage 步调一致、micro-batch 数对齐。
+- **Iterator（`StreamingTQIterator`）**：运行在 Actor 侧，逐个拉取 micro-batch，直到分区数据消费完（`StopIteration`）。拉到 mb N 后会在后台**预热** mb N+1 的缓存，让下一次拉取直接命中、减少等待。
+
+### 与流式调度配合
+
+micro-batch 数事先未知，由 Iterator 拉到 `StopIteration` 为止。因此 fully-async + 动态 batch 使用专门的流式 forward/backward 调度（`relax/backends/megatron/streaming_schedules.py`），分别支持 PP=1 与 PP>1；所有 micro-batch 累积梯度，在末尾统一做一次梯度同步。
+
+::: tip
+动态 batch 主要收益是把变长样本打满 GPU、提升 MFU。注意 `max_staleness=0` 时，每步训练开始仍需等 Rollout 产出第一批完整 GRPO 组；要让 Rollout 提前跑、消除这段等待，配合 `max_staleness>=1` 使用。
+:::
+
+______________________________________________________________________
+
 ## 训练循环
 
 ### Actor 训练循环
@@ -457,6 +505,8 @@ ______________________________________________________________________
 | `--checkpoint-engine-backend`  | `nccl`  | DCS 通信后端（`nccl` 或 `gloo`）                                        |
 | `--polling-mode`               | `true`  | TransferQueue Controller 使用轮询模式获取元数据                         |
 | `--ref-update-interval`        | `None`  | 参考模型更新周期（None=不更新）                                         |
+| `--use-dynamic-batch-size`     | `false` | 按 token 预算流式打包 micro-batch（见「动态 Batch Size」）              |
+| `--max-tokens-per-gpu`         | `None`  | 每张 GPU 每个 micro-batch 的 token 预算（启用动态 batch 时必填）        |
 | `--resource`                   | -       | JSON 格式角色资源分配，如 `'{"actor": [1, 2], "rollout": [1, 4], ...}'` |
 
 ### 配置示例

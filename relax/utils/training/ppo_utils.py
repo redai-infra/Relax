@@ -184,6 +184,69 @@ def compute_sapo_loss(
 
 
 @torch.compile(dynamic=True)
+def compute_cispo_loss(
+    log_probs: torch.Tensor,
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes the CISPO (Clipped Importance-ratio Soft Policy Optimization)
+    loss.
+
+    Unlike PPO which zeros out gradients when the importance ratio exceeds
+    the clipping threshold, CISPO preserves the gradient direction but caps
+    the gradient magnitude via a stop-gradient'd coefficient.
+
+    The key formulation:
+        ratio = π_new / π_old = exp(-ppo_kl)
+        coef  = clamp(ratio, ...) based on advantage sign
+        loss  = -stop_grad(coef) * stop_grad(A) * log_probs
+
+    Gradients flow ONLY through `log_probs`, not through the ratio or advantages.
+    Reference: MiniMax-M1 (arXiv:2501.15116).
+
+    Args:
+        log_probs: Current policy log-probabilities (gradient source).
+            Shape: [total_tokens]
+        ppo_kl: KL divergence approximation (old_log_probs - new_log_probs).
+            Shape: [total_tokens]. Used only for ratio computation (detached).
+        advantages: Advantage values, shape matches log_probs.
+        eps_clip: Lower clipping margin (ratio lower bound = 1 - eps_clip).
+        eps_clip_high: Upper clipping margin (ratio upper bound = 1 + eps_clip_high).
+
+    Returns:
+        pg_loss: Element-wise CISPO loss tensor (negative objective for minimization).
+            Shape matches input. NO reduction applied (caller handles masking).
+        clipfrac: Element-wise indicator of tokens where ratio exceeds bounds.
+            Shape matches input.
+    """
+    # Importance ratio: r(θ) = π_new / π_old = exp(-ppo_kl)
+    ratio = torch.exp(-ppo_kl)
+
+    upper = 1.0 + eps_clip_high
+    lower = 1.0 - eps_clip
+
+    # Asymmetric clipping based on advantage sign:
+    #   A >= 0: cap ratio from above → coef = min(ratio, 1 + eps_clip_high)
+    #   A <  0: cap ratio from below → coef = max(ratio, 1 - eps_clip)
+    coef_pos = torch.clamp(ratio, max=upper)
+    coef_neg = torch.clamp(ratio, min=lower)
+    coef = torch.where(advantages >= 0, coef_pos, coef_neg)
+    del coef_pos, coef_neg
+
+    # CISPO objective: gradient flows ONLY through log_probs.
+    # coef and advantages are detached to prevent extra gradient paths.
+    pg_loss = -(coef.detach() * advantages.detach() * log_probs)
+
+    # Clipfrac: fraction of tokens where ratio exceeds trust-region bounds
+    clipfrac = ((advantages >= 0) & (ratio > upper)).float() + ((advantages < 0) & (ratio < lower)).float()
+    del ratio, coef
+
+    return pg_loss, clipfrac
+
+
+@torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,

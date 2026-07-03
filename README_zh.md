@@ -19,8 +19,11 @@
   <a href="https://redai-infra.github.io/Relax">
     <img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Documentation">
   </a>
-  <a href="https://my.feishu.cn/wiki/ZcTQwrmwbiWRhvkgcMxciefHn7f" target="_blank">
+  <a href="https://github.com/redai-infra/Relax/discussions/48" target="_blank">
     <img src="https://img.shields.io/badge/WeChat-green?logo=wechat" alt="WeChat QR">
+  </a>
+  <a href="https://github.com/redai-infra/Relax/discussions/30" target="_blank">
+    <img src="https://img.shields.io/badge/Docker-Image-blue?logo=docker" alt="Docker Image">
   </a>
 </p>
 
@@ -88,12 +91,13 @@ ______________________________________________________________________
 
 ## 🧠 支持的算法
 
-| 算法                       | 类型     | 描述                               |
-| :------------------------- | :------- | :--------------------------------- |
-| **GRPO**                   | 策略优化 | Group Relative Policy Optimization |
-| **GSPO**                   | 策略优化 | Group Sample Policy Optimization   |
-| **SAPO**                   | 策略优化 | Sample-Aware Policy Optimization   |
-| **On-Policy Distillation** | 知识迁移 | 基于 KL 惩罚的师生蒸馏             |
+| 算法                       | 类型     | 描述                                              |
+| :------------------------- | :------- | :------------------------------------------------ |
+| **GRPO**                   | 策略优化 | Group Relative Policy Optimization                |
+| **GSPO**                   | 策略优化 | Group Sample Policy Optimization                  |
+| **SAPO**                   | 策略优化 | Sample-Aware Policy Optimization                  |
+| **CISPO**                  | 策略优化 | Clipped Importance-ratio Soft Policy Optimization |
+| **On-Policy Distillation** | 知识迁移 | 基于 KL 惩罚的师生蒸馏                            |
 
 > 📖 添加新算法非常简单 — 实现一个服务类，注册到 `ALGOS` 注册表即可。
 
@@ -103,15 +107,16 @@ ______________________________________________________________________
 
 Relax 专为**全模态强化学习训练**设计 —— 文本、视觉、音频统一框架。通过 `--multimodal-keys` 参数灵活配置多模态数据，框架内置了完整的图像、视频、音频处理管线（`relax/utils/multimodal/`），支持图像 token 数量控制、视频帧率采样、音频采样率等精细调节。
 
-| 模型系列       | 规模              | 模态               | 典型任务                                 | 后端     |
-| :------------- | :---------------- | :----------------- | :--------------------------------------- | :------- |
-| **Qwen3**      | 4B, 30B-A3B (MoE) | 文本               | 数学推理、代码生成、多轮对话、工具调用   | Megatron |
-| **Qwen3-VL**   | 4B, 30B-A3B       | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
-| **Qwen3.5**    | 30B-A3B           | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
-| **Qwen3-Omni** | 30B-A3B           | 文本 + 视觉 + 音频 | 图文音频联合问答、全模态理解             | Megatron |
-| **Qwen3.6**    | 35B-A3B (MoE)     | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
-| **GLM5**       | 744B-A40B (MoE)   | 文本               | 数学推理、代码生成、多轮对话             | Megatron |
-| **Kimi K2.6**  | ~1T-A32B (MoE)    | 视觉 + 语言        | 视觉问答、多模态推理；支持 INT4 QAT 训练 | Megatron |
+| 模型系列       | 规模                                                        | 模态               | 典型任务                                 | 后端     |
+| :------------- | :---------------------------------------------------------- | :----------------- | :--------------------------------------- | :------- |
+| **Qwen3**      | 4B, 30B-A3B (MoE)                                           | 文本               | 数学推理、代码生成、多轮对话、工具调用   | Megatron |
+| **Qwen3-VL**   | 4B, 30B-A3B                                                 | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
+| **Qwen3.5**    | 30B-A3B                                                     | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
+| **Qwen3-Omni** | 30B-A3B                                                     | 文本 + 视觉 + 音频 | 图文音频联合问答、全模态理解             | Megatron |
+| **Qwen3.6**    | 35B-A3B (MoE)                                               | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
+| **GLM5**       | 744B-A40B (MoE)                                             | 文本               | 数学推理、代码生成、多轮对话             | Megatron |
+| **Kimi K2.6**  | ~1T-A32B (MoE)                                              | 视觉 + 语言        | 视觉问答、多模态推理；支持 INT4 QAT 训练 | Megatron |
+| **dots.mcore** | [dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr) | 视觉 + 语言        | OCR、文档理解、多模态推理                | Megatron |
 
 > 📖 新模型架构通过 [Megatron Bridge](relax/backends/megatron/mbridge/) 接入，自动完成 HF ↔ Megatron 权重转换。
 

@@ -1,7 +1,9 @@
 import random
+import socket
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
@@ -54,6 +56,19 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         create_gloo_process_groups=args.use_gloo_process_groups,
     )
 
+    try:
+        host_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        host_ip = "unknown"
+    logger.info(
+        f"[mpu] rank={torch.distributed.get_rank()} "
+        f"tp={mpu.get_tensor_model_parallel_rank()} "
+        f"cp={mpu.get_context_parallel_rank()} "
+        f"pp={mpu.get_pipeline_model_parallel_rank()} "
+        f"ep={mpu.get_expert_model_parallel_rank()} "
+        f"ip={host_ip}"
+    )
+
 
 def init(args):
     set_args(args)
@@ -70,6 +85,18 @@ def init(args):
 
     # Pytorch distributed.
     _initialize_distributed(args)
+
+    # DEBUG: verify which backend each parallel group uses (nccl vs gloo).
+    # Remove once the broadcast_object_list UnicodeDecodeError issue is diagnosed.
+    rank = dist.get_rank()
+    logger.info(
+        "[backend-check] rank=%d WORLD=%s TP=%s PP=%s DP=%s",
+        rank,
+        dist.get_backend(),
+        dist.get_backend(mpu.get_tensor_model_parallel_group()),
+        dist.get_backend(mpu.get_pipeline_model_parallel_group()),
+        dist.get_backend(mpu.get_data_parallel_group()),
+    )
 
     # https://github.com/NVIDIA/Megatron-LM/issues/1563
     assert np.__version__.startswith("1."), "Megatron does not support numpy 2.x"

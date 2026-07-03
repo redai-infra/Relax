@@ -12,10 +12,27 @@ from omegaconf import OmegaConf
 from ray import serve
 from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
 
-from relax.components.genrm import register_genrm
+
+try:
+    from transfer_queue import StreamingTokenBudgetSampler
+except ImportError as e:
+    raise ImportError(
+        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
+        '    pip install "transferqueue @ git+https://github.com/redai-infra/'
+        'TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps\n'
+        "or use the latest image."
+    ) from e
+
+from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
+from relax.agentic.session.service import (
+    deploy_agentic_chat_api_services,
+    shutdown_agentic_chat_api_services,
+)
+from relax.core.optional_roles import register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
+from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.health_system import HealthManager
@@ -24,13 +41,14 @@ from relax.utils.misc import load_function
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
 
+def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
+    """Skip rollout_manager wiring in SFT-only mode (no rollout role)."""
+    return ROLES.rollout in serve_dict
+
+
 logger = get_logger(__name__)
 
 ACTOR_ROLLOUT_PG_ROLES = [ROLES.actor, ROLES.rollout, "genrm"]
-
-
-def register_extra_roles(config, algo: dict) -> list[str]:
-    return register_genrm(config, algo)
 
 
 class Controller:
@@ -52,6 +70,10 @@ class Controller:
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
 
+        # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
+        # is launched (RL is resolved later in placement_group.py).
+        resolve_sft_num_rollout(self.config)
+
         # Initialize data management system
         self._initialize_data_system()
         self.dcs, self.config.coordinator_url = create_dcs_deployment()
@@ -60,6 +82,11 @@ class Controller:
         if self._metrics_service_enabled:
             self._deploy_metrics_service()
 
+        if self.config.use_agentic_rollout and not self.config.debug_train_only:
+            deploy_agentic_chat_api_services(
+                config=self.config,
+                runtime_env=self.runtime_env,
+            )
         self._autoscaler_config = None
         try:
             self.register_all_serve()
@@ -78,16 +105,31 @@ class Controller:
 
         # Start health management with service restart callback
         if self._health_check_enabled:
-            self._health_manager.start(on_unhealthy=self._on_service_unhealthy)
+            self._health_manager.start(
+                on_unhealthy=self._on_service_unhealthy,
+                on_fatal=self._on_service_fatal,
+            )
             logger.info("Global health check system enabled")
         else:
             logger.info("Global health check system disabled (use --use-health-check to enable)")
 
     def _initialize_data_system(self):
+        algo_key = resolve_sft_algo_key(self.config)
         total_storage_size = (
             self.config.rollout_batch_size * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
-        if getattr(self.config, "balance_data", False):
+        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+            # Fully-async + dynamic-batch path streams data per DP via token
+            # budget; the controller-side sampler maintains per-DP buckets and
+            # balances tokens at small-unit granularity.  See
+            # docs/draft/dynamic_batch_size_fully_async.md.
+            sampler = StreamingTokenBudgetSampler(
+                n_samples_per_prompt=self.config.n_samples_per_prompt,
+            )
+            logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
+        elif algo_key == "sft" or getattr(self.config, "balance_data", False):
+            # SFT walks the SeqlenBalancedSampler branch (sequential / balanced sampling),
+            # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.
             dp_size = compute_dp_size(self.config)
             sampler = SeqlenBalancedSampler(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
@@ -193,6 +235,19 @@ class Controller:
         logger.warning(f"Service '{role}' detected as unhealthy, initiating restart...")
         self.restart_serve(role)
 
+    def _on_service_fatal(self, role: str, error_msg: str) -> None:
+        """Callback when a service reports a fatal (non-recoverable) error.
+
+        Runs immediately before the HealthChecker calls ``os._exit(1)`` — used
+        to push the error to the metrics service for Apprise so the operator
+        gets a notification before the process dies.
+        """
+        logger.error(f"Fatal error from service '{role}': {error_msg}")
+        try:
+            self._report_error_to_metrics_service(RuntimeError(f"{role}: {error_msg}"))
+        except Exception as e:
+            logger.warning(f"Failed to report fatal error to metrics service: {e}")
+
     def _create_service_task(self, role, cls, num_gpus, data_source, actor_rollout_pgs):
         """Create a single service.
 
@@ -257,26 +312,31 @@ class Controller:
             )
 
     def register_all_serve(self):
-        if self.config.advantage_estimator not in ALGOS:
-            raise ValueError(
-                f"Advantage estimator '{self.config.advantage_estimator}' not found in ALGOS. Available: {list(ALGOS.keys())}"
-            )
-        algo: dict = ALGOS.get(self.config.advantage_estimator).copy()
+        algo_key = resolve_sft_algo_key(self.config)
+        if algo_key not in ALGOS:
+            raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
+        algo: dict = ALGOS.get(algo_key).copy()
         ROLES = process_role(self.config)
 
-        # Register optional services (e.g., GenRM)
+        # Fail-fast on missing SFT producer role; without this the train
+        # workers silently block on TransferQueue forever.
+        validate_sft_resource(self.config)
+        # Register optional services (e.g., GenRM, SFT-side rollout)
         extra_roles = register_extra_roles(self.config, algo)
 
-        colocate = self.config.colocate and hasattr(ROLES, "rollout") and hasattr(ROLES, "actor")
+        roles_iter = list(ROLES) + extra_roles
+        role_names = {str(r) for r in roles_iter}
+        # SFT path returns ROLES_SFT_ONLY (no `rollout` attr); rollout may be
+        # injected via extra_roles — gate on the unified name set, not the enum.
+        colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
 
         roles_to_create = []
-        roles_iter = list(ROLES) + extra_roles
         for role in roles_iter:
             cls = algo.get(role)
             if cls is None:
                 logger.warning(f"No class registered for role '{role}', skipping")
                 continue
-            if hasattr(ROLES, "rollout") and role == ROLES.rollout:
+            if str(role) == "rollout":
                 data_source_cls = load_function(self.config.data_source_path)
                 data_source = ray.remote(num_cpus=1)(data_source_cls).remote(self.config)
             else:
@@ -400,6 +460,15 @@ class Controller:
         except Exception as e:
             logger.error(f"Failed to report error to metrics service: {e}")
 
+    def _shutdown_agentic_rollout_services(self, *, warning_prefix: str = "") -> None:
+        if not self.config.use_agentic_rollout:
+            return
+        shutdown_agentic_chat_api_services()
+        try:
+            clear_agentic_runtime_caches()
+        except Exception as e:
+            logger.warning(f"{warning_prefix}Failed to clear agentic runtime caches: {e}")
+
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
@@ -412,10 +481,11 @@ class Controller:
 
                 # Always set rollout_manager for both sync and async modes
                 # (needed for scaled-out engine weight sync in fully_async mode)
-                rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
-                await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
+                if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
+                    rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
+                    await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
 
-                if self.config.fully_async and not self.config.hybrid:
+                if self.config.fully_async and not self.config.hybrid and ROLES.actor in self.serve_dict:
                     # Pure fully_async: actor sends weights to separate actor_fwd/reference services
                     # via checkpoint engine. Hybrid mode skips this because the actor handles
                     # ref/actor_fwd internally via _switch_model.
@@ -425,9 +495,10 @@ class Controller:
                     if ROLES.reference in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
                     [await handle for handle in handles]
-                step = await self.serve_dict[ROLES.actor].get_step()
-                for service in self.serve_dict.values():
-                    await service.set_step(step)
+                if ROLES.actor in self.serve_dict:
+                    step = await self.serve_dict[ROLES.actor].get_step()
+                    for service in self.serve_dict.values():
+                        await service.set_step(step)
 
             task_refs = []
             service_names = []
@@ -507,6 +578,8 @@ class Controller:
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
+        self._shutdown_agentic_rollout_services()
+
         logger.info("Controller shutdown complete.")
 
     def add_serve(self, role: str) -> None:
@@ -539,8 +612,18 @@ class Controller:
         """
         logger.info(f"Restarting service '{role}'...")
         serve.delete(role)
-        algo = ALGOS.get(self.config.advantage_estimator).copy()
-        # Include dynamically added genRM
+        # Must mirror register_all_serve's algo-key resolution. SFT mode is
+        # identified by ``loss_type == "sft"``, not by ``advantage_estimator``
+        # (Megatron's parser doesn't accept "sft" as an --advantage-estimator
+        # choice), so looking the algo up under ``advantage_estimator`` here
+        # silently misses the {sft, actor} dict, hits the cls-is-None skip
+        # below, leaves the unhealthy flag set, and the health checker spins
+        # restart attempts forever on a service that was already deleted.
+        algo_key = resolve_sft_algo_key(self.config)
+        if algo_key not in ALGOS:
+            raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
+        algo: dict = ALGOS.get(algo_key).copy()
+        # Include dynamically added optional roles.
         register_extra_roles(self.config, algo)
         cls = algo.get(role)
         if cls is None:
@@ -677,6 +760,8 @@ class Controller:
                 logger.info("[Global Restart] Deleted metrics deployment")
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete metrics deployment: {e}")
+
+        self._shutdown_agentic_rollout_services(warning_prefix="[Global Restart] ")
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:

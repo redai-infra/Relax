@@ -17,6 +17,7 @@ from ray import serve
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.utils import telemetry
 from relax.utils.http_utils import _wrap_ipv6
 
 
@@ -374,10 +375,23 @@ class Rollout(Base):
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
 
+    async def _run_eval_with_mark(self, rollout_id: int) -> None:
+        telemetry.mark_eval_begin(rollout_id, role="rollout")
+        try:
+            await self.rollout_manager.eval.remote(rollout_id=rollout_id)
+        finally:
+            telemetry.mark_eval_end(rollout_id, role="rollout")
+
     async def _async_run(self) -> None:
+        from relax.engine.sft.runtime import is_sft_mode
+
+        # SFT-with-rollout: Rollout is a passive SGLang server that responds to
+        # HTTP /predict and /evaluate driven by the Actor. No RL rollout loop.
+        if is_sft_mode(self.config):
+            return
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
-                await self.rollout_manager.eval.remote(rollout_id=0)
+                await self._run_eval_with_mark(rollout_id=0)
             while True:
                 local_step = self.step
 
@@ -504,13 +518,24 @@ class Rollout(Base):
         try:
             if self._should_eval(train_step):
                 self._logger.info(f"Evaluating train_step {train_step}")
-                self.eval_handler = self.rollout_manager.eval.remote(rollout_id=train_step)
+                self.eval_handler = asyncio.ensure_future(self._run_eval_with_mark(rollout_id=train_step))
             return {"status": "ok", "rollout_id": train_step}
         except Exception as e:
             error_msg = f"Evaluation failed for train_step {train_step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("rollout", error_msg)
             return {"status": "error", "message": error_msg}
+
+    @app.get("/predict")
+    async def predict(self, train_step: int):
+        """Periodic SFT predict pass — symmetric with /evaluate.
+
+        Body lives in ``relax.engine.sft.predict.runner.handle_predict``;
+        this method is the thin HTTP-decoration shell.
+        """
+        from relax.engine.sft.predict.runner import handle_predict
+
+        return await handle_predict(self, train_step)
 
     @app.get("/can_do_update_weight_for_async")
     async def can_do_update_weight_for_async(self):
@@ -527,6 +552,18 @@ class Rollout(Base):
         return 0
 
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
+        # The final rollout has already left the producer loop; there is no
+        # in-flight generation to pause before syncing weights for final eval.
+        if step >= self.config.num_rollout:
+            return True
+
+        # No-preset-global-batch path: a tensor-wide .all() flips True as soon as
+        # activated rows are produced (even mid-fill across steps), admitting an
+        # under-filled partition. Gate on the explicit producer completion signal.
+        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+            return await self.data_system_client.async_check_production_completed(
+                f"train_{step - 1}"
+            ) or await self.data_system_client.async_check_production_completed(f"train_{step}")
         return await self.data_system_client.async_check_production_status(
             ["tokens"], f"train_{step - 1}"
         ) or await self.data_system_client.async_check_production_status(["tokens"], f"train_{step}")
@@ -537,6 +574,8 @@ class Rollout(Base):
         failure)."""
         if self.eval_handler is None:
             return {"done": True}
+        if isinstance(self.eval_handler, asyncio.Future):
+            return {"done": self.eval_handler.done()}
         try:
             ready, _ = ray.wait([self.eval_handler], timeout=0)
         except Exception:

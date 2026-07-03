@@ -58,8 +58,9 @@ ROLLOUT_ARGS=(
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
+   --rollout-max-response-len 10240
    --rollout-max-prompt-len 2048
+   --rollout-max-context-len 12288
    --rollout-temperature 0.8
    --global-batch-size 256
    --multimodal-keys '{"image":"image"}'
@@ -83,13 +84,12 @@ PERF_ARGS=(
    # --micro-batch-size 16
    # --qkv-format bshd
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
-
+   --max-tokens-per-gpu 12288
    --no-rope-fusion
 )
 
 GRPO_ARGS=(
-   --use-kl-loss
+   # --use-kl-loss
    --advantage-estimator grpo
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
@@ -108,6 +108,10 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
    --clip-grad 1.0
+   --optimizer-cpu-offload
+   --overlap-cpu-optimizer-d2h-h2d
+   --use-precision-aware-optimizer
+
 )
 
 WANDB_ARGS=(
@@ -115,12 +119,12 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9b-GRPO-gpu8-hybrid-${MODE}-${now}
+   --tb-experiment-name qwen35-9b-GRPO-gpu8-${MODE}-${now}
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.6
+   --sglang-mem-fraction-static 0.8
 )
 
 MISC_ARGS=(
@@ -143,7 +147,7 @@ if [ ${MODE} = "hybrid-async" ]; then
         --resource '{"actor": [1, 4], "rollout": [1, 4]}'\
    --max-staleness 2 \
         --num-data-storage-units 1 \
-        --num-iters-per-train-update 8 \
+        --num-iters-per-train-update 2  \
          --balance-data \
         --hybrid \
         "${MODEL_ARGS[@]}" \

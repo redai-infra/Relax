@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.multimodal.stats import get_sample_multimodal_stats
 
 
 logger = get_logger(__name__)
@@ -192,14 +193,27 @@ def _summarize_multimodal_train_inputs(mm_train_inputs: dict) -> dict:
 
 
 def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: str | None = None) -> dict:
+    total_length = len(sample.tokens) if sample.tokens else 0
+    response_length = sample.response_length
+    prompt_length = max(total_length - response_length, 0)
+    multimodal_stats = get_sample_multimodal_stats(sample)
+    metadata = sample.metadata or {}
     record = {
         "rollout_id": rollout_id,
         "sample_index": idx,
         "prompt": sample.prompt,
         "response": sample.response,
         "reward": sample.reward,
-        "response_length": sample.response_length,
-        "total_length": len(sample.tokens) if sample.tokens else 0,
+        "prompt_length": prompt_length,
+        "response_length": response_length,
+        "total_length": total_length,
+        "prompt_token_count": prompt_length,
+        "response_token_count": response_length,
+        "total_token_count": total_length,
+        "image_count": multimodal_stats["image_count"],
+        "image_token_count": multimodal_stats["image_token_count"],
+        "multimodal_token_count": multimodal_stats["multimodal_token_count"],
+        "agent_turns": metadata.get("rollout_turns", 1),
         "status": sample.status.value if hasattr(sample.status, "value") else str(sample.status),
         "group_index": sample.group_index,
     }

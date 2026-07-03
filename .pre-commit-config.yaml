@@ -76,5 +76,6 @@ repos:
     rev: v8.24.2
     hooks:
       - id: gitleaks
-        entry: gitleaks git --pre-commit --redact --staged --verbose
+        entry: python .pre-commit-hooks/gitleaks_tracked.py
+        always_run: true
         pass_filenames: false

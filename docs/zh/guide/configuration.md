@@ -31,6 +31,7 @@
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--num-data-storage-units` | int | 1 | TransferQueue SimpleStorageUnit Actor 数量 |
+| `--per-rank-fetch` | flag | False | 让每个 TP/PP rank 都并行地各自从 TransferQueue 拉一份数据，省掉 rank-0 pickle + TP/PP broadcast。跨 rank 一致性依赖 TQ sampler 的 `(partition_id, task_name, dp_rank, batch_index)` 缓存（PP/TP 不变量）。当 `rollout_routed_experts` 出现在 `data_fields` 时自动禁用（jagged NestedTensor broadcast 路径不兼容）。多卡训练推荐配合 `--num-data-storage-units >= TP world size` 使用。在 pickle 主导 `tgd_bcast_tp_time` 时有收益。 |
 | `--max-staleness` | int | 0 | TransferQueue 数据系统的最大陈旧度（0=on-policy） |
 | `--polling-mode` | bool | True | 获取 metadata 时是否使用轮询模式 |
 | `--num-iters-per-train-update` | int | 1 | 全异步流水线中每个 global batch 的迭代次数 |
@@ -79,6 +80,7 @@
 | `--prompt-data` | str | None | 训练 Prompt 数据集路径 |
 | `--input-key` | str | input | 数据集中输入字段的 key |
 | `--label-key` | str | None | 数据集中标签字段的 key |
+| `--conversation-key-map` | json | None | 将非 OpenAI 格式的对话消息改写成 SFT 期望的 `{role, content}` 结构的 JSON 映射。一个扁平 map 同时覆盖两种重命名：**字段名重命名**（作用于每个消息 dict 的所有 key，例如 `from`→`role`、`value`→`content`）与 **role 值重命名**（仅作用于重命名后名为 `role` 字段的值，例如 `human`→`user`、`gpt`→`assistant`——因此消息正文中即使出现相同词也不会被误改）。仅在未设置 `--label-key`（即 `--input-key` 整列为完整的 messages list）时生效。sharegpt 示例：`'{"from":"role","value":"content","human":"user","gpt":"assistant"}'` |
 | `--metadata-key` | str | metadata | 数据集中元数据字段的 key |
 | `--tool-key` | str | tools | 应用 Chat Template 时的 tools 字段 key |
 | `--apply-chat-template` | flag | False | 将输入作为 OpenAI message 格式应用 Chat Template |
@@ -280,7 +282,7 @@
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--loss-type` | str | policy_loss | `policy_loss`, `custom_loss` | 损失类型。`custom_loss` 时需设置 `--custom-loss-function-path` |
+| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `custom_loss` | 损失类型。`policy_loss` 跑 PPO/GRPO 等 RL 训练；`sft` 跑监督微调（详见 [SFT 配置](#sft-配置)）；`custom_loss` 需配 `--custom-loss-function-path`。`sft_loss` 是 `sft` 的已弃用别名。 |
 | `--custom-loss-function-path` | str | None | - | 自定义损失函数路径 |
 | `--eps-clip` | float | 0.2 | - | PPO 裁剪范围（下界） |
 | `--eps-clip-high` | float | None | - | PPO 裁剪上界。None 时等于 `--eps-clip` |
@@ -351,6 +353,42 @@
 |------|------|--------|------|
 | `--only-train-params-name-list` | str (列表) | None | 要训练的参数名正则表达式列表。其余参数被冻结。不能与 `--freeze-params-name-list` 同时使用。示例：`--only-train-params-name-list experts` |
 | `--freeze-params-name-list` | str (列表) | None | 要冻结的参数名正则表达式列表。其余参数保持可训练。示例：`--freeze-params-name-list embedding output_layer` |
+
+---
+
+## SFT 配置
+
+以下参数仅在 `--loss-type sft` 下生效。SFT 流水线由 `SFTStreamingDataset` producer（把 packed 样本推入 TransferQueue 的 `sft_<rollout_id>` 分区）和 `MegatronTrainRayActor` consumer（训练、周期性 PPL eval、可选生成式 predict）组成。
+
+### 训练控制
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--eval-size` | float | None | 从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 末尾 5%）；值 ≥1 视为绝对样本数。被预留的尾部会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
+| `--sft-predict-interval` | int | None | 每 N 个 rollout step 在 eval 集上跑一次生成式 predict，把生成结果写到 `<save>/predict/predictions_step_<rollout_id>.jsonl`。设置该参数后会自动拉起 Rollout 角色（SGLang 必须在线）。它是 always-on 的 PPL eval（`--eval-interval`）的生成式补充。**必需**：`--save`（写到 `<save>/predict/` 下）以及至少一个 eval 数据源（`--eval-prompt-data` / `--eval-config` / `--eval-size`）。 |
+
+### 流式数据集预取
+
+SFT producer 用自己的 `PrefetchBuffer`，跟 rollout 数据源的 `--prefetch-*` 参数互相独立。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--sft-prefetch-buffer-size` | int | 256 | SFT 流式数据集 PrefetchBuffer 缓存的最大预加载样本数。设为 0 禁用预取，producer 会回退到基于 ProcessorPool 的 `asyncio.gather` 路径做 batch 级并行。 |
+| `--sft-prefetch-chunk-size` | int | 32 | 每轮派发给 SFT 预取线程池的 chunk 大小。 |
+| `--sft-prefetch-num-workers` | int | 4 | SFT PrefetchBuffer 内部用于 I/O 密集型媒体解码（视频/图像）的工作线程数。 |
+
+### 超长样本处理
+
+SFT producer 如何处理 tokenize + 多模态展开后长度超过单卡容量（`--max-tokens-per-gpu × --context-parallel-size`）的样本。所有分支都会给每个超长样本打一条 WARNING 日志。
+
+| 参数 | 类型 | 默认值 | 可选值 | 说明 |
+|------|------|--------|--------|------|
+| `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` 丢弃样本；`keep` 原样返回（可能下游 OOM）；`truncate_left` 保留末尾 `capacity` 个 token；`truncate_right` 保留开头 `capacity` 个 token；`custom` 委托给 `--sft-oversize-custom-function-path`。⚠ 直接截多模态样本可能导致 `multimodal_train_inputs` 错位——需要同时裁剪媒体输入时请用 `custom`。 |
+| `--sft-oversize-custom-function-path` | str | None | - | 在 `--sft-oversize-strategy custom` 时必填。指向一个 Python 可导入函数，签名为 `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`。返回 `None` 等同于 `skip`。 |
+
+::: tip 相关数据集参数
+SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--input-key`、`--label-key`、`--conversation-key-map`（sharegpt 风格数据集）、`--multimodal-keys`、`--system-prompt`、`--tool-key`。
+:::
 
 ---
 

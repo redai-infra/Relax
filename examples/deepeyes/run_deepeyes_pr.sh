@@ -96,7 +96,6 @@ ROLLOUT_ARGS=(
 PARTIAL_ROLLOUT_ARGS=(
    --partial-rollout
    --over-sampling-batch-size 48
-   --mask-offpolicy-in-partial-rollout
    --partial-rollout-max-aborted-count 3
 )
 

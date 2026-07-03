@@ -221,6 +221,18 @@ Relax 预留内存以防止碎片化。调整预留量：
 --sglang-mem-fraction-static 0.7  # 从 0.8 下调
 ```
 
+### 12. 平衡 Pipeline Parallel 各 stage 的层数
+
+启用 PP 后如果发现各 stage 显存占用明显不均，通常是最后一个 stage 占用更多（需要承担 loss 计算、输出 embedding 等额外开销）。可以通过把更多层放到第一个 stage 来减轻最后一个 stage 的负担：
+
+```bash
+# 例：Qwen3.5 35B 共 40 层，PP=2
+# 默认均分时每 stage 20 层，最后一个 stage 容易 OOM
+--decoder-first-pipeline-num-layers 30
+```
+
+类似地可以使用 `--decoder-last-pipeline-num-layers` 单独减少最后一个 stage 的层数。调整时建议小步迭代，每次只移动 1~2 层并观察各 stage 的显存水位。
+
 ---
 
 ## 特定阶段的 OOM
@@ -235,6 +247,7 @@ Relax 预留内存以防止碎片化。调整预留量：
 3. 降低 `--max-tokens-per-gpu`
 4. 启用 `--recompute-loss-function`
 5. 尝试 `--optimizer-cpu-offload`
+6. 如果开了 PP 且最后一个 stage 显存明显更高，用 `--decoder-first-pipeline-num-layers` 把更多层放到第一个 stage
 
 ### Log Probs 计算 OOM
 
@@ -283,6 +296,7 @@ Relax 预留内存以防止碎片化。调整预留量：
 | 分析显存使用 | `--profile-with-memory` |
 | 调整内存预留 | `--train-memory-margin-bytes <字节数>` |
 | SGLang 显存（colocate） | `--sglang-mem-fraction-static <比例>` |
+| 平衡 PP stage 层数 | `--decoder-first-pipeline-num-layers <层数>` |
 
 ---
 

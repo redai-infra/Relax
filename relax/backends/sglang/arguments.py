@@ -278,6 +278,19 @@ def add_sglang_arguments(parser):
             "Mutually exclusive with --prefill-num-servers."
         ),
     )
+    parser.add_argument(
+        "--sglang-external-model-package",
+        type=str,
+        default=None,
+        help=(
+            "Python package containing external SGLang model and processor for "
+            "registration via SGLANG_EXTERNAL_MODEL_PACKAGE env var. "
+            "The package should contain modules with EntryClass (model) and/or "
+            "BaseMultimodalProcessor subclasses (processor). "
+            "The multimodal architecture name is auto-derived from EntryClass. "
+            "Example: relax.models.dots_ocr.sglang"
+        ),
+    )
 
     return parser
 
