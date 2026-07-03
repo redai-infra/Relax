@@ -57,7 +57,7 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-For more details on Docker releases, see [Docker README](https://github.com/redai-infra/Relax/blob/develop/docker/README.md).
+For more details on Docker releases, see [Docker README](https://github.com/redai-infra/Relax/blob/main/docker/README.md).
 
 ### Method 2: Install from Source
 

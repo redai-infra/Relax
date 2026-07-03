@@ -57,7 +57,7 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-更多 Docker 发布信息请参见 [Docker README](https://github.com/redai-infra/Relax/blob/develop/docker/README.md)。
+更多 Docker 发布信息请参见 [Docker README](https://github.com/redai-infra/Relax/blob/main/docker/README.md)。
 
 ### 方法 2：从源码安装
 
