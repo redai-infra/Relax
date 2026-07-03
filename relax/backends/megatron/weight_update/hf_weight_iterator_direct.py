@@ -17,6 +17,9 @@ from .common import all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
+_NON_BLOCKING = device_utils.use_non_blocking_copy()
+
+
 class HfWeightIteratorDirect(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -57,7 +60,7 @@ def _get_megatron_full_params(
             params.append(
                 torch.nn.Parameter(
                     megatron_local_weights[info.name].to(
-                        device=device_utils.make_current_torch_device(), non_blocking=True
+                        device=device_utils.make_current_torch_device(), non_blocking=_NON_BLOCKING
                     ),
                     requires_grad=False,
                 )

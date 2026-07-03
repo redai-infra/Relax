@@ -196,7 +196,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "reinforce_plus_plus_baseline"]
+        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
         # group norm
@@ -209,7 +209,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         mean = rewards.mean(dim=-1, keepdim=True)
         rewards = rewards - mean
 
-        if args.advantage_estimator in ["grpo", "gspo", "sapo"] and args.grpo_std_normalization:
+        if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
             std = rewards.std(dim=-1, keepdim=True)
             rewards = rewards / (std + 1e-6)
 
@@ -333,7 +333,15 @@ def post_process_env(args, env):
     if "env_vars" not in env or not isinstance(env["env_vars"], dict):
         env["env_vars"] = {}
 
-    env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(args.rollout_batch_size * args.n_samples_per_prompt)
+    # Dynamic-batch streaming ends via the producer's is_last signal, not a
+    # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
+    # The non-dynamic path still pre-allocates the exact count for its .all() check.
+    if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
+        env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
+            args.rollout_batch_size * args.n_samples_per_prompt
+        )  ## * args.max_num_agents
+    else:
+        env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(args.rollout_batch_size * args.n_samples_per_prompt)
     env["env_vars"]["TQ_ZERO_COPY_SERIALIZATION"] = "true"
     env["env_vars"]["SLIME_HOST_IP"] = _resolve_to_ip(os.getenv("MASTER_ADDR", "127.0.0.1"))
 
@@ -439,6 +447,7 @@ async def transfer_batch_to_data_system(
     batch_count: int,
     rollout_id: int,
     data_system_client: Any,
+    is_last: bool = False,
 ) -> None:
     """Helper function to transfer a batch of samples to the data system
     client.
@@ -448,6 +457,9 @@ async def transfer_batch_to_data_system(
         batch_count: Batch sequence number
         rollout_id: Rollout identifier
         data_system_client: Client for async data transfer
+        is_last: Mark this as the final batch of the partition train_{rollout_id}
+            so the data system can detect streaming end-of-stream without a preset
+            global batch size. See the is_last bookkeeping in generate_rollout.
     """
     try:
         # Guard against empty batch_samples
@@ -467,16 +479,18 @@ async def transfer_batch_to_data_system(
         rollout_batch = convert_samples_to_train_data(args, batch_samples)
         logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
-        metadata = await data_system_client.async_put(data=rollout_batch, partition_id=f"train_{rollout_id}")
 
-        # Store total_lengths in custom_meta so that the TransferQueue sampler
-        # can use it for seqlen-balanced partitioning across DP ranks.
-        if metadata and metadata.size > 0:
-            total_lengths = rollout_batch.get("total_lengths", None)
-            if total_lengths is not None:
-                custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths]
-                metadata.update_custom_meta(custom_meta)
-                await data_system_client.async_set_custom_meta(metadata)
+        # Store total_lengths in custom_meta so the TransferQueue sampler can use it
+        # for seqlen-balanced / token-budget partitioning across DP ranks. Pass it
+        # inline to async_put so it lands ATOMICALLY with the samples becoming ready
+        # (otherwise a streaming consumer can fetch a ready sample before its
+        # total_lengths is set, forcing the sampler into a 1-sample-per-microbatch
+        # fallback and defeating dynamic batching).
+        total_lengths = rollout_batch.get("total_lengths", None)
+        custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths] if total_lengths is not None else None
+        await data_system_client.async_put(
+            data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
+        )
 
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
@@ -487,8 +501,10 @@ async def transfer_batch_to_data_system(
 def process_args(args: Namespace, role: str) -> None:
     """Process args for reference actor and actor fwd."""
     # Adjust max tokens per GPU for reference actor and actor fwd
-    for key in args.ref_actor_config:
-        setattr(args, key, args.ref_actor_config[key])
+    if args.ref_actor_config is not None:
+        for key in args.ref_actor_config:
+            setattr(args, key, args.ref_actor_config[key])
+    args.max_tokens_per_gpu = args.log_probs_max_tokens_per_gpu
     args.only_load_weight = True
     if role == "reference":
         args.load = args.ref_load

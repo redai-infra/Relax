@@ -39,6 +39,7 @@ from relax.agentic.profile import (
 from relax.agentic.session.state import (
     FinalizedResultTransport,
     InflightRequest,
+    MsgNode,
     RequestKind,
     SessionForest,
     TrainingFieldArtifact,
@@ -918,10 +919,10 @@ class AgenticSessionShard:
             raise RuntimeError("AgenticSessionShard eval counter underflow.")
         return self._evaluating
 
-    def _session_stats(self, record: _SessionRecord | None) -> dict[str, int]:
-        forest = record.forest if record is not None else None
+    def _session_stats(self, record: _SessionRecord) -> dict[str, int]:
+        forest = record.forest
         return {
-            "request_count": len(record.irs_by_id) if record is not None else 0,
+            "request_count": len(record.irs_by_id),
             "node_count": len(forest.nodes_by_hash) if forest is not None else 0,
         }
 
@@ -1130,7 +1131,7 @@ class AgenticSessionShard:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
-    ) -> tuple[str | None, list[dict[str, Any]]]:
+    ) -> tuple[str, list[dict[str, Any]]]:
         normalized_messages = check_messages(messages)
         normalized_tools = normalize_tools(tools)
         for prefix_len in range(len(normalized_messages), 0, -1):
@@ -1141,7 +1142,30 @@ class AgenticSessionShard:
             )
             if prefix_hash in forest.nodes_by_hash:
                 return prefix_hash, normalized_messages[prefix_len:]
-        return None, normalized_messages
+        return forest.root_state_hash, normalized_messages
+
+    def _raise_if_observation_exceeds_context(
+        self,
+        *,
+        forest: SessionForest,
+        parent_state_hash: str,
+        observation_rollout_tokens: list[int],
+    ) -> None:
+        rollout_max_context_len = self.args.rollout_max_context_len
+        if rollout_max_context_len is None:
+            return
+        prompt_tokens = forest.rollout_token_count(parent_state_hash) + len(observation_rollout_tokens)
+        if prompt_tokens < int(rollout_max_context_len):
+            return
+        error = _openai_context_length_error_result(
+            max_context_len=rollout_max_context_len,
+            prompt_tokens=prompt_tokens,
+        )["error"]
+        raise AgenticChatRequestError(
+            error["message"],
+            code=error["code"],
+            param=error["param"],
+        )
 
     async def _append_subtree_root_observation(
         self,
@@ -1153,14 +1177,20 @@ class AgenticSessionShard:
         rollout_id: int,
     ) -> tuple[str, dict[str, float] | None]:
         normalized_messages = check_messages(messages)
+        root_state_hash = forest.root_state_hash
         encoded = await self._encode_messages(
             messages=normalized_messages,
             tools=normalize_tools(tools),
             chat_template_kwargs=chat_template_kwargs,
             multimodal_inputs=_message_multimodal_inputs(normalized_messages),
         )
+        self._raise_if_observation_exceeds_context(
+            forest=forest,
+            parent_state_hash=root_state_hash,
+            observation_rollout_tokens=list(encoded.backend_prompt_ids),
+        )
         subtree_root = forest.append_obs(
-            parent_state_hash=forest.root_state_hash,
+            parent_state_hash=root_state_hash,
             rollout_id=rollout_id,
             abort_count=0,
             messages_delta=normalized_messages,
@@ -1179,13 +1209,15 @@ class AgenticSessionShard:
         self,
         *,
         forest: SessionForest,
-        parent_state_hash: str | None,
+        parent_state_hash: str,
         obs_delta: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
         rollout_id: int,
     ) -> tuple[str, dict[str, float] | None]:
-        if parent_state_hash is None:
+        if not obs_delta:
+            return parent_state_hash, None
+        if parent_state_hash == forest.root_state_hash:
             return await self._append_subtree_root_observation(
                 forest=forest,
                 messages=obs_delta,
@@ -1193,25 +1225,31 @@ class AgenticSessionShard:
                 chat_template_kwargs=chat_template_kwargs,
                 rollout_id=rollout_id,
             )
-        if not obs_delta:
-            return parent_state_hash, None
         encoded_obs = await self.backend.compiler.encode_observation_delta(
             obs_delta,
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
             multimodal_inputs=_message_multimodal_inputs(obs_delta),
         )
-        parent_tools = forest.subtree_tools(parent_state_hash)
+        self._raise_if_observation_exceeds_context(
+            forest=forest,
+            parent_state_hash=parent_state_hash,
+            observation_rollout_tokens=list(encoded_obs.backend_prompt_ids),
+        )
+        parent_subtree_root = forest.subtree_root_node(parent_state_hash)
+        parent_tools = normalize_tools(parent_subtree_root.tools) if parent_subtree_root is not None else []
         if normalize_tools(tools) != parent_tools:
             raise RuntimeError(f"Session {forest.session_id!r} tools diverged inside an existing subtree")
-        parent_chat_template_kwargs = forest.subtree_chat_template_kwargs(parent_state_hash)
+        parent_chat_template_kwargs = (
+            normalize_template_kwargs(parent_subtree_root.chat_template_kwargs)
+            if parent_subtree_root is not None
+            else {}
+        )
         if normalize_template_kwargs(chat_template_kwargs) != parent_chat_template_kwargs:
             raise RuntimeError(
                 f"Session {forest.session_id!r} chat_template_kwargs diverged inside an existing subtree"
             )
-        parent_abort_count = 0
-        if parent_state_hash is not None and parent_state_hash in forest.nodes_by_hash:
-            parent_abort_count = forest.nodes_by_hash[parent_state_hash].abort_count
+        parent_abort_count = forest.nodes_by_hash[parent_state_hash].abort_count
         obs_node = forest.append_obs(
             parent_state_hash=parent_state_hash,
             rollout_id=rollout_id,
@@ -1339,15 +1377,12 @@ class AgenticSessionShard:
     def _mark_record_protected_locked(record: _SessionRecord) -> None:
         record.protected_until_finalize = True
         for ir in record.irs_by_id.values():
-            if hasattr(ir, "kind"):
-                ir.kind = RequestKind.PROTECTED
+            ir.kind = RequestKind.PROTECTED
         AgenticSessionShard._assert_protected_kind_invariant(record)
 
     @staticmethod
     def _assert_protected_kind_invariant(record: _SessionRecord) -> None:
         for ir in record.irs_by_id.values():
-            if not hasattr(ir, "kind"):
-                continue
             if record.protected_until_finalize and ir.kind != RequestKind.PROTECTED:
                 raise RuntimeError("Protected session contains a non-protected IR.")
             if not record.protected_until_finalize and ir.kind == RequestKind.PROTECTED:
@@ -1379,9 +1414,7 @@ class AgenticSessionShard:
         bootstrap_compiler_timing: dict[str, float] | None,
         observation_compiler_timing: dict[str, float] | None,
     ) -> InflightRequest:
-        parent_abort_count = 0
-        if parent_state_hash in record.forest.nodes_by_hash:
-            parent_abort_count = record.forest.nodes_by_hash[parent_state_hash].abort_count
+        parent_abort_count = record.forest.nodes_by_hash[parent_state_hash].abort_count
         request_kind = record.forest.resolve_request_kind(
             abort_count=parent_abort_count,
             resumed=False,
@@ -2022,24 +2055,12 @@ class AgenticSessionShard:
         self,
         *,
         record: _SessionRecord,
+        leaf_node: MsgNode,
         reward: float | dict[str, Any] | None,
         metadata: dict[str, Any] | None,
     ):
-        leaf_hashes = record.forest.export_leaf_hashes()
-        if not leaf_hashes:
-            raise RuntimeError(f"Session {record.forest.session_id!r} has no committed response")
-        if len(leaf_hashes) != 1:
-            raise RuntimeError(
-                f"Session {record.forest.session_id!r} currently supports exporting exactly one sample, "
-                f"got {len(leaf_hashes)}"
-            )
-        leaf_hash = leaf_hashes[0]
         metadata_patch = copy.deepcopy(metadata) if isinstance(metadata, dict) else {}
         finalize_started_at = time.time()
-        lineage = record.forest.lineage(leaf_hash)
-        if not any(node.kind == "resp" for node in lineage):
-            raise RuntimeError(f"Session {record.forest.session_id!r} has no committed response")
-        leaf_node = record.forest.nodes_by_hash[leaf_hash]
         leaf_profile = agentic_trace_events(leaf_node.export_metadata_patch)
         mark_agentic_event(leaf_profile, "finalize_start_at", finalize_started_at)
         if reward is not None:
@@ -2047,7 +2068,7 @@ class AgenticSessionShard:
         if metadata_patch:
             leaf_node.export_metadata_patch.update(metadata_patch)
         sample = record.forest.build_sample(
-            leaf_state_hash=leaf_hash,
+            leaf_state_hash=leaf_node.state_hash,
             tokenizer=self.backend.tokenizer,
             # mask_offpolicy_in_partial_rollout=bool(
             #     self.args.partial_rollout and self.args.mask_offpolicy_in_partial_rollout
@@ -2057,14 +2078,16 @@ class AgenticSessionShard:
         mark_metadata_agentic_event(sample.metadata, "finalize_end_at", finalize_ended_at)
         return sample
 
-    def _record_has_exportable_leaf(self, record: _SessionRecord) -> bool:
+    def _exportable_leaf_node(self, record: _SessionRecord) -> MsgNode | None:
         if record.forest is None:
-            return False
+            return None
         leaf_hashes = record.forest.export_leaf_hashes()
         if len(leaf_hashes) != 1:
-            return False
+            return None
         lineage = record.forest.lineage(leaf_hashes[0])
-        return any(node.kind == "resp" for node in lineage)
+        if not any(node.kind == "resp" for node in lineage):
+            return None
+        return lineage[-1]
 
     @staticmethod
     def _build_transport_from_sample(sample) -> FinalizedResultTransport:
@@ -2317,20 +2340,22 @@ class AgenticSessionShard:
                     status="discarded",
                     metadata={"discard_reason": "already_discarded"},
                 )
-            if not self._record_has_exportable_leaf(record):
+            leaf_node = self._exportable_leaf_node(record)
+            if leaf_node is None:
                 transport = FinalizedResultTransport(
                     status="non_finalizable",
                     metadata={"discard_reason": "no_committed_response"},
                 )
             else:
-                leaf_hashes = record.forest.export_leaf_hashes()
-                leaf_hash = leaf_hashes[0]
-                leaf_node = record.forest.nodes_by_hash.get(leaf_hash)
-                if leaf_node is not None:
-                    profile = agentic_trace_events(leaf_node.export_metadata_patch)
-                    mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
-                    mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
-                sample = self._finalize_sample_from_leaf(record=record, reward=reward, metadata=metadata)
+                profile = agentic_trace_events(leaf_node.export_metadata_patch)
+                mark_agentic_event(profile, "finalize_arrive_at", finalize_arrive_at)
+                mark_agentic_event(profile, "finalize_lock_acquired_at", finalize_lock_acquired_at)
+                sample = self._finalize_sample_from_leaf(
+                    record=record,
+                    leaf_node=leaf_node,
+                    reward=reward,
+                    metadata=metadata,
+                )
                 transport = self._build_transport_from_sample(sample)
             removed, stats, active_tasks, waiters, backend_request_ids = self._discard_session_locked(
                 session_id=session_id

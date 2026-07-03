@@ -23,7 +23,27 @@ def compute_pass_rate(
         return {}
 
     if num_groups is None:
+        # Caller doesn't know the group structure (e.g. streaming consumer whose
+        # per-DP slice may not be group-aligned).  Derive whole groups and drop
+        # any ragged remainder instead of asserting, so a non-multiple count
+        # never crashes the caller.  An empty result means nothing to report.
         num_groups = len(flat_rewards) // group_size
+        if num_groups == 0:
+            logger.warning(
+                "compute_pass_rate: %d rewards < group_size %d; skipping pass@k",
+                len(flat_rewards),
+                group_size,
+            )
+            return {}
+        usable = num_groups * group_size
+        if usable != len(flat_rewards):
+            logger.warning(
+                "compute_pass_rate: %d rewards not a multiple of group_size %d; truncating to %d for pass@k",
+                len(flat_rewards),
+                group_size,
+                usable,
+            )
+            flat_rewards = flat_rewards[:usable]
 
     pass_rate_name_list = [2**i for i in range(int(math.log2(group_size)) + 1)]
 

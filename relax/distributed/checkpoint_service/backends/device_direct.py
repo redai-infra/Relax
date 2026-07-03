@@ -112,6 +112,11 @@ class DeviceDirectBackend(CommBackend):
 
         # Ray actors for rollout communication
         self.rollout_engines: Dict[int, Any] = {}  # rank -> Ray actor handle
+        # Signature of the rollout topology the current engines + NCCL weight-update
+        # group were built for. When unchanged (and engines healthy), the group and
+        # proxy actors are reused across weight updates instead of being torn down
+        # and rebuilt every step. None forces a (re)build on the next update.
+        self._rollout_topology_signature: Optional[frozenset] = None
         device_utils.set_device(self.device)
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
@@ -120,6 +125,28 @@ class DeviceDirectBackend(CommBackend):
             from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
             self._bridge_converter = BridgeConverter(args=args, model=model, quantization_config=quantization_config)
+
+    @staticmethod
+    def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
+        """Build a stable signature of the rollout topology.
+
+        Two topologies with the same signature describe the same set of engines
+        (same rank, endpoint and per-engine GPU count, the latter affecting the
+        NCCL group world size), so the existing engines + weight-update group
+        can be reused without a teardown/rebuild.
+        """
+        sig = set()
+        for rank, info in rollout_topology.items():
+            meta = (info.get("metadata") or {}) if isinstance(info, dict) else {}
+            sig.add(
+                (
+                    int(rank),
+                    info.get("ip") if isinstance(info, dict) else None,
+                    info.get("port") if isinstance(info, dict) else None,
+                    meta.get("num_gpus_per_engine"),
+                )
+            )
+        return frozenset(sig)
 
     def _create_rollout_engines(self, rollout_topology: Dict[int, Dict[str, Any]]) -> None:
         """Create Ray actors for each rollout node.
@@ -297,6 +324,28 @@ class DeviceDirectBackend(CommBackend):
 
             self.rollout_topology = topology_data.get("nodes", {}).get("rollout", {})
 
+            # Fast path: when the rollout topology is unchanged and the engines are
+            # still healthy, reuse the existing proxy actors and NCCL weight-update
+            # group. We skip create/destroy/sleep/reinit entirely, and crucially do
+            # NOT send /destroy_weights_update_group or /init_weights_update_group to
+            # the rollout side either, so both ends keep the same persistent group.
+            new_sig = self._rollout_topology_signature_of(self.rollout_topology)
+            if (
+                self._model_update_groups is not None
+                and new_sig == self._rollout_topology_signature
+                and self.rollout_engines
+                and not self._healthcheck_rollout_engines()
+            ):
+                logger.info("Reusing rollout weight-update group (topology unchanged).")
+                return
+
+            # Rebuild path (first update, topology change, or an unhealthy engine):
+            # drop any stale engines/group before recreating, and invalidate the
+            # signature until the new group is successfully established.
+            if self.rollout_engines:
+                self._cleanup_rollout_engines()
+            self._rollout_topology_signature = None
+
             self._create_rollout_engines(self.rollout_topology)
             self._update_rollout_engines()
 
@@ -377,6 +426,10 @@ class DeviceDirectBackend(CommBackend):
                 raise RuntimeError(
                     f"Failed to init process group for rollout after {max_retries} attempts"
                 ) from last_error
+
+            # Group successfully (re)built — remember the topology it serves so the
+            # next update with the same topology takes the reuse fast path above.
+            self._rollout_topology_signature = new_sig
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
@@ -543,7 +596,11 @@ class DeviceDirectBackend(CommBackend):
                 logger.info("Resuming generation on all rollout nodes...")
                 self._batch_request("/continue_generation")
             dist.barrier(group=get_gloo_group())
-            self._cleanup_rollout_engines()
+            # NOTE: rollout proxy actors are intentionally kept alive across weight
+            # updates so init_process_group_for_rollout can reuse them (and the NCCL
+            # group) when the topology is unchanged. They are torn down only when the
+            # topology actually changes (inside init_process_group_for_rollout's
+            # rebuild path).
 
         # Release fragmented CUDA reserved memory left behind by the
         # all_gather + HF-convert buffers that were allocated and freed

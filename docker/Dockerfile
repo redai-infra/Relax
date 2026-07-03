@@ -97,7 +97,8 @@ COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \

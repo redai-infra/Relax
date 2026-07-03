@@ -76,6 +76,8 @@ The reasoning parser runs on assistant text. The tool-call parser runs only when
 
 `--agent-timeout` controls each managed-command agent session's active runtime budget in seconds. The budget is charged while an admitted managed process is running and pauses while the session is gated. On timeout, Relax sends `SIGTERM` to the managed agent process group, records a managed-command timeout, and drops the corresponding runtime group.
 
+`--agentic-prepare-pool-size` accepts a positive rollout prepare pool size or `0`. Positive values control how many rollout groups Relax warms ahead of rollout admission. The default is `over_sampling_batch_size`. Set it to `0` to start agents when rollout begins.
+
 Relax runs the command under `--agent-cwd` and injects these environment variables:
 
 | Variable | Meaning |

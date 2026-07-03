@@ -483,10 +483,12 @@ def test_finish_eligibility_interrupted_current_policy(
 
 def test_transfer_fifo_routes_slots_by_arrival_ignoring_metadata(monkeypatch) -> None:
     recorded: list[tuple[int, list[str]]] = []
+    recorded_is_last: list[tuple[int, bool]] = []
 
-    async def _fake_transfer(args, batch_samples, batch_count, rollout_id, data_system_client):
+    async def _fake_transfer(args, batch_samples, batch_count, rollout_id, data_system_client, is_last=False):
         del args, batch_count, data_system_client
         recorded.append((int(rollout_id), [s.metadata["label"] for group in batch_samples for s in group]))
+        recorded_is_last.append((int(rollout_id), bool(is_last)))
 
     monkeypatch.setattr("relax.agentic.pipeline.transfer._transfer_batch_to_data_system", _fake_transfer)
     args = _runtime_args(fully_async=True, rollout_batch_size=2, n_samples_per_prompt=1)
@@ -504,6 +506,33 @@ def test_transfer_fifo_routes_slots_by_arrival_ignoring_metadata(monkeypatch) ->
     assert len(released_groups) == 4
     asyncio.run(transfer.wait_for_pending_transfers())
     assert recorded == [(2, ["current-first", "old-second"]), (3, ["old-third", "current-fourth"])]
+    # Both partitions are fully filled this step (prev quota=2 backfilled, current
+    # quota=2 met), so each partition's batch is marked is_last for end-of-stream.
+    assert recorded_is_last == [(2, True), (3, True)]
+
+
+def test_transfer_is_last_only_when_partition_target_met(monkeypatch) -> None:
+    # Current partition NOT fully filled this step (quota=4, only 2 committed) -> its
+    # batch is NOT marked is_last; the tail is backfilled next step (as the previous
+    # partition), which is where is_last fires. Guards against premature end-of-stream.
+    recorded_is_last: list[tuple[int, bool]] = []
+
+    async def _fake_transfer(args, batch_samples, batch_count, rollout_id, data_system_client, is_last=False):
+        del args, batch_samples, batch_count, data_system_client
+        recorded_is_last.append((int(rollout_id), bool(is_last)))
+
+    monkeypatch.setattr("relax.agentic.pipeline.transfer._transfer_batch_to_data_system", _fake_transfer)
+    args = _runtime_args(fully_async=True, rollout_batch_size=4, over_sampling_batch_size=4, n_samples_per_prompt=1)
+    transfer = TransferDomain(args=args, data_system_client=object())
+    transfer.rebind_step(rollout_id=5)
+    transfer.configure_transfer_quota(previous_partition_quota=0, current_partition_quota=4)
+    # Only 2 groups available this step -> current partition under-filled (deficit 2).
+    for idx in range(2):
+        transfer.enqueue_ready_groups([_sample_group(f"g{idx}", group_index=idx, rollout_id=5)])
+    asyncio.run(transfer.drain_ready_group_payloads())
+    asyncio.run(transfer.wait_for_pending_transfers())
+    # No is_last: the current partition will be completed next step via backfill.
+    assert recorded_is_last == [(5, False)]
 
 
 def test_oversampling_surplus_retained_not_dropped(monkeypatch) -> None:

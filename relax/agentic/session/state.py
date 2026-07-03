@@ -183,11 +183,7 @@ def normalize_template_kwargs(template_kwargs: dict[str, Any] | None) -> dict[st
             return {str(key): _normalize(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
         if isinstance(value, list):
             return [_normalize(item) for item in value]
-        if isinstance(value, tuple):
-            return [_normalize(item) for item in value]
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        return copy.deepcopy(value)
+        return value
 
     return _normalize(template_kwargs or {})
 
@@ -507,17 +503,13 @@ class SessionForest:
                 messages.extend(copy.deepcopy(node.messages_delta))
         return messages
 
-    def rollout_token_count(self, state_hash: str | None) -> int:
-        if state_hash is None:
-            return 0
+    def rollout_token_count(self, state_hash: str) -> int:
         total = 0
         for node in self.lineage(state_hash):
             total += len(node.rollout_token_delta)
         return total
 
-    def build_execution_prefix(self, state_hash: str | None) -> ExecutionPrefix:
-        if state_hash is None:
-            return ExecutionPrefix()
+    def build_execution_prefix(self, state_hash: str) -> ExecutionPrefix:
         train_token_prefix: list[int] = []
         rollout_token_prefix: list[int] = []
         backend_image_data: list[str] = []
@@ -537,47 +529,32 @@ class SessionForest:
             backend_video_data=backend_video_data,
         )
 
-    def current_tools(self, state_hash: str | None) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        if state_hash is None:
-            return tools
-        for node in self.lineage(state_hash):
-            if node.tools is not None:
-                tools = normalize_tools(node.tools)
-        return tools
-
-    def current_chat_template_kwargs(self, state_hash: str | None) -> dict[str, Any]:
-        chat_template_kwargs = normalize_template_kwargs(self.static_metadata.get("chat_template_kwargs"))
-        if state_hash is None:
-            return chat_template_kwargs
-        for node in self.lineage(state_hash):
-            if node.chat_template_kwargs is not None:
-                chat_template_kwargs = normalize_template_kwargs(node.chat_template_kwargs)
-        return chat_template_kwargs
-
     def export_leaf_hashes(self) -> list[str]:
         return list(self.leaf_state_hashes)
 
-    def subtree_root_hash(self, state_hash: str) -> str | None:
+    def subtree_root_node(self, state_hash: str | None) -> MsgNode | None:
+        if state_hash is None:
+            return None
         lineage = self.lineage(state_hash)
-        if not lineage:
+        if len(lineage) <= 1:
             return None
-        if len(lineage) == 1:
-            return None
-        return lineage[1].state_hash
+        return lineage[1]
 
-    def subtree_tools(self, state_hash: str) -> list[dict[str, Any]]:
-        subtree_root_hash = self.subtree_root_hash(state_hash)
-        if subtree_root_hash is None:
+    def subtree_tools(self, state_hash: str | None) -> list[dict[str, Any]]:
+        subtree_root = self.subtree_root_node(state_hash)
+        if subtree_root is None:
             return []
-        subtree_root = self.nodes_by_hash[subtree_root_hash]
         return normalize_tools(subtree_root.tools)
 
-    def subtree_chat_template_kwargs(self, state_hash: str) -> dict[str, Any]:
-        subtree_root_hash = self.subtree_root_hash(state_hash)
-        if subtree_root_hash is None:
-            return {}
-        subtree_root = self.nodes_by_hash[subtree_root_hash]
+    def subtree_chat_template_kwargs(
+        self,
+        state_hash: str | None,
+        base_kwargs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base_kwargs = normalize_template_kwargs(base_kwargs)
+        subtree_root = self.subtree_root_node(state_hash)
+        if subtree_root is None:
+            return base_kwargs
         return normalize_template_kwargs(subtree_root.chat_template_kwargs)
 
     def _register_node(self, node: MsgNode) -> MsgNode:
@@ -610,11 +587,11 @@ class SessionForest:
     ) -> str:
         parent_messages = self.full_messages(parent_state_hash) if parent_state_hash is not None else []
         full_messages = parent_messages + check_messages(messages_delta)
-        current_tools = normalize_tools(tools) if tools is not None else self.current_tools(parent_state_hash)
+        current_tools = normalize_tools(tools) if tools is not None else self.subtree_tools(parent_state_hash)
         current_chat_template_kwargs = (
             normalize_template_kwargs(chat_template_kwargs)
             if chat_template_kwargs is not None
-            else self.current_chat_template_kwargs(parent_state_hash)
+            else self.subtree_chat_template_kwargs(parent_state_hash, self.static_metadata.get("chat_template_kwargs"))
         )
         return messages_tools_template_state_hash(full_messages, current_tools, current_chat_template_kwargs)
 
@@ -724,39 +701,26 @@ class SessionForest:
             )
         )
 
-    def build_agentic_trace_turns(
-        self,
-        *,
-        leaf_state_hash: str,
-    ) -> list[dict[str, Any]]:
-        lineage = self.lineage(leaf_state_hash)
-        if not lineage:
-            raise ValueError(f"Unknown state hash: {leaf_state_hash}")
-        turns: list[dict[str, Any]] = []
-        for node in lineage:
-            if node.kind != "resp":
-                continue
-            patch = copy.deepcopy(node.export_metadata_patch)
-            patch_trace = patch.get(TRACE_KEY)
-            events = merge_agentic_trace(None, patch_trace).get("events") if patch_trace is not None else None
-            turns.append(
-                {
-                    "turn_idx": len(turns),
-                    "resp_state_hash": node.state_hash,
-                    "parent_state_hash": node.parent_state_hash,
-                    "rollout_id": node.rollout_id,
-                    "request_id": patch.get("request_id"),
-                    "request_kind": patch.get("request_kind"),
-                    "base_state_hash": patch.get("base_state_hash"),
-                    "abort_count": node.abort_count,
-                    "status": str(node.status),
-                    "response_length": len(node.train_token_delta),
-                    "wall_elapsed_s": float(node.wall_elapsed_s),
-                    "generation_elapsed_s": float(node.generation_elapsed_s),
-                    "events": copy.deepcopy(events) if isinstance(events, dict) else {},
-                }
-            )
-        return turns
+    @staticmethod
+    def _agentic_trace_turn_from_node(node: MsgNode, turn_idx: int) -> dict[str, Any]:
+        patch = copy.deepcopy(node.export_metadata_patch)
+        patch_trace = patch.get(TRACE_KEY)
+        events = merge_agentic_trace(None, patch_trace).get("events") if patch_trace is not None else None
+        return {
+            "turn_idx": turn_idx,
+            "resp_state_hash": node.state_hash,
+            "parent_state_hash": node.parent_state_hash,
+            "rollout_id": node.rollout_id,
+            "request_id": patch.get("request_id"),
+            "request_kind": patch.get("request_kind"),
+            "base_state_hash": patch.get("base_state_hash"),
+            "abort_count": node.abort_count,
+            "status": str(node.status),
+            "response_length": len(node.train_token_delta),
+            "wall_elapsed_s": float(node.wall_elapsed_s),
+            "generation_elapsed_s": float(node.generation_elapsed_s),
+            "events": copy.deepcopy(events) if isinstance(events, dict) else {},
+        }
 
     def build_sample(
         self,
@@ -769,31 +733,38 @@ class SessionForest:
         if not lineage:
             raise ValueError(f"Unknown state hash: {leaf_state_hash}")
         leaf = lineage[-1]
-        response_nodes = [node for node in lineage if node.kind == "resp"]
-        if not response_nodes:
-            raise ValueError("A sample export leaf must have at least one resp node in its lineage.")
 
         tokens: list[int] = []
         rollout_tokens: list[int] = []
         continuation_train_tokens: list[int] = []
         loss_mask: list[int] = []
         rollout_log_probs: list[float] = []
+        messages: list[dict[str, Any]] = []
+        turns: list[dict[str, Any]] = []
         multimodal_train_inputs: dict[str, Any] | None = None
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
+        first_response_node: MsgNode | None = None
+        last_response_status: str | None = None
 
         for idx, node in enumerate(lineage):
             tokens.extend(node.train_token_delta)
             rollout_tokens.extend(node.rollout_token_delta)
+            messages.extend(node.messages_delta)
             wall_elapsed_s += float(node.wall_elapsed_s)
             generation_elapsed_s += float(node.generation_elapsed_s)
             multimodal_train_inputs = _merge_multimodal_train_inputs(
                 multimodal_train_inputs, node.multimodal_train_inputs_delta
             )
             if node.kind == "resp":
+                if first_response_node is None:
+                    first_response_node = node
+                if node.status is not None:
+                    last_response_status = node.status
+                turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
                 continuation_train_tokens.extend(node.train_token_delta)
                 node_loss_mask = list(node.loss_mask_delta)
                 # if mask_offpolicy_in_partial_rollout and node.rollout_id < leaf.rollout_id:
@@ -804,14 +775,14 @@ class SessionForest:
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
-            if idx == 0:
-                continue
-            if not any(item.kind == "resp" for item in lineage[:idx]):
+            if idx == 0 or first_response_node is None:
                 continue
             continuation_train_tokens.extend(node.train_token_delta)
             loss_mask.extend(node.loss_mask_delta or ([0] * len(node.train_token_delta)))
             rollout_log_probs.extend(node.logprob_delta or ([0.0] * len(node.train_token_delta)))
 
+        if first_response_node is None:
+            raise ValueError("A sample export leaf must have at least one resp node in its lineage.")
         prompt_train_token_count = len(tokens) - len(continuation_train_tokens)
         if prompt_train_token_count < 0:
             raise RuntimeError(
@@ -819,18 +790,15 @@ class SessionForest:
                 f"total={len(tokens)}, continuation={len(continuation_train_tokens)}."
             )
         effective_prompt = _decode_tokens(tokenizer=tokenizer, token_ids=tokens[:prompt_train_token_count])
-        if not effective_prompt:
-            raise RuntimeError(
-                f"SessionForest {self.session_id!r} export produced no decoded prompt; "
-                "every exported leaf must have at least one observation node in its lineage."
-            )
         merged_metadata = _merge_export_metadata(self.static_metadata, leaf.export_metadata_patch)
         if "start_rollout_id" not in merged_metadata:
-            merged_metadata["start_rollout_id"] = response_nodes[0].rollout_id
-        merged_metadata["tools"] = self.subtree_tools(leaf_state_hash)
-        merged_metadata["chat_template_kwargs"] = self.subtree_chat_template_kwargs(leaf_state_hash)
+            merged_metadata["start_rollout_id"] = first_response_node.rollout_id
+        subtree_root = lineage[1] if len(lineage) > 1 else None
+        merged_metadata["tools"] = normalize_tools(subtree_root.tools) if subtree_root is not None else []
+        merged_metadata["chat_template_kwargs"] = (
+            normalize_template_kwargs(subtree_root.chat_template_kwargs) if subtree_root is not None else {}
+        )
         trace = merge_agentic_trace(merged_metadata.get(TRACE_KEY), None)
-        turns = self.build_agentic_trace_turns(leaf_state_hash=leaf_state_hash)
         trace.update(
             {
                 "session_id": self.session_id,
@@ -846,15 +814,14 @@ class SessionForest:
         else:
             status = leaf.status
         if status is None:
-            response_statuses = [node.status for node in response_nodes if node.status is not None]
-            status = response_statuses[-1] if response_statuses else Sample.Status.COMPLETED.value
+            status = last_response_status or Sample.Status.COMPLETED.value
         sample = Sample(
             group_index=self.group_index,
             index=self.index,
             prompt=effective_prompt,
             tokens=tokens,
             rollout_tokens=rollout_tokens,
-            multimodal_inputs=_multimodal_inputs_from_messages(self.full_messages(leaf_state_hash)),
+            multimodal_inputs=_multimodal_inputs_from_messages(messages),
             multimodal_train_inputs=multimodal_train_inputs,
             response=_decode_tokens(tokenizer=tokenizer, token_ids=continuation_train_tokens),
             response_length=len(continuation_train_tokens),

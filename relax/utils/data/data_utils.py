@@ -129,7 +129,7 @@ def build_messages(
                 raise ValueError(f"Unsupported multimodal type: {type_name}")
 
             placeholder = mt.placeholder
-            multimodal_data = list(data.get(data_key))
+            multimodal_data = list(data.get(data_key) or [])
             multimodals[placeholder] = (mt, multimodal_data)
             remain_data[mt.name] += len(multimodal_data)
 

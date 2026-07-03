@@ -19,6 +19,8 @@ from .hf_weight_iterator_base import HfWeightIteratorBase
 
 logger = get_logger(__name__)
 
+_NON_BLOCKING = device_utils.use_non_blocking_copy()
+
 # Weight names that must appear in the same chunk for SGLang's MLA fusion.
 _MLA_PAIRED_SUFFIXES = ("q_a_proj.weight", "kv_a_proj_with_mqa.weight")
 
@@ -227,7 +229,7 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if rank == info.src_rank:
             vanilla_key = vanilla_key_map[info.name]
             cpu_tensor = megatron_local_weights[vanilla_key]
-            gpu_tensor = cpu_tensor.to(device=device, non_blocking=True)
+            gpu_tensor = cpu_tensor.to(device=device, non_blocking=_NON_BLOCKING)
             param = torch.nn.Parameter(gpu_tensor, requires_grad=False)
         else:
             param = torch.nn.Parameter(torch.empty(info.shape, dtype=info.dtype, device=device), requires_grad=False)

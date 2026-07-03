@@ -402,13 +402,15 @@ index 19de0ed52..d957e0f1e 100644
      ):
          """Postprocesses decoder hidden states to generate logits or compute loss.
  
-@@ -630,8 +634,26 @@ class GPTModel(LanguageModule):
+@@ -630,8 +634,28 @@ class GPTModel(LanguageModule):
          # logits and loss
          output_weight = None
          if self.share_embeddings_and_output_weights:
 -            output_weight = self.shared_embedding_or_output_weight()
 -        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
-+            output_weight = self.shared_embedding_or_output_weight().detach()
++            output_weight = self.shared_embedding_or_output_weight()
++            if output_weight is not None:
++                output_weight = output_weight.detach()
 +        mtp_labels = labels
 +        if mtp_kwargs is not None and mtp_kwargs.get("mtp_labels", None) is not None:
 +            mtp_labels = mtp_kwargs["mtp_labels"]
@@ -431,7 +433,7 @@ index 19de0ed52..d957e0f1e 100644
              hidden_states = self.mtp(
                  input_ids=input_ids,
                  position_ids=position_ids,
-@@ -660,7 +682,7 @@ class GPTModel(LanguageModule):
+@@ -660,7 +684,7 @@ class GPTModel(LanguageModule):
                  # In training/eval, use the utility function for processing MTP loss/scaling.
                  hidden_states = process_mtp_loss(
                      hidden_states=hidden_states,

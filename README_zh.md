@@ -91,12 +91,13 @@ ______________________________________________________________________
 
 ## 🧠 支持的算法
 
-| 算法                       | 类型     | 描述                               |
-| :------------------------- | :------- | :--------------------------------- |
-| **GRPO**                   | 策略优化 | Group Relative Policy Optimization |
-| **GSPO**                   | 策略优化 | Group Sample Policy Optimization   |
-| **SAPO**                   | 策略优化 | Sample-Aware Policy Optimization   |
-| **On-Policy Distillation** | 知识迁移 | 基于 KL 惩罚的师生蒸馏             |
+| 算法                       | 类型     | 描述                                              |
+| :------------------------- | :------- | :------------------------------------------------ |
+| **GRPO**                   | 策略优化 | Group Relative Policy Optimization                |
+| **GSPO**                   | 策略优化 | Group Sample Policy Optimization                  |
+| **SAPO**                   | 策略优化 | Sample-Aware Policy Optimization                  |
+| **CISPO**                  | 策略优化 | Clipped Importance-ratio Soft Policy Optimization |
+| **On-Policy Distillation** | 知识迁移 | 基于 KL 惩罚的师生蒸馏                            |
 
 > 📖 添加新算法非常简单 — 实现一个服务类，注册到 `ALGOS` 注册表即可。
 

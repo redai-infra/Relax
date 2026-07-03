@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -241,6 +242,12 @@ class SFTStreamingDataset:
         self._oversize_strategy = oversize_strategy
         self._oversize_custom_fn = oversize_custom_fn
 
+        # Fail-fast latch. Background prefetch threads can't propagate
+        # exceptions to the asyncio producer, so the first error is recorded
+        # here and re-raised by the next ``get_batch*`` call.
+        self._first_error: BaseException | None = None
+        self._error_lock = threading.Lock()
+
         self.reader = _build_reader(path)
         self.index_manager = IndexManager(len(self.reader), seed=seed)
 
@@ -293,15 +300,27 @@ class SFTStreamingDataset:
         return await self._get_batch_async_gather(n)
 
     def get_batch_in_order(self, start: int, n: int) -> list[ProcessedSample]:
+        self._raise_if_failed()
         out: list[ProcessedSample] = []
         for offset in range(n):
             idx = start + offset
             if idx >= len(self.reader):
                 break
-            sample = self._process_one_safe(idx)
+            sample = self._process_one(idx)
             if sample is not None:
                 out.append(sample)
         return out
+
+    def _record_first_error(self, exc: BaseException) -> None:
+        with self._error_lock:
+            if self._first_error is None:
+                self._first_error = exc
+
+    def _raise_if_failed(self) -> None:
+        with self._error_lock:
+            err = self._first_error
+        if err is not None:
+            raise err
 
     def stop(self) -> None:
         if self._prefetch is not None:
@@ -324,6 +343,7 @@ class SFTStreamingDataset:
         )
 
     def _get_batch_prefetch(self, n: int) -> tuple[list[ProcessedSample], bool]:
+        self._raise_if_failed()
         samples: list[ProcessedSample] = []
         crossed_epoch = False
         max_attempts = max(n * 10, 32)
@@ -343,8 +363,14 @@ class SFTStreamingDataset:
             idx = indices[0]
             assert self._prefetch is not None
             sample = self._prefetch.get(idx)
-            if sample is not None:
+            if sample is None:
+                # PrefetchBuffer swallows worker-thread exceptions; surface
+                # any latched failure now instead of silently returning a
+                # short batch (which deadlocks the TQ consumer).
+                self._raise_if_failed()
+            else:
                 samples.append(sample)
+        self._raise_if_failed()
         if len(samples) < n:
             logger.warning(
                 f"SFTStreamingDataset.get_batch: returned {len(samples)}/{n} samples after {attempts} attempts."
@@ -352,6 +378,7 @@ class SFTStreamingDataset:
         return samples, crossed_epoch
 
     def _get_batch_inline(self, n: int) -> tuple[list[ProcessedSample], bool]:
+        self._raise_if_failed()
         samples: list[ProcessedSample] = []
         crossed_epoch = False
         max_attempts = max(n * 10, 32)
@@ -362,7 +389,7 @@ class SFTStreamingDataset:
             crossed_epoch = crossed_epoch or epoch_crossed
             for idx in indices:
                 attempts += 1
-                sample = self._process_one_safe(idx)
+                sample = self._process_one(idx)
                 if sample is not None:
                     samples.append(sample)
         if len(samples) < n:
@@ -373,6 +400,7 @@ class SFTStreamingDataset:
         return samples, crossed_epoch
 
     async def _get_batch_async_gather(self, n: int) -> tuple[list[ProcessedSample], bool]:
+        self._raise_if_failed()
         rendered: list[_RenderedSample] = []
         crossed_epoch = False
         max_attempts = max(n * 10, 32)
@@ -383,11 +411,7 @@ class SFTStreamingDataset:
             crossed_epoch = crossed_epoch or ec
             for idx in indices:
                 attempts += 1
-                try:
-                    pre = self._render_one(idx)
-                except Exception:
-                    logger.exception(f"SFTStreamingDataset.get_batch_async: render failed for idx={idx}")
-                    continue
+                pre = self._render_one(idx)
                 if pre is not None:
                     rendered.append(pre)
         if len(rendered) < n:
@@ -397,21 +421,24 @@ class SFTStreamingDataset:
         if not rendered:
             return [], crossed_epoch
         coros = [self._finalize_async(r) for r in rendered]
-        finalized = await asyncio.gather(*coros, return_exceptions=True)
-        out: list[ProcessedSample] = []
-        for r, result in zip(rendered, finalized, strict=True):
-            if isinstance(result, BaseException):
-                logger.warning(f"SFTStreamingDataset.get_batch_async: finalize failed for idx={r.idx}: {result}")
-                continue
-            if result is not None:
-                out.append(result)
+        finalized = await asyncio.gather(*coros)
+        out = [r for r in finalized if r is not None]
         return out, crossed_epoch
 
     def _process_one_safe(self, idx: int) -> ProcessedSample | None:
+        """Wrapper passed to ``PrefetchBuffer`` worker threads.
+
+        The buffer's internal ``try/except`` would otherwise drop the exception
+        on the floor and store ``None`` in its cache, leaving the producer to
+        push short batches that deadlock the TQ consumer. We capture the first
+        exception into a latch that the next ``get_batch*`` call re-raises from
+        the asyncio context.
+        """
         try:
             return self._process_one(idx)
-        except Exception:
+        except Exception as exc:
             logger.exception(f"SFTStreamingDataset: failed to process sample idx={idx}")
+            self._record_first_error(exc)
             return None
 
     def _process_one(self, idx: int) -> ProcessedSample | None:

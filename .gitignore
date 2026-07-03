@@ -42,6 +42,7 @@ ENV/
 coverage.json
 log
 logs
+traces
 output
 outputs
 tensorboard_log

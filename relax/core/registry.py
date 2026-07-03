@@ -7,7 +7,8 @@ except ImportError:
     from enum import Enum
 
     class StrEnum(str, Enum):
-        pass
+        def __str__(self) -> str:
+            return self.value
 
 
 from relax.components.actor import Actor
@@ -71,6 +72,13 @@ ALGOS = {
         ROLES.actor_fwd: ActorFwd,
     },
     "sapo": {
+        ROLES.rollout: Rollout,
+        ROLES.actor: Actor,
+        ROLES.advantages: Advantages,
+        ROLES.reference: ActorFwd,
+        ROLES.actor_fwd: ActorFwd,
+    },
+    "cispo": {
         ROLES.rollout: Rollout,
         ROLES.actor: Actor,
         ROLES.advantages: Advantages,

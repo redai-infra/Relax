@@ -4,7 +4,15 @@
 
 from types import SimpleNamespace
 
-from relax.core.registry import ALGOS, ROLES_SFT_ONLY, process_role
+import pytest
+
+
+# `relax.core.registry` eagerly imports `relax.components.advantages`, which
+# imports `megatron.core` at module level. Skip the whole module when megatron
+# is unavailable (e.g. GitHub CI without GPU stack).
+pytest.importorskip("megatron.core")
+
+from relax.core.registry import ALGOS, ROLES_SFT_ONLY, process_role  # noqa: E402
 
 
 def _cfg(**kwargs):

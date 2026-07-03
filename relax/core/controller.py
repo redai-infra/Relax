@@ -12,6 +12,17 @@ from omegaconf import OmegaConf
 from ray import serve
 from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
 
+
+try:
+    from transfer_queue import StreamingTokenBudgetSampler
+except ImportError as e:
+    raise ImportError(
+        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
+        '    pip install "transferqueue @ git+https://github.com/redai-infra/'
+        'TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps\n'
+        "or use the latest image."
+    ) from e
+
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
 from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
@@ -94,7 +105,10 @@ class Controller:
 
         # Start health management with service restart callback
         if self._health_check_enabled:
-            self._health_manager.start(on_unhealthy=self._on_service_unhealthy)
+            self._health_manager.start(
+                on_unhealthy=self._on_service_unhealthy,
+                on_fatal=self._on_service_fatal,
+            )
             logger.info("Global health check system enabled")
         else:
             logger.info("Global health check system disabled (use --use-health-check to enable)")
@@ -104,7 +118,16 @@ class Controller:
         total_storage_size = (
             self.config.rollout_batch_size * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
-        if algo_key == "sft" or getattr(self.config, "balance_data", False):
+        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+            # Fully-async + dynamic-batch path streams data per DP via token
+            # budget; the controller-side sampler maintains per-DP buckets and
+            # balances tokens at small-unit granularity.  See
+            # docs/draft/dynamic_batch_size_fully_async.md.
+            sampler = StreamingTokenBudgetSampler(
+                n_samples_per_prompt=self.config.n_samples_per_prompt,
+            )
+            logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
+        elif algo_key == "sft" or getattr(self.config, "balance_data", False):
             # SFT walks the SeqlenBalancedSampler branch (sequential / balanced sampling),
             # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.
             dp_size = compute_dp_size(self.config)
@@ -211,6 +234,19 @@ class Controller:
         """
         logger.warning(f"Service '{role}' detected as unhealthy, initiating restart...")
         self.restart_serve(role)
+
+    def _on_service_fatal(self, role: str, error_msg: str) -> None:
+        """Callback when a service reports a fatal (non-recoverable) error.
+
+        Runs immediately before the HealthChecker calls ``os._exit(1)`` — used
+        to push the error to the metrics service for Apprise so the operator
+        gets a notification before the process dies.
+        """
+        logger.error(f"Fatal error from service '{role}': {error_msg}")
+        try:
+            self._report_error_to_metrics_service(RuntimeError(f"{role}: {error_msg}"))
+        except Exception as e:
+            logger.warning(f"Failed to report fatal error to metrics service: {e}")
 
     def _create_service_task(self, role, cls, num_gpus, data_source, actor_rollout_pgs):
         """Create a single service.
@@ -576,7 +612,17 @@ class Controller:
         """
         logger.info(f"Restarting service '{role}'...")
         serve.delete(role)
-        algo = ALGOS.get(self.config.advantage_estimator).copy()
+        # Must mirror register_all_serve's algo-key resolution. SFT mode is
+        # identified by ``loss_type == "sft"``, not by ``advantage_estimator``
+        # (Megatron's parser doesn't accept "sft" as an --advantage-estimator
+        # choice), so looking the algo up under ``advantage_estimator`` here
+        # silently misses the {sft, actor} dict, hits the cls-is-None skip
+        # below, leaves the unhealthy flag set, and the health checker spins
+        # restart attempts forever on a service that was already deleted.
+        algo_key = resolve_sft_algo_key(self.config)
+        if algo_key not in ALGOS:
+            raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
+        algo: dict = ALGOS.get(algo_key).copy()
         # Include dynamically added optional roles.
         register_extra_roles(self.config, algo)
         cls = algo.get(role)

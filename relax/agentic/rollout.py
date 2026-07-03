@@ -207,6 +207,7 @@ class AgenticResidentPipeline:
         self.resident_dataflow_lock: asyncio.Lock | None = None
         self.resident_dataflow_error: BaseException | None = None
         self.step_admission_closed = False
+        self.prepare_requires_open_step = False
         self._step_get_samples_wait_started_at: float | None = None
         self._step_get_samples_times: list[float] = []
         self._active_step_handle: _AgenticStepHandle | None = None
@@ -306,7 +307,7 @@ class AgenticResidentPipeline:
         if prepare_domain.has_pending_prepare():
             if await prepare_domain.launch_pending():
                 progressed = True
-        if prepare_domain.start_fetch():
+        if (not self.prepare_requires_open_step or not self.step_admission_closed) and prepare_domain.start_fetch():
             progressed = True
         return progressed
 
@@ -543,8 +544,10 @@ class AgenticResidentPipeline:
                 runtime_driver=runtime_domain,
                 pool_target_group_count=pool_target_group_count,
             )
+            self.prepare_requires_open_step = args.agentic_prepare_pool_size == 0
             self.step_admission_closed = True
-            prepare_domain.start_fetch()
+            if not self.prepare_requires_open_step:
+                prepare_domain.start_fetch()
         await self.start_resident_dataflow()
 
     async def open_step(

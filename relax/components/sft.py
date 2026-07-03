@@ -253,10 +253,17 @@ class SFT(Base):
         count: they are pushed and drained synchronously by
         ``_maybe_produce_eval`` and do not consume the train backpressure
         budget.
+
+        Bounded by ``--sft-tq-timeout-minutes`` (falls back to
+        ``--distributed-timeout-minutes``): if the consumer dies, the
+        producer raises ``TimeoutError`` instead of spinning forever.
         """
         if self.step == 0:
             return
         max_in_flight = self.config.max_staleness + 1
+        timeout_sec = float(getattr(self.config, "sft_tq_timeout_minutes", None) or 30) * 60.0
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_sec
         wait_count = 0
         while not self._stop_event.is_set():
             partitions = await self.data_system_client.async_get_partition_list()
@@ -270,6 +277,13 @@ class SFT(Base):
                         f"(in_flight={in_flight}/{max_in_flight})"
                     )
                 return
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"SFT producer step {self.step}: TQ buffer stuck for "
+                    f">{timeout_sec:.0f}s (in_flight={in_flight}/{max_in_flight}, "
+                    f"partitions={partitions}); consumer likely dead. Raise "
+                    f"--sft-tq-timeout-minutes if this is a slow consumer."
+                )
             if wait_count % 10 == 0:
                 self._logger.info(
                     f"SFT producer step {self.step}: TQ buffer full "
@@ -447,7 +461,12 @@ class SFT(Base):
         except Exception as exc:
             error_msg = f"SFT producer crashed at step {self.step}: {type(exc).__name__}: {str(exc)}"
             self._logger.exception(error_msg)
-            self.healthy.report_error.remote("sft", error_msg)
+            # SFT producer failures are deterministic by nature — data schema
+            # mismatches, malformed rows, alignment errors. Restarting the
+            # replica reads the same data and crashes again. Mark fatal so
+            # the controller exits immediately instead of grinding through
+            # ~12 service restarts before _global_restart hits its limit.
+            self.healthy.report_error.remote("sft", error_msg, fatal=True)
             raise
 
     async def stop(self) -> None:

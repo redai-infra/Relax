@@ -38,3 +38,4 @@ pystack
 py-spy
 ipdb
 mathruler==0.1.0
+pyarrow==14.0.2

@@ -180,7 +180,7 @@ MEGATRON_ARGS=(
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
-    --max-tokens-per-gpu 8192
+    --max-tokens-per-gpu 10240
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32

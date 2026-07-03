@@ -26,6 +26,7 @@ async def _transfer_batch_to_data_system(
     rollout_id: int,
     data_system_client,
     metadata=None,
+    is_last: bool = False,
 ) -> list[str]:
     from relax.utils.utils import convert_samples_to_train_data
 
@@ -52,8 +53,12 @@ async def _transfer_batch_to_data_system(
     logger.info("Prepared rollout batch %s with %s samples for transfer", batch_count, rollout_batch.numel())
     logger.info("Transferring batch rollout_batch: %s", rollout_batch)
     if metadata is None:
-        metadata = await data_system_client.async_put(data=rollout_batch, partition_id=f"train_{rollout_id}")
+        metadata = await data_system_client.async_put(
+            data=rollout_batch, partition_id=f"train_{rollout_id}", is_last=is_last
+        )
     else:
+        # is_last only applies to the insert path; a backfill put with explicit
+        # metadata writes into existing samples and must not announce end-of-stream.
         metadata = await data_system_client.async_put(data=rollout_batch, metadata=metadata)
     if metadata and metadata.size > 0:
         total_lengths = rollout_batch.get("total_lengths", None)
@@ -133,7 +138,7 @@ class TransferDomain:
         for sample in group:
             mark_sample_agentic_event_once(sample, "transfer_buffer_enter_at", buffered_at)
 
-    async def _dispatch_transfer_batch(self, *, groups, partition_rollout_id: int) -> None:
+    async def _dispatch_transfer_batch(self, *, groups, partition_rollout_id: int, is_last: bool = False) -> None:
         if self.data_system_client is None:
             return
         if partition_rollout_id < self.rollout_id:
@@ -153,6 +158,7 @@ class TransferDomain:
             batch_count=len(groups),
             rollout_id=partition_rollout_id,
             data_system_client=self.data_system_client,
+            is_last=is_last,
         )
         release_ended_at = time.time()
         for group in groups:
@@ -172,6 +178,11 @@ class TransferDomain:
                 self._committed_previous_group_count - self._dispatched_previous_group_count,
             )
             self._dispatched_previous_group_count += take_count
+            # The previous partition's quota is closed entirely within this step's
+            # backfill, so reaching the quota marks its final batch.
+            is_last = self._previous_partition_quota > 0 and (
+                self._dispatched_previous_group_count >= self._previous_partition_quota
+            )
         elif self._dispatched_current_group_count < self._committed_current_group_count:
             partition_rollout_id = self.rollout_id
             take_count = min(
@@ -179,6 +190,15 @@ class TransferDomain:
                 self._committed_current_group_count - self._dispatched_current_group_count,
             )
             self._dispatched_current_group_count += take_count
+            # The current partition is only fully filled within this step (no tail
+            # backfilled next step) when its committed count reached the full quota.
+            # _committed_current_group_count can only reach _current_partition_quota
+            # when this step met the target, so dispatching up to the quota == last.
+            is_last = (
+                self._current_partition_quota > 0
+                and self._committed_current_group_count >= self._current_partition_quota
+                and self._dispatched_current_group_count >= self._current_partition_quota
+            )
         else:
             return 0
         groups = []
@@ -188,7 +208,9 @@ class TransferDomain:
             return len(groups)
         self._transfer_tasks.append(
             asyncio.create_task(
-                self._dispatch_transfer_batch(groups=groups, partition_rollout_id=partition_rollout_id)
+                self._dispatch_transfer_batch(
+                    groups=groups, partition_rollout_id=partition_rollout_id, is_last=is_last
+                )
             )
         )
         return len(groups)

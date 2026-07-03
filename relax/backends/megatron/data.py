@@ -688,6 +688,9 @@ def log_rollout_data(
                 "teacher_topk_token_ids",
                 "teacher_topk_log_probs",
                 "teacher_topk_k",
+                "packed_seq_params",
+                "vlm_packed_seq_params",
+                "__loss_scale__",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -719,14 +722,21 @@ def log_rollout_data(
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
-                        val = torch.cat(val).clone().detach()
+                        try:
+                            val = torch.cat(val).clone().detach().float()
+                        except RuntimeError:
+                            # Tensors have mismatched shapes (e.g. variable-length mbs in
+                            # streaming mode) — fall back to per-mb mean then average.
+                            val = torch.stack([v.float().mean() for v in val])
                         val = val.mean() * cp_size
                 else:
+                    if not isinstance(val[0], (int, float)):
+                        continue
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
-                raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
+                continue
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
@@ -747,7 +757,18 @@ def log_rollout_data(
     if args.log_multi_turn:
         log_multi_turn_data(rollout_id, args, rollout_data)
     if args.log_passrate:
-        log_passrate(rollout_id, args, rollout_data, ignore_num_groups=True)
+        # On the fully-async dynamic-batch (streaming) path the sampler balances
+        # GRPO groups across DP ranks PER SAMPLE (groups are intentionally split),
+        # so this DP rank's ``rollout_data`` holds an arbitrary, non-group-aligned
+        # subset (count not a multiple of n_samples_per_prompt).  Train-time
+        # per-DP pass@k is therefore neither computable nor meaningful here —
+        # reshaping into [num_groups, group_size] would mix unrelated prompts (or
+        # assert on the ragged count).  Skip it on this path; eval pass@k (with
+        # complete groups, rollout side) is unaffected.
+        if getattr(args, "use_dynamic_batch_size", False) and getattr(args, "fully_async", False):
+            pass
+        else:
+            log_passrate(rollout_id, args, rollout_data, ignore_num_groups=True)
 
     if args.log_correct_samples:
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():

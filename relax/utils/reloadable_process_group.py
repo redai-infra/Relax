@@ -328,13 +328,23 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         self.group.bound_device_id = dev
 
 
+def _should_skip_reload_and_destroy() -> bool:
+    """Whether destroy/reload of process groups should be skipped on this
+    backend."""
+    return device_utils.is_klx()
+
+
 def destroy_process_groups(post_destroy_delay: float = 2.0):
     """Destroy all reloadable process groups."""
+    if _should_skip_reload_and_destroy():
+        return
     ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
 
 
 def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
     """Reload all reloadable process groups."""
+    if _should_skip_reload_and_destroy():
+        return
     ReloadableProcessGroup.reload_process_groups(
         timeout_minutes=timeout_minutes, max_retries=max_retries, retry_delay=retry_delay
     )

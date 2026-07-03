@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import atexit
-import importlib
 import os
 import signal
 import sys
@@ -11,21 +10,18 @@ import ray
 import yaml
 from ray import serve
 
+from relax.utils import try_import_telemetry_hook
 
-# Optional telemetry hook: if the RELAX_TELEMETRY_HOOK env var names an
-# importable module, import it here so it can install any patches it needs
-# (e.g. a metrics-forwarding shim) before Controller is referenced below.
-# Silent no-op when the env var is unset or the named module is unavailable.
-_telemetry_hook = os.environ.get("RELAX_TELEMETRY_HOOK")
-if _telemetry_hook:
-    try:
-        importlib.import_module(_telemetry_hook)
-    except ImportError:
-        pass
+
+# Optional telemetry hook: import before Controller so it can install patches.
+# Missing or broken hooks must not change training behavior.
+try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
+from relax.utils import telemetry  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
 
@@ -37,20 +33,39 @@ _ctrl: Controller | None = None
 _shutdown_done = False
 
 
-def _graceful_shutdown(sig=None, frame=None):
+def _hard_exit(code: int):
+    """Exit without running Python/native extension destructors."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
+def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     """Shut down SGLang engines and Ray on SIGTERM / SIGINT / atexit."""
     global _shutdown_done
+
+    if sig is not None:
+        exit_code = 128 + sig
+
     if _shutdown_done:
+        if exit_code is not None:
+            _hard_exit(exit_code)
         return
+
     _shutdown_done = True
 
     sig_name = signal.Signals(sig).name if sig else "atexit"
     logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
+
     if _ctrl is not None:
         try:
             _ctrl.shutdown()
         except Exception as e:
             logger.warning(f"Controller shutdown error during {sig_name}: {e}")
+
     if ray.is_initialized():
         try:
             serve.shutdown()
@@ -58,8 +73,9 @@ def _graceful_shutdown(sig=None, frame=None):
             logger.info("Ray shutdown successfully")
         except Exception as e:
             logger.warning(f"Ray shutdown error during {sig_name}: {e}")
-    if sig is not None:
-        sys.exit(128 + sig)
+
+    if exit_code is not None:
+        _hard_exit(exit_code)
 
 
 def main(args):
@@ -72,6 +88,7 @@ def main(args):
         runtime_env = yaml.safe_load(file)
 
     runtime_env = post_process_env(args, runtime_env)
+    init_tracking(args)
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env=runtime_env)
@@ -95,15 +112,17 @@ def main(args):
     try:
         ctrl.training_loop()
     except Exception as e:
+        telemetry.mark_end(status="failed", error_type=type(e).__name__, error_message=str(e))
         logger.exception(f"Training loop failed with error: {e}")
-        _graceful_shutdown()
-        os._exit(1)
+        _graceful_shutdown(exit_code=1)
 
+    telemetry.mark_end(status="success")
     logger.info("Main func successfully")
     # Gracefully shut down SGLang engine processes before tearing down Ray Serve.
-    _graceful_shutdown()
+    _graceful_shutdown(exit_code=0)
 
 
 if __name__ == "__main__":
     args = parse_args()
+    telemetry.mark_start(fields=vars(args))
     main(args)

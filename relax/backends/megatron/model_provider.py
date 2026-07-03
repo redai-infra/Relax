@@ -324,7 +324,8 @@ def get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-
+        if hasattr(args, "gradient_accumulation_fusion"):
+            provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
         if is_npu_available:
             for key, value in vars(args).items():
                 if not hasattr(provider, key):

@@ -2204,11 +2204,7 @@ class RuntimeDomain:
         result_payload: dict[str, Any],
         session_runner_started_at: float,
     ) -> FinalizedResultTransport:
-        if not isinstance(result_payload, dict):
-            raise TypeError(f"Managed result payload must be a dict, got {type(result_payload)}")
         framework_events = result_payload["_agentic_trace_events"]
-        if not isinstance(framework_events, dict):
-            raise TypeError("Managed result payload '_agentic_trace_events' must be a dict")
         finalize_metadata = result_payload["_session_output_metadata"]
         if not isinstance(finalize_metadata, dict):
             raise TypeError("Managed result payload '_session_output_metadata' must be a dict")

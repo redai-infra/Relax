@@ -17,7 +17,10 @@ def clear_memory(clear_host_memory: bool = False):
     gc.collect()
     device_utils.empty_cache()
     if clear_host_memory:
-        torch._C._host_emptyCache()
+        if device_utils.is_npu_available:
+            torch.npu.host_empty_cache()
+        else:
+            torch._C._host_emptyCache()
 
 
 def available_memory():

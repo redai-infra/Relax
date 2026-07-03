@@ -55,6 +55,7 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
    --global-batch-size 64
    --use-fault-tolerance
+   --balance-data
 )
 
 EVAL_ARGS=(
@@ -80,13 +81,13 @@ PERF_ARGS=(
    # --recompute-num-layers 1
 
    --micro-batch-size 1 # avoid OOM
-   # --use-dynamic-batch-size
-   # --max-tokens-per-gpu 9216
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 10240
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
+   # --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
@@ -137,20 +138,19 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 2], "rollout": [1, 4], "reference": [1, 1], "actor_fwd": [1, 1], "advantages": [1, 0]}'\
+   --resource '{"actor": [1, 4], "rollout": [1, 4], "advantages": [1, 0]}'\
    --max-staleness 2 \
    --num-data-storage-units 1 \
    --num-iters-per-train-update 8 \
-   --ref-actor-config '{"tensor_model_parallel_size": 1, "max_tokens_per_gpu": 16384, "sequence_parallel": false, "only_load_weight": true}' \
    --fully-async \
-    --use-health-check \
-    "${MODEL_ARGS[@]}" \
-    "${CKPT_ARGS[@]}" \
-    "${ROLLOUT_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${PERF_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
-    "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-GRPO-gpu8-async-${now}.log
+   --use-health-check \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-GRPO-gpu8-async-${now}.log

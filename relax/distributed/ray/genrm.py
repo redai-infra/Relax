@@ -167,8 +167,10 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
             "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
             "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-            "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-            "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            # See rollout.py: recent SGLang reads SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK
+            # (default True) and the deprecation shim value-copies SGL_DISABLE_* into it,
+            # so the old DISABLE vars re-enable the check. Set ENABLE=false directly.
+            "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
             "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",

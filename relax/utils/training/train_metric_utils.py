@@ -6,7 +6,7 @@ from argparse import Namespace
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from relax.utils import tracking_utils
+from relax.utils import telemetry, tracking_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.timer import Timer
@@ -38,6 +38,7 @@ def log_perf_data_raw(
     if timer_instance.seq_lens:
         log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)
 
+    per_gpu_tflops: float | None = None
     if ("perf/actor_train_time" in log_dict) and (flops_counter is not None):
         seq_lens = timer_instance.seq_lens
         images_seqlens = getattr(timer_instance, "images_seqlens", None) or None
@@ -87,3 +88,11 @@ def log_perf_data_raw(
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
+    telemetry.mark_step_end(
+        rollout_id,
+        role="actor",
+        world_size=world_size,
+        tokens_per_gpu=log_dict.get("perf/actor_train_tokens", 0) / world_size,
+        mfu=log_dict.get("perf/mfu/actor_train", 0),
+        tflops_per_gpu=log_dict.get("perf/actor_train_tflops", 0),
+    )

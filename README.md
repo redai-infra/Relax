@@ -91,12 +91,13 @@ ______________________________________________________________________
 
 ## 🧠 Supported Algorithms
 
-| Algorithm                  | Type                | Description                             |
-| :------------------------- | :------------------ | :-------------------------------------- |
-| **GRPO**                   | Policy Optimization | Group Relative Policy Optimization      |
-| **GSPO**                   | Policy Optimization | Group Sample Policy Optimization        |
-| **SAPO**                   | Policy Optimization | Sample-Aware Policy Optimization        |
-| **On-Policy Distillation** | Knowledge Transfer  | Teacher-student KL penalty distillation |
+| Algorithm                  | Type                | Description                                       |
+| :------------------------- | :------------------ | :------------------------------------------------ |
+| **GRPO**                   | Policy Optimization | Group Relative Policy Optimization                |
+| **GSPO**                   | Policy Optimization | Group Sample Policy Optimization                  |
+| **SAPO**                   | Policy Optimization | Sample-Aware Policy Optimization                  |
+| **CISPO**                  | Policy Optimization | Clipped Importance-ratio Soft Policy Optimization |
+| **On-Policy Distillation** | Knowledge Transfer  | Teacher-student KL penalty distillation           |
 
 > 📖 Adding a new algorithm is straightforward — implement a service class, register it in the `ALGOS` registry, and you're done.
 

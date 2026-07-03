@@ -57,7 +57,11 @@ export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
 
 # ── NVLink detection ────────────────────────────────────────────────────────
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+if [ -e /dev/xpuptcl ]; then
+    NVLINK_COUNT=0
+else
+    NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+fi
 if [ "$NVLINK_COUNT" -gt 0 ]; then
     export HAS_NVLINK=1
 else
@@ -129,6 +133,8 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
    \"SGLANG_HEALTH_CHECK_TIMEOUT\": \"${SGLANG_HEALTH_CHECK_TIMEOUT:-180}\",
    \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\",
    \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
+   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-1}\",
+   \"NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK\": \"${NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK:-1}\",
    \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
 
 }

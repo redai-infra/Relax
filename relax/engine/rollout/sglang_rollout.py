@@ -731,6 +731,17 @@ async def generate_rollout_async(
     total_transfer_samples = 0
     get_samples_times: list[float] = []
 
+    # is_last bookkeeping: a partition train_X is filled across two steps (step X
+    # commits committed_current, step X+1 backfills the deficit). Mark is_last on
+    # the transfer that brings a partition's cumulative commits to its final target:
+    #   - prev partition (train_{rollout_id-1}): closed by this step's num_old_samples backfill
+    #   - cur partition (train_{rollout_id}): only if this step fully meets rollout_batch_size
+    #     (no deficit carried); otherwise its tail is backfilled next step.
+    committed_prev = 0  # groups committed to train_{rollout_id-1} this step
+    committed_curr = 0  # groups committed to train_{rollout_id} this step
+    prev_target = num_old_samples
+    curr_target = args.rollout_batch_size
+
     logger.info(
         f"Starting rollout step {rollout_id}: target(commit)={target_data_size} "
         f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples}), submit_target={submit_target}"
@@ -808,45 +819,62 @@ async def generate_rollout_async(
         # in fully async mode, we transfer all remaining samples when we reach the target size
         if len(batch_to_transfer) >= transfer_batch_size:
             if total_transfer_samples <= num_old_samples:
+                n = len(batch_to_transfer)
+                # is_last: this backfill closes the previous partition's debt.
+                prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
                     transfer_batch_to_data_system(
                         args,
                         batch_to_transfer,
-                        len(batch_to_transfer),
+                        n,
                         rollout_id - 1,
                         data_system_client,
+                        is_last=prev_is_last,
                     )
                 )
+                committed_prev += n
                 transfer_tasks.append(transfer_task)
                 batch_to_transfer = []
                 logger.info(f"Total yielded: {total_transfer_samples}/{num_old_samples} for step: {rollout_id - 1}")
             else:
                 if len(batch_to_transfer) > total_transfer_samples - num_old_samples:
                     cutoff_batch = len(batch_to_transfer) - total_transfer_samples + num_old_samples
+                    n_prev = len(batch_to_transfer[:cutoff_batch])
+                    # This split sends the remaining backfill to the previous partition;
+                    # it always closes the debt, so it is the previous partition's last.
+                    prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
                         transfer_batch_to_data_system(
                             args,
                             batch_to_transfer[:cutoff_batch],
-                            len(batch_to_transfer[:cutoff_batch]),
+                            n_prev,
                             rollout_id - 1,
                             data_system_client,
+                            is_last=prev_is_last,
                         )
                     )
+                    committed_prev += n_prev
                     transfer_tasks.append(transfer_task)
                     batch_to_transfer = batch_to_transfer[cutoff_batch:]
                     logger.info(
                         f"{num_old_samples} old samples completed! Total yielded: {num_old_samples}/{num_old_samples} for step: {rollout_id - 1}"
                     )
                 else:
+                    n = len(batch_to_transfer)
+                    # is_last for the current partition ONLY if this step fully meets its
+                    # target (no deficit carried) — otherwise the tail is backfilled next step.
+                    curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
                         transfer_batch_to_data_system(
                             args,
                             batch_to_transfer,
-                            len(batch_to_transfer),
+                            n,
                             rollout_id,
                             data_system_client,
+                            is_last=curr_is_last,
                         )
                     )
+                    committed_curr += n
                     transfer_tasks.append(transfer_task)
                     batch_to_transfer = []
                     logger.info(
@@ -854,15 +882,20 @@ async def generate_rollout_async(
                     )
 
     if len(batch_to_transfer) > 0:
+        n = len(batch_to_transfer)
+        # Tail flush to the current partition: last only if it completes this step's target.
+        curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
         transfer_task = asyncio.create_task(
             transfer_batch_to_data_system(
                 args,
                 batch_to_transfer,
-                len(batch_to_transfer),
+                n,
                 rollout_id,
                 data_system_client,
+                is_last=curr_is_last,
             )
         )
+        committed_curr += n
         transfer_tasks.append(transfer_task)
         batch_to_transfer = []
         logger.info(

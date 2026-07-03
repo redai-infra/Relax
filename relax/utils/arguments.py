@@ -340,6 +340,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--sft-logits-chunk-size",
+                type=int,
+                default=1024,
+                help="SFT only: chunk size for the lm_head + CE matmul under "
+                "sft_loss_function_chunked (avoids materializing full [B,S,V/TP] logits). "
+                "Independent from --log-probs-chunk-size, which only chunks the post-logits "
+                "log_prob reduce used by RL paths and SFT eval (PPL).",
+            )
+            parser.add_argument(
+                "--sft-chunked-logits",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
+                "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
+                "logits. Default off — legacy external-loss SFT path materializes full logits "
+                "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
+                "when --enable-mtp-training is set (MTP head needs the real output_layer; "
+                "bypass would break it) or when embeddings are tied "
+                "(--untie-embeddings-and-output-weights not set: output_layer is built with "
+                "skip_weight_param_allocation=True so output_layer.weight is None and the "
+                "chunked path's lm_head matmul has nothing to multiply against; tied models "
+                "are small enough that the chunked path's memory win is marginal anyway).",
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
@@ -465,6 +489,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Required when --sft-oversize-strategy custom. Importable path to a function with "
                     "signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) | None`. "
                     "Returning None is treated as skip."
+                ),
+            )
+            parser.add_argument(
+                "--sft-tq-timeout-minutes",
+                type=int,
+                default=None,
+                help=(
+                    "SFT-only timeout (in minutes) for the producer's TransferQueue waits. "
+                    "If the consumer dies, the SFT producer would otherwise spin forever on "
+                    "_wait_for_buffer_capacity. On timeout the producer raises TimeoutError "
+                    "and the job crashes. Defaults to --distributed-timeout-minutes."
                 ),
             )
             parser.add_argument(
@@ -1120,7 +1155,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Balance the number of tokens between data parallel ranks with `karmarkar_karp` for verl. "
-                    "Note that this may allocate the different response of the same prompt into different training steps."
+                    "Note that this may allocate the different response of the same prompt into different training steps. "
+                    "In fully-async + --use-dynamic-batch-size mode this is effectively always on: the "
+                    "StreamingTokenBudgetSampler already balances tokens across DP ranks per sample, so the "
+                    "flag is accepted but has no additional effect there."
                 ),
             )
 
@@ -1225,8 +1263,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Target size of the agentic prepare pool in groups. "
-                    "If unset, defaults to over_sampling_batch_size."
+                    "Positive target size of the agentic prepare pool in groups, or 0 to start agent processes after "
+                    "rollout begins. If unset, defaults to over_sampling_batch_size."
                 ),
             )
             parser.add_argument(
@@ -1405,6 +1443,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus_baseline",
                     "ppo",
                     "sapo",
+                    "cispo",
                 ],
                 default="grpo",
                 help=(
@@ -2376,6 +2415,16 @@ def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
     args.max_staleness = sft_max_in_flight_steps - 1
 
 
+def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
+    if not is_sft:
+        return
+    timeout = getattr(args, "sft_tq_timeout_minutes", None)
+    if timeout is None:
+        args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
+    elif timeout <= 0:
+        raise ValueError("--sft-tq-timeout-minutes must be > 0.")
+
+
 def _validate_agentic_rollout_args(args) -> None:
     if not args.use_agentic_rollout:
         return
@@ -2400,8 +2449,8 @@ def _validate_agentic_rollout_args(args) -> None:
             raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
         if key.startswith("RELAX_"):
             raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
-    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size <= 0:
-        raise ValueError("--agentic-prepare-pool-size must be > 0.")
+    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size < 0:
+        raise ValueError("--agentic-prepare-pool-size must be >= 0.")
     if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
@@ -2443,7 +2492,31 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
+    # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
+    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
+    # response_length=1 for every sample and training silently degenerates.
+    if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    ):
+        raise ValueError(
+            "SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
+            "--sglang-speculative-algorithm in this build: spec_v2 EAGLE worker "
+            "does not populate output_token_logprobs, which collapses rollout "
+            "response_length to 1 and silently breaks training. "
+            "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
+            "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
+            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
+            "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
+            "spec_v2."
+        )
+
     _normalize_sft_max_in_flight_steps(args, is_sft)
+    _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
@@ -2639,6 +2712,24 @@ def slime_validate_args(args):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
+        # The token-budget sampler always emits at least one sample per micro-batch,
+        # even if that single sample exceeds the budget (otherwise the stream stalls).
+        # So the per-GPU token budget (max_tokens_per_gpu * context_parallel_size,
+        # since a sequence is split across CP ranks) must be able to hold the longest
+        # possible single sample (rollout_max_context_len). Otherwise an over-long
+        # sample produces an oversized micro-batch that OOMs mid-training.
+        max_ctx_len = getattr(args, "rollout_max_context_len", None)
+        if max_ctx_len is not None:
+            cp_size = getattr(args, "context_parallel_size", 1)
+            token_budget = args.max_tokens_per_gpu * cp_size
+            if token_budget < max_ctx_len:
+                raise ValueError(
+                    f"max_tokens_per_gpu * context_parallel_size ({args.max_tokens_per_gpu} * {cp_size} = "
+                    f"{token_budget}) must be >= rollout_max_context_len ({max_ctx_len}); otherwise a single "
+                    f"over-long sample forms an oversized micro-batch and OOMs. Increase max_tokens_per_gpu "
+                    f"(or context_parallel_size), or reduce rollout_max_context_len."
+                )
+
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
@@ -2740,14 +2831,6 @@ def slime_validate_args(args):
         raise ValueError(
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
-        )
-
-    if args.fully_async and args.balance_data and not args.hybrid:
-        raise ValueError(
-            "--balance-data is not supported in pure fully-async mode (--fully-async without --hybrid). "
-            "In pure fully-async training, the actor consumes rollout data via StreamDataLoader "
-            "which is incompatible with data balancing. Use --hybrid mode "
-            "or remove --balance-data from your command."
         )
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
@@ -2890,6 +2973,44 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
+    # --sft-chunked-logits incompatibilities. All three are flagged here so
+    # downstream (model.py _should_use_sft_chunked + the three loss.py direct
+    # reads of args.sft_chunked_logits) sees a single, consistent truth.
+    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # from their script rather than have it silently flipped off.
+    if getattr(args, "sft_chunked_logits", False):
+        # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
+        #    Output_layer is built with skip_weight_param_allocation=True →
+        #    output_layer.weight is None → chunked path's lm_head matmul
+        #    crashes on NoneType. The chunked memory win is marginal on the
+        #    small models that ship with tied embeddings anyway, so the user
+        #    should just drop the flag.
+        assert getattr(args, "untie_embeddings_and_output_weights", False), (
+            "--sft-chunked-logits is incompatible with tied embeddings "
+            "(HF config.tie_word_embeddings=true → "
+            "--untie-embeddings-and-output-weights not set; output_layer.weight "
+            "is None and the chunked path's lm_head matmul has nothing to "
+            "multiply against). Remove --sft-chunked-logits; the chunked "
+            "memory win is marginal on tied-weight models."
+        )
+        # 2) MTP. MTP's _postprocess reaches for self.output_layer directly;
+        #    _bypass_output_layer's passthrough would break the MTP head.
+        assert not getattr(args, "enable_mtp_training", False), (
+            "--sft-chunked-logits is incompatible with --enable-mtp-training "
+            "(MTP head needs the real output_layer; the chunked path's "
+            "passthrough would break it). Remove one of the two flags."
+        )
+        # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        #    forward through model.build_schedule_plan(), which does NOT call
+        #    model(**kwargs) and so never hits _bypass_output_layer — chunked
+        #    silently degrades to the full-logits path.
+        assert not getattr(args, "overlap_moe_expert_parallel_comm", False), (
+            "--sft-chunked-logits is incompatible with "
+            "--overlap-moe-expert-parallel-comm (combined-1f1b path bypasses "
+            "_bypass_output_layer; chunked would silently degrade). "
+            "Remove one of the two flags."
+        )
+
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
 
@@ -2924,6 +3045,13 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if args.advantage_estimator == "ppo":
+        raise ValueError(
+            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
+            "Please use one of the following advantage estimators instead: "
+            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
+        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."
