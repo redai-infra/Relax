@@ -81,13 +81,17 @@ index bc21f8882..87329e5a0 100644
                              return
  
                  self.bootstrap_infos = bootstrap_infos
-@@ -826,8 +847,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
+@@ -826,8 +847,17 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                      f" ({self._registered_count} workers registered).",
                      status=503,
                  )
-+            
++
 +            inferred_attn_tp_size = max(
-+                (len(v) for v in self.prefill_port_table.values()),
++                (
++                    len(tp_group_table)
++                    for dp_group_table in self.prefill_port_table.values()
++                    for tp_group_table in dp_group_table.values()
++                ),
 +                default=self.attn_tp_size,
 +            )
              info = PrefillServerInfo(
