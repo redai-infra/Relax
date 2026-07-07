@@ -1,6 +1,6 @@
 ---
 name: sync-github
-description: Use when syncing Relax code between internal GitLab and external GitHub, especially gitlab/dev, gitlab/main, github/main, internal CR/MR handoff, linear main history, sensitive-content checks, or guarded GitHub pushes.
+description: Use when syncing Relax code between internal GitLab and external GitHub, especially gitlab/dev, gitlab/main, github/main, internal CR/MR handoff, linear main history, sensitive-content checks, GitHub Actions CI validation, or guarded GitHub pushes.
 ---
 
 # sync-github
@@ -61,7 +61,47 @@ git status --porcelain --untracked-files=no
 
 ## GitHub Push 门禁
 
-任何 GitHub push 前都要输出并暂停：
+任何推送到 `github/main` 前，必须先完成 GitHub Actions main push 门禁。普通功能分支 / 验证分支 push 只用于触发 CI，不等同于允许推送 `github/main`。
+
+### GitHub Actions main push 门禁
+
+`gh workflow run` 只会运行 GitHub 上已经 push 的代码，不会包含本地未提交或未 push 的改动。`ci.yml` 目前只能触发整个 workflow，不能只跑其中一个 job，除非 workflow 自己添加 inputs 控制。
+
+在准备 `git push github HEAD:refs/heads/main` 前，必须：
+
+```bash
+test -z "$(git status --porcelain --untracked-files=no)"
+SOURCE_SHA=$(git rev-parse HEAD)
+VALIDATE_BRANCH=sync/validate-github-main-$(git rev-parse --short HEAD)
+git push github HEAD:refs/heads/$VALIDATE_BRANCH
+gh workflow run ci.yml -R redai-infra/Relax --ref $VALIDATE_BRANCH
+gh run list -R redai-infra/Relax --workflow ci.yml --branch $VALIDATE_BRANCH --limit 5
+gh run watch <run-id> -R redai-infra/Relax
+gh run view <run-id> -R redai-infra/Relax --json status,conclusion,headSha,url
+```
+
+门禁规则：
+
+- `headSha` 必须等于 `SOURCE_SHA`，否则该 CI 结果不能作为本次 `github/main` push 凭证。
+- `conclusion` 必须是 `success`，且至少包含 `Pre-commit Checks`、`Lint`、Python 测试矩阵全部成功。
+- 如果失败，先查看失败日志：
+
+```bash
+gh run view <run-id> -R redai-infra/Relax --log-failed
+```
+
+- 如果需要改代码：本地修复、提交、push 到同一个验证分支或新验证分支后，重新 `gh workflow run ci.yml`。不要用旧 run 证明新代码。
+- 如果确认是瞬时失败且代码未变，可以只重跑失败 job：
+
+```bash
+gh run rerun <run-id> -R redai-infra/Relax --failed
+```
+
+- 在 CI 全绿前禁止执行 `git push github HEAD:refs/heads/main`。
+
+### 最终 GitHub push 暂停
+
+GitHub Actions main push 门禁全绿后，任何 `github/main` push 前都要输出并暂停：
 
 ```text
 准备执行 GitHub push：
@@ -70,7 +110,8 @@ git status --porcelain --untracked-files=no
 source ref / SHA: <...>
 target ref / 当前 SHA: <...>
 fast-forward: <yes|no|not-applicable>
-安全检查: <gitleaks/pre-commit 结果>
+安全检查: <duplicate-def / F811 / gitleaks 结果>
+GitHub Actions: <ci.yml run url> / <success> / <headSha>
 
 请回复：确认执行 GitHub push
 ```

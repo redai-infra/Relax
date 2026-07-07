@@ -22,6 +22,7 @@
 9. 已跟踪文件有本地改动时停止；只有未跟踪文件时，记录路径并继续。不要删除、stage、stash、clean 未跟踪文件。
 10. 不要运行需要 GPU 的代码或测试。
 11. 如果缺少 `gitleaks`，读取 `references/gitleaks.md`，向用户确认安装方案后再继续。
+12. 推送 `github/main` 前必须先把同一个 `HEAD` push 到 GitHub 验证分支，手动触发 `ci.yml`，并确认该 run 的 `headSha` 等于本地 `HEAD` 且结论为 `success`。
 
 ## 0. 重新拉取状态
 
@@ -157,7 +158,65 @@ git fetch gitlab --prune
 test "$(git rev-parse gitlab/main)" = "$(git rev-parse HEAD)"
 ```
 
-## 6. 普通 push 到 GitHub main
+## 6. GitHub Actions main push 门禁
+
+`gh workflow run` 跑的是 GitHub 上已经 push 的代码，不会带本地未提交或未 push 的改动。因此必须先把准备推到 `github/main` 的同一个 `HEAD` 推到 GitHub 验证分支，再手动触发远端 CI。
+
+确认本地 tracked 工作区干净，并记录源 SHA：
+
+```bash
+test -z "$(git status --porcelain --untracked-files=no)"
+SOURCE_SHA=$(git rev-parse HEAD)
+VALIDATE_BRANCH=sync/validate-github-main-$(git rev-parse --short HEAD)
+```
+
+推送验证分支并触发完整 `ci.yml`：
+
+```bash
+git push github HEAD:refs/heads/$VALIDATE_BRANCH
+gh workflow run ci.yml -R redai-infra/Relax --ref $VALIDATE_BRANCH
+gh run list -R redai-infra/Relax --workflow ci.yml --branch $VALIDATE_BRANCH --limit 5
+```
+
+选中刚触发的 run id 后盯住它：
+
+```bash
+gh run watch <run-id> -R redai-infra/Relax
+gh run view <run-id> -R redai-infra/Relax --json status,conclusion,headBranch,headSha,url
+```
+
+门禁规则：
+
+- `headBranch` 必须等于 `$VALIDATE_BRANCH`。
+- `headSha` 必须等于 `$SOURCE_SHA`。
+- `conclusion` 必须等于 `success`。
+- `Pre-commit Checks`、`Lint`、`Tests (Python 3.10)`、`Tests (Python 3.11)`、`Tests (Python 3.12)` 必须全部成功。
+
+如果失败，先看失败日志：
+
+```bash
+gh run view <run-id> -R redai-infra/Relax --log-failed
+```
+
+处理规则：
+
+- 如果需要改代码：本地修复、提交、push 到验证分支后，重新 `gh workflow run ci.yml`。旧 run 不能证明新代码。
+- 如果确认是瞬时失败且代码未变，可以只重跑失败 job：
+
+```bash
+gh run rerun <run-id> -R redai-infra/Relax --failed
+```
+
+CI 没有全绿前，禁止执行下一步 `git push github HEAD:refs/heads/main`。
+
+记录：
+
+- 验证分支名
+- `SOURCE_SHA`
+- `ci.yml` run id 和 URL
+- `status` / `conclusion` / `headSha`
+
+## 7. 普通 push 到 GitHub main
 
 先确认是 fast-forward：
 
@@ -175,6 +234,7 @@ source ref / SHA: HEAD / $(git rev-parse HEAD)
 target ref / 当前 SHA: refs/heads/main / $(git rev-parse github/main)
 fast-forward: yes
 安全检查: <duplicate-def / F811 / gitleaks 结果>
+GitHub Actions: <ci.yml run url> / success / <headSha>
 
 请回复：确认执行 GitHub push
 ```
@@ -185,7 +245,7 @@ fast-forward: yes
 git push github HEAD:refs/heads/main
 ```
 
-## 7. 最终验证
+## 8. 最终验证
 
 重新 fetch：
 
@@ -206,6 +266,7 @@ test "$(git rev-parse gitlab/main)" = "$(git rev-parse github/main)"
 - 本次同步 cherry-pick 的有效 commit 列表
 - 跳过的空提交 / GitLab merge / 无效 merge commit 列表
 - duplicate-def / ruff F811 / gitleaks 检查结果
+- GitHub Actions `ci.yml` 验证分支、run id、run URL、headSha、conclusion
 - 本地 `sync/*` 临时分支若存在，只是旧流程遗留；Prompt B 不应再创建新的同步分支
 
 ## 异常处理
