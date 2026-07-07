@@ -27,7 +27,6 @@ from app.env_deepeyes_v2 import (
     extract_tool_call,
 )
 from app.sandboxes import SandboxExecutor, get_sandbox_backend
-from openai import APIStatusError, AsyncOpenAI
 from PIL import Image
 
 
@@ -136,6 +135,8 @@ def _build_executor(backend_name: str, ensure_sandbox_timeout_s: int) -> Sandbox
 
 
 async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, Any]:
+    from openai import APIStatusError, AsyncOpenAI  # type: ignore[import-not-found]
+
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     max_turns = int(config["max_turns"])
     ensure_sandbox_timeout_s = int(config["ensure_sandbox_timeout_s"])
