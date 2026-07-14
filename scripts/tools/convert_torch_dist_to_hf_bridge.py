@@ -115,14 +115,7 @@ if __name__ == "__main__":
     print(f"Exporting checkpoint from {args.input_dir} to {args.output_dir}")
     bridge.export_ckpt(args.input_dir, args.output_dir)
 
-    # --- Post-process: make the output dir consumable by older vLLM /
-    # transformers 4.x releases. Bridge running under transformers 5.x writes
-    # the new HF schema (rope_parameters nested, dtype renamed, chat_template
-    # split into a sidecar .jinja, vocab.json/merges.txt dropped). All of these
-    # are silently incompatible with transformers ≤ 4.x consumers — in
-    # particular the missing top-level `rope_theta` makes the model fall back
-    # to default 10000 and produce garbled tokens at inference. Patch the
-    # written config / tokenizer files to be readable by BOTH schema versions.
+    # Make the output dir consumable by older transformers 4.x releases.
     import json
     import shutil
 
@@ -136,18 +129,11 @@ if __name__ == "__main__":
             cfg.setdefault("rope_scaling", None)
         if "dtype" in cfg and "torch_dtype" not in cfg:
             cfg["torch_dtype"] = cfg["dtype"]
-        # Pin to the schema vLLM 4.x consumers know; harmless on 5.x consumers
-        # (they ignore the field).
         cfg["transformers_version"] = "4.51.0"
         with open(cfg_path, "w") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
         print(f"[convert] post-processed {cfg_path} for transformers 4.x compatibility")
 
-    # Restore tokenizer files dropped by the 5.x writer. Origin's
-    # tokenizer_config.json carries the chat_template inline (older
-    # transformers cannot read the standalone .jinja sidecar); vocab.json
-    # and merges.txt are needed by the slow-tokenizer path some vLLM
-    # versions still use as a fallback.
     for fname in ("tokenizer_config.json", "vocab.json", "merges.txt"):
         src = os.path.join(args.origin_hf_dir, fname)
         dst = os.path.join(args.output_dir, fname)

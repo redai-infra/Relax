@@ -8,117 +8,99 @@ On-Policy Distillation (OPD) enables knowledge transfer from a large teacher mod
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--use-opd`               | Enable On-Policy Distillation. Required flag when using OPD.                                                                               |
 | `--opd-type`              | OPD type: `sglang` or `megatron`. Must be set when `--use-opd` is enabled.                                                                 |
-| `--opd-kl-coef`           | OPD KL penalty coefficient (default: 1.0). Controls the weight of the distillation signal relative to the RL advantage.                    |
+| `--opd-token-selection`   | Token selection mode: `student_sampled` (default), `student_topk`, `teacher_topk`, `union`.                                               |
+| `--opd-kl-coef`           | KL coefficient for advantage mode (default: 1.0). When set, `--opd-loss-coef` must be 0.                                                  |
+| `--opd-loss-coef`         | KL coefficient for loss mode (default: 0.0). When set, `--opd-kl-coef` must be 0.                                                         |
+| `--opd-kl-type`           | KL divergence type: `reverse_kl` (default), `forward_kl`, `low_var_kl`, `jsd`.                                                            |
+| `--opd-jsd-alpha`         | JSD mixing coefficient (default: 0.5). 0.0 is equivalent to reverse_kl, 1.0 to forward_kl.                                                |
+| `--opd-log-prob-top-k`    | Top-K candidate set size (set to `0` to disable, default: `0`).                                                                            |
+| `--opd-norm-mode`         | Top-K tail handling: `tail` (default), `norm`, `trunc`.                                                                                   |
+| `--opd-per-token-clip`    | Hard upper bound for per-token KL (optional).                                                                                              |
+| `--opd-is-clip`           | Hard upper bound for importance sampling ratio (optional, loss mode only).                                                                |
 | `--opd-teacher-load`      | Path to the teacher model. **Must** be set when `--opd-type=megatron`, **must not** be set when `--opd-type=sglang`.                       |
 | `--opd-teacher-ckpt-step` | Optional checkpoint step for the teacher model.                                                                                            |
 | `--opd-teacher-timeout-s` | Timeout (seconds) for OPD teacher HTTP requests in SGLang mode (default: 30).                                                              |
-| `--opd-log-prob-top-k`    | Top-k size for collecting teacher/student candidate tokens used by OPD dynamic metrics (set `0` to disable, default: 0).                 |
 | `--opd-only-reward`       | Keep only the OPD reward signal (zero out base RL reward and use OPD KL term only). Requires `--use-opd`.                                 |
 
 ## How It Works
 
-OPD modifies the advantage calculation by subtracting a KL penalty term, encouraging the student to match the teacher's output distribution:
+OPD injects distillation signals into training by computing token-level KL divergence between teacher and student. Relax supports two injection methods:
+
+- **Advantage mode (adv)**: Subtract KL from advantage (via `--opd-kl-coef`)
+- **Loss mode (loss)**: Add KL as an extra loss term (via `--opd-loss-coef`)
+
+Only one mode can be active at a time. OPD is orthogonal to the advantage estimator and can be combined with any estimator (GRPO, GSPO, SAPO, and experimental estimators like PPO and REINFORCE++).
+
+## Token-Selection Modes
+
+OPD supports four token-selection strategies that determine which tokens are used for KL computation:
+
+| Mode | Student self top-K | Teacher self top-K | Teacher @ student top-K | Student @ teacher top-K | Description |
+| --- | --- | --- | --- | --- | --- |
+| `student_sampled` | — | — | — | — | Compute KL only on student-sampled 1D tokens, lowest overhead |
+| `student_topk` | ✅ | — | ✅ | — | Compute KL on student top-K token set |
+| `teacher_topk` | — | ✅ | — | ✅ | Compute KL on teacher top-K token set |
+| `union` | ✅ | ✅ | ✅ | ✅ | Compute KL on the union of student and teacher top-K sets, most comprehensive |
+
+Use `--opd-token-selection` to specify the mode and `--opd-log-prob-top-k` for the top-K size. For all modes except `student_sampled`, the environment variable `RELAX_OPD_PER_POS_TOKEN_IDS=1` must be set.
+
+## Two Application Methods: adv and loss
+
+### Advantage Mode (adv)
+
+Enabled via `--opd-kl-coef` (with `--opd-loss-coef` set to 0). After advantage computation, the per-token KL is subtracted from the advantage:
 
 $$\hat{A}_t = A_t - \lambda_{\text{opd}} \cdot D_{\text{KL}}(P_{\text{teacher}} \| P_{\text{student}})_t$$
 
-Where $A_t$ is the original advantage from the base estimator (e.g., GRPO), $\lambda_{\text{opd}}$ is `--opd-kl-coef`, and $D_{\text{KL}}$ is the token-level reverse KL divergence.
+Characteristics:
 
-Therefore, OPD can be combined with any advantage estimator, including GRPO, GSPO, SAPO, and experimental estimators like PPO and REINFORCE++.
+- KL term uses `.detach()`, **no gradient** is produced
+- Only affects advantage estimation, does not change the loss function form
+- Orthogonal to any advantage estimator (GRPO, GSPO, SAPO, etc.)
 
-## Two Teacher Modes
+Architecture flow:
 
-### SGLang Mode (`--opd-type sglang`)
+```
+Rollout Phase:
+  Student Rollout → student top-K token IDs / log-probs
+  Teacher Prefill → teacher log-probs / teacher top-K
+  Student Prefill → student @ teacher top-K log-probs (adv mode only)
+      ↓
+  Assemble training data (opd_topk_token_ids, opd_topk_student_log_probs, opd_topk_teacher_log_probs)
 
-The teacher model runs on an external SGLang server, and the teacher's log-probs are obtained during the rollout phase.
-
-**Use cases**: Teacher architecture differs from student, or teacher model is too large to be loaded together with the training model.
-
-**Workflow**:
-
-1. An external SGLang server runs the teacher model.
-2. During rollout, after the reward is computed for each sample, the framework automatically sends the sample to the teacher server to obtain token-level log-probs and stores them in `sample.teacher_log_probs`.
-3. When `--opd-log-prob-top-k > 0`, the framework also requests teacher top-k candidates (via SGLang request fields), and stores:
-	- `sample.teacher_topk_token_ids`
-	- `sample.teacher_topk_log_probs` (if returned by teacher)
-4. If teacher request fails or top-k fields are missing, OPD uses a safe fallback path (rollout log-probs and placeholder top-k data) to avoid breaking the rollout loop.
-5. During training, the KL penalty is computed from the stored teacher log-probs and applied to advantages.
-
-> **Note**: OPD sglang mode does NOT occupy `--custom-rm-path` or `--custom-reward-post-process-path`. Users can freely use custom reward functions alongside OPD.
-
-**Configuration**:
-
-```bash
---use-opd
---opd-type sglang
---opd-kl-coef 1.0
---opd-teacher-timeout-s 30
---opd-log-prob-top-k 10
---rm-url http://<TEACHER_IP>:<TEACHER_PORT>/generate
+Training Phase:
+  compute_advantages_and_returns()
+    → apply_opd_to_advantages()
+    → modify advantage: adv = adv - opd_kl_coef * kl_term.detach()
 ```
 
-## Dynamic Metrics
+### Loss Mode (loss)
 
-When top-k collection is enabled, OPD can monitor student-teacher candidate alignment online.
+Enabled via `--opd-loss-coef` (with `--opd-kl-coef` set to 0). During policy loss computation, the per-token KL is added as an extra loss term:
 
-Let $S_t^{(p)} = \text{TopK}(p_t, k)$ and $S_t^{(q)} = \text{TopK}(q_t, k)$ denote student/teacher top-$k$ sets at token step $t$.
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{PG}} + \lambda_{\text{loss}} \cdot \mathbb{E}_t[D_{\text{KL}}(P_{\text{teacher}} \| P_{\text{student}})_t]$$
 
-### Overlap Ratio
+Characteristics:
 
-$$
-\mathcal{M}_{\text{overlap}} \triangleq \mathbb{E}_t \left[ \frac{|S_t^{(p)} \cap S_t^{(q)}|}{k} \right]
-$$
+- KL term **produces gradient**, directly affecting policy gradient direction
+- Supports per-token clipping (`--opd-per-token-clip`) and importance ratio clipping (`--opd-is-clip`)
+- Independent of the advantage estimator
 
-Interpretation:
+Architecture flow:
 
-- Lower overlap suggests candidate-space mismatch between student and teacher.
-- Higher overlap indicates the student policy is moving closer to teacher support.
+```
+Rollout Phase:
+  Student Rollout → student top-K token IDs / log-probs
+  Teacher Prefill → teacher log-probs / teacher top-K
+      ↓
+  Assemble training data (opd_topk_token_ids, opd_topk_teacher_log_probs)
 
-### Megatron Mode (`--opd-type megatron`)
-
-The teacher model is directly loaded into Megatron via `--opd-teacher-load`, and the teacher's log-probs are computed during the training forward pass.
-
-**Use cases**: Teacher and student/reference model have the same architecture and can fit in GPU memory together.
-
-**Hard requirement (important)**: Megatron teacher must be architecture-compatible with the student (e.g., hidden size, layer count, attention heads, and related parameter shapes).
-
-- ✅ Valid: 8B student + 8B teacher, or 32B student + 32B teacher
-- ❌ Invalid: 8B student + 32B teacher (will fail with parameter shape mismatch)
-
-**Workflow**:
-
-1. The teacher model is loaded as an additional Megatron model during initialization.
-2. During the training forward pass, the teacher model computes log-probs for each sample.
-3. The KL penalty is computed inline and applied to advantages.
-
-**Configuration**:
-
-```bash
---use-opd
---opd-type megatron
---opd-kl-coef 1.0
---opd-teacher-load /path/to/teacher_model
+Training Phase:
+  policy_loss_function()
+    → get_log_probs_and_entropy() (collect student top-K log-probs)
+    → compute_policy_opd_loss()
+    → compute KL → clipping → reduce
+    → loss = loss + opd_loss_coef * opd_loss
 ```
 
-> **Note**:
->
-> 1. With `--megatron-to-hf-mode bridge`, models can be loaded directly from HuggingFace paths (no pre-conversion to `torch_dist` required).
-> 2. Without bridge (for example, `raw` mode), checkpoints still need to be in Megatron format (`torch_dist` or `torch`).
-
-## Running Examples
-
-Complete example scripts are available in `examples/on_policy_distillation/`
-
-## Preliminary Results
-
-Using Qwen3-8B-Base model, performing SFT on a portion of the [OpenThoughts3-1.2M](https://huggingface.co/datasets/open-thoughts/OpenThoughts3-1.2M) dataset, then applying On-Policy Distillation with Qwen3-32B teacher on the remaining data, the Math500 evaluation results are as follows:
-
-| Model                                        | Pass@1 |
-| -------------------------------------------- | ------ |
-| Qwen3-8B-Base + SFT                          | 76%    |
-| Qwen3-8B-Base + SFT + On-Policy Distillation | 94%    |
-
-## Backend Support
-
-| Backend  | SGLang Teacher | Megatron Teacher   |
-| -------- | -------------- | ------------------ |
-| Megatron | ✅             | ✅ (teacher/student architecture must match) |
+> **Note**: adv and loss modes are mutually exclusive; only one can be enabled at a time.

@@ -1362,8 +1362,6 @@ class AgenticSessionShard:
     def _protected_abort_count_threshold(self) -> int | None:
         if not getattr(self.args, "partial_rollout", False):
             return None
-        if getattr(self.args, "fully_async", False):
-            return None
         return self.args.partial_rollout_max_aborted_count
 
     def _set_session_gate_locked(self, *, record: _SessionRecord, gate_reason: SessionGateReason | str | None) -> bool:

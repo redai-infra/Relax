@@ -7,16 +7,12 @@
 # Usage:
 # node1:
 # export IP_ADDRESS1=<IP_ADDRESS1>
-# export MEGATRON=/workspace/Megatron-LM
-# export MODEL_DIR=/workspace
 # export MASTER_ADDR=${IP_ADDRESS1}
 # export POD_NAME=${IP_ADDRESS1}
 # export HOST_IP=${IP_ADDRESS1}
 # bash -x scripts/entrypoint/spmd-multinode.sh scripts/training/text/run-qwen35-35B-A3B-16xklx.sh
 # node2:
 # export IP_ADDRESS2=<IP_ADDRESS2>
-# export MEGATRON=/workspace/Megatron-LM
-# export MODEL_DIR=/workspace
 # export MASTER_ADDR=${IP_ADDRESS1}
 # export POD_NAME=${IP_ADDRESS2}
 # export HOST_IP=${IP_ADDRESS2}
@@ -28,14 +24,14 @@ set -o pipefail
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
-export WORKDIR=/workspace/
-export MODEL_DIR="${MODEL_DIR:-/workspace}" # 存放模型权重的父目录
-export DATA_DIR="${DATA_DIR:-/workspace}"   # 存放训练样本的父目录
-export PROJECT_NAME=Relax-Qwen3.5-35B-P800 # 任意
-export MODEL_CONFIG_DIR=${WORKDIR}/Relax/scripts/models # Relax模型脚本路径
+export WORKDIR="${WORKDIR:-/workspace}"
+export MODEL_DIR="${MODEL_DIR:-/workspace}"
+export DATA_DIR="${DATA_DIR:-/workspace}"
+export PROJECT_NAME=Relax-Qwen3.5-35B-P800
+export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
+
 export MEGATRON=${WORKDIR}/Megatron-LM
 
-export XPU_SET_SIGMOID_GATING_DELTA_RULE_UPDATE_FP16_FAST_OPT=1
 export XMLIR_USE_HYDRA_LINEAR=1
 export XMLIR_ENABLE_FAST_FC=1
 export XTE_DISABLE_MOE_DW_FUSION=0
@@ -46,9 +42,9 @@ export CUDA_ENABLE_P2P_NO_UVA=0
 export CUDA_FAKE_UVA_ENABLE=1
 export CUDA_ERROR_LEVEL=0
 export XPU_SUPPORT_IPC_EVENT=1
-export GLOO_SOCKET_IFNAME="eth0"
-export TP_SOCKET_IFNAME="eth0"
-
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-"eth0"}
+export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-"eth0"}
+export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7"}
 
 
 unset http_proxy
@@ -59,7 +55,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-klx.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
+source "${SCRIPT_DIR}/../../models/qwen35-35B-A3B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
@@ -68,12 +64,12 @@ DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-1000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B
-   --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-35B-A3B/
+   --ref-load ${MODEL_DIR}/Qwen3.5-35B-A3B/
    --megatron-to-hf-mode bridge
 
-   # --load ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_8xpu/
-   --save ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xpu/
+   # --load ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
+   --save ${EXP_DIR}/Qwen3.5-35B-A3B_mcore_16xgpu/
    --save-interval 100
    --max-actor-ckpt-to-keep 1
 )
@@ -121,10 +117,10 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 4096
    --moe-token-dispatcher-type flex
    --moe-grouped-gemm true
-   --moe-permute-fusion true
+   # --moe-permute-fusion true
    # --optimizer-offload-fraction 0.5
 )
 
@@ -176,12 +172,13 @@ WANDB_ARGS=(
    # --use-metrics-service
    # --tb-project-name  ${PROJECT_NAME}
    # --tb-experiment-name relax-qwen35-35B-A3B-p800x8-sync-${now}
-   --tb-experiment-name qwen3.5-35B-p800x16-bs128-20260629-${now}
+   --tb-experiment-name qwen3.5-35B-p800x16-${now}
    --use-wandb
-   --wandb-project relax-qwen3.5-35B
-   --wandb-group qwen3.5-35B-p800x16-bs128-20260629-${now}
-   --wandb-key ${WANDB_KEY}
+   --wandb-project ${PROJECT_NAME}
+   --wandb-group qwen3.5-35B-p800x16-${now}
+   --wandb-key ${WANDB_API_KEY}
    --disable-wandb-random-suffix
+   --no-use-metrics-service
 )
 
 MISC_ARGS=(
@@ -197,7 +194,7 @@ MISC_ARGS=(
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}\",
+    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
     \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENBLAS_NUM_THREADS\": \"64\",
@@ -251,7 +248,7 @@ RUNTIME_ENV_JSON="{
     \"BKCL_TIMEOUT\": \"400000\",
     \"CUDA_DISABLE_PRINTF\": \"1\",
     \"BKCL_RDMA_VERBS\": \"1\",
-    \"BKCL_RDMA_NICS\": \"bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7\",
+    \"BKCL_RDMA_NICS\": \"${BKCL_RDMA_NICS}\",
     \"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES\": \"1\",
     \"TORCH_XCCL_DEFAUTL_PG_TIMEOUT_MILSEC\": \"7200000\",
     \"CUDA_ERROR_LEVEL\": \"0\",
@@ -291,11 +288,11 @@ RUNTIME_ENV_JSON="{
     \"RAY_OVERRIDE_JOB_RUNTIME_ENV\":\"1\",
     \"RELAX_SKIP_TORCH_MEMORY_SAVER\": \"1\",
     \"XMLIR_MEMCPY_RETRY_SYNC\": \"${XMLIR_MEMCPY_RETRY_SYNC}\",
-    \"XSGL_USE_FAST_BFP16\": \"1\",
-    \"XPU_SET_SIGMOID_GATING_DELTA_RULE_UPDATE_FP16_FAST_OPT\": \"${XPU_SET_SIGMOID_GATING_DELTA_RULE_UPDATE_FP16_FAST_OPT}\",
     \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"GLOO_SOCKET_IFNAME\": \"eth0\",
-    \"TP_SOCKET_IFNAME\": \"eth0\"
+    \"GLOO_SOCKET_IFNAME\": \"${GLOO_SOCKET_IFNAME}\",
+    \"TP_SOCKET_IFNAME\": \"${TP_SOCKET_IFNAME}\",
+    \"NVTE_DEBUG\": \"1\",
+    \"NVTE_DEBUG_LEVEL\": \"1\"
    }
 }"
 

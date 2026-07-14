@@ -263,6 +263,7 @@ export default defineConfig({
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
+                { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' }
@@ -368,6 +369,7 @@ export default defineConfig({
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
+                { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' }

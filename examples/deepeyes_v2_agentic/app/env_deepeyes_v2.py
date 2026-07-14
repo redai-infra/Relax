@@ -204,34 +204,46 @@ class DeepEyesV2Env:
     async def exec_code(self, response_text: str) -> ToolObs:
         code = extract_code(response_text)
         if not code:
-            return ToolObs(body_text="", done=True, error="code_extract_failed")
+            return ToolObs(
+                body_text=(
+                    "Error: <tool_call> was received but the 'code' field is empty or missing. "
+                    "Put your Python code as a non-empty string in arguments.code, e.g. "
+                    '<tool_call>{"name": "python_exec", "arguments": {"code": "print(image_1.size)"}}</tool_call>.'
+                ),
+                done=False,
+                error="code_extract_failed",
+            )
         try:
             await asyncio.wait_for(self._ensure_sandbox(), timeout=self._ensure_sandbox_timeout_s)
         except asyncio.TimeoutError:
             logger.warning(f"[deepeyes-v2] {self.data_index} ensure_sandbox timed out")
             return ToolObs(
-                body_text="Code execution error: sandbox unavailable",
-                done=True,
+                body_text="Error: sandbox startup timed out; skip tool execution and continue reasoning or answer directly.",
+                done=False,
                 error="ensure_sandbox_timeout",
             )
         except SandboxError as exc:
             logger.warning(f"[deepeyes-v2] {self.data_index} sandbox provision failed: {exc}")
             return ToolObs(
-                body_text="Code execution error: sandbox unavailable",
-                done=True,
+                body_text="Error: sandbox unavailable; skip tool execution and continue reasoning or answer directly.",
+                done=False,
                 error=f"sandbox_provision_failed:{type(exc).__name__}",
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(f"[deepeyes-v2] {self.data_index} ensure_sandbox raised")
             return ToolObs(
-                body_text="Code execution error: sandbox unavailable",
-                done=True,
+                body_text="Error: sandbox unavailable; skip tool execution and continue reasoning or answer directly.",
+                done=False,
                 error=f"sandbox_provision_failed:{type(exc).__name__}",
             )
 
         result = await self._run_code_in_sandbox(code)
         if result is None:
-            return ToolObs(body_text="Code execution error", done=True, error="sandbox_exec_failed")
+            return ToolObs(
+                body_text="Error: code execution failed; check your code or continue reasoning without the tool.",
+                done=False,
+                error="sandbox_exec_failed",
+            )
         images = result["images"][:MAX_IMAGES_PER_ROUND]
         marker = "Images:\n" + "<image>" * len(images) if images else ""
         body = RETURN_CODE_PROMPT.format(
@@ -244,7 +256,14 @@ class DeepEyesV2Env:
     async def exec_tool(self, response_text: str) -> ToolObs:
         parsed = extract_tool_call(response_text)
         if parsed is None:
-            return ToolObs(body_text="", done=True, error="tool_call_extract_failed")
+            return ToolObs(
+                body_text=(
+                    "Error: <tool_call> block could not be parsed. Emit a single <tool_call>{...}</tool_call> "
+                    "containing valid JSON with a 'name' field (e.g. 'search' or 'image_search') and optional 'arguments'."
+                ),
+                done=False,
+                error="tool_call_extract_failed",
+            )
         name = parsed["name"]
         args = parsed["arguments"]
         if name not in SUPPORTED_TOOL_NAMES:
@@ -269,7 +288,11 @@ class DeepEyesV2Env:
                 error=str(exc),
             )
         if not result or result.get("status") != "success":
-            return ToolObs(body_text="Search error", done=True, error="search_failed")
+            return ToolObs(
+                body_text="Error: search returned no result; continue reasoning or answer directly.",
+                done=False,
+                error="search_failed",
+            )
         images = result.get("images", [])[:MAX_IMAGES_PER_ROUND]
         body = RETURN_SEARCH_PROMPT.format(search_result=result.get("result", "")).strip()
         return ToolObs(body_text=body, images=images, done=False, error=None)

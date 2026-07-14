@@ -22,9 +22,40 @@ __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 logger = get_logger(__name__)
 
 
+def _validate_dynamic_context_parallel(args):
+    import inspect
+
+    from megatron.core import mpu
+
+    assert "dynamic_context_parallel" in inspect.signature(mpu.initialize_model_parallel).parameters, (
+        "dynamic_context_parallel is not supported in your megatron version, "
+        "please update your megatron version to the corresponding version"
+    )
+    assert args.use_dynamic_batch_size, "--dynamic-context-parallel requires --use-dynamic-batch-size."
+    assert args.rollout_max_context_len, (
+        "--dynamic-context-parallel requires --rollout-max-context-len. (context = prompt + response)"
+    )
+    assert args.max_tokens_per_gpu, "--dynamic-context-parallel requires --max-tokens-per-gpu."
+
+    cp_size = (args.rollout_max_context_len + args.max_tokens_per_gpu - 1) // args.max_tokens_per_gpu
+    args.context_parallel_size = 1 << (cp_size - 1).bit_length()
+    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+    assert args.world_size % total_model_size == 0, (
+        f"world_size ({args.world_size}) must be a multiple of tp*pp*cp ({total_model_size}), "
+        f"dynamic_context_parallel make max context_parallel_size={args.context_parallel_size} from "
+        f"(args.rollout_max_context_len + args.max_tokens_per_gpu - 1) // args.max_tokens_per_gpu."
+    )
+    args.data_parallel_size = args.world_size // total_model_size
+    logger.info(f"dynamic_context_parallel init context_parallel_size = {args.context_parallel_size}")
+    args.max_seqlen_per_dp_cp_rank = args.max_tokens_per_gpu
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
+
+    if getattr(args, "dynamic_context_parallel", False):
+        _validate_dynamic_context_parallel(args)
 
     if not device_utils.is_available():
         from unittest.mock import patch
@@ -61,9 +92,9 @@ def validate_args(args):
 
     # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
     # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
-    if args.context_parallel_size > 1:
+    if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
         assert args.calculate_per_token_loss, (
-            "--calculate-per-token-loss must be set when context_parallel_size > 1 (required by Megatron-Bridge)."
+            "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
     return args
 

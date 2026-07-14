@@ -13,6 +13,13 @@ from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
+from relax.utils.opd.opd_utils import (
+    add_opd_arguments,
+    is_managed_opd_teacher_enabled,
+    teacher_sglang_parse_args,
+    validate_managed_opd_teacher_colocate_args,
+    validate_opd_args,
+)
 from relax.utils.training.eval_config import (
     EvalDatasetConfig,
     build_eval_dataset_configs,
@@ -368,7 +375,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 nargs="*",
                 default=None,
-                help="""List of regex patterns of parameter names to TRAIN. All other parameters will be FROZEN.
+                help=r"""List of regex patterns of parameter names to TRAIN. All other parameters will be FROZEN.
                         Supports Python regex syntax (re.search).
 
                         Examples:
@@ -1610,74 +1617,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_on_policy_distillation_arguments(parser):
-            """Add on-policy distillation (OPD) related arguments.
-
-            OPD is orthogonal to advantage estimators and can be applied on top
-            of any estimator (GRPO, PPO, etc.) by adding a KL penalty to
-            advantages.
-            """
-            parser.add_argument(
-                "--use-opd",
-                action="store_true",
-                default=False,
-                help="Enable on-policy distillation (OPD). Must specify --opd-type when enabled.",
-            )
-            parser.add_argument(
-                "--opd-type",
-                type=str,
-                choices=["sglang", "megatron"],
-                default=None,
-                help=(
-                    "Type of on-policy distillation. "
-                    "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
-                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
-                ),
-            )
-            parser.add_argument(
-                "--opd-kl-coef",
-                type=float,
-                default=1.0,
-                help="On-policy distillation KL penalty coefficient. Default is 1.0.",
-            )
-            parser.add_argument(
-                "--opd-only-reward",
-                action="store_true",
-                default=False,
-                help=(
-                    "If enabled, zero out base advantages/returns before OPD injection, "
-                    "so training uses only OPD reward signal."
-                ),
-            )
-            parser.add_argument(
-                "--opd-teacher-load",
-                type=str,
-                default=None,
-                help=(
-                    "The checkpoint for OPD teacher model. Required when --opd-type=megatron. "
-                    "The teacher model should have the same architecture as policy/ref model."
-                ),
-            )
-            parser.add_argument(
-                "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
-            )
-            parser.add_argument(
-                "--opd-teacher-timeout-s",
-                type=float,
-                default=30.0,
-                help=(
-                    "Timeout (seconds) for OPD teacher HTTP requests when --opd-type=sglang. "
-                    "Increase this for long responses or high-latency cross-host teacher services."
-                ),
-            )
-            parser.add_argument(
-                "--opd-log-prob-top-k",
-                type=int,
-                default=0,
-                help=(
-                    "Top-k token ids to request/collect for OPD overlap metrics. Set to 0 to disable top-k collection."
-                ),
-            )
-            return parser
+            return add_opd_arguments(parser)
 
         def add_router_arguments(parser):
             parser.add_argument(
@@ -2354,8 +2294,10 @@ def parse_args(add_custom_arguments=None):
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
     # Skipped when sglang servers are not needed.
     sglang_ns = None
+    teacher_sglang_ns = None
     if not skip_sglang:
         sglang_ns = sglang_parse_args()
+        teacher_sglang_ns = teacher_sglang_parse_args()
 
     # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
@@ -2375,6 +2317,10 @@ def parse_args(add_custom_arguments=None):
     # Merge sglang args into the main namespace
     if sglang_ns is not None:
         for key, value in vars(sglang_ns).items():
+            setattr(args, key, value)
+
+    if teacher_sglang_ns is not None:
+        for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
 
     slime_validate_args(args)
@@ -2565,51 +2511,7 @@ def slime_validate_args(args):
                 "please make sure it is a valid megatron checkpoint directory."
             )
 
-    # Validate on-policy distillation (OPD) arguments
-    if args.opd_teacher_timeout_s <= 0:
-        raise ValueError("--opd-teacher-timeout-s must be > 0.")
-    if args.opd_log_prob_top_k < 0:
-        raise ValueError("--opd-log-prob-top-k must be >= 0.")
-
-    if is_sft:
-        pass  # SFT skips OPD validation entirely.
-    elif args.use_opd:
-        if args.opd_type is None:
-            raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
-
-        if args.opd_type == "megatron":
-            if args.opd_teacher_load is None:
-                raise ValueError(
-                    "--opd-teacher-load is required when --opd-type=megatron. "
-                    "Please provide the path to the teacher model checkpoint."
-                )
-            if not os.path.exists(args.opd_teacher_load):
-                raise FileNotFoundError(
-                    f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
-                )
-            if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
-                logger.info(
-                    f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
-                    "please make sure it is a valid megatron checkpoint directory."
-                )
-
-        elif args.opd_type == "sglang":
-            if args.opd_teacher_load is not None:
-                raise ValueError(
-                    "--opd-teacher-load should not be set when --opd-type=sglang. "
-                    "In sglang mode, teacher log-probs are obtained from external server during rollout."
-                )
-            if args.rm_url is None:
-                raise ValueError(
-                    "--rm-url is required when --opd-type=sglang. "
-                    "Set it to the teacher SGLang server address, e.g. http://localhost:30010/generate"
-                )
-    else:
-        # If OPD is not enabled, opd_teacher_load should not be set
-        if args.opd_teacher_load is not None:
-            raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
-        if args.opd_only_reward:
-            raise ValueError("--opd-only-reward requires --use-opd.")
+    validate_opd_args(args, is_sft=is_sft, log=logger)
 
     if args.megatron_to_hf_mode == "bridge":
         if (
@@ -2755,7 +2657,7 @@ def slime_validate_args(args):
         if max_ctx_len is not None:
             cp_size = getattr(args, "context_parallel_size", 1)
             token_budget = args.max_tokens_per_gpu * cp_size
-            if token_budget < max_ctx_len:
+            if token_budget < max_ctx_len and not getattr(args, "dynamic_context_parallel", False):
                 raise ValueError(
                     f"max_tokens_per_gpu * context_parallel_size ({args.max_tokens_per_gpu} * {cp_size} = "
                     f"{token_budget}) must be >= rollout_max_context_len ({max_ctx_len}); otherwise a single "
@@ -2872,6 +2774,7 @@ def slime_validate_args(args):
 
     # Check if genRM is enabled
     genrm_enabled = args.genrm_model_path is not None
+    managed_opd_teacher_enabled = is_managed_opd_teacher_enabled(args)
     args._genrm_colocate_with_rollout = False
 
     # always true on offload for colocate at the moment.
@@ -2885,6 +2788,8 @@ def slime_validate_args(args):
             args.offload_rollout = False
         # Mark that actor should compute advantages and ref/actor_fwd internally
         args.compute_advantages_and_returns = True
+    elif args.colocate and managed_opd_teacher_enabled:
+        validate_managed_opd_teacher_colocate_args(args)
     elif args.colocate and not genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True

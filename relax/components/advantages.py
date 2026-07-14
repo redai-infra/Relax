@@ -10,9 +10,12 @@ from megatron.core import mpu
 from ray import serve
 from tensordict import TensorDict
 
-from relax.backends.megatron.loss import apply_opd_kl_to_advantages
 from relax.components.base import Base
 from relax.utils.async_utils import run as run_
+from relax.utils.opd.opd_utils import (
+    apply_opd_to_advantages,
+    consume_opd_advantage_data,
+)
 from relax.utils.training.ppo_utils import (
     compute_approx_kl,
     get_advantages_and_returns_batch,
@@ -78,8 +81,7 @@ class Advantages(Base):
                         adv_data_fields.append("log_probs")
                     if self.config.kl_coef != 0 or self.config.use_kl_loss:
                         adv_data_fields.append("ref_log_probs")
-                    if getattr(self.config, "use_opd", False):
-                        adv_data_fields.append("teacher_log_probs")
+                    consume_opd_advantage_data(adv_data_fields, self.config)
                     batch_meta = run_(
                         self.data_system_client.async_get_meta(
                             data_fields=adv_data_fields,
@@ -205,23 +207,16 @@ class Advantages(Base):
         else:
             raise NotImplementedError(f"advantage_estimator {self.config.advantage_estimator} is not supported. ")
 
+        # Optional pure OPD mode: remove all non-OPD reward contribution.
         if getattr(self.config, "use_opd", False) and getattr(self.config, "opd_only_reward", False):
             advantages = [torch.zeros_like(a) for a in advantages]
             returns = [torch.zeros_like(r) for r in returns]
 
+        # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
         if getattr(self.config, "use_opd", False):
-            apply_opd_kl_to_advantages(
-                args=self.config,
-                rollout_data=rollout_data,
-                advantages=advantages,
-                student_log_probs=log_probs,
-            )
+            apply_opd_to_advantages(self.config, rollout_data, advantages)
 
-        result = {
+        return {
             "advantages": torch.nested.nested_tensor(advantages),
             "returns": torch.nested.nested_tensor(returns),
         }
-        if "opd_reverse_kl" in rollout_data:
-            result["opd_reverse_kl"] = torch.nested.nested_tensor(rollout_data["opd_reverse_kl"])
-
-        return result

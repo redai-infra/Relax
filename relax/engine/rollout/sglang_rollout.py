@@ -21,6 +21,7 @@ from tqdm import tqdm
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
+from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -57,6 +58,9 @@ class GenerateState(metaclass=SingletonMeta):
         self.args = args
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+
+        # OPD manager (singleton — one OpdManager per GenerateState)
+        self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
@@ -291,6 +295,9 @@ async def generate(
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
 
+    if state.opd_manager and not evaluation:
+        state.opd_manager.before_rollout(payload)
+
     _t_mm_encode: float | None = None
     if _has_media:
         # Use pre-encoded data from group-level de-dup if available; otherwise encode inline.
@@ -342,6 +349,11 @@ async def generate(
         else:
             new_response_tokens = output["output_ids"]
             new_response_log_probs = []
+
+        if state.opd_manager and not evaluation:
+            new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
+                output["meta_info"], new_response_tokens, new_response_log_probs
+            )
 
         while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
             index = new_response_tokens.index(state.tokenizer.image_token_id)
@@ -395,6 +407,9 @@ async def generate(
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = []
         sample.rollout_log_probs += new_response_log_probs
+
+        if state.opd_manager and not evaluation:
+            state.opd_manager.after_rollout(sample, output)
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(
@@ -474,15 +489,8 @@ async def generate_and_rm(
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
 
-        # OPD sglang: fetch teacher log-probs for each sample (independent of reward)
-        if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang" and not evaluation:
-            from relax.engine.rollout.on_policy_distillation import (
-                create_teacher_client_session,
-                fetch_teacher_log_probs,
-            )
-
-            async with create_teacher_client_session(args) as teacher_session:
-                await asyncio.gather(*[fetch_teacher_log_probs(args, s, session=teacher_session) for s in samples])
+        if state.opd_manager and not evaluation:
+            await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
 
         return samples
     else:
@@ -492,15 +500,8 @@ async def generate_and_rm(
         if sample.reward is None:
             sample.reward = await async_rm(args, sample)
 
-        # OPD sglang: fetch teacher log-probs (independent of reward)
-        if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang" and not evaluation:
-            from relax.engine.rollout.on_policy_distillation import (
-                create_teacher_client_session,
-                fetch_teacher_log_probs,
-            )
-
-            async with create_teacher_client_session(args) as teacher_session:
-                await fetch_teacher_log_probs(args, sample, session=teacher_session)
+        if state.opd_manager and not evaluation:
+            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
 
     return sample
 
@@ -579,15 +580,8 @@ async def generate_and_rm_group(
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
-        # OPD sglang: fetch teacher log-probs for group_rm samples (independent of reward)
-        if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang" and not evaluation:
-            from relax.engine.rollout.on_policy_distillation import (
-                create_teacher_client_session,
-                fetch_teacher_log_probs,
-            )
-
-            async with create_teacher_client_session(args) as teacher_session:
-                await asyncio.gather(*[fetch_teacher_log_probs(args, s, session=teacher_session) for s in group])
+        if state.opd_manager and not evaluation:
+            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
 

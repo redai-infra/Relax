@@ -380,7 +380,7 @@ def test_chat_request_validation_context_limit_and_logprob_payload() -> None:
     [
         (False, 0, RequestKind.RESUMED, False, RequestKind.FRESH),
         (False, 1, RequestKind.PROTECTED, True, RequestKind.PROTECTED),
-        (True, 1, RequestKind.RESUMED, False, RequestKind.FRESH),
+        (True, 1, RequestKind.PROTECTED, True, RequestKind.PROTECTED),
     ],
 )
 def test_ir_gate_and_requeue_policy(

@@ -12,7 +12,13 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision import transforms
-from torchvision.io.video import _read_from_stream
+
+
+try:
+    from torchvision.io.video import _read_from_stream
+except ImportError:
+    # torchvision >= 0.26 remove torchvision.io.video。
+    _read_from_stream = None
 from torchvision.transforms import InterpolationMode
 
 from relax.utils.logging_utils import get_logger

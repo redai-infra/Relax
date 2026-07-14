@@ -8,117 +8,99 @@
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `--use-opd`               | 启用在线策略蒸馏。使用 OPD 时需要此标志。                                                                        |
 | `--opd-type`              | OPD 类型：`sglang` 或 `megatron`。启用 `--use-opd` 时必须设置。                                                  |
-| `--opd-kl-coef`           | OPD KL 惩罚系数（默认：1.0）。控制蒸馏信号相对于 RL 优势的权重。                                                 |
+| `--opd-token-selection`   | Token 选择模式：`student_sampled`（默认）、`student_topk`、`teacher_topk`、`union`。                            |
+| `--opd-kl-coef`           | Advantage 模式的 KL 系数（默认 1.0）。设置时 `--opd-loss-coef` 必须为 0。                                        |
+| `--opd-loss-coef`         | Loss 模式的 KL 系数（默认 0.0）。设置时 `--opd-kl-coef` 必须为 0。                                               |
+| `--opd-kl-type`           | KL 散度类型：`reverse_kl`（默认）、`forward_kl`、`low_var_kl`、`jsd`。                                           |
+| `--opd-jsd-alpha`         | JSD 混合系数（默认 0.5）。0.0 等价于 reverse_kl，1.0 等价于 forward_kl。                                         |
+| `--opd-log-prob-top-k`    | Top-K 候选集合大小（设为 `0` 可关闭，默认 `0`）。                                                               |
+| `--opd-norm-mode`         | Top-K 尾部处理方式：`tail`（默认）、`norm`、`trunc`。                                                            |
+| `--opd-per-token-clip`    | Per-token KL 的硬上界（可选）。                                                                                  |
+| `--opd-is-clip`           | Importance sampling ratio 的硬上界（可选，仅 loss 模式）。                                                       |
 | `--opd-teacher-load`      | 教师模型路径。当 `--opd-type=megatron` 时**必须**设置，当 `--opd-type=sglang` 时**不能**设置。                   |
 | `--opd-teacher-ckpt-step` | 教师模型的可选检查点步骤。                                                                                       |
 | `--opd-teacher-timeout-s` | SGLang 模式下 OPD teacher HTTP 请求超时（秒），默认 `30`。                                                      |
-| `--opd-log-prob-top-k`    | 用于 OPD 动态指标的 teacher/student top-k 候选集合大小（设为 `0` 可关闭，默认 `0`）。                          |
 | `--opd-only-reward`       | 仅保留 OPD 奖励信号（将基础 RL reward 置零，只使用 OPD KL 项）。需配合 `--use-opd`。                            |
 
 ## 工作原理
 
-OPD 通过减去 KL 惩罚项来修改优势计算，鼓励学生匹配教师的输出分布：
+OPD 通过计算教师与学生之间的 token 级 KL 散度，将蒸馏信号注入训练。Relax 支持两种注入方式：
+
+- **Advantage 模式（adv）**：将 KL 从 advantage 中减去（通过 `--opd-kl-coef` 设置）
+- **Loss 模式（loss）**：将 KL 作为额外 loss 项（通过 `--opd-loss-coef` 设置）
+
+两种方式只能选其一，不能同时启用。OPD 与优势估计器正交，可以与任何估计器（GRPO、GSPO、SAPO，以及实验性的 PPO 和 REINFORCE++）结合使用。
+
+## Token-Selection 模式
+
+OPD 支持四种 token-selection 策略，决定在哪些 token 上计算 KL 散度：
+
+| 模式 | 学生自 top-K | 教师自 top-K | 教师 @ 学生 top-K | 学生 @ 教师 top-K | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `student_sampled` | — | — | — | — | 仅在学生采样的 1D token 上计算 KL，开销最小 |
+| `student_topk` | ✅ | — | ✅ | — | 在学生 top-K token 集合上计算 KL |
+| `teacher_topk` | — | ✅ | — | ✅ | 在教师 top-K token 集合上计算 KL |
+| `union` | ✅ | ✅ | ✅ | ✅ | 在学生和教师 top-K 的并集上计算 KL，覆盖最全面 |
+
+通过 `--opd-token-selection` 指定模式，`--opd-log-prob-top-k` 指定 top-K 大小。除 `student_sampled` 外，其余模式需要设置环境变量 `RELAX_OPD_PER_POS_TOKEN_IDS=1`。
+
+## 两种应用方式：adv 与 loss
+
+### Advantage 模式（adv）
+
+通过 `--opd-kl-coef` 设置（此时 `--opd-loss-coef` 必须为 0）。在 advantage 计算后，将 per-token KL 从 advantage 中减去：
 
 $$\hat{A}_t = A_t - \lambda_{\text{opd}} \cdot D_{\text{KL}}(P_{\text{teacher}} \| P_{\text{student}})_t$$
 
-其中 $A_t$ 是来自基础估计器（例如 GRPO）的原始优势，$\lambda_{\text{opd}}$ 是 `--opd-kl-coef`，$D_{\text{KL}}$ 是词元级反向 KL 散度。
+特点：
 
-因此，OPD 可以与任何优势估计器结合，包括 GRPO、GSPO、SAPO，以及实验性的 PPO 和 REINFORCE++。
+- KL 项使用 `.detach()`，**不产生梯度**
+- 仅影响 advantage 估计，不改变 loss 函数形式
+- 与任何优势估计器（GRPO、GSPO、SAPO 等）正交
 
-## 两种教师模式
+架构流程：
 
-### SGLang 模式 (`--opd-type sglang`)
+```
+Rollout 阶段:
+  学生 Rollout → 学生 top-K token IDs / log-probs
+  教师 Prefill → 教师 log-probs / 教师 top-K
+  学生 Prefill → 学生 @ 教师 top-K log-probs（adv 模式独有）
+      ↓
+  组装训练数据 (opd_topk_token_ids, opd_topk_student_log_probs, opd_topk_teacher_log_probs)
 
-教师模型在外部 SGLang 服务器上运行，教师的对数概率在回滚阶段获得。
-
-**使用场景**：教师架构与学生不同，或教师模型太大无法与训练模型一起加载。
-
-**工作流程**：
-
-1. 外部 SGLang 服务器运行教师模型。
-2. 在回滚期间，每个样本的奖励计算完成后，框架自动将样本发送到教师服务器以获取词元级对数概率，并将其存储在 `sample.teacher_log_probs` 中。
-3. 当 `--opd-log-prob-top-k > 0` 时，框架还会请求并提取 teacher 的 top-k 候选信息（通过 SGLang 请求字段），并存储：
-	- `sample.teacher_topk_token_ids`
-	- `sample.teacher_topk_log_probs`（若 teacher 返回）
-4. 当 teacher 请求失败或响应缺失 top-k 字段时，OPD 会进入安全回退路径（使用 rollout log-probs 与占位 top-k 数据），避免打断 rollout 主流程。
-5. 在训练期间，从存储的教师对数概率计算 KL 惩罚并应用于优势。
-
-> **注意**：OPD sglang 模式不再占用 `--custom-rm-path` 和 `--custom-reward-post-process-path`。用户可以自由地同时使用自定义奖励函数和 OPD，两者互不冲突。
-
-**配置**：
-
-```bash
---use-opd
---opd-type sglang
---opd-kl-coef 1.0
---opd-teacher-timeout-s 30
---opd-log-prob-top-k 10
---rm-url http://<TEACHER_IP>:<TEACHER_PORT>/generate
+Training 阶段:
+  compute_advantages_and_returns()
+    → apply_opd_to_advantages()
+    → 修改 advantage: adv = adv - opd_kl_coef * kl_term.detach()
 ```
 
-## 动态指标
+### Loss 模式（loss）
 
-启用 top-k 采集后，OPD 可以在线监控 student 与 teacher 候选空间的一致性。
+通过 `--opd-loss-coef` 设置（此时 `--opd-kl-coef` 必须为 0）。在 policy loss 计算中，将 per-token KL 作为额外的 loss 项：
 
-定义 $S_t^{(p)} = \text{TopK}(p_t, k)$、$S_t^{(q)} = \text{TopK}(q_t, k)$，分别表示 token 步 $t$ 上 student/teacher 的 top-$k$ 集合。
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{PG}} + \lambda_{\text{loss}} \cdot \mathbb{E}_t[D_{\text{KL}}(P_{\text{teacher}} \| P_{\text{student}})_t]$$
 
-### Overlap Ratio（重叠率）
+特点：
 
-$$
-\mathcal{M}_{\text{overlap}} \triangleq \mathbb{E}_t \left[ \frac{|S_t^{(p)} \cap S_t^{(q)}|}{k} \right]
-$$
+- KL 项**产生梯度**，直接影响策略梯度方向
+- 支持 per-token clipping（`--opd-per-token-clip`）和 importance ratio clipping（`--opd-is-clip`）
+- 与 advantage 估计器无关
 
-解释：
+架构流程：
 
-- 重叠率低：student 与 teacher 候选空间偏离较大。
-- 重叠率高：student 策略逐步靠近 teacher 支撑区域。
+```
+Rollout 阶段:
+  学生 Rollout → 学生 top-K token IDs / log-probs
+  教师 Prefill → 教师 log-probs / 教师 top-K
+      ↓
+  组装训练数据 (opd_topk_token_ids, opd_topk_teacher_log_probs)
 
-### Megatron 模式 (`--opd-type megatron`)
-
-教师模型通过 `--opd-teacher-load` 直接加载到 Megatron 中，教师的对数概率在训练前向传递期间计算。
-
-**使用场景**：教师和学生/参考模型具有相同的架构，可以一起放入 GPU 内存中。
-
-**硬性要求（重要）**：Megatron teacher 必须与 student 结构一致（例如 hidden size、层数、attention heads、词表相关参数形状等）。
-
-- ✅ 可行：8B student + 8B teacher，或 32B student + 32B teacher
-- ❌ 不可行：8B student + 32B teacher（会触发参数 shape mismatch）
-
-**工作流程**：
-
-1. 教师模型在初始化期间作为额外的 Megatron 模型加载。
-2. 在训练前向传递期间，教师模型为每个样本计算对数概率。
-3. KL 惩罚被内联计算并应用于优势。
-
-**配置**：
-
-```bash
---use-opd
---opd-type megatron
---opd-kl-coef 1.0
---opd-teacher-load /path/to/teacher_model
+Training 阶段:
+  policy_loss_function()
+    → get_log_probs_and_entropy()（收集学生 top-K log-probs）
+    → compute_policy_opd_loss()
+    → 计算 KL → clipping → reduce
+    → loss = loss + opd_loss_coef * opd_loss
 ```
 
-> **注意**：
->
-> 1. 使用 `--megatron-to-hf-mode bridge` 时，可直接从 HuggingFace 路径加载模型，无需预先转换为 `torch_dist`。
-> 2. 如果不使用 bridge（例如 `raw` 模式），则仍需提供 Megatron 格式检查点（`torch_dist` 或 `torch`）。
-
-## 运行示例
-
-完整的示例脚本位于 `examples/on_policy_distillation/`
-
-## 初步结果
-
-使用 Qwen3-8B-Base 模型，在 [OpenThoughts3-1.2M](https://huggingface.co/datasets/open-thoughts/OpenThoughts3-1.2M) 数据集的一部分上执行 SFT，然后在剩余数据上应用在线策略蒸馏（使用 Qwen3-32B 教师），Math500 评估结果如下：
-
-| 模型                               | Pass@1 |
-| ---------------------------------- | ------ |
-| Qwen3-8B-Base + SFT                | 76%    |
-| Qwen3-8B-Base + SFT + 在线策略蒸馏 | 94%    |
-
-## 后端支持
-
-| 后端     | SGLang 教师 | Megatron 教师 |
-| -------- | ----------- | ------------- |
-| Megatron | ✅          | ✅（要求 teacher/student 结构一致） |
+> **注意**：adv 和 loss 两种方式只能选其一，不能同时启用。

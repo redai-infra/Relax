@@ -12,9 +12,9 @@ description: Use when syncing Relax code between internal GitLab and external Gi
 每次完整同步必须分成两个独立人工闸门阶段，不能一次跑完：
 
 1. **Prompt A：GitHub -> GitLab dev**  
-   找到 GitHub 分支从 `gitlab/dev` 分出去的基点 `commitA`，识别 `commitA` 之后 GitHub PR 合入的外部 commit，只 cherry-pick 这些外部 commit 到新的 GitLab CR 分支。创建或确认无需 CR 后必须停止，等待云效 CR 提交和合入。
+   扫描 `gitlab/dev` 最近提交里所有 `(cherry picked from commit <sha>)` 尾巴以及 Prompt A 替身 commit 里显式提到的 github SHA，得到「已进 dev 的 github commit 集合」；在 `github/main` first-parent 链上落到该集合的最新一条即 `github_anchor`，之后的 PR commit 就是本次要 cherry-pick 的外部 commit。落到 GitLab CR 分支后必须停止，等待云效 CR 合入。
 2. **Prompt B：GitLab dev -> GitLab/GitHub main**  
-   只能在用户明确说“内部 CR 已合入，继续同步”后执行，直接在本地 `main` 从 `gitlab/main` 开始，用真实 tree diff 找最小有效同步集并线性重放到 `main`，直接推送到 `gitlab/main`，再走 GitHub push 门禁推到 `github/main`。不要创建 `sync/dev-to-main`。
+   只能在用户明确说“内部 CR 已合入，继续同步”后执行。扫描 `gitlab/main` 顶端最近提交的 `(cherry picked from commit <sha>)` 尾巴，第一条尾巴指向的 dev SHA 就是本次的 `BASE`；`BASE..gitlab/dev` 按顺序去掉 sync 合并、Prompt A 替身、纯内部 merge 节点后线性 `cherry-pick -x` 到本地 `main`，再直接推送到 `gitlab/main`、走 GitHub push 门禁推到 `github/main`。不要创建 `sync/dev-to-main`。
 
 禁止在 Prompt A 中 push GitHub。禁止跳过 Prompt A 直接做 `dev -> main`。
 Prompt A 禁止通过 merge 把 `github/main` 纳入 `gitlab/dev`；必须走 commitA + external PR commit cherry-pick 流程。
@@ -25,12 +25,15 @@ Prompt A 禁止通过 merge 把 `github/main` 纳入 `gitlab/dev`；必须走 co
 - 用户明确说“内部 CR 已合入，继续同步”：读取并执行 [references/prompt-b-dev-to-main.md](references/prompt-b-dev-to-main.md)。Prompt B 直接更新并推送 `gitlab/main`；如果 `github/main` 落后于 `gitlab/main`，不要回退 `gitlab/main`，继续在 `gitlab/main` 基础上追加 `dev` 内容，最后停在 GitHub push 门禁。
 - 不确定阶段时，只做只读检查：`git status --porcelain`、`git status --porcelain --untracked-files=no`、`git fetch --all --prune`，再运行 `python skills/sync-github/scripts/plan_github_to_dev.py --github github/main --dev gitlab/dev` 判断是否还有未吸收的外部 PR commit。不要根据 `gitlab/main`/`github/main` 关系跳过 Prompt A。
 
-## Prompt B 效率硬规则
+## BASE 定位硬规则
 
-- Prompt B 的工作队列必须先由真实 tree diff 驱动：先看 `git diff --stat gitlab/main..gitlab/dev` / `git diff --name-status gitlab/main..gitlab/dev`，再用 commit 历史解释这些路径来自哪些有效提交。
-- `git rev-list --right-only gitlab/main...gitlab/dev` 只用于审计和追溯，不能直接当作 cherry-pick 队列；GitLab merge 历史里有大量已被 main 吸收的旧 merge 噪音。
-- 遇到 `Merge branch main into dev`、Prompt A merge、已被 tree diff 证明吸收的旧 merge，直接记录跳过。不要为了这些历史 merge 解冲突。
-- 如果 Prompt A 已实际验证某个 GitHub external commit cherry-pick 到 `gitlab/dev` 为空/已吸收，而规划脚本仍报告 `not-in-dev`，按人工审计 false positive 记录后继续 Prompt B，不要再次要求用户确认。
+Prompt A / Prompt B 都靠 `git cherry-pick -x` 留下的 `(cherry picked from commit <sha>)` 尾巴来定位起点。历次 cherry-pick 必须都带 `-x`，这是下一次同步能自动找到 base 的唯一凭据。
+
+- **Prompt B**：`gitlab/main` 顶端往下第一条带 `cherry picked from` 尾巴的 commit，尾巴里的 dev SHA 就是 `BASE`。主题带 `(#数字)` 的 GitHub PR 直推 commit 直接跳过。找不到尾巴时停止让用户确认。
+- **Prompt A**：把 `gitlab/dev` 最近若干条 commit body 里的 `cherry picked from commit <sha>` 尾巴以及 Prompt A 替身 commit（`chore(sync): replay github external changes` 一类）body 里显式列出的 github SHA 全部收集起来，落到 `github/main` first-parent 链上的最新一条就是 `github_anchor`。之后按序的 PR commit 就是本轮外部 commit 候选。
+- Prompt B 的工作队列来自 `BASE..gitlab/dev` 的历史切片；`git diff gitlab/main..gitlab/dev` 只用来在队列执行完之后核验漏搬，`git rev-list --right-only` 只用来审计跳过项，两者都不是 cherry-pick 输入。
+- 队列中永远跳过：`Merge branch sync/github-main-to-dev-...`、`chore(sync): replay github external changes`、纯内部 merge 节点。只有 merge commit 带有当前 tree diff 仍需要的真实冲突解决时才作为普通线性 commit 重放。
+- 如果 Prompt A 已实际验证某个 GitHub external commit cherry-pick 到 `gitlab/dev` 为空/已吸收，而 `plan_github_to_dev.py` 仍报告 `not-in-dev`，按人工审计 false positive 记录后继续，不要再次要求用户确认。
 
 ## 全局硬规则
 

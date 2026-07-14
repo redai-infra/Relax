@@ -35,10 +35,12 @@ def get_logits_and_tokens_offset_with_cp(
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
     padded_total_length: int | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ):
     """All offsets start from the begining of the prompt."""
-    cp_rank = mpu.get_context_parallel_rank()
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     assert cp_size > 1
 
     prompt_length = total_length - response_length
@@ -86,9 +88,11 @@ def get_sum_of_sample_mean(
     qkv_format: str = "thd",
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
@@ -118,7 +122,13 @@ def get_sum_of_sample_mean(
             padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
             prompt_length = total_length - response_length
             _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, max_seq_len, padded_total_length
+                total_length,
+                response_length,
+                qkv_format,
+                max_seq_len,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
             )
             loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
             loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
@@ -148,6 +158,66 @@ def get_sum_of_sample_mean(
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
 
+def get_cp_local_num_tokens(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Count loss-contributing tokens held by THIS CP rank.
+
+    With context parallelism each sample is zig-zag partitioned across CP ranks,
+    so a rank only owns part (or none) of every sample. Summing this CP-local
+    count across the CP group (as ``finalize_model_grads`` and the metric
+    all-reduce do) counts every token exactly once, independent of how tokens are
+    split across ranks. This keeps the per-token normalizer correct even when the
+    CP degree differs between micro-batches (dynamic CP).
+
+    Contrast with the full-sample count (``sum(loss_mask.sum())`` on every rank),
+    which is summed ``cp_size`` times and therefore requires a matching
+    ``* cp_size`` on the loss/metric — a coupling that only cancels when CP is
+    uniform across the step.
+
+    For ``cp_size == 1`` this reduces to the total number of unmasked tokens
+    (preserving the historical per-sample ``clamp_min(., 1)``).
+    """
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if cp_size == 1:
+        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
+
+    # cp_size > 1: mirror the chunk slicing done in get_sum_of_sample_mean so the
+    # counted tokens exactly match the ones sum_of_token contributes on this rank.
+    total: torch.Tensor | None = None
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
+        prompt_length = total_length - response_length
+        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+            total_length,
+            response_length,
+            qkv_format,
+            max_seq_len,
+            padded_total_length,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
+        )
+        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
+        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
+        chunk_count = loss_mask_0.sum() + loss_mask_1.sum()
+        total = chunk_count if total is None else total + chunk_count
+
+    if total is None:
+        # No samples on this rank: mirror the empty-sum behaviour of cp_size == 1.
+        return sum([loss_mask.sum() for loss_mask in loss_masks])
+    return total
+
+
 def all_gather_with_cp(
     tensor: torch.Tensor,
     total_length: int,
@@ -155,13 +225,16 @@ def all_gather_with_cp(
     padded_total_length: int | None = None,
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+    dynamic_cp_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
     """Gather tensors across all ranks in the context parallel group.
 
     The first dimension of the output tensor will be the `response_length`.
     """
-    cp_group = mpu.get_context_parallel_group()
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_group = dynamic_cp_group if dynamic_cp_group is not None else mpu.get_context_parallel_group()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
     if cp_size == 1:
         return tensor
@@ -172,6 +245,8 @@ def all_gather_with_cp(
         qkv_format,
         max_seq_len,
         padded_total_length=padded_total_length,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
     )
 
     prompt_length = total_length - response_length
@@ -218,9 +293,11 @@ def slice_with_cp(
     pad_value: tuple[int, float, Callable],
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ) -> torch.Tensor:
-    cp_rank = mpu.get_context_parallel_rank()
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
     if qkv_format == "bshd":
         assert max_seq_len is not None
@@ -264,20 +341,28 @@ def slice_log_prob_with_cp(
     qkv_format: str = "thd",
     max_token_len: int | None = None,
     padded_total_length: int | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ) -> list[float] | torch.Tensor:
     assert len(log_prob) == response_length, (
         f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
         f"response_length={response_length}, total_length={total_length}"
     )
 
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
     if cp_size == 1:
         return log_prob
 
     prompt_length = total_length - response_length
     _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
-        total_length, response_length, qkv_format, max_token_len, padded_total_length
+        total_length,
+        response_length,
+        qkv_format,
+        max_token_len,
+        padded_total_length,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
     )
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
@@ -287,3 +372,217 @@ def slice_log_prob_with_cp(
         return chunk_1 + chunk_2
     else:
         return torch.cat([chunk_1, chunk_2], dim=0)
+
+
+def compute_dynamic_cp_size(max_seq_len: int, max_tokens_per_gpu: int) -> int:
+    """Compute dynamic CP group size for a micro-batch based on its max
+    sequence length.
+
+    Rounds up to the nearest power of 2. No clamp is needed: arguments.py
+    derives the static context_parallel_size from rollout_max_context_len (the
+    longest possible sequence), so any real micro-batch's result is already <=
+    that maximum.
+    """
+    dynamic_cp_size = (max_seq_len + max_tokens_per_gpu - 1) // max_tokens_per_gpu
+    dynamic_cp_size = 1 << (dynamic_cp_size - 1).bit_length()
+    return dynamic_cp_size
+
+
+def dynamic_cp_split_data(batch: dict, max_tokens_per_gpu: int) -> int:
+    """Per-micro-batch dynamic CP split, run inside get_batch.
+
+    On entry every rank of the static (size = context_parallel_size) CP group holds
+    the SAME micro-batch (data enters replicated per group). This:
+
+    1. picks a CP size from THIS mb's longest sequence (``compute_dynamic_cp_size``,
+       same formula as arguments.py);
+    2. if DP > 1, all-reduces MAX over the DP group so the mb uses one CP size on
+       every rank (within a static CP group the value is already identical, so DP-only
+       suffices; with the ascending mb sort in get_data_iterator this MAX is
+       well-matched), then grows it (guided by the global-min sample count) so no
+       sub-group is empty;
+    3. subdivides the mb among the ``static_cp_size // dynamic_cp_size`` sub-groups so
+       each trains distinct data — members of a sub-group share one seqlen-balanced
+       partition (then hold its zig-zag CP shard); local & deterministic, no comm.
+
+    Returns the per-mb ``dynamic_cp_size``; the caller derives cp_rank / cp_group from
+    it. ``batch`` is mutated in place: per-sample fields are replaced by this rank's
+    sub-partition.
+    """
+    from relax.utils import device as device_utils
+    from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
+
+    static_cp_size = mpu.get_context_parallel_world_size()
+    static_cp_rank = mpu.get_context_parallel_rank()
+    device = device_utils.make_current_torch_device()
+    total_lengths = batch["total_lengths"]
+    num_samples = len(total_lengths)
+    max_seq = max(total_lengths)
+
+    dynamic_cp_size = compute_dynamic_cp_size(max_seq, max_tokens_per_gpu)
+    min_samples = num_samples
+
+    if mpu.get_data_parallel_world_size(with_context_parallel=False) > 1:
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        cp_t = torch.tensor([dynamic_cp_size], dtype=torch.int, device=device)
+        dist.all_reduce(cp_t, op=dist.ReduceOp.MAX, group=dp_group)
+        dynamic_cp_size = int(cp_t.item())
+        ns_t = torch.tensor([num_samples], dtype=torch.int, device=device)
+        dist.all_reduce(ns_t, op=dist.ReduceOp.MIN, group=dp_group)
+        min_samples = int(ns_t.item())
+
+    # Grow so no sub-group is empty (num_sub must be <= samples); needed even at dp==1.
+    while dynamic_cp_size < static_cp_size and static_cp_size // dynamic_cp_size > min_samples:
+        dynamic_cp_size *= 2
+
+    if dynamic_cp_size >= static_cp_size:
+        # Whole static group is one CP group; no subdivision.
+        return static_cp_size
+
+    # dynamic_cp_size < static_cp_size (incl. 1): subdivide into
+    # static_cp_size // dynamic_cp_size parts so each sub-group trains distinct data
+    # (dynamic_cp_size == 1 -> pure DP, no CP slicing).
+    num_sub = static_cp_size // dynamic_cp_size
+    sub_idx = static_cp_rank // dynamic_cp_size
+    partitions = get_seqlen_balanced_partitions(total_lengths, num_sub, equal_size=False)
+    selected = partitions[sub_idx]
+    for key, val in list(batch.items()):
+        if isinstance(val, (list, tuple)) and len(val) == num_samples:
+            batch[key] = [val[i] for i in selected]
+    # Record the full-mb sample order (sub-group by sub-group) AFTER the subdivide loop,
+    # so this bookkeeping list (also length num_samples) is not itself subdivided.
+    # dynamic_cp_merge_output uses it to restore the original order after gathering.
+    batch["_dcp_partition_order"] = [i for p in partitions for i in p]
+
+    return dynamic_cp_size
+
+
+def _nccl_all_gather_variable_tensors(
+    values: list[torch.Tensor],
+    world_size: int,
+    group: dist.ProcessGroup,
+) -> list[list[torch.Tensor]]:
+    """All-gather variable-length tensors via NCCL (no pickle, no D2H/H2D).
+
+    Each rank has a list of tensors with potentially different first-dim sizes.
+    Returns a list-of-lists: ``result[rank] = [tensor, ...]`` from that rank.
+
+    Every rank in ``group`` must call this with a non-empty ``values`` so the
+    collective is symmetric and a device/dtype is available.
+    """
+    assert values, "_nccl_all_gather_variable_tensors requires a non-empty values list on every rank"
+    local_sizes = torch.tensor([v.shape[0] for v in values], dtype=torch.long, device=values[0].device)
+    num_samples = torch.tensor([len(values)], dtype=torch.long, device=values[0].device)
+
+    all_num_samples = [torch.zeros_like(num_samples) for _ in range(world_size)]
+    dist.all_gather(all_num_samples, num_samples, group=group)
+
+    max_num_samples = max(n.item() for n in all_num_samples)
+    padded_sizes = torch.zeros(max_num_samples, dtype=torch.long, device=values[0].device)
+    padded_sizes[: len(values)] = local_sizes
+    all_sizes = [torch.zeros_like(padded_sizes) for _ in range(world_size)]
+    dist.all_gather(all_sizes, padded_sizes, group=group)
+
+    local_cat = torch.cat(values, dim=0)
+    max_total = max(s.sum().item() for s in all_sizes)
+    max_total = max(max_total, 1)
+    extra_dims = list(local_cat.shape[1:])
+    padded = torch.zeros([max_total] + extra_dims, dtype=local_cat.dtype, device=local_cat.device)
+    padded[: local_cat.shape[0]] = local_cat
+
+    gathered = [torch.empty_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded, group=group)
+
+    result: list[list[torch.Tensor]] = []
+    for r in range(world_size):
+        n = all_num_samples[r].item()
+        sizes_r = all_sizes[r][:n].tolist()
+        data_r = gathered[r][: sum(sizes_r)]
+        result.append(list(data_r.split(sizes_r, dim=0)))
+    return result
+
+
+def dynamic_cp_merge_output(
+    forward_data_store: list[dict],
+    static_cp_size: int,
+    static_cp_rank: int,
+) -> list[dict]:
+    """Merge forward-only outputs back to full per-mb results for dynamic CP.
+
+    get_batch subdivided each mb inside its static (size ``static_cp_size``) CP group
+    into ``static_cp_size // dynamic_cp_size`` sub-groups of ``dynamic_cp_size`` ranks
+    and CP-split each sample across its sub-group, so a rank's forward output covers
+    only its sub-partition, in CP-local (zig-zag) form. The forward_only write-back
+    scatters by the FULL micro_batch_indices, so it needs each mb's full sample set
+    back in original order. Per mb (metadata carried in ``_dcp_meta``):
+
+    1. ``all_gather_with_cp`` over the dynamic CP sub-group -> full-response per sample;
+    2. if subdivided (``dynamic_cp_size < static_cp_size``), all-gather over the static
+       CP group to collect every sub-group's samples (sub-group members hold the same
+       samples, so one rank per sub-group is kept), then reorder to the original mb
+       order via the recorded ``partition_order``.
+
+    Returns a new list where each mb dict holds the full mb's per-sample tensors in
+    original order. Must be called by every rank of the static CP group.
+    """
+    merged: list[dict] = []
+    for mb_result in forward_data_store:
+        meta = mb_result.pop("_dcp_meta")
+        dynamic_cp_size = meta["dynamic_cp_size"]
+        dynamic_cp_rank = meta["dynamic_cp_rank"]
+        total_lengths = meta["total_lengths"]
+        response_lengths = meta["response_lengths"]
+        padded_total_lengths = meta.get("padded_total_lengths")
+        partition_order = meta.get("partition_order")
+
+        new_result: dict = {}
+        for key, values in mb_result.items():
+            # Only per-sample tensor lists get reconstructed: same per-sample length
+            # check as dynamic_cp_split_data, plus a tensor check (all_gather needs tensors).
+            if not (
+                isinstance(values, (list, tuple))
+                and len(values) == len(total_lengths)
+                and isinstance(values[0], torch.Tensor)
+            ):
+                new_result[key] = values
+                continue
+
+            # 1. reconstruct each sample's full response from its CP-local zig-zag shards.
+            if dynamic_cp_size > 1:
+                dynamic_cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+                ptls = padded_total_lengths if padded_total_lengths is not None else [None] * len(values)
+                values = [
+                    all_gather_with_cp(
+                        v,
+                        tl,
+                        rl,
+                        padded_total_length=ptl,
+                        dynamic_cp_size=dynamic_cp_size,
+                        dynamic_cp_rank=dynamic_cp_rank,
+                        dynamic_cp_group=dynamic_cp_group,
+                    )
+                    for v, tl, rl, ptl in zip(values, total_lengths, response_lengths, ptls, strict=False)
+                ]
+
+            # 2. collect all sub-groups' samples across the static CP group and reorder.
+            if dynamic_cp_size < static_cp_size:
+                static_cp_group = mpu.get_context_parallel_group()
+                gathered = _nccl_all_gather_variable_tensors(values, static_cp_size, static_cp_group)
+                # Sub-group members hold identical samples -> take one rank per sub-group.
+                selected_ranks = list(range(static_cp_rank % dynamic_cp_size, static_cp_size, dynamic_cp_size))
+                values = [v for r in selected_ranks for v in gathered[r]]
+                # A subdivided mb always carries a partition order; reorder back to the
+                # original mb sample order so the write-back aligns with micro_batch_indices.
+                # Fail loud (not a silent wrong order) if the invariant ever breaks.
+                assert partition_order is not None and len(partition_order) == len(values), (
+                    "dynamic-CP merge: partition_order missing or length mismatch "
+                    f"(order={None if partition_order is None else len(partition_order)}, values={len(values)})"
+                )
+                reordered: list = [None] * len(values)
+                for new_pos, orig_pos in enumerate(partition_order):
+                    reordered[orig_pos] = values[new_pos]
+                values = reordered
+
+            new_result[key] = values
+        merged.append(new_result)
+    return merged

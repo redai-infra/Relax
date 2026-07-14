@@ -730,6 +730,8 @@ class StreamingDataset(BaseDataset):
         prefetch_num_workers: int = 1,
         multimodal_config: MultimodalConfig = None,
         custom_prompt_func=None,
+        teacher_prompt_key: Optional[str] = None,
+        teacher_multimodal_keys: Optional[dict] = None,
     ):
         """Initialize the streaming dataset.
 
@@ -775,6 +777,8 @@ class StreamingDataset(BaseDataset):
             use_audio_in_video=use_audio_in_video,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
+            teacher_prompt_key=teacher_prompt_key,
+            teacher_multimodal_keys=teacher_multimodal_keys,
         )
 
         # Streaming-specific components

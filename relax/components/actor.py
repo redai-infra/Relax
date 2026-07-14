@@ -15,6 +15,7 @@ from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import is_sft_mode, sft_partition_id, sft_task_name
 from relax.utils.async_utils import run
+from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 
 
 app = FastAPI()
@@ -100,6 +101,12 @@ class Actor(Base):
         self.genrm_manager = genrm_manager
         self.actor_model.set_genrm_manager(self.genrm_manager)
         self._logger.info("GenRM manager set on Actor for coordinated offload/onload")
+
+    def set_teacher_manager(self, teacher_manager: Any) -> None:
+        """Set the managed OPD teacher manager for coordinated
+        offload/onload."""
+        set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
+        self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
     def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
         self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)

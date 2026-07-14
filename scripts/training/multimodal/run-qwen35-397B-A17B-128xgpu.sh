@@ -67,7 +67,7 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 4
    --context-parallel-size 4
@@ -79,6 +79,8 @@ PERF_ARGS=(
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
+   --log-probs-chunk-size 2048
+   --recompute-loss-function
    --use-distributed-optimizer
 
    --calculate-per-token-loss

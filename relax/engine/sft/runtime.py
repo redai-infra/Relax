@@ -65,37 +65,3 @@ def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
     if interval is None or interval <= 0:
         return False
     return (rollout_id + 1) % interval == 0
-
-
-def build_data_fields(args: Namespace) -> list[str]:
-    """Decide which fields to pull from TQ based on training mode.
-
-    SFT producer emits only tokens / loss_masks / total_lengths /
-    response_lengths (+ multimodal_train_inputs if applicable). No log_probs,
-    no rewards.
-    """
-    if is_sft_mode(args):
-        fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
-        if args.multimodal_keys is not None:
-            fields.append("multimodal_train_inputs")
-        return fields
-
-    fields = [
-        "tokens",
-        "total_lengths",
-        "response_lengths",
-        "loss_masks",
-        "rollout_log_probs",
-        "rewards",
-        "raw_reward",
-    ]
-    if args.use_rollout_routing_replay:
-        fields.append("rollout_routed_experts")
-    if args.multimodal_keys is not None:
-        fields.append("multimodal_train_inputs")
-    if args.use_opd and args.opd_type == "sglang":
-        fields.append("teacher_log_probs")
-        if args.opd_log_prob_top_k > 0:
-            fields.append("teacher_topk_token_ids")
-            fields.append("teacher_topk_k")
-    return fields

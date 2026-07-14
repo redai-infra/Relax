@@ -19,10 +19,14 @@ Final score:
   whenever the response contains at least one ``<tool_call>``.
 * ``tool`` (perception/reason only) is ``1.0`` if the response contains at
   least one well-formed ``<tool_call>`` with a known tool ``name``
-  (``python_exec`` / ``search`` / ``image_search``), else ``0.0``. Binary by
-  design — repeated tool calls do not stack. Diverges from upstream
-  DeepEyesV2 (which has no tool bonus) because we skip the cold-start SFT
-  stage that taught upstream's model to call tools.
+  (``python_exec`` / ``search`` / ``image_search``) **AND** ``acc >= 0.5``,
+  else ``0.0``. Binary by design — repeated tool calls do not stack. Gated
+  on acc to match upstream DeepEyesV2's (dead-code) intent and prevent
+  reward hacking where the model wraps any output in ``<tool_call>`` to
+  farm the 0.2 bonus regardless of whether the tool call actually helped.
+  Diverges from upstream DeepEyesV2 (which drops the bonus entirely)
+  because we skip the cold-start SFT stage that taught upstream's model
+  to call tools.
 
 Judge backend env vars:
 
@@ -442,7 +446,7 @@ def compute_score(predict_str: str, ground_truth: str, extra_info: dict | None =
         acc_reward = float(_parse_chinese_judge(judge_response))
 
     format_reward = 0.0 if is_format_error else 1.0
-    tool_reward = 1.0 if _has_valid_tool_call(predict_str) else 0.0
+    tool_reward = 1.0 if _has_valid_tool_call(predict_str) and acc_reward >= 0.5 else 0.0
     final_score = 0.6 * acc_reward + 0.2 * format_reward + 0.2 * tool_reward
     return {
         "score": final_score,
@@ -578,7 +582,7 @@ def compute_score_math(predict_str: str, ground_truth: str, extra_info: dict | N
             acc_reward = 1.0 if _math_generative_verify(extra_info["question"], ground_truth, final_answer) else 0.0
 
     format_reward = 0.0 if is_format_error else 1.0
-    tool_reward = 1.0 if _has_valid_tool_call(predict_str) else 0.0
+    tool_reward = 1.0 if _has_valid_tool_call(predict_str) and acc_reward >= 0.5 else 0.0
     final_score = 0.6 * acc_reward + 0.2 * format_reward + 0.2 * tool_reward
     return {
         "score": final_score,

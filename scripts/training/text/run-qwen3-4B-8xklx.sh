@@ -13,22 +13,19 @@ set -o pipefail
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
+export WORKDIR="${WORKDIR:-/workspace}"
+export MODEL_DIR="${MODEL_DIR:-/workspace}"
+export DATA_DIR="${DATA_DIR:-/workspace}"
+export PROJECT_NAME=Relax-Qwen3-4B-P800
+export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
+export MEGATRON=${WORKDIR}/Megatron-LM
+
 export CUDA_ENABLE_P2P_NO_UVA=0
 export CUDA_FAKE_UVA_ENABLE=1
 export CUDA_ERROR_LEVEL=0
 
 export XPU_SUPPORT_IPC_EVENT=1
-
-
-export MODEL_DIR="${MODEL_DIR:-/workspace/Qwen3-4B}"
-export EVAL_DATA="${EVAL_DATA:-/workspace/aime-2024/aime-2024.jsonl}"
-export PROJECT_NAME="${PROJECT_NAME:-relax-qwen3-4B}"
-export MODEL_CONFIG_DIR=/workspace/Relax/scripts/models # Relax模型脚本路径
-export MEGATRON=/workspace/Megatron-LM
-export NUM_GPUS=8
-
-
-export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
+export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4"}
 
 
 unset http_proxy
@@ -37,18 +34,18 @@ unset https_proxy
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source /workspace/Relax/scripts/entrypoint/local-klx.sh
+    source "${SCRIPT_DIR}/../../entrypoint/local-klx.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
+source "${SCRIPT_DIR}/../../models/qwen3-4B.sh"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/
-   --ref-load ${MODEL_DIR}/
+   --hf-checkpoint ${MODEL_DIR}/Qwen3-4B
+   --ref-load ${MODEL_DIR}/Qwen3-4B
    --megatron-to-hf-mode bridge
-   # --load ${MODEL_DIR}/Qwen3-4B_mcore_8xgpu/
-   --save ${MODEL_DIR}_mcore_8xgpu/
+   --load ${EXP_DIR}/Qwen3-4B_mcore_8xgpu/
+   --save ${EXP_DIR}/Qwen3-4B_mcore_8xgpu/
    --save-interval 100
 )
 
@@ -138,11 +135,13 @@ SGLANG_ARGS=(
 
 WANDB_ARGS=(
    --use-wandb
+   --tb-experiment-name relax-qwen3-4B-p800-${now}
    --wandb-project ${PROJECT_NAME}
-   --wandb-group relax-qwen3-4B-p800
+   --wandb-group relax-qwen3-4B-p800-${now}
    --wandb-key ${WANDB_API_KEY}
    # --wandb-mode ${WANDB_MODE:-offline}
    --disable-wandb-random-suffix
+   --no-use-metrics-service
 )
 
 MISC_ARGS=(
@@ -158,7 +157,7 @@ MISC_ARGS=(
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/workspace/TransferQueue:/workspace/Megatron-LM/:/workspace/Megatron-Bridge/src/:/workspace/Relax/:${SCRIPT_DIR}\",
+    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
     \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENBLAS_NUM_THREADS\": \"64\",
@@ -207,7 +206,7 @@ RUNTIME_ENV_JSON="{
     \"BKCL_TIMEOUT\": \"400000\",
     \"CUDA_DISABLE_PRINTF\": \"1\",
     \"BKCL_RDMA_VERBS\": \"1\",
-    \"BKCL_RDMA_NICS\": \"${BKCL_RDMA_NICS:-eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4}\",
+    \"BKCL_RDMA_NICS\": \"${BKCL_RDMA_NICS}\",
     \"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES\": \"1\",
     \"TORCH_XCCL_DEFAUTL_PG_TIMEOUT_MILSEC\": \"7200000\",
     \"CUDA_ERROR_LEVEL\": \"0\",
@@ -250,7 +249,9 @@ RUNTIME_ENV_JSON="{
     \"XMLIR_MATMUL_FAST_MODE\": \"1\",
     \"XMLIR_ENABLE_FAST_FC\": \"1\",
     \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"XSGL_INT8_LM_HEAD\": \"0\"
+    \"XSGL_INT8_LM_HEAD\": \"0\",
+    \"NVTE_DEBUG\": \"1\",
+    \"NVTE_DEBUG_LEVEL\": \"1\"
   }
 }"
 

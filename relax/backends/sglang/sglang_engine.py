@@ -59,13 +59,12 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def _patched_run_scheduler_process(*args, **kwargs):
-    """Wrapper around SGLang's ``run_scheduler_process`` that applies the async
-    D→H monkey-patch before the scheduler creates the model runner (and thus
-    the routed-experts capturer).
+    """Scheduler-subprocess entry used for the routing-replay path.
 
-    This function is used as ``run_scheduler_process_func`` when ``--optimize-
-    routing-replay`` is enabled.  It runs inside the spawned scheduler
-    subprocess.
+    This wrapper is only installed when ``--optimize-routing-replay`` is
+    enabled (see ``_launch_server_with_patches``), so the routing-replay async
+    D→H patch is applied **unconditionally** here, preserving the original
+    behavior.
     """
     from relax.backends.sglang.routing_replay_patch import apply_patch
 
@@ -76,19 +75,27 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patch(server_args: ServerArgs):
-    """Top-level picklable target for ``multiprocessing.Process`` when the
-    async D→H optimisation is enabled.
+def _launch_server_with_patches(server_args: ServerArgs):
+    """Top-level picklable ``multiprocessing.Process`` target that applies the
+    SGLang patches, each gated by its own env flag so any combination is valid:
 
-    Passes ``_patched_run_scheduler_process`` into ``launch_server`` so that
-    every scheduler subprocess applies the monkey-patch.
+    - main process: OPD pre-expanded multimodal patch
+      (``RELAX_OPD_PREEXPANDED_PATCH=1``).
+    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
+      installs ``_patched_run_scheduler_process``, which applies the
+      routing-replay patch unconditionally.
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
-    launch_server(
-        server_args,
-        run_scheduler_process_func=_patched_run_scheduler_process,
-    )
+    if os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1":
+        from relax.utils.opd.opd_sglang_patch import apply_opd_preexpanded_patch
+
+        apply_opd_preexpanded_patch()
+
+    if os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1":
+        launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
+    else:
+        launch_server(server_args)
 
 
 def _resolve_external_model_arch(package_name):
@@ -121,19 +128,24 @@ def _resolve_external_model_arch(package_name):
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
-    from sglang.srt.entrypoints.http_server import launch_server
-
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
 
+    # Each SGLang patch is controlled by its own env flag and applied
+    # independently (see ``_launch_server_with_patches`` and
+    # ``_patched_run_scheduler_process``); any combination is valid:
+    #   - RELAX_OPTIMIZE_ROUTING_REPLAY : async D→H routing-replay patch (runtime)
+    #   - RELAX_OPD_PREEXPANDED_PATCH   : OPD pre-expanded multimodal patch (runtime)
+    #   - RELAX_OPD_PER_POS_TOKEN_IDS   : OPD per-position token_ids logprob;
     optimize = os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1"
-    if optimize:
-        logger.info("Launching SGLang server with async D→H routing-replay patch")
-        target_func = _launch_server_with_patch
-    else:
-        target_func = launch_server
+    opd_patch = os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1"
+    per_pos = os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1"
+    logger.info(
+        "Launching SGLang server with independently-gated patches: "
+        f"routing_replay={optimize}, opd_preexpanded={opd_patch}, per_pos_token_ids={per_pos}"
+    )
 
-    p = multiprocessing.Process(target=target_func, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
@@ -421,6 +433,16 @@ class SGLangEngine(RayActor):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
             os.environ["RELAX_OPTIMIZE_ROUTING_REPLAY"] = "1"
+
+        if os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1":
+            os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"
+            top_k = getattr(self.args, "opd_log_prob_top_k", 0)
+            if top_k:
+                os.environ["RELAX_OPD_TOKEN_IDS_LOGPROB_K"] = str(top_k)
+            logger.info(
+                "Set RELAX_FORCE_LOGPROBS_BASE64=1, RELAX_OPD_TOKEN_IDS_LOGPROB_K=%s (topk enabled)",
+                os.environ.get("RELAX_OPD_TOKEN_IDS_LOGPROB_K", "0"),
+            )
 
         # Set SGLang external model/processor package env vars so the spawned
         # SGLang subprocess discovers and registers custom model implementations.
@@ -890,6 +912,12 @@ def _compute_genrm_server_args(
         "dp_size": args.genrm_engine_config.get("dp_size", 1),
         "pp_size": args.genrm_engine_config.get("pp_size", 1),
         "ep_size": args.genrm_engine_config.get("ep_size", 1),
+        # Pin moe_dense_tp_size for the genRM so it does NOT inherit the global
+        # --sglang-moe-dense-tp-size (set to 1 for the MoE actor/rollout). The genRM
+        # is a standalone dense model at tp_size>1; inheriting moe_dense_tp_size=1
+        # shards its dense layers as TP=1 while it runs tp_size=2 → corrupted weights
+        # → garbage judgements (all rewards 0). None = use tp_size (correct default).
+        "moe_dense_tp_size": args.genrm_engine_config.get("moe_dense_tp_size", None),
         # # context and response length
         # "max_total_tokens": args.genrm_engine_config['max_total_tokens'],
         # always skip warmup to prevent warmup timeout.

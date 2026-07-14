@@ -121,3 +121,8 @@ class TrainRayActor(RayActor):
         resources.
         """
         self.genrm_manager = genrm_manager
+
+    def set_teacher_manager(self, teacher_manager):
+        """Set the managed OPD teacher manager for coordinated
+        offload/onload."""
+        self.teacher_manager = teacher_manager

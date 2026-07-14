@@ -84,6 +84,7 @@ jobs:
           python -m pip install --upgrade pip
           # Install PyTorch CPU-only build
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pybase64
           pip install tensordict
           # Install project in editable mode (--no-deps to avoid re-installing
           # torch from PyPI and to tolerate packages that may fail to compile)

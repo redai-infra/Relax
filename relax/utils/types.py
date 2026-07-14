@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -28,8 +29,27 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     abort_count: int = 0  # Number of times this sample has been aborted
-    teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
-    teacher_topk_token_ids: list[list[int]] | None = None  # Teacher top-k token ids per response token for OPD
+
+    teacher_log_probs: list[float] | None = None
+    student_topk_token_ids: np.ndarray | None = None
+    student_topk_log_probs: np.ndarray | None = None
+    teacher_at_student_topk_log_probs: np.ndarray | None = None
+    teacher_topk_token_ids: np.ndarray | None = None
+    teacher_topk_log_probs: np.ndarray | None = None
+    student_at_teacher_topk_log_probs: np.ndarray | None = None
+
+    opd_topk_token_ids: list[np.ndarray] | None = None  # [R, K] or [R, max_K'](union pad)
+    opd_topk_student_log_probs: list[np.ndarray] | None = None
+    opd_topk_teacher_log_probs: list[np.ndarray] | None = None
+    opd_topk_ksz: np.ndarray | None = None  # [only union]
+
+    teacher_prompt: str | list[dict[str, str]] | None = None
+    teacher_multimodal_inputs: dict[str, Any] | None = None
+    teacher_tokens: list[int] | None = None  # expanded teacher_prompt_tokens + response_tokens
+    teacher_prompt_length: int | None = None  # number of teacher prompt tokens in teacher_tokens (expanded)
+    teacher_image_data: dict[str, list] | None = None  # base64-encoded teacher media for SGLang payload
+    teacher_image_b64_list: list[str] | None = None  # raw base64-PNG list for OPD pre-expanded teacher path
+    teacher_image_grid_thw: Any = None  # HF processor image_grid_thw, [[t, h, w], ...]
 
     class Status(Enum):
         PENDING = "pending"

@@ -1,113 +1,140 @@
 # On-Policy Distillation Examples
 
-本目录包含 On-Policy Distillation (OPD) 的示例启动脚本。
+## Overview
 
-## 概述
+On-Policy Distillation (OPD) trains the student model on its own rollout data while matching the teacher's token-level log-probabilities, enabling knowledge transfer from a large teacher to a smaller student.
 
-On-Policy Distillation (OPD) 让学生模型在自己的 rollout 数据上训练，同时匹配教师模型的 token 级 log-probability，从而实现从大模型到小模型的知识传递。
+Relax's OPD supports:
 
-## 选择建议
+- **Token-Selection Modes**: `student_sampled`, `student_topk`, `teacher_topk`, `union`, determining which tokens' log-probabilities are used for KL computation.
+- **Application Methods**: `adv` (modifying advantage) and `loss` (modifying loss), determining how the distillation signal is injected into training.
 
-- **SGLang teacher（推荐异构蒸馏）**：teacher 和 student 可以不同架构（例如 32B -> 8B）。
-- **Megatron teacher（同构蒸馏）**：teacher 与 student 必须结构一致（见下方硬性要求）。
+## Token-Selection Modes
 
-## Megatron teacher 的硬性要求（重要）
+| Mode              | Description                                                     |
+| ----------------- | --------------------------------------------------------------- |
+| `student_sampled` | Compute KL only on student-sampled tokens                       |
+| `student_topk`    | Compute KL on the student's top-K token set                     |
+| `teacher_topk`    | Compute KL on the teacher's top-K token set                     |
+| `union`           | Compute KL on the union of student and teacher top-K token sets |
 
-当 `--opd-type megatron` 时，`--opd-teacher-load` 指向的 teacher checkpoint 必须与 student 模型结构一致（hidden size、层数、attention heads、词表相关形状等）。
+## Application Methods: adv and loss
 
-> 换句话说：
->
-> - ✅ 可行：8B student + 8B teacher（或 32B student + 32B teacher）
-> - ❌ 不可行：8B student + 32B teacher（会触发参数 shape mismatch）
+- **adv (advantage)**: `--opd-kl-coef 1.0 --opd-loss-coef 0.0`
+- **loss**: `--opd-kl-coef 0.0 --opd-loss-coef 1.0`
 
-原因是当前 Megatron OPD teacher 通过同一 Megatron 模型图加载并切换权重实现，权重 shape 必须一一对应。
+Only one can be enabled at a time; they cannot be used simultaneously.
 
-## 快速开始
+## Top-K Normalization Modes
 
-### SGLang teacher 模式（支持异构 teacher）
+For top-K modes (`student_topk`, `teacher_topk`, `union`), `--opd-norm-mode` controls how the tail probability mass is handled:
 
-适用于教师与学生架构不同，或教师模型较大不适合同图加载的场景。
+| Mode             | Description                                                                      |
+| ---------------- | -------------------------------------------------------------------------------- |
+| `tail` (default) | Keep the tail mass;                                                              |
+| `norm`           | Normalize teacher and student top-K probabilities each to 1, discarding the tail |
+| `trunc`          | Truncate directly;                                                               |
 
-```bash
-# 1) 下载模型和数据
-hf download Qwen/Qwen3-32B --local-dir /root/Qwen3-32B
-hf download Qwen/Qwen3-8B --local-dir /root/Qwen3-8B
-hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /root/dapo-math-17k
+## SGLang Patch
 
-# 2) 启动 SGLang teacher 服务（新终端）
-python -m sglang.launch_server \
-    --model /root/Qwen3-32B \
-    --tp 8 \
-    --port 30010
-
-# 3) 使用 Megatron-Bridge 直接加载 HF student 并启动 OPD 训练
-cd /root/Relax
-bash examples/on_policy_distillation/run-qwen3-8B-sglang-opd.sh
-```
-
-### Megatron teacher 模式（仅支持同构 teacher）
-
-适用于 teacher/student 结构一致的场景。可通过 Megatron-Bridge 直接加载 HF checkpoint，无需先转换成 torch_dist。
+When using top-K modes (`student_topk`, `teacher_topk`, `union`), the `RELAX_OPD_PER_POS_TOKEN_IDS` feature requires a source-level patch to SGLang:
 
 ```bash
-# 1) 下载模型和数据（示例：8B 对 8B）
-hf download Qwen/Qwen3-8B --local-dir /root/Qwen3-8B
-hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /root/dapo-math-17k
-
-# 2) 使用 Megatron-Bridge 直接从 HF 路径加载 student/teacher
-#    典型配置：
-#    --megatron-to-hf-mode bridge
-#    --hf-checkpoint /root/Qwen3-8B
-#    --opd-teacher-load /root/Qwen3-8B
-#    （teacher 路径必须与 student 结构一致）
-cd /root/Relax
-bash examples/on_policy_distillation/run-qwen3-8B-megatron-opd.sh
+cd /sgl-workspace/sglang
+patch -p1 < /path/to/your/Relax/docker/patch/latest/sglang_per_pos_topk.patch
 ```
 
-## 关键参数说明
+This patch enables per-position token ID log-prob collection, base64 encoding, and `drop_token_ids` optimization in SGLang. It only needs to be applied once at install time.
 
-| 参数                      | 说明                                                                           |
-| ------------------------- | ------------------------------------------------------------------------------ |
-| `--use-opd`               | 启用 OPD                                                                       |
-| `--opd-type`              | 教师类型：`sglang` 或 `megatron`                                               |
-| `--opd-kl-coef`           | OPD KL 系数（默认 1.0）                                                        |
-| `--opd-teacher-load`      | teacher 模型路径（`--opd-type megatron` 时必需；可配合 bridge 直接填 HF 路径） |
-| `--opd-teacher-timeout-s` | SGLang 模式下 OPD teacher HTTP 请求超时（秒），默认 `30`                       |
-| `--opd-log-prob-top-k`    | teacher/student top-k 候选集合大小（设为 `0` 可关闭，默认 `0`）                |
-| `--opd-only-reward`       | 仅保留 OPD reward 信号（将 base reward 置零，仅注入 OPD KL）                   |
-| `--rm-url`                | SGLang teacher 服务地址（`--opd-type sglang` 时必需）                          |
+## Environment Variables
 
-> Note:
->
-> 1. OPD `sglang` 模式不占用 `--custom-rm-path` 与 `--custom-reward-post-process-path`，可与自定义奖励并存。
-> 2. `--opd-only-reward` 需要配合 `--use-opd` 使用。
-> 3. 当 `--opd-log-prob-top-k > 0` 时，框架会在 SGLang teacher 请求中启用 top-k 采集，并尝试提取 teacher 的 top-k token ids / log-probs。
-> 4. 若 teacher 响应缺失 top-k 字段或请求失败，会自动回退到安全路径（rollout log-probs + 占位 top-k），不打断 rollout 主流程。
+| Variable                      | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RELAX_OPD_PREEXPANDED_PATCH` | Set to `1` to enable the multimodal pre-expanded patch. **Required for multimodal OPD**. Because the tokenizer is not idempotent, this passes through parameters so SGLang directly accepts expanded `input_ids + image_data（base64)`; the SGLang-side tokenizer becomes a no-op and will not re-detokenize/tokenize during inference. Default: `0`. Affects both teacher and student engines (in adv mode, student-at-teacher-topk prefill also sends pre-expanded data). |
+| `RELAX_OPD_PER_POS_TOKEN_IDS` | Set to `1` to enable per-position token ID log-prob collection. Changes the SGLang transfer format from `list[[int, float, None]]` to base64 encoding, significantly reducing serialization overhead. **Required** for `student_topk`, `teacher_topk`, `union` modes; not needed for `student_sampled`. Default: `0`. Requires the SGLang patch above.                                                                                                                      |
 
-## 动态指标
+## Performance Benchmark
 
-启用 top-k 采集后，OPD 可以在线监控 student 与 teacher 候选空间的一致性。
+SGLang per-position top-K log-prob transfer optimization (Qwen3-4B, simulated data batch=128, prompt_len=1024, resp_len=7168, top_k=64, concurrency=128):
 
-定义 $S_t^{(p)} = \\text{TopK}(p_t, k)$、$S_t^{(q)} = \\text{TopK}(q_t, k)$，分别表示 token 步 $t$ 上 student/teacher 的 top-$k$ 集合。
+| Config                                                 | E2E      |
+| ------------------------------------------------------ | -------- |
+| `tokenizer-worker-num=1` + `list()`                    | 260.169s |
+| `tokenizer-worker-num=1` + `base64` + `drop_token_ids` | 24.659s  |
 
-### Overlap Ratio（重叠率）
+## Example Scripts
 
-$$
-\\mathcal{M}\_{\\text{overlap}} \\triangleq \\mathbb{E}\_t \\left\[ \\frac{|S_t^{(p)} \\cap S_t^{(q)}|}{k} \\right\]
-$$
+### Text OPD
 
-解释：
+| Script                                                                                     | Description                                                                                 |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| [`math_opd/run-opd-sampled-8xgpu-colocate.sh`](math_opd/run-opd-sampled-8xgpu-colocate.sh) | Math OPD, Qwen3-4B → Qwen3-4B-Non-Thinking-RL, `student_sampled` + adv mode, 8 GPU colocate |
 
-- 重叠率低：student 与 teacher 候选空间偏离较大。
-- 重叠率高：student 策略逐步靠近 teacher 支撑区域。
+### Multimodal OPD
 
-## 后端支持
+| Script                                                                                                                                             | Description                                           |
+| -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| [`vision_opd/run-vision-opd-qwen3.5_9b-35ba3b-8xgpu-colocate.sh`](vision_opd/run-vision-opd-qwen3.5_9b-35ba3b-8xgpu-colocate.sh)                   | Qwen3.5-9B → Qwen3.5-35B-A3B, 8 GPU colocate          |
+| [`vision_opd/run-vision-opd-qwen3.5_9b-35ba3b-8xgpu-2teacher-colocate.sh`](vision_opd/run-vision-opd-qwen3.5_9b-35ba3b-8xgpu-2teacher-colocate.sh) | Same as above, dual teacher replicas                  |
+| [`vision_opd/run-opd-qwen3.5_35ba3b-122ba10b-128xgpu-colocate.sh`](vision_opd/run-opd-qwen3.5_35ba3b-122ba10b-128xgpu-colocate.sh)                 | Qwen3.5-35B-A3B → Qwen3.5-122B-A10B, 128 GPU colocate |
 
-| 后端     | SGLang teacher | Megatron teacher                    |
-| -------- | -------------- | ----------------------------------- |
-| Megatron | ✅             | ✅（要求 teacher/student 结构一致） |
+## Common Combinations
 
-## 参考文献
+Based on [`math_opd/run-opd-sampled-8xgpu-colocate.sh`](math_opd/run-opd-sampled-8xgpu-colocate.sh), modify key variables to switch modes:
 
-- [On-Policy Distillation - Slime Docs](https://github.com/THUDM/slime/blob/main/docs/zh/advanced/on-policy-distillation.md)
-- [Tinker Cookbook - On-Policy Distillation](https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py)
+> **KL type note**: `student_sampled` supports only `reverse_kl` and `low_var_kl`; `student_topk`, `teacher_topk`, and `union` support `reverse_kl`, `forward_kl`, and `jsd` (set via `--opd-kl-type`; `jsd` can be tuned with `--opd-jsd-alpha`).
+
+**1. student_sampled + adv + reverse_kl (default, lowest overhead)**
+
+```bash
+OPD_KL_COEF=1.0
+OPD_LOSS_COEF=0.0
+OPD_TOKEN_SELECTION=student_sampled
+OPD_KL_TYPE=reverse_kl
+# RELAX_OPD_PER_POS_TOKEN_IDS not needed
+```
+
+**2. student_topk + adv + jsd**
+
+```bash
+export RELAX_OPD_PER_POS_TOKEN_IDS=1
+OPD_KL_COEF=1.0
+OPD_LOSS_COEF=0.0
+OPD_TOKEN_SELECTION=student_topk
+OPD_KL_TYPE=jsd
+# Add to OPD_ARGS: --opd-log-prob-top-k 64 --opd-jsd-alpha 0.5
+```
+
+**3. union + loss + forward_kl**
+
+```bash
+export RELAX_OPD_PER_POS_TOKEN_IDS=1
+OPD_KL_COEF=0.0
+OPD_LOSS_COEF=1.0
+OPD_TOKEN_SELECTION=union
+OPD_KL_TYPE=forward_kl
+# --opd-log-prob-top-k 64
+```
+
+**4. teacher_topk + adv + reverse_kl**
+
+```bash
+export RELAX_OPD_PER_POS_TOKEN_IDS=1
+OPD_KL_COEF=1.0
+OPD_LOSS_COEF=0.0
+OPD_TOKEN_SELECTION=teacher_topk
+OPD_KL_TYPE=reverse_kl
+# --opd-log-prob-top-k 64
+```
+
+**5. Multimodal union + loss + jsd**
+
+```bash
+export RELAX_OPD_PREEXPANDED_PATCH=1     # required for multimodal
+export RELAX_OPD_PER_POS_TOKEN_IDS=1     # required for topk modes
+OPD_KL_COEF=0.0
+OPD_LOSS_COEF=1.0
+OPD_TOKEN_SELECTION=union
+OPD_KL_TYPE=jsd
+# Add to OPD_ARGS: --opd-log-prob-top-k 64 --opd-jsd-alpha 0.5
+```

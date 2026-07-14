@@ -21,12 +21,19 @@ from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step
+from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.flops_counter import FlopsCounter
 from relax.utils.types import RolloutBatch
 
-from .cp_utils import get_sum_of_sample_mean, maybe_padded_total_lengths, slice_with_cp
+from .cp_utils import (
+    dynamic_cp_split_data,
+    get_sum_of_sample_mean,
+    maybe_padded_total_lengths,
+    slice_log_prob_with_cp,
+    slice_with_cp,
+)
 
 
 logger = get_logger(__name__)
@@ -284,16 +291,33 @@ def get_batch(
             batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
     else:
         batch, _ = next(data_iterator)
+
+    use_dynamic_context_parallel = getattr(get_args(), "dynamic_context_parallel", False)
+    if use_dynamic_context_parallel:
+        # Pick this mb's CP size with the SAME per-GPU token budget the iterator was packed
+        # with: forward-only iterators carry log_probs_max_tokens_per_gpu, the training
+        # iterator carries max_tokens_per_gpu. Using the wrong (smaller) budget would over-
+        # estimate CP (fewer DP subdivisions) and lose forward-only throughput. Falls back to
+        # args.max_tokens_per_gpu when the iterator didn't record one.
+        mt = getattr(data_iterator, "max_tokens_per_gpu", None) or get_args().max_tokens_per_gpu
+        cp_size = dynamic_cp_split_data(batch, mt)
+        batch["dynamic_cp_size"] = cp_size
+        cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=cp_size)
+        cp_rank = dist.get_rank(cp_group)
+        batch["dynamic_cp_rank"] = cp_rank
+        logger.info(
+            f"[dynamic_cp] micro-step dynamic_cp_size={cp_size} (num_samples={len(batch['total_lengths'])}, max_token_per_gpu={mt})"
+        )
+    else:
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
-
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
-
-    cp_size = mpu.get_context_parallel_world_size()
-    cp_rank = mpu.get_context_parallel_rank()
 
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
@@ -343,7 +367,7 @@ def get_batch(
 
             batch["unsplit_tokens"] = unsplit_tokens
             batch["unsplit_attention_mask"] = unsplit_attention_mask
-            batch["vlm_packed_seq_params"] = PackedSeqParams(
+            vlm_packed_seq_params = PackedSeqParams(
                 qkv_format="thd",
                 cu_seqlens_q=cu_seqlens_padded,
                 cu_seqlens_kv=cu_seqlens_padded,
@@ -352,6 +376,10 @@ def get_batch(
                 cu_seqlens_q_padded=cu_seqlens_padded,
                 cu_seqlens_kv_padded=cu_seqlens_padded,
             )
+            if use_dynamic_context_parallel:
+                vlm_packed_seq_params.local_cp_size = cp_size
+                vlm_packed_seq_params.cp_group = cp_group
+            batch["vlm_packed_seq_params"] = vlm_packed_seq_params
             # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
             # their per-sample chunking matches bridge's preprocess_packed_seqs.
             batch["padded_total_lengths"] = seqlens_padded.tolist()
@@ -378,7 +406,10 @@ def get_batch(
             )
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
-            tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
+            tokens = [
+                slice_with_cp(t, pad_token_id, qkv_format, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank)
+                for t in tokens
+            ]
 
             cu_seqlens = [0]
             for t in tokens:
@@ -405,6 +436,9 @@ def get_batch(
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
         )
+        if use_dynamic_context_parallel:
+            packed_seq_params.local_cp_size = cp_size
+            packed_seq_params.cp_group = cp_group
 
         tokens = tokens.unsqueeze(0)
     else:
@@ -432,7 +466,9 @@ def get_batch(
         # labels/mask below (built after this loop closes).
         full_per_sample_loss_masks.append(loss_mask)
         if not allgather_cp:
-            loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
+            loss_mask = slice_with_cp(
+                loss_mask, 0, qkv_format, max_seqlen, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
+            )
         loss_masks.append(loss_mask)
     batch["loss_masks"] = per_sample_loss_masks
 
@@ -508,6 +544,44 @@ def get_batch(
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
+    # Dynamic CP: forward_only merged its per-sample outputs back to full-length
+    # responses (dynamic_cp_merge_output), so rollout_data stores full fields.
+    # Re-slice them into this mb's CP-local zig-zag layout (with the dynamic cp_size/
+    # cp_rank) so they line up with the CP-local log_probs the training forward emits.
+    # Reuses batch["padded_total_lengths"] (dynamic-cp-aligned above) — the same value
+    # the forward pass consumes — so chunk boundaries match. forward_only never fetches
+    # these fields, so this is a no-op there; cp_size == 1 (pure DP) needs no slicing.
+    if use_dynamic_context_parallel and cp_size > 1:
+        padded_total_lengths = batch.get("padded_total_lengths")
+        ptls = padded_total_lengths if padded_total_lengths is not None else [None] * len(batch["total_lengths"])
+        _dcp_response_fields = (
+            "log_probs",
+            "ref_log_probs",
+            "rollout_log_probs",
+            "advantages",
+            "teacher_log_probs",
+            "opd_reverse_kl",
+        )
+        for key in _dcp_response_fields:
+            vals = batch.get(key)
+            # slice_log_prob_with_cp accepts list[float] | Tensor, so (unlike merge's
+            # all_gather) no tensor check: mirror split's type-agnostic per-sample check.
+            if isinstance(vals, (list, tuple)) and len(vals) == len(batch["total_lengths"]):
+                batch[key] = [
+                    slice_log_prob_with_cp(
+                        v,
+                        tl,
+                        rl,
+                        qkv_format,
+                        padded_total_length=ptl,
+                        dynamic_cp_size=cp_size,
+                        dynamic_cp_rank=cp_rank,
+                    )
+                    for v, tl, rl, ptl in zip(
+                        vals, batch["total_lengths"], batch["response_lengths"], ptls, strict=False
+                    )
+                ]
+
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     return batch
 
@@ -571,6 +645,7 @@ class DataIterator:
         rollout_data: RolloutBatch,
         micro_batch_size: int | None = None,
         micro_batch_indices: list[list[int]] | None = None,
+        max_tokens_per_gpu: int | None = None,
     ) -> None:
         """Initialize an iterator over `rollout_data`.
 
@@ -579,10 +654,15 @@ class DataIterator:
             micro_batch_size: Fixed contiguous slice size when not using dynamic scheduling.
             micro_batch_indices: Explicit indices per micro-batch when using dynamic balancing.
                 Must be mutually exclusive with `micro_batch_size`.
+            max_tokens_per_gpu: Per-GPU token budget this iterator was built with. Dynamic CP
+                reads it in get_batch to pick each mb's CP size consistently with how the
+                micro-batches were packed (forward-only uses log_probs_max_tokens_per_gpu,
+                training uses max_tokens_per_gpu). None falls back to args.max_tokens_per_gpu.
         """
         self.rollout_data = rollout_data
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
+        self.max_tokens_per_gpu = max_tokens_per_gpu
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
 
@@ -710,10 +790,10 @@ def get_data_iterator(
             f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
         )
 
-    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
+    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None, max_tokens_per_gpu=None):
         data_iterator = []
         for _ in range(vpp_size):
-            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
+            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices, max_tokens_per_gpu))
         return data_iterator
 
     if step_local_sample_counts is None:
@@ -766,11 +846,23 @@ def get_data_iterator(
                     partitions[j][k] += start
             micro_batch_indices.extend(partitions)
 
+        if getattr(args, "dynamic_context_parallel", False):
+            # Dynamic CP: within each step, order micro-batches by their longest
+            # packed sub-sequence, ascending (shortest first).
+            total_lengths = rollout_data["total_lengths"]
+            step_mb_offsets = np.cumsum([0, *num_microbatches]).tolist()
+            ordered: list[list[int]] = []
+            for s in range(len(num_microbatches)):
+                block = micro_batch_indices[step_mb_offsets[s] : step_mb_offsets[s + 1]]
+                block.sort(key=lambda mb: max((total_lengths[i] for i in mb), default=0))
+                ordered.extend(block)
+            micro_batch_indices = ordered
+
         assert len(set(sum(micro_batch_indices, []))) == num_local_samples
         logger.info(
             f"After dynamic batching, num_microbatches: {num_microbatches}, micro_batch_indices: {micro_batch_indices}"
         )
-        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
+        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices, _max_tokens)
 
     return (
         data_iterator,
@@ -793,7 +885,10 @@ def log_rollout_data(
     - Scalars are converted to Python numbers.
     """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
-        cp_size = mpu.get_context_parallel_world_size()
+        # Under dynamic CP, rollout_data was merged back to full-length responses
+        # (dynamic_cp_merge_output), so metrics here run on full data — use cp=1 (no
+        # zig-zag chunking / no * cp_size scaling), matching the merged layout.
+        cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
         log_dict = {}
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
@@ -805,43 +900,6 @@ def log_rollout_data(
             rollout_data.get("multimodal_train_inputs") is not None or getattr(args, "uses_unsplit_forward", False),
         )
 
-        # OPD dynamic metric: overlap ratio on top-k token sets.
-        student_topk_ids = rollout_data.get("topk_token_ids", None)
-        teacher_topk_ids = rollout_data.get("teacher_topk_token_ids", None)
-        if isinstance(student_topk_ids, list) and isinstance(teacher_topk_ids, list):
-            assert len(student_topk_ids) == len(teacher_topk_ids)
-
-            overlap_ratio_per_sample = []
-            for s_ids, t_ids in zip(student_topk_ids, teacher_topk_ids, strict=False):
-                if not isinstance(s_ids, torch.Tensor) or not isinstance(t_ids, torch.Tensor):
-                    continue
-                if s_ids.ndim < 2 or t_ids.ndim < 2:
-                    continue
-                k = min(int(s_ids.size(-1)), int(t_ids.size(-1)))
-                if k <= 0:
-                    continue
-                s_ids = s_ids[:, :k].long()
-                t_ids = t_ids[:, :k].long()
-                overlap_matrix = s_ids.unsqueeze(-1).eq(t_ids.unsqueeze(-2))
-                overlap_ratio = overlap_matrix.any(dim=-1).float().sum(dim=-1) / float(k)
-                overlap_ratio_per_sample.append(overlap_ratio)
-
-            if overlap_ratio_per_sample:
-                loss_masks_t = loss_masks
-                total_lengths_i = total_lengths
-                response_lengths_i = response_lengths
-                overlap_ratio_flat = torch.cat(overlap_ratio_per_sample).clone().detach().to(loss_masks_t[0].device)
-                sum_of_sample_mean = get_sum_of_sample_mean(
-                    total_lengths_i,
-                    response_lengths_i,
-                    loss_masks_t,
-                    qkv_format=args.qkv_format,
-                    max_seq_lens=max_seq_lens,
-                    padded_total_lengths=padded_total_lengths,
-                )
-                overlap_ratio_value = cp_size * sum_of_sample_mean(overlap_ratio_flat) / len(loss_masks_t)
-                log_dict["opd_overlap_ratio"] = overlap_ratio_value.item()
-
         for key, val in rollout_data.items():
             if key in [
                 "tokens",
@@ -851,11 +909,6 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
-                "topk_token_ids",
-                "topk_log_probs",
-                "teacher_topk_token_ids",
-                "teacher_topk_log_probs",
-                "teacher_topk_k",
                 "packed_seq_params",
                 "vlm_packed_seq_params",
                 "__loss_scale__",
@@ -864,6 +917,8 @@ def log_rollout_data(
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
             ]:
                 continue
+            if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:
+                continue
             # Upload per sample mean for each rollout value
             # There are the following assumptions:
             # - Each dp rank has the same number of samples
@@ -871,7 +926,7 @@ def log_rollout_data(
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
-                    if key in [
+                    use_sample_mean = key in [
                         "log_probs",
                         "ref_log_probs",
                         "rollout_log_probs",
@@ -879,8 +934,9 @@ def log_rollout_data(
                         "advantages",
                         "values",
                         "teacher_log_probs",
-                        "opd_reverse_kl",
-                    ]:
+                        "opd_kl_term",
+                    ]
+                    if use_sample_mean:
                         val = torch.cat(val).clone().detach()
                         val = val.to(loss_masks[0].device)
                         sum_of_sample_mean = get_sum_of_sample_mean(
@@ -890,6 +946,7 @@ def log_rollout_data(
                             qkv_format=args.qkv_format,
                             max_seq_lens=max_seq_lens,
                             padded_total_lengths=padded_total_lengths,
+                            dynamic_cp_size=cp_size,
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
@@ -943,7 +1000,8 @@ def log_rollout_data(
 
     if args.log_correct_samples:
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
-            cp_size = mpu.get_context_parallel_world_size()
+            # Dynamic CP: rollout_data is full-length (merged), so use cp=1 here too.
+            cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
             log_dict = {}
             response_lengths = rollout_data["response_lengths"]
             loss_masks = rollout_data["loss_masks"]
@@ -1013,6 +1071,7 @@ def log_rollout_data(
                     correct_response_lengths,
                     correct_loss_masks,
                     padded_total_lengths=correct_padded_total_lengths,
+                    dynamic_cp_size=cp_size,
                 )
                 correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
                 rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses

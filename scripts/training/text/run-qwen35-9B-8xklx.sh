@@ -13,43 +13,47 @@ set -o pipefail
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
+export WORKDIR="${WORKDIR:-/workspace}"
+export MODEL_DIR="${MODEL_DIR:-/workspace}"
+export DATA_DIR="${DATA_DIR:-/workspace}"
+export PROJECT_NAME=Relax-Qwen3.5-9B-P800
+export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
+
+export MEGATRON=${WORKDIR}/Megatron-LM
+
 export CUDA_ENABLE_P2P_NO_UVA=0
 export CUDA_FAKE_UVA_ENABLE=1
 export CUDA_ERROR_LEVEL=0
+export XMLIR_MEMCPY_RETRY_SYNC=true
 
 export XPU_SUPPORT_IPC_EVENT=1
+export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4"}
 
-# export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
-
-export MODEL_DIR="${MODEL_DIR:-/workspace/model/qwen3.5-9B}" # 存放模型权重、训练样本的共同父目录
-export EVAL_DATA="${EVAL_DATA:-/workspace/aime-2024/aime-2024.jsonl}"
-export MODEL_CONFIG_DIR=/workspace/Relax/scripts/models # Relax模型脚本路径
-export MEGATRON=/workspace/Megatron-LM
-export NUM_GPUS=8
 unset http_proxy
 unset https_proxy
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "/workspace/Relax/scripts/entrypoint/local-klx.sh"
+    source "${SCRIPT_DIR}/../../entrypoint/local-klx.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
+source "${SCRIPT_DIR}/../../models/qwen35-9B.sh"
 
-NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/
-   --ref-load ${MODEL_DIR}/
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
+   --ref-load ${MODEL_DIR}/Qwen3.5-9B
    --megatron-to-hf-mode bridge
-#   --load ${MODEL_DIR}/Qwen3-9B_mcore_8xgpu/
-   --save ${MODEL_DIR}/Qwen3-9B_mcore_8xgpu/
+
+   --load ${EXP_DIR}/Qwen3-9B_mcore_8xgpu/
+   --save ${EXP_DIR}/Qwen3-9B_mcore_8xgpu/
    --save-interval 50
    --max-actor-ckpt-to-keep 1
 )
 
-PROMPT_SET="${PROMPT_SET:-/workspace/dapo-math-17k/dapo-math-17k.jsonl}"
-EVAL_DATA="${EVAL_DATA:-/workspace/aime-2024/aime-2024.jsonl}"
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+EVAL_DATA=${DATA_DIR}/aime-2024/aime-2024.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
@@ -60,11 +64,11 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 64
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 512
    --balance-data
    --use-fault-tolerance
 )
@@ -139,12 +143,13 @@ SGLANG_ARGS=(
 )
 
 WANDB_ARGS=(
-   --tb-experiment-name qwen3.5-p800-9B-20260622
+   --tb-experiment-name qwen3.5-p800-9B-${now}
    --use-wandb
-   --wandb-project relax—qwen3.5-9B
-   --wandb-group qwen3.5-p800-9B-20260622
+   --wandb-project ${PROJECT_NAME}
+   --wandb-group qwen3.5-p800-9B-${now}
    --wandb-key ${WANDB_API_KEY}
    --disable-wandb-random-suffix
+   --no-use-metrics-service
 )
 
 MISC_ARGS=(
@@ -160,9 +165,8 @@ MISC_ARGS=(
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/workspace/TransferQueue:/workspace/Megatron-LM/:/workspace/Megatron-Bridge/src/:/workspace/Relax/:$PYTHONPATH\",
+    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
     \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
-    \"XMLIR_MEMCPY_RETRY_SYNC\": \"true\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENBLAS_NUM_THREADS\": \"64\",
     \"OMP_NUM_THREADS\": \"64\",
@@ -174,7 +178,6 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_ORDER\": \"OAM_ID\",
     \"CUDART_DUMMY_REGISTER\": \"1\",
     \"XPU_FORCE_USERMODE_LAUNCH\": \"1\",
-    \"XMLIR_DIST_SINGLETON_STREAM\": \"true\",
     \"CUDA_VISIBLE_DEVICES\": \"0,1,2,3,4,5,6,7\",
     \"XPU_VISIBLE_DEVICES\": \"0,1,2,3,4,5,6,7\",
     \"XMLIR_FA_GEMM_TYPE\": \"float\",
@@ -192,12 +195,11 @@ RUNTIME_ENV_JSON="{
     \"BKCL_RING_OPT\": \"1\",
     \"BKCL_FLAT_RING\": \"1\",
     \"BKCL_CCIX_RING\": \"1\",
-    \"BKCL_TREE_THRESHOLD\": \"1\",
+    \"BKCL_TREE_THRESHOLD\": \"1048576\",
     \"BKCL_CCIX_BUFFER_GM\": \"1\",
     \"BKCL_FORCE_L3_RDMA\": \"0\",
     \"BKCL_RING_BUFFER_GM\": \"1\",
     \"BKCL_ENABLE_XDR\": \"1\",
-    \"BKCL_RDMA_FORCE_TREE\": \"1\",
     \"BKCL_XLINK_D2D\": \"0\",
     \"BKCL_XLINK_ETH\": \"0\",
     \"BKCL_XLINK_C2C\": \"1\",
@@ -210,12 +212,13 @@ RUNTIME_ENV_JSON="{
     \"BKCL_TIMEOUT\": \"400000\",
     \"CUDA_DISABLE_PRINTF\": \"1\",
     \"BKCL_RDMA_VERBS\": \"1\",
-    \"BKCL_RDMA_NICS\": \"xgbe0,xgbe0,xgbe2,xgbe2,xgbe4,xgbe4,xgbe5,xgbe5\",
+    \"BKCL_RDMA_NICS\": \"${BKCL_RDMA_NICS}\",
+    \"NVTE_DEBUG\": \"1\",
+    \"NVTE_DEBUG_LEVEL\": \"1\",
     \"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES\": \"1\",
     \"TORCH_XCCL_DEFAUTL_PG_TIMEOUT_MILSEC\": \"7200000\",
     \"CUDA_ERROR_LEVEL\": \"0\",
     \"HYDRA_FULL_ERROR\": \"1\",
-    \"XMLIR_ENABLE_NEW_PG\": \"1\",
     \"TORCH_XCCL_HEARTBEAT_TIMEOUT_SEC\": \"1800\",
     \"TORCH_XCCL_ENABLE_TIMING\": \"1\",
     \"TORCH_FR_BUFFER_SIZE\": \"2000\",
@@ -224,33 +227,32 @@ RUNTIME_ENV_JSON="{
     \"BKCL_ALL_TO_ALL_OPT\": \"1\",
     \"SGLANG_IS_FLASHINFER_AVAILABLE\": \"false\",
     \"USE_MOE_FC_V3\": \"1\",
-    \"XMLIR_DIST_SINGLETON_STREAM\": \"1\",
-    \"XMLIR_USE_HYDRA_LINEAR\": \"0\",
-    \"SGL_CPU_QUANTIZATION\": \"0\",
-    \"XSGL_ENABLE_MEM_SAVER\": \"0\",
-    \"XPU_ENABLE_CTX_LAZY_INIT\": \"1\",
-    \"XPU_SUPPORT_IPC_EVENT\": \"1\",
-    \"XSGL_USE_TORCH_CAUSAL_CONV\": \"1\",
-    \"TRACE_WEIGHT_PATHS\": \"0\",
-    \"TRITON_SKIP_AUTOTUNE\": \"1\",
     \"FLA_USE_NAIVE\": \"1\",
     \"FORCE_DISABLE_FLA\": \"1\",
-    \"DUMP_CONVERTED_WEIGHTS_DIR\": \"\",
     \"DISABLE_CAST_CACHE\": \"1\",
-    \"FORCE_NN_LINEAR\": \"1\",
-    \"USE_FUSED_GATED_DELTA_RULE\": \"1\",
+    \"FORCE_NN_LINEAR\": \"0\",
+    \"XMLIR_USE_HYDRA_LINEAR\": \"1\",
+    \"SGL_CPU_QUANTIZATION\": \"1\",
+    \"XPU_ENABLE_CTX_LAZY_INIT\": \"1\",
+    \"XPU_SUPPORT_IPC_EVENT\": \"1\",
+    \"TRITON_SKIP_AUTOTUNE\": \"1\",
+    \"XMLIR_FORCE_USE_XPU_GRAPH\": \"1\",
+    \"XSGL_USE_TORCH_CAUSAL_CONV\": \"1\",
+    \"XSGL_FUSE_SPLIT_NORM_ROPE_NEOX\": \"1\",
+    \"XPU_FLASH_ATTENTION_DECODER_USE_BALANCE\": \"1\",
+    \"CUDA_ENABLE_P2P_NO_UVA\": \"0\",
+    \"CUDA_FAKE_UVA_ENABLE\": \"1\",
     \"XSGL_TRANSPOSE_SSM_STATE\": \"1\",
     \"XSGL_TRANSPOSE_CONV_STATE\": \"1\",
-    \"XSGL_FUSE_SPLIT_NORM_ROPE_NEOX\": \"1\",
-    \"XSGL_MOE_UNSTABLE_TOPK\": \"1\",
-    \"XPU_FLASH_ATTENTION_DECODER_USE_BALANCE\": \"1\",
-    \"XMLIR_FORCE_USE_XPU_GRAPH\": \"1\",
+    \"USE_FUSED_GATED_DELTA_RULE\": \"1\",
     \"RAY_OVERRIDE_JOB_RUNTIME_ENV\":\"1\",
-    \"HYDRAX_USE_PROTEUS\": \"0\",
+    \"XMLIR_D_XPU_L3_SIZE\": \"0\",
+    \"XMLIR_MEMCPY_RETRY_SYNC\": \"true\",
+    \"DEBUG_DUMP_TOKENS\": \"0\",
+    \"RELAX_SKIP_TORCH_MEMORY_SAVER\":\"1\",
     \"XMLIR_MATMUL_FAST_MODE\": \"1\",
     \"XMLIR_ENABLE_FAST_FC\": \"1\",
-    \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"XSGL_INT8_LM_HEAD\": \"0\"
+    \"HYDRAX_USE_PROTEUS\": \"0\"
   }
 }"
 

@@ -33,7 +33,6 @@ from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
-    build_data_fields,
     is_sft_mode,
     sft_partition_id,
     sft_task_name,
@@ -53,11 +52,18 @@ from relax.utils.data.stream_dataloader import (
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.opd.opd_utils import (
+    append_managed_opd_teacher_offload_handle,
+    append_managed_opd_teacher_onload_handle,
+    consume_opd_train_data,
+    has_managed_opd_teacher_manager,
+)
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
+from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -534,14 +540,19 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
     def train(self, rollout_id: int) -> None:
-        # offload genrm before train (rollout has already self-offloaded at end of _async_run)
-        if self.args.offload_rollout and dist.get_rank() == 0 and self.genrm_manager is not None:
-            ray.get(self.genrm_manager.offload.remote())
+        if self.args.offload_rollout and dist.get_rank() == 0:
+            pre_train_offload_handles = []
+            if self.genrm_manager is not None:
+                pre_train_offload_handles.append(self.genrm_manager.offload.remote())
+            append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
+            if pre_train_offload_handles:
+                ray.get(pre_train_offload_handles)
 
-        # Gate all ranks behind rank-0's GenRM offload: otherwise other ranks
-        # wake_up() and reclaim GPU memory while colocated GenRM still holds its
-        # static pool, causing cuMemCreate OOM (mirrors the update_weights barrier).
-        if self.args.offload_rollout and self.genrm_manager is not None:
+        # Gate all ranks behind rank-0's GenRM/OPD-teacher offload: otherwise
+        # other ranks wake_up() and reclaim GPU memory while colocated GenRM or
+        # teacher still holds its static pool, causing cuMemCreate OOM (mirrors
+        # the update_weights barrier).
+        if self.args.offload_rollout and (self.genrm_manager is not None or has_managed_opd_teacher_manager(self)):
             dist.barrier(group=get_gloo_group())
 
         if self.args.offload_train and self._per_step_rollout:
@@ -1336,12 +1347,8 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields.append("ref_log_probs")
         if self.args.multimodal_keys is not None:
             data_fields.append("multimodal_train_inputs")
-        if self.args.use_opd and self.args.opd_type == "sglang":
-            data_fields.append("teacher_log_probs")
-            data_fields.append("opd_reverse_kl")
-            if self.args.opd_log_prob_top_k > 0:
-                data_fields.append("teacher_topk_token_ids")
-                data_fields.append("teacher_topk_k")
+        if self.args.use_opd:
+            consume_opd_train_data(data_fields, self.args)
         if getattr(self.args, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path: drain this DP's bucket from TQ
             # using token-budget fetches, align num_microbatches across DPs
@@ -1485,11 +1492,13 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
 
         if self.args.offload_rollout and dist.get_rank() == 0:
-            # Onload rollout weights only. genRM (no NCCL weight sync — the reward
+            # Onload rollout weights. genRM (no NCCL weight sync — the reward
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
-            # temp buffers and OOM. See onload_kv below.
-            ray.get(self.rollout_manager.onload_weights.remote())
+            # temp buffers and OOM. See onload_kv below (post_sync_handles).
+            onload_handles = [self.rollout_manager.onload_weights.remote()]
+            append_managed_opd_teacher_onload_handle(onload_handles, self)
+            ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:

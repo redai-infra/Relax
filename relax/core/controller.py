@@ -38,6 +38,11 @@ from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.opd.opd_utils import (
+    maybe_start_managed_opd_teacher,
+    set_managed_opd_teacher_on_actor_service,
+    shutdown_managed_opd_teacher,
+)
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
 
@@ -55,6 +60,7 @@ class Controller:
     def __init__(self, config: Namespace, runtime_env: dict = None) -> None:
         self.config = config
         self.serve_dict = {}
+        self._teacher_manager = None
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -317,6 +323,11 @@ class Controller:
             )
 
     def register_all_serve(self):
+        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
+            self.config,
+            runtime_env=self.runtime_env,
+        )
+
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
             raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
@@ -363,8 +374,9 @@ class Controller:
 
         if colocate and not self.config.hybrid:
             # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
-            num_gpus = self.config.resource.get(ROLES.actor)[1]
-            actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
+            if actor_rollout_pgs is None:
+                num_gpus = self.config.resource.get(ROLES.actor)[1]
+                actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
@@ -484,6 +496,12 @@ class Controller:
                     genrm_manager = await self.serve_dict["genrm"].get_genrm_manager()
                     await self.serve_dict[ROLES.actor].set_genrm_manager(genrm_manager)
 
+                await set_managed_opd_teacher_on_actor_service(
+                    self.serve_dict.get(ROLES.actor),
+                    self._teacher_manager,
+                    self.config,
+                )
+
                 # Always set rollout_manager for both sync and async modes
                 # (needed for scaled-out engine weight sync in fully_async mode)
                 if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
@@ -582,6 +600,8 @@ class Controller:
                 logger.info("RolloutManager disposed — SGLang engines shut down.")
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
+
+        shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
 
@@ -797,7 +817,28 @@ class Controller:
         shutdown_async_loop()
         logger.info("[Global Restart] Async event loop stopped")
 
-        # --- 1.9 Shutdown Ray Serve and Ray to kill all processes ---
+        # --- 1.9 Terminate router processes and reset cached endpoint ---
+        # The router runs as a daemon subprocess of this main process, so it
+        # survives ray.shutdown().  If we don't kill it, the pre-restart engine
+        # URLs stay in its worker list forever (endless "Connection refused"
+        # health WARNs on dead ports), and post-restart `_start_router` also
+        # short-circuits because `sglang_router_ip`/`_port` were written back
+        # to the config on first launch.
+        try:
+            from relax.distributed.ray.rollout import stop_launched_routers
+
+            killed = stop_launched_routers()
+            # Only clear cached endpoint if we actually owned & killed a router.
+            # An externally-provided router (--sglang-router-ip) was never in
+            # our launched list, so we leave the endpoint set to reuse it.
+            if killed > 0:
+                self.config.sglang_router_ip = None
+                self.config.sglang_router_port = None
+                logger.info(f"[Global Restart] Terminated {killed} router process(es), endpoint reset")
+        except Exception as e:
+            logger.warning(f"[Global Restart] Failed to terminate router: {e}")
+
+        # --- 1.10 Shutdown Ray Serve and Ray to kill all processes ---
         try:
             serve.shutdown()
             logger.info("[Global Restart] Ray Serve shutdown completed")
@@ -822,7 +863,7 @@ class Controller:
         time.sleep(5)
         logger.info("[Global Restart] Waited 5s for resource release")
 
-        # --- 1.10 Re-initialize Ray and Ray Serve (same as train.py) ---
+        # --- 1.11 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
         logger.info("[Global Restart] Ray re-initialized")
         try:

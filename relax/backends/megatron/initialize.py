@@ -38,6 +38,9 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
     """Initialize torch.distributed and core model parallel."""
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
+    extra_args = dict()
+    if getattr(args, "dynamic_context_parallel", False):
+        extra_args["dynamic_context_parallel"] = True
     mpu.initialize_model_parallel(
         args.tensor_model_parallel_size,
         args.pipeline_model_parallel_size,
@@ -54,6 +57,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         create_gloo_process_groups=args.use_gloo_process_groups,
+        **extra_args,
     )
 
     try:

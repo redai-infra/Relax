@@ -38,7 +38,14 @@ def read_session_input(path: str | Path) -> dict[str, Any]:
 
 
 def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
-    Path(path).write_text(json.dumps(payload), encoding="utf-8")
+    # Defensive: if Relax already discarded the session (timeout) it will
+    # have deleted the tmpdir out from under us. Runtime SIGKILLs us in that
+    # case, but during the race window we may still reach here. Skip the
+    # write instead of dying with FileNotFoundError.
+    try:
+        Path(path).write_text(json.dumps(payload), encoding="utf-8")
+    except FileNotFoundError:
+        pass
 
 
 def load_initial_image(messages: list[dict[str, Any]]) -> Image.Image | None:
@@ -154,7 +161,12 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"].rstrip("/"),
-        timeout=httpx.Timeout(timeout=900.0, connect=30.0),
+        # 600s gives generous margin over expected 20-45s per-turn even if
+        # some tail requests hit SGLang backpressure. Livelock protection
+        # comes from max_retries=0 (no zombie SDK retry loops) +
+        # runtime.py:322 SIGKILL on cancel, NOT from a short timeout.
+        timeout=httpx.Timeout(timeout=1200.0, connect=30.0),
+        max_retries=0,
     )
 
     stop_reason = "max_turns"

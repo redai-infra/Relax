@@ -38,6 +38,7 @@ except ImportError:
     pq = None
 
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.opd.opd_utils import build_opd_teacher_sample_fields
 from relax.utils.types import MultimodalTypes, Sample
 
 
@@ -200,6 +201,8 @@ def process_raw_sample(
     use_audio_in_video: Optional[bool] = False,
     multimodal_config: MultimodalConfig = None,
     custom_prompt_func: Optional[Callable[[Any, dict], Any]] = None,
+    teacher_prompt_key: Optional[str] = None,
+    teacher_multimodal_keys: Optional[dict] = None,
 ) -> Sample:
     """Process a raw data dictionary into a Sample object.
 
@@ -267,11 +270,32 @@ def process_raw_sample(
     else:
         multimodal_inputs = None
 
+    teacher_prompt_str, teacher_multimodal_inputs = build_opd_teacher_sample_fields(
+        data,
+        tokenizer,
+        processor,
+        prompt_key=prompt_key,
+        system_prompt=system_prompt,
+        as_conversation=as_conversation,
+        multimodal_keys=multimodal_keys,
+        teacher_prompt_key=teacher_prompt_key,
+        teacher_multimodal_keys=teacher_multimodal_keys,
+        custom_prompt_func=custom_prompt_func,
+        apply_chat_template=apply_chat_template,
+        apply_chat_template_kwargs=apply_chat_template_kwargs,
+        tools=tools,
+        use_audio_in_video=use_audio_in_video,
+        multimodal_config=multimodal_config,
+        build_messages_fn=build_messages,
+    )
+
     return Sample(
         prompt=output_prompt,
         label=data[label_key] if label_key is not None else None,
         metadata=metadata,
         multimodal_inputs=multimodal_inputs,
+        teacher_prompt=teacher_prompt_str,
+        teacher_multimodal_inputs=teacher_multimodal_inputs,
     )
 
 
@@ -637,6 +661,8 @@ class BaseDataset(abc.ABC):
         use_audio_in_video: bool = False,
         multimodal_config: MultimodalConfig = None,
         custom_prompt_func: Optional[Callable[[Any, dict], Any]] = None,
+        teacher_prompt_key: Optional[str] = None,
+        teacher_multimodal_keys: Optional[dict] = None,
     ):
         """Initialize base dataset configuration.
 
@@ -670,6 +696,8 @@ class BaseDataset(abc.ABC):
         self.use_audio_in_video = use_audio_in_video
         self.multimodal_config = multimodal_config
         self.custom_prompt_func = custom_prompt_func
+        self.teacher_prompt_key = teacher_prompt_key
+        self.teacher_multimodal_keys = teacher_multimodal_keys
 
         self.epoch_id = -1
 
@@ -708,4 +736,6 @@ class BaseDataset(abc.ABC):
             use_audio_in_video=self.use_audio_in_video,
             multimodal_config=self.multimodal_config,
             custom_prompt_func=self.custom_prompt_func,
+            teacher_prompt_key=self.teacher_prompt_key,
+            teacher_multimodal_keys=self.teacher_multimodal_keys,
         )

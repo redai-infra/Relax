@@ -34,6 +34,21 @@ if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; 
 fi
 mkdir -p ${SAVE_DIR}
 
+###############################################################################
+#                             STARTUP CLEANUP                                 #
+###############################################################################
+# Sessions that die by SIGKILL / OOM / uncaught crash never run
+# ApptainerJupyterSession.close(), so their /tmp/relax-apptainer-* dirs
+# (kernel conn files + bind-mounted imgs/inputs holding base64-decoded
+# dataset images) leak. Over 2000 rollouts × 32 batch × 8 samples ≈ 512K
+# sessions, even a 1% leak fills the container disk and triggers eviction.
+# mtime > 240 min is well above any single session's max wall-clock (bounded
+# by max_turns × code_timeout_s ≈ tens of minutes), so live sessions are
+# never touched.
+find /tmp -maxdepth 1 -name 'relax-apptainer-*' -mmin +240 -exec rm -rf {} + 2>/dev/null || true
+# Per-run agent log dirs accumulate one file per session; keep 3 days.
+find "${SCRIPT_DIR}/log/agent" -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
+
 # SIF path under DATA_DIR layout; user may override APPTAINER_IMAGE_PATH to
 # point at a shared NFS copy elsewhere.
 export APPTAINER_IMAGE_PATH="${APPTAINER_IMAGE_PATH:-${DATA_DIR}/sif/deepeyes_v2_kernel.sif}"
@@ -57,9 +72,9 @@ CKPT_ARGS=(
     --hf-checkpoint ${MODEL_DIR}/Qwen3.6-35B-A3B
     --ref-load ${MODEL_DIR}/Qwen3.6-35B-A3B
     --warm-hf-checkpoint-page-cache
-    --save ${SAVE_DIR}/Qwen3.6-35B-A3B-Checkpoint
+    --save ${SAVE_DIR}/Qwen3.6-35B-A3B-Checkpoint_v2
     --megatron-to-hf-mode bridge
-    --save-interval 100
+    --save-interval 200
     --max-actor-ckpt-to-keep 1
 )
 
@@ -118,6 +133,10 @@ ROLLOUT_ARGS=(
     # sessions are both kept, which is what makes hang/timeout diagnosis
     # possible — Relax's own tmpdir-based capture drops both.
     --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
+    # 30-min default is too generous: normal sessions take 1-3 min, a
+    # zombie session still burning chat completions after 10 min is
+    # ~always doomed. Faster session-level SIGKILL clears prepare-gate
+    # IR backlog quicker so new groups actually get served.
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
     --micro-batch-size 1
@@ -128,7 +147,7 @@ ROLLOUT_ARGS=(
     --global-batch-size 256
     --rollout-shuffle
     --use-streaming-dataset
-    --agentic-prepare-pool-size 32
+    --agentic-prepare-pool-size 0
 )
 
 ###############################################################################
@@ -136,8 +155,8 @@ ROLLOUT_ARGS=(
 ###############################################################################
 
 EVAL_ARGS=(
-    # --skip-eval-before-train
-    --eval-interval 50
+    --skip-eval-before-train
+    --eval-interval 500
     --eval-prompt-data vstar ${TEST_FILES}
     --n-samples-per-eval-prompt 8
     --eval-max-response-len 4096
@@ -183,11 +202,17 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 2
+    # Qwen3.6-35B-A3B hybrid mamba path — see memory f6e5bfaa.
+    # cuda-graph strategy: enable but cap batch size. Prior runs showed
+    # IMA at `#running-req: 16` with cuda-graph fully enabled; capping
+    # capture at bs<=8 keeps small-batch decode fast (graph replay path)
+    # while large batches fall back to non-graph execution. If IMA still
+    # triggers, drop to --sglang-disable-cuda-graph.
     --sglang-mem-fraction-static 0.6
     --sglang-mamba-scheduler-strategy no_buffer
     --sglang-disable-overlap-schedule
     --sglang-disable-radix-cache
-    --sglang-disable-cuda-graph
+    --sglang-cuda-graph-max-bs 8
 )
 
 ###############################################################################

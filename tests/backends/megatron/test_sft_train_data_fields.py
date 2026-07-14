@@ -5,18 +5,6 @@ partition naming."""
 
 from argparse import Namespace
 
-import pytest
-
-
-# Importing relax.backends.megatron.actor pulls in distributed checkpoint
-# service deps (deep_gemm, transformer_engine) that are CUDA-only. Skip the
-# whole module on CPU-only envs — matches the pattern used in
-# tests/distributed/checkpoint_service/test_dcs_weight_conversion.py.
-try:
-    from relax.backends.megatron import actor as _actor_module  # noqa: F401
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"relax.backends.megatron.actor unavailable: {_exc}", allow_module_level=True)
-
 
 def _mk_actor_args(loss_type: str):
     return Namespace(
@@ -39,7 +27,7 @@ def _mk_actor_args(loss_type: str):
 def test_sft_data_fields_excludes_rl_only_keys():
     """In SFT mode, data_fields must NOT include rollout_log_probs / rewards /
     raw_reward."""
-    from relax.engine.sft.runtime import build_data_fields
+    from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="sft")
     fields = build_data_fields(args)
@@ -55,7 +43,7 @@ def test_sft_data_fields_excludes_rl_only_keys():
 
 def test_rl_data_fields_unchanged():
     """RL path must keep the existing field set."""
-    from relax.engine.sft.runtime import build_data_fields
+    from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="policy_loss")
     fields = build_data_fields(args)

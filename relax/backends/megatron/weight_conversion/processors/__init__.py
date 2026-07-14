@@ -4,7 +4,7 @@ from .padding_remover import remove_padding
 try:
     from .quantizer_compressed_tensors import quantize_params_compressed_tensors
     from .quantizer_fp8 import quantize_params_fp8
-except ImportError:
+except Exception:
     quantize_params_fp8 = None
     quantize_params_compressed_tensors = None
 

@@ -480,33 +480,88 @@ diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/cor
 index 465e83f28..707162f47 100644
 --- a/megatron/core/pipeline_parallel/p2p_communication.py
 +++ b/megatron/core/pipeline_parallel/p2p_communication.py
-@@ -27,22 +27,22 @@ def _batched_p2p_ops(
-     ops = []
-     if tensor_send_prev is not None:
-         send_prev_op = torch.distributed.P2POp(
--            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
-+            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank,
-         )
-         ops.append(send_prev_op)
-     if tensor_recv_prev is not None:
-         recv_prev_op = torch.distributed.P2POp(
--            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
-+            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank,
-         )
-         ops.append(recv_prev_op)
-     if tensor_send_next is not None:
-         send_next_op = torch.distributed.P2POp(
--            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
-+            torch.distributed.isend, tensor_send_next, next_pipeline_rank,
-         )
-         ops.append(send_next_op)
-     if tensor_recv_next is not None:
-         recv_next_op = torch.distributed.P2POp(
--            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
-+            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank,
-         )
-         ops.append(recv_next_op)
-     if len(ops) > 0:
+@@ -232,34 +232,26 @@
+                 group=self.pp_group,
+             )
+         else:
+-            ops = []
+-            if send_prev_shape_tensor is not None:
+-                send_prev_op = torch.distributed.P2POp(
+-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
+-                )
+-                ops.append(send_prev_op)
+-            if recv_prev_shape_tensor is not None:
+-                recv_prev_op = torch.distributed.P2POp(
+-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
+-                )
+-                ops.append(recv_prev_op)
+-            if send_next_shape_tensor is not None:
+-                send_next_op = torch.distributed.P2POp(
+-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
+-                )
+-                ops.append(send_next_op)
+-            if recv_next_shape_tensor is not None:
+-                recv_next_op = torch.distributed.P2POp(
+-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
+-                )
+-                ops.append(recv_next_op)
+-            if len(ops) > 0:
+-                reqs = torch.distributed.batch_isend_irecv(ops)
+-                for req in reqs:
+-                    req.wait()
++            # PR #5271 (Megatron-LM): shape exchange MUST use _p2p_ops rather than
++            # batch_isend_irecv. batch_isend_irecv is one tagless NCCL group; when
++            # pp_group.size()==2, prev_rank == next_rank (single physical peer) and
++            # same-peer ops pair FIFO by enqueue order. Both ranks build ops in the
++            # same fixed order but hold opposite prev/next roles → recv_prev_shape
++            # and recv_next_shape get silently crossed. _p2p_ops handles size==2
++            # via the group.WORLD split + even/odd ordering, correct for size>=4 too.
++            reqs = _p2p_ops(
++                tensor_send_prev=send_prev_shape_tensor,
++                tensor_recv_prev=recv_prev_shape_tensor,
++                tensor_send_next=send_next_shape_tensor,
++                tensor_recv_next=recv_next_shape_tensor,
++                group=self.pp_group,
++                prev_pipeline_rank=self.prev_rank,
++                next_pipeline_rank=self.next_rank,
++            )
++            for req in reqs.values():
++                req.wait()
+ 
+-            # To protect against race condition when using batch_isend_irecv().
+-            # should take this out once the bug with batch_isend_irecv is resolved.
++            # keep the CUDA sync as a defensive measure — cheap for 3-int64 tensors.
+             torch.cuda.synchronize()
+ 
+         recv_prev_shape = [0, 0, 0]
+@@ -371,6 +363,11 @@
+                 return []
+ 
+             p2p_func = _ring_exchange_wrapper
++        elif self.pp_group.size() == 2:
++            # PR #5271 (Megatron-LM): size==2 has same-peer (prev_rank == next_rank);
++            # batch_isend_irecv cannot pair same-peer bidirectional ops correctly (see
++            # #1450). Force _p2p_ops which handles this via WORLD split + even/odd order.
++            p2p_func = _p2p_ops
+         elif config.batch_p2p_comm:
+             assert wait_on_reqs
+             p2p_func = _batched_p2p_ops
+@@ -381,10 +378,12 @@
+         next_rank = self.next_rank
+         prev_rank = self.prev_rank
+ 
+-        if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+-            reqs = []
+-        else:
++        # reqs init must match p2p_func return type: _p2p_ops returns dict,
++        # _batched_p2p_ops + _ring_exchange_wrapper return list.
++        if p2p_func is _p2p_ops:
+             reqs = {}
++        else:
++            reqs = []
+ 
+         tensor_recv_prev = None
+         tensor_recv_next = None
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
 index d316d23de..9bb6d2bd6 100644
 --- a/megatron/core/transformer/moe/moe_utils.py

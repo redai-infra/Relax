@@ -31,6 +31,8 @@ The user-supplied apptainer image is treated as authoritative.
 from __future__ import annotations
 
 import asyncio
+import atexit
+import glob
 import os
 import shutil
 import signal
@@ -72,6 +74,9 @@ def _translate(exc: BaseException, *, context: str) -> SandboxError:
 
 _DEFAULT_CONNECTION_DIR = "/tmp/relax_sandbox"  # kept for backward-compat; unused under IPC transport
 _DELETE_CHUNK = 256
+# Pid-prefixed so the atexit sweep (below) only reaps this process's own
+# leftovers — sibling Ray workers on the same host stay safe.
+_SESSION_TMP_PREFIX = f"relax-apptainer-{os.getpid()}-"
 # Linux AF_UNIX caps sockaddr_un.sun_path at 108 bytes incl. trailing \0.
 # jupyter_client builds each of the 5 channels' socket files as
 # f"{ip_prefix}-{random_int}" where random_int ∈ [1, 999999] (≤6 digits →
@@ -264,7 +269,7 @@ class ApptainerJupyterBackend(BaseSandbox):
         proc: Optional[asyncio.subprocess.Process] = None
         kernel_client: Any = None
         try:
-            session_tmp = Path(tempfile.mkdtemp(prefix="relax-apptainer-"))
+            session_tmp = Path(tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX))
             os.chmod(session_tmp, 0o755)
 
             host_conn_dir = session_tmp / "conn"
@@ -851,3 +856,24 @@ async def _teardown_partial(
 
 
 register_backend("apptainer_jupyter", ApptainerJupyterBackend)
+
+
+def _sweep_leaked_session_tmpdirs() -> None:
+    """Reap this process's leaked session tmpdirs on interpreter exit.
+
+    ``ApptainerJupyterSession.close()`` normally rmtree's each session_tmp, but
+    is skipped when the process dies before ``finally`` runs (SIGKILL, OOM,
+    hard crash in the owner loop). Over hundreds of thousands of sessions per
+    training run the leak — bind-mounted image dirs holding base64-decoded
+    dataset images — fills the container disk and triggers eviction. Pid prefix
+    keeps sibling Ray workers untouched.
+    """
+    pattern = os.path.join(tempfile.gettempdir(), f"{_SESSION_TMP_PREFIX}*")
+    for path in glob.glob(pattern):
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_sweep_leaked_session_tmpdirs)

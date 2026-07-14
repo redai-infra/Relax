@@ -11,6 +11,13 @@ from torch.utils.checkpoint import checkpoint
 
 from relax.utils.distributed_utils import distributed_masked_whiten
 from relax.utils.misc import load_function
+from relax.utils.opd.opd_utils import (
+    apply_opd_to_advantages,
+    compute_opd_topk_log_probs,
+    compute_policy_opd_loss,
+    resolve_opd_gather_topk_token_ids,
+    validate_opd_topk_gather,
+)
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -29,6 +36,7 @@ from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
     all_gather_with_cp,
+    get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
@@ -45,6 +53,8 @@ def get_responses(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -86,7 +96,7 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    cp_size = mpu.get_context_parallel_world_size()
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     end = 0
     seq_start = 0
     for i, (tokens, total_length, response_length) in enumerate(
@@ -136,7 +146,13 @@ def get_responses(
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length, qkv_format, max_seq_len, padded_total_length
+                total_length,
+                response_length,
+                qkv_format,
+                max_seq_len,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
             )
 
             logits_0, logits_1 = logits[end : end + chunk_size], logits[end + chunk_size : end + 2 * chunk_size]
@@ -271,9 +287,12 @@ def get_log_probs_and_entropy(
     with_entropy: bool = False,
     with_topk: bool = False,
     topk_k: int | None = None,
+    gather_topk_token_ids: list[torch.Tensor] | None = None,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
     lm_head_forward: Callable[..., tuple[torch.Tensor, torch.Tensor | None]] | None = None,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
@@ -295,6 +314,22 @@ def get_log_probs_and_entropy(
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
         with_entropy: If True, include "entropy" key in result.
+        with_topk: If True, include per-sample student-side top-K *indices*
+            (selected from current logits via ``torch.topk``) in result key
+            ``"topk_token_ids"``. Used for diagnostic / membership metrics.
+        topk_k: Override for the K used by ``with_topk``; defaults to
+            ``args.opd_log_prob_top_k``.
+        gather_topk_token_ids: Optional list of per-sample ``[R, K]`` long
+            tensors (already CP-sliced by ``post_process_rollout_data``).
+            When provided, compute student's *current-step* log-probabilities
+            at exactly these K token ids per position via
+            :func:`compute_log_probs_on_topk_token_ids` (vocab-parallel
+            gather + cross-rank logsumexp, differentiable). The returned dict
+            gains key ``"topk_log_probs"`` mapping to list of ``[R, K]``
+            tensors with gradient flowing back to the policy.
+            Used by the OPD-as-loss top-K path; the K ids come from the
+            student's rollout-time top-K stored in
+            ``batch["student_topk_token_ids"]``.
         non_loss_data: Unused; kept for API compatibility.
         lm_head_forward: If set, ``logits`` is actually hidden_states; we defer
             the lm_head into this loss path and chunk the matmul at
@@ -308,9 +343,13 @@ def get_log_probs_and_entropy(
         - empty tensor (placeholder for loss-compatible API)
         - Dict with key "log_probs" mapping to a list of `[R]` tensors per
         sample. If `with_entropy` is True, also includes "entropy" key with
-        a list of `[R]` tensors.
+        a list of `[R]` tensors. If `with_topk` is True, also includes
+        "topk_token_ids" key. If `gather_topk_token_ids` is provided, also
+        includes "topk_log_probs" key with list of `[R, K]` tensors.
     """
     assert non_loss_data
+
+    validate_opd_topk_gather(args, gather_topk_token_ids)
     if lm_head_forward is not None:
         assert not with_entropy and not with_topk, (
             "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
@@ -323,14 +362,19 @@ def get_log_probs_and_entropy(
     log_probs_list = []
     entropy_list = []
     topk_token_ids_list = []
-    for logits_chunk, tokens_chunk in get_responses(
-        logits,
-        args=args,
-        unconcat_tokens=unconcat_tokens,
-        total_lengths=total_lengths,
-        response_lengths=response_lengths,
-        max_seq_lens=max_seq_lens,
-        padded_total_lengths=padded_total_lengths,
+    topk_log_probs_list: list[torch.Tensor] = []
+    for sample_idx, (logits_chunk, tokens_chunk) in enumerate(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+            padded_total_lengths=padded_total_lengths,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
+        )
     ):
         if lm_head_forward is not None:
             # SFT chunked: logits_chunk is per-sample hidden_states [R, H].
@@ -373,6 +417,9 @@ def get_log_probs_and_entropy(
             k = min(max(int(resolved_topk_k), 1), int(logits_chunk.size(-1)))
             topk_token_ids_list.append(torch.topk(logits_chunk, k=k, dim=-1).indices)
 
+        if gather_topk_token_ids is not None:
+            topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, gather_topk_token_ids, sample_idx))
+
     res = {
         "log_probs": log_probs_list,
     }
@@ -380,6 +427,8 @@ def get_log_probs_and_entropy(
         res["entropy"] = entropy_list
     if with_topk:
         res["topk_token_ids"] = topk_token_ids_list
+    if gather_topk_token_ids is not None:
+        res["topk_log_probs"] = topk_log_probs_list
 
     # we need to turn the all gather kv into zigzag ring attn kv
     if args.allgather_cp:
@@ -459,47 +508,6 @@ def get_values(
         )
 
     return torch.empty((0,), device=logits.device), res
-
-
-def apply_opd_kl_to_advantages(
-    args: Namespace,
-    rollout_data: RolloutBatch,
-    advantages: list[torch.Tensor],
-    student_log_probs: list[torch.Tensor] | None,
-) -> None:
-    """Apply on-policy distillation KL penalty to advantages.
-
-    Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty
-    to advantages in-place. This is orthogonal to the base advantage estimator.
-
-    Args:
-        args: Configuration containing `use_opd` and `opd_kl_coef`.
-        rollout_data: Dict containing "teacher_log_probs".
-        advantages: List of advantage tensors to modify in-place.
-        student_log_probs: List of student log-probability tensors.
-
-    References:
-        https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py
-    """
-
-    if student_log_probs is None:
-        return
-
-    teacher_log_probs = rollout_data.get("teacher_log_probs")
-    if teacher_log_probs is None:
-        raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
-
-    device = student_log_probs[0].device
-    teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
-
-    reverse_kls = []
-    for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
-        reverse_kls.append(reverse_kl)
-
-    # Store reverse KL for logging
-    rollout_data["opd_reverse_kl"] = reverse_kls
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -612,17 +620,16 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
     if args.use_opd:
-        apply_opd_kl_to_advantages(
-            args=args,
-            rollout_data=rollout_data,
-            advantages=advantages,
-            student_log_probs=log_probs,
-        )
+        apply_opd_to_advantages(args, rollout_data, advantages)
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
-        cp_size = mpu.get_context_parallel_world_size()
+        # Under dynamic CP, rollout_data was merged back to full-length responses
+        # (dynamic_cp_merge_output), so advantages/masks are already full — use cp=1
+        # (no zig-zag chunking). The whitening stats are unchanged by the CP-group
+        # replication (uniform duplication doesn't move mean/std).
+        cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
         if cp_size == 1:
             all_masks = torch.cat(loss_masks)
         else:
@@ -796,8 +803,11 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        gather_topk_token_ids=resolve_opd_gather_topk_token_ids(args, batch),
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -819,14 +829,40 @@ def policy_loss_function(
             padded_iter = [None] * len(log_probs)
         else:
             padded_iter = padded_total_lengths
+        # OPSM supports CP: reconstruct each sample's full response from its CP-local
+        # zig-zag shards. Under dynamic CP, gather over this mb's dynamic CP sub-group
+        # (size/rank/group), not the static CP group. (GSPO does not support CP.)
+        dynamic_cp_size = batch.get("dynamic_cp_size", None)
+        dynamic_cp_rank = batch.get("dynamic_cp_rank", None)
+        dynamic_cp_group = (
+            mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+            if dynamic_cp_size is not None
+            else None
+        )
         full_log_probs = [
-            all_gather_with_cp(log_prob, total_length, response_length, padded_total_length)
+            all_gather_with_cp(
+                log_prob,
+                total_length,
+                response_length,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_group=dynamic_cp_group,
+            )
             for log_prob, total_length, response_length, padded_total_length in zip(
                 log_probs, total_lengths, response_lengths, padded_iter, strict=False
             )
         ]
         full_old_log_probs = [
-            all_gather_with_cp(old_log_prob, total_length, response_length, padded_total_length)
+            all_gather_with_cp(
+                old_log_prob,
+                total_length,
+                response_length,
+                padded_total_length,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_group=dynamic_cp_group,
+            )
             for old_log_prob, total_length, response_length, padded_total_length in zip(
                 old_log_probs, total_lengths, response_lengths, padded_iter, strict=False
             )
@@ -925,6 +961,8 @@ def policy_loss_function(
             args.qkv_format,
             max_seq_lens,
             padded_total_lengths,
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
@@ -966,7 +1004,16 @@ def policy_loss_function(
 
         loss = loss + args.kl_loss_coef * kl_loss
 
-    # make sure the gradient could backprop correctly.
+    opd_loss, opd_reported_loss = compute_policy_opd_loss(
+        args=args,
+        batch=batch,
+        log_probs=log_probs,
+        old_log_probs=old_log_probs,
+        log_probs_and_entropy=log_probs_and_entropy,
+    )
+    if opd_loss is not None:
+        loss = loss + opd_loss
+
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
@@ -993,6 +1040,8 @@ def policy_loss_function(
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
+    reported_loss.update(opd_reported_loss)
+
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
@@ -1004,11 +1053,6 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
-
-    # Add OPD metrics if available
-    if "opd_reverse_kl" in batch:
-        opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
-        reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
 
     return loss, reported_loss
 
@@ -1204,7 +1248,22 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    # CP-local token count (tokens whose loss this rank actually contributes).
+    # Summed across the CP group in finalize_model_grads / the metric all-reduce,
+    # it counts every token exactly once regardless of CP degree, so the per-token
+    # normalizer is correct even when CP differs across micro-batches (dynamic CP).
+    # Under static CP it equals the old full-sample count distributed across ranks,
+    # so the final loss/grad/metric are unchanged after all-reduce.
+    num_tokens = get_cp_local_num_tokens(
+        batch["total_lengths"],
+        batch["response_lengths"],
+        batch["loss_masks"],
+        args.qkv_format,
+        batch.get("max_seq_lens", None),
+        batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
@@ -1215,6 +1274,8 @@ def loss_function(
         args.qkv_format,
         batch.get("max_seq_lens", None),
         batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     match args.loss_type:
@@ -1254,7 +1315,10 @@ def loss_function(
     is_dummy = batch.get("__is_dummy__", False)
     explicit_loss_scale = batch.get("__loss_scale__", None)
 
-    # Here we need to divide by cp_size because to cancel the multiply in Megatron.
+    # Rescale the loss for Megatron's gradient accumulation. The non-per-token
+    # branch folds in the DP(+CP) world size (cancelled by DDP's 1/dp_cp grad
+    # scaling); the per-token branch does NO CP scaling (normalization is the
+    # all-reduced CP-local token count in finalize_model_grads).
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     if not args.calculate_per_token_loss:
         if is_dummy:
@@ -1273,8 +1337,12 @@ def loss_function(
     else:
         if is_dummy:
             loss = 0.0 * loss
-        else:
-            loss = loss * mpu.get_context_parallel_world_size()
+        # Non-dummy per-token path: do NOT scale by cp_size. `loss` is the
+        # CP-local token-sum; finalize_model_grads normalizes the summed gradient
+        # by the all-reduced CP-local `num_tokens`. A `* cp_size` here would weight
+        # each sample by its CP degree — wrong when CP differs across micro-batches
+        # (dynamic CP). Under static CP the removed factor exactly cancels the old
+        # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     log_values = torch.tensor(

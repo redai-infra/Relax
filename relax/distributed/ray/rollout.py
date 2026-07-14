@@ -474,6 +474,15 @@ class EngineGroup:
                 key: os.environ.get(key, default_val)
                 for key, default_val in {
                     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                    # OPD per-position token_ids logprob patch: default off, enabled
+                    # via env (affects the student engine too, like the teacher).
+                    "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
+                    # OPD pre-expanded multimodal patch: passed through to the
+                    # student engine too, because advantage mode sends
+                    # opd_preexpanded_raw requests to the student (student-at-
+                    # teacher-topk prefill).  The patch makes the student SGLang
+                    # skip retokenize/detokenize for expanded input_ids + image_data.
+                    "RELAX_OPD_PREEXPANDED_PATCH": "0",
                     # The TP memory-imbalance check is overly conservative under
                     # colocate (the actor occupies GPUs at engine init and is
                     # offloaded before rollout), so disable it. Recent SGLang reads
@@ -3651,9 +3660,47 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     process.start()
     time.sleep(3)
     assert process.is_alive()
+    _LAUNCHED_ROUTER_PROCESSES.append(process)
     logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
 
     return router_ip, router_port
+
+
+# Router processes launched via `_start_router`. Retained so
+# `Controller._global_restart` can terminate them before re-initializing —
+# otherwise the daemon router survives with stale pre-restart engine URLs and
+# spams "Connection refused" health-check WARNs against dead ports forever.
+_LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
+
+
+def stop_launched_routers() -> int:
+    """Terminate every router process launched in this Controller lifetime.
+
+    Returns the number of processes that were alive and successfully killed —
+    callers use this to decide whether to reset cached router endpoint state.
+    """
+    global _LAUNCHED_ROUTER_PROCESSES
+    killed = 0
+    survivors: list[multiprocessing.Process] = []
+    for proc in _LAUNCHED_ROUTER_PROCESSES:
+        try:
+            if not proc.is_alive():
+                continue
+            logger.info(f"Terminating router process pid={proc.pid}")
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
+            if proc.is_alive():
+                logger.warning(f"Router pid={proc.pid} still alive after kill; leaking")
+                survivors.append(proc)
+            else:
+                killed += 1
+        except Exception as e:
+            logger.warning(f"Failed to terminate router pid={getattr(proc, 'pid', None)}: {e}")
+    _LAUNCHED_ROUTER_PROCESSES = survivors
+    return killed
 
 
 def _wait_engine_init_with_progress(

@@ -44,6 +44,8 @@ class Dataset(BaseDataset):
         use_audio_in_video=False,
         multimodal_config=None,
         custom_prompt_func=None,
+        teacher_prompt_key=None,
+        teacher_multimodal_keys=None,
     ):
         # Initialize base class
         super().__init__(
@@ -62,6 +64,8 @@ class Dataset(BaseDataset):
             use_audio_in_video=use_audio_in_video,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
+            teacher_prompt_key=teacher_prompt_key,
+            teacher_multimodal_keys=teacher_multimodal_keys,
         )
 
         # Load all samples into memory
