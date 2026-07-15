@@ -184,19 +184,27 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     ):
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)
-        if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
-            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
-        else:
-            # when samples count are not equal in each group
-            rewards = rewards.view(-1, rewards.shape[-1])
-        mean = rewards.mean(dim=-1, keepdim=True)
-        rewards = rewards - mean
+        positions_by_group: dict[int, list[int]] = {}
+        for position, sample in enumerate(samples):
+            if sample.group_index is None:
+                raise ValueError("Sample.group_index is required for group reward normalization.")
+            if sample.group_index not in positions_by_group:
+                positions_by_group[sample.group_index] = []
+            positions_by_group[sample.group_index].append(position)
 
-        if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
-            std = rewards.std(dim=-1, keepdim=True)
-            rewards = rewards / (std + 1e-6)
+        normalized_rewards = torch.empty_like(rewards)
+        for group_index, positions in positions_by_group.items():
+            if len(positions) != args.n_samples_per_prompt:
+                raise ValueError(
+                    f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
+                )
+            group_rewards = rewards[positions]
+            group_rewards = group_rewards - group_rewards.mean()
+            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
+                group_rewards = group_rewards / (group_rewards.std() + 1e-6)
+            normalized_rewards[positions] = group_rewards
 
-        return raw_rewards, rewards.flatten().tolist()
+        return raw_rewards, normalized_rewards.tolist()
 
     return raw_rewards, raw_rewards
 
@@ -417,8 +425,22 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     data = [Sample.from_dict(sample) for sample in data]
     if (ratio := args.load_debug_rollout_data_subsample) is not None:
         original_num_rows = len(data)
-        rough_subsample_num_rows = int(original_num_rows * ratio)
-        data = data[: rough_subsample_num_rows // 2] + data[-rough_subsample_num_rows // 2 :]
+        if (
+            args.custom_reward_post_process_path is None
+            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+            and args.rewards_normalization
+        ):
+            group_ids = list(dict.fromkeys(sample.group_index for sample in data))
+            if None in group_ids:
+                raise ValueError("Sample.group_index is required for group-aware debug subsampling.")
+            subsample_group_count = min(max(int(len(group_ids) * ratio), 1), len(group_ids))
+            front_group_count = subsample_group_count // 2
+            selected_group_ids = set(group_ids[:front_group_count])
+            selected_group_ids.update(group_ids[-(subsample_group_count - front_group_count) :])
+            data = [sample for sample in data if sample.group_index in selected_group_ids]
+        else:
+            rough_subsample_num_rows = int(original_num_rows * ratio)
+            data = data[: rough_subsample_num_rows // 2] + data[-rough_subsample_num_rows // 2 :]
         logger.info(
             f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
         )
