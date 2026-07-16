@@ -22,7 +22,9 @@ class OpsdWorker:
     def from_args(cls, args) -> "OpsdWorker":
         teacher_prompt_key = getattr(args, "opd_teacher_prompt_key", None)
         teacher_image_key = getattr(args, "opd_teacher_image_key", None)
-        return cls(is_opsd=teacher_prompt_key is not None or teacher_image_key is not None)
+        multimodal_keys = getattr(args, "multimodal_keys", None) or {}
+        uses_student_images = "image" in multimodal_keys
+        return cls(is_opsd=teacher_prompt_key is not None or teacher_image_key is not None or uses_student_images)
 
     async def build_teacher_inputs(self, args, sample: "Sample") -> None:
         """Pre-expand teacher inputs on the client (rollout) side.
@@ -52,6 +54,8 @@ class OpsdWorker:
             # logprob requests use the pre-expanded path and logprob_start_len
             # stays aligned with SGLang.
             if sample.tokens and int(sample.response_length or 0) > 0:
+                sample.teacher_tokens = list(sample.tokens)
+                sample.teacher_prompt_length = len(sample.tokens) - int(sample.response_length)
                 student_mm_train_inputs = getattr(sample, "multimodal_train_inputs", None)
                 student_grid_thw = (student_mm_train_inputs or {}).get("image_grid_thw")
                 student_mm_in = sample.multimodal_inputs or {}
