@@ -1,5 +1,5 @@
 ray[serve]
-fastapi
+fastapi==0.139.1
 uvicorn
 apprise
 clearml==2.1.3
