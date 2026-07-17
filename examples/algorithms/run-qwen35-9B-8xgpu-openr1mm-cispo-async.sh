@@ -9,7 +9,7 @@
 # run-qwen35-9B-8xgpu-openr1mm-async.sh. Only the advantage estimator differs.
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh [async|sync]
+#   bash examples/algorithms/run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh [async|sync]
 
 set -ex
 set -o pipefail
@@ -22,7 +22,7 @@ echo "当前时间: $now"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+    source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 # source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
@@ -93,9 +93,9 @@ PERF_ARGS=(
 )
 
 CISPO_ARGS=(
-   --use-kl-loss
+   # --use-kl-loss
    --advantage-estimator cispo
-   --kl-loss-coef 0.001
+   --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
    --entropy-coef 0.00
