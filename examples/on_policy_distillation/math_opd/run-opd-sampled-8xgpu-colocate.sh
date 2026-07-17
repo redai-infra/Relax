@@ -106,6 +106,8 @@ OPD_ARGS=(
 
    --opd-teacher-timeout-s ${OPD_TEACHER_TIMEOUT_S:-6000}
    --use-rollout-logprobs
+   
+   --opd-disable-rl-reward
 )
 
 GRPO_ARGS=(
