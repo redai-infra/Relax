@@ -24,10 +24,10 @@
 git clone https://github.com/redai-infra/Relax.git
 
 # 拉取 Docker 镜像
-docker pull relaxrl/relax:latest
+docker pull ghcr.io/redai-infra/relaxrl:latest
 
 # 运行容器，将本地代码仓库挂载到容器内的 /root/Relax
-docker run -it --gpus all -v $(pwd)/Relax:/root/Relax relaxrl/relax:latest /bin/bash
+docker run -it --gpus all -v $(pwd)/Relax:/root/Relax ghcr.io/redai-infra/relaxrl:latest /bin/bash
 ```
 
 或者基于 Dockerfile 构建镜像：

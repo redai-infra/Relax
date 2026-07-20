@@ -24,10 +24,10 @@ Run the following commands to clone the repository, pull the latest image, and s
 git clone https://github.com/redai-infra/Relax.git
 
 # Pull the Docker image
-docker pull relaxrl/relax:latest
+docker pull ghcr.io/redai-infra/relaxrl:latest
 
 # Run the container, mounting the local repository to /root/Relax inside the container
-docker run -it --gpus all -v $(pwd)/Relax:/root/Relax relaxrl/relax:latest /bin/bash
+docker run -it --gpus all -v $(pwd)/Relax:/root/Relax ghcr.io/redai-infra/relaxrl:latest /bin/bash
 ```
 
 Alternatively, build the image from the Dockerfile:

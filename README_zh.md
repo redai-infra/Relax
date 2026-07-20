@@ -128,12 +128,12 @@ ______________________________________________________________________
 
 ```bash
 # 拉取官方镜像
-docker pull relaxrl/relax:latest
+docker pull ghcr.io/redai-infra/relaxrl:latest
 
 # 启动容器，挂载 GPU、共享内存与工作目录
 docker run -it --gpus all --ipc=host --network=host \
   -v /path/to/your/workspace:/root \
-  relaxrl/relax:latest bash
+  ghcr.io/redai-infra/relaxrl:latest bash
 
 # 容器内克隆仓库并安装
 git clone https://github.com/redai-infra/Relax.git /root/Relax

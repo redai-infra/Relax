@@ -128,12 +128,12 @@ The recommended way to run Relax is via the official Docker image, which ships w
 
 ```bash
 # Pull the official image
-docker pull relaxrl/relax:latest
+docker pull ghcr.io/redai-infra/relaxrl:latest
 
 # Launch a container with GPUs, shared memory, and your workspace mounted
 docker run -it --gpus all --ipc=host --network=host \
   -v /path/to/your/workspace:/root \
-  relaxrl/relax:latest bash
+  ghcr.io/redai-infra/relaxrl:latest bash
 
 # Inside the container
 git clone https://github.com/redai-infra/Relax.git /root/Relax
