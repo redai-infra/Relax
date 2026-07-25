@@ -7,6 +7,11 @@ import pytest
 from relax.engine.rollout.request_permit import RequestPermitPool
 
 
+async def _acquire_once(permits: RequestPermitPool) -> None:
+    async with permits.acquire():
+        pass
+
+
 @pytest.mark.asyncio
 async def test_request_permit_enforces_concurrency_limit():
     permits = RequestPermitPool(2)
@@ -43,9 +48,7 @@ async def test_request_permit_releases_after_failure(failure):
     with pytest.raises(type(failure)):
         await fail()
 
-    async with asyncio.timeout(1):
-        async with permits.acquire():
-            pass
+    await asyncio.wait_for(_acquire_once(permits), timeout=1)
 
 
 @pytest.mark.asyncio
@@ -73,9 +76,7 @@ async def test_request_permit_cancellation_while_waiting_does_not_consume_permit
 
     release_holder.set()
     await holder
-    async with asyncio.timeout(1):
-        async with permits.acquire():
-            pass
+    await asyncio.wait_for(_acquire_once(permits), timeout=1)
 
 
 @pytest.mark.asyncio
