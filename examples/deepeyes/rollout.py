@@ -236,6 +236,11 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     return response_text, new_tokens, new_log_probs, finish_type, meta_info
 
 
+async def _run_inference_step_with_permit(state, *args, **kwargs):
+    async with state.request_permits.acquire():
+        return await _run_inference_step(*args, **kwargs)
+
+
 async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
     result = env.step(response_text)
     # 兼容 async env.step（如 VideoSearchEnv）：若返回 coroutine 则 await
@@ -475,8 +480,14 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 new_response_log_probs,
                 finish_type,
                 meta_info,
-            ) = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
+            ) = await _run_inference_step_with_permit(
+                state,
+                url,
+                sample.tokens,
+                cur_sampling_params,
+                current_image_data,
+                state.tokenizer,
+                args=args,
             )
             inference_end_ts = time.time()
             trace_recorder.record_inference_output(
