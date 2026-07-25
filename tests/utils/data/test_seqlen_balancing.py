@@ -79,14 +79,14 @@ def test_single_partition_returns_all_indices():
 
 def test_raises_when_items_fewer_than_partitions():
     """Illegal input: len(seqlen_list) < k_partitions raises AssertionError."""
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="number of items"):
         get_seqlen_balanced_partitions([1, 2], k_partitions=3, equal_size=False)
 
 
 def test_raises_when_equal_size_length_not_divisible():
     """Illegal input: equal_size=True with len not divisible by k raises
     AssertionError."""
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match=r"5 % 2 != 0"):
         get_seqlen_balanced_partitions([1, 2, 3, 4, 5], k_partitions=2, equal_size=True)
 
 
@@ -98,6 +98,7 @@ def test_get_reverse_idx_is_inverse_permutation():
     assert reverse_idx_map == [1, 3, 0, 2], "inverse of [2,0,3,1] must be [1,3,0,2]"
     for i, idx in enumerate(idx_map):
         assert reverse_idx_map[idx] == i, "reverse_idx_map[idx_map[i]] must equal i"
+    assert idx_map == [2, 0, 3, 1], "get_reverse_idx must not mutate its input"
 
 
 def test_get_reverse_idx_round_trip_restores_identity():
