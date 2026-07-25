@@ -6,7 +6,7 @@ import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from time import monotonic
 from typing import Any
 
@@ -103,7 +103,7 @@ class GenerateState(metaclass=SingletonMeta):
 
         self.reset()
 
-    def request_permit(self):
+    def request_permit(self) -> AbstractAsyncContextManager[None]:
         """Return an async context manager for one model request."""
         return self.request_permits.acquire()
 
