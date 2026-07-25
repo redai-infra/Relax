@@ -151,7 +151,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        async with state.request_permit():
+            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
@@ -165,7 +166,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
+
+generate.manages_inference_permit = True
 ```
+
+`request_permit()` limits only the model request inside its context. It releases the slot on success, exception, or cancellation, and checks the rollout abort state after acquiring the slot so a queued request does not start after an abort. Keep environment calls, tool execution, and observation processing outside this context.
+
+The `manages_inference_permit = True` attribute is an explicit capability declaration: every model request made by that custom function must use `request_permit()`. Custom generate functions without the attribute keep the legacy behavior, where Relax holds one permit for the complete function call. This preserves existing functions that have not adopted the request-level API. Request-level scheduling does not limit the number of active environment or tool sessions; add separate limits in the custom environment when those resources need them.
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
 

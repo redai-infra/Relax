@@ -5,8 +5,9 @@ import copy
 import inspect
 import uuid
 from argparse import Namespace
-from collections.abc import Callable
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from time import monotonic
 from typing import Any
 
@@ -48,6 +49,13 @@ from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_b
 __all__ = ["generate_rollout"]
 
 logger = get_logger(__name__)
+
+
+class _RequestAborted(Exception):
+    pass
+
+
+_LEGACY_CUSTOM_GENERATE_ACTIVE: ContextVar[bool] = ContextVar("legacy_custom_generate_active", default=False)
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -113,6 +121,18 @@ class GenerateState(metaclass=SingletonMeta):
         finally:
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
+
+    @asynccontextmanager
+    async def request_permit(self) -> AsyncIterator[None]:
+        if _LEGACY_CUSTOM_GENERATE_ACTIVE.get():
+            raise RuntimeError(
+                "Custom generate functions using request_permit() must set manages_inference_permit = True"
+            )
+
+        async with self.semaphore:
+            if self.aborted:
+                raise _RequestAborted
+            yield
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -333,9 +353,10 @@ async def generate(
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
-    _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
-    _t_generate = monotonic() - _t_generate_start
+    async with state.request_permit():
+        _t_generate_start = monotonic()
+        output = await post(url, payload, headers=headers)
+        _t_generate = monotonic() - _t_generate_start
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -453,18 +474,13 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
 
+    async def _dispatch_generate() -> None:
+        nonlocal sample
         with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
-
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
+            if custom_generate_func is not None:
                 # if signature has evaluation, pass evaluation
                 if "evaluation" in inspect.signature(custom_generate_func).parameters:
                     sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
@@ -472,6 +488,29 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+
+    manages_inference_permit = (
+        custom_generate_func is not None and getattr(custom_generate_func, "manages_inference_permit", False) is True
+    )
+    try:
+        if custom_generate_func is not None and not manages_inference_permit:
+            async with state.semaphore:
+                if state.aborted:
+                    sample.status = Sample.Status.ABORTED
+                    return sample
+                token = _LEGACY_CUSTOM_GENERATE_ACTIVE.set(True)
+                try:
+                    await _dispatch_generate()
+                finally:
+                    _LEGACY_CUSTOM_GENERATE_ACTIVE.reset(token)
+        else:
+            if state.aborted:
+                sample.status = Sample.Status.ABORTED
+                return sample
+            await _dispatch_generate()
+    except _RequestAborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:

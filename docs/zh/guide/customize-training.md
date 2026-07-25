@@ -150,7 +150,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        async with state.request_permit():
+            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
@@ -164,7 +165,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
+
+generate.manages_inference_permit = True
 ```
+
+`request_permit()` 只限制 context 内的模型请求。它会在成功、异常或取消时释放 slot，并在取得 slot 后检查 rollout abort 状态，避免排队中的请求在 abort 后启动。环境调用、工具执行和 observation 处理必须放在该 context 外。
+
+`manages_inference_permit = True` 是显式能力声明：该自定义函数发出的每一个模型请求都必须使用 `request_permit()`。未声明该属性的自定义 generate 函数保持 legacy 行为，由 Relax 在整个函数调用期间持有一个 permit，从而兼容尚未接入请求级 API 的已有函数。请求级调度不限制同时活跃的环境或工具 session 数；如这些资源也需要限流，应由自定义环境单独配置。
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
 
