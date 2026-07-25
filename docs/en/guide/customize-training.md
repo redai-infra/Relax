@@ -116,13 +116,35 @@ python scripts/tools/process_avqa.py \
 
 ## Custom Reward Methods
 
-You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
+Define a reward function in your own `.py` file and wire it with `--custom-rm-path`. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
+
+Supported signatures:
+
+```python
+# Sync: runs in an isolated Ray RewardWorker process (does not block the rollout event loop)
+def reward_func(args, sample: Sample, **kwargs) -> float | dict: ...
+
+# Async: awaited directly on the Driver event loop (good for HTTP / I/O)
+async def async_reward_func(args, sample: Sample, **kwargs) -> float | dict: ...
+
+# Group: receives list[Sample] and returns a same-length list (legacy batched_async_rm / --group-rm)
+def group_reward_func(args, samples: list[Sample], **kwargs) -> list[float | dict]: ...
+```
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # Custom reward_func may return a dict; if so, specify which key corresponds to the actual reward score
 --reward-key score
+# Concurrency: logical cap and sync worker count
+--reward-max-concurrency 64
+--reward-num-workers 16
 ```
+
+Notes:
+
+- Only `async def` callables recognized by `inspect.iscoroutinefunction` take the async path; a sync function that returns an awaitable raises an error.
+- Sync custom rewards see only a whitelist view of args (e.g. `custom_rm_path` / `rm_type` / `reward_key`) plus explicit `custom_options`; do not rely on full training `Namespace` objects such as models or tokenizers.
+- Use `functools.wraps` on decorators so async detection keeps working.
 
 ## Custom Generate Function
 

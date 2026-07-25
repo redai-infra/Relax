@@ -31,26 +31,19 @@ def _effective_reward_concurrency(args, *, explicit_limit: int | None = None) ->
 
 
 async def _async_rm(args, sample):
-    custom_rm_path = args.custom_rm_path
-    if custom_rm_path:
-        from relax.utils.utils import load_function
+    from relax.engine.rewards import async_rm, get_reward_executor
 
-        rm_function = load_function(custom_rm_path)
-        return await rm_function(args, sample)
-    from relax.engine.rewards import async_rm
-
+    if args.custom_rm_path:
+        # RewardDomain already owns the concurrency semaphore; do not acquire again.
+        return await get_reward_executor(args).dispatch_custom_sample(args, sample)
     return await async_rm(args, sample)
 
 
 async def _batched_async_rm(args, samples):
-    custom_rm_path = args.custom_rm_path
-    if custom_rm_path:
-        from relax.utils.utils import load_function
+    from relax.engine.rewards import batched_async_rm, get_reward_executor
 
-        rm_function = load_function(custom_rm_path)
-        return await rm_function(args, samples)
-    from relax.engine.rewards import batched_async_rm
-
+    if args.custom_rm_path:
+        return await get_reward_executor(args).dispatch_custom_group(args, samples)
     return await batched_async_rm(args, samples)
 
 

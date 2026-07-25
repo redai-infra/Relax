@@ -48,7 +48,7 @@ from relax.utils.metrics.metric_utils import (
 from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
-from relax.utils.reload_utils import ReloadableMixin
+from relax.utils.reload_utils import ReloadableMixin, ReloadGenerationRegistry
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -794,6 +794,7 @@ class RolloutManager(ReloadableMixin):
         self.pg = pg
         self.args = args
         self._dynamic_global_batch_size = None
+        self._reload_generations = ReloadGenerationRegistry()
 
         init_tracking(args, primary=False)
 
@@ -875,6 +876,11 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+        # Bind custom_rm reload generation provider after init, before serving requests.
+        from relax.engine.rewards import get_reward_executor
+
+        get_reward_executor(self.args).bind_generation_provider(self._reload_generations.current)
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is

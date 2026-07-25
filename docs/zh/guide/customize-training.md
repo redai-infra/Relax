@@ -115,13 +115,35 @@ python scripts/tools/process_avqa.py \
 
 ## 自定义 Reward 方法
 
-您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
+您可以在自己的 `.py` 文件内定义 reward 函数，然后通过 `--custom-rm-path` 接入。具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
+
+支持的签名：
+
+```python
+# 同步：在独立 Ray RewardWorker 进程中执行，不阻塞 Rollout event loop
+def reward_func(args, sample: Sample, **kwargs) -> float | dict: ...
+
+# 异步：在 Driver event loop 中直接 await（适合 HTTP / I/O）
+async def async_reward_func(args, sample: Sample, **kwargs) -> float | dict: ...
+
+# Group：一次接收 list[Sample]，返回等长 list（legacy batched_async_rm / --group-rm）
+def group_reward_func(args, samples: list[Sample], **kwargs) -> list[float | dict]: ...
+```
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # 自定义 reward_func 允许返回 dict，但若如此您需要明确哪个 key 对应于实际的 reward 得分
 --reward-key score
+# 并发：逻辑上限与 sync Worker 数量
+--reward-max-concurrency 64
+--reward-num-workers 16
 ```
+
+说明：
+
+- 仅 `async def`（可被 `inspect.iscoroutinefunction` 识别）走异步路径；同步函数即使返回 awaitable 也会报错。
+- Sync custom 在 Worker 中只能看到白名单字段（如 `custom_rm_path` / `rm_type` / `reward_key` 等）以及调用方显式传入的 `custom_options`；不要依赖完整训练 `Namespace` 中的模型、Tokenizer 等对象。
+- 装饰器请使用 `functools.wraps`，否则可能无法正确识别 async。
 
 ## 自定义 Generate 函数
 
