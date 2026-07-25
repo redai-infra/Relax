@@ -31,6 +31,8 @@ def _effective_reward_concurrency(args, *, explicit_limit: int | None = None) ->
 
 
 async def _async_rm(args, sample):
+    # Use the shared reward executor so custom reward isolation and concurrency
+    # are identical between regular rollout and agentic rollout.
     from relax.engine.rewards import async_rm
 
     return await async_rm(args, sample)

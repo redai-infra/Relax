@@ -127,6 +127,8 @@ class RewardWorker:
 
     def compute_custom(self, custom_rm_path: str, args, sample: Sample, kwargs: dict | None = None):
         rm_function = self._load_custom_rm_function(custom_rm_path)
+        # Worker actors only execute synchronous custom rewards; async rewards
+        # must stay on the rollout event loop where they can be awaited safely.
         if inspect.iscoroutinefunction(rm_function):
             raise TypeError(f"Custom reward {custom_rm_path!r} is async and cannot run in RewardWorker.")
 
@@ -145,6 +147,8 @@ class RewardWorker:
 
     def compute_custom_batch(self, custom_rm_path: str, args, samples: list[Sample], kwargs: dict | None = None):
         rm_function = self._load_custom_rm_function(custom_rm_path)
+        # Keep group reward semantics intact by passing the whole sample group
+        # to a synchronous custom scorer inside one worker process.
         if inspect.iscoroutinefunction(rm_function):
             raise TypeError(f"Custom reward {custom_rm_path!r} is async and cannot run in RewardWorker.")
 
@@ -223,6 +227,8 @@ class RewardExecutor:
         return rm_function
 
     def _clear_custom_rm_cache(self, custom_rm_path: str | None = None):
+        # Explicit hot reload refreshes sys.modules in the rollout process; drop
+        # cached function objects here and in already-created worker actors.
         if custom_rm_path is None:
             self._custom_rm_functions.clear()
         else:
@@ -315,6 +321,8 @@ class RewardExecutor:
     async def _execute_custom(self, args, sample: Sample, kwargs: dict):
         custom_rm_path = args.custom_rm_path
         rm_function = self._load_custom_rm_function(custom_rm_path)
+        # Classify before calling the function. Calling first and checking the
+        # return value would already block the event loop for sync scorers.
         if inspect.iscoroutinefunction(rm_function):
             try:
                 return await rm_function(args, sample, **kwargs)
@@ -405,6 +413,8 @@ async def batched_async_rm(
 ) -> list[int | float]:
     if not samples:
         return []
+    # group_rm custom rewards are documented as whole-group scorers, so keep
+    # their batch input shape and offload sync implementations as one worker job.
     if args.custom_rm_path is not None and not kwargs.get("ignore_custom", False) and getattr(args, "group_rm", False):
         max_concurrency = getattr(args, "reward_max_concurrency", 64)
         num_workers = getattr(args, "reward_num_workers", 16)

@@ -387,6 +387,8 @@ class ReloadableMixin:
             try:
                 from relax.engine.rewards import RewardExecutor
 
+                # custom_rm is cached by RewardExecutor and RewardWorker; clear
+                # both layers so explicit reload takes effect on the next call.
                 RewardExecutor.clear_custom_rm_cache(module_path)
             except Exception as exc:
                 logger.warning("Failed to clear custom reward cache after reload: %s", exc)
