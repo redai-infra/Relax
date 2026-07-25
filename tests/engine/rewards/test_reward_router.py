@@ -85,6 +85,16 @@ def test_custom_priority_can_put_global_route_before_label_matcher():
     assert route.reason is None
 
 
+def test_missing_metadata_and_label_use_later_global_route_by_default():
+    registry = _registry(("global_reward", RewardSpec("sync", _handler)))
+
+    route = resolve_reward_route({}, "unsupported", "global_reward", registry)
+
+    assert route.reward_type == "global_reward"
+    assert route.source == "global"
+    assert route.reason is None
+
+
 def test_unknown_metadata_uses_label_before_global_by_default():
     registry = _registry(
         ("global_reward", RewardSpec("sync", _handler)),
@@ -187,6 +197,28 @@ def test_registry_rejects_duplicate_names():
             ("duplicate", RewardSpec("sync", _handler)),
             ("duplicate", RewardSpec("async", _handler)),
         )
+
+
+@pytest.mark.asyncio
+async def test_single_registry_entry_routes_and_executes_without_router_branch():
+    calls = []
+
+    async def score_registered_reward(args, sample):
+        calls.append((args, sample))
+        return 0.75
+
+    registry = _registry(
+        ("registered_reward", RewardSpec("async", score_registered_reward, lambda label, metadata: label == "R"))
+    )
+    executor = RewardExecutor(max_concurrency=1, num_workers=1)
+    args = SimpleNamespace(custom_rm_path=None, rm_type=None, reward_key=None)
+    sample = Sample(response="response", label="R", metadata={})
+
+    with patch("relax.engine.rewards.REWARD_REGISTRY", registry):
+        reward = await executor.execute(args, sample)
+
+    assert reward == 0.75
+    assert calls == [(args, sample)]
 
 
 def test_route_priority_requires_each_stage_exactly_once():
