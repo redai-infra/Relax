@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import re
 from collections import Counter
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -63,29 +62,6 @@ class RewardRoutePreflightReport:
             "unresolved_indices": list(self.unresolved_indices),
             "conflict_indices": list(self.conflict_indices),
         }
-
-
-_MULTIPLE_CHOICE_LABEL = re.compile(r"\s*<answer>\s*[A-Za-z]\s*</answer>\s*", re.DOTALL)
-_MATH_LABEL = re.compile(
-    r"""
-    \s*(?:
-        [-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+))?
-        | \\frac\s*\{\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s*\}\s*\{\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s*\}
-        | \\boxed\s*\{\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+))?\s*\}
-    )\s*
-    """,
-    re.VERBOSE,
-)
-
-
-def match_multiple_choice_label(label: object, metadata: dict) -> bool:
-    del metadata
-    return isinstance(label, str) and _MULTIPLE_CHOICE_LABEL.fullmatch(label) is not None
-
-
-def match_math_label(label: object, metadata: dict) -> bool:
-    del metadata
-    return isinstance(label, str) and _MATH_LABEL.fullmatch(label) is not None
 
 
 def build_reward_registry(entries: Iterable[tuple[str, RewardSpec]]) -> Mapping[str, RewardSpec]:

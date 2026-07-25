@@ -2,6 +2,7 @@
 
 import asyncio
 import random
+import re
 
 import aiohttp
 import ray
@@ -21,8 +22,6 @@ from .openr1mm import get_openr1mm_rule_based_reward
 from .reward_router import (
     RewardSpec,
     build_reward_registry,
-    match_math_label,
-    match_multiple_choice_label,
     normalize_reward_route_config,
     resolve_reward_route,
 )
@@ -304,14 +303,37 @@ async def _run_dummy(args, sample):
     return await _dummy_reward(args)
 
 
+_MULTIPLE_CHOICE_LABEL = re.compile(r"\s*<answer>\s*[A-Za-z]\s*</answer>\s*", re.DOTALL)
+_MATH_LABEL = re.compile(
+    r"""
+    \s*(?:
+        [-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+))?
+        | \\frac\s*\{\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s*\}\s*\{\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s*\}
+        | \\boxed\s*\{\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+))?\s*\}
+    )\s*
+    """,
+    re.VERBOSE,
+)
+
+
+def _match_multiple_choice_label(label: object, metadata: dict) -> bool:
+    del metadata
+    return isinstance(label, str) and _MULTIPLE_CHOICE_LABEL.fullmatch(label) is not None
+
+
+def _match_math_label(label: object, metadata: dict) -> bool:
+    del metadata
+    return isinstance(label, str) and _MATH_LABEL.fullmatch(label) is not None
+
+
 REWARD_REGISTRY = build_reward_registry(
     (
         ("deepscaler", RewardSpec("sync", _score_deepscaler)),
         ("geo3k", RewardSpec("sync", _score_geo3k)),
         ("openr1mm", RewardSpec("sync", _score_openr1mm)),
-        ("multiple_choice", RewardSpec("sync", _score_multiple_choice, match_multiple_choice_label)),
+        ("multiple_choice", RewardSpec("sync", _score_multiple_choice, _match_multiple_choice_label)),
         ("dapo", RewardSpec("sync", _score_dapo)),
-        ("math", RewardSpec("sync", _score_math, match_math_label)),
+        ("math", RewardSpec("sync", _score_math, _match_math_label)),
         ("mopd", RewardSpec("sync", _score_mopd)),
         ("f1", RewardSpec("sync", _score_f1)),
         ("gpqa", RewardSpec("sync", _score_gpqa)),

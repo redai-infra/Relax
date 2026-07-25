@@ -9,7 +9,6 @@ from relax.engine.rewards import REWARD_REGISTRY, RewardExecutor, _zero_reward
 from relax.engine.rewards.reward_router import (
     RewardSpec,
     build_reward_registry,
-    match_math_label,
     normalize_reward_route_config,
     normalize_reward_route_priority,
     preflight_reward_routes,
@@ -128,7 +127,7 @@ def test_unknown_metadata_uses_global_fallback_when_configured_before_label():
 
 
 def test_unknown_metadata_without_fallback_returns_unresolved_route():
-    registry = _registry(("math", RewardSpec("sync", _handler, match_math_label)))
+    registry = _registry(("math", RewardSpec("sync", _handler, lambda label, metadata: label == "42")))
 
     route = resolve_reward_route({"rm_type": "unknown"}, "unsupported", None, registry)
 
