@@ -78,6 +78,7 @@ def _make_args(**overrides) -> SimpleNamespace:
     """Create a mock args namespace that mimics the training args structure."""
     defaults = {
         "rm_type": "openr1mm",
+        "rm_type_fallback": "zero",
         "custom_rm_path": None,
         "reward_max_concurrency": 64,
         "reward_num_workers": 4,
@@ -310,11 +311,67 @@ class TestRewardExecutorSingleSample:
         assert result == 1.0
 
     @pytest.mark.asyncio
-    async def test_execute_unknown_rm_type_raises(self):
+    async def test_execute_unknown_rm_type_returns_zero_and_warns(self, caplog):
         args = _make_args(rm_type="totally_unknown_type")
         sample = _make_sample(response="foo", label="bar")
-        with pytest.raises(NotImplementedError, match="totally_unknown_type"):
+        with caplog.at_level("WARNING"):
+            result = await async_rm(args, sample)
+
+        assert result == 0.0
+        assert "unknown_cli_type" in caplog.text
+        assert "totally_unknown_type" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_execute_missing_rm_type_returns_reward_key_zero(self, caplog):
+        args = _make_args(rm_type=None, reward_key="score")
+        sample = _make_sample(response="foo", label="not typed")
+        with caplog.at_level("WARNING"):
+            result = await async_rm(args, sample)
+
+        assert result == {"score": 0.0}
+        assert "missing_reward_type" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_execute_error_fallback_raises(self):
+        args = _make_args(rm_type="totally_unknown_type", rm_type_fallback="error")
+        sample = _make_sample(response="foo", label="bar")
+        with pytest.raises(ValueError, match="unknown_cli_type"):
             await async_rm(args, sample)
+
+    @pytest.mark.asyncio
+    async def test_execute_registered_reward_fallback(self, caplog):
+        args = _make_args(rm_type="totally_unknown_type", rm_type_fallback="openr1mm")
+        sample = _make_sample(response="\\boxed{42}", label="42")
+        with caplog.at_level("WARNING"):
+            result = await async_rm(args, sample)
+
+        assert result == 1.0
+        assert "fallback:cli" in caplog.text
+        assert "selected_type='openr1mm'" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_execute_async_dummy_without_sync_workers(self):
+        args = _make_args(rm_type="dummy")
+        sample = _make_sample(response="ignored", label="ignored")
+
+        result = await async_rm(args, sample)
+
+        assert result == 0.0
+        assert RewardExecutor._instance is not None
+        assert RewardExecutor._instance._workers == []
+
+    @pytest.mark.asyncio
+    async def test_execute_repeated_route_failure_warns_once(self, caplog):
+        args = _make_args(rm_type="totally_unknown_type")
+        samples = [
+            _make_sample(response="foo", label="bar"),
+            _make_sample(response="baz", label="qux"),
+        ]
+        with caplog.at_level("WARNING"):
+            results = await batched_async_rm(args, samples)
+
+        assert results == [0.0, 0.0]
+        assert caplog.text.count("Reward routing fallback") == 1
 
 
 @requires_full_pipeline
@@ -353,6 +410,38 @@ class TestBatchedAsyncRM:
         args = _make_args()
         rewards = await batched_async_rm(args, [])
         assert rewards == []
+
+    @pytest.mark.asyncio
+    async def test_batch_routes_math_and_multiple_choice_per_sample(self):
+        args = _make_args(rm_type=None)
+        samples = [
+            _make_sample(
+                response="The final answer is \\boxed{9}",
+                label="9",
+                metadata={"rm_type": "math"},
+            ),
+            _make_sample(
+                response="<answer>B</answer>",
+                label="<answer>B</answer>",
+                metadata={"rm_type": "multiple_choice"},
+            ),
+        ]
+
+        rewards = await batched_async_rm(args, samples)
+
+        assert rewards == [1, 1.0]
+
+    @pytest.mark.asyncio
+    async def test_batch_routes_math_and_multiple_choice_from_labels(self):
+        args = _make_args(rm_type=None)
+        samples = [
+            _make_sample(response="The final answer is \\boxed{9}", label="9"),
+            _make_sample(response="<answer>B</answer>", label="<answer>B</answer>"),
+        ]
+
+        rewards = await batched_async_rm(args, samples)
+
+        assert rewards == [1, 1.0]
 
 
 # ===========================================================================

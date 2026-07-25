@@ -113,6 +113,28 @@ python scripts/tools/process_avqa.py \
   --md-dir /root/AVQA-R1-6K/AVQA_R1/train
 ```
 
+## 混合内置 Reward 路由
+
+同一个 batch 可以通过每条样本的 `metadata.rm_type` 使用不同的内置 Reward。推荐在数据预处理时显式写入类型：
+
+```jsonl
+{"prompt":"Compute 3 * 3.","label":"9","metadata":{"rm_type":"math"}}
+{"prompt":"Choose A, B, or C.","label":"<answer>B</answer>","metadata":{"rm_type":"multiple_choice"}}
+```
+
+默认数据键和异常处理配置如下：
+
+```bash
+--label-key label
+--metadata-key metadata
+--rm-type-fallback zero
+```
+
+`metadata.rm_type` 优先于全局 `--rm-type`。没有逐样本类型时，显式 `--rm-type` 保持原有全局行为；
+两者都没有时，框架只对明确的数学或选择题 label 格式进行保守识别。未知、缺失或冲突的类型默认返回
+零分并记录 warning。`--rm-type-fallback` 也可以设置为已注册的 Reward 类型，或设置为 `error`
+启用严格失败。
+
 ## 自定义 Reward 方法
 
 您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
