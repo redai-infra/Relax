@@ -123,6 +123,29 @@ python scripts/tools/process_avqa.py \
 --reward-key score
 ```
 
+### 内置 Reward 的逐样本路由
+
+混合任务 batch 可以在每条数据的 `metadata.rm_type` 中显式指定内置 Reward：
+
+```json
+{"text": "...", "label": "42", "metadata": {"rm_type": "math"}}
+{"text": "...", "label": "<answer>B</answer>", "metadata": {"rm_type": "multiple_choice"}}
+```
+
+内置 Reward 按以下优先级选择：
+
+```text
+metadata["rm_type"] > --rm-type > label 格式匹配
+```
+
+- `metadata.rm_type` 是逐样本的显式选择，优先级最高。
+- `--rm-type` 保留原有的全局单任务行为；metadata 中的未知类型也会尝试回退到合法的全局类型。
+- 只有 metadata 和 `--rm-type` 都缺失时，才会根据现有 ground-truth label 的严格格式自动识别 `math` 或 `multiple_choice`。
+- 无法唯一识别时不会猜测：运行时返回 0 分并记录 warning；标准静态数据源会在启动 Rollout 模型前汇总 reward 分配并拦截无法分配的记录。
+- 配置了 `--reward-key` 时，0 分保持字典形状，例如 `{"score": 0.0}`。
+
+Label 自动识别只覆盖无歧义格式。建议生产数据优先使用 `metadata.rm_type`；如果整个数据集使用同一种 Reward，则继续显式设置 `--rm-type`。
+
 ## 自定义 Generate 函数
 
 对于多轮对话、工具调用、Agent 交互等场景，可自定义 `generate` 函数替换默认的单轮生成逻辑。函数签名如下：

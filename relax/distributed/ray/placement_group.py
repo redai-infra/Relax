@@ -83,6 +83,13 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None):
 def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     from .rollout import RolloutManager
 
+    builtin_data_sources = {
+        "relax.engine.rollout.data_source.RolloutDataSource",
+        "relax.engine.rollout.data_source.RolloutDataSourceWithBuffer",
+    }
+    if data_source is not None and getattr(args, "data_source_path", None) in builtin_data_sources:
+        ray.get(data_source.validate_reward_routes.remote())
+
     # Get the head node ID to ensure RolloutManager runs on the head node
     # This is critical because the Router binds to the SLIME_HOST_IP_ENV address,
     # and other components expect the router to be accessible at the head node's IP

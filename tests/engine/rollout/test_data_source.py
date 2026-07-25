@@ -11,9 +11,81 @@ Run with: pytest tests/engine/rollout/test_data_source.py -v
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+from relax.engine.rollout.data_source import RolloutDataSource
+from relax.utils.types import Sample
+
+
+def _make_preflight_data_source(samples, *, rm_type=None, use_streaming=False, prompt_data=None):
+    data_source = RolloutDataSource.__new__(RolloutDataSource)
+    data_source.args = SimpleNamespace(
+        custom_rm_path=None,
+        label_key="label",
+        metadata_key="metadata",
+        prompt_data=prompt_data,
+        rm_type=rm_type,
+    )
+    data_source._use_streaming = use_streaming
+    data_source.dataset = SimpleNamespace(samples=samples)
+    return data_source
+
+
+class TestRewardRoutePreflight:
+    def test_eager_dataset_reports_mixed_reward_assignments(self):
+        data_source = _make_preflight_data_source(
+            [
+                Sample(label="42", metadata={"rm_type": "math"}),
+                Sample(label="<answer>B</answer>", metadata={}),
+            ]
+        )
+
+        report = data_source.validate_reward_routes()
+
+        assert report["total"] == 2
+        assert report["assignments"] == {"label/multiple_choice": 1, "metadata/math": 1}
+        assert report["unresolved_count"] == 0
+
+    def test_eager_dataset_blocks_unresolved_records(self):
+        data_source = _make_preflight_data_source([Sample(label="unsupported", metadata={})])
+
+        with pytest.raises(ValueError, match="1 sample.*no unambiguous reward assignment"):
+            data_source.validate_reward_routes()
+
+    def test_unknown_metadata_uses_global_fallback(self):
+        data_source = _make_preflight_data_source(
+            [Sample(label="unsupported", metadata={"rm_type": "unknown"})],
+            rm_type="math",
+        )
+
+        report = data_source.validate_reward_routes()
+
+        assert report["assignments"] == {"fallback/math": 1}
+        assert report["fallback_count"] == 1
+
+    def test_streaming_preflight_scans_raw_route_fields(self):
+        rows = [
+            {"text": "math", "label": "42", "metadata": {"rm_type": "math"}},
+            {"text": "choice", "label": "<answer>C</answer>", "metadata": {}},
+        ]
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as stream:
+                path = stream.name
+                for row in rows:
+                    stream.write(json.dumps(row) + "\n")
+            data_source = _make_preflight_data_source([], use_streaming=True, prompt_data=path)
+
+            report = data_source.validate_reward_routes()
+
+            assert report["total"] == 2
+            assert report["assignments"] == {"label/multiple_choice": 1, "metadata/math": 1}
+        finally:
+            if path is not None and os.path.exists(path):
+                os.unlink(path)
 
 
 class TestEagerDataset:

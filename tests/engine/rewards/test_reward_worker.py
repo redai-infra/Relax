@@ -15,6 +15,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -310,11 +311,16 @@ class TestRewardExecutorSingleSample:
         assert result == 1.0
 
     @pytest.mark.asyncio
-    async def test_execute_unknown_rm_type_raises(self):
+    async def test_execute_unknown_rm_type_returns_zero_and_warns(self):
         args = _make_args(rm_type="totally_unknown_type")
         sample = _make_sample(response="foo", label="bar")
-        with pytest.raises(NotImplementedError, match="totally_unknown_type"):
-            await async_rm(args, sample)
+
+        with patch("relax.engine.rewards.logger.warning") as warning:
+            result = await async_rm(args, sample)
+
+        assert result == 0.0
+        warning.assert_called_once()
+        assert warning.call_args.args[1] == "unknown"
 
 
 @requires_full_pipeline
@@ -449,8 +455,21 @@ class TestHighConcurrency:
         )
         rewards = list(rewards)
         assert len(rewards) == len(samples)
-        # All three should be correct (1.0)
+        # All samples should be correct (1.0).
         assert all(r == 1.0 for r in rewards), f"Got {rewards}"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mixed_rm_types_via_label_format(self):
+        """Math and multiple-choice labels route independently in one batch."""
+        args = _make_args(rm_type=None)
+        samples = [
+            _make_sample(response="\\boxed{42}", label="42"),
+            _make_sample(response="<answer>C</answer>", label="<answer>B</answer>"),
+        ]
+
+        rewards = await asyncio.wait_for(batched_async_rm(args, samples), timeout=60)
+
+        assert rewards == [1, 0.0]
 
     @pytest.mark.asyncio
     async def test_concurrent_repeated_identical_requests(self):
