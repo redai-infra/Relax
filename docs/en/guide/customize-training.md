@@ -124,6 +124,14 @@ You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your ow
 --reward-key score
 ```
 
+Synchronous `reward_func` runs in the `RewardWorker` process pool so it does
+not block the rollout event loop. Asynchronous `async def reward_func(...)`
+continues to run in the event loop and is directly awaited. The concurrency
+limit is controlled by `--reward-max-concurrency`, and the number of worker
+processes is controlled by `--reward-num-workers`. When `--group-rm` is set,
+the custom reward receives the whole group as a `samples` list and returns one
+reward per sample.
+
 ## Custom Generate Function
 
 For multi-turn dialogue, tool calling, or agentic rollout, define a custom `generate` function to replace the default single-turn logic. The function signature is:

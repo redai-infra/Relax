@@ -123,6 +123,12 @@ python scripts/tools/process_avqa.py \
 --reward-key score
 ```
 
+同步 `reward_func` 会在 `RewardWorker` 进程池内执行，避免阻塞 rollout 的 event loop；
+异步 `async def reward_func(...)` 会保持在 event loop 内直接 `await`。并发上限由
+`--reward-max-concurrency` 控制，worker 进程数量由 `--reward-num-workers` 控制。
+开启 `--group-rm` 时，custom reward 接收整个 group 的 `samples` 列表并返回逐样本
+reward 列表。
+
 ## 自定义 Generate 函数
 
 对于多轮对话、工具调用、Agent 交互等场景，可自定义 `generate` 函数替换默认的单轮生成逻辑。函数签名如下：
