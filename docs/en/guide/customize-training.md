@@ -172,6 +172,16 @@ Specify via launch script (`--custom-generate-function-path examples.deepeyes.ro
 
 Acquire `state.request_permit()` only around each model request. Release it before running environment or tool code so a long multi-turn session does not block unrelated short requests. The context manager releases the permit when the request succeeds, raises, or is cancelled.
 
+Custom generate functions must adopt this interface after upgrading. A custom implementation that sends requests without `state.request_permit()` is not covered by `--sglang-server-concurrency`. The built-in rollout checks the abort state again after waiting for a permit, so it does not submit a new request after a rollout abort. Rollout timing reports permit queueing separately as `request_permit_wait`; `generate` continues to measure the model request itself.
+
+The CPU async scheduling benchmark uses the same synthetic model and environment durations for the former session-level policy and the request-level policy:
+
+```bash
+PYTHONPATH=. python scripts/benchmarks/benchmark_request_permit.py --warmups 1 --runs 9
+```
+
+This benchmark validates scheduling behavior and the concurrency bound. It does not measure model throughput.
+
 ## Training Script and Key Parameters
 
 For complete parameter reference, see [Configuration](./configuration.md).

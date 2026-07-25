@@ -23,7 +23,7 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from relax.engine.rollout.request_permit import RequestPermitPool
+from relax.engine.rollout.request_permit import RequestPermitPool, run_request_with_permit
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -338,10 +338,21 @@ async def generate(
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
-    _t_generate_start = monotonic()
-    async with state.request_permit():
-        output = await post(url, payload, headers=headers)
-    _t_generate = monotonic() - _t_generate_start
+    request_execution = await run_request_with_permit(
+        state.request_permit,
+        lambda: post(url, payload, headers=headers),
+        should_abort=lambda: state.aborted and not evaluation,
+    )
+    if request_execution.aborted:
+        sample.status = Sample.Status.ABORTED
+        sample.metadata["_timing"] = {
+            "request_permit_wait": request_execution.permit_wait_seconds,
+            "generate": 0.0,
+        }
+        return sample
+    output = request_execution.value
+    assert output is not None
+    _t_generate = request_execution.request_seconds
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -430,7 +441,11 @@ async def generate(
     sample.update_from_meta_info(args, output["meta_info"])
     _t_post_generate = monotonic() - _t_post_generate_start
 
-    _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
+    _timing: dict[str, float] = {
+        "request_permit_wait": request_execution.permit_wait_seconds,
+        "generate": _t_generate,
+        "post_generate": _t_post_generate,
+    }
     if _t_image_processor is not None:
         _timing["image_processor"] = _t_image_processor
     if _t_mm_encode is not None:
@@ -528,7 +543,7 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     timing_data = _collect_timing_from_samples(all_samples)
     metrics: dict[str, float] = {}
 
-    for phase in ("image_processor", "mm_encode", "generate", "post_generate"):
+    for phase in ("image_processor", "mm_encode", "request_permit_wait", "generate", "post_generate"):
         values = timing_data.get(phase, [])
         if not values:
             continue
