@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import random
+from typing import Any
 
 import aiohttp
 import ray
@@ -24,6 +25,7 @@ from .openr1mm import get_openr1mm_rule_based_reward
 
 logger = get_logger(__name__)
 _shared_session: aiohttp.ClientSession | None = None
+RewardValue = int | float | dict[str, Any]
 
 
 def _sample_context(sample: Sample) -> str:
@@ -410,7 +412,7 @@ async def batched_async_rm(
     args,
     samples: list[Sample],
     **kwargs,
-) -> list[int | float]:
+) -> list[RewardValue]:
     if not samples:
         return []
     # group_rm custom rewards are documented as whole-group scorers, so keep
