@@ -174,7 +174,7 @@ RELOADABLE_FUNCTIONS: List[ReloadableFunction] = [
         config_attr="custom_rm_path",
         scope=ReloadScope.IMMEDIATE,
         required=False,
-        description="Custom reward model function (auto-reloaded on each call)",
+        description="Custom reward model function (cached between explicit reloads)",
     ),
     ReloadableFunction(
         name="rollout_sample_filter",
@@ -382,6 +382,14 @@ class ReloadableMixin:
             # IMMEDIATE scope: Only refresh sys.modules, next load_function will get the new version
             logger.info(f"Refreshed sys.modules cache for {module_path}")
             message = f"Module '{module_name}' reloaded - will take effect on next call"
+
+        if func_def.name == "custom_rm":
+            try:
+                from relax.engine.rewards import RewardExecutor
+
+                RewardExecutor.clear_custom_rm_cache(module_path)
+            except Exception as exc:
+                logger.warning("Failed to clear custom reward cache after reload: %s", exc)
 
         return {
             "success": True,
