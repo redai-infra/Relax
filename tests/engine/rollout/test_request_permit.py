@@ -49,6 +49,36 @@ async def test_request_permit_releases_after_failure(failure):
 
 
 @pytest.mark.asyncio
+async def test_request_permit_cancellation_while_waiting_does_not_consume_permit():
+    permits = RequestPermitPool(1)
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def hold_permit():
+        async with permits.acquire():
+            holder_entered.set()
+            await release_holder.wait()
+
+    async def wait_for_permit():
+        async with permits.acquire():
+            pass
+
+    holder = asyncio.create_task(hold_permit())
+    await holder_entered.wait()
+    waiter = asyncio.create_task(wait_for_permit())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release_holder.set()
+    await holder
+    async with asyncio.timeout(1):
+        async with permits.acquire():
+            pass
+
+
+@pytest.mark.asyncio
 async def test_request_permit_does_not_cover_environment_work():
     permits = RequestPermitPool(1)
     first_request_done = asyncio.Event()

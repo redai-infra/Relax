@@ -103,6 +103,10 @@ class GenerateState(metaclass=SingletonMeta):
 
         self.reset()
 
+    def request_permit(self):
+        """Return an async context manager for one model request."""
+        return self.request_permits.acquire()
+
     @contextmanager
     def dp_rank_context(self):
         candidates = [i for i, count in enumerate(self.dp_counts) if count == min(self.dp_counts)]
@@ -335,7 +339,7 @@ async def generate(
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
-    async with state.request_permits.acquire():
+    async with state.request_permit():
         output = await post(url, payload, headers=headers)
     _t_generate = monotonic() - _t_generate_start
 

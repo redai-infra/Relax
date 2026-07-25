@@ -237,7 +237,7 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
 
 
 async def _run_inference_step_with_permit(state, *args, **kwargs):
-    async with state.request_permits.acquire():
+    async with state.request_permit():
         return await _run_inference_step(*args, **kwargs)
 
 
