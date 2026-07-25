@@ -1,0 +1,72 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Custom reward fixtures used by Task 19 integration tests."""
+
+import asyncio
+import os
+import time
+
+
+_DYNAMIC_LOAD_COUNT = 0
+
+
+def sync_process_reward(args, sample, **kwargs):
+    return {
+        "pid": os.getpid(),
+        "index": sample.index,
+        "response": sample.response,
+        "marker": kwargs.get("marker"),
+    }
+
+
+def sync_timed_reward(args, sample, **kwargs):
+    started_at = time.monotonic()
+    time.sleep(args.test_reward_delay)
+    return {
+        "pid": os.getpid(),
+        "index": sample.index,
+        "started_at": started_at,
+        "finished_at": time.monotonic(),
+    }
+
+
+def sync_maybe_failing_reward(args, sample, **kwargs):
+    if sample.response == "fail":
+        raise ValueError("intentional custom reward failure")
+    return float(sample.index)
+
+
+def sync_group_reward(args, samples, **kwargs):
+    return [float(sample.index) for sample in samples]
+
+
+async def async_process_reward(args, sample, **kwargs):
+    await asyncio.sleep(0)
+    return {
+        "pid": os.getpid(),
+        "index": sample.index,
+        "marker": kwargs.get("marker"),
+    }
+
+
+async def async_group_reward(args, samples, **kwargs):
+    await asyncio.sleep(0)
+    return [float(sample.index) for sample in samples]
+
+
+def __getattr__(name):
+    """Expose a function whose attribute lookup count is observable per
+    process."""
+    if name != "counted_sync_reward":
+        raise AttributeError(name)
+
+    global _DYNAMIC_LOAD_COUNT
+    _DYNAMIC_LOAD_COUNT += 1
+
+    def counted_sync_reward(args, sample, **kwargs):
+        return {
+            "pid": os.getpid(),
+            "load_count": _DYNAMIC_LOAD_COUNT,
+        }
+
+    return counted_sync_reward
