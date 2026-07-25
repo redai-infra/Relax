@@ -31,6 +31,13 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -1104,6 +1111,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
                     "When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers "
                     "for true parallelism without GIL contention."
+                ),
+            )
+            parser.add_argument(
+                "--encode-max-workers",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Maximum number of threads used for image, video, audio, and multimodal prompt encoding. "
+                    "If unset, defaults to min(32, os.cpu_count() or 8)."
                 ),
             )
             parser.add_argument(

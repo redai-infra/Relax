@@ -114,6 +114,15 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | `--audio-sample-rate` | int | None | Sample rate for audio processing. Default is 16000 if not set |
 | `--frame-factor` | int | None | Frame alignment factor. Default is 2 if not set |
 | `--mm-processor-pool-size` | int | 0 | Size of the multimodal processor pool. 0 (default) disables the pool and uses ThreadPoolExecutor. When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers for true parallelism without GIL contention |
+| `--encode-max-workers` | int | `min(32, CPU count or 8)` | Maximum threads in the shared pool used for image, video, audio, and multimodal prompt encoding |
+
+`--encode-max-workers` controls the shared media-encoding `ThreadPoolExecutor`. It is separate from
+`--mm-processor-pool-size`, which controls the HuggingFace processor `ProcessPoolExecutor`. On high-core-count
+systems such as NVIDIA Grace, try values such as 32 and 64 and tune them for the workload:
+
+```bash
+--encode-max-workers 64
+```
 
 ---
 
