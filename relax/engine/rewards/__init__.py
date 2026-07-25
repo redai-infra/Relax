@@ -23,6 +23,7 @@ from .reward_router import (
     build_reward_registry,
     match_math_label,
     match_multiple_choice_label,
+    normalize_reward_route_config,
     resolve_reward_route,
 )
 
@@ -203,8 +204,22 @@ class RewardExecutor:
                 rm_function = load_function(args.custom_rm_path)
                 return await rm_function(args, sample, **kwargs)
 
+            route_config = normalize_reward_route_config(getattr(args, "reward_route", None))
             metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-            route = resolve_reward_route(metadata, sample.label, getattr(args, "rm_type", None), REWARD_REGISTRY)
+            route = resolve_reward_route(
+                metadata,
+                sample.label,
+                getattr(args, "rm_type", None),
+                REWARD_REGISTRY,
+                route_config.priority,
+            )
+
+            if route.reward_type is None:
+                raise NotImplementedError(
+                    "Rule-based RM type could not be resolved: "
+                    f"reason={route.reason!r}, candidates={route.candidates!r}."
+                )
+
             if route.reason is not None:
                 logger.warning(
                     "Reward route %s for sample index=%r group_index=%r candidates=%s; selected=%r source=%s",
@@ -215,8 +230,6 @@ class RewardExecutor:
                     route.reward_type,
                     route.source,
                 )
-            if route.reward_type is None:
-                return _zero_reward(args)
 
             spec = REWARD_REGISTRY[route.reward_type]
             response = sample.response

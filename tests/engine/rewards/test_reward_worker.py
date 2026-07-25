@@ -80,6 +80,7 @@ def _make_args(**overrides) -> SimpleNamespace:
     defaults = {
         "rm_type": "openr1mm",
         "custom_rm_path": None,
+        "reward_route": None,
         "reward_max_concurrency": 64,
         "reward_num_workers": 4,
         "rm_url": None,
@@ -311,16 +312,15 @@ class TestRewardExecutorSingleSample:
         assert result == 1.0
 
     @pytest.mark.asyncio
-    async def test_execute_unknown_rm_type_returns_zero_and_warns(self):
+    async def test_execute_unknown_rm_type_preserves_not_implemented_error(self):
         args = _make_args(rm_type="totally_unknown_type")
         sample = _make_sample(response="foo", label="bar")
 
         with patch("relax.engine.rewards.logger.warning") as warning:
-            result = await async_rm(args, sample)
+            with pytest.raises(NotImplementedError, match="could not be resolved"):
+                await async_rm(args, sample)
 
-        assert result == 0.0
-        warning.assert_called_once()
-        assert warning.call_args.args[1] == "unknown"
+        warning.assert_not_called()
 
 
 @requires_full_pipeline

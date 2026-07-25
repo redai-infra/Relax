@@ -20,7 +20,14 @@ from relax.engine.rollout.data_source import RolloutDataSource
 from relax.utils.types import Sample
 
 
-def _make_preflight_data_source(samples, *, rm_type=None, use_streaming=False, prompt_data=None):
+def _make_preflight_data_source(
+    samples,
+    *,
+    rm_type=None,
+    reward_route=None,
+    use_streaming=False,
+    prompt_data=None,
+):
     data_source = RolloutDataSource.__new__(RolloutDataSource)
     data_source.args = SimpleNamespace(
         custom_rm_path=None,
@@ -28,6 +35,7 @@ def _make_preflight_data_source(samples, *, rm_type=None, use_streaming=False, p
         metadata_key="metadata",
         prompt_data=prompt_data,
         rm_type=rm_type,
+        reward_route=reward_route,
     )
     data_source._use_streaming = use_streaming
     data_source.dataset = SimpleNamespace(samples=samples)
@@ -63,8 +71,20 @@ class TestRewardRoutePreflight:
 
         report = data_source.validate_reward_routes()
 
-        assert report["assignments"] == {"fallback/math": 1}
+        assert report["assignments"] == {"global/math": 1}
         assert report["fallback_count"] == 1
+
+    def test_yaml_config_can_place_global_rm_type_before_label(self):
+        data_source = _make_preflight_data_source(
+            [Sample(label="42", metadata={})],
+            rm_type="openr1mm",
+            reward_route={"priority": ["metadata", "rm_type", "label"]},
+        )
+
+        report = data_source.validate_reward_routes()
+
+        assert report["assignments"] == {"global/openr1mm": 1}
+        assert report["fallback_count"] == 0
 
     def test_streaming_preflight_scans_raw_route_fields(self):
         rows = [

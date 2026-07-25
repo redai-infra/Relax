@@ -201,7 +201,7 @@ class RolloutDataSource(DataSource):
             return {"skipped": "no_global_dataset"}
 
         from relax.engine.rewards import REWARD_REGISTRY
-        from relax.engine.rewards.reward_router import preflight_reward_routes
+        from relax.engine.rewards.reward_router import normalize_reward_route_config, preflight_reward_routes
 
         if self._use_streaming:
             label_key = getattr(self.args, "label_key", None)
@@ -219,13 +219,17 @@ class RolloutDataSource(DataSource):
                 (index, sample.label, sample.metadata) for index, sample in enumerate(self.dataset.samples)
             )
 
+        route_config = normalize_reward_route_config(getattr(self.args, "reward_route", None))
+
         report = preflight_reward_routes(
             route_records,
             getattr(self.args, "rm_type", None),
             REWARD_REGISTRY,
+            route_config.priority,
         )
         logger.info(
-            "Reward routing preflight: total=%d assignments=%s fallback=%d unresolved=%d conflict=%d",
+            "Reward routing preflight: priority=%s total=%d assignments=%s fallback=%d unresolved=%d conflict=%d",
+            route_config.priority,
             report.total,
             report.assignments,
             report.fallback_count,
