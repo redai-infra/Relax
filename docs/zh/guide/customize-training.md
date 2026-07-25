@@ -137,6 +137,18 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 
 函数返回前必须填充以下 `sample` 字段：`tokens`（完整 prompt+response token ID）、`response`（解码后字符串）、`response_length`、`loss_mask`（逐 token：`1`=参与训练，`0`=跳过）、`rollout_log_probs` 以及 `status`（`Sample.Status.COMPLETED` / `TRUNCATED` 等）。
 
+### 并发控制（多轮场景务必遵守）
+
+框架用一个信号量限制**同时发往 SGLang 的模型请求数**。对于多轮 rollout，请通过 `state.model_request_permit()` 在**每一次模型请求**前获取额度、请求结束后立即释放，**不要**把 environment / 工具执行也圈进额度内：
+
+```python
+async with state.model_request_permit():
+    output = await post(url, payload)   # 仅模型请求持有额度
+observation, done, info = env.step(...) # environment / 工具执行在额度之外
+```
+
+这样在 environment 执行期间会释放额度，让其他请求（包括短的单轮请求）得以推进，避免长会话独占并发槽导致的排队与利用率下降。注意此时并发上限的语义是"最大并发**模型请求**数"，而非"最大并发**会话**数"——在途会话数可以超过该上限。框架自带的默认单轮 `generate()` 已在内部按此约定持有额度，自定义函数只需在自己发起的每次请求处套用上面的写法即可。`model_request_permit()` 通过 `finally` 保证在成功、异常、取消、abort 各场景下都会释放额度。
+
 **示例** — 简化自 [`examples/deepeyes/rollout.py`](../examples/deepeyes.md)（多轮工具调用 rollout）：
 
 ```python
@@ -150,7 +162,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        async with state.model_request_permit():                                                    # 仅模型请求持有并发额度
+            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出

@@ -469,15 +469,21 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             inference_start_ts = time.time()
-            (
-                response_text,
-                new_response_tokens,
-                new_response_log_probs,
-                finish_type,
-                meta_info,
-            ) = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
-            )
+            # Per-request concurrency control: acquire a permit only around the
+            # model (SGLang) request and release it immediately after, so the
+            # slot is freed during environment / tool execution below. This keeps
+            # concurrency at "single model request" granularity rather than
+            # holding it for the whole multi-turn session.
+            async with state.model_request_permit():
+                (
+                    response_text,
+                    new_response_tokens,
+                    new_response_log_probs,
+                    finish_type,
+                    meta_info,
+                ) = await _run_inference_step(
+                    url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
+                )
             inference_end_ts = time.time()
             trace_recorder.record_inference_output(
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)

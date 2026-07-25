@@ -6,7 +6,7 @@ import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from time import monotonic
 from typing import Any
 
@@ -113,6 +113,28 @@ class GenerateState(metaclass=SingletonMeta):
         finally:
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
+
+    @asynccontextmanager
+    async def model_request_permit(self):
+        """Acquire one concurrency permit for a *single* model (SGLang) request
+        and release it on exit.
+
+        This is the fine-grained unit of concurrency control shared by the
+        default single-turn ``generate()`` and by custom multi-turn rollouts.
+        Custom multi-turn rollouts should wrap ONLY the model request (not the
+        environment / tool execution) so the permit is freed while the
+        environment runs, letting other requests proceed. This shifts
+        concurrency control from "session-level" to "single model
+        request-level".
+
+        Release is guaranteed on success, exception, and cancellation via the
+        ``finally`` block, so the permit is never leaked.
+        """
+        await self.semaphore.acquire()
+        try:
+            yield
+        finally:
+            self.semaphore.release()
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -454,23 +476,37 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    async with state.semaphore:
+    # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+
+    if custom_func_path is not None:
+        # Custom (possibly multi-turn) generate. Concurrency is controlled at the
+        # granularity of a single model request *inside* the function, via
+        # state.model_request_permit(). We must NOT hold a session-level permit
+        # here: it would keep the slot occupied during environment / tool
+        # execution (the very thing this optimization avoids) and would deadlock a
+        # nested per-request acquire when the concurrency limit is 1
+        # (asyncio.Semaphore is not reentrant).
         if state.aborted:
             sample.status = Sample.Status.ABORTED
             return sample
 
+        custom_generate_func = load_function(custom_func_path)
         with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
-
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
+            # if signature has evaluation, pass evaluation
+            if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
             else:
+                sample = await custom_generate_func(args, sample, sampling_params)
+    else:
+        # Default single-turn generate: one session == one model request, so the
+        # session-level permit already IS the per-request permit.
+        async with state.model_request_permit():
+            if state.aborted:
+                sample.status = Sample.Status.ABORTED
+                return sample
+
+            with state.dp_rank_context() as _:
                 sample = await generate(args, sample, sampling_params, evaluation=evaluation)
 
     # for the rm that need the whole group, we will not do the rm here
