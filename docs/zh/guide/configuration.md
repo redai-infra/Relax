@@ -114,6 +114,15 @@
 | `--audio-sample-rate` | int | None | 音频处理的采样率。未设置时使用默认值 16000 |
 | `--frame-factor` | int | None | 帧数对齐因子。未设置时使用默认值 2 |
 | `--mm-processor-pool-size` | int | 0 | 多模态处理器池大小。0（默认）禁用进程池，使用 ThreadPoolExecutor。设置为正整数时，创建指定数量 worker 的 ProcessPoolExecutor，实现无 GIL 竞争的真正并行 |
+| `--encode-max-workers` | int | `min(32, CPU count or 8)` | 图片、视频、音频和多模态 prompt 编码所用共享线程池的最大线程数 |
+
+`--encode-max-workers` 控制媒体编码所用的共享 `ThreadPoolExecutor`。它与
+`--mm-processor-pool-size` 不同，后者控制 HuggingFace processor 所用的 `ProcessPoolExecutor`。在 NVIDIA
+Grace 等高核数系统上，可以尝试 32 和 64，并根据实际 workload 调整：
+
+```bash
+--encode-max-workers 64
+```
 
 ---
 

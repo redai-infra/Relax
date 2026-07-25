@@ -1,11 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tests for relax.utils.data.processing_utils.adapt_processor_kwargs.
+"""Tests for relax.utils.data.processing_utils.
 
 Imports are deferred to fixtures because processing_utils pulls in the heavy
 imageio / soundfile / transformers / torch stack at module level, which trips a
 numpy ABI mismatch in this CI image during pytest collection.
 """
+
+import threading
 
 import pytest
 
@@ -15,6 +17,90 @@ def adapt_processor_kwargs():
     from relax.utils.data.processing_utils import adapt_processor_kwargs as fn
 
     return fn
+
+
+@pytest.fixture()
+def processing_utils():
+    from relax.utils.data import processing_utils as module
+
+    module.shutdown_encode_executor()
+    yield module
+    module.shutdown_encode_executor()
+
+
+@pytest.mark.parametrize(
+    ("cpu_count", "expected"),
+    [(4, 4), (12, 12), (32, 32), (72, 32), (128, 32), (None, 8)],
+)
+def test_encode_executor_uses_cpu_aware_default(monkeypatch, processing_utils, cpu_count, expected):
+    monkeypatch.setattr(processing_utils.os, "cpu_count", lambda: cpu_count)
+
+    executor = processing_utils.configure_encode_executor()
+
+    assert executor._max_workers == expected
+
+
+@pytest.mark.parametrize("workers", [1, 8, 32, 64])
+def test_encode_executor_uses_explicit_worker_count(processing_utils, workers):
+    executor = processing_utils.configure_encode_executor(workers)
+
+    assert executor._max_workers == workers
+
+
+@pytest.mark.parametrize("workers", [0, -1, -32])
+def test_encode_executor_rejects_non_positive_values(processing_utils, workers):
+    with pytest.raises(ValueError, match="positive integer"):
+        processing_utils.configure_encode_executor(workers)
+
+
+@pytest.mark.parametrize("workers", [True, 1.5, "8"])
+def test_encode_executor_rejects_non_integer_values(processing_utils, workers):
+    with pytest.raises(TypeError, match="integer"):
+        processing_utils.configure_encode_executor(workers)
+
+
+def test_encode_executor_same_configuration_is_idempotent(processing_utils):
+    first = processing_utils.configure_encode_executor(8)
+    second = processing_utils.configure_encode_executor(8)
+
+    assert first is second
+    assert processing_utils.get_encode_executor() is first
+
+
+def test_encode_executor_rejects_reconfiguration(processing_utils):
+    original = processing_utils.configure_encode_executor(8)
+
+    with pytest.raises(RuntimeError, match="already initialized with 8 workers"):
+        processing_utils.configure_encode_executor(16)
+
+    assert processing_utils.get_encode_executor() is original
+
+
+def test_encode_executor_shutdown_allows_reinitialization(processing_utils):
+    first = processing_utils.configure_encode_executor(4)
+
+    processing_utils.shutdown_encode_executor()
+
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        first.submit(lambda: None)
+
+    second = processing_utils.configure_encode_executor(4)
+    assert second is not first
+
+
+@pytest.mark.asyncio
+async def test_async_encode_uses_configured_executor(monkeypatch, processing_utils):
+    processing_utils.configure_encode_executor(1)
+    monkeypatch.setattr(
+        processing_utils,
+        "encode_image_for_rollout_engine",
+        lambda image: (image, threading.current_thread().name),
+    )
+
+    image, thread_name = await processing_utils.async_encode_image_for_rollout_engine("image")
+
+    assert image == "image"
+    assert thread_name.startswith("relax-encode")
 
 
 class _FakeQwenVLProcessor:

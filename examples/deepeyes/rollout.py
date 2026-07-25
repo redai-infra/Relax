@@ -15,7 +15,7 @@ import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.data.processing_utils import _ENCODE_EXECUTOR, encode_image_for_rollout_engine
+from relax.utils.data.processing_utils import encode_image_for_rollout_engine
 from relax.utils.http_utils import post
 from relax.utils.types import Sample
 
@@ -175,7 +175,7 @@ def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
 async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict, is_resuming: bool = False):
     loop = asyncio.get_running_loop()
     prompt_ids, image_data, init_mm_train = await loop.run_in_executor(
-        _ENCODE_EXECUTOR,
+        state.encode_executor,
         _prepare_initial_inputs,
         sample,
         state.processor,
@@ -236,7 +236,15 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     return response_text, new_tokens, new_log_probs, finish_type, meta_info
 
 
-async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
+async def _process_env_step(
+    env: BaseInteractionEnv,
+    response_text: str,
+    tokenizer,
+    processor,
+    encode_executor,
+    args,
+    sample_metadata,
+):
     result = env.step(response_text)
     # 兼容 async env.step（如 VideoSearchEnv）：若返回 coroutine 则 await
     if inspect.isawaitable(result):
@@ -248,7 +256,7 @@ async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokeniz
     next_user_message = env.format_observation(observation)
     loop = asyncio.get_running_loop()
     obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs = await loop.run_in_executor(
-        _ENCODE_EXECUTOR,
+        encode_executor,
         _encode_observation_for_generation,
         tokenizer,
         processor,
@@ -513,7 +521,15 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 obs_multimodal_train_inputs,
                 done,
                 info,
-            ) = await _process_env_step(env, response_text, state.tokenizer, state.processor, args, sample.metadata)
+            ) = await _process_env_step(
+                env,
+                response_text,
+                state.tokenizer,
+                state.processor,
+                state.encode_executor,
+                args,
+                sample.metadata,
+            )
             env_end_ts = time.time()
 
             trace_recorder.record_env_step(

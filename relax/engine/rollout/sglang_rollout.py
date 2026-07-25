@@ -26,10 +26,10 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
-    _ENCODE_EXECUTOR,
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
     async_encode_video_tensor_for_rollout_engine,
+    configure_encode_executor,
     load_processor,
     load_tokenizer,
 )
@@ -56,6 +56,7 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
+        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
@@ -206,7 +207,7 @@ async def _run_image_processor(
             prompt_ids = expand_kimi_k25_placeholders(state.processor, prompt_ids, train_inputs)
             return prompt_ids, train_inputs
 
-        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(_ENCODE_EXECUTOR, _run_processor)
+        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(state.encode_executor, _run_processor)
 
     return processor_prompt_ids, mm_train_inputs, monotonic() - t_start
 
