@@ -15,7 +15,7 @@ import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.data.processing_utils import _ENCODE_EXECUTOR, encode_image_for_rollout_engine
+from relax.utils.data.processing_utils import encode_image_for_rollout_engine, get_encode_executor
 from relax.utils.http_utils import post
 from relax.utils.types import Sample
 
@@ -175,7 +175,7 @@ def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
 async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict, is_resuming: bool = False):
     loop = asyncio.get_running_loop()
     prompt_ids, image_data, init_mm_train = await loop.run_in_executor(
-        _ENCODE_EXECUTOR,
+        get_encode_executor(),
         _prepare_initial_inputs,
         sample,
         state.processor,
@@ -248,7 +248,7 @@ async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokeniz
     next_user_message = env.format_observation(observation)
     loop = asyncio.get_running_loop()
     obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs = await loop.run_in_executor(
-        _ENCODE_EXECUTOR,
+        get_encode_executor(),
         _encode_observation_for_generation,
         tokenizer,
         processor,

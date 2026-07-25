@@ -26,10 +26,10 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
-    _ENCODE_EXECUTOR,
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
     async_encode_video_tensor_for_rollout_engine,
+    configure_encode_executor,
     load_processor,
     load_tokenizer,
 )
@@ -61,6 +61,11 @@ class GenerateState(metaclass=SingletonMeta):
 
         # OPD manager (singleton — one OpdManager per GenerateState)
         self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+
+        # Media-encoding thread pool for this rollout worker process, sized by
+        # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
+        # affinity-aware default). Held on state so consumers use it explicitly.
+        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
@@ -206,7 +211,7 @@ async def _run_image_processor(
             prompt_ids = expand_kimi_k25_placeholders(state.processor, prompt_ids, train_inputs)
             return prompt_ids, train_inputs
 
-        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(_ENCODE_EXECUTOR, _run_processor)
+        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(state.encode_executor, _run_processor)
 
     return processor_prompt_ids, mm_train_inputs, monotonic() - t_start
 
