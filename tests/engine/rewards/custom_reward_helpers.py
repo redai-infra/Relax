@@ -44,6 +44,11 @@ def failing_sync_reward(args, sample, **kwargs):
     raise ValueError(f"boom for sample {sample.index}")
 
 
+def failing_batch_reward(args, samples, **kwargs):
+    del args, kwargs
+    raise ValueError(f"boom for group size {len(samples)}")
+
+
 def _update_counter(path: str, delta: int) -> None:
     import fcntl
 

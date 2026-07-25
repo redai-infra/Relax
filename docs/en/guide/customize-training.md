@@ -116,7 +116,7 @@ python scripts/tools/process_avqa.py \
 
 ## Custom Reward Methods
 
-You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
+You can define `reward_func(args, sample: Sample, **kwargs) -> float | dict` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func

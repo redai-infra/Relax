@@ -115,7 +115,7 @@ python scripts/tools/process_avqa.py \
 
 ## 自定义 Reward 方法
 
-您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
+您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float | dict`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func

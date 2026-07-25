@@ -178,6 +178,19 @@ async def test_sync_custom_reward_exception_includes_sample_context():
 
 
 @pytest.mark.asyncio
+async def test_group_custom_reward_exception_context_is_bounded():
+    args = _make_args(
+        custom_rm_path=f"{HELPERS}.failing_batch_reward",
+        group_rm=True,
+        reward_num_workers=1,
+    )
+    samples = [_make_sample(index=idx) for idx in range(8)]
+
+    with pytest.raises(Exception, match="omitted 3 samples"):
+        await batched_async_rm(args, samples)
+
+
+@pytest.mark.asyncio
 async def test_custom_reward_function_is_loaded_once_per_executor(monkeypatch):
     import relax.engine.rewards as reward_module
 

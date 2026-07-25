@@ -26,6 +26,7 @@ from .openr1mm import get_openr1mm_rule_based_reward
 logger = get_logger(__name__)
 _shared_session: aiohttp.ClientSession | None = None
 RewardValue = int | float | dict[str, Any]
+_MAX_ERROR_CONTEXT_SAMPLES = 5
 
 
 def _sample_context(sample: Sample) -> str:
@@ -38,8 +39,13 @@ def _sample_context(sample: Sample) -> str:
     )
 
 
-def _sample_group_context(samples: list[Sample]) -> str:
-    return "[" + ", ".join(_sample_context(sample) for sample in samples) + "]"
+def _sample_group_context(samples: list[Sample], max_samples: int = _MAX_ERROR_CONTEXT_SAMPLES) -> str:
+    visible_samples = samples[:max_samples]
+    context = "[" + ", ".join(_sample_context(sample) for sample in visible_samples) + "]"
+    omitted = len(samples) - len(visible_samples)
+    if omitted > 0:
+        context += f" (omitted {omitted} samples)"
+    return context
 
 
 def _get_shared_session() -> aiohttp.ClientSession:
@@ -68,11 +74,11 @@ def _get_shared_session() -> aiohttp.ClientSession:
 
 @ray.remote(num_cpus=0.25)
 class RewardWorker:
-    """Stateless worker that executes synchronous reward functions in a
-    dedicated process.
+    """Worker that executes synchronous reward functions in a dedicated
+    process.
 
-    Each call receives the rm_type and the necessary arguments so the worker
-    does not need to hold any state.
+    Built-in rewards are dispatched by rm_type. Custom reward functions are
+    cached per worker process so repeated calls do not re-import user code.
     """
 
     def __init__(self):
@@ -221,6 +227,12 @@ class RewardExecutor:
         self._worker_index += 1
         return worker
 
+    async def _submit_worker_call(self, remote_method, *args):
+        # Ray serializes remote-call arguments before returning ObjectRef. Do
+        # that submission in a thread so larger custom args/Sample payloads do
+        # not stall the rollout event loop during serialization.
+        return await asyncio.to_thread(remote_method.remote, *args)
+
     def _load_custom_rm_function(self, custom_rm_path: str):
         rm_function = self._custom_rm_functions.get(custom_rm_path)
         if rm_function is None:
@@ -314,7 +326,7 @@ class RewardExecutor:
             if rm_type:
                 self._ensure_workers()
                 worker = self._next_worker()
-                ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
+                ref = await self._submit_worker_call(worker.compute, rm_type, response, label, metadata)
                 return await ref
 
             # --- no rm_type specified -----------------------------------------
@@ -333,7 +345,7 @@ class RewardExecutor:
 
         self._ensure_workers()
         worker = self._next_worker()
-        ref = worker.compute_custom.remote(custom_rm_path, args, sample, kwargs)
+        ref = await self._submit_worker_call(worker.compute_custom, custom_rm_path, args, sample, kwargs)
         return await ref
 
     async def execute_custom_batch(self, args, samples: list[Sample], **kwargs):
@@ -352,7 +364,7 @@ class RewardExecutor:
 
             self._ensure_workers()
             worker = self._next_worker()
-            ref = worker.compute_custom_batch.remote(custom_rm_path, args, samples, kwargs)
+            ref = await self._submit_worker_call(worker.compute_custom_batch, custom_rm_path, args, samples, kwargs)
             return await ref
 
 
