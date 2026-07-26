@@ -10,6 +10,7 @@ import ray
 import relax.engine.rewards as rewards_module
 from relax.agentic.pipeline import reward as agentic_reward
 from relax.engine.rewards import RewardExecutor, async_rm, batched_async_rm
+from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.types import Sample
 
 
@@ -104,6 +105,36 @@ async def test_custom_function_is_loaded_once_in_caller(monkeypatch):
     await async_rm(args, _make_sample(1))
 
     assert load_count == 1
+
+
+@pytest.mark.asyncio
+async def test_async_custom_reward_observes_module_hot_reload():
+    args = _make_args("async_reloadable_reward")
+
+    first = await async_rm(args, _make_sample(0))
+    reloader = ReloadableMixin()
+    reloader.args = args
+    assert reloader.reload_module("custom_rm")["success"]
+    second = await async_rm(args, _make_sample(1))
+
+    assert second["generation"] == first["generation"] + 1
+    assert first["pid"] == second["pid"] == os.getpid()
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_sync_custom_reward_propagates_hot_reload_to_worker():
+    args = _make_args("sync_reloadable_reward", reward_num_workers=1)
+
+    first = await async_rm(args, _make_sample(0))
+    reloader = ReloadableMixin()
+    reloader.args = args
+    assert reloader.reload_module("custom_rm")["success"]
+    second = await async_rm(args, _make_sample(1))
+
+    assert second["generation"] == first["generation"] + 1
+    assert first["pid"] == second["pid"]
+    assert first["pid"] != os.getpid()
 
 
 @pytest.mark.asyncio

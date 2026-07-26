@@ -8,6 +8,7 @@ import time
 
 
 _DYNAMIC_LOAD_COUNT = 0
+_RELOAD_GENERATION = globals().get("_RELOAD_GENERATION", 0) + 1
 
 
 def sync_process_reward(args, sample, **kwargs):
@@ -52,6 +53,15 @@ async def async_process_reward(args, sample, **kwargs):
 async def async_group_reward(args, samples, **kwargs):
     await asyncio.sleep(0)
     return [float(sample.index) for sample in samples]
+
+
+def sync_reloadable_reward(args, sample, _generation=_RELOAD_GENERATION, **kwargs):
+    return {"generation": _generation, "pid": os.getpid()}
+
+
+async def async_reloadable_reward(args, sample, _generation=_RELOAD_GENERATION, **kwargs):
+    await asyncio.sleep(0)
+    return {"generation": _generation, "pid": os.getpid()}
 
 
 def __getattr__(name):

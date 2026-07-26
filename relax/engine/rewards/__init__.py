@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import importlib
 import inspect
 import random
+import sys
 from typing import Any
 
 import aiohttp
@@ -10,6 +12,7 @@ import ray
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.reload_utils import get_reload_token
 from relax.utils.types import Sample
 
 from .dapo_genrm import async_compute_score_genrm
@@ -25,6 +28,16 @@ from .openr1mm import get_openr1mm_rule_based_reward
 
 logger = get_logger(__name__)
 _shared_session: aiohttp.ClientSession | None = None
+
+
+def _reload_function_in_process(function_path: str) -> object:
+    module_path, _, attr_name = function_path.rpartition(".")
+    module = sys.modules.get(module_path)
+    if module is None:
+        module = importlib.import_module(module_path)
+    else:
+        module = importlib.reload(module)
+    return getattr(module, attr_name)
 
 
 def _get_shared_session() -> aiohttp.ClientSession:
@@ -56,7 +69,7 @@ class RewardWorker:
     """Execute synchronous reward functions in a dedicated process."""
 
     def __init__(self):
-        self._custom_rm_functions: dict[str, object] = {}
+        self._custom_rm_functions: dict[str, tuple[tuple[str, int], object]] = {}
 
     def compute(self, rm_type: str, response: str, label, metadata: dict | None = None):
         """Dispatch to the appropriate synchronous reward function.
@@ -94,12 +107,18 @@ class RewardWorker:
         else:
             raise NotImplementedError(f"RewardWorker: unknown rm_type={rm_type!r}")
 
-    def compute_custom(self, custom_rm_path: str, args, sample, kwargs: dict):
-        """Execute a synchronous custom reward, loading it once per worker."""
-        rm_function = self._custom_rm_functions.get(custom_rm_path)
-        if rm_function is None:
+    def compute_custom(self, custom_rm_path: str, reload_token: tuple[str, int], args, sample, kwargs: dict):
+        """Execute a synchronous custom reward, loading each version once per
+        worker."""
+        cached = self._custom_rm_functions.get(custom_rm_path)
+        if cached is None:
             rm_function = load_function(custom_rm_path)
-            self._custom_rm_functions[custom_rm_path] = rm_function
+            self._custom_rm_functions[custom_rm_path] = (reload_token, rm_function)
+        elif cached[0] != reload_token:
+            rm_function = _reload_function_in_process(custom_rm_path)
+            self._custom_rm_functions[custom_rm_path] = (reload_token, rm_function)
+        else:
+            rm_function = cached[1]
 
         result = rm_function(args, sample, **kwargs)
         if inspect.isawaitable(result):
@@ -129,7 +148,7 @@ class RewardExecutor:
         self._semaphore: asyncio.Semaphore | None = None
         self._workers: list = []
         self._worker_index = 0
-        self._custom_rm_functions: dict[str, object] = {}
+        self._custom_rm_functions: dict[str, tuple[tuple[str, int], object]] = {}
 
     # -- singleton access -----------------------------------------------------
 
@@ -166,11 +185,15 @@ class RewardExecutor:
         return worker
 
     def _get_custom_rm_function(self, custom_rm_path: str):
-        rm_function = self._custom_rm_functions.get(custom_rm_path)
-        if rm_function is None:
+        reload_token = get_reload_token(custom_rm_path)
+        cached = self._custom_rm_functions.get(custom_rm_path)
+        if cached is None or cached[0] != reload_token:
             rm_function = load_function(custom_rm_path)
-            self._custom_rm_functions[custom_rm_path] = rm_function
-        return rm_function
+        else:
+            rm_function = cached[1]
+
+        self._custom_rm_functions[custom_rm_path] = (reload_token, rm_function)
+        return rm_function, reload_token
 
     @staticmethod
     def _is_async_callable(function) -> bool:
@@ -193,13 +216,13 @@ class RewardExecutor:
 
     async def _execute_custom(self, custom_rm_path: str, args, sample, kwargs: dict):
         try:
-            rm_function = self._get_custom_rm_function(custom_rm_path)
+            rm_function, reload_token = self._get_custom_rm_function(custom_rm_path)
             if self._is_async_callable(rm_function):
                 return await rm_function(args, sample, **kwargs)
 
             self._ensure_workers()
             worker = self._next_worker()
-            return await worker.compute_custom.remote(custom_rm_path, args, sample, kwargs)
+            return await worker.compute_custom.remote(custom_rm_path, reload_token, args, sample, kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -331,7 +354,7 @@ async def batched_async_rm(
     args,
     samples: list[Sample],
     **kwargs,
-) -> list[float | dict[str, Any]]:
+) -> list[int | float | dict[str, Any]]:
     use_custom_reward = args.custom_rm_path is not None and not kwargs.get("ignore_custom", False)
     if use_custom_reward and getattr(args, "group_rm", False):
         # Group reward functions receive the complete group in one call.
