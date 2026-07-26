@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import random
+from typing import Any
 
 import aiohttp
 import ray
@@ -330,8 +331,9 @@ async def batched_async_rm(
     args,
     samples: list[Sample],
     **kwargs,
-) -> list[int | float]:
-    if args.custom_rm_path is not None and getattr(args, "group_rm", False):
+) -> list[float | dict[str, Any]]:
+    use_custom_reward = args.custom_rm_path is not None and not kwargs.get("ignore_custom", False)
+    if use_custom_reward and getattr(args, "group_rm", False):
         # Group reward functions receive the complete group in one call.
         return await async_rm(args, samples, **kwargs)
 
@@ -341,7 +343,7 @@ async def batched_async_rm(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if args.custom_rm_path is None:
+            if not use_custom_reward:
                 raise
             raise RuntimeError(f"Custom reward failed at batch position {position}") from exc
 

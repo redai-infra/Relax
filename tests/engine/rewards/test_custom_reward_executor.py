@@ -215,6 +215,25 @@ async def test_async_group_custom_reward_keeps_batch_call_compatibility():
 
 
 @pytest.mark.asyncio
+async def test_group_batch_ignore_custom_scores_builtin_reward_per_sample():
+    args = _make_args("sync_group_reward", group_rm=True, rm_type="dummy")
+    samples = [_make_sample(index) for index in range(4)]
+
+    results = await batched_async_rm(args, samples, ignore_custom=True)
+
+    assert results == [0.0, 0.0, 0.0, 0.0]
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_non_group_ignore_custom_preserves_builtin_error():
+    args = _make_args("sync_process_reward", rm_type=None)
+
+    with pytest.raises(NotImplementedError, match="Rule-based RM type is not specified"):
+        await batched_async_rm(args, [_make_sample(0)], ignore_custom=True)
+
+
+@pytest.mark.asyncio
 async def test_batched_custom_reward_error_identifies_batch_position():
     args = _make_args("sync_maybe_failing_reward")
     samples = [_make_sample(0), _make_sample(1, response="fail"), _make_sample(2)]
