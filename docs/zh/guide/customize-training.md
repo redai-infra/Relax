@@ -141,7 +141,6 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 
 ```python
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
@@ -150,7 +149,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        # 每轮各取一次 permit：post_generate 内部获取/释放，环境与工具执行期间不占用
+        output = await state.post_generate(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
@@ -164,9 +164,27 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
+
+
+# 声明本函数按“单次请求”粒度自行管理 permit（不声明则退回会话级锁，行为同旧版）
+generate.manages_inference_permit = True
 ```
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
+
+### 多轮 Rollout 的请求级并发调度
+
+默认情况下，`generate_and_rm` 会为整个自定义 `generate` 调用持有一把会话级并发锁（`GenerateState.semaphore`）——多轮 rollout 在环境/工具执行期间也一直占用名额，降低推理引擎利用率。
+
+要把并发控制细化到「单次模型请求」，在自定义函数上声明 opt-in 标志，并用 `state.post_generate` 发起每轮请求：
+
+- `generate.manages_inference_permit = True`：声明后本函数**不再**被会话级锁包裹，改由函数自身按请求获取 permit；
+- `await state.post_generate(url, payload)`：获取一个 permit → 发请求 → 返回后立即释放。一个 permit == 一次在飞请求（含内部最多 6 次重试）；环境交互、观测编码等应放在 `post_generate` 之外，不占用 permit；
+- **abort**：若获取 permit 时 rollout 已被 abort，`post_generate` 抛出 `GenerationAborted`。可捕获它以写入精细的续跑元数据；**不捕获也不会导致整步崩溃**——框架会兜底把该样本标记为 `ABORTED`。
+
+**使用契约**：只有声明了 `manages_inference_permit = True` 的函数才能调用 `state.post_generate` / `state.inference_permit()`。未声明的函数仍在会话级锁内运行，若再获取 permit 会在**同一把不可重入信号量**上嵌套获取——并发上限为 1 时直接死锁（框架已加运行时护栏，检测到误用会抛出清晰的 `RuntimeError` 而非挂死）。
+
+**注意**：解除会话级锁后，同时“活跃”的会话数不再受该信号量限制（仅在飞请求受限）；如需限制并发环境/工具的资源占用，请在自定义函数内自行控制。
 
 ## 训练脚本与关键参数概览
 

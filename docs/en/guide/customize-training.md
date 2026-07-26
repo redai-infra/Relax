@@ -142,7 +142,6 @@ The function must populate these `sample` fields before returning: `tokens` (ful
 
 ```python
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
@@ -151,7 +150,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        # One permit per turn: post_generate acquires/releases it internally; the
+        # permit is not held during env/tool execution.
+        output = await state.post_generate(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
@@ -165,9 +166,28 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
+
+
+# Opt in to per-request permit management (without this flag the function falls
+# back to the session-level lock, i.e. the legacy behavior).
+generate.manages_inference_permit = True
 ```
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
+
+### Per-request concurrency scheduling for multi-turn rollout
+
+By default `generate_and_rm` holds one session-level concurrency permit (`GenerateState.semaphore`) for the entire custom `generate` call — a multi-turn rollout keeps the slot even while running env/tool steps, which hurts engine utilization.
+
+To scope concurrency down to a single model request, declare the opt-in flag on your function and issue each turn's request via `state.post_generate`:
+
+- `generate.manages_inference_permit = True`: once declared, the function is **no longer** wrapped in the session-level lock; it acquires a per-request permit itself.
+- `await state.post_generate(url, payload)`: acquire one permit → send the request → release immediately on return. One permit == one in-flight request (including up to 6 internal retries); keep env interaction and observation encoding **outside** `post_generate` so they do not hold a permit.
+- **abort**: if the rollout has already been aborted by the time the permit is acquired, `post_generate` raises `GenerationAborted`. You may catch it to write fine-grained resume metadata; **not catching it will not crash the step** — the framework contains it and marks the sample `ABORTED`.
+
+**Usage contract**: only functions that declare `manages_inference_permit = True` may call `state.post_generate` / `state.inference_permit()`. A function without the flag still runs under the session-level lock; acquiring a permit from there nests an acquire on the **same non-reentrant semaphore** and deadlocks when the concurrency limit is 1 (a runtime guard detects the misuse and raises a clear `RuntimeError` instead of hanging).
+
+**Note**: once the session-level lock is lifted, the number of concurrently *active* sessions is no longer bounded by this semaphore (only in-flight requests are); throttle concurrent env/tool resource usage inside your function if needed.
 
 ## Training Script and Key Parameters
 
