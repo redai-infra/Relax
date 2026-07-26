@@ -123,6 +123,23 @@ python scripts/tools/process_avqa.py \
 --reward-key score
 ```
 
+### 格式感知的 Reward 路由
+
+内置 reward 统一注册在 `relax/engine/rewards/registry.py` 中，新增一个 reward 只需一行 `register_reward` 调用，无需修改任何分发分支：
+
+```python
+register_reward("my_reward", "my_pkg.my_module:my_reward_fn")  # def my_reward_fn(response, label) -> float
+```
+
+每个样本按以下优先级解析 reward 类型：样本 `metadata["rm_type"]` > `--rm-type` > label 推断（需开启）> fallback（需开启）。因此一个 batch 可以混合多种任务格式（如 math + multiple-choice），只需每条数据携带 `"metadata": {"rm_type": "..."}`（列名由 `--metadata-key` 指定，默认 `metadata`）。
+
+两个可选参数控制降级样本的行为，默认值下与现有行为完全一致：
+
+- `--rm-type-fallback`：设为 `zero` 时，未知/缺失类型的样本记 `0.0` 分（感知 reward-key）并告警；设为已注册的 reward 名则路由到该 reward；不设置保持现有报错行为。
+- `--rm-type-infer`：无显式类型时按注册的保守 matcher 从 label 推断类型（严格数字答案 → `math`，`<answer>X</answer>` 单字母 → `multiple_choice`）。当 label 与显式类型冲突时记录告警，并以显式类型优先。
+
+降级告警包含样本 index、异常值与原因；每种 `(原因, 值)` 组合只打印一次，但计数器精确累计。注意：`--custom-rm-path` 仍然完全绕过路由；返回 dict 的 reward（如 `dapo`）不能与标量 reward 混在同一 batch（`--reward-key` 是全局的）；driver 侧运行时调用 `register_reward` 注册的 sync reward 对已启动的 Ray worker 不可见——请像 `registry.py` 一样在 import 期注册，或使用 `--custom-rm-path`。
+
 ## 自定义 Generate 函数
 
 对于多轮对话、工具调用、Agent 交互等场景，可自定义 `generate` 函数替换默认的单轮生成逻辑。函数签名如下：

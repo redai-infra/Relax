@@ -124,6 +124,23 @@ You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your ow
 --reward-key score
 ```
 
+### Format-aware reward routing
+
+Built-in rewards live in a registry (`relax/engine/rewards/registry.py`). Adding one is a single `register_reward` call — no dispatch branch to edit:
+
+```python
+register_reward("my_reward", "my_pkg.my_module:my_reward_fn")  # def my_reward_fn(response, label) -> float
+```
+
+Each sample resolves its reward type as: `metadata["rm_type"]` in the sample > `--rm-type` > label inference (opt-in) > fallback (opt-in). A batch can therefore mix task formats (e.g. math + multiple-choice) by carrying `"metadata": {"rm_type": "..."}` per data row (column name set by `--metadata-key`, default `metadata`).
+
+Two optional flags control degraded samples; their defaults keep today's behavior exactly:
+
+- `--rm-type-fallback`: `zero` scores unknown/missing-type samples `0.0` (reward-key aware) with a warning; a registered reward name routes them there; unset keeps the current error.
+- `--rm-type-infer`: infers the type from the label via conservative registered matchers (strict numeric answer → `math`, `<answer>X</answer>` single letter → `multiple_choice`) when no explicit type exists. When the label disagrees with an explicit type, a conflict warning is logged and the explicit type wins.
+
+Degradation warnings carry the sample index, offending value, and reason; each `(reason, value)` identity is logged once and counted exactly. Notes: `--custom-rm-path` still bypasses routing entirely; rewards returning dicts (e.g. `dapo`) cannot be mixed with scalar rewards in one batch because `--reward-key` is global; runtime `register_reward` calls in the driver are not visible to already-running Ray workers for sync rewards — register at import time (as `registry.py` does) or use `--custom-rm-path`.
+
 ## Custom Generate Function
 
 For multi-turn dialogue, tool calling, or agentic rollout, define a custom `generate` function to replace the default single-turn logic. The function signature is:
