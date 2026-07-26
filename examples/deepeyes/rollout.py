@@ -14,9 +14,8 @@ import pybase64
 import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
-from relax.engine.rollout.sglang_rollout import GenerateState
+from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, RolloutRequestAborted, request_model_aware
 from relax.utils.data.processing_utils import encode_image_for_rollout_engine, get_encode_executor
-from relax.utils.http_utils import post
 from relax.utils.types import Sample
 
 
@@ -213,7 +212,16 @@ async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params
     return current_image_data, response_tokens, context_budget, generation_budget, multimodal_train_inputs_buffer
 
 
-async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, args=None):
+async def _run_inference_step(
+    url: str,
+    tokens: list[int],
+    sampling_params: dict,
+    image_data,
+    tokenizer,
+    args=None,
+    *,
+    request_model: RequestModel,
+):
     payload = {
         "input_ids": tokens,
         "sampling_params": sampling_params,
@@ -224,7 +232,7 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     if image_data:
         payload["image_data"] = image_data
 
-    output = await post(url, payload)
+    output = await request_model(url, payload)
     response_text = output["text"]
     if "output_token_logprobs" in output["meta_info"]:
         new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -335,10 +343,16 @@ def _update_routed_experts(sample: Sample, meta_info: dict, args: Any) -> None:
     )
 
 
-def _finalize_sample(sample: Sample, tokenizer, response_tokens, multimodal_train_inputs_buffer):
+# Status-neutral sync of decoded response and multimodal train inputs.
+def _sync_sample_outputs(sample: Sample, tokenizer, response_tokens, multimodal_train_inputs_buffer):
     sample.multimodal_train_inputs = _merge_multimodal_train_inputs(multimodal_train_inputs_buffer)
     sample.response = tokenizer.decode(response_tokens, skip_special_tokens=False)
     sample.response_length = len(response_tokens)
+    return sample
+
+
+def _finalize_sample(sample: Sample, tokenizer, response_tokens, multimodal_train_inputs_buffer):
+    _sync_sample_outputs(sample, tokenizer, response_tokens, multimodal_train_inputs_buffer)
     if sample.status is None:
         sample.status = Sample.Status.COMPLETED
     return sample
@@ -391,10 +405,15 @@ class _RolloutTraceRecorder:
         }
 
 
-async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
-    """Custom multi-turn rollout that interacts with a pluggable
-    environment."""
-
+@request_model_aware
+async def generate(
+    args: Any,
+    sample: Sample,
+    sampling_params,
+    *,
+    request_model: RequestModel,
+) -> Sample:
+    # Custom multi-turn rollout that interacts with a pluggable environment.
     env, env_module, config, state, url = _initialize_resources(args, sample)
     sampling_params = sampling_params.copy()
 
@@ -469,15 +488,34 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             inference_start_ts = time.time()
-            (
-                response_text,
-                new_response_tokens,
-                new_response_log_probs,
-                finish_type,
-                meta_info,
-            ) = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
-            )
+            try:
+                (
+                    response_text,
+                    new_response_tokens,
+                    new_response_log_probs,
+                    finish_type,
+                    meta_info,
+                ) = await _run_inference_step(
+                    url,
+                    sample.tokens,
+                    cur_sampling_params,
+                    current_image_data,
+                    state.tokenizer,
+                    args=args,
+                    request_model=request_model,
+                )
+            except RolloutRequestAborted:
+                # Scheduler refused before HTTP; do not count this turn or append incomplete trace.
+                sample.metadata["rollout_turns"] = turn_idx
+                sample.metadata["rollout_stop_reason"] = "rollout_abort"
+                _sync_sample_outputs(
+                    sample,
+                    tokenizer=state.tokenizer,
+                    response_tokens=response_tokens,
+                    multimodal_train_inputs_buffer=multimodal_train_inputs_buffer,
+                )
+                # Keep _current_turn_response_start for resumption from the same turn.
+                raise
             inference_end_ts = time.time()
             trace_recorder.record_inference_output(
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)
