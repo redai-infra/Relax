@@ -488,3 +488,20 @@ def grade_answer_verl(solution_str, ground_truth):
     if given_answer is None:
         return False
     return grade_answer_mathd(given_answer, ground_truth) or grade_answer_sympy(given_answer, ground_truth)
+
+
+# ---------------------------------------------------------------------------
+# Format-aware reward registry wrapper
+# ---------------------------------------------------------------------------
+
+from relax.engine.rewards.registry import register_reward  # noqa: E402
+
+
+@register_reward("math")
+def math_reward(response, label, metadata=None):
+    """Reward function for the ``math`` type.
+
+    Registered via ``@register_reward("math")`` so it participates in the
+    format-aware reward routing system.
+    """
+    return 1 if grade_answer_verl(response, label) else 0
