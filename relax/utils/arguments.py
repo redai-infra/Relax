@@ -202,6 +202,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fast-colocate-switching",
+                action="store_true",
+                default=False,
+                help=(
+                    "Skip redundant NCCL process group destroy/reload cycle between "
+                    "sleep() and update_weights() in colocate mode. Instead of destroying "
+                    "groups in sleep() and immediately reloading them in update_weights(), "
+                    "keep groups alive through the weight sync and destroy once afterward. "
+                    "Only effective when --colocate is set."
+                ),
+            )
+            parser.add_argument(
+                "--pg-destroy-delay",
+                type=float,
+                default=2.0,
+                help=(
+                    "Seconds to wait after destroying NCCL process groups for TCP TIME_WAIT "
+                    "socket release (default: 2.0). Lower values reduce switching overhead "
+                    "but may cause 'Address already in use' errors on fast reload cycles."
+                ),
+            )
+            parser.add_argument(
                 "--offload",
                 action="store_true",
                 default=False,

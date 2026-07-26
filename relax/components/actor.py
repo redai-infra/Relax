@@ -209,9 +209,10 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
+        poll_interval = 0.2 if getattr(self.config, "fast_colocate_switching", False) else 1
         partition_list = run(self.data_system_client.async_get_partition_list())
         if partition_list is None or sft_partition_id(self.config, self.step) not in partition_list:
-            time.sleep(1)
+            time.sleep(poll_interval)
             return False
 
         # RL: poll rollout status — RL rollout runs async on the same GPUs, so
@@ -224,7 +225,7 @@ class Actor(Base):
         if is_sft_mode(self.config):
             return True
         if self.config.offload_rollout and ray.get(self.rollout_manager.get_status.remote()) == "onload":
-            time.sleep(1)
+            time.sleep(poll_interval)
             return False
         return True
 
