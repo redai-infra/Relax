@@ -39,6 +39,12 @@ class InferencePermitManager:
     """
 
     def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError(
+                f"InferencePermitManager capacity must be >= 1, got {capacity}. "
+                "It is derived from sglang_server_concurrency * rollout_num_gpus // "
+                "rollout_num_gpus_per_engine; a value < 1 would block every request forever."
+            )
         self.capacity = capacity
         # Public: GenerateState exposes it as ``self.semaphore`` (backward-compat
         # alias) and the session-lock dispatch path acquires it directly.

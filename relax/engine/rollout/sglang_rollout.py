@@ -7,7 +7,7 @@ import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from time import monotonic
 from typing import Any
 
@@ -138,7 +138,7 @@ class GenerateState(metaclass=SingletonMeta):
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
 
-    def inference_permit(self):
+    def inference_permit(self) -> AbstractAsyncContextManager[None]:
         """Per-request permit for custom multi-turn rollouts.
 
         Acquire one permit per model request and release it right after; do not

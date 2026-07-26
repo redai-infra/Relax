@@ -2,7 +2,7 @@
 
 """CPU async unit tests for per-request inference permit scheduling.
 
-Task #86 section 3-20. Covers acceptance V1-V6:
+Task 20 - claim issue #120 (task spec: #86 section 3-20). Covers acceptance V1-V6:
 - T1-T8 exercise ``InferencePermitManager`` directly (no ``GenerateState``, no GPU/network).
 - T9-T11 exercise ``_dispatch_generate`` with a lightweight stub state (duck-typed:
   only ``.aborted`` / ``.dp_rank_context`` / ``.semaphore``).
@@ -55,6 +55,13 @@ class _StubSample:
 # --------------------------------------------------------------------------- #
 # T1-T8: InferencePermitManager
 # --------------------------------------------------------------------------- #
+def test_capacity_must_be_positive() -> None:
+    """Capacity < 1 (e.g. from integer division) fails loudly, not a silent
+    hang."""
+    with pytest.raises(ValueError):
+        InferencePermitManager(capacity=0)
+
+
 async def test_permit_bounds_concurrency() -> None:
     """V3: peak in-flight requests never exceed the configured capacity."""
     mgr = InferencePermitManager(capacity=4)
