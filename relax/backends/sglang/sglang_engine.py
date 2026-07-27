@@ -30,6 +30,16 @@ from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_module
 logger = get_logger(__name__)
 
 
+# GenRM colocate offload drain: bound every HTTP round-trip and the whole drain
+# by a wall-clock deadline so a wedged SGLang scheduler surfaces as a
+# TimeoutError instead of blocking rank-0 in ray.get() (and every other rank at
+# the downstream offload barrier) indefinitely.
+_GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
+_GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
+_SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
+_MIN_HTTP_TIMEOUT_S = 1.0
+
+
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
     if args.colocate:
@@ -477,13 +487,16 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router(bootstrap_port=bootstrap_port)
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
         payload.
 
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
+            timeout: Optional per-request timeout in seconds. Defaults to None
+                (no timeout) to preserve behaviour for existing callers; pass a
+                bound on paths that must not hang (e.g. colocate offload).
 
         Returns:
             The JSON response from the server
@@ -491,7 +504,7 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -607,6 +620,29 @@ class SGLangEngine(RayActor):
         """
         return self._make_request("unload_lora_adapter", {"lora_name": lora_name})
 
+    def abort_requests(self, timeout: float = _SGLANG_HTTP_ATTEMPT_TIMEOUT_S):
+        """Best-effort abort of all in-flight requests on the engine.
+
+        Called while draining before offload (``release_memory_occupation``) so
+        lingering requests do not block ``flush_cache``: SGLang returns HTTP
+        400 from ``/flush_cache`` while the scheduler still has pending/running
+        requests. A GenRM judge/summary ``/generate`` left over from a partial
+        rollout can keep decoding for minutes, which otherwise times out the
+        offload and kills the job. Aborting drains the scheduler so the
+        subsequent flush + memory release proceed. Never raises — abort failure
+        must not block the offload path.
+        """
+        if self.node_rank != 0:
+            return
+        try:
+            requests.post(
+                f"http://{self.server_host}:{self.server_port}/abort_request",
+                json={"abort_all": True},
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort, keep offloading
+            logger.info(f"abort_requests failed (continuing to flush): {e}")
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
@@ -614,9 +650,17 @@ class SGLangEngine(RayActor):
         # flush cache will not return status_code 200 when there are pending requests
         for _ in range(60):
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S,
+                )
                 if response.status_code == 200:
                     break
+                # Non-200 (typically 400) means the scheduler still has pending/
+                # running requests. Sleep before retrying so the 60 iterations give
+                # a real ~60s drain window instead of spinning through them in
+                # milliseconds and raising TimeoutError immediately.
+                time.sleep(1)
             except NewConnectionError as e:
                 raise e
             except Exception as e:
@@ -839,13 +883,17 @@ class SGLangEngine(RayActor):
             },
         )
 
-    def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+    def pause_generation(self, timeout: float | None = None):
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, timeout=timeout
+        )
         response.raise_for_status()
         return response
 
-    def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+    def continue_generation(self, timeout: float | None = None):
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/continue_generation", json={}, timeout=timeout
+        )
         response.raise_for_status()
         return response
 
@@ -935,6 +983,74 @@ class GenRMEngine(SGLangEngine):
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
         else:
             self._init_normal(server_args_dict)
+
+    def release_memory_occupation(self):
+        # GenRM is colocated on the training GPUs, so it must offload at the
+        # rollout->train transition. Two failure modes are defended against here:
+        #
+        # 1. Admission race. SGLang's release_memory_occupation asserts the
+        #    scheduler is idle (``_is_no_request``); a straggler agentic
+        #    /generate admitted between our flush and the release crashes the
+        #    scheduler. relax has no hard barrier guaranteeing all agentic
+        #    sessions are quiesced before offload, so /pause_generation
+        #    (mode="abort", the default) is issued first: it stops the scheduler
+        #    from admitting new requests for the whole offloaded window AND
+        #    aborts everything in flight. Admission is re-opened by
+        #    continue_generation in resume_memory_occupation, after weights + KV
+        #    cache are back. We still abort on each retry as a fallback in case
+        #    the pause did not take (best-effort). Safe because the batch's
+        #    reward/judge is already computed by offload time — no in-flight
+        #    GenRM request needs to survive.
+        #
+        # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
+        #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
+        #    scheduler blocks rank-0 in ray.get() forever and every other rank
+        #    stalls at the downstream offload barrier — a silent training hang.
+        if self.node_rank == 0:
+            deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
+            self._pause_generation_for_offload(deadline)
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timeout while draining GenRM before release.")
+                self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+                try:
+                    resp = requests.get(
+                        f"http://{self.server_host}:{self.server_port}/flush_cache",
+                        timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()),
+                    )
+                    if resp.status_code == 200:
+                        break
+                except NewConnectionError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.info(f"Error flushing GenRM cache: {e}")
+                time.sleep(1)
+        return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
+
+    def resume_memory_occupation(self, tags: list[str] = None):
+        result = super().resume_memory_occupation(tags=tags)
+        # Re-open admission that release_memory_occupation closed via
+        # /pause_generation. Only after a full resume (weights + KV cache back):
+        # GenRM always full-resumes, but the ``not tags`` guard prevents
+        # re-enabling generation before KV cache exists if a partial
+        # (weights-only) resume is ever introduced. Not swallowed — if the
+        # engine stays paused, GenRM silently stops serving, so fail loudly.
+        if self.node_rank == 0 and not tags:
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+        return result
+
+    def _pause_generation_for_offload(self, deadline: float) -> None:
+        """Best-effort /pause_generation (abort mode) before draining for
+        offload.
+
+        Never raises: if the pause does not take, the per-retry abort in
+        release_memory_occupation still drains the engine — the pause only
+        additionally closes the flush->release admission window.
+        """
+        try:
+            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
 def _compute_genrm_server_args(
