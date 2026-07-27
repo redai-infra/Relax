@@ -214,18 +214,14 @@ class RewardExecutor:
             )
 
             if route.reward_type is None:
-                raise NotImplementedError(
-                    "Rule-based RM type could not be resolved: "
-                    f"reason={route.reason!r}, candidates={route.candidates!r}."
-                )
+                raise NotImplementedError(f"Rule-based RM type could not be resolved: issues={route.issues!r}.")
 
-            if route.reason is not None:
+            if route.issues:
                 logger.warning(
-                    "Reward route %s for sample index=%r group_index=%r candidates=%s; selected=%r source=%s",
-                    route.reason,
+                    "Reward route fallback for sample index=%r group_index=%r issues=%s; selected=%r source=%s",
                     getattr(sample, "index", None),
                     getattr(sample, "group_index", None),
-                    route.candidates,
+                    route.issues,
                     route.reward_type,
                     route.source,
                 )

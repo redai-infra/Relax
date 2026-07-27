@@ -12,10 +12,11 @@ import json
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from relax.engine.rewards.reward_router import RewardSpec, build_reward_registry
 from relax.engine.rollout.data_source import RolloutDataSource
 from relax.utils.types import Sample
 
@@ -27,6 +28,7 @@ def _make_preflight_data_source(
     reward_route=None,
     use_streaming=False,
     prompt_data=None,
+    tool_key=None,
 ):
     data_source = RolloutDataSource.__new__(RolloutDataSource)
     data_source.args = SimpleNamespace(
@@ -36,6 +38,7 @@ def _make_preflight_data_source(
         prompt_data=prompt_data,
         rm_type=rm_type,
         reward_route=reward_route,
+        tool_key=tool_key,
     )
     data_source._use_streaming = use_streaming
     data_source.dataset = SimpleNamespace(samples=samples)
@@ -60,12 +63,40 @@ class TestRewardRoutePreflight:
     def test_eager_dataset_blocks_unresolved_records(self):
         data_source = _make_preflight_data_source([Sample(label="unsupported", metadata={})])
 
-        with pytest.raises(ValueError, match="1 sample.*no unambiguous reward assignment"):
+        with pytest.raises(ValueError, match="1 sample.*no reward assignment"):
             data_source.validate_reward_routes()
+
+    def test_label_conflict_blocks_preflight_even_when_global_fallback_resolves(self):
+        registry = build_reward_registry(
+            (
+                ("first", RewardSpec("sync", MagicMock(), lambda label, metadata: True)),
+                ("second", RewardSpec("sync", MagicMock(), lambda label, metadata: True)),
+                ("global_reward", RewardSpec("sync", MagicMock())),
+            )
+        )
+        data_source = _make_preflight_data_source(
+            [Sample(label="ambiguous", metadata={"rm_type": "unknown"})],
+            rm_type="global_reward",
+        )
+
+        with patch("relax.engine.rewards.REWARD_REGISTRY", registry):
+            with pytest.raises(ValueError, match="1 sample.*ambiguous label matcher assignments"):
+                data_source.validate_reward_routes()
 
     def test_unknown_metadata_uses_global_fallback(self):
         data_source = _make_preflight_data_source(
             [Sample(label="unsupported", metadata={"rm_type": "unknown"})],
+            rm_type="math",
+        )
+
+        report = data_source.validate_reward_routes()
+
+        assert report["assignments"] == {"global/math": 1}
+        assert report["fallback_count"] == 1
+
+    def test_missing_sample_route_uses_global_fallback(self):
+        data_source = _make_preflight_data_source(
+            [Sample(label="unsupported", metadata={})],
             rm_type="math",
         )
 
@@ -84,7 +115,7 @@ class TestRewardRoutePreflight:
         report = data_source.validate_reward_routes()
 
         assert report["assignments"] == {"global/openr1mm": 1}
-        assert report["fallback_count"] == 0
+        assert report["fallback_count"] == 1
 
     def test_streaming_preflight_scans_raw_route_fields(self):
         rows = [
@@ -103,6 +134,51 @@ class TestRewardRoutePreflight:
 
             assert report["total"] == 2
             assert report["assignments"] == {"label/multiple_choice": 1, "metadata/math": 1}
+        finally:
+            if path is not None and os.path.exists(path):
+                os.unlink(path)
+
+    def test_streaming_route_fields_match_runtime_metadata_normalization(self):
+        row = {
+            "text": "math",
+            "label": "unsupported",
+            "metadata": "invalid-metadata-is-normalized",
+            "data_source": "gsm8k",
+            "tools": '[{"type": "function", "function": {"name": "calculator"}}]',
+        }
+        path = None
+        registry = build_reward_registry(
+            (
+                (
+                    "source_and_tools",
+                    RewardSpec(
+                        "sync",
+                        lambda *args: 0.0,
+                        lambda label, metadata: (
+                            label == "unsupported"
+                            and metadata.get("data_source") == "gsm8k"
+                            and metadata.get("tools", [{}])[0].get("type") == "function"
+                        ),
+                    ),
+                ),
+            )
+        )
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as stream:
+                path = stream.name
+                stream.write(json.dumps(row) + "\n")
+            data_source = _make_preflight_data_source(
+                [],
+                use_streaming=True,
+                prompt_data=path,
+                tool_key="tools",
+            )
+
+            with patch("relax.engine.rewards.REWARD_REGISTRY", registry):
+                report = data_source.validate_reward_routes()
+
+            assert report["assignments"] == {"label/source_and_tools": 1}
+            assert report["unresolved_count"] == 0
         finally:
             if path is not None and os.path.exists(path):
                 os.unlink(path)

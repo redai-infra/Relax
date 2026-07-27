@@ -3,7 +3,7 @@
 from collections import Counter
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Iterable, Literal, Mapping
+from typing import Callable, Iterable, Literal, Mapping, NamedTuple
 
 
 RewardMode = Literal["sync", "async"]
@@ -29,13 +29,25 @@ class RewardRouteConfig:
     priority: tuple[RewardRouteStage, ...] = DEFAULT_REWARD_ROUTE_PRIORITY
 
 
+class RewardRouteIssue(NamedTuple):
+    stage: RewardRouteStage
+    reason: RewardRouteReason
+    candidates: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class ResolvedRewardRoute:
+    """A route selection plus issues relevant to that final selection.
+
+    Missing optional sample fields are omitted when another sample-level source
+    resolves normally. Unknown values and matcher conflicts remain observable,
+    and unresolved routes retain issues from every stage.
+    """
+
     reward_type: str | None
     source: RewardSource
     boxed: bool = False
-    reason: RewardRouteReason | None = None
-    candidates: tuple[str, ...] = ()
+    issues: tuple[RewardRouteIssue, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -50,7 +62,10 @@ class RewardRoutePreflightReport:
 
     @property
     def is_valid(self) -> bool:
-        return self.unresolved_count == 0
+        # A later fallback may resolve a sample after label matching has already
+        # exposed an ambiguous registry configuration.  That route is useful
+        # for diagnostics, but it must not make preflight validation succeed.
+        return self.unresolved_count == 0 and self.conflict_count == 0
 
     def to_dict(self) -> dict:
         return {
@@ -132,25 +147,33 @@ def resolve_reward_route(
     metadata_value = metadata_dict.get("rm_type")
     metadata_missing = metadata_value is None or (isinstance(metadata_value, str) and not metadata_value.strip())
     explicit_missing = explicit_rm_type is None or (isinstance(explicit_rm_type, str) and not explicit_rm_type.strip())
-    first_problem: tuple[RewardRouteReason, tuple[str, ...]] | None = None
+    issues: list[RewardRouteIssue] = []
+
+    def resolved(
+        reward_type: str,
+        source: RewardSource,
+        *,
+        boxed: bool = False,
+        include_missing: bool = False,
+    ) -> ResolvedRewardRoute:
+        route_issues = tuple(issue for issue in issues if include_missing or issue.reason != "missing")
+        return ResolvedRewardRoute(
+            reward_type=reward_type,
+            source=source,
+            boxed=boxed,
+            issues=route_issues,
+        )
 
     for stage in normalize_reward_route_priority(priority):
         if stage == "metadata":
             if metadata_missing:
+                issues.append(RewardRouteIssue("metadata", "missing", ()))
                 continue
             registered = _registered_reward_type(metadata_value, registry)
             if registered is not None:
                 reward_type, boxed = registered
-                reason, candidates = first_problem or (None, ())
-                return ResolvedRewardRoute(
-                    reward_type=reward_type,
-                    source="metadata",
-                    boxed=boxed,
-                    reason=reason,
-                    candidates=candidates,
-                )
-            if first_problem is None:
-                first_problem = ("unknown", (repr(metadata_value),))
+                return resolved(reward_type, "metadata", boxed=boxed)
+            issues.append(RewardRouteIssue("metadata", "unknown", (repr(metadata_value),)))
             continue
 
         if stage == "label":
@@ -160,39 +183,27 @@ def resolve_reward_route(
                 if spec.label_matcher is not None and spec.label_matcher(label, metadata_dict)
             )
             if len(matches) == 1:
-                reason, candidates = first_problem or (None, ())
-                return ResolvedRewardRoute(
-                    reward_type=matches[0],
-                    source="label",
-                    reason=reason,
-                    candidates=candidates,
-                )
-            if len(matches) > 1 and first_problem is None:
-                first_problem = ("conflict", matches)
+                return resolved(matches[0], "label")
+            if len(matches) > 1:
+                issues.append(RewardRouteIssue("label", "conflict", matches))
+            else:
+                issues.append(RewardRouteIssue("label", "missing", ()))
             continue
 
         if explicit_missing:
+            issues.append(RewardRouteIssue("rm_type", "missing", ()))
             continue
         registered = _registered_reward_type(explicit_rm_type, registry)
         if registered is not None:
             reward_type, boxed = registered
-            reason, candidates = first_problem or (None, ())
-            return ResolvedRewardRoute(
-                reward_type=reward_type,
-                source="global",
-                boxed=boxed,
-                reason=reason,
-                candidates=candidates,
-            )
-        if first_problem is None:
-            first_problem = ("unknown", (repr(explicit_rm_type),))
+            return resolved(reward_type, "global", boxed=boxed, include_missing=True)
+        issues.append(RewardRouteIssue("rm_type", "unknown", (repr(explicit_rm_type),)))
 
-    reason, candidates = first_problem or ("missing", ())
+    route_issues = tuple(issues)
     return ResolvedRewardRoute(
         reward_type=None,
         source="none",
-        reason=reason,
-        candidates=candidates,
+        issues=route_issues or (RewardRouteIssue("rm_type", "missing", ()),),
     )
 
 
@@ -216,13 +227,13 @@ def preflight_reward_routes(
     for index, label, metadata in records:
         total += 1
         route = resolve_reward_route(metadata, label, explicit_rm_type, registry, normalized_priority)
-        if route.reason == "conflict":
+        if any(issue.reason == "conflict" for issue in route.issues):
             conflict_count += 1
             if len(conflict_indices) < max_reported_indices:
                 conflict_indices.append(index)
         if route.reward_type is not None:
             assignments[f"{route.source}/{route.reward_type}"] += 1
-            if route.reason is not None:
+            if route.issues:
                 fallback_count += 1
             continue
 

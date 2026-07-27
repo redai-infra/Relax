@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import itertools
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,6 +27,10 @@ def _registry(*entries):
     return build_reward_registry(entries)
 
 
+def _issue_reasons(route):
+    return tuple(issue.reason for issue in route.issues)
+
+
 def test_metadata_route_keeps_existing_priority_and_skips_matcher():
     def unexpected_matcher(label, metadata):
         del label, metadata
@@ -46,7 +51,7 @@ def test_metadata_route_keeps_existing_priority_and_skips_matcher():
 
     assert route.reward_type == "metadata_reward"
     assert route.source == "metadata"
-    assert route.reason is None
+    assert _issue_reasons(route) == ()
 
 
 def test_label_route_precedes_global_route_by_default():
@@ -61,7 +66,7 @@ def test_label_route_precedes_global_route_by_default():
     assert route.source == "label"
 
 
-def test_custom_priority_can_put_global_route_before_label_matcher():
+def test_custom_priority_can_fall_back_to_global_before_label_matcher():
     def unexpected_matcher(label, metadata):
         del label, metadata
         raise AssertionError("label matcher must not run")
@@ -81,7 +86,31 @@ def test_custom_priority_can_put_global_route_before_label_matcher():
 
     assert route.reward_type == "fallback"
     assert route.source == "global"
-    assert route.reason is None
+    assert _issue_reasons(route) == ("missing",)
+
+
+@pytest.mark.parametrize("priority", tuple(itertools.permutations(("metadata", "label", "rm_type"))))
+def test_every_priority_permutation_selects_first_valid_source(priority):
+    registry = _registry(
+        ("metadata_reward", RewardSpec("sync", _handler)),
+        ("label_reward", RewardSpec("sync", _handler, lambda label, metadata: label == "match")),
+        ("global_reward", RewardSpec("sync", _handler)),
+    )
+    expected = {
+        "metadata": ("metadata_reward", "metadata"),
+        "label": ("label_reward", "label"),
+        "rm_type": ("global_reward", "global"),
+    }[priority[0]]
+
+    route = resolve_reward_route(
+        {"rm_type": "metadata_reward"},
+        "match",
+        "global_reward",
+        registry,
+        priority,
+    )
+
+    assert (route.reward_type, route.source) == expected
 
 
 def test_missing_metadata_and_label_use_later_global_route_by_default():
@@ -91,7 +120,41 @@ def test_missing_metadata_and_label_use_later_global_route_by_default():
 
     assert route.reward_type == "global_reward"
     assert route.source == "global"
-    assert route.reason is None
+    assert _issue_reasons(route) == ("missing", "missing")
+    assert [(issue.stage, issue.reason) for issue in route.issues] == [
+        ("metadata", "missing"),
+        ("label", "missing"),
+    ]
+
+
+def test_missing_metadata_does_not_warn_when_label_matches():
+    registry = _registry(
+        ("label_reward", RewardSpec("sync", _handler, lambda label, metadata: label == "match")),
+    )
+
+    route = resolve_reward_route({}, "match", "unused", registry)
+
+    assert route.reward_type == "label_reward"
+    assert route.source == "label"
+    assert _issue_reasons(route) == ()
+    assert route.issues == ()
+
+
+def test_global_first_is_explicit_selection_not_fallback():
+    registry = _registry(("global_reward", RewardSpec("sync", _handler)))
+
+    route = resolve_reward_route(
+        {},
+        "unsupported",
+        "global_reward",
+        registry,
+        ("rm_type", "metadata", "label"),
+    )
+
+    assert route.reward_type == "global_reward"
+    assert route.source == "global"
+    assert _issue_reasons(route) == ()
+    assert route.issues == ()
 
 
 def test_unknown_metadata_uses_label_before_global_by_default():
@@ -104,7 +167,7 @@ def test_unknown_metadata_uses_label_before_global_by_default():
 
     assert route.reward_type == "label_reward"
     assert route.source == "label"
-    assert route.reason == "unknown"
+    assert _issue_reasons(route) == ("unknown",)
 
 
 def test_unknown_metadata_uses_global_fallback_when_configured_before_label():
@@ -123,7 +186,7 @@ def test_unknown_metadata_uses_global_fallback_when_configured_before_label():
 
     assert route.reward_type == "global_reward"
     assert route.source == "global"
-    assert route.reason == "unknown"
+    assert _issue_reasons(route) == ("unknown",)
 
 
 def test_unknown_metadata_without_fallback_returns_unresolved_route():
@@ -133,7 +196,7 @@ def test_unknown_metadata_without_fallback_returns_unresolved_route():
 
     assert route.reward_type is None
     assert route.source == "none"
-    assert route.reason == "unknown"
+    assert _issue_reasons(route) == ("unknown", "missing", "missing")
 
 
 @pytest.mark.parametrize(
@@ -159,7 +222,7 @@ def test_ambiguous_or_unsupported_label_is_not_guessed(label):
     route = resolve_reward_route({}, label, None, REWARD_REGISTRY)
 
     assert route.reward_type is None
-    assert route.reason == "missing"
+    assert _issue_reasons(route) == ("missing", "missing", "missing")
 
 
 def test_multiple_label_matches_are_reported_as_conflict():
@@ -171,11 +234,12 @@ def test_multiple_label_matches_are_reported_as_conflict():
     route = resolve_reward_route({}, "label", None, registry)
 
     assert route.reward_type is None
-    assert route.reason == "conflict"
-    assert route.candidates == ("first", "second")
+    assert _issue_reasons(route) == ("missing", "conflict", "missing")
+    conflict = next(issue for issue in route.issues if issue.reason == "conflict")
+    assert conflict.candidates == ("first", "second")
 
 
-def test_label_conflict_can_fall_back_to_later_global_route():
+def test_label_conflict_route_keeps_later_global_result_for_diagnostics():
     registry = _registry(
         ("first", RewardSpec("sync", _handler, lambda label, metadata: True)),
         ("second", RewardSpec("sync", _handler, lambda label, metadata: True)),
@@ -186,8 +250,30 @@ def test_label_conflict_can_fall_back_to_later_global_route():
 
     assert route.reward_type == "global_reward"
     assert route.source == "global"
-    assert route.reason == "conflict"
-    assert route.candidates == ("first", "second")
+    assert _issue_reasons(route) == ("missing", "conflict")
+    assert route.issues[-1].candidates == ("first", "second")
+
+
+def test_unknown_metadata_and_label_conflict_both_remain_observable_after_global_fallback():
+    registry = _registry(
+        ("first", RewardSpec("sync", _handler, lambda label, metadata: True)),
+        ("second", RewardSpec("sync", _handler, lambda label, metadata: True)),
+        ("global_reward", RewardSpec("sync", _handler)),
+    )
+
+    route = resolve_reward_route({"rm_type": "unknown"}, "label", "global_reward", registry)
+    report = preflight_reward_routes([(7, "label", {"rm_type": "unknown"})], "global_reward", registry)
+
+    assert route.reward_type == "global_reward"
+    assert [(issue.stage, issue.reason) for issue in route.issues] == [
+        ("metadata", "unknown"),
+        ("label", "conflict"),
+    ]
+    assert _issue_reasons(route) == ("unknown", "conflict")
+    assert report.fallback_count == 1
+    assert report.conflict_count == 1
+    assert report.conflict_indices == (7,)
+    assert report.is_valid is False
 
 
 def test_registry_rejects_duplicate_names():
@@ -196,6 +282,19 @@ def test_registry_rejects_duplicate_names():
             ("duplicate", RewardSpec("sync", _handler)),
             ("duplicate", RewardSpec("async", _handler)),
         )
+
+
+@pytest.mark.parametrize(
+    ("entry", "error_type"),
+    [
+        (("bad", RewardSpec("invalid", _handler)), ValueError),
+        (("bad", RewardSpec("sync", None)), TypeError),
+        (("bad", RewardSpec("sync", _handler, "not-callable")), TypeError),
+    ],
+)
+def test_registry_rejects_invalid_specs(entry, error_type):
+    with pytest.raises(error_type):
+        _registry(entry)
 
 
 @pytest.mark.asyncio
@@ -286,7 +385,15 @@ def test_preflight_counts_unknown_metadata_global_fallback():
     assert report.is_valid is True
 
 
-def test_preflight_counts_resolved_label_conflict():
+def test_preflight_counts_missing_sample_route_global_fallback():
+    report = preflight_reward_routes([(0, "unsupported", {})], "math", REWARD_REGISTRY)
+
+    assert report.assignments == {"global/math": 1}
+    assert report.fallback_count == 1
+    assert report.is_valid is True
+
+
+def test_preflight_rejects_label_conflict_even_when_global_route_resolves():
     registry = _registry(
         ("first", RewardSpec("sync", _handler, lambda label, metadata: True)),
         ("second", RewardSpec("sync", _handler, lambda label, metadata: True)),
@@ -300,6 +407,7 @@ def test_preflight_counts_resolved_label_conflict():
     assert report.unresolved_count == 0
     assert report.conflict_count == 1
     assert report.conflict_indices == (7,)
+    assert report.is_valid is False
 
 
 def test_zero_reward_preserves_reward_key_shape():
@@ -366,10 +474,32 @@ async def test_runtime_warns_when_invalid_metadata_falls_back_to_global_route():
         await executor.execute(args, sample)
 
     warning.assert_called_once()
-    assert warning.call_args.args[1] == "unknown"
+    assert tuple(issue.reason for issue in warning.call_args.args[3]) == ("unknown",)
     worker.compute.remote.assert_called_once_with(
         "openr1mm",
         "answer",
         "unsupported",
         metadata={"rm_type": "unknown"},
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_warns_when_missing_sample_route_falls_back_to_global_route():
+    executor = RewardExecutor(max_concurrency=1, num_workers=1)
+    args = SimpleNamespace(custom_rm_path=None, rm_type="openr1mm", reward_key=None)
+    sample = Sample(response="answer", label="unsupported", metadata={})
+
+    async def completed_reward():
+        return 1.0
+
+    with (
+        patch.object(executor, "_ensure_workers"),
+        patch.object(executor, "_next_worker") as next_worker,
+        patch("relax.engine.rewards.logger.warning") as warning,
+    ):
+        worker = next_worker.return_value
+        worker.compute.remote.return_value = completed_reward()
+        await executor.execute(args, sample)
+
+    warning.assert_called_once()
+    assert tuple(issue.reason for issue in warning.call_args.args[3]) == ("missing", "missing")

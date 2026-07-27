@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from relax.utils.data.data import Dataset
-from relax.utils.data.data_utils import read_file
+from relax.utils.data.data_utils import extract_route_fields, read_file
 from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -205,12 +205,17 @@ class RolloutDataSource(DataSource):
 
         if self._use_streaming:
             label_key = getattr(self.args, "label_key", None)
+            tool_key = getattr(self.args, "tool_key", None)
             metadata_key = getattr(self.args, "metadata_key", "metadata")
 
             def records():
                 for index, data in enumerate(read_file(self.args.prompt_data)):
-                    label = data.get(label_key) if label_key is not None else None
-                    metadata = data.get(metadata_key) or {}
+                    label, metadata, _ = extract_route_fields(
+                        data,
+                        label_key=label_key,
+                        tool_key=tool_key,
+                        metadata_key=metadata_key,
+                    )
                     yield index, label, metadata
 
             route_records = records()
@@ -243,17 +248,18 @@ class RolloutDataSource(DataSource):
             )
         if not report.is_valid:
             logger.warning(
-                "Reward routing preflight found %d unresolved sample(s), including conflicts=%d; "
-                "sample_indices=%s conflict_indices=%s.",
+                "Reward routing preflight found unresolved=%d conflict=%d; sample_indices=%s conflict_indices=%s.",
                 report.unresolved_count,
                 report.conflict_count,
                 report.unresolved_indices,
                 report.conflict_indices,
             )
-            raise ValueError(
-                "Reward routing preflight failed: "
-                f"{report.unresolved_count} sample(s) have no unambiguous reward assignment."
-            )
+            failure_reasons = []
+            if report.conflict_count:
+                failure_reasons.append(f"{report.conflict_count} sample(s) have ambiguous label matcher assignments")
+            if report.unresolved_count:
+                failure_reasons.append(f"{report.unresolved_count} sample(s) have no reward assignment")
+            raise ValueError("Reward routing preflight failed: " + "; ".join(failure_reasons) + ".")
         return report.to_dict()
 
     def get_samples(self, num_samples):
