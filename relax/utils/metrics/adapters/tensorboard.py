@@ -36,12 +36,17 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
         tb_project_name = args.tb_project_name
         tb_experiment_name = args.tb_experiment_name
         save_dir = getattr(args, "save", None)
-        if tb_project_name is not None or os.environ.get("TENSORBOARD_DIR", None) or save_dir:
-            if tb_project_name is not None and tb_experiment_name is None:
-                tb_experiment_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._initialize(tb_project_name, tb_experiment_name, save_dir)
-        else:
-            raise ValueError("tb_project_name and tb_experiment_name, TENSORBOARD_DIR, or args.save are required")
+        if tb_project_name is None and not os.environ.get("TENSORBOARD_DIR", None) and not save_dir:
+            # Nothing user-supplied to locate the run — fall back to a defaulted
+            # project + timestamped experiment so tensorboard just works.
+            tb_project_name = "relax"
+            logger.warning(
+                "No tb_project_name / tb_experiment_name / TENSORBOARD_DIR / args.save supplied; "
+                f"defaulting tb_project_name={tb_project_name!r} and auto-generating tb_experiment_name."
+            )
+        if tb_project_name is not None and tb_experiment_name is None:
+            tb_experiment_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._initialize(tb_project_name, tb_experiment_name, save_dir)
 
     def _initialize(self, tb_project_name, tb_experiment_name, save_dir):
         """Actual initialization logic."""
