@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from argparse import Namespace
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
@@ -12,14 +13,35 @@ import pytest
 
 from examples.deepeyes import rollout as deepeyes_rollout
 from relax.engine.rollout import sglang_rollout
+from relax.engine.rollout.request_gate import InferenceRequestGate
 from relax.utils.types import Sample
 
 
 Runner = Callable[[Any, Sample], Awaitable[None]]
+_ALLOWED_REQUEST_EVENT_FIELDS = {
+    "request_id",
+    "turn_index",
+    "relative_start_s",
+    "permit_wait_s",
+    "request_duration_s",
+    "total_duration_s",
+    "queue_depth_at_start",
+    "queue_depth_at_acquire",
+    "in_flight_at_start",
+    "in_flight_at_end",
+    "capacity",
+    "outcome",
+    "exception_type",
+    "reentrant",
+}
 
 
 class _Tokenizer:
     bos_token_id = None
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del text, add_special_tokens
+        return [1]
 
     def decode(self, tokens: list[int], skip_special_tokens: bool = False) -> str:
         del skip_special_tokens
@@ -52,10 +74,19 @@ class _RequestProbe:
             self.in_flight -= 1
 
 
+class _CapturedLogger:
+    def __init__(self) -> None:
+        self.debug_messages: list[str] = []
+
+    def debug(self, message: str, *args: Any) -> None:
+        self.debug_messages.append(message % args)
+
+
 def _make_state(capacity: int) -> Any:
     state = object.__new__(sglang_rollout.GenerateState)
-    state.semaphore = asyncio.Semaphore(capacity)
     state.aborted = False
+    state.request_gate = InferenceRequestGate(capacity=capacity, is_aborted=lambda: state.aborted)
+    state.semaphore = state.request_gate.semaphore
     state.dp_counts = [0]
     state.dp_rank = 0
     state.opd_manager = None
@@ -64,14 +95,35 @@ def _make_state(capacity: int) -> Any:
     return state
 
 
-def _make_args(custom_generate_function_path: str | None = None) -> Namespace:
+def _make_args(custom_generate_function_path: str | None = None, *, capacity: int = 1) -> Namespace:
     return Namespace(
+        hf_checkpoint="unused-task20",
+        mm_processor_pool_size=0,
+        sglang_server_concurrency=capacity,
+        rollout_num_gpus=1,
+        rollout_num_gpus_per_engine=1,
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=False,
+        sglang_enable_deterministic_inference=False,
+        sglang_dp_size=1,
+        ci_test=False,
         partial_rollout=False,
         mask_offpolicy_in_partial_rollout=False,
         group_rm=True,
         custom_generate_function_path=custom_generate_function_path,
         rollout_max_response_len=16,
         rollout_max_context_len=None,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        sglang_router_policy="random",
+        slime_router_sticky=False,
+        use_slime_router=False,
+        slime_router_middleware_paths=[],
+        sglang_speculative_algorithm=None,
         use_rollout_routing_replay=False,
         num_layers=1,
         moe_router_topk=1,
@@ -136,6 +188,15 @@ async def _legacy_generate(
     return sample
 
 
+async def _legacy_delegate_builtin_generate(
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+) -> Sample:
+    return await sglang_rollout.generate(args, sample, sampling_params, evaluation=evaluation)
+
+
 async def _unmarked_permit_generate(
     args: Namespace,
     sample: Sample,
@@ -192,6 +253,65 @@ async def test_request_permit_recovers_after_exception_and_cancellation() -> Non
     hold.set()
     await second_holder
     await asyncio.wait_for(_acquire_request_permit(state), timeout=1.0)
+
+
+def test_generate_state_semaphore_aliases_request_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sglang_rollout, "load_tokenizer", lambda *args, **kwargs: _Tokenizer())
+    monkeypatch.setattr(sglang_rollout, "load_processor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sglang_rollout.opd, "is_opd_enabled", lambda args: False)
+    sglang_rollout.GenerateState.clear_instances()
+
+    try:
+        state = sglang_rollout.GenerateState(_make_args(capacity=2))
+        request_gate = getattr(state, "request_gate", None)
+        assert request_gate is not None
+        assert state.semaphore is request_gate.semaphore
+    finally:
+        sglang_rollout.GenerateState.clear_instances()
+
+
+@pytest.mark.parametrize(("log_level", "expected_count"), (("INFO", 0), ("DEBUG", 1)))
+async def test_default_request_logging_is_debug_only_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    log_level: str,
+    expected_count: int,
+) -> None:
+    captured_logger = _CapturedLogger()
+    monkeypatch.setattr(sglang_rollout, "load_tokenizer", lambda *args, **kwargs: _Tokenizer())
+    monkeypatch.setattr(sglang_rollout, "load_processor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sglang_rollout.opd, "is_opd_enabled", lambda args: False)
+    monkeypatch.setattr(sglang_rollout, "LOG_LEVEL", log_level)
+    monkeypatch.setattr(sglang_rollout, "logger", captured_logger)
+
+    async def fake_post(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
+        del url, payload, headers
+        return {
+            "text": "sensitive-response-body",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.1, 10]],
+            },
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    sglang_rollout.GenerateState.clear_instances()
+
+    try:
+        result = await _run_sample(_make_args(), Sample(prompt="sensitive-prompt-body"))
+    finally:
+        sglang_rollout.GenerateState.clear_instances()
+
+    assert result.status == Sample.Status.COMPLETED
+    assert len(captured_logger.debug_messages) == expected_count
+    if expected_count:
+        message = captured_logger.debug_messages[0]
+        prefix = "request_event="
+        assert message.startswith(prefix)
+        payload = json.loads(message.removeprefix(prefix))
+        assert set(payload) == _ALLOWED_REQUEST_EVENT_FIELDS
+        assert payload["outcome"] == "success"
+        assert "sensitive-prompt-body" not in message
+        assert "sensitive-response-body" not in message
 
 
 async def test_generate_and_rm_keeps_legacy_custom_generator_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,14 +381,43 @@ async def test_queued_permit_aware_request_stops_after_abort(monkeypatch: pytest
     await asyncio.wait_for(_acquire_request_permit(state), timeout=1.0)
 
 
-async def test_unmarked_custom_generator_cannot_nest_request_permit(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_unmarked_custom_generator_borrows_same_task_request_permit(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _make_state(capacity=1)
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
     args = _make_args(_function_path(_unmarked_permit_generate))
 
-    with pytest.raises(RuntimeError, match="manages_inference_permit"):
-        await asyncio.wait_for(_run_sample(args, _make_sample()), timeout=1.0)
+    result = await asyncio.wait_for(_run_sample(args, _make_sample()), timeout=1.0)
 
+    assert result.status == Sample.Status.COMPLETED
+    await asyncio.wait_for(_acquire_semaphore(state.semaphore), timeout=1.0)
+
+
+async def test_legacy_custom_generator_can_delegate_builtin_generate(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _make_state(capacity=1)
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    args = _make_args(_function_path(_legacy_delegate_builtin_generate))
+    probe = _RequestProbe(capacity=1)
+
+    async def fake_post(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
+        del url, payload, headers
+        await probe.execute("delegated-default")
+        return {
+            "text": "response",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.1, 10]],
+            },
+        }
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+
+    result = await asyncio.wait_for(_run_sample(args, _make_sample()), timeout=1.0)
+
+    assert result.status == Sample.Status.COMPLETED
+    assert result.response == "response"
+    assert probe.start_order == ["delegated-default"]
+    assert probe.peak_in_flight == 1
+    assert probe.in_flight == 0
     await asyncio.wait_for(_acquire_semaphore(state.semaphore), timeout=1.0)
 
 
@@ -356,11 +505,8 @@ async def test_deepeyes_dispatch_releases_permit_during_environment_step(
 
         short_sample = _make_sample(short_runner, path=_function_path(_permit_aware_generate))
         short_task = asyncio.create_task(_run_sample(args, short_sample), name="short-request")
-        for _ in range(50):
-            if probe.started("short").is_set():
-                break
-            await asyncio.sleep(0)
-        interleaved = probe.started("short").is_set()
+        await asyncio.wait_for(probe.started("short").wait(), timeout=1.0)
+        interleaved = True
         long_waited_in_env = not long_task.done()
     finally:
         release_env.set()
@@ -375,7 +521,9 @@ async def test_deepeyes_dispatch_releases_permit_during_environment_step(
     assert isinstance(short_result, Sample)
     assert long_result.status == Sample.Status.COMPLETED
     assert short_result.status == Sample.Status.COMPLETED
+    assert model_calls == 2
+    assert env_calls == 2
     assert probe.peak_in_flight == 1
     assert probe.in_flight == 0
-    assert probe.start_order.index("short") < probe.start_order.index("deepeyes-1")
+    assert probe.start_order == ["deepeyes-0", "short", "deepeyes-1"]
     assert env.closed

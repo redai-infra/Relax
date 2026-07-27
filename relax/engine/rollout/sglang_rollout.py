@@ -3,11 +3,12 @@
 import asyncio
 import copy
 import inspect
+import json
 import uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, contextmanager
-from contextvars import ContextVar
+from dataclasses import asdict
 from time import monotonic
 from typing import Any
 
@@ -24,6 +25,7 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.request_gate import GenerationAborted, InferenceRequestGate, RequestEvent
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -36,7 +38,7 @@ from relax.utils.data.processing_utils import (
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import get, post
-from relax.utils.logging_utils import get_logger
+from relax.utils.logging_utils import LOG_LEVEL, get_logger
 from relax.utils.misc import SingletonMeta, load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.timer import Timer
@@ -51,11 +53,9 @@ __all__ = ["generate_rollout"]
 logger = get_logger(__name__)
 
 
-class _RequestAborted(Exception):
-    pass
-
-
-_LEGACY_CUSTOM_GENERATE_ACTIVE: ContextVar[bool] = ContextVar("legacy_custom_generate_active", default=False)
+class _RequestEventLogger:
+    def record(self, event: RequestEvent) -> None:
+        logger.debug("request_event=%s", json.dumps(asdict(event), sort_keys=True, separators=(",", ":")))
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -85,9 +85,13 @@ class GenerateState(metaclass=SingletonMeta):
                 except Exception as e:
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        request_capacity = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self.request_gate = InferenceRequestGate(
+            capacity=request_capacity,
+            is_aborted=lambda: self.aborted,
+            recorder=_RequestEventLogger() if LOG_LEVEL == "DEBUG" else None,
         )
+        self.semaphore = self.request_gate.semaphore
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -124,14 +128,7 @@ class GenerateState(metaclass=SingletonMeta):
 
     @asynccontextmanager
     async def request_permit(self) -> AsyncIterator[None]:
-        if _LEGACY_CUSTOM_GENERATE_ACTIVE.get():
-            raise RuntimeError(
-                "Custom generate functions using request_permit() must set manages_inference_permit = True"
-            )
-
-        async with self.semaphore:
-            if self.aborted:
-                raise _RequestAborted
+        async with self.request_gate.permit():
             yield
 
     def reset(self) -> None:
@@ -353,10 +350,17 @@ async def generate(
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
-    async with state.request_permit():
+    _t_generate = 0.0
+
+    async def _send_request() -> dict[str, Any]:
+        nonlocal _t_generate
         _t_generate_start = monotonic()
-        output = await post(url, payload, headers=headers)
-        _t_generate = monotonic() - _t_generate_start
+        try:
+            return await post(url, payload, headers=headers)
+        finally:
+            _t_generate = monotonic() - _t_generate_start
+
+    output = await state.request_gate.run(_send_request)
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -494,21 +498,14 @@ async def generate_and_rm(
     )
     try:
         if custom_generate_func is not None and not manages_inference_permit:
-            async with state.semaphore:
-                if state.aborted:
-                    sample.status = Sample.Status.ABORTED
-                    return sample
-                token = _LEGACY_CUSTOM_GENERATE_ACTIVE.set(True)
-                try:
-                    await _dispatch_generate()
-                finally:
-                    _LEGACY_CUSTOM_GENERATE_ACTIVE.reset(token)
+            async with state.request_permit():
+                await _dispatch_generate()
         else:
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
                 return sample
             await _dispatch_generate()
-    except _RequestAborted:
+    except GenerationAborted:
         sample.status = Sample.Status.ABORTED
         return sample
 
