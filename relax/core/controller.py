@@ -347,6 +347,34 @@ class Controller:
                 f"or switch to colocate mode to share GPUs between actor and rollout."
             )
 
+    def _maybe_resolve_num_rollout(self, roles_to_create):
+        # Resolve --num-rollout from --num-epoch here, before any service is
+        # deployed: services pickle self.config, so resolving later (inside the
+        # Rollout actor) leaves Actor/Critic with num_rollout=None and breaks
+        # args.train_iters. SFT is already pre-resolved in __init__, so this only
+        # fills the RL "--num-epoch without --num-rollout" case.
+        if self.config.num_rollout is not None:
+            return
+        if getattr(self.config, "num_epoch", None) is None:
+            return
+        rollout_data_source = None
+        for role, _cls, _num_gpus, ds in roles_to_create:
+            if str(role) == "rollout" and ds is not None:
+                rollout_data_source = ds
+                break
+        if rollout_data_source is None:
+            return
+        num_rollout_per_epoch = ray.get(rollout_data_source.lengths.remote()) // self.config.rollout_batch_size
+        self.config.num_rollout = num_rollout_per_epoch * self.config.num_epoch
+        assert self.config.num_rollout > 0, (
+            f"Resolved num_rollout={self.config.num_rollout} from num_epoch={self.config.num_epoch} and "
+            f"num_rollout_per_epoch={num_rollout_per_epoch}; check dataset size vs rollout_batch_size."
+        )
+        logger.info(
+            f"Resolved --num-rollout={self.config.num_rollout} from --num-epoch={self.config.num_epoch} "
+            f"(num_rollout_per_epoch={num_rollout_per_epoch})"
+        )
+
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
@@ -396,6 +424,8 @@ class Controller:
             logger.info(f"Service {role} start creating.")
 
             roles_to_create.append((role, cls, num_gpus, data_source))
+
+        self._maybe_resolve_num_rollout(roles_to_create)
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)

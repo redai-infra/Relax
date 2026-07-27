@@ -32,6 +32,11 @@ app = FastAPI()
 # saturate the engines. Override via env for tuning.
 GENRM_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("GENRM_SERVE_MAX_ONGOING_REQUESTS", "256"))
 
+# Serve→engine retry attempts for transient resets (ReadError / 5xx under bursty
+# colocate contention), absorbing them before they surface as a 500 to the
+# client. Set 1 to disable.
+GENRM_ENGINE_RETRY_ATTEMPTS = int(os.environ.get("GENRM_ENGINE_RETRY_ATTEMPTS", "3"))
+
 
 class Message(BaseModel):
     """Single chat message."""
@@ -105,8 +110,14 @@ class GenRM(Base):
         self._engine_hosts_ports = None
         self._engine_index = 0
         self._logger.info("GenRM service initialized successfully")
-        # Shared HTTP client for engine calls (avoids per-request connection overhead)
-        self._http_client = httpx.AsyncClient(timeout=1800)
+        # Shared HTTP client for engine calls (avoids per-request connection overhead).
+        # Raise pool limits well above httpx's default 100 so one replica can fan out
+        # many concurrent engine requests; keepalive_expiry >> the default 5s so
+        # idle-then-reused connections aren't reaped mid-burst (avoids ReadError/500).
+        self._http_client = httpx.AsyncClient(
+            timeout=1800,
+            limits=httpx.Limits(max_connections=2048, max_keepalive_connections=2048, keepalive_expiry=600),
+        )
 
         # Load tokenizer for prompt encoding
         self.tokenizer = load_tokenizer(config.genrm_model_path, trust_remote_code=True)
@@ -213,8 +224,22 @@ class GenRM(Base):
             "sampling_params": default_sampling,
         }
 
-        resp = await self._http_client.post(url, json=payload)
-        resp.raise_for_status()
+        # Retry transient resets (transport-level or 5xx) with short backoff so
+        # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
+        # (terminal) and a cancellation (caller timeout) is never retried.
+        for _attempt in range(1, GENRM_ENGINE_RETRY_ATTEMPTS + 1):
+            try:
+                resp = await self._http_client.post(url, json=payload)
+                resp.raise_for_status()
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
+                if (status == 0 or status >= 500) and _attempt < GENRM_ENGINE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.3 * _attempt)
+                    continue
+                raise
         return resp.json()
 
     @app.get("/health")

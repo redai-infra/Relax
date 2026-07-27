@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from argparse import Namespace
@@ -311,7 +312,11 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
     return current_rollout_id + 1 - min(list(map(split_partition, partition_list))) <= max_staleness
 
 
-@serve.deployment
+# Ray Serve's default max_ongoing_requests (5) throttles concurrent load; env-tunable like the genrm knob.
+ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", "256"))
+
+
+@serve.deployment(max_ongoing_requests=ROLLOUT_SERVE_MAX_ONGOING_REQUESTS)
 @serve.ingress(app)
 class Rollout(Base):
     """The class to run rollout and convert rollout data to training data."""
@@ -861,7 +866,7 @@ class Rollout(Base):
         if self._proxy_client is None:
             self._proxy_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(None),
-                limits=httpx.Limits(max_connections=256),
+                limits=httpx.Limits(max_connections=4096, max_keepalive_connections=4096, keepalive_expiry=600),
             )
         return self._proxy_client
 

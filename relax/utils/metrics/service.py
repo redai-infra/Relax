@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import threading
 from argparse import Namespace
 from collections import defaultdict
@@ -90,7 +91,10 @@ def is_timeline_event(metric_value: Any) -> bool:
     return "ph" in metric_value[0] and "ts" in metric_value[0]
 
 
-@serve.deployment
+METRICS_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("METRICS_SERVE_MAX_ONGOING_REQUESTS", "200"))
+
+
+@serve.deployment(max_ongoing_requests=METRICS_SERVE_MAX_ONGOING_REQUESTS)
 @serve.ingress(app)
 class MetricsService:
     """Centralized metrics collection and reporting service.

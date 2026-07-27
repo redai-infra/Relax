@@ -17,6 +17,7 @@ Deployment options:
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -108,8 +109,12 @@ app = FastAPI(
 )
 
 
+DCS_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("DCS_SERVE_MAX_ONGOING_REQUESTS", "100"))
+
+
 @serve.deployment(
     num_replicas=1,
+    max_ongoing_requests=DCS_SERVE_MAX_ONGOING_REQUESTS,
     ray_actor_options={"num_cpus": 1},
     logging_config=LoggingConfig(
         log_level="WARNING",

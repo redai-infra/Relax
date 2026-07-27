@@ -15,6 +15,7 @@ Features:
 
 import asyncio
 import logging
+import os
 import socket
 import time
 from collections.abc import Sequence
@@ -208,6 +209,8 @@ class DeviceDirectBackend(CommBackend):
         return futures
 
     def _healthcheck_rollout_engines(self, timeout_seconds: int = 5) -> set[int]:
+        # Allow raising the cold-start healthcheck timeout via env for slow starts.
+        timeout_seconds = int(os.environ.get("RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT", str(timeout_seconds)))
         failed_ranks = set()
         futures_to_rank = {}
 

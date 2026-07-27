@@ -643,12 +643,13 @@ class SGLangEngine(RayActor):
         except Exception as e:  # noqa: BLE001 — best-effort, keep offloading
             logger.info(f"abort_requests failed (continuing to flush): {e}")
 
-    def flush_cache(self):
+    def flush_cache(self, timeout_s: float = 120.0):
         """Flush the cache of the server."""
         if self.node_rank != 0:
             return
+        deadline = time.monotonic() + timeout_s
         # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        while True:
             try:
                 response = requests.get(
                     f"http://{self.server_host}:{self.server_port}/flush_cache",
@@ -656,19 +657,14 @@ class SGLangEngine(RayActor):
                 )
                 if response.status_code == 200:
                     break
-                # Non-200 (typically 400) means the scheduler still has pending/
-                # running requests. Sleep before retrying so the 60 iterations give
-                # a real ~60s drain window instead of spinning through them in
-                # milliseconds and raising TimeoutError immediately.
-                time.sleep(1)
+                # 400 = running/waiting requests present; wait and retry below.
             except NewConnectionError as e:
                 raise e
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
-        else:
-            raise TimeoutError("Timeout while flushing cache.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timeout while flushing cache.")
+            time.sleep(1)
 
     def shutdown(self):
         if self.args.rollout_external:
