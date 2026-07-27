@@ -687,6 +687,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=("Whether to shuffle the prompts during rollout."),
             )
             parser.add_argument(
+                "--sort-prompts-by-length",
+                action="store_true",
+                default=False,
+                help=(
+                    "Sort prompts by text length (descending) before rollout submission. "
+                    "Gives longer prompts a head start in generation, reducing tail latency "
+                    "when combined with --partial-rollout."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-seed",
                 type=int,
                 default=42,
