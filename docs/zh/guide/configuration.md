@@ -255,6 +255,30 @@
 | `--overlap-param-gather` | flag | - | reduce-scatter 与下一步 param all-gather 重叠，强制配合 `--overlap-grad-reduce`（Megatron 原生参数） |
 | `--calculate-per-token-loss` | flag | False | 按 Token 计算损失（Megatron 原生参数） |
 
+### FP16 优化器兼容默认值
+
+| 参数 | FP16 兼容 fallback | 非 FP16 的 Megatron 原生默认值 | 说明 |
+|------|--------------------|--------------------------------|------|
+| `--initial-loss-scale` | `32768` | `2**32` | 动态 loss scaling 的初始 scale |
+| `--min-loss-scale` | `1` | `1` | 动态 loss scaling 的最小 scale |
+| `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | 开启 | 关闭 | 开启或关闭 TransformerEngine 精度感知优化器 |
+| `--store-param-remainders` / `--no-store-param-remainders` | 关闭 | 开启 | 控制分布式优化器是否保存参数余数 |
+
+当 FP16 模式下缺少其中任一选项时，Relax 会保留历史兼容值，并用一条 warning 列出实际采用的 fallback。
+显式传入全部四项即可消除该 warning。设置静态 `--loss-scale` 时，动态 loss scale 参数不会生效。在 FP16
+模式下，两个动态 scale 必须为大于零的有限值，且 `--min-loss-scale` 不能大于 `--initial-loss-scale`。
+
+Qwen3-4B FP16 脚本会显式配置全部四项。传给脚本的额外参数会追加到训练命令末尾，因此可以覆盖脚本值而
+无需修改文件：
+
+```bash
+bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
+  --initial-loss-scale 65536 \
+  --min-loss-scale 2 \
+  --no-use-precision-aware-optimizer \
+  --store-param-remainders
+```
+
 ### 优化器 Flag 兼容性
 
 | 场景 | `--use-distributed-optimizer` | `--overlap-grad-reduce` / `--overlap-param-gather` |

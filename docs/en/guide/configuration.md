@@ -255,6 +255,31 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--overlap-param-gather` | flag | - | Overlap reduce-scatter with next-step param all-gather; requires `--overlap-grad-reduce` (native Megatron parameter) |
 | `--calculate-per-token-loss` | flag | False | Calculate loss per token (native Megatron parameter) |
 
+### FP16 Optimizer Compatibility Defaults
+
+| Parameter | FP16 compatibility fallback | Native non-FP16 default | Description |
+|-----------|-------------------------------|--------------------------|-------------|
+| `--initial-loss-scale` | `32768` | `2**32` | Initial scale used by dynamic loss scaling |
+| `--min-loss-scale` | `1` | `1` | Minimum scale used by dynamic loss scaling |
+| `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | enabled | disabled | Enable or disable TransformerEngine's precision-aware optimizer |
+| `--store-param-remainders` / `--no-store-param-remainders` | disabled | enabled | Control parameter-remainder storage in the distributed optimizer |
+
+Relax preserves its historical FP16 values when one or more of these options are omitted and emits one warning listing
+the applied fallbacks. Pass all four options explicitly to silence the warning. These dynamic-scale settings are
+inactive when a static `--loss-scale` is used. In FP16 mode, both dynamic-scale values must be finite and greater than
+zero, and `--min-loss-scale` must not exceed `--initial-loss-scale`.
+
+The Qwen3-4B FP16 recipe configures all four values explicitly. Extra arguments passed to the shell script are appended
+to the training command, so a later value can override the recipe without editing it:
+
+```bash
+bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
+  --initial-loss-scale 65536 \
+  --min-loss-scale 2 \
+  --no-use-precision-aware-optimizer \
+  --store-param-remainders
+```
+
 ### Optimizer Flag Compatibility
 
 | Scenario | `--use-distributed-optimizer` | `--overlap-grad-reduce` / `--overlap-param-gather` |
