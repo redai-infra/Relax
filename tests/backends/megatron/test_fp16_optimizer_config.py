@@ -5,10 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 
-from relax.backends.megatron import arguments as megatron_arguments
-from relax.utils.arguments import (
+
+# The default CPU CI does not install Megatron. These tests run in the official
+# Relax image, where they exercise the real parser and OptimizerConfig.
+torch = pytest.importorskip("torch")
+pytest.importorskip("megatron.training.arguments")
+
+from relax.backends.megatron import arguments as megatron_arguments  # noqa: E402
+from relax.utils.arguments import (  # noqa: E402
     _add_fp16_optimizer_arguments,
     get_slime_extra_args_provider,
 )
