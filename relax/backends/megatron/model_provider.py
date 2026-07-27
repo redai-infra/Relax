@@ -258,6 +258,7 @@ def get_model_provider_func(
             "dsa_indexer_loss_coeff",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
+            "masked_softmax_fusion",
             "bias_dropout_fusion",
             "apply_rope_fusion",
             "recompute_granularity",
