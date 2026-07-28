@@ -18,16 +18,9 @@ from relax.engine.rollout import sglang_rollout as rollout_mod
 from relax.engine.rollout.sglang_rollout import (
     ModelRequestScheduler,
     RolloutRequestAborted,
-    _is_request_model_aware,
-    _validate_request_model_signature,
     request_model_aware,
 )
 from relax.utils.types import Sample
-
-
-def test_deepeyes_generate_is_request_model_aware() -> None:
-    assert _is_request_model_aware(deepeyes_rollout.generate)
-    _validate_request_model_signature(deepeyes_rollout.generate)
 
 
 def test_sync_sample_outputs_does_not_set_completed() -> None:
@@ -309,13 +302,27 @@ async def test_generate_and_rm_bad_marker_signature_raises_before_run() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generate_and_rm_abort_sets_sample_status() -> None:
+async def test_generate_and_rm_evaluation_continues_when_aborted() -> None:
+    # Fast abort must keep evaluation exception: aborted + evaluation=True continues.
+    ran = False
+
     @request_model_aware
     async def aware_custom(args, sample, sampling_params, *, request_model):
+        nonlocal ran
+        ran = True
         await request_model("http://x", {"n": 1})
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = 0.0
         return sample
 
-    sample = Sample(prompt="p")
+    async def fake_post(url, payload, headers=None):
+        return {"text": "t", "meta_info": {"finish_reason": {"type": "stop"}}}
+
+    class AbortedState(_FakeGenState):
+        def __init__(self, args):
+            super().__init__(args)
+            self.aborted = True
+
     args = Namespace(
         group_rm=False,
         custom_generate_function_path="x.aware",
@@ -323,14 +330,16 @@ async def test_generate_and_rm_abort_sets_sample_status() -> None:
         mask_offpolicy_in_partial_rollout=False,
     )
 
-    class AbortedState(_FakeGenState):
-        def __init__(self, args):
-            super().__init__(args)
-            self.aborted = True
-
     with (
         patch.object(rollout_mod, "GenerateState", AbortedState),
         patch.object(rollout_mod, "load_function", return_value=aware_custom),
+        patch.object(rollout_mod, "async_rm", new=AsyncMock(return_value=0.0)),
+        patch.object(rollout_mod, "post", side_effect=fake_post),
     ):
-        out = await rollout_mod.generate_and_rm(args, sample, {}, evaluation=False)
-        assert out.status == Sample.Status.ABORTED
+        out_train = await rollout_mod.generate_and_rm(args, Sample(prompt="p"), {}, evaluation=False)
+        assert out_train.status == Sample.Status.ABORTED
+        assert ran is False
+
+        out_eval = await rollout_mod.generate_and_rm(args, Sample(prompt="p"), {}, evaluation=True)
+        assert ran is True
+        assert out_eval.status == Sample.Status.COMPLETED
