@@ -244,6 +244,7 @@ export default defineConfig({
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
+                { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
@@ -267,7 +268,8 @@ export default defineConfig({
                 { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
-                { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' }
+                { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
+                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' }
               ]
             },
             {
@@ -351,6 +353,7 @@ export default defineConfig({
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
+                { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]
@@ -374,7 +377,8 @@ export default defineConfig({
                 { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
-                { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' }
+                { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
+                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' }
               ]
             },
             {

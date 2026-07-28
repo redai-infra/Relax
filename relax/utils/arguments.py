@@ -33,6 +33,40 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
+# Minimum required TransferQueue version and the command to upgrade to it.
+_MIN_TQ_VERSION = "0.1.10.dev0"
+_TQ_UPGRADE_CMD = (
+    'pip install "transferqueue @ git+https://github.com/redai-infra/'
+    'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
+)
+
+
+def check_transfer_queue_version() -> None:
+    """Fail fast if the installed TransferQueue is older than the required
+    version.
+
+    Only fully-async mode needs the newer TransferQueue, so this is called from
+    ``parse_args`` only when ``--fully-async`` is set.
+    """
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as pkg_version
+
+    from packaging.version import parse as parse_version
+
+    try:
+        installed = pkg_version("transferqueue")
+    except PackageNotFoundError as e:
+        raise ImportError(
+            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        ) from e
+
+    if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
+        raise RuntimeError(
+            f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
+            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        )
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset selected metadata on an existing Megatron argument.
 
@@ -284,7 +318,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Skip the actor_fwd role and reuse the train forward's log_probs as "
-                    "old_log_probs (ppo_kl ? 0, ratio ? 1), saving the dedicated actor_fwd "
+                    "old_log_probs (ppo_kl ≡ 0, ratio ≡ 1), saving the dedicated actor_fwd "
                     "GPU group and one weight-sync per step. "
                     "Auto-enabled when --fully-async and "
                     "rollout_batch_size * n_samples_per_prompt == global_batch_size; no need "
@@ -365,14 +399,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Whether to freeze the audio encoder backbone parameters "
                 "(used in bridge mode for multimodal models with an audio "
-                "encoder).  Does NOT freeze the audio projection ? pass "
+                "encoder).  Does NOT freeze the audio projection — pass "
                 "--freeze-audio-projection for that.",
             )
             parser.add_argument(
                 "--freeze-audio-projection",
                 action="store_true",
                 default=False,
-                help="Whether to freeze the audio?LM projection parameters "
+                help="Whether to freeze the audio→LM projection parameters "
                 "(used in bridge mode for multimodal models with an audio "
                 "encoder).  Independent of --freeze-audio-model.",
             )
@@ -414,7 +448,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
                 "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
-                "logits. Default off ? legacy external-loss SFT path materializes full logits "
+                "logits. Default off — legacy external-loss SFT path materializes full logits "
                 "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
                 "when --enable-mtp-training is set (MTP head needs the real output_layer; "
                 "bypass would break it) or when embeddings are tied "
@@ -488,7 +522,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Carve a held-out eval split from --prompt-data instead of providing a separate "
                     "--eval-prompt-data. A value <1 is treated as a fraction of the train dataset "
-                    "(e.g. 0.05 ? last 5%); a value ?1 is treated as an absolute sample count. "
+                    "(e.g. 0.05 → last 5%); a value ≥1 is treated as an absolute sample count. "
                     "The reserved tail is removed from the train pool so train and eval samples never "
                     "overlap. Mutually exclusive with --eval-prompt-data."
                 ),
@@ -537,7 +571,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "`skip` drops the sample; `keep` (default) returns it unchanged (may OOM downstream); "
                     "`truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first "
                     "`capacity` tokens; `custom` delegates to --sft-oversize-custom-function-path. "
-                    "Note: truncating multimodal samples in-place may misalign multimodal_train_inputs ? "
+                    "Note: truncating multimodal samples in-place may misalign multimodal_train_inputs — "
                     "use `custom` if you need to also trim media inputs."
                 ),
             )
@@ -1319,6 +1353,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SGLang reasoning parser for agentic rollout.",
             )
             parser.add_argument(
+                "--agentic-custom-advantage-path",
+                type=str,
+                default=None,
+                help="Custom group-level advantage function for explicit agentic exports.",
+            )
+            parser.add_argument(
                 "--agentic-prepare-pool-size",
                 type=int,
                 default=None,
@@ -1411,6 +1451,56 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
+            )
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="LoRA rank for parameter-efficient fine-tuning (0=disabled).",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=32,
+                help="LoRA alpha scaling factor for learning rate adjustment.",
+            )
+            parser.add_argument(
+                "--lora-target-modules",
+                type=str,
+                nargs="+",
+                default=["linear_qkv", "linear_proj"],
+                help=(
+                    "Target modules for LoRA (Megatron-style names, e.g. linear_qkv, "
+                    "linear_proj, linear_fc1, linear_fc2). Expanded to HF-style names "
+                    "automatically when exporting the adapter."
+                ),
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="Dropout probability for LoRA layers.",
+            )
+            parser.add_argument(
+                "--lora-merge-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Merge LoRA adapters into base weights before weight synchronization. "
+                    "Simplifies rollout but slower rollout inference."
+                ),
+            )
+            parser.add_argument(
+                "--lora-adapter-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable LoRA adapter mode: sync the base model once, then each step push only "
+                    "the trained LoRA adapter to the rollout engine via SGLang's runtime LoRA API "
+                    "(rollouts select it via lora_path). Saves per-step full-weight-sync bandwidth. "
+                    "Requires --enable-lora (auto-set by the engine) and sglang_dp_size == 1. "
+                    "Supported in colocate and fully-async modes. Mutually exclusive with --lora-merge-mode."
+                ),
             )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
@@ -2068,15 +2158,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             following the same pattern as --ref-actor-config.
 
             --genrm-engine-config keys (with defaults):
-              model_path (str, required) ? genRM model path; presence enables genRM
-              num_gpus (int, 1) ? total number of GPUs for genRM
-              num_gpus_per_engine (int, 1) ? GPUs per genRM engine instance
-              max_context_len (int, 8192) ? maximum context length
+              model_path (str, required) — genRM model path; presence enables genRM
+              num_gpus (int, 1) — total number of GPUs for genRM
+              num_gpus_per_engine (int, 1) — GPUs per genRM engine instance
+              max_context_len (int, 8192) — maximum context length
             --genrm-sampling-config keys (with defaults):
-              temperature (float, 0.1) ? sampling temperature
-              top_p (float, 1.0) ? nucleus sampling probability
-              top_k (int, -1) ? top-k sampling (-1 disables)
-              max_response_len (int, 4096) ? maximum response length
+              temperature (float, 0.1) — sampling temperature
+              top_p (float, 1.0) — nucleus sampling probability
+              top_k (int, -1) — top-k sampling (-1 disables)
+              max_response_len (int, 4096) — maximum response length
             """
             parser.add_argument(
                 "--genrm-model-path",
@@ -2384,6 +2474,11 @@ def parse_args(add_custom_arguments=None):
     if not args.debug_train_only:
         sglang_validate_args(args)
 
+    # Only fully-async mode relies on the newer TransferQueue (e.g.
+    # StreamingTokenBudgetSampler), so gate the version requirement on it.
+    if getattr(args, "fully_async", False):
+        check_transfer_queue_version()
+
     return args
 
 
@@ -2522,12 +2617,34 @@ def _normalize_precision_optimizer_args(args) -> None:
             raise ValueError("--min-loss-scale must be less than or equal to --initial-loss-scale.")
 
 
+def _normalize_sync_ppo_kl_args(args) -> bool:
+    """Disable KL options that have no ref-logprob producer in sync PPO."""
+    is_sync_ppo = (
+        getattr(args, "use_critic", False)
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "hybrid", False)
+    )
+    if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
+        return False
+
+    args.use_kl_loss = False
+    args.kl_coef = 0.0
+    return True
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
+    if is_sft and getattr(args, "dynamic_context_parallel", False) and args.eval_interval is not None:
+        raise ValueError(
+            "--dynamic-context-parallel cannot be used with SFT eval (--eval-interval) yet: "
+            "this combination can hang and has not been fixed. "
+            "Disable --eval-interval or --dynamic-context-parallel."
+        )
+
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
         # `--disable-compute-advantages-and-returns` and friends.
@@ -2560,9 +2677,26 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
+    if getattr(args, "lora_rank", 0) > 0:
+        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+            raise ValueError(
+                "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
+            )
+        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+            raise ValueError(
+                "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
+                "support dp_size > 1)."
+            )
+        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+            logger.info(
+                "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
+                args.lora_rank,
+            )
+            args.lora_merge_mode = True
+
     # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
     # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
-    # v0.5.9 build) does not populate output_token_logprobs ? rollout sees
+    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
     # response_length=1 for every sample and training silently degenerates.
     if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
         "1",
@@ -2577,7 +2711,7 @@ def slime_validate_args(args):
             "response_length to 1 and silently breaks training. "
             "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
             "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
-            "--sglang-mamba-scheduler-strategy extra_buffer ? that flag alone "
+            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
             "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
             "spec_v2."
         )
@@ -2816,6 +2950,23 @@ def slime_validate_args(args):
             args.balance_data = True
 
     args.use_critic = args.advantage_estimator == "ppo"
+    # Synchronous PPO has no producer for
+    # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
+    # gated on `advantage_estimator != "ppo"`, and the sync role set does not
+    # deploy a separate reference service. Either KL option would make
+    # advantages / actor request a field that never arrives and hang in
+    # TQ.get_meta, so disable both for the currently supported sync topology.
+    if _normalize_sync_ppo_kl_args(args):
+        logger.warning(
+            "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
+            "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
+            "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
+            "Drop these KL options from the launch script to silence this warning."
+        )
+    elif args.use_critic and args.use_kl_loss:
+        # Preserve the existing behavior outside the synchronous topology.
+        logger.warning("PPO does not support --use-kl-loss. Auto-disabling --use-kl-loss.")
+        args.use_kl_loss = False
     if args.critic_num_gpus_per_node is None:
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     if args.critic_num_nodes is None:
@@ -3006,18 +3157,18 @@ def slime_validate_args(args):
     # --sft-chunked-logits incompatibilities. All three are flagged here so
     # downstream (model.py _should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # All three are hard asserts ? the user must remove --sft-chunked-logits
+    # All three are hard asserts — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
         # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
-        #    Output_layer is built with skip_weight_param_allocation=True ?
-        #    output_layer.weight is None ? chunked path's lm_head matmul
+        #    Output_layer is built with skip_weight_param_allocation=True →
+        #    output_layer.weight is None → chunked path's lm_head matmul
         #    crashes on NoneType. The chunked memory win is marginal on the
         #    small models that ship with tied embeddings anyway, so the user
         #    should just drop the flag.
         assert getattr(args, "untie_embeddings_and_output_weights", False), (
             "--sft-chunked-logits is incompatible with tied embeddings "
-            "(HF config.tie_word_embeddings=true ? "
+            "(HF config.tie_word_embeddings=true → "
             "--untie-embeddings-and-output-weights not set; output_layer.weight "
             "is None and the chunked path's lm_head matmul has nothing to "
             "multiply against). Remove --sft-chunked-logits; the chunked "
@@ -3032,7 +3183,7 @@ def slime_validate_args(args):
         )
         # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
-        #    model(**kwargs) and so never hits _bypass_output_layer ? chunked
+        #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.
         assert not getattr(args, "overlap_moe_expert_parallel_comm", False), (
             "--sft-chunked-logits is incompatible with "
@@ -3077,13 +3228,6 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
-
-    if args.advantage_estimator == "ppo":
-        raise ValueError(
-            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
-            "Please use one of the following advantage estimators instead: "
-            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
-        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."

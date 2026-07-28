@@ -211,3 +211,14 @@ def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tm
 
     with pytest.raises(ValueError, match="--initial-loss-scale"):
         arguments_module.slime_validate_args(args)
+
+
+def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
+    args = _opd_args()
+    args.loss_type = "sft"
+    args.dynamic_context_parallel = True
+    args.eval_interval = 10
+    args.eval_size = 0.1
+
+    with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
+        arguments_module.slime_validate_args(args)

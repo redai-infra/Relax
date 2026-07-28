@@ -46,7 +46,7 @@ ______________________________________________________________________
 - 🔁 **Hybrid 混合模式** — Actor 与 Rollout 独立 Placement Group + TransferQueue 流式数据，ref / actor_fwd / advantages 在 Actor 本机进程内完成；配合 `--balance-data` 与子批 forward，避免独立 ref/actor_fwd 服务的 GPU 浪费
 - 🤖 **Agentic RL** — 多轮交互、loss masking、灵活的终止条件以及 VLM 多模态上下文累积，构建"执行 → 观察 → 决策"闭环训练
 - 🔀 **Rollout 弹性扩缩容** — 通过 HTTP REST API 在训练过程中动态增减推理引擎，支持同集群（`ray_native`）和跨集群联邦（`external`）两种模式
-- 🧠 **丰富的算法矩阵** — 开箱即用的 GRPO、GSPO、SAPO 与 On-Policy Distillation，配合可插拔奖励函数和内置 **GenRM**（LLM-as-judge）模式
+- 🧠 **丰富的算法矩阵** — 开箱即用的 PPO、GRPO、GSPO、SAPO、CISPO 与 On-Policy Distillation，配合可插拔奖励函数和内置 **GenRM**（LLM-as-judge）模式
 - 🚀 **Megatron + SGLang 后端** — Megatron-LM（TP/PP/CP/EP）训练 MoE 和深层模型，SGLang 提供高吞吐推理，DCS 基于 NCCL 广播同步权重
 - 📦 **生产级运维** — HealthManager 自动恢复、中心化 Metrics Service（WandB / TensorBoard / ClearML）、Apprise 实时告警
 
@@ -91,13 +91,14 @@ ______________________________________________________________________
 
 ## 🧠 支持的算法
 
-| 算法                       | 类型     | 描述                                              |
-| :------------------------- | :------- | :------------------------------------------------ |
-| **GRPO**                   | 策略优化 | Group Relative Policy Optimization                |
-| **GSPO**                   | 策略优化 | Group Sample Policy Optimization                  |
-| **SAPO**                   | 策略优化 | Sample-Aware Policy Optimization                  |
-| **CISPO**                  | 策略优化 | Clipped Importance-ratio Soft Policy Optimization |
-| **On-Policy Distillation** | 知识迁移 | 基于 KL 惩罚的师生蒸馏                            |
+| 算法                       | 类型         | 描述                                              |
+| :------------------------- | :----------- | :------------------------------------------------ |
+| **PPO**                    | Actor-Critic | Proximal Policy Optimization                      |
+| **GRPO**                   | 策略优化     | Group Relative Policy Optimization                |
+| **GSPO**                   | 策略优化     | Group-wise Sequence-level Policy Optimization     |
+| **SAPO**                   | 策略优化     | Soft Adaptive Policy Optimization                 |
+| **CISPO**                  | 策略优化     | Clipped Importance-ratio Soft Policy Optimization |
+| **On-Policy Distillation** | 知识迁移     | 基于 KL 惩罚的师生蒸馏                            |
 
 > 📖 添加新算法非常简单 — 实现一个服务类，注册到 `ALGOS` 注册表即可。
 

@@ -3,7 +3,14 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from megatron.core import mpu
+
+
+try:
+    from megatron.core import mpu
+except ModuleNotFoundError as exc:
+    if exc.name not in {"megatron", "megatron.core"}:
+        raise
+    mpu = None
 
 
 def maybe_padded_total_lengths(
@@ -586,3 +593,122 @@ def dynamic_cp_merge_output(
             new_result[key] = values
         merged.append(new_result)
     return merged
+
+
+def gdn_reassemble_full(
+    gathered: list[torch.Tensor],
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+) -> torch.Tensor:
+    """Reassemble per-CP-rank zig-zag shards into the full sequential sequence.
+
+    ``gathered[r]`` is rank ``r``'s local activation ``[s_local, b, C]``. Each
+    sample is split across CP by :func:`slice_with_cp`: rank ``r`` holds chunk
+    ``r`` and chunk ``2*cp-1-r`` (each of size ``chunk_size``). This reassembles,
+    per sample, the sequential chunk order ``[0, 1, ..., 2*cp-1]``. Pure (no
+    collectives) so it is unit-testable. Returns ``[s_full, b, C]``.
+
+    Inverse of taking, per rank, :func:`gdn_cp_slice`.
+
+    ``cu_seqlens`` are the full (x cp) per-sample boundaries. Pass a **Python
+    ``list[int]``** on the hot path (precomputed once per micro-batch) to avoid a
+    per-layer ``.tolist()`` device sync; a device tensor is also accepted (host
+    sync) for standalone/unit-test use.
+    """
+    cu = cu_seqlens if isinstance(cu_seqlens, list) else cu_seqlens.tolist()
+    local_cu = [c // cp_size for c in cu]
+    pieces: list[torch.Tensor] = []
+    for i in range(len(local_cu) - 1):
+        lo, hi = local_cu[i], local_cu[i + 1]
+        cs = (hi - lo) // 2  # per-rank chunk_size (each rank holds 2 chunks)
+        first_halves = [gathered[r][lo : lo + cs] for r in range(cp_size)]  # chunks 0..cp-1
+        second_halves = [gathered[r][lo + cs : hi] for r in range(cp_size)][::-1]  # chunks cp..2cp-1
+        pieces.extend(first_halves + second_halves)
+    return torch.cat(pieces, dim=0)
+
+
+def gdn_cp_slice(
+    full: torch.Tensor,
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Slice this CP rank's zig-zag shard out of the full sequential sequence.
+
+    Inverse of :func:`gdn_reassemble_full` for one rank: given the full
+    ``[s_full, b, X]`` (sequential order), return this rank's shard
+    ``[s_local, b, X]`` = per sample ``[chunk_r, chunk_{2cp-1-r}]``, matching
+    :func:`slice_with_cp`. Plain indexing + cat, so autograd scatters the grad
+    back into the correct full-sequence positions.
+
+    ``cu_seqlens`` are the full per-sample boundaries. Pass a **Python
+    ``list[int]``** on the hot path (precomputed once per micro-batch) to avoid a
+    per-layer ``.tolist()`` device sync; a device tensor is also accepted.
+    """
+    full_cu = cu_seqlens if isinstance(cu_seqlens, list) else cu_seqlens.tolist()
+    pieces: list[torch.Tensor] = []
+    for i in range(len(full_cu) - 1):
+        flo, fhi = full_cu[i], full_cu[i + 1]
+        cs = (fhi - flo) // (2 * cp_size)
+        c1 = full[flo + cp_rank * cs : flo + (cp_rank + 1) * cs]
+        c2 = full[flo + (2 * cp_size - cp_rank - 1) * cs : flo + (2 * cp_size - cp_rank) * cs]
+        pieces.append(c1)
+        pieces.append(c2)
+    return torch.cat(pieces, dim=0)
+
+
+class _AllGatherFullSequence(torch.autograd.Function):
+    """All-gather each CP rank's shard into the full sequence; backward reduce-
+    scatters (sums) the gradient.
+
+    The GDN all-gather path is **not** a fully-duplicated computation: after the
+    duplicated recurrent scan on the full sequence, each rank slices back *its
+    own* zig-zag shard (:func:`gdn_cp_slice`) for the output projection, so every
+    rank's downstream loss is different. Because the scan is causal/recurrent,
+    rank ``r``'s output positions depend on input positions owned by *other* CP
+    ranks, and — symmetrically — rank ``r``'s input positions receive gradient
+    from *other* ranks' output losses. The correct grad for a full-sequence
+    position is therefore the **sum** over all CP ranks of each rank's local
+    backward, scattered back to the owning rank: exactly ``reduce_scatter(sum)``.
+
+    (A plain ``grads[rank]`` backward — correct only when the post-gather compute
+    is duplicated *and* the loss is identical on every rank — would silently drop
+    these cross-rank contributions and corrupt training gradients.)
+    """
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        ctx.rank = dist.get_rank(group=group)
+        ctx.world_size = dist.get_world_size(group=group)
+        out = [torch.empty_like(x) for _ in range(ctx.world_size)]
+        dist.all_gather(out, x.contiguous(), group=group)
+        return tuple(out)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # grads[m] = dL_local/d(gathered[m]); sum across ranks and keep this
+        # rank's slot: out = sum_k grads[this_rank](on rank k) = full input grad.
+        template = next((g for g in grads if g is not None), None)
+        grad_list = [torch.zeros_like(template) if g is None else g.contiguous() for g in grads]
+        out = torch.empty_like(grad_list[ctx.rank])
+        dist.reduce_scatter(out, grad_list, group=ctx.group)
+        return out, None
+
+
+def gdn_cp_gather_full(
+    qkvzba: torch.Tensor,
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+    cp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Gather the per-CP-rank zig-zag shards into the full sequential sequence.
+
+    All-gathers every rank's local activation (reduce-scatter backward autograd,
+    :class:`_AllGatherFullSequence`) then reassembles with
+    :func:`gdn_reassemble_full`. ``qkvzba`` is ``[s_local, b, C]``; returns
+    ``[s_full, b, C]``. Pass a precomputed host boundary list as ``cu_seqlens`` on
+    the hot path to avoid a per-layer device sync.
+    """
+    gathered = _AllGatherFullSequence.apply(qkvzba, cp_group)
+    return gdn_reassemble_full(gathered, cu_seqlens, cp_size)
