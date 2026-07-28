@@ -59,6 +59,16 @@ class _StaticGenerationProvider:
         return self._generation
 
 
+def _is_same_generation_provider(left: Callable[..., int], right: Callable[..., int]) -> bool:
+    if left is right:
+        return True
+    left_self = getattr(left, "__self__", None)
+    right_self = getattr(right, "__self__", None)
+    left_func = getattr(left, "__func__", None)
+    right_func = getattr(right, "__func__", None)
+    return left_self is not None and left_self is right_self and left_func is not None and left_func is right_func
+
+
 def get_reward_executor(args) -> "RewardExecutor":
     """Return the process-wide RewardExecutor for the given training args."""
     max_concurrency = getattr(args, "reward_max_concurrency", None)
@@ -143,7 +153,8 @@ class RewardWorker:
         prev_gen = self._loaded_generation_by_path.get(path)
         refresh = prev_gen is None or generation > prev_gen
         loaded = self._custom_resolver.ensure_loaded(path, generation, refresh_modules=refresh)
-        self._loaded_generation_by_path[path] = generation
+        if prev_gen is None or generation > prev_gen:
+            self._loaded_generation_by_path[path] = generation
         if loaded.is_async:
             raise TypeError("Async custom reward must run in the rollout event loop")
         result = loaded.function(worker_config.as_namespace(), payload, **kwargs)
@@ -184,12 +195,12 @@ class RewardExecutor:
         return cls._instance
 
     def bind_generation_provider(self, provider: Callable[..., int]) -> None:
-        if self._generation_provider_bound and provider is not self._generation_provider:
+        if self._generation_provider_bound:
+            if _is_same_generation_provider(provider, self._generation_provider):
+                return
             raise RuntimeError(
                 "RewardExecutor generation provider already bound; call RewardExecutor.reset() before rebinding"
             )
-        if self._generation_provider_bound and provider is self._generation_provider:
-            return
         self._generation_provider = provider
         self._generation_provider_bound = True
         self._custom_resolver.invalidate_all()

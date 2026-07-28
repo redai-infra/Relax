@@ -145,6 +145,7 @@ Notes:
 - Only `async def` callables recognized by `inspect.iscoroutinefunction` take the async path; a sync function that returns an awaitable raises an error.
 - Sync custom rewards see only a whitelist view of args (e.g. `custom_rm_path` / `rm_type` / `reward_key`) plus explicit `custom_options`; do not rely on full training `Namespace` objects such as models or tokenizers.
 - Use `functools.wraps` on decorators so async detection keeps working.
+- Hot-reload of `custom_rm` (`ReloadScope.IMMEDIATE`) takes effect on the next call when a `RolloutManager` has bound the generation provider; paths without that bind keep generation `0` and do not claim automatic reload propagation.
 
 ## Custom Generate Function
 

@@ -12,8 +12,6 @@ from relax.utils.misc import load_function
 from relax.utils.types import Sample
 
 
-# Protocol version for named RewardWorker fingerprint checks (not reload counter).
-GENERATION_PROTOCOL_VERSION = 1
 IMPLEMENTATION_VERSION = 1
 
 
@@ -64,12 +62,8 @@ def build_reward_worker_config(
 
 @dataclass(frozen=True)
 class WorkerConfigFingerprint:
-    """Pool-level identity for named RewardWorker actors (not per-request
-    path)."""
-
     num_workers: int
     implementation_version: int = IMPLEMENTATION_VERSION
-    generation_protocol_version: int = GENERATION_PROTOCOL_VERSION
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -120,10 +114,6 @@ class CustomRewardResolver:
             path=path,
         )
         self._cache[key] = resolved
-        # Drop older generations for the same path to bound memory.
-        stale = [k for k in self._cache if k[0] == path and k[1] != generation]
-        for old_key in stale:
-            self._cache.pop(old_key, None)
         return resolved
 
     def invalidate(self, path: str) -> None:
