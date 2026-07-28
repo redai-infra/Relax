@@ -246,6 +246,26 @@ def test_non_fp16_omission_applies_megatron_defaults_without_warning(arguments_m
     warning.assert_not_called()
 
 
+@pytest.mark.parametrize("bf16", [False, True])
+def test_non_fp16_explicit_unused_scales_remain_compatible(arguments_module, monkeypatch, bf16):
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _precision_args(
+        fp16=False,
+        bf16=bf16,
+        initial_loss_scale=0.0,
+        min_loss_scale=-1.0,
+        use_precision_aware_optimizer=False,
+        store_param_remainders=True,
+    )
+
+    arguments_module._normalize_precision_optimizer_args(args)
+
+    assert args.initial_loss_scale == 0.0
+    assert args.min_loss_scale == -1.0
+    warning.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("field", "value", "option"),
     [
@@ -286,7 +306,7 @@ def test_precision_optimizer_rejects_minimum_scale_above_initial_scale(arguments
         arguments_module._normalize_precision_optimizer_args(args)
 
 
-def test_fp16_rejects_parameter_remainders(arguments_module):
+def test_fp16_preserves_explicit_parameter_remainders(arguments_module):
     args = _precision_args(
         initial_loss_scale=32768.0,
         min_loss_scale=1.0,
@@ -294,5 +314,6 @@ def test_fp16_rejects_parameter_remainders(arguments_module):
         store_param_remainders=True,
     )
 
-    with pytest.raises(ValueError, match="--store-param-remainders"):
-        arguments_module._normalize_precision_optimizer_args(args)
+    arguments_module._normalize_precision_optimizer_args(args)
+
+    assert args.store_param_remainders is True

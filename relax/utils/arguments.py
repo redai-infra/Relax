@@ -34,11 +34,12 @@ logger = get_logger(__name__)
 
 
 def reset_arg(parser, name, **kwargs):
-    """Reset the default value of a Megatron argument.
+    """Reset selected metadata on an existing Megatron argument.
 
     :param parser: The argument parser.
     :param name: The name of the argument to reset.
     :param default: The new default value.
+    :param help: The new help text.
     """
     for action in parser._actions:
         if name in action.option_strings:
@@ -2508,19 +2509,17 @@ def _normalize_precision_optimizer_args(args) -> None:
     if fp16 and missing:
         logger.warning("FP16 optimizer arguments omitted; applying fallbacks: " + ", ".join(missing))
 
-    for attr, option in (
-        ("initial_loss_scale", "--initial-loss-scale"),
-        ("min_loss_scale", "--min-loss-scale"),
-    ):
-        value = getattr(args, attr)
-        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{option} must be a finite positive number, got {value!r}.")
+    if fp16:
+        for attr, option in (
+            ("initial_loss_scale", "--initial-loss-scale"),
+            ("min_loss_scale", "--min-loss-scale"),
+        ):
+            value = getattr(args, attr)
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{option} must be a finite positive number, got {value!r}.")
 
-    if args.min_loss_scale > args.initial_loss_scale:
-        raise ValueError("--min-loss-scale must be less than or equal to --initial-loss-scale.")
-
-    if fp16 and args.store_param_remainders:
-        raise ValueError("--store-param-remainders cannot be enabled with --fp16.")
+        if args.min_loss_scale > args.initial_loss_scale:
+            raise ValueError("--min-loss-scale must be less than or equal to --initial-loss-scale.")
 
 
 def slime_validate_args(args):
