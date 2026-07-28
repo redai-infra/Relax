@@ -80,6 +80,19 @@ def test_unknown_metadata_type_uses_configured_fallback_and_warns():
     assert "Unknown metadata rm_type" in route.warnings[0]
 
 
+def test_whitespace_metadata_type_is_treated_as_missing():
+    route = resolve_reward_route(
+        metadata={"rm_type": " \t\n "},
+        label="free-form answer",
+        fallback_rm_type="math",
+        registry=REWARD_REGISTRY,
+    )
+
+    assert route.rm_type == "math"
+    assert route.source == "fallback"
+    assert route.warnings == ()
+
+
 @pytest.mark.parametrize(
     "label",
     ["42", "-3.5", "1 / 2", "\\frac{1}{2}", "\\boxed{7}", "\\boxed{\\frac{1}{2}}", 12, 0.5],

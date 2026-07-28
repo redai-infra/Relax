@@ -107,7 +107,10 @@ def resolve_reward_route(
         return RewardRoute(resolved_type, "metadata", strip_boxed=strip_boxed)
 
     raw_metadata_type = _normalize_rm_type(metadata_rm_type)
-    if "rm_type" in metadata_dict and metadata_rm_type not in (None, ""):
+    has_metadata_type = metadata_rm_type is not None and (
+        not isinstance(metadata_rm_type, str) or bool(raw_metadata_type)
+    )
+    if "rm_type" in metadata_dict and has_metadata_type:
         display_type = raw_metadata_type or metadata_rm_type
         warnings.append(f"Unknown metadata rm_type {display_type!r}; trying label routing and fallback.")
 
