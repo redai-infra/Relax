@@ -2592,7 +2592,7 @@ def _normalize_precision_optimizer_args(args) -> None:
             ("initial_loss_scale", "--initial-loss-scale", 2**32),
             ("min_loss_scale", "--min-loss-scale", 1.0),
             ("use_precision_aware_optimizer", "--use-precision-aware-optimizer", False),
-            ("store_param_remainders", "--store-param-remainders", True),
+            ("store_param_remainders", "--store-param-remainders", False),
         )
 
     missing = []
