@@ -583,7 +583,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 k[-1] += reward
             rewards.append(k)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths,
+            response_lengths,
+            values,
+            rewards,
+            args.gamma,
+            args.lambd,
+            padded_total_lengths=padded_total_lengths,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":
@@ -1152,6 +1158,8 @@ def sft_loss_function(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1200,6 +1208,8 @@ def sft_loss_function_chunked(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         lm_head_forward=lm_head_forward,
     )
 
