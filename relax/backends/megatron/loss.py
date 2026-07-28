@@ -13,6 +13,7 @@ from relax.utils.distributed_utils import distributed_masked_normalize, distribu
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
+    compute_eopd_fkl_loss,
     compute_opd_topk_log_probs,
     compute_policy_opd_loss,
     resolve_opd_gather_topk_token_ids,
@@ -423,7 +424,9 @@ def get_log_probs_and_entropy(
 
         if with_topk:
             k = min(max(int(resolved_topk_k), 1), int(logits_chunk.size(-1)))
-            topk_token_ids_list.append(torch.topk(logits_chunk, k=k, dim=-1).indices)
+            topk_ids = torch.topk(logits_chunk, k=k, dim=-1).indices
+            topk_token_ids_list.append(topk_ids)
+            topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, [topk_ids], 0))
 
         if gather_topk_token_ids is not None:
             topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, gather_topk_token_ids, sample_idx))
@@ -435,7 +438,7 @@ def get_log_probs_and_entropy(
         res["entropy"] = entropy_list
     if with_topk:
         res["topk_token_ids"] = topk_token_ids_list
-    if gather_topk_token_ids is not None:
+    if topk_log_probs_list:
         res["topk_log_probs"] = topk_log_probs_list
 
     # we need to turn the all gather kv into zigzag ring attn kv
@@ -1090,6 +1093,14 @@ def policy_loss_function(
     if opd_loss is not None:
         loss = loss + opd_loss
 
+    eopd_fkl_loss, eopd_reported_loss = compute_eopd_fkl_loss(
+        args=args,
+        batch=batch,
+        log_probs_and_entropy=log_probs_and_entropy,
+    )
+    if eopd_fkl_loss is not None:
+        loss = loss + eopd_fkl_loss
+
     if log_probs.numel() == 0:
         loss += 0 * logits.sum()
 
@@ -1130,6 +1141,7 @@ def policy_loss_function(
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
     reported_loss.update(opd_reported_loss)
+    reported_loss.update(eopd_reported_loss)
 
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.

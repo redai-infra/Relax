@@ -85,6 +85,7 @@ def build_prefill_payload_base(input_ids: list[int], logprob_start_len: int) -> 
 class SampledTokenWorker:
     TRANSFER_TEACHER_LOG_PROBS = "teacher_log_probs"
     TRANSFER_STUDENT_LOG_PROBS = "rollout_log_probs"
+    TRANSFER_TEACHER_ENTROPY = "teacher_entropy"
 
     @classmethod
     def from_args(cls, args) -> "SampledTokenWorker":
@@ -97,6 +98,7 @@ class SampledTokenWorker:
 class TopkWorker:
     TRANSFER_TOKEN_IDS = "opd_topk_token_ids"
     TRANSFER_TEACHER_LOG_PROBS = "opd_topk_teacher_log_probs"
+    TRANSFER_TEACHER_ENTROPY = "teacher_entropy"
     # only as_adv
     TRANSFER_STUDENT_LOG_PROBS = "opd_topk_student_log_probs"
     # only union

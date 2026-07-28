@@ -33,7 +33,7 @@ OPD_ROLLOUT_LOG_SKIP_FIELDS = frozenset(
     }
 )
 
-OPD_CP_FLOAT_FIELDS = ("teacher_log_probs",)
+OPD_CP_FLOAT_FIELDS = ("teacher_log_probs", "teacher_entropy")
 
 
 def iter_opd_cp_float_fields() -> tuple[str, ...]:
@@ -677,6 +677,35 @@ def add_opd_arguments(parser: Any) -> Any:
             "Set to None (default) to disable."
         ),
     )
+
+    # EOPD (Entropy-aware On-Policy Distillation) arguments
+    parser.add_argument(
+        "--use-eopd",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Entropy-aware OPD (EOPD). Adds a forward KL loss at "
+            "high-entropy teacher positions. Requires --use-opd and --opd-type=megatron."
+        ),
+    )
+    parser.add_argument(
+        "--eopd-entropy-threshold",
+        type=float,
+        default=0.8,
+        help="Teacher entropy threshold (nats) for EOPD gating. Default 0.8.",
+    )
+    parser.add_argument(
+        "--eopd-fkl-coef",
+        type=float,
+        default=1.0,
+        help="Coefficient for EOPD forward KL loss. Default 1.0.",
+    )
+    parser.add_argument(
+        "--eopd-fkl-top-k",
+        type=int,
+        default=0,
+        help="Top-K for EOPD forward KL. 0 (default) uses --opd-log-prob-top-k.",
+    )
     return parser
 
 
@@ -827,6 +856,23 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
                 "(single) / --opd-teacher-routes (multi) with a 'teacher' entry in --resource."
             )
 
+    # EOPD validation
+    if getattr(args, "use_eopd", False):
+        if args.opd_type != "megatron":
+            raise ValueError("--use-eopd requires --opd-type=megatron (teacher entropy needs full-vocab logits).")
+        if opd_loss_coef == 0.0:
+            raise ValueError("--use-eopd requires --opd-loss-coef > 0 (loss mode).")
+        eopd_top_k = int(getattr(args, "eopd_fkl_top_k", 0) or 0)
+        base_top_k = int(getattr(args, "opd_log_prob_top_k", 0) or 0)
+        if eopd_top_k <= 0 and base_top_k <= 0:
+            raise ValueError("--use-eopd requires --eopd-fkl-top-k > 0 or --opd-log-prob-top-k > 0.")
+        log.info(
+            "EOPD enabled: threshold=%.3f nats, fkl_coef=%.3f, fkl_top_k=%d",
+            args.eopd_entropy_threshold,
+            args.eopd_fkl_coef,
+            eopd_top_k if eopd_top_k > 0 else base_top_k,
+        )
+
 
 # ============================================================================
 # Multimodal image encoding helpers (raw base64 PNG for opd_preexpanded_raw)
@@ -914,6 +960,19 @@ def consume_opd_train_data(data_fields: list[str], args: Namespace) -> None:
     if not (getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"):
         return
     data_fields.extend(_get_opd_transfer_schema(args))
+
+
+def get_megatron_opd_batch_keys(args: Namespace) -> list[str]:
+    """Return extra batch keys needed for megatron OPD training forward."""
+    if not (getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "megatron"):
+        return []
+    keys = ["teacher_log_probs"]
+    token_selection = getattr(args, "opd_token_selection", "student_sampled")
+    if token_selection in ("student_topk", "teacher_topk", "union"):
+        keys.extend(["opd_topk_token_ids", "opd_topk_teacher_log_probs"])
+    if getattr(args, "use_eopd", False):
+        keys.append("teacher_entropy")
+    return keys
 
 
 def consume_opd_advantage_data(data_fields: list[str], args: Namespace) -> None:
@@ -1450,6 +1509,77 @@ def compute_policy_opd_loss(
 
     opd_loss = reduce_opd_loss(batch, opd_per_token_kl)
     return opd_loss_coef * opd_loss, reported_loss
+
+
+def compute_eopd_fkl_loss(
+    *,
+    args: Namespace,
+    batch: RolloutBatch,
+    log_probs_and_entropy: dict[str, list[torch.Tensor]],
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    if not getattr(args, "use_eopd", False):
+        return None, {}
+
+    teacher_entropy_list = batch.get("teacher_entropy")
+    if teacher_entropy_list is None:
+        return None, {}
+
+    student_topk_lp_list = log_probs_and_entropy.get("topk_log_probs")
+    teacher_topk_lp_list = batch.get("opd_topk_teacher_log_probs")
+    if not student_topk_lp_list or not teacher_topk_lp_list:
+        return None, {}
+
+    threshold = float(args.eopd_entropy_threshold)
+    fkl_coef = float(args.eopd_fkl_coef)
+    norm_mode = getattr(args, "opd_norm_mode", "tail")
+    log_prob_min_clamp = getattr(args, "opd_log_prob_min_clamp", None)
+    token_selection = args.opd_token_selection
+    k_lengths_list = batch.get("opd_topk_ksz") if token_selection == "union" else None
+    device = student_topk_lp_list[0].device
+
+    fkl_chunks: list[torch.Tensor] = []
+    entropy_mask_chunks: list[torch.Tensor] = []
+    teacher_ent_chunks: list[torch.Tensor] = []
+
+    for i, s_lp_2d in enumerate(student_topk_lp_list):
+        t_lp_2d = teacher_topk_lp_list[i].to(device=device).detach()
+        s_lp_2d = s_lp_2d.to(device=device)
+        t_ent = teacher_entropy_list[i].to(device=device).detach()
+
+        mask = None
+        if k_lengths_list is not None and i < len(k_lengths_list):
+            kl = k_lengths_list[i]
+            if kl is not None and t_lp_2d is not None:
+                kl = kl.to(device=device)
+                max_kp = t_lp_2d.size(-1)
+                mask = torch.arange(max_kp, device=device).unsqueeze(0) < kl.unsqueeze(1)
+
+        per_token_fkl = compute_opd_kl_topk(
+            s_lp_2d,
+            t_lp_2d,
+            kl_type="forward_kl",
+            norm_mode=norm_mode,
+            log_prob_min_clamp=log_prob_min_clamp,
+            mask=mask,
+        )
+
+        ent_mask = (t_ent >= threshold).float()
+        fkl_chunks.append(per_token_fkl * ent_mask)
+        entropy_mask_chunks.append(ent_mask)
+        teacher_ent_chunks.append(t_ent)
+
+    eopd_fkl_per_token = torch.cat(fkl_chunks, dim=0).to(dtype=student_topk_lp_list[0].dtype)
+    eopd_fkl_loss = reduce_opd_loss(batch, eopd_fkl_per_token)
+
+    reported: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        all_ent_mask = torch.cat(entropy_mask_chunks, dim=0)
+        all_teacher_ent = torch.cat(teacher_ent_chunks, dim=0)
+        reported["eopd_fkl_loss"] = eopd_fkl_loss.clone().detach()
+        reported["eopd_high_entropy_frac"] = all_ent_mask.mean().clone().detach()
+        reported["eopd_teacher_entropy_mean"] = all_teacher_ent.mean().clone().detach()
+
+    return fkl_coef * eopd_fkl_loss, reported
 
 
 # ---------------------------------------------------------------------------
