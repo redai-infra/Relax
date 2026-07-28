@@ -207,7 +207,7 @@ def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monk
     warning.assert_called_once()
 
 
-def test_custom_config_disabling_fp16_restores_bf16_default(arguments_module, monkeypatch, tmp_path):
+def test_custom_config_disabling_cli_fp16_preserves_fp32_baseline(arguments_module, monkeypatch, tmp_path):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text("fp16: false\n")
     warning = Mock()
@@ -220,9 +220,46 @@ def test_custom_config_disabling_fp16_restores_bf16_default(arguments_module, mo
     arguments_module.slime_validate_args(args)
 
     assert args.fp16 is False
+    assert args.bf16 is False
+    assert args.store_param_remainders is True
+    warning.assert_not_called()
+
+
+def test_custom_config_fp16_false_preserves_existing_bf16(arguments_module, monkeypatch, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: false\n")
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = False
+    args.bf16 = True
+    args.custom_config_path = str(config_path)
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.fp16 is False
     assert args.bf16 is True
     assert args.store_param_remainders is True
     warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("config", "flag"),
+    [
+        ('fp16: "false"\n', "fp16"),
+        ("fp16: 1\n", "fp16"),
+        ('bf16: "true"\n', "bf16"),
+        ("bf16: 0\n", "bf16"),
+    ],
+)
+def test_custom_config_precision_flags_require_booleans(arguments_module, tmp_path, config, flag):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text(config)
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match=rf"custom config.*{flag}.*boolean"):
+        arguments_module.slime_validate_args(args)
 
 
 def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tmp_path):
@@ -232,6 +269,15 @@ def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tm
     args.custom_config_path = str(config_path)
 
     with pytest.raises(ValueError, match="--initial-loss-scale"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_kl_loss_requires_existing_ref_load(arguments_module, tmp_path):
+    args = _opd_args()
+    args.use_kl_loss = True
+    args.ref_load = str(tmp_path / "missing-ref")
+
+    with pytest.raises(FileNotFoundError, match=r"ref_load .* does not exist"):
         arguments_module.slime_validate_args(args)
 
 

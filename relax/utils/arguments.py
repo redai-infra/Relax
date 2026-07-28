@@ -3198,12 +3198,15 @@ def slime_validate_args(args):
     if args.custom_config_path:
         with open(args.custom_config_path) as f:
             data = yaml.safe_load(f) or {}
+        for precision_flag in ("fp16", "bf16"):
+            if precision_flag in data and not isinstance(data[precision_flag], bool):
+                raise ValueError(f"custom config field {precision_flag!r} must be a boolean")
         for k, v in data.items():
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
-        if "fp16" in data and "bf16" not in data:
-            args.bf16 = not bool(args.fp16)
+        if data.get("fp16") is True and "bf16" not in data:
+            args.bf16 = False
 
     _normalize_precision_optimizer_args(args)
 

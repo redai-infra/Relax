@@ -107,7 +107,17 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
 def test_custom_config_only_fp16_reaches_validated_optimizer_config(tmp_path: Path, monkeypatch) -> None:
     custom_config = tmp_path / "custom-config.yaml"
     custom_config.write_text("fp16: true\n", encoding="utf-8")
-    argv = _run_and_capture_argv(tmp_path, ["--custom-config-path", str(custom_config)])
+    argv = _run_and_capture_argv(
+        tmp_path,
+        [
+            "--custom-config-path",
+            str(custom_config),
+            "--ref-load",
+            str(tmp_path),
+            "--skip-hf-validate",
+            "--debug-train-only",
+        ],
+    )
     command_separator = argv.index("--")
     training_args = argv[command_separator + 4 :]
     training_args.remove("--fp16")
@@ -115,24 +125,14 @@ def test_custom_config_only_fp16_reaches_validated_optimizer_config(tmp_path: Pa
     pytest.importorskip("megatron.core")
 
     from relax.backends.megatron import model
-    from relax.backends.megatron.arguments import megatron_parse_args
-    from relax.backends.megatron.arguments import validate_args as megatron_validate_args
-    from relax.utils.arguments import get_slime_extra_args_provider, slime_validate_args
+    from relax.utils.arguments import parse_args
 
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     monkeypatch.setattr(sys, "argv", ["probe", *training_args])
-    args = megatron_parse_args(
-        extra_args_provider=get_slime_extra_args_provider(),
-        skip_hf_validate=True,
-    )
-    assert args.fp16 is False
-    assert args.bf16 is True
-
-    slime_validate_args(args)
+    args = parse_args()
     assert args.fp16 is True
     assert args.bf16 is False
 
-    args = megatron_validate_args(args)
     config = model.OptimizerConfig(**model._build_optimizer_config_kwargs(args))
 
     assert config.fp16 is True
