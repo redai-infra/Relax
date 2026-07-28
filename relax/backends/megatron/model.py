@@ -224,6 +224,18 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     return opt_param_scheduler
 
 
+def _build_optimizer_config_kwargs(args: Namespace) -> dict:
+    kwargs = {}
+    for field in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, field.name):
+            kwargs[field.name] = getattr(args, field.name)
+    if args.fp16:
+        kwargs["bf16"] = False
+        kwargs["fp16"] = True
+        kwargs["params_dtype"] = torch.float16
+    return kwargs
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -276,18 +288,8 @@ def setup_model_and_optimizer(
     if args.only_load_weight:
         return model, None, None
     # Optimizer
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
+    kwargs = _build_optimizer_config_kwargs(args)
     if args.fp16:
-        kwargs["bf16"] = False
-        kwargs["fp16"] = True
-        kwargs["params_dtype"] = torch.float16
-        kwargs["initial_loss_scale"] = 32768
-        kwargs["min_loss_scale"] = 1
-        kwargs["use_precision_aware_optimizer"] = True
-        kwargs["store_param_remainders"] = False
         logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
     config = OptimizerConfig(**kwargs)
     config.timers = None
