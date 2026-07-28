@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import math
 import os
 import warnings
+from numbers import Real
 from typing import Any
 
 import yaml
@@ -42,6 +44,8 @@ def reset_arg(parser, name, **kwargs):
         if name in action.option_strings:
             if "default" in kwargs:
                 action.default = kwargs["default"]
+            if "help" in kwargs:
+                action.help = kwargs["help"]
             break
     else:
         parser.add_argument(name, **kwargs)
@@ -231,6 +235,41 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_train_arguments(parser):
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
+            reset_arg(
+                parser,
+                "--initial-loss-scale",
+                type=float,
+                default=None,
+                help="Initial loss scale. When omitted in FP16 mode, Relax uses 32768.0.",
+            )
+            reset_arg(
+                parser,
+                "--min-loss-scale",
+                type=float,
+                default=None,
+                help="Minimum loss scale. When omitted in FP16 mode, Relax uses 1.0.",
+            )
+            reset_arg(
+                parser,
+                "--use-precision-aware-optimizer",
+                action="store_true",
+                default=None,
+                help="Use the precision-aware optimizer. When omitted in FP16 mode, Relax enables it.",
+            )
+            parser.add_argument(
+                "--no-use-precision-aware-optimizer",
+                action="store_false",
+                dest="use_precision_aware_optimizer",
+                default=None,
+                help="Disable the precision-aware optimizer explicitly.",
+            )
+            reset_arg(
+                parser,
+                "--store-param-remainders",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Store parameter remainders. When omitted in FP16 mode, Relax disables it.",
+            )
             parser.add_argument(
                 "--qkv-format",
                 type=str,
@@ -2443,7 +2482,50 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _normalize_precision_optimizer_args(args) -> None:
+    fp16 = bool(getattr(args, "fp16", False))
+    if fp16:
+        fallbacks = (
+            ("initial_loss_scale", "--initial-loss-scale", 32768.0),
+            ("min_loss_scale", "--min-loss-scale", 1.0),
+            ("use_precision_aware_optimizer", "--use-precision-aware-optimizer", True),
+            ("store_param_remainders", "--store-param-remainders", False),
+        )
+    else:
+        fallbacks = (
+            ("initial_loss_scale", "--initial-loss-scale", 2**32),
+            ("min_loss_scale", "--min-loss-scale", 1.0),
+            ("use_precision_aware_optimizer", "--use-precision-aware-optimizer", False),
+            ("store_param_remainders", "--store-param-remainders", True),
+        )
+
+    missing = []
+    for attr, option, fallback in fallbacks:
+        if getattr(args, attr, None) is None:
+            setattr(args, attr, fallback)
+            missing.append(f"{option}={fallback}")
+
+    if fp16 and missing:
+        logger.warning("FP16 optimizer arguments omitted; applying fallbacks: " + ", ".join(missing))
+
+    for attr, option in (
+        ("initial_loss_scale", "--initial-loss-scale"),
+        ("min_loss_scale", "--min-loss-scale"),
+    ):
+        value = getattr(args, attr)
+        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{option} must be a finite positive number, got {value!r}.")
+
+    if args.min_loss_scale > args.initial_loss_scale:
+        raise ValueError("--min-loss-scale must be less than or equal to --initial-loss-scale.")
+
+    if fp16 and args.store_param_remainders:
+        raise ValueError("--store-param-remainders cannot be enabled with --fp16.")
+
+
 def slime_validate_args(args):
+    _normalize_precision_optimizer_args(args)
+
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
