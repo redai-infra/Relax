@@ -3,6 +3,7 @@
 """Custom reward fixtures used by Task 19 integration tests."""
 
 import asyncio
+import functools
 import os
 import time
 
@@ -47,6 +48,23 @@ async def async_process_reward(args, sample, **kwargs):
         "pid": os.getpid(),
         "index": sample.index,
         "marker": kwargs.get("marker"),
+    }
+
+
+def _wrap_async_reward(function):
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+@_wrap_async_reward
+async def decorated_async_process_reward(args, sample, **kwargs):
+    await asyncio.sleep(0)
+    return {
+        "pid": os.getpid(),
+        "index": sample.index,
     }
 
 

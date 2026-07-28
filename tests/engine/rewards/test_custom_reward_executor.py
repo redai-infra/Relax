@@ -89,6 +89,27 @@ async def test_async_custom_reward_is_awaited_in_caller_process():
 
 
 @pytest.mark.asyncio
+async def test_decorated_async_custom_reward_is_awaited_in_caller_process():
+    args = _make_args("decorated_async_process_reward")
+
+    result = await async_rm(args, _make_sample(4))
+
+    assert result == {"pid": os.getpid(), "index": 4}
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_agentic_async_custom_reward_supports_unlimited_concurrency():
+    args = _make_args("async_process_reward", reward_max_concurrency=None)
+
+    result = await agentic_reward._async_rm(args, _make_sample(5))
+
+    assert result["pid"] == os.getpid()
+    assert RewardExecutor._instance._semaphore is None
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
 async def test_custom_function_is_loaded_once_in_caller(monkeypatch):
     load_count = 0
     original_load_function = rewards_module.load_function
@@ -269,8 +290,92 @@ async def test_batched_custom_reward_error_identifies_batch_position():
     args = _make_args("sync_maybe_failing_reward")
     samples = [_make_sample(0), _make_sample(1, response="fail"), _make_sample(2)]
 
-    with pytest.raises(RuntimeError, match=r"batch position 1"):
+    with pytest.raises(RuntimeError, match=rf"{args.custom_rm_path!r} failed at batch position 1"):
         await batched_async_rm(args, samples)
+
+
+@pytest.mark.asyncio
+async def test_batched_custom_reward_failure_cancels_and_drains_siblings(monkeypatch):
+    args = _make_args("async_process_reward")
+    samples = [_make_sample(0), _make_sample(1, response="fail"), _make_sample(2)]
+    started = set()
+    cancelled = set()
+
+    async def fake_async_rm(received_args, sample, **kwargs):
+        assert received_args is args
+        started.add(sample.index)
+        while len(started) < len(samples):
+            await asyncio.sleep(0)
+        if sample.response == "fail":
+            raise ValueError("intentional failure")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(sample.index)
+            raise
+
+    monkeypatch.setattr(rewards_module, "async_rm", fake_async_rm)
+
+    with pytest.raises(RuntimeError, match="batch position 1"):
+        await batched_async_rm(args, samples)
+
+    assert started == {0, 1, 2}
+    assert cancelled == {0, 2}
+
+
+@pytest.mark.asyncio
+async def test_batched_custom_reward_cancellation_drains_all_samples(monkeypatch):
+    args = _make_args("async_process_reward")
+    samples = [_make_sample(index) for index in range(3)]
+    all_started = asyncio.Event()
+    started = set()
+    cancelled = set()
+
+    async def fake_async_rm(received_args, sample, **kwargs):
+        assert received_args is args
+        started.add(sample.index)
+        if len(started) == len(samples):
+            all_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(sample.index)
+            raise
+
+    monkeypatch.setattr(rewards_module, "async_rm", fake_async_rm)
+    batch_task = asyncio.create_task(batched_async_rm(args, samples))
+    await asyncio.wait_for(all_started.wait(), timeout=1)
+
+    batch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await batch_task
+
+    assert cancelled == {0, 1, 2}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_actor_wait_requests_ray_cancellation(monkeypatch):
+    wait_forever = asyncio.Event()
+    cancel_calls = []
+
+    class PendingRef:
+        def __await__(self):
+            return wait_forever.wait().__await__()
+
+    ref = PendingRef()
+
+    def fake_cancel(received_ref, **kwargs):
+        cancel_calls.append((received_ref, kwargs))
+
+    monkeypatch.setattr(ray, "cancel", fake_cancel)
+    wait_task = asyncio.create_task(RewardExecutor._await_actor_ref(ref))
+    await asyncio.sleep(0)
+
+    wait_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wait_task
+
+    assert cancel_calls == [(ref, {"force": False, "recursive": True})]
 
 
 @pytest.mark.asyncio
