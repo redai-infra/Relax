@@ -227,7 +227,9 @@ class RolloutDataSource(DataSource):
             self.sample_group_index += 1
             samples.append(group)
         if getattr(self.args, "sort_prompts_by_length", False):
-            samples.sort(key=lambda group: len(group[0].prompt) if isinstance(group[0].prompt, str) else 0, reverse=True)
+            samples.sort(
+                key=lambda group: len(group[0].prompt) if isinstance(group[0].prompt, str) else 0, reverse=True
+            )
         return samples
 
     def add_samples(self, samples: list[list[Sample]]):
@@ -316,12 +318,16 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 
         if num_samples == 0:
             if getattr(self.args, "sort_prompts_by_length", False):
-                samples.sort(key=lambda group: len(group[0].prompt) if isinstance(group[0].prompt, str) else 0, reverse=True)
+                samples.sort(
+                    key=lambda group: len(group[0].prompt) if isinstance(group[0].prompt, str) else 0, reverse=True
+                )
             return samples
 
         samples += super().get_samples(num_samples=num_samples)
         if getattr(self.args, "sort_prompts_by_length", False):
-            samples.sort(key=lambda group: len(group[0].prompt) if isinstance(group[0].prompt, str) else 0, reverse=True)
+            samples.sort(
+                key=lambda group: len(group[0].prompt) if isinstance(group[0].prompt, str) else 0, reverse=True
+            )
         return samples
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:

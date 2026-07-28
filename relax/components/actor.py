@@ -252,7 +252,6 @@ class Actor(Base):
         ):
             self._peer_barrier.wait_completed_round_sync(self.step)
 
-
         return True
 
     def _execute_training(self) -> bool:
