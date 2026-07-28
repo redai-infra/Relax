@@ -23,7 +23,7 @@ pytest.importorskip("safetensors")
 import safetensors  # noqa: E402
 import safetensors.torch  # noqa: E402
 
-from relax.utils.hf_export import reconcile_hf_export_index  # noqa: E402
+from relax.utils.hf_export import reconcile_hf_export_index, reference_expects_mtp  # noqa: E402
 
 
 _INDEX = "model.safetensors.index.json"
@@ -141,3 +141,53 @@ def test_no_ghosts_is_noop(tmp_path):
 
     assert summary == {"ghosts": [], "supplemented": [], "dropped": []}
     assert json.load(open(ref / _INDEX)) == before  # index left untouched
+
+
+def test_reference_expects_mtp(tmp_path):
+    # Sharded reference that contains mtp.* -> True.
+    ref = tmp_path / "ref"
+    _make_reference(ref)
+    assert reference_expects_mtp(str(ref)) is True
+
+    # Sharded reference without any mtp.* -> False.
+    no_mtp = tmp_path / "no_mtp"
+    no_mtp.mkdir()
+    _write_shard(no_mtp / "model-00001-of-00001.safetensors", {"model.embed_tokens.weight": torch.zeros(2, 2)})
+    _write_index(no_mtp / _INDEX, {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"})
+    assert reference_expects_mtp(str(no_mtp)) is False
+
+    # Single-file reference (no index) that contains mtp.* -> True.
+    single = tmp_path / "single"
+    single.mkdir()
+    _write_shard(
+        single / "model.safetensors",
+        {"model.embed_tokens.weight": torch.zeros(2, 2), "mtp.fc.weight": torch.zeros(2, 2)},
+    )
+    assert reference_expects_mtp(str(single)) is True
+
+    # Missing / unreadable directory -> False (never raises).
+    assert reference_expects_mtp(str(tmp_path / "does_not_exist")) is False
+
+
+def test_supplement_mtp_single_file(tmp_path):
+    # Single-file export missing MTP; reference (sharded) has it. The reconciler
+    # must supplement MTP and create an index alongside the original file.
+    ref, out = tmp_path / "ref", tmp_path / "out"
+    _make_reference(ref)
+    out.mkdir()
+    _write_shard(
+        out / "model.safetensors", {"model.embed_tokens.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+    )
+
+    summary = reconcile_hf_export_index(str(out), reference_hf_dir=str(ref), supplement_mtp=True)
+
+    assert summary["ghosts"] == []  # single-file has no index -> no ghosts
+    assert set(summary["supplemented"]) == {"mtp.fc.weight", "mtp.norm.weight"}
+    # An index was created and is consistent with the tensors on disk.
+    physical, index = _physical_and_index(out)
+    assert set(index) == physical
+    assert {"model.embed_tokens.weight", "lm_head.weight", "mtp.fc.weight", "mtp.norm.weight"} == set(index)
+    # Original single file is untouched; MTP lives in the new shard.
+    assert index["model.embed_tokens.weight"] == "model.safetensors"
+    with safetensors.safe_open(str(out / index["mtp.fc.weight"]), framework="pt", device="cpu") as f:
+        assert torch.equal(f.get_tensor("mtp.fc.weight"), torch.arange(8, dtype=torch.float32).reshape(2, 4))
