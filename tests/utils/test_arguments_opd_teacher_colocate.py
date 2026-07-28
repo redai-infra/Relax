@@ -4,6 +4,7 @@ import argparse
 import importlib
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -183,3 +184,30 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monkeypatch, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\n")
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.initial_loss_scale == 32768.0
+    assert args.min_loss_scale == 1.0
+    assert args.use_precision_aware_optimizer is True
+    assert args.store_param_remainders is False
+    warning.assert_called_once()
+
+
+def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\ninitial_loss_scale: 0\n")
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match="--initial-loss-scale"):
+        arguments_module.slime_validate_args(args)

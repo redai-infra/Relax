@@ -284,7 +284,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Skip the actor_fwd role and reuse the train forward's log_probs as "
-                    "old_log_probs (ppo_kl ≡ 0, ratio ≡ 1), saving the dedicated actor_fwd "
+                    "old_log_probs (ppo_kl ? 0, ratio ? 1), saving the dedicated actor_fwd "
                     "GPU group and one weight-sync per step. "
                     "Auto-enabled when --fully-async and "
                     "rollout_batch_size * n_samples_per_prompt == global_batch_size; no need "
@@ -365,14 +365,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Whether to freeze the audio encoder backbone parameters "
                 "(used in bridge mode for multimodal models with an audio "
-                "encoder).  Does NOT freeze the audio projection — pass "
+                "encoder).  Does NOT freeze the audio projection ? pass "
                 "--freeze-audio-projection for that.",
             )
             parser.add_argument(
                 "--freeze-audio-projection",
                 action="store_true",
                 default=False,
-                help="Whether to freeze the audio→LM projection parameters "
+                help="Whether to freeze the audio?LM projection parameters "
                 "(used in bridge mode for multimodal models with an audio "
                 "encoder).  Independent of --freeze-audio-model.",
             )
@@ -414,7 +414,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
                 "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
-                "logits. Default off — legacy external-loss SFT path materializes full logits "
+                "logits. Default off ? legacy external-loss SFT path materializes full logits "
                 "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
                 "when --enable-mtp-training is set (MTP head needs the real output_layer; "
                 "bypass would break it) or when embeddings are tied "
@@ -488,7 +488,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Carve a held-out eval split from --prompt-data instead of providing a separate "
                     "--eval-prompt-data. A value <1 is treated as a fraction of the train dataset "
-                    "(e.g. 0.05 → last 5%); a value ≥1 is treated as an absolute sample count. "
+                    "(e.g. 0.05 ? last 5%); a value ?1 is treated as an absolute sample count. "
                     "The reserved tail is removed from the train pool so train and eval samples never "
                     "overlap. Mutually exclusive with --eval-prompt-data."
                 ),
@@ -537,7 +537,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "`skip` drops the sample; `keep` (default) returns it unchanged (may OOM downstream); "
                     "`truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first "
                     "`capacity` tokens; `custom` delegates to --sft-oversize-custom-function-path. "
-                    "Note: truncating multimodal samples in-place may misalign multimodal_train_inputs — "
+                    "Note: truncating multimodal samples in-place may misalign multimodal_train_inputs ? "
                     "use `custom` if you need to also trim media inputs."
                 ),
             )
@@ -2068,15 +2068,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             following the same pattern as --ref-actor-config.
 
             --genrm-engine-config keys (with defaults):
-              model_path (str, required) — genRM model path; presence enables genRM
-              num_gpus (int, 1) — total number of GPUs for genRM
-              num_gpus_per_engine (int, 1) — GPUs per genRM engine instance
-              max_context_len (int, 8192) — maximum context length
+              model_path (str, required) ? genRM model path; presence enables genRM
+              num_gpus (int, 1) ? total number of GPUs for genRM
+              num_gpus_per_engine (int, 1) ? GPUs per genRM engine instance
+              max_context_len (int, 8192) ? maximum context length
             --genrm-sampling-config keys (with defaults):
-              temperature (float, 0.1) — sampling temperature
-              top_p (float, 1.0) — nucleus sampling probability
-              top_k (int, -1) — top-k sampling (-1 disables)
-              max_response_len (int, 4096) — maximum response length
+              temperature (float, 0.1) ? sampling temperature
+              top_p (float, 1.0) ? nucleus sampling probability
+              top_k (int, -1) ? top-k sampling (-1 disables)
+              max_response_len (int, 4096) ? maximum response length
             """
             parser.add_argument(
                 "--genrm-model-path",
@@ -2523,8 +2523,6 @@ def _normalize_precision_optimizer_args(args) -> None:
 
 
 def slime_validate_args(args):
-    _normalize_precision_optimizer_args(args)
-
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
@@ -2564,7 +2562,7 @@ def slime_validate_args(args):
 
     # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
     # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
-    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
+    # v0.5.9 build) does not populate output_token_logprobs ? rollout sees
     # response_length=1 for every sample and training silently degenerates.
     if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
         "1",
@@ -2579,7 +2577,7 @@ def slime_validate_args(args):
             "response_length to 1 and silently breaks training. "
             "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
             "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
-            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
+            "--sglang-mamba-scheduler-strategy extra_buffer ? that flag alone "
             "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
             "spec_v2."
         )
@@ -3008,18 +3006,18 @@ def slime_validate_args(args):
     # --sft-chunked-logits incompatibilities. All three are flagged here so
     # downstream (model.py _should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # All three are hard asserts ? the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
         # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
-        #    Output_layer is built with skip_weight_param_allocation=True →
-        #    output_layer.weight is None → chunked path's lm_head matmul
+        #    Output_layer is built with skip_weight_param_allocation=True ?
+        #    output_layer.weight is None ? chunked path's lm_head matmul
         #    crashes on NoneType. The chunked memory win is marginal on the
         #    small models that ship with tied embeddings anyway, so the user
         #    should just drop the flag.
         assert getattr(args, "untie_embeddings_and_output_weights", False), (
             "--sft-chunked-logits is incompatible with tied embeddings "
-            "(HF config.tie_word_embeddings=true → "
+            "(HF config.tie_word_embeddings=true ? "
             "--untie-embeddings-and-output-weights not set; output_layer.weight "
             "is None and the chunked path's lm_head matmul has nothing to "
             "multiply against). Remove --sft-chunked-logits; the chunked "
@@ -3034,7 +3032,7 @@ def slime_validate_args(args):
         )
         # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
-        #    model(**kwargs) and so never hits _bypass_output_layer — chunked
+        #    model(**kwargs) and so never hits _bypass_output_layer ? chunked
         #    silently degrades to the full-logits path.
         assert not getattr(args, "overlap_moe_expert_parallel_comm", False), (
             "--sft-chunked-logits is incompatible with "
@@ -3053,6 +3051,8 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    _normalize_precision_optimizer_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(
