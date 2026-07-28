@@ -24,6 +24,7 @@ from relax.utils import device as device_utils
 from relax.utils.async_utils import run
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
 
 
 logger = get_logger(__name__)
@@ -546,6 +547,66 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def load_lora_adapter_from_tensors(
+        self,
+        lora_name: str,
+        serialized_tensors: str,
+        config_dict: dict,
+        load_format: str | None = None,
+        pinned: bool = False,
+    ) -> dict | None:
+        """Load/refresh a LoRA adapter directly from serialized tensors — no
+        disk IO.
+
+        In-memory counterpart to :meth:`load_lora_adapter` (SGLang's ``/load_lora_adapter_from_tensors``,
+        available since 0.5.12). ``config_dict`` is the HF-PEFT adapter config (the same content
+        the disk path writes to ``adapter_config.json``); ``serialized_tensors`` carries the full
+        (TP-gathered, PP-merged) adapter tensors serialized with SGLang's ``MultiprocessingSerializer``.
+
+        Unlike ``update_weights_from_tensor`` (which fans out one shard per TP worker), SGLang
+        broadcasts this single blob to every TP worker, which each deserialize it and slice their
+        own shard internally (``slice_lora_a/b_weights``). The caller must therefore serialize
+        **host** tensors (CUDA-IPC handles would not survive the fan-out to GPU-isolated workers).
+
+        Requires the server launched with ``--enable-lora`` and ``dp_size == 1``. Re-registers the
+        adapter when called again with the same ``lora_name``.
+
+        Args:
+            lora_name: Adapter name; rollout requests pass ``lora_path=lora_name``.
+            serialized_tensors: Adapter tensors serialized via ``MultiprocessingSerializer.serialize(..., output_str=True)``.
+            config_dict: HF-PEFT config dict (see ``build_hf_peft_config_dict``).
+            load_format: Optional SGLang load format (e.g. ``"flattened_bucket"``); ``None`` for a plain tensor dict.
+            pinned: Pin the adapter against LRU eviction (kept False; one self-managed adapter).
+
+        Returns:
+            Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
+        """
+        return self._make_request(
+            "load_lora_adapter_from_tensors",
+            {
+                "lora_name": lora_name,
+                "config_dict": config_dict,
+                "serialized_tensors": serialized_tensors,
+                "load_format": load_format,
+                "pinned": pinned,
+            },
+        )
+
+    def unload_lora_adapter(self, lora_name: str) -> dict | None:
+        """Unload a previously registered LoRA adapter by name.
+
+        Used in adapter mode to drop the prior adapter version before registering a refreshed
+        one under the same name, so adapters do not accumulate / collide in the engine's LoRA
+        registry.
+
+        Args:
+            lora_name: Adapter name to unload.
+
+        Returns:
+            Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
+        """
+        return self._make_request("unload_lora_adapter", {"lora_name": lora_name})
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
@@ -1037,6 +1098,23 @@ def _compute_server_args(
         "enable_draft_weights_cpu_backup": True,
         "enable_metrics": True,
     }
+
+    # LoRA adapter mode: launch the engine with SGLang's runtime LoRA serving so the
+    # trained adapter can be pushed each step via load_lora_adapter (see
+    # UpdateWeightFromTensor._push_lora_adapter) and selected at generation via lora_path.
+    if is_lora_enabled(args) and getattr(args, "lora_adapter_mode", False):
+        kwargs["enable_lora"] = True
+        kwargs["max_lora_rank"] = args.lora_rank
+        # SGLang expects HF-style module names; CLI holds canonical Megatron names.
+        kwargs["lora_target_modules"] = convert_megatron_to_hf_target_modules(args.lora_target_modules)
+        # We serve exactly one policy adapter. max_loaded_loras >= max_loras_per_batch is a
+        # SGLang startup requirement; 2 leaves room for the unload->reload overlap.
+        kwargs["max_loras_per_batch"] = 1
+        kwargs["max_loaded_loras"] = 2
+        # Mandatory: base is synced once, so it must survive colocate sleep/wake. Without CPU
+        # backup, release_memory_occupation drops the GPU pages and base becomes garbage after
+        # the first wake (other modes re-push full base every step and never notice).
+        kwargs["enable_weights_cpu_backup"] = True
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"

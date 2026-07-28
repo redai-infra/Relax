@@ -192,24 +192,18 @@ def _pipeline_with_transfer(args):
         args=args,
         rollout_id=0,
         runtime_groups_by_key={},
-        interrupted_current_groups=0,
-        interrupted_previous_groups=0,
+        interrupted_groups=0,
     )
     runtime.require_rollout_id = lambda: runtime.rollout_id
     runtime.resident_group_keys = lambda: set(runtime.runtime_groups_by_key)
     runtime.accounting_snapshot = lambda: {
         "resident_groups": len(runtime.runtime_groups_by_key),
-        "interrupted_current_groups": runtime.interrupted_current_groups,
-        "interrupted_previous_groups": runtime.interrupted_previous_groups,
+        "interrupted_groups": runtime.interrupted_groups,
     }
-    runtime.interrupted_group_count_for_step = lambda *, rollout_id, previous: (
-        runtime.interrupted_previous_groups if previous else runtime.interrupted_current_groups
-    )
 
     async def _refresh_interrupted_close_accounting() -> dict[str, int]:
         return {
-            "interrupted_current_groups": runtime.interrupted_current_groups,
-            "interrupted_previous_groups": runtime.interrupted_previous_groups,
+            "interrupted_groups": runtime.interrupted_groups,
         }
 
     runtime.refresh_interrupted_close_accounting = _refresh_interrupted_close_accounting
@@ -452,31 +446,48 @@ def test_admission_quota_prepare_isolation_and_resident_tail_carry() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fully_async", "terminal_step", "resident_groups", "interrupted_current", "expected_finish", "status"),
+    (
+        "fully_async",
+        "terminal_step",
+        "previous_quota",
+        "committed_previous",
+        "committed_current",
+        "interrupted_groups",
+        "required_groups",
+        "expected_finish",
+        "status",
+    ),
     [
-        (True, False, 2, 0, False, "committed_target"),
-        (True, False, 2, 2, True, None),
-        (False, False, 0, 0, False, "committed_target"),
-        (True, True, 0, 2, False, "committed_target"),
+        (True, False, 0, 0, 0, 0, 2, False, "committed_target"),
+        (True, False, 0, 0, 0, 2, 2, True, None),
+        (False, False, 0, 0, 0, 0, 2, False, "committed_target"),
+        (True, True, 0, 0, 0, 2, 2, True, None),
+        (True, False, 4, 4, 0, 8, 8, True, None),
     ],
 )
-def test_finish_eligibility_interrupted_current_policy(
+def test_finish_eligibility_interrupted_policy(
     fully_async: bool,
     terminal_step: bool,
-    resident_groups: int,
-    interrupted_current: int,
+    previous_quota: int,
+    committed_previous: int,
+    committed_current: int,
+    interrupted_groups: int,
+    required_groups: int,
     expected_finish: bool,
     status: str | None,
 ) -> None:
-    args = _runtime_args(fully_async=fully_async, rollout_batch_size=2, n_samples_per_prompt=1)
+    args = _runtime_args(fully_async=fully_async, rollout_batch_size=required_groups, n_samples_per_prompt=1)
     pipeline = _pipeline_with_transfer(args)
     pipeline.transfer_domain.rebind_step(rollout_id=3)
     pipeline.runtime_domain.rollout_id = 3
-    if resident_groups:
-        _set_runtime_resident_groups(pipeline, resident_groups)
-    pipeline.transfer_domain.configure_transfer_quota(previous_partition_quota=0, current_partition_quota=2)
-    pipeline.runtime_domain.interrupted_current_groups = interrupted_current
-    step_handle = _AgenticStepHandle(rollout_id=3, required_group_count=2, terminal_step=terminal_step)
+    pipeline.transfer_domain.configure_transfer_quota(
+        previous_partition_quota=previous_quota,
+        current_partition_quota=required_groups,
+    )
+    pipeline.transfer_domain._committed_previous_group_count = committed_previous
+    pipeline.transfer_domain._committed_current_group_count = committed_current
+    pipeline.runtime_domain.interrupted_groups = interrupted_groups
+    step_handle = _AgenticStepHandle(rollout_id=3, required_group_count=required_groups, terminal_step=terminal_step)
     assert pipeline._close_status(step_handle) == status
     assert (status is None) is expected_finish
 
@@ -619,4 +630,3 @@ def test_deficit_quota_keeps_admission_ledger_consistent() -> None:
     assert remaining_previous_debt == 1  # only the genuine deficit is debt
     assert resident_current_window_groups == 2  # the 2 surplus folded into current window
     assert current_window_slack >= 0
-    pipeline._assert_resident_group_count_invariant(context="test_deficit_ledger")

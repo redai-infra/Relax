@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections import deque
 
@@ -25,7 +26,6 @@ async def _transfer_batch_to_data_system(
     batch_count: int,
     rollout_id: int,
     data_system_client,
-    metadata=None,
     is_last: bool = False,
 ) -> list[str]:
     from relax.utils.utils import convert_samples_to_train_data
@@ -49,23 +49,25 @@ async def _transfer_batch_to_data_system(
     )
     while isinstance(batch_samples[0], list):
         batch_samples = sum(batch_samples, [])
-    rollout_batch = convert_samples_to_train_data(args, batch_samples)
+    transfer_samples = []
+    for sample in batch_samples:
+        if sample.reward is None:
+            sample = copy.copy(sample)
+            # Fall back to custom advantage when neither JSON reward nor custom RM supplies a reward.
+            # The transferred raw_reward is then unsuitable for raw-reward statistics; rollout metrics
+            # still use the original sample and ignore this fallback.
+            sample.reward = {args.reward_key: sample.custom_advantage} if args.reward_key else sample.custom_advantage
+        transfer_samples.append(sample)
+    rollout_batch = convert_samples_to_train_data(args, transfer_samples)
     logger.info("Prepared rollout batch %s with %s samples for transfer", batch_count, rollout_batch.numel())
     logger.info("Transferring batch rollout_batch: %s", rollout_batch)
-    if metadata is None:
-        metadata = await data_system_client.async_put(
-            data=rollout_batch, partition_id=f"train_{rollout_id}", is_last=is_last
-        )
-    else:
-        # is_last only applies to the insert path; a backfill put with explicit
-        # metadata writes into existing samples and must not announce end-of-stream.
-        metadata = await data_system_client.async_put(data=rollout_batch, metadata=metadata)
-    if metadata and metadata.size > 0:
-        total_lengths = rollout_batch.get("total_lengths", None)
-        if total_lengths is not None:
-            custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths]
-            metadata.update_custom_meta(custom_meta)
-            await data_system_client.async_set_custom_meta(metadata)
+    custom_meta = [{"total_lengths": int(length)} for length in rollout_batch["total_lengths"]]
+    await data_system_client.async_put(
+        data=rollout_batch,
+        partition_id=f"train_{rollout_id}",
+        custom_meta=custom_meta,
+        is_last=is_last,
+    )
     logger.info("Batch %s transferred successfully for rollout_id: %s", batch_count, rollout_id)
     return list(rollout_batch.keys())
 
@@ -281,8 +283,6 @@ class TransferDomain:
 
     def enqueue_ready_groups(self, groups) -> None:
         for group in groups:
-            if not all(sample.reward is not None for sample in group):
-                raise RuntimeError("TransferDomain received unrewarded group.")
             self.ready_group_buffer.append(group)
 
     def drop_ready_groups(self) -> int:

@@ -8,7 +8,7 @@ import time
 from argparse import Namespace
 from contextlib import nullcontext
 from functools import partial
-from typing import List
+from typing import Any, List
 
 import ray
 import requests
@@ -88,7 +88,6 @@ from .data import (
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
-    sync_actor_critic_data,
 )
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
@@ -101,6 +100,46 @@ from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
+
+
+def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
+    if not counts or any((not isinstance(c, int)) or c <= 0 for c in counts):
+        raise ValueError(f"rollout mini counts must be positive integers, got {counts}")
+    total = sum(counts)
+    if len(values) != total:
+        raise ValueError(f"sum(rollout mini counts) must equal values length, got sum={total}, values={len(values)}")
+    chunks = []
+    start = 0
+    for c in counts:
+        chunks.append(values[start : start + c])
+        start += c
+    return chunks
+
+
+def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
+    num_samples = len(rollout_data.get("total_lengths", []))
+    if start < 0 or end < start or end > num_samples:
+        raise ValueError(f"Invalid slice range: start={start}, end={end}, size={num_samples}")
+
+    def _slice(value):
+        if isinstance(value, (str, bytes)):
+            return value
+        if isinstance(value, (list, tuple)) and len(value) == num_samples:
+            return value[start:end]
+        ndim = getattr(value, "ndim", None)
+        size = getattr(value, "size", None)
+        if ndim and ndim > 0 and callable(size):
+            try:
+                if int(size(0)) == num_samples:
+                    return value[start:end]
+            except (TypeError, ValueError, IndexError):
+                pass
+        return value
+
+    return {k: _slice(v) for k, v in rollout_data.items()}
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -631,17 +670,36 @@ class MegatronTrainRayActor(TrainRayActor):
                     batch_size = plan.mini_local_sample_request
                     num_rollout_minis = plan.num_rollout_minis
             batch_index = 0
-            task_name = sft_task_name(self.args, component="backend")
+            # PPO shares the RL train path across actor and critic backends. If both
+            # used the same TQ task_name, the first consumer (critic) would mark the
+            # whole partition consumed and the actor would exit its fetch loop with
+            # zero mini batches. Use a role-specific task_name so consumption is
+            # tracked independently per consumer.
+            base_task_name = sft_task_name(self.args, component="backend")
+            if not is_sft_mode(self.args) and self.role == "critic":
+                task_name = f"{base_task_name}_critic"
+            else:
+                task_name = base_task_name
             empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
+            rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
+            fetch_iter = 0
             while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
-                data_fields = build_data_fields(self.args)
+                consumer = "critic" if self.role == "critic" else "actor"
+                data_fields = build_data_fields(self.args, consumer=consumer)
                 with timer("train_get_data"):
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
                         task_name, rollout_id, data_fields, batch_size, batch_index
                     )
                 if rollout_data is None:
+                    if fetch_iter % 100 == 0:
+                        logger.info(
+                            f"[fetch loop] rollout_id={rollout_id} batch_index={batch_index}/"
+                            f"{num_rollout_minis} iter={fetch_iter} task={task_name} "
+                            f"fields={data_fields} — empty meta, retrying."
+                        )
+                    fetch_iter += 1
                     if empty_poll_sleep_s > 0:
                         time.sleep(empty_poll_sleep_s)
                     continue
@@ -658,6 +716,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"got {len(rollout_data['total_lengths'])}."
                     )
                 rollout_mini_batches.append(rollout_data)
+                rollout_mini_batch_metas.append(batch_meta)
                 rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
 
             if not is_sft_mode(self.args):
@@ -668,6 +727,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 rollout_data = concat_rollout_batches(rollout_mini_batches)
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+                rollout_data[ROLLOUT_MINI_BATCH_METAS_KEY] = rollout_mini_batch_metas
                 if self.role == "critic":
                     return self.train_critic(rollout_id, rollout_data)
                 else:
@@ -685,9 +745,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_microbatches,
             )
         )
-
-        if rollout_id >= self.args.num_critic_only_steps and not self.args.critic_train_only:
-            sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
+        # Ship values to TransferQueue before we sleep — CP all-gather needs
+        # live NCCL groups and .cpu() needs live GPU memory.
+        self._put_critic_values_to_transfer_queue(rollout_data)
 
         compute_advantages_and_returns(self.args, rollout_data)
 
@@ -701,8 +761,39 @@ class MegatronTrainRayActor(TrainRayActor):
             num_microbatches,
         )
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        # Save critic ckpt while still awake — the outer critic loop used to
+        # call save_model after train_critic returned, which meant save_model
+        # ran with tms.paused and hit `CUDA error: invalid argument` on the
+        # first cudaMalloc (e.g. all_gather_object's byte tensor).
+        is_train_done = (rollout_id + 1) == self.args.num_rollout
+        if self.args.save is not None and (
+            self.args.rotate_ckpt
+            or (
+                self.args.save_interval is not None
+                and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
+            )
+        ):
+            self.save_model(rollout_id, force_sync=is_train_done)
+        # Mirror train_actor's post-train sleep so critic frees GPU before the
+        # next rollout's SGLang resume tries to alloc KV pages.
+        if self._per_step_rollout and self.args.offload_train:
+            self.sleep()
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
+        # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
+        # GAE + normalize_advantages need GPU tensors — dispatch here so the
+        # rest of the pipeline can assume same-device inputs.
+        if self.args.advantage_estimator == "ppo":
+            cur_device = torch.cuda.current_device()
+            for key in ("values", "loss_masks"):
+                tensors = rollout_data.get(key)
+                if tensors is None:
+                    continue
+                rollout_data[key] = [
+                    t.to(cur_device) if isinstance(t, torch.Tensor) and t.device.type != "cuda" else t for t in tensors
+                ]
+
         # Create data iterator for actor forward + routing replay + train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
@@ -720,7 +811,16 @@ class MegatronTrainRayActor(TrainRayActor):
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
-            if self.args.compute_advantages_and_returns:
+            # All RL algorithms need ref/teacher/actor inline forwards to produce old_log_probs.
+            should_compute_old_log_probs = self.args.compute_advantages_and_returns
+            # PPO fully_async has a standalone Advantages service that produces
+            # advantages/returns via TransferQueue; every other path (including
+            # PPO colocate) computes GAE inline from critic's ``values``.
+            should_compute_gae_in_actor = self.args.compute_advantages_and_returns and not (
+                self.args.advantage_estimator == "ppo" and self.args.fully_async and not self.args.hybrid
+            )
+
+            if should_compute_old_log_probs:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -765,15 +865,13 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
-                if self.args.use_critic:
-                    sync_actor_critic_data(
-                        self.args,
-                        rollout_data,
-                        self._actor_critic_groups,
-                    )
+                # Restore model tag before train (keep_old_actor may have switched to old_actor).
                 if self._active_model_tag != "actor":
                     self._switch_model("actor")
 
+            if should_compute_gae_in_actor:
+                if self.args.use_critic and "values" not in rollout_data:
+                    raise RuntimeError("Actor training with critic requires 'values' in rollout data.")
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
@@ -1812,7 +1910,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return status[0]
 
-    def all_consumed_streaming(self, task_name, rollout_id):
+    def all_consumed_streaming(self, task_name, rollout_id, window_id=None, window_quota=None):
         """End-of-stream check for the streaming PP schedule — NO pipeline-
         group collective.
 
@@ -1832,13 +1930,28 @@ class MegatronTrainRayActor(TrainRayActor):
         them aligned on the "data is None" branch), so we broadcast the flag over
         the TP group ONLY to give tp_rank>0 the same answer.  CP ranks within a
         stage are likewise in lockstep, so a CP-group broadcast is safe too.
+
+        When ``window_id`` is given (multi-mini train path) the check is PER
+        WINDOW: the sampler reports drained once it has globally dispatched
+        ``window_quota`` (``mini_global_samples``) for this rollout-mini window,
+        or the whole partition is drained (under-produced final window).
+        Otherwise it falls back to the partition-level stream-drained check.
         """
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
             # Streaming end-of-stream predicate (no preset global batch): the producer
             # marks production_completed and we require every actually-inserted sample
             # to be consumed, rather than a tensor-wide .all() over (possibly dynamic)
-            # rows. See TransferQueue check_stream_drained.
-            status = [run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))]
+            # rows. See TransferQueue check_stream_drained / check_window_drained.
+            if window_id is not None:
+                status = [
+                    run(
+                        self.data_system_client.async_check_window_drained(
+                            task_name, f"train_{rollout_id}", window_id, window_quota
+                        )
+                    )
+                ]
+            else:
+                status = [run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))]
         else:
             status = [True]
         status = torch.tensor(status, device=device_utils.make_current_torch_device())
@@ -1885,7 +1998,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if use_streaming:
             batch_index_stride = 1_000_000
-            overflow_buffer = []
             data_iterator = [
                 StreamingTQIterator(
                     args=self.args,
@@ -1894,18 +2006,36 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_id=rollout_id,
                     token_budget=token_budget,
                     loss_scale=loss_scale,
-                    # PP-collective-free end-of-stream check: the streaming PP
-                    # schedule pulls per-stage at different schedule points, so a
-                    # PP-group broadcast inside __next__ would deadlock.  See
+                    # PP-collective-free PER-WINDOW end-of-stream check: the
+                    # streaming PP schedule pulls per-stage at different schedule
+                    # points, so a PP-group broadcast inside __next__ would
+                    # deadlock.  window_id + window_quota make it query per-window
+                    # drained (sampler dispatched mini_global_samples for this
+                    # window, or partition drained).  Default-arg binds mini_idx
+                    # to avoid the late-binding closure bug.  See
                     # all_consumed_streaming for the full rationale.
-                    all_consumed_fn=lambda: self.all_consumed_streaming(task_name, rollout_id),
+                    all_consumed_fn=(
+                        lambda mi=mini_idx: self.all_consumed_streaming(
+                            task_name, rollout_id, window_id=mi, window_quota=plan.mini_global_samples
+                        )
+                    ),
+                    # Train path: sampler-driven per-round dummy alignment. On an
+                    # empty fetch the iterator reads the DUMMY-round flag from the
+                    # fetched meta and emits a zero-grad dummy so all DPs run equal
+                    # micro-batch counts (MoE EP all-to-all matches by call order).
+                    per_round_dummy=True,
                     dp_rank=dp_rank,
                     dp_size=dp_size,
                     task_name=task_name,
-                    max_samples=plan.mini_local_sample_request,
+                    # Global per-window quota (mini_global_samples): the sampler
+                    # stops dispatching this window once the quota is met across
+                    # all DPs.  Per-DP counts stay uneven (token-budget driven);
+                    # the dummy-pad aligns cross-DP mb counts.  No per-DP hard
+                    # count target on the consumer — termination is the per-window
+                    # drained signal above.
+                    window_quota=plan.mini_global_samples,
                     rollout_mini_index=mini_idx,
                     start_batch_index=mini_idx * batch_index_stride,
-                    overflow_buffer=overflow_buffer,
                 )
                 for mini_idx in range(plan.num_rollout_minis)
             ]
@@ -2125,3 +2255,26 @@ class MegatronTrainRayActor(TrainRayActor):
             }
             output_dict = TensorDict(output_dict, batch_size=[len(batch_meta.samples)])
             run(self.data_system_client.async_put(data=output_dict, metadata=batch_meta))
+
+    def _put_critic_values_to_transfer_queue(self, rollout_data: RolloutBatch) -> None:
+        if getattr(self.args, "advantage_estimator", None) != "ppo":
+            return
+
+        values = rollout_data.get("values")
+        batch_metas = rollout_data.get(ROLLOUT_MINI_BATCH_METAS_KEY)
+        counts = rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
+        if values is None or batch_metas is None or counts is None:
+            return
+        if len(batch_metas) != len(counts):
+            raise ValueError(
+                f"{ROLLOUT_MINI_BATCH_METAS_KEY} length must match {ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY}, "
+                f"got metas={len(batch_metas)}, counts={len(counts)}"
+            )
+
+        value_chunks = _split_by_rollout_mini_counts(values, counts)
+        start = 0
+        for value_chunk, batch_meta, count in zip(value_chunks, batch_metas, counts, strict=False):
+            end = start + count
+            mini_rollout_data = _slice_rollout_batch(rollout_data, start, end)
+            self._put_data_to_transfer_queue({"values": value_chunk}, batch_meta, mini_rollout_data)
+            start = end
