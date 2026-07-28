@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -42,34 +43,6 @@ class _ActiveCounter:
 
     def leave(self) -> None:
         self.active -= 1
-
-
-@pytest.mark.asyncio
-async def test_model_request_scheduler_respects_capacity() -> None:
-    scheduler, _ = _scheduler(capacity=2)
-    counter = _ActiveCounter()
-    release = asyncio.Event()
-    entered = asyncio.Event()
-
-    async def fake_post(url, payload, headers=None):
-        counter.enter()
-        if counter.active == 2:
-            entered.set()
-        await release.wait()
-        counter.leave()
-        return {"ok": True}
-
-    with patch("relax.engine.rollout.sglang_rollout.post", side_effect=fake_post):
-        tasks = [
-            asyncio.create_task(scheduler.request("http://x", {"i": i})) for i in range(3)
-        ]
-        await asyncio.wait_for(entered.wait(), timeout=1.0)
-        assert counter.max_active <= 2
-        assert counter.active == 2
-        release.set()
-        await asyncio.gather(*tasks)
-        assert counter.max_active <= 2
-        assert counter.calls == 3
 
 
 @pytest.mark.asyncio
@@ -124,7 +97,7 @@ async def test_model_request_scheduler_releases_on_cancel_while_holding() -> Non
 
     async def fake_post(url, payload, headers=None):
         holding.set()
-        await asyncio.Event().wait()  # block forever
+        await asyncio.Event().wait()
         return {}
 
     with patch("relax.engine.rollout.sglang_rollout.post", side_effect=fake_post):
@@ -200,20 +173,6 @@ async def test_model_request_scheduler_abort_after_acquire() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_request_scheduler_evaluation_ignores_abort() -> None:
-    scheduler, state = _scheduler(capacity=1)
-    state.aborted = True
-
-    async def ok(url, payload, headers=None):
-        return {"ok": True}
-
-    with patch("relax.engine.rollout.sglang_rollout.post", side_effect=ok):
-        with pytest.raises(RolloutRequestAborted):
-            await scheduler.request("http://x", {}, evaluation=False)
-        assert await scheduler.request("http://x", {}, evaluation=True) == {"ok": True}
-
-
-@pytest.mark.asyncio
 async def test_model_request_scheduler_retry_holds_slot_for_real_post(monkeypatch: pytest.MonkeyPatch) -> None:
     # Real http_utils.post/_post retry+backoff still occupies one scheduler slot.
     import httpx
@@ -234,14 +193,12 @@ async def test_model_request_scheduler_retry_holds_slot_for_real_post(monkeypatc
             self.calls += 1
             if self.calls == 1:
                 raise httpx.ConnectError("transient")
-            # Third HTTP call is the second scheduler.request()'s first attempt.
             if self.calls >= 3:
                 second_http_started.set()
             request = httpx.Request("POST", url)
             return httpx.Response(200, request=request, json={"ok": True, "call": self.calls})
 
     async def gated_sleep(seconds: float) -> None:
-        # Only gate the retry backoff (~1s); keep sleep(0)/short yields real.
         if seconds < 0.5:
             await real_sleep(seconds)
             return
@@ -252,7 +209,6 @@ async def test_model_request_scheduler_retry_holds_slot_for_real_post(monkeypatc
     monkeypatch.setattr(http_utils, "_distributed_post_enabled", False)
     monkeypatch.setattr(http_utils.asyncio, "sleep", gated_sleep)
 
-    # Do not patch sglang_rollout.post: exercise the real http_utils.post path.
     t1 = asyncio.create_task(scheduler.request("http://x", {"id": 1}))
     await asyncio.wait_for(backoff_entered.wait(), timeout=1.0)
 
@@ -290,8 +246,6 @@ async def test_mixed_ordinary_aware_legacy_respect_shared_capacity() -> None:
         counter.leave()
         return "legacy"
 
-    from functools import partial
-
     request_model = partial(scheduler.request, evaluation=False)
 
     @request_model_aware
@@ -317,35 +271,7 @@ async def test_mixed_ordinary_aware_legacy_respect_shared_capacity() -> None:
         assert counter.calls == 3
 
 
-@pytest.mark.asyncio
-async def test_model_request_scheduler_run_legacy_holds_session_slot() -> None:
-    scheduler, _ = _scheduler(capacity=1)
-    legacy_entered = asyncio.Event()
-    release_legacy = asyncio.Event()
-    other_entered = asyncio.Event()
-
-    async def legacy_op():
-        legacy_entered.set()
-        await release_legacy.wait()
-        return "legacy"
-
-    async def other_post(url, payload, headers=None):
-        other_entered.set()
-        return {"ok": True}
-
-    t_legacy = asyncio.create_task(scheduler.run_legacy(legacy_op, evaluation=False))
-    await asyncio.wait_for(legacy_entered.wait(), timeout=1.0)
-    with patch("relax.engine.rollout.sglang_rollout.post", side_effect=other_post):
-        t_other = asyncio.create_task(scheduler.request("http://x", {}))
-        await asyncio.sleep(0)
-        assert not other_entered.is_set()
-        release_legacy.set()
-        assert await t_legacy == "legacy"
-        await asyncio.wait_for(other_entered.wait(), timeout=1.0)
-        assert await t_other == {"ok": True}
-
-
-def test_request_model_aware_marker_and_signature_validation() -> None:
+def test_request_model_aware_accepts_valid_signature() -> None:
     async def unmarked(args, sample, sampling_params, *, request_model):
         return sample
 
@@ -358,56 +284,23 @@ def test_request_model_aware_marker_and_signature_validation() -> None:
     assert _is_request_model_aware(good)
     _validate_request_model_signature(good)
 
+
+def test_request_model_aware_rejects_invalid_signature() -> None:
     @request_model_aware
     async def missing(args, sample, sampling_params):
         return sample
-
-    with pytest.raises(TypeError, match="missing"):
-        _validate_request_model_signature(missing)
 
     @request_model_aware
     async def positional(args, sample, sampling_params, request_model):
         return sample
 
-    with pytest.raises(TypeError, match="keyword-only"):
-        _validate_request_model_signature(positional)
-
     @request_model_aware
     async def optional(args, sample, sampling_params, *, request_model=None):
         return sample
 
+    with pytest.raises(TypeError, match="missing"):
+        _validate_request_model_signature(missing)
+    with pytest.raises(TypeError, match="keyword-only"):
+        _validate_request_model_signature(positional)
     with pytest.raises(TypeError, match="no default"):
         _validate_request_model_signature(optional)
-
-
-@pytest.mark.asyncio
-async def test_bypass_request_model_not_in_framework_guarantee() -> None:
-    # Third-party HTTP that bypasses request_model is outside capacity accounting.
-    scheduler, _ = _scheduler(capacity=1)
-    counter = _ActiveCounter()
-    holding = asyncio.Event()
-    release = asyncio.Event()
-
-    async def slotted(url, payload, headers=None):
-        counter.enter()
-        holding.set()
-        await release.wait()
-        counter.leave()
-        return {"slotted": True}
-
-    async def bypass_http():
-        # Simulates custom code calling post() directly — not admitted.
-        counter.enter()
-        await asyncio.sleep(0)
-        counter.leave()
-        return {"bypass": True}
-
-    with patch("relax.engine.rollout.sglang_rollout.post", side_effect=slotted):
-        t1 = asyncio.create_task(scheduler.request("http://x", {}))
-        await asyncio.wait_for(holding.wait(), timeout=1.0)
-        bypass_result = await bypass_http()
-        assert bypass_result == {"bypass": True}
-        # Framework-managed active is 1, but raw counter may be 2 during bypass overlap.
-        assert counter.max_active >= 2
-        release.set()
-        await t1

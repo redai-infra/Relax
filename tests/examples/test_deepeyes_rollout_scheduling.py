@@ -15,15 +15,58 @@ import pytest
 
 from examples.deepeyes import rollout as deepeyes_rollout
 from relax.engine.rollout import sglang_rollout as rollout_mod
-from relax.engine.rollout.sglang_rollout import (
-    ModelRequestScheduler,
-    RolloutRequestAborted,
-    request_model_aware,
-)
+from relax.engine.rollout.sglang_rollout import ModelRequestScheduler, RolloutRequestAborted, request_model_aware
 from relax.utils.types import Sample
 
 
-def test_sync_sample_outputs_does_not_set_completed() -> None:
+class _FakeEnv:
+    def __init__(self) -> None:
+        self.turn = 0
+        self.current_image = None
+
+    def reset(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class _FakeGenState:
+    def __init__(self, args):
+        self.args = args
+        self.aborted = False
+        self.opd_manager = None
+        self.model_request_scheduler = ModelRequestScheduler(self, capacity=2)
+
+    def dp_rank_context(self):
+        @contextmanager
+        def _ctx():
+            yield 0
+
+        return _ctx()
+
+
+def _deepeyes_args(*, partial_rollout: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        apply_chat_template=False,
+        apply_chat_template_kwargs={},
+        partial_rollout=partial_rollout,
+        mask_offpolicy_in_partial_rollout=False,
+        rollout_max_context_len=None,
+        use_rollout_routing_replay=False,
+    )
+
+
+def _generate_and_rm_args(*, custom_generate_function_path: str = "x.custom") -> Namespace:
+    return Namespace(
+        group_rm=False,
+        custom_generate_function_path=custom_generate_function_path,
+        partial_rollout=False,
+        mask_offpolicy_in_partial_rollout=False,
+    )
+
+
+def test_deepeyes_sample_status_helpers() -> None:
     sample = Sample(prompt="p", tokens=[1, 2, 3], response="", response_length=0)
     sample.status = None  # type: ignore[assignment]
     tokenizer = MagicMock()
@@ -39,30 +82,13 @@ def test_sync_sample_outputs_does_not_set_completed() -> None:
     assert sample.response_length == 2
     assert sample.status is None
 
-
-def test_finalize_sample_sets_completed_when_status_none() -> None:
-    sample = Sample(prompt="p", tokens=[1], response="", response_length=0)
-    sample.status = None  # type: ignore[assignment]
-    tokenizer = MagicMock()
     tokenizer.decode.return_value = "done"
-
     deepeyes_rollout._finalize_sample(sample, tokenizer, [1], [])
     assert sample.status == Sample.Status.COMPLETED
 
 
 @pytest.mark.asyncio
 async def test_deepeyes_abort_before_http_uses_turn_idx_and_no_trace() -> None:
-    # Scheduler abort before HTTP: rollout_turns=turn_idx, no incomplete trace append.
-    class _FakeEnv:
-        turn = 0
-        current_image = None
-
-        def reset(self):
-            return None
-
-        def close(self):
-            return None
-
     sample = Sample(prompt="hello")
     sample.tokens = [10, 11]
     sample.metadata = {}
@@ -70,14 +96,6 @@ async def test_deepeyes_abort_before_http_uses_turn_idx_and_no_trace() -> None:
     fake_tokenizer = MagicMock()
     fake_tokenizer.decode.return_value = ""
     fake_state = SimpleNamespace(tokenizer=fake_tokenizer, processor=None)
-    fake_args = SimpleNamespace(
-        apply_chat_template=False,
-        apply_chat_template_kwargs={},
-        partial_rollout=True,
-        mask_offpolicy_in_partial_rollout=False,
-        rollout_max_context_len=None,
-        use_rollout_routing_replay=False,
-    )
 
     async def aborting_request_model(url, payload, *, headers=None):
         raise RolloutRequestAborted("aborted")
@@ -96,7 +114,7 @@ async def test_deepeyes_abort_before_http_uses_turn_idx_and_no_trace() -> None:
     ):
         with pytest.raises(RolloutRequestAborted):
             await deepeyes_rollout.generate(
-                fake_args,
+                _deepeyes_args(partial_rollout=True),
                 sample,
                 {"max_new_tokens": 16},
                 request_model=aborting_request_model,
@@ -110,7 +128,6 @@ async def test_deepeyes_abort_before_http_uses_turn_idx_and_no_trace() -> None:
 
 @pytest.mark.asyncio
 async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
-    # After turn-1 model request, env wait must not hold the model slot.
     scheduler = ModelRequestScheduler(SimpleNamespace(aborted=False), capacity=1)
     turn1_done = asyncio.Event()
     env_gate = asyncio.Event()
@@ -135,15 +152,6 @@ async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
             },
         }
 
-    class _GateEnv:
-        turn = 0
-
-        def reset(self):
-            return None
-
-        def close(self):
-            return None
-
     sample = Sample(prompt="hello")
     sample.tokens = [1]
     sample.loss_mask = []
@@ -153,17 +161,7 @@ async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
     fake_tokenizer = MagicMock()
     fake_tokenizer.decode.return_value = "decoded"
     fake_state = SimpleNamespace(tokenizer=fake_tokenizer, processor=None)
-    fake_args = SimpleNamespace(
-        apply_chat_template=False,
-        apply_chat_template_kwargs={},
-        partial_rollout=False,
-        mask_offpolicy_in_partial_rollout=False,
-        rollout_max_context_len=None,
-        use_rollout_routing_replay=False,
-    )
-
     request_model = partial(scheduler.request, evaluation=False)
-    env = _GateEnv()
     inference_calls = 0
     real_run_inference = deepeyes_rollout._run_inference_step
 
@@ -191,7 +189,7 @@ async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
         patch.object(
             deepeyes_rollout,
             "_initialize_resources",
-            return_value=(env, SimpleNamespace(), {"max_turns": 2}, fake_state, "http://x/generate"),
+            return_value=(_FakeEnv(), SimpleNamespace(), {"max_turns": 2}, fake_state, "http://x/generate"),
         ),
         patch.object(
             deepeyes_rollout,
@@ -202,7 +200,12 @@ async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
         patch.object(deepeyes_rollout, "_process_env_step", new=env_step_mock),
     ):
         long_task = asyncio.create_task(
-            deepeyes_rollout.generate(fake_args, sample, {"max_new_tokens": 8}, request_model=request_model)
+            deepeyes_rollout.generate(
+                _deepeyes_args(),
+                sample,
+                {"max_new_tokens": 8},
+                request_model=request_model,
+            )
         )
         await asyncio.wait_for(turn1_done.wait(), timeout=1.0)
         short_task = asyncio.create_task(request_model("http://x", {"label": "short"}))
@@ -211,21 +214,6 @@ async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
         env_gate.set()
         await long_task
         await short_task
-
-
-class _FakeGenState:
-    def __init__(self, args):
-        self.args = args
-        self.aborted = False
-        self.opd_manager = None
-        self.model_request_scheduler = ModelRequestScheduler(self, capacity=2)
-
-    def dp_rank_context(self):
-        @contextmanager
-        def _ctx():
-            yield 0
-
-        return _ctx()
 
 
 @pytest.mark.asyncio
@@ -249,25 +237,18 @@ async def test_generate_and_rm_legacy_vs_request_aware_dispatch() -> None:
     async def fake_post(url, payload, headers=None):
         return {"text": "t", "meta_info": {"finish_reason": {"type": "stop"}}}
 
-    sample = Sample(prompt="p")
-    args = Namespace(
-        group_rm=False,
-        custom_generate_function_path="mod.legacy_custom",
-        partial_rollout=False,
-        mask_offpolicy_in_partial_rollout=False,
-    )
+    args = _generate_and_rm_args(custom_generate_function_path="mod.legacy_custom")
     with (
         patch.object(rollout_mod, "GenerateState", _FakeGenState),
         patch.object(rollout_mod, "load_function", return_value=legacy_custom),
         patch.object(rollout_mod, "async_rm", new=AsyncMock(return_value=0.0)),
         patch.object(rollout_mod, "post", side_effect=fake_post),
     ):
-        out = await rollout_mod.generate_and_rm(args, sample, {}, evaluation=False)
+        out = await rollout_mod.generate_and_rm(args, Sample(prompt="p"), {}, evaluation=False)
         assert out.status == Sample.Status.COMPLETED
         assert calls == ["legacy"]
 
     calls.clear()
-    sample2 = Sample(prompt="p")
     args.custom_generate_function_path = "mod.aware_custom"
     with (
         patch.object(rollout_mod, "GenerateState", _FakeGenState),
@@ -275,7 +256,7 @@ async def test_generate_and_rm_legacy_vs_request_aware_dispatch() -> None:
         patch.object(rollout_mod, "async_rm", new=AsyncMock(return_value=0.0)),
         patch.object(rollout_mod, "post", side_effect=fake_post),
     ):
-        out = await rollout_mod.generate_and_rm(args, sample2, {}, evaluation=False)
+        out = await rollout_mod.generate_and_rm(args, Sample(prompt="p"), {}, evaluation=False)
         assert out.status == Sample.Status.COMPLETED
         assert calls == ["aware"]
 
@@ -286,24 +267,21 @@ async def test_generate_and_rm_bad_marker_signature_raises_before_run() -> None:
     async def bad(args, sample, sampling_params):
         raise AssertionError("should not run")
 
-    sample = Sample(prompt="p")
-    args = Namespace(
-        group_rm=False,
-        custom_generate_function_path="x.bad",
-        partial_rollout=False,
-        mask_offpolicy_in_partial_rollout=False,
-    )
     with (
         patch.object(rollout_mod, "GenerateState", _FakeGenState),
         patch.object(rollout_mod, "load_function", return_value=bad),
     ):
         with pytest.raises(TypeError, match="request_model"):
-            await rollout_mod.generate_and_rm(args, sample, {}, evaluation=False)
+            await rollout_mod.generate_and_rm(
+                _generate_and_rm_args(),
+                Sample(prompt="p"),
+                {},
+                evaluation=False,
+            )
 
 
 @pytest.mark.asyncio
 async def test_generate_and_rm_evaluation_continues_when_aborted() -> None:
-    # Fast abort must keep evaluation exception: aborted + evaluation=True continues.
     ran = False
 
     @request_model_aware
@@ -323,23 +301,26 @@ async def test_generate_and_rm_evaluation_continues_when_aborted() -> None:
             super().__init__(args)
             self.aborted = True
 
-    args = Namespace(
-        group_rm=False,
-        custom_generate_function_path="x.aware",
-        partial_rollout=False,
-        mask_offpolicy_in_partial_rollout=False,
-    )
-
     with (
         patch.object(rollout_mod, "GenerateState", AbortedState),
         patch.object(rollout_mod, "load_function", return_value=aware_custom),
         patch.object(rollout_mod, "async_rm", new=AsyncMock(return_value=0.0)),
         patch.object(rollout_mod, "post", side_effect=fake_post),
     ):
-        out_train = await rollout_mod.generate_and_rm(args, Sample(prompt="p"), {}, evaluation=False)
+        out_train = await rollout_mod.generate_and_rm(
+            _generate_and_rm_args(),
+            Sample(prompt="p"),
+            {},
+            evaluation=False,
+        )
         assert out_train.status == Sample.Status.ABORTED
         assert ran is False
 
-        out_eval = await rollout_mod.generate_and_rm(args, Sample(prompt="p"), {}, evaluation=True)
+        out_eval = await rollout_mod.generate_and_rm(
+            _generate_and_rm_args(),
+            Sample(prompt="p"),
+            {},
+            evaluation=True,
+        )
         assert ran is True
         assert out_eval.status == Sample.Status.COMPLETED

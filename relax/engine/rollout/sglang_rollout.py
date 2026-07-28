@@ -598,14 +598,10 @@ async def generate_and_rm(
                 async def _legacy_custom() -> Sample | list[Sample]:
                     with state.dp_rank_context() as _:
                         if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                            return await custom_generate_func(
-                                args, sample, sampling_params, evaluation=evaluation
-                            )
+                            return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
                         return await custom_generate_func(args, sample, sampling_params)
 
-                sample = await state.model_request_scheduler.run_legacy(
-                    _legacy_custom, evaluation=evaluation
-                )
+                sample = await state.model_request_scheduler.run_legacy(_legacy_custom, evaluation=evaluation)
         else:
             with state.dp_rank_context() as _:
                 sample = await generate(
