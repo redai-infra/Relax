@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "training" / "text" / "run-qwen3-4B-fp16-8xgpu.sh"
 
@@ -72,6 +74,8 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
     assert argv[default_scale + 1] == "32768"
     assert argv[-len(user_args) :] == user_args
     assert default_scale < len(argv) - len(user_args)
+
+    pytest.importorskip("megatron.core")
 
     from relax.backends.megatron import model
     from relax.backends.megatron.arguments import megatron_parse_args
