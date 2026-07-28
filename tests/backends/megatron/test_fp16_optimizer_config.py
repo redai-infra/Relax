@@ -2,9 +2,13 @@
 
 from argparse import Namespace
 
+import pytest
 import torch
 
-from relax.backends.megatron import model
+
+pytest.importorskip("megatron.core")
+
+from relax.backends.megatron import model  # noqa: E402
 
 
 def test_build_optimizer_config_kwargs_does_not_rewrite_precision_values():
