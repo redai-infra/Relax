@@ -14,8 +14,7 @@ import pybase64
 import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
-from relax.engine.rollout.request_gate import GenerationAborted
-from relax.engine.rollout.sglang_rollout import GenerateState
+from relax.engine.rollout.sglang_rollout import GenerateState, GenerationAborted, request_scoped_generate
 from relax.utils.data.processing_utils import _ENCODE_EXECUTOR, encode_image_for_rollout_engine
 from relax.utils.http_utils import post
 from relax.utils.types import Sample
@@ -237,7 +236,7 @@ async def _run_inference_step(
     async def _send_request() -> dict[str, Any]:
         return await post(url, payload)
 
-    output = await state.request_gate.run(_send_request, turn_index=turn_index)
+    output = await state.run_request(_send_request, turn_index=turn_index)
     response_text = output["text"]
     if "output_token_logprobs" in output["meta_info"]:
         new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -404,6 +403,7 @@ class _RolloutTraceRecorder:
         }
 
 
+@request_scoped_generate
 async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
     """Custom multi-turn rollout that interacts with a pluggable
     environment."""
@@ -597,6 +597,3 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             env.close()
         except Exception:
             pass
-
-
-generate.manages_inference_permit = True

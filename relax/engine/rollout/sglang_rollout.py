@@ -6,11 +6,11 @@ import inspect
 import json
 import uuid
 from argparse import Namespace
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
 from time import monotonic
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 import pybase64
@@ -25,7 +25,12 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from relax.engine.rollout.request_gate import GenerationAborted, InferenceRequestGate, RequestEvent
+from relax.engine.rollout.request_gate import (
+    GenerationAborted,
+    InferenceRequestGate,
+    RequestEvent,
+    request_scoped_generate,
+)
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -48,9 +53,11 @@ from relax.utils.types import Sample
 from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_batch_to_data_system
 
 
-__all__ = ["generate_rollout"]
+__all__ = ["GenerateState", "GenerationAborted", "generate_rollout", "request_scoped_generate"]
 
 logger = get_logger(__name__)
+
+_Result = TypeVar("_Result")
 
 
 class _RequestEventLogger:
@@ -86,12 +93,11 @@ class GenerateState(metaclass=SingletonMeta):
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
 
         request_capacity = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-        self.request_gate = InferenceRequestGate(
+        self._request_gate = InferenceRequestGate(
             capacity=request_capacity,
             is_aborted=lambda: self.aborted,
             recorder=_RequestEventLogger() if LOG_LEVEL == "DEBUG" else None,
         )
-        self.semaphore = self.request_gate.semaphore
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -126,9 +132,20 @@ class GenerateState(metaclass=SingletonMeta):
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
 
+    async def run_request(
+        self,
+        request_factory: Callable[[], Awaitable[_Result]],
+        *,
+        turn_index: int | None = None,
+    ) -> _Result:
+        """Run one lazily created inference request under the shared
+        concurrency limit."""
+        return await self._request_gate.run(request_factory, turn_index=turn_index)
+
     @asynccontextmanager
-    async def request_permit(self) -> AsyncIterator[None]:
-        async with self.request_gate.permit():
+    async def _request_permit(self) -> AsyncIterator[None]:
+        """Hold one admission slot for the legacy whole-generator fallback."""
+        async with self._request_gate.permit():
             yield
 
     def reset(self) -> None:
@@ -360,7 +377,7 @@ async def generate(
         finally:
             _t_generate = monotonic() - _t_generate_start
 
-    output = await state.request_gate.run(_send_request)
+    output = await state.run_request(_send_request)
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -493,12 +510,12 @@ async def generate_and_rm(
             else:
                 sample = await generate(args, sample, sampling_params, evaluation=evaluation)
 
-    manages_inference_permit = (
+    uses_request_scoped_admission = (
         custom_generate_func is not None and getattr(custom_generate_func, "manages_inference_permit", False) is True
     )
     try:
-        if custom_generate_func is not None and not manages_inference_permit:
-            async with state.request_permit():
+        if custom_generate_func is not None and not uses_request_scoped_admission:
+            async with state._request_permit():
                 await _dispatch_generate()
         else:
             if state.aborted:

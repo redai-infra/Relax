@@ -141,9 +141,10 @@ The function must populate these `sample` fields before returning: `tokens` (ful
 **Example** — simplified from [`examples/deepeyes/rollout.py`](../examples/deepeyes.md) (multi-turn tool-use rollout):
 
 ```python
-from relax.engine.rollout.sglang_rollout import GenerateState
+from relax.engine.rollout.sglang_rollout import GenerateState, request_scoped_generate
 from relax.utils.http_utils import post
 
+@request_scoped_generate
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
@@ -151,8 +152,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        async with state.request_permit():
-            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+
+        async def send_request():
+            payload = {
+                "input_ids": sample.tokens,
+                "sampling_params": sampling_params,
+                "return_logprob": True,
+            }
+            return await post(url, payload)
+
+        output = await state.run_request(send_request, turn_index=turn)
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
@@ -166,13 +175,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
-
-generate.manages_inference_permit = True
 ```
 
-`request_permit()` limits only the model request inside its context. It releases the slot on success, exception, or cancellation, and checks the rollout abort state after acquiring the slot so a queued request does not start after an abort. Keep environment calls, tool execution, and observation processing outside this context.
+`run_request()` waits for a concurrency slot, re-checks the rollout abort state, and only then invokes and awaits the zero-argument request factory. It releases the slot on success, exception, or cancellation. Pass the factory itself, not a coroutine or pre-started task, and keep environment calls, tool execution, and observation processing outside it.
 
-The `manages_inference_permit = True` attribute is an explicit capability declaration: every model request made by that custom function must use `request_permit()`. Custom generate functions without the attribute keep the legacy behavior, where Relax holds one permit for the complete function call. This preserves existing functions that have not adopted the request-level API. Request-level scheduling does not limit the number of active environment or tool sessions; add separate limits in the custom environment when those resources need them.
+The `@request_scoped_generate` decorator opts a custom function into request-scoped scheduling: every model request it sends must use `run_request()`. The decorator only declares this contract; it does not intercept direct HTTP calls. Without the decorator, Relax treats the complete custom function call as one admission unit for backward compatibility. Request-level scheduling does not limit the number of active environment or tool sessions; add separate limits in the custom environment when those resources need them.
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
 

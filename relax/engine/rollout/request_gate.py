@@ -12,17 +12,12 @@ from time import monotonic
 from typing import Any, Protocol, TypeVar
 
 
-__all__ = [
-    "GenerationAborted",
-    "InferenceRequestGate",
-    "RequestEvent",
-    "RequestEventRecorder",
-    "request_scoped_generate",
-]
+__all__: list[str] = []
 
 
 class GenerationAborted(Exception):
-    """Raised before dispatch when generation has been aborted."""
+    """Raised when an aborted rollout prevents an inference request from being
+    dispatched."""
 
 
 @dataclass(frozen=True)
@@ -44,7 +39,7 @@ class RequestEvent:
 
 
 class RequestEventRecorder(Protocol):
-    """Synchronous observer for completed inference requests."""
+    """Synchronous observer for finished inference request attempts."""
 
     def record(self, event: RequestEvent) -> None: ...
 
@@ -54,7 +49,9 @@ _Result = TypeVar("_Result")
 
 
 def request_scoped_generate(func: _GenerateCallable) -> _GenerateCallable:
-    """Mark a custom generator as managing its own inference permits."""
+    """Declare that a custom generator submits each inference request through
+    GenerateState.run_request()."""
+    # Keep the legacy marker name; dispatch interprets it as request-scoped admission.
     func.manages_inference_permit = True
     return func
 
@@ -83,6 +80,8 @@ class InferenceRequestGate:
         is_aborted: Callable[[], bool],
         recorder: RequestEventRecorder | None = None,
     ) -> None:
+        if capacity <= 0:
+            raise ValueError(f"InferenceRequestGate capacity must be positive, got {capacity}")
         self.capacity = capacity
         self.semaphore = asyncio.Semaphore(capacity)
         self._is_aborted = is_aborted

@@ -140,9 +140,10 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 **示例** — 简化自 [`examples/deepeyes/rollout.py`](../examples/deepeyes.md)（多轮工具调用 rollout）：
 
 ```python
-from relax.engine.rollout.sglang_rollout import GenerateState
+from relax.engine.rollout.sglang_rollout import GenerateState, request_scoped_generate
 from relax.utils.http_utils import post
 
+@request_scoped_generate
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
@@ -150,8 +151,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        async with state.request_permit():
-            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+
+        async def send_request():
+            payload = {
+                "input_ids": sample.tokens,
+                "sampling_params": sampling_params,
+                "return_logprob": True,
+            }
+            return await post(url, payload)
+
+        output = await state.run_request(send_request, turn_index=turn)
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
@@ -165,13 +174,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
-
-generate.manages_inference_permit = True
 ```
 
-`request_permit()` 只限制 context 内的模型请求。它会在成功、异常或取消时释放 slot，并在取得 slot 后检查 rollout abort 状态，避免排队中的请求在 abort 后启动。环境调用、工具执行和 observation 处理必须放在该 context 外。
+`run_request()` 会先等待并发 slot、重新检查 rollout abort 状态，然后才调用并等待这个无参数 request factory。成功、异常或取消时都会释放 slot。应传入 factory 本身，而不是已创建的 coroutine 或已启动的 task；环境调用、工具执行和 observation 处理必须放在 factory 外。
 
-`manages_inference_permit = True` 是显式能力声明：该自定义函数发出的每一个模型请求都必须使用 `request_permit()`。未声明该属性的自定义 generate 函数保持 legacy 行为，由 Relax 在整个函数调用期间持有一个 permit，从而兼容尚未接入请求级 API 的已有函数。请求级调度不限制同时活跃的环境或工具 session 数；如这些资源也需要限流，应由自定义环境单独配置。
+`@request_scoped_generate` 将自定义函数显式接入请求级调度：它发出的每个模型请求都必须使用 `run_request()`。该装饰器只声明这一契约，不会拦截直接 HTTP 调用。未使用装饰器时，Relax 为保持向后兼容，会将整个自定义函数调用作为一个限流单元。请求级调度不限制同时活跃的环境或工具 session 数；如这些资源也需要限流，应由自定义环境单独配置。
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
 
