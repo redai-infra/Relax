@@ -242,7 +242,7 @@ def test_non_fp16_omission_applies_megatron_defaults_without_warning(arguments_m
     assert args.initial_loss_scale == 2**32
     assert args.min_loss_scale == 1.0
     assert args.use_precision_aware_optimizer is False
-    assert args.store_param_remainders is False
+    assert args.store_param_remainders is True
     warning.assert_not_called()
 
 
@@ -259,7 +259,7 @@ def test_bf16_precision_aware_omission_preserves_native_remainder_default(argume
     arguments_module._normalize_precision_optimizer_args(args)
 
     assert args.use_precision_aware_optimizer is True
-    assert args.store_param_remainders is False
+    assert args.store_param_remainders is True
     warning.assert_not_called()
 
 

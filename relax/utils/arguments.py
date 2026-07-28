@@ -2592,7 +2592,7 @@ def _normalize_precision_optimizer_args(args) -> None:
             ("initial_loss_scale", "--initial-loss-scale", 2**32),
             ("min_loss_scale", "--min-loss-scale", 1.0),
             ("use_precision_aware_optimizer", "--use-precision-aware-optimizer", False),
-            ("store_param_remainders", "--store-param-remainders", False),
+            ("store_param_remainders", "--store-param-remainders", True),
         )
 
     missing = []
@@ -3202,6 +3202,8 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        if "fp16" in data and "bf16" not in data:
+            args.bf16 = not bool(args.fp16)
 
     _normalize_precision_optimizer_args(args)
 

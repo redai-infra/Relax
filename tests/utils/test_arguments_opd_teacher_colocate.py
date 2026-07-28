@@ -192,15 +192,37 @@ def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monk
     warning = Mock()
     monkeypatch.setattr(arguments_module.logger, "warning", warning)
     args = _opd_args()
+    args.fp16 = False
+    args.bf16 = True
     args.custom_config_path = str(config_path)
 
     arguments_module.slime_validate_args(args)
 
+    assert args.fp16 is True
+    assert args.bf16 is False
     assert args.initial_loss_scale == 32768.0
     assert args.min_loss_scale == 1.0
     assert args.use_precision_aware_optimizer is True
     assert args.store_param_remainders is False
     warning.assert_called_once()
+
+
+def test_custom_config_disabling_fp16_restores_bf16_default(arguments_module, monkeypatch, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: false\n")
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = True
+    args.bf16 = False
+    args.custom_config_path = str(config_path)
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.fp16 is False
+    assert args.bf16 is True
+    assert args.store_param_remainders is True
+    warning.assert_not_called()
 
 
 def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tmp_path):
