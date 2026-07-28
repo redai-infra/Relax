@@ -2,11 +2,12 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU colocate (sync) PPO training script for DAPO math dataset.
+# Qwen3.5-9B 8xGPU colocate (sync) PPO training script for DAPO math dataset.
 #
-# Aligned with slime tests/test_qwen3_4B_ppo.py — hyperparameters, model,
-# and colocate memory scheduling should match the slime baseline so that
-# any divergence points to relax-side bugs, not config drift.
+# Adapted from run-qwen3-4B-8xgpu-ppo.sh: same PPO wiring (critic + advantages,
+# GAE, KL-loss path enabled at coef=0, --use-rollout-logprobs required by
+# colocate), swapped in the qwen35-9B model config and TP=4 to match the
+# existing run-qwen35-9B-8xgpu.sh GRPO baseline.
 #
 # Notes:
 #   - PPO requires critic + advantages entries in --resource. critic shares the
@@ -18,9 +19,11 @@
 #     get the full GPU while training. SGLang mem fraction stays at 0.8.
 #   - Critic starts from the same HF checkpoint as the actor and is warmed up
 #     for a few pure-critic steps before joint updates begin.
+#   - 9B + critic is tighter than 4B PPO; recompute stays on and TP=4 matches
+#     the existing 9B GRPO baseline.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen3-4B-8xgpu-ppo.sh
+#   bash scripts/training/text/run-qwen35-9B-8xgpu-ppo.sh
 
 set -ex
 set -o pipefail
@@ -36,7 +39,7 @@ fi
 if [ -n "${WANDB_API_KEY:-}" ]; then
     export RUNTIME_ENV_JSON=$(echo "$RUNTIME_ENV_JSON" | jq --arg k "$WANDB_API_KEY" '.env_vars.WANDB_API_KEY = $k')
 fi
-source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
+source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math-ppo}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
@@ -47,20 +50,20 @@ NUM_CRITIC_ONLY_STEPS="${NUM_CRITIC_ONLY_STEPS:=1}"
 CRITIC_LR_WARMUP_ITERS="${CRITIC_LR_WARMUP_ITERS:=1}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3-4B
-   --ref-load ${MODEL_DIR}/Qwen3-4B
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
+   --ref-load ${MODEL_DIR}/Qwen3.5-9B
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
 
-   --load ${EXP_DIR}/Qwen3-4B_mcore_ppo_8xgpu/actor/
-   --save ${EXP_DIR}/Qwen3-4B_mcore_ppo_8xgpu/actor/
+   --load ${EXP_DIR}/Qwen3.5-9B_mcore_ppo_8xgpu/actor/
+   --save ${EXP_DIR}/Qwen3.5-9B_mcore_ppo_8xgpu/actor/
    --save-interval 50
    --max-actor-ckpt-to-keep 1
 
    # critic must save to a separate subdir; actor and critic both call save(...) with
    # self.args.save, so a shared root causes them to overwrite each other's iter_XXXXXX/.
-   --critic-load ${EXP_DIR}/Qwen3-4B_mcore_ppo_8xgpu/critic/
-   --critic-save ${EXP_DIR}/Qwen3-4B_mcore_ppo_8xgpu/critic/
+   --critic-load ${EXP_DIR}/Qwen3.5-9B_mcore_ppo_8xgpu/critic/
+   --critic-save ${EXP_DIR}/Qwen3.5-9B_mcore_ppo_8xgpu/critic/
 )
 
 PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
@@ -77,8 +80,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
    --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT:-4}
    --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN:-8192}
-   # Align with slime test: temperature 0.8 keeps rollout logprobs closer to
-   # actor logprobs, which matters when --use-rollout-logprobs is on.
+   # Keep rollout logprobs closer to actor logprobs (--use-rollout-logprobs is on in colocate).
    --rollout-temperature 0.8
    --global-batch-size ${GLOBAL_BATCH_SIZE:-128}
    --balance-data
@@ -96,8 +98,9 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   # 4B fits comfortably on TP=2; matches slime test_qwen3_4B_ppo.py.
-   --tensor-model-parallel-size 2
+   # TP=4 matches the existing 9B GRPO baseline; critic doubles training memory
+   # so keep recompute on.
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -112,7 +115,7 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu 10240
-   --log-probs-max-tokens-per-gpu 10240
+   --log-probs-max-tokens-per-gpu 40960
 
    --no-rope-fusion
 )
@@ -163,14 +166,14 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen3-4B-ppo-8x-${now}
+   --tb-experiment-name qwen35-9B-ppo-8x-${now}
 )
 
 if [ -n "${WANDB_API_KEY:-}" ]; then
     WANDB_ARGS+=(
        --use-wandb
        --wandb-project ${PROJECT_NAME//\//-}
-       --wandb-group qwen3-4B-ppo-8x-${now}
+       --wandb-group qwen35-9B-ppo-8x-${now}
     )
 fi
 
@@ -202,4 +205,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4B-PPO-gpu8-${now}.log
+    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-PPO-gpu8-${now}.log

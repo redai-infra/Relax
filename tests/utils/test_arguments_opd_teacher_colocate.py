@@ -68,6 +68,7 @@ def _opd_args() -> SimpleNamespace:
         use_agentic_rollout=False,
         partial_rollout=False,
         use_rollout_routing_replay=False,
+        distributed_timeout_minutes=30,
         kl_coef=0.0,
         kl_loss_coef=0.0,
         use_kl_loss=False,
@@ -185,12 +186,21 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     assert args.rollout_num_gpus == 4
 
 
-def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
+def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"
     args.dynamic_context_parallel = True
     args.eval_interval = 10
     args.eval_size = 0.1
+    args.prompt_data = ["/train.jsonl"]
+    args.sft_oversize_strategy = "drop"
+    args.sft_oversize_custom_function_path = None
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    args.rollout_max_context_len = 4096
 
-    with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
-        arguments_module.slime_validate_args(args)
+    arguments_module.slime_validate_args(args)
+
+    assert args.dynamic_context_parallel is True
+    assert args.eval_interval == 10
+    assert args.eval_size == 0.1
