@@ -15,6 +15,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -42,10 +43,13 @@ try:
                 raise
 
     from relax.engine.rewards import (
+        REWARD_REGISTRY,
         RewardExecutor,
         RewardWorker,
         async_rm,
         batched_async_rm,
+        register_reward,
+        resolve_rm_type,
     )
     from relax.engine.rewards.openr1mm import get_openr1mm_rule_based_reward
     from relax.utils.types import Sample
@@ -310,11 +314,79 @@ class TestRewardExecutorSingleSample:
         assert result == 1.0
 
     @pytest.mark.asyncio
-    async def test_execute_unknown_rm_type_raises(self):
+    async def test_execute_unknown_rm_type_returns_zero_with_warning(self):
         args = _make_args(rm_type="totally_unknown_type")
         sample = _make_sample(response="foo", label="bar")
-        with pytest.raises(NotImplementedError, match="totally_unknown_type"):
-            await async_rm(args, sample)
+        with patch("relax.engine.rewards.logger.warning") as warning:
+            assert await async_rm(args, sample) == 0.0
+        warning.assert_called_once()
+
+
+@requires_full_pipeline
+class TestFormatAwareRewardRouter:
+    def test_metadata_route_overrides_legacy_fallback(self):
+        args = _make_args(rm_type="openr1mm")
+        sample = _make_sample("", "42", {"rm_type": "math"})
+        assert resolve_rm_type(args, sample) == "math"
+
+    def test_explicit_rm_type_keeps_legacy_behavior_without_sample_hint(self):
+        args = _make_args(rm_type="openr1mm")
+        assert resolve_rm_type(args, _make_sample("", "42")) == "openr1mm"
+
+    def test_label_mapping_route(self):
+        args = _make_args(rm_type="math")
+        sample = _make_sample("", {"answer": "A", "format": "multiple-choice"})
+        assert resolve_rm_type(args, sample) == "multiple_choice"
+
+    def test_label_format_inference(self):
+        args = _make_args(rm_type=None)
+        assert resolve_rm_type(args, _make_sample("", "<answer>B</answer>")) == "multiple_choice"
+        assert resolve_rm_type(args, _make_sample("", "\\boxed{12}")) == "math"
+
+    def test_unknown_route_uses_configured_fallback_and_warns(self):
+        args = _make_args(rm_type="openr1mm")
+        sample = _make_sample("", "not-formatted", {"rm_type": "unknown"})
+        with patch("relax.engine.rewards.logger.warning") as warning:
+            assert resolve_rm_type(args, sample) == "openr1mm"
+        warning.assert_called_once()
+
+    def test_conflict_uses_configured_fallback_and_warns(self):
+        args = _make_args(rm_type="openr1mm")
+        sample = _make_sample("", {"answer": "A", "rm_type": "multiple_choice"}, {"rm_type": "math"})
+        with patch("relax.engine.rewards.logger.warning") as warning:
+            assert resolve_rm_type(args, sample) == "openr1mm"
+        warning.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("args", "sample"),
+        [
+            (_make_args(rm_type=None), _make_sample("", "not-formatted")),
+            (_make_args(rm_type=None), _make_sample("", "not-formatted", {"rm_type": "unknown"})),
+            (_make_args(rm_type="unknown"), _make_sample("", "not-formatted")),
+        ],
+    )
+    def test_missing_or_unknown_without_valid_fallback_returns_none_and_warns(self, args, sample):
+        with patch("relax.engine.rewards.logger.warning") as warning:
+            assert resolve_rm_type(args, sample) is None
+        warning.assert_called()
+
+    def test_registry_contains_sync_and_async_rewards(self):
+        assert REWARD_REGISTRY["math"].is_async is False
+        assert REWARD_REGISTRY["multiple_choice"].is_async is False
+        assert REWARD_REGISTRY["remote_rm"].is_async is True
+
+    def test_registry_extension_requires_no_router_change(self):
+        name = "test_one_line_reward"
+        try:
+
+            @register_reward(name)
+            def reward(response, label, metadata):
+                return 0.25
+
+            assert resolve_rm_type(_make_args(rm_type=name), _make_sample("", "not-formatted")) == name
+            assert REWARD_REGISTRY[name].function("", "", {}) == 0.25
+        finally:
+            REWARD_REGISTRY.pop(name, None)
 
 
 @requires_full_pipeline
@@ -433,15 +505,20 @@ class TestHighConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_mixed_rm_types_via_metadata(self):
         """Different rm_types in the same batch should all route correctly."""
-        args = _make_args(rm_type="openr1mm")
+        args = _make_args(rm_type=None)
         samples = [
-            _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="A", label="A", metadata={"rm_type": "multiple_choice"}),
+            _make_sample(response="\\boxed{42}", label="42", metadata={"format": "math"}),
+            _make_sample(response="\\boxed{41}", label="42", metadata={"format": "math"}),
+            _make_sample(
+                response="<answer>A</answer>",
+                label="<answer>A</answer>",
+                metadata={"format": "multiple-choice"},
+            ),
+            _make_sample(
+                response="<answer>B</answer>",
+                label="<answer>A</answer>",
+                metadata={"format": "multiple-choice"},
+            ),
         ]
         rewards = await asyncio.wait_for(
             batched_async_rm(args, samples),
@@ -449,8 +526,7 @@ class TestHighConcurrency:
         )
         rewards = list(rewards)
         assert len(rewards) == len(samples)
-        # All three should be correct (1.0)
-        assert all(r == 1.0 for r in rewards), f"Got {rewards}"
+        assert rewards == [1, 0, 1.0, 0.0]
 
     @pytest.mark.asyncio
     async def test_concurrent_repeated_identical_requests(self):
