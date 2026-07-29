@@ -50,10 +50,44 @@ __all__ = [
     "parse_generalized_path",
     "resolve_path_plan",
     "build_messages",
+    "extract_route_fields",
     "process_raw_sample",
     "check_sample_length",
     "filter_long_prompts",
 ]
+
+
+def extract_route_fields(
+    data: dict,
+    *,
+    label_key: Optional[str] = None,
+    tool_key: Optional[str] = None,
+    metadata_key: str = "metadata",
+) -> tuple[object, dict, Optional[list]]:
+    """Build the label and metadata view used by reward routing.
+
+    Streaming preflight and runtime sample construction must use the same
+    normalization; otherwise a custom label matcher can see different metadata
+    before and after rollout starts.
+    """
+    label = data[label_key] if label_key is not None else None
+    raw_metadata = data.get(metadata_key)
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+
+    if "data_source" in data:
+        metadata.setdefault("data_source", data["data_source"])
+
+    tools = None
+    if tool_key is not None and tool_key in data:
+        tools = data[tool_key]
+        if isinstance(tools, str):
+            tools = json.loads(tools)
+        elif isinstance(tools, np.ndarray):
+            tools = tools.tolist()
+        assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
+        metadata["tools"] = tools
+
+    return label, metadata, tools
 
 
 def parse_generalized_path(s: str) -> tuple[str, Optional[slice]]:
@@ -227,28 +261,12 @@ def process_raw_sample(
     as_conversation = apply_chat_template or (multimodal_keys is not None)
     prompt = build_messages(data, prompt_key, system_prompt, as_conversation, multimodal_keys, custom_prompt_func)
 
-    metadata = data.get(metadata_key) or {}
-
-    # MOPD: surface top-level ``data_source`` column into metadata so the
-    # per-sample teacher router (``_pick_teacher_url``) can look it up via
-    # ``sample.metadata["data_source"]``.  Only injected when the column
-    # exists and the metadata dict does not already carry it.
-    if "data_source" not in metadata and "data_source" in data:
-        if isinstance(metadata, dict):
-            metadata["data_source"] = data["data_source"]
-        else:
-            metadata = {"data_source": data["data_source"]}
-
-    tools = None
-
-    if tool_key is not None and tool_key in data:
-        tools = data[tool_key]
-        if isinstance(tools, str):
-            tools = json.loads(tools)
-        elif isinstance(tools, np.ndarray):
-            tools = tools.tolist()
-        assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
-        metadata["tools"] = tools
+    label, metadata, tools = extract_route_fields(
+        data,
+        label_key=label_key,
+        tool_key=tool_key,
+        metadata_key=metadata_key,
+    )
 
     # Apply chat template if needed.
     # Per-sample override: a sample may carry its own ``apply_chat_template_kwargs``
@@ -302,7 +320,7 @@ def process_raw_sample(
 
     return Sample(
         prompt=output_prompt,
-        label=data[label_key] if label_key is not None else None,
+        label=label,
         metadata=metadata,
         multimodal_inputs=multimodal_inputs,
         teacher_prompt=teacher_prompt_str,

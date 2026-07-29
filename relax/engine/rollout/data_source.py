@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from relax.utils.data.data import Dataset
+from relax.utils.data.data_utils import extract_route_fields, read_file
 from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -189,6 +190,77 @@ class RolloutDataSource(DataSource):
 
     def lengths(self):
         return len(self.dataset)
+
+    def validate_reward_routes(self):
+        """Validate built-in reward assignment before rollout engines start."""
+        if getattr(self.args, "custom_rm_path", None) is not None:
+            logger.info("Skipping reward routing preflight because --custom-rm-path is configured.")
+            return {"skipped": "custom_rm_path"}
+        if self.dataset is None:
+            logger.info("Skipping reward routing preflight because no global rollout dataset is configured.")
+            return {"skipped": "no_global_dataset"}
+
+        from relax.engine.rewards import REWARD_REGISTRY
+        from relax.engine.rewards.reward_router import normalize_reward_route_config, preflight_reward_routes
+
+        if self._use_streaming:
+            label_key = getattr(self.args, "label_key", None)
+            tool_key = getattr(self.args, "tool_key", None)
+            metadata_key = getattr(self.args, "metadata_key", "metadata")
+
+            def records():
+                for index, data in enumerate(read_file(self.args.prompt_data)):
+                    label, metadata, _ = extract_route_fields(
+                        data,
+                        label_key=label_key,
+                        tool_key=tool_key,
+                        metadata_key=metadata_key,
+                    )
+                    yield index, label, metadata
+
+            route_records = records()
+        else:
+            route_records = (
+                (index, sample.label, sample.metadata) for index, sample in enumerate(self.dataset.samples)
+            )
+
+        route_config = normalize_reward_route_config(getattr(self.args, "reward_route", None))
+
+        report = preflight_reward_routes(
+            route_records,
+            getattr(self.args, "rm_type", None),
+            REWARD_REGISTRY,
+            route_config.priority,
+        )
+        logger.info(
+            "Reward routing preflight: priority=%s total=%d assignments=%s fallback=%d unresolved=%d conflict=%d",
+            route_config.priority,
+            report.total,
+            report.assignments,
+            report.fallback_count,
+            report.unresolved_count,
+            report.conflict_count,
+        )
+        if report.fallback_count:
+            logger.warning(
+                "Reward routing preflight uses the configured fallback for %d sample(s).",
+                report.fallback_count,
+            )
+        if not report.is_valid:
+            logger.warning(
+                "Reward routing preflight found unresolved=%d conflict=%d; sample_indices=%s conflict_indices=%s.",
+                report.unresolved_count,
+                report.conflict_count,
+                report.unresolved_indices,
+                report.conflict_indices,
+            )
+            failure_reasons = []
+            if report.conflict_count:
+                failure_reasons.append(f"{report.conflict_count} sample(s) have ambiguous label matcher assignments")
+            if report.unresolved_count:
+                failure_reasons.append(f"{report.unresolved_count} sample(s) have no reward assignment")
+            raise ValueError("Reward routing preflight failed: " + "; ".join(failure_reasons) + ".")
+        return report.to_dict()
 
     def get_samples(self, num_samples):
         # TODO further improve code

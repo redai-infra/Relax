@@ -123,6 +123,38 @@ python scripts/tools/process_avqa.py \
 --reward-key score
 ```
 
+### 内置 Reward 的逐样本路由
+
+混合任务 batch 可以在每条数据的 `metadata.rm_type` 中显式指定内置 Reward：
+
+```json
+{"text": "...", "label": "42", "metadata": {"rm_type": "math"}}
+{"text": "...", "label": "<answer>B</answer>", "metadata": {"rm_type": "multiple_choice"}}
+```
+
+内置 Reward 的默认优先级为：
+
+```text
+metadata["rm_type"] > label 格式匹配 > --rm-type
+```
+
+- `metadata.rm_type` 是逐样本的显式选择，优先级最高。
+- label matcher 根据现有 ground-truth label 的严格格式自动识别 `math` 或 `multiple_choice`。
+- `--rm-type` 继续作为全局类型来源；在默认顺序下，仅当前两个来源没有选出有效类型时使用。
+- 某个较高优先级来源包含未知值或发生 matcher 冲突时，路由器会继续尝试后续来源，并对实际降级记录 warning。
+- 三个来源均无法唯一解析时不会猜测：运行时保留原有 `NotImplementedError`；标准数据源会在启动 Rollout 模型前汇总 reward 分配并拦截无法分配的记录。
+
+路由顺序可以通过现有 `--custom-config-path` YAML 调整。例如需要让全局 `--rm-type` 先于 label matcher：
+
+```yaml
+reward_route:
+  priority: [metadata, rm_type, label]
+```
+
+`priority` 必须恰好包含一次 `metadata`、`label` 和 `rm_type`。没有配置 `reward_route` 时使用默认顺序；`custom_rm_path` 始终绕过内置路由并保持最高优先级。
+
+Label 自动识别只覆盖无歧义格式。建议生产数据优先使用 `metadata.rm_type`；如果整个数据集使用同一种 Reward，则继续显式设置 `--rm-type`。
+
 ## 自定义 Generate 函数
 
 对于多轮对话、工具调用、Agent 交互等场景，可自定义 `generate` 函数替换默认的单轮生成逻辑。函数签名如下：
