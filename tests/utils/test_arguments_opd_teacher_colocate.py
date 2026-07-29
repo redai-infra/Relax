@@ -183,3 +183,14 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
+    args = _opd_args()
+    args.loss_type = "sft"
+    args.dynamic_context_parallel = True
+    args.eval_interval = 10
+    args.eval_size = 0.1
+
+    with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
+        arguments_module.slime_validate_args(args)
