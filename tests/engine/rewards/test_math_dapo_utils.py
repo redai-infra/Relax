@@ -55,6 +55,18 @@ def test_normalize_final_answer_removes_units_spaces_and_commas():
     assert normalized == "1234"
 
 
+def test_normalize_final_answer_takes_rhs_of_equation():
+    normalized = normalize_final_answer("x = 42")
+
+    assert normalized == "42"
+
+
+def test_normalize_final_answer_unwraps_text():
+    normalized = normalize_final_answer(r"\text{apples}")
+
+    assert normalized == "apples"
+
+
 def test_is_correct_strict_box_accepts_matching_boxed_answer():
     score, extracted = is_correct_strict_box("推理过程...... 最终答案是 \\boxed{9}", "9")
 
