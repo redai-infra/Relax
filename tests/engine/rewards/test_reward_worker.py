@@ -310,11 +310,45 @@ class TestRewardExecutorSingleSample:
         assert result == 1.0
 
     @pytest.mark.asyncio
-    async def test_execute_unknown_rm_type_raises(self):
+    async def test_execute_unknown_rm_type_returns_zero(self, caplog):
         args = _make_args(rm_type="totally_unknown_type")
         sample = _make_sample(response="foo", label="bar")
-        with pytest.raises(NotImplementedError, match="totally_unknown_type"):
-            await async_rm(args, sample)
+        result = await async_rm(args, sample)
+
+        assert result == 0.0
+        assert "Unknown fallback rm_type" in caplog.text
+        assert "returning a zero reward" in caplog.text
+        assert RewardExecutor._instance is not None
+        assert RewardExecutor._instance._workers == []
+
+    @pytest.mark.asyncio
+    async def test_unresolved_route_preserves_reward_key_shape(self, caplog):
+        args = _make_args(rm_type="totally_unknown_type", reward_key="score")
+        sample = _make_sample(response="foo", label="bar")
+
+        result = await async_rm(args, sample)
+
+        assert result == {"score": 0.0}
+        assert "returning a zero reward" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_explicit_dapo_type_is_not_overridden_by_numeric_label(self):
+        args = _make_args(rm_type="dapo")
+        sample = _make_sample(response="The final answer is \\boxed{42}", label="42")
+
+        result = await async_rm(args, sample)
+
+        assert isinstance(result, dict)
+        assert "score" in result
+
+    @pytest.mark.asyncio
+    async def test_explicit_dummy_type_is_not_overridden_by_numeric_label(self):
+        args = _make_args(rm_type="dummy", reward_key="score")
+        sample = _make_sample(response="unused", label="42")
+
+        result = await async_rm(args, sample)
+
+        assert result == {"score": 0.0}
 
 
 @requires_full_pipeline
@@ -353,6 +387,32 @@ class TestBatchedAsyncRM:
         args = _make_args()
         rewards = await batched_async_rm(args, [])
         assert rewards == []
+
+
+@requires_full_pipeline
+class TestRewardRoutingIntegration:
+    @pytest.fixture(autouse=True)
+    def _reset_executor(self):
+        _kill_executor_workers()
+        RewardExecutor._instance = None
+        yield
+        _kill_executor_workers()
+        RewardExecutor._instance = None
+
+    @pytest.mark.asyncio
+    async def test_mixed_rm_types_inferred_from_labels(self):
+        args = _make_args(rm_type=None)
+        samples = [
+            _make_sample(response="\\boxed{42}", label="42"),
+            _make_sample(response="<answer>B</answer>", label="<answer>B</answer>"),
+        ]
+
+        rewards = await asyncio.wait_for(
+            batched_async_rm(args, samples),
+            timeout=60,
+        )
+
+        assert list(rewards) == [1, 1.0]
 
 
 # ===========================================================================
@@ -441,7 +501,11 @@ class TestHighConcurrency:
             _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
             _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
             _make_sample(response="\\boxed{42}", label="42", metadata={"rm_type": "openr1mm"}),
-            _make_sample(response="A", label="A", metadata={"rm_type": "multiple_choice"}),
+            _make_sample(
+                response="<answer>A</answer>",
+                label="<answer>A</answer>",
+                metadata={"rm_type": "multiple_choice"},
+            ),
         ]
         rewards = await asyncio.wait_for(
             batched_async_rm(args, samples),
@@ -449,7 +513,6 @@ class TestHighConcurrency:
         )
         rewards = list(rewards)
         assert len(rewards) == len(samples)
-        # All three should be correct (1.0)
         assert all(r == 1.0 for r in rewards), f"Got {rewards}"
 
     @pytest.mark.asyncio
