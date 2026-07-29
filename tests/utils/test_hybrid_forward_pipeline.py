@@ -65,6 +65,35 @@ def test_restore_occurs_once_per_optimizer_mini():
     assert restore_calls == [0, 2, 4]
 
 
+def test_no_overlap_control_fetches_all_chunks_before_matched_forwards():
+    events = []
+
+    chunks = execute_hybrid_forward_mini(
+        chunks_per_mini=3,
+        batch_index_for_chunk=lambda chunk_index: 10 + chunk_index,
+        restore_actor=lambda batch_index: events.append(("restore", batch_index)),
+        fetch_chunk=lambda batch_index: (
+            events.append(("fetch", batch_index)) or {"total_lengths": [batch_index]},
+            [100 + batch_index],
+        ),
+        forward_chunk=lambda _batch, batch_index, global_indexes: events.append(
+            ("forward", batch_index, global_indexes)
+        ),
+        overlap_producer=False,
+    )
+
+    assert events == [
+        ("restore", 10),
+        ("fetch", 10),
+        ("fetch", 11),
+        ("fetch", 12),
+        ("forward", 10, [110]),
+        ("forward", 11, [111]),
+        ("forward", 12, [112]),
+    ]
+    assert [indexes for _, indexes in chunks] == [[110], [111], [112]]
+
+
 def test_chunk_microbatch_schedule_is_replayed_on_canonical_batch():
     schedule = canonicalize_hybrid_microbatch_schedule(
         [

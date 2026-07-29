@@ -101,15 +101,17 @@ def test_debug_rollout_chunking_slices_every_per_sample_container():
 
 
 @pytest.mark.parametrize(
-    ("pipeline_enabled", "expected_fetch_sizes", "expected_forward_count"),
+    ("pipeline_enabled", "pipeline_overlap", "expected_fetch_sizes", "expected_forward_count"),
     [
-        (False, [4], 1),
-        (True, [2, 2], 2),
+        (False, True, [4], 1),
+        (True, True, [2, 2], 2),
+        (True, False, [2, 2], 2),
     ],
 )
 def test_train_hybrid_wires_one_update_around_flagged_actor_chunks(
     monkeypatch,
     pipeline_enabled,
+    pipeline_overlap,
     expected_fetch_sizes,
     expected_forward_count,
 ):
@@ -123,6 +125,7 @@ def test_train_hybrid_wires_one_update_around_flagged_actor_chunks(
         num_steps_per_rollout=None,
         num_iters_per_train_update=2,
         hybrid_pipeline_forward=pipeline_enabled,
+        hybrid_pipeline_overlap=pipeline_overlap,
         hybrid_pipeline_trace_dir=None,
         hybrid_pipeline_fetch_timeout_s=1.0,
         use_rollout_routing_replay=False,
@@ -221,6 +224,13 @@ def test_train_hybrid_wires_one_update_around_flagged_actor_chunks(
     assert [event[1] for event in events if isinstance(event, tuple) and event[0] == "fetch"] == (expected_fetch_sizes)
     assert sum(isinstance(event, tuple) and event[0] == "forward" for event in events) == expected_forward_count
     assert sum(isinstance(event, tuple) and event[0] == "restore" for event in events) == int(pipeline_enabled)
+    fetch_forward_events = [
+        event[0] for event in events if isinstance(event, tuple) and event[0] in {"fetch", "forward"}
+    ]
+    if pipeline_enabled:
+        assert fetch_forward_events == (
+            ["fetch", "forward", "fetch", "forward"] if pipeline_overlap else ["fetch", "fetch", "forward", "forward"]
+        )
     assert events.count("advantages") == 1
     assert events.count("optimizer") == 1
     assert events.count("update_weights") == 1

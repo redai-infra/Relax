@@ -1562,6 +1562,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             ),
                             fetch_chunk=fetch_debug_chunk,
                             forward_chunk=forward_pipeline_chunk,
+                            overlap_producer=bool(getattr(self.args, "hybrid_pipeline_overlap", True)),
                         )
                     mini_batch, canonical_indexes = canonicalize_rollout_chunks(
                         mini_chunks,
@@ -1625,6 +1626,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             ),
                             fetch_chunk=fetch_pipeline_chunk,
                             forward_chunk=forward_pipeline_chunk,
+                            overlap_producer=bool(getattr(self.args, "hybrid_pipeline_overlap", True)),
                         )
 
                     mini_batch, canonical_indexes = canonicalize_rollout_chunks(

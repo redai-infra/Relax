@@ -81,14 +81,20 @@ def test_hybrid_pipeline_options_default_off(arguments_module):
     args = parser.parse_args([])
 
     assert args.hybrid_pipeline_forward is False
+    assert args.hybrid_pipeline_overlap is True
     assert args.hybrid_pipeline_trace_dir is None
     assert args.hybrid_pipeline_fetch_timeout_s == 600.0
+
+    args = parser.parse_args(["--hybrid-pipeline-forward", "--no-hybrid-pipeline-overlap"])
+    assert args.hybrid_pipeline_forward is True
+    assert args.hybrid_pipeline_overlap is False
 
 
 def _hybrid_pipeline_args() -> SimpleNamespace:
     return SimpleNamespace(
         hybrid=True,
         hybrid_pipeline_forward=True,
+        hybrid_pipeline_overlap=True,
         hybrid_pipeline_trace_dir="/tmp/trace",
         hybrid_pipeline_fetch_timeout_s=600.0,
         use_dynamic_batch_size=True,
@@ -128,6 +134,15 @@ def _hybrid_pipeline_args() -> SimpleNamespace:
 
 def test_hybrid_pipeline_supported_configuration_is_accepted(arguments_module):
     arguments_module._validate_hybrid_pipeline_args(_hybrid_pipeline_args())
+
+
+def test_hybrid_pipeline_overlap_control_requires_chunk_forward(arguments_module):
+    args = _hybrid_pipeline_args()
+    args.hybrid_pipeline_forward = False
+    args.hybrid_pipeline_overlap = False
+
+    with pytest.raises(ValueError, match="requires --hybrid-pipeline-forward"):
+        arguments_module._validate_hybrid_pipeline_args(args)
 
 
 @pytest.mark.parametrize(

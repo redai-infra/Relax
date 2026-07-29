@@ -182,6 +182,7 @@ instead of waiting for a complete optimizer mini:
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `--hybrid-pipeline-forward` | off | Fetch and forward each fixed actor chunk as soon as enough samples are ready |
+| `--hybrid-pipeline-overlap` / `--no-hybrid-pipeline-overlap` | on | Forward immediately, or fetch all identical chunks first for a schedule-matched performance control |
 | `--hybrid-pipeline-trace-dir PATH` | unset | Write content-free producer, fetch, restore, forward, advantage, and optimizer events |
 | `--hybrid-pipeline-fetch-timeout-s SECONDS` | `600` | Fail an incomplete chunk wait with rollout/mini/chunk context |
 
@@ -218,6 +219,14 @@ old-policy and training forward shapes aligned while retaining one optimizer
 update over the complete mini. For this reason, the switch requires
 `--use-dynamic-batch-size`; an incompatible batch mode fails during actor
 startup.
+
+`--no-hybrid-pipeline-overlap` changes only the ordering of the same chunk
+operations: the actor fetches every chunk before starting any chunk forward.
+It preserves the chunk-local dynamic schedules and their single merged
+optimizer update. This is the registered baseline for a causal performance
+comparison. Omitting `--hybrid-pipeline-forward` remains the compatibility
+rollback, but its full-batch packing is not a schedule-matched performance
+control.
 
 The first implementation is intentionally limited and fails fast instead of
 silently falling back:
@@ -264,6 +273,7 @@ run or paired benchmark does not require editing the script:
 | `CHECKPOINT_SAVE` | `1` | Set to `0` to omit all `--save*` arguments and use separate rollout/TensorBoard outputs |
 | `ROLLOUT_RESULT_DIR` / `TENSORBOARD_DIR` | No override while saving; `${EXP_DIR}/rollout_result` and `${EXP_DIR}/tensorboard_log` without saving | Preserve raw results and scalars in no-save runs; `TENSORBOARD_DIR` is exported for MetricsService |
 | `NUM_ITERS_PER_TRAIN_UPDATE` | `2` | Set the prompt-group-aligned producer and actor chunk count for each optimizer mini |
+| `HYBRID_PIPELINE_OVERLAP` | `1` | Set to `0` only with `HYBRID_PIPELINE_FORWARD=1` to run the schedule-matched no-overlap control |
 | `ROLLOUT_MAX_RESPONSE_LEN` / `ROLLOUT_MAX_PROMPT_LEN` / `ROLLOUT_MAX_CONTEXT_LEN` | `10240` / `2048` / `12288` | Pin generation and context limits |
 | `ACTOR_MAX_TOKENS_PER_GPU` | `12288` | Bound dynamic-batch actor microbatch tokens |
 | `HYBRID_ACTOR_GPUS` / `HYBRID_ROLLOUT_GPUS` | `4` / `4` | Build the Hybrid placement resource |
@@ -278,9 +288,10 @@ start instead of silently degrading.
 With the reference `global_batch_size=256` and
 `n_samples_per_prompt=8`, setting `NUM_ITERS_PER_TRAIN_UPDATE=4` creates four
 64-sample stages. Each stage therefore contains eight complete prompt groups.
-Baseline and experiment runs in a pair must use the same value: the baseline
-waits for and forwards the full mini, while the optional pipeline fetches and
-forwards the four stages incrementally.
+Baseline and experiment runs in a strict pair both enable chunk forwarding and
+use the same value. The baseline sets `HYBRID_PIPELINE_OVERLAP=0`, so it fetches
+all four stages before their forwards; the experiment sets it to `1`, so each
+ready stage is forwarded while later stages are still produced.
 
 For example, this is a no-save Qwen3-VL-8B configuration for a constrained
 machine. It may be used for a resource-qualified smoke or paired performance
@@ -335,6 +346,12 @@ python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
   --enforce-targets
 ```
 
+For every paired seed, launch the baseline with
+`HYBRID_PIPELINE_FORWARD=1 HYBRID_PIPELINE_OVERLAP=0` and the experiment with
+`HYBRID_PIPELINE_FORWARD=1 HYBRID_PIPELINE_OVERLAP=1`. All other manifest
+fields, including candidate commit, model, data, limits, topology, seed, image,
+and hardware fingerprint, must match.
+
 The analyzer validates event closure, one restore and optimizer step, sample
 conservation, same-host monotonic timing, finite metrics, producer/fetch
 fingerprints, steady-step coverage, and the registered performance thresholds.
@@ -343,10 +360,14 @@ strictly fixed. Strict producer overlap means the first actor forward starts
 before the producer starts its final put. The final put completion is retained
 only as a transfer-stage diagnostic because its trace write can lose a
 scheduling race with the consumer. With `--enforce-targets`, the analyzer also
-checks per-run strict producer overlap, step-time p95,
+checks that the baseline fetched all chunks before its first forward, that the
+experiment forwarded before its final fetch completed, per-run strict producer
+overlap, step-time p95,
 the configured expected-GPU NVML coverage, peak VRAM,
 token/multimodal-byte workload, and the
-raw-reward, truncation-rate, and staleness guardrails. It uses `sum(step_tokens) /
+raw-reward, truncation-rate, staleness, same-weight PPO KL, and policy
+clip-fraction guardrails. Same-weight `abs(train/ppo_kl)` and
+`abs(train/pg_clipfrac)` must each remain at or below `1e-7`. It uses `sum(step_tokens) /
 sum(step_time)` for aggregate throughput rather than averaging per-step rates.
 The truncation guardrail reads the rollout-side
 `rollout/truncated_ratio`; the training-side `rollout/truncated` scalar is not

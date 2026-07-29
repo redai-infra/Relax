@@ -13,20 +13,27 @@ def execute_hybrid_forward_mini(
     restore_actor: Callable[[int], None],
     fetch_chunk: Callable[[int], tuple[Any, list[int]]],
     forward_chunk: Callable[[Any, int, list[int]], None],
+    overlap_producer: bool = True,
 ) -> list[tuple[Any, list[int]]]:
-    """Restore once, then fetch and forward each fixed actor chunk in order."""
+    """Restore once, then execute a matched chunk schedule with optional overlap."""
     if chunks_per_mini <= 0:
         raise ValueError(f"chunks_per_mini must be positive, got {chunks_per_mini}")
+    if type(overlap_producer) is not bool:
+        raise TypeError(f"overlap_producer must be bool, got {overlap_producer!r}")
 
-    first_batch_index = batch_index_for_chunk(0)
-    restore_actor(first_batch_index)
+    batch_indexes = [batch_index_for_chunk(chunk_index) for chunk_index in range(chunks_per_mini)]
+    restore_actor(batch_indexes[0])
 
-    chunks = []
-    for chunk_index in range(chunks_per_mini):
-        batch_index = batch_index_for_chunk(chunk_index)
+    chunks: list[tuple[Any, list[int]]] = []
+    for batch_index in batch_indexes:
         batch, global_indexes = fetch_chunk(batch_index)
-        forward_chunk(batch, batch_index, global_indexes)
         chunks.append((batch, global_indexes))
+        if overlap_producer:
+            forward_chunk(batch, batch_index, global_indexes)
+
+    if not overlap_producer:
+        for (batch, global_indexes), batch_index in zip(chunks, batch_indexes, strict=True):
+            forward_chunk(batch, batch_index, global_indexes)
     return chunks
 
 

@@ -238,6 +238,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-pipeline-overlap",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "When Hybrid pipeline forwarding is enabled, forward each chunk immediately "
+                    "instead of waiting until all chunks have been fetched. Disable only to run a "
+                    "schedule-matched no-overlap performance control. Default: enabled."
+                ),
+            )
+            parser.add_argument(
                 "--hybrid-pipeline-trace-dir",
                 type=str,
                 default=None,
@@ -2842,10 +2852,16 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
 
 def _validate_hybrid_pipeline_args(args) -> None:
     enabled = bool(getattr(args, "hybrid_pipeline_forward", False))
+    overlap_enabled = bool(getattr(args, "hybrid_pipeline_overlap", True))
     trace_enabled = bool(getattr(args, "hybrid_pipeline_trace_dir", None))
-    if (enabled or trace_enabled) and not getattr(args, "hybrid", False):
-        raise ValueError("--hybrid-pipeline-forward and --hybrid-pipeline-trace-dir are only supported with --hybrid.")
+    if (enabled or trace_enabled or not overlap_enabled) and not getattr(args, "hybrid", False):
+        raise ValueError(
+            "--hybrid-pipeline-forward, its overlap control, and --hybrid-pipeline-trace-dir "
+            "are only supported with --hybrid."
+        )
     if not enabled:
+        if not overlap_enabled:
+            raise ValueError("--no-hybrid-pipeline-overlap requires --hybrid-pipeline-forward.")
         return
 
     timeout = getattr(args, "hybrid_pipeline_fetch_timeout_s", 600.0)

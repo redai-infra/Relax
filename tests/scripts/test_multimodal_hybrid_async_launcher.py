@@ -160,3 +160,29 @@ def test_launcher_rejects_invalid_actor_chunk_count_before_ray(tmp_path):
     assert "requires NUM_ITERS_PER_TRAIN_UPDATE >= 2" in result.stderr
     assert arguments == []
     assert not capture_path.exists()
+
+
+def test_launcher_exposes_schedule_matched_no_overlap_control(tmp_path):
+    result, arguments, _, _ = _run_launcher(
+        tmp_path,
+        overrides={
+            "HYBRID_PIPELINE_FORWARD": "1",
+            "HYBRID_PIPELINE_OVERLAP": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--hybrid-pipeline-forward" in arguments
+    assert "--no-hybrid-pipeline-overlap" in arguments
+
+
+def test_launcher_rejects_overlap_control_without_pipeline_forward(tmp_path):
+    result, arguments, capture_path, _ = _run_launcher(
+        tmp_path,
+        overrides={"HYBRID_PIPELINE_OVERLAP": "0"},
+    )
+
+    assert result.returncode == 2
+    assert "requires HYBRID_PIPELINE_FORWARD=1" in result.stderr
+    assert arguments == []
+    assert not capture_path.exists()

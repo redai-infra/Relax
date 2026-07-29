@@ -113,19 +113,22 @@ def _write_run(
     *,
     name="run",
     pipeline_enabled=True,
+    pipeline_overlap=None,
     hostname="test-host",
     missing_event=None,
     nonfinite=False,
     producer_put_count=2,
     producer_last_start_ns=700,
 ):
+    if pipeline_overlap is None:
+        pipeline_overlap = pipeline_enabled
     run_dir = tmp_path / name
     timeline = run_dir / "timeline"
     timeline.mkdir(parents=True)
     (run_dir / "run_manifest.json").write_text(
         json.dumps(
             {
-                "condition": "experiment" if pipeline_enabled else "baseline",
+                "condition": "experiment" if pipeline_enabled and pipeline_overlap else "baseline",
                 "hostname": hostname,
                 "order": "B1" if pipeline_enabled else "A1",
                 "seed": 7,
@@ -137,6 +140,7 @@ def _write_run(
                 "n_samples_per_prompt": 2,
                 "num_iters_per_train_update": 2,
                 "hybrid_pipeline_forward": int(pipeline_enabled),
+                "hybrid_pipeline_overlap": int(pipeline_overlap),
                 "hybrid_pipeline_trace_dir": str(timeline),
                 "hybrid_pipeline_fetch_timeout_s": 600,
                 "git_commit": "a" * 40,
@@ -196,7 +200,7 @@ def _write_run(
     if nonfinite:
         producer[0]["total_tokens"] = float("nan")
 
-    if pipeline_enabled:
+    if pipeline_enabled and pipeline_overlap:
         actor = [
             _event("actor_restore_start", 210, role="actor", chunk_index=0, sample_count=4),
             _event("actor_restore_end", 300, role="actor", chunk_index=0, sample_count=4),
@@ -237,6 +241,61 @@ def _write_run(
             _event(
                 "actor_forward_start",
                 860,
+                role="actor",
+                chunk_index=1,
+                sample_count=2,
+                fingerprint=FINGERPRINT_1,
+            ),
+            _event(
+                "actor_forward_end",
+                1000,
+                role="actor",
+                chunk_index=1,
+                sample_count=2,
+                fingerprint=FINGERPRINT_1,
+            ),
+        ]
+    elif pipeline_enabled:
+        actor = [
+            _event("actor_restore_start", 210, role="actor", chunk_index=0, sample_count=4),
+            _event("actor_restore_end", 300, role="actor", chunk_index=0, sample_count=4),
+            _event("chunk_fetch_start", 310, role="actor", chunk_index=0, sample_count=2),
+            _event(
+                "chunk_fetch_end",
+                350,
+                role="actor",
+                chunk_index=0,
+                sample_count=2,
+                fingerprint=FINGERPRINT_0,
+            ),
+            _event("chunk_fetch_start", 810, role="actor", chunk_index=1, sample_count=2),
+            _event(
+                "chunk_fetch_end",
+                850,
+                role="actor",
+                chunk_index=1,
+                sample_count=2,
+                fingerprint=FINGERPRINT_1,
+            ),
+            _event(
+                "actor_forward_start",
+                860,
+                role="actor",
+                chunk_index=0,
+                sample_count=2,
+                fingerprint=FINGERPRINT_0,
+            ),
+            _event(
+                "actor_forward_end",
+                900,
+                role="actor",
+                chunk_index=0,
+                sample_count=2,
+                fingerprint=FINGERPRINT_0,
+            ),
+            _event(
+                "actor_forward_start",
+                910,
                 role="actor",
                 chunk_index=1,
                 sample_count=2,
@@ -385,6 +444,21 @@ def test_baseline_trace_preserves_one_full_fetch_and_no_overlap(tmp_path):
     assert analysis.trace_rows[0]["actor_fetch_count"] == 1
     assert analysis.trace_rows[0]["actor_restore_count"] == 1
     assert analysis.trace_rows[0]["first_forward_before_last_put_start"] is False
+
+
+def test_schedule_matched_baseline_fetches_all_chunks_before_forward(tmp_path):
+    run_dir = _write_run(tmp_path, pipeline_enabled=True, pipeline_overlap=False)
+
+    analysis = analyzer.analyze_run(
+        run_dir,
+        windows=((4, 4),),
+        expected_samples=4,
+        expected_actor_chunks=2,
+    )
+
+    assert analysis.trace_rows[0]["actor_fetch_count"] == 2
+    assert analysis.trace_rows[0]["all_chunks_fetched_before_first_forward"] is True
+    assert analysis.summary["hybrid_pipeline_overlap"] is False
 
 
 @pytest.mark.parametrize(
@@ -542,10 +616,12 @@ def _comparison_analysis(
     throughput,
     phase1,
     *,
-    overlap=True,
+    overlap=None,
     accuracy=0.5,
     peak_vram_mib=10_000,
 ):
+    if overlap is None:
+        overlap = condition == "experiment"
     metrics = {
         "perf/step_token_per_s": {"aggregate": throughput},
         "perf/step_resp_token_per_s": {"aggregate": throughput / 2},
@@ -556,6 +632,8 @@ def _comparison_analysis(
         "rollout/truncated_ratio": {"mean": 0.0},
         "train/loss": {"mean": 1.0},
         "train/grad_norm": {"mean": 0.5},
+        "train/ppo_kl": {"mean": 0.0},
+        "train/pg_clipfrac": {"mean": 0.0},
     }
     trace_rows = [
         {
@@ -582,6 +660,8 @@ def _comparison_analysis(
         "rollout/truncated_ratio": 0.0,
         "train/loss": 1.0,
         "train/grad_norm": 0.5,
+        "train/ppo_kl": 0.0,
+        "train/pg_clipfrac": 0.0,
     }
     scalar_rows = [
         {"tag": tag, "step": step, "value": value} for step in range(4, 19) for tag, value in scalar_values.items()
@@ -600,7 +680,8 @@ def _comparison_analysis(
             "rollout_batch_size": 32,
             "n_samples_per_prompt": 8,
             "num_iters_per_train_update": 2,
-            "hybrid_pipeline_forward": condition == "experiment",
+            "hybrid_pipeline_forward": True,
+            "hybrid_pipeline_overlap": condition == "experiment",
             "hybrid_pipeline_fetch_timeout_s": 600,
             "git_commit": "a" * 40,
             "git_branch": "perf/task21",
@@ -687,6 +768,23 @@ def test_preregistered_targets_pass_and_fail_deterministically():
     with pytest.raises(analyzer.BenchmarkValidationError, match="below 5%"):
         analyzer._build_comparison(
             failing,
+            windows=((4, 8), (9, 13), (14, 18)),
+            enforce_targets=True,
+        )
+
+
+def test_performance_targets_require_schedule_matched_overlap_modes():
+    analyses = [
+        _comparison_analysis("baseline", 1, 100, 10),
+        _comparison_analysis("experiment", 1, 106, 8),
+        _comparison_analysis("baseline", 2, 102, 10.2),
+        _comparison_analysis("experiment", 2, 108.12, 8.16),
+    ]
+    analyses[0].manifest["hybrid_pipeline_forward"] = False
+
+    with pytest.raises(analyzer.BenchmarkValidationError, match="schedule-matched chunk forwarding"):
+        analyzer._build_comparison(
+            analyses,
             windows=((4, 8), (9, 13), (14, 18)),
             enforce_targets=True,
         )
@@ -801,6 +899,8 @@ def test_comparison_plot_bundle_fails_fast_without_matplotlib(tmp_path, monkeypa
         ("staleness_max", "observed producer lead exceeds configured max_staleness=2"),
         ("vram", "peak VRAM increased"),
         ("workload", "actor_total_tokens must match exactly"),
+        ("ppo_kl", "same-weight train/ppo_kl exceeds"),
+        ("pg_clipfrac", "same-weight train/pg_clipfrac exceeds"),
     ],
 )
 def test_preregistered_guardrails_fail_closed(guardrail, error):
@@ -828,6 +928,10 @@ def test_preregistered_guardrails_fail_closed(guardrail, error):
     elif guardrail == "workload":
         for row in experiment.trace_rows:
             row["actor_total_tokens"] *= 2
+    elif guardrail == "ppo_kl":
+        experiment.summary["metrics"]["train/ppo_kl"]["mean"] = 1e-4
+    elif guardrail == "pg_clipfrac":
+        experiment.summary["metrics"]["train/pg_clipfrac"]["mean"] = 1e-4
 
     with pytest.raises(analyzer.BenchmarkValidationError, match=error):
         analyzer._build_comparison(

@@ -62,6 +62,8 @@ CORRECTNESS_GUARDRAIL_TAGS = (
     "rollout/truncated_ratio",
     "train/loss",
     "train/grad_norm",
+    "train/ppo_kl",
+    "train/pg_clipfrac",
 )
 QUALITY_TAG_FRAGMENTS = (
     "raw_reward",
@@ -236,6 +238,13 @@ def _validate_run_manifest(
     ):
         if type(manifest[key]) is not int:
             _fail(f"{run_dir} manifest field {key!r} must be an integer, got {manifest[key]!r}")
+    if "hybrid_pipeline_overlap" in manifest and (
+        type(manifest["hybrid_pipeline_overlap"]) is not int or manifest["hybrid_pipeline_overlap"] not in (0, 1)
+    ):
+        _fail(
+            f"{run_dir} manifest field 'hybrid_pipeline_overlap' must be integer 0 or 1, "
+            f"got {manifest['hybrid_pipeline_overlap']!r}"
+        )
     if manifest["seed"] != manifest["rollout_seed"]:
         _fail(
             f"{run_dir} must use the same paired Megatron/rollout seed, got "
@@ -450,6 +459,7 @@ def _analyze_trace(
     rows: Sequence[dict[str, Any]],
     *,
     pipeline_enabled: bool,
+    pipeline_overlap_enabled: bool,
     expected_samples: int,
     expected_actor_chunks: int,
     expected_producer_chunks: int | None,
@@ -622,8 +632,17 @@ def _analyze_trace(
             )
             last_forward_ns = max(row["monotonic_ns"] for row in forward_end)
             first_forward_ns = min(row["monotonic_ns"] for row in forward_start)
+            last_fetch_end_ns = max(row["monotonic_ns"] for row in fetch_end)
             last_put_start_ns = max(row["monotonic_ns"] for row in put_start)
             last_put_done_ns = max(row["monotonic_ns"] for row in put_done)
+            chunk_schedule_overlapped = first_forward_ns < last_fetch_end_ns
+            if pipeline_enabled and chunk_schedule_overlapped != pipeline_overlap_enabled:
+                expected_order = (
+                    "the first forward before the final fetch completed"
+                    if pipeline_overlap_enabled
+                    else "all fetches before the first forward"
+                )
+                _fail(f"{context} does not implement the requested overlap mode: expected {expected_order}")
             ready_rollout_ids = [
                 int(row["rollout_id"])
                 for row in rows
@@ -643,6 +662,7 @@ def _analyze_trace(
                     "pid": stream[1],
                     "global_rank": stream[2],
                     "pipeline_enabled": pipeline_enabled,
+                    "pipeline_overlap_enabled": pipeline_overlap_enabled,
                     "producer_samples": producer_samples,
                     "actor_fetch_samples": sum(int(row["sample_count"]) for row in fetch_end),
                     "actor_forward_samples": sum(int(row["sample_count"]) for row in forward_start),
@@ -659,6 +679,8 @@ def _analyze_trace(
                     # Diagnostic only: async_put may have made data visible
                     # before the producer coroutine records tq_put_done.
                     "first_forward_before_last_put_done": first_forward_ns < last_put_done_ns,
+                    "first_forward_before_last_fetch_end": chunk_schedule_overlapped,
+                    "all_chunks_fetched_before_first_forward": not chunk_schedule_overlapped,
                     "producer_overlap_s": max(0, last_put_start_ns - first_forward_ns) / 1e9,
                     "transfer_overlap_s": max(0, last_put_done_ns - first_forward_ns) / 1e9,
                     "producer_lead_at_first_forward": producer_lead,
@@ -706,15 +728,19 @@ def _analyze_trace(
 
     producer_overlap_count = sum(bool(row["first_forward_before_last_put_start"]) for row in rollout_rows)
     transfer_overlap_count = sum(bool(row["first_forward_before_last_put_done"]) for row in rollout_rows)
+    chunk_schedule_overlap_count = sum(bool(row["first_forward_before_last_fetch_end"]) for row in rollout_rows)
     summary = {
         "hostname": next(iter({row["hostname"] for row in rows})),
         "pipeline_enabled": pipeline_enabled,
+        "pipeline_overlap_enabled": pipeline_overlap_enabled,
         "rollout_count": len(rollout_rows),
         "actor_stream_count": len({_stream_key(row) for row in rows if row["role"] == "actor"}),
         "producer_overlap_rollout_count": producer_overlap_count,
         "producer_overlap_rollout_ratio": producer_overlap_count / len(rollout_rows),
         "transfer_overlap_rollout_count": transfer_overlap_count,
         "transfer_overlap_rollout_ratio": transfer_overlap_count / len(rollout_rows),
+        "chunk_schedule_overlap_rollout_count": chunk_schedule_overlap_count,
+        "chunk_schedule_overlap_rollout_ratio": chunk_schedule_overlap_count / len(rollout_rows),
         "mean_phase1_s": statistics.fmean(row["phase1_s"] for row in rollout_rows),
         "mean_producer_overlap_s": statistics.fmean(row["producer_overlap_s"] for row in rollout_rows),
         "mean_transfer_overlap_s": statistics.fmean(row["transfer_overlap_s"] for row in rollout_rows),
@@ -1009,6 +1035,10 @@ def analyze_run(
     if type(pipeline_flag) is not int or pipeline_flag not in (0, 1):
         _fail(f"{run_dir} hybrid_pipeline_forward must be integer 0 or 1, got {pipeline_flag!r}")
     pipeline_enabled = bool(pipeline_flag)
+    overlap_flag = manifest.get("hybrid_pipeline_overlap", pipeline_flag)
+    if type(overlap_flag) is not int or overlap_flag not in (0, 1):
+        _fail(f"{run_dir} hybrid_pipeline_overlap must be integer 0 or 1, got {overlap_flag!r}")
+    pipeline_overlap_enabled = bool(overlap_flag)
     if manifest["global_batch_size"] != expected_samples:
         _fail(
             f"{run_dir} expected_samples={expected_samples} disagrees with "
@@ -1022,13 +1052,14 @@ def analyze_run(
     condition = str(manifest["condition"])
     if condition not in {"baseline", "experiment"}:
         _fail(f"{run_dir} has unsupported condition {condition!r}; expected 'baseline' or 'experiment'")
-    if condition == "baseline" and pipeline_enabled:
-        _fail(f"{run_dir} is labeled baseline but hybrid_pipeline_forward is enabled")
-    if condition == "experiment" and not pipeline_enabled:
-        _fail(f"{run_dir} is labeled experiment but hybrid_pipeline_forward is disabled")
+    if condition == "baseline" and pipeline_enabled and pipeline_overlap_enabled:
+        _fail(f"{run_dir} is labeled baseline but both chunk forwarding and producer overlap are enabled")
+    if condition == "experiment" and (not pipeline_enabled or not pipeline_overlap_enabled):
+        _fail(f"{run_dir} is labeled experiment but chunk forwarding with producer overlap is not enabled")
     rollout_rows, actor_rank_rows, trace_summary = _analyze_trace(
         trace_rows,
         pipeline_enabled=pipeline_enabled,
+        pipeline_overlap_enabled=pipeline_overlap_enabled,
         expected_samples=expected_samples,
         expected_actor_chunks=expected_actor_chunks,
         expected_producer_chunks=expected_producer_chunks,
@@ -1045,6 +1076,7 @@ def analyze_run(
         "condition": manifest["condition"],
         "seed": manifest["seed"],
         "hybrid_pipeline_forward": pipeline_enabled,
+        "hybrid_pipeline_overlap": pipeline_overlap_enabled,
         "steady_windows": [list(window) for window in windows],
         "trace": trace_summary,
         "metrics": metrics,
@@ -1141,6 +1173,28 @@ def _build_comparison(
 
     steady_steps = _stable_steps(windows)
     if enforce_targets:
+        missing_overlap_mode = [
+            str(analysis.run_dir) for analysis in analyses if "hybrid_pipeline_overlap" not in analysis.manifest
+        ]
+        if missing_overlap_mode:
+            _fail(
+                f"performance targets require an explicit hybrid_pipeline_overlap manifest field: {missing_overlap_mode}"
+            )
+        invalid_modes = {
+            str(analysis.run_dir): {
+                "condition": analysis.manifest["condition"],
+                "hybrid_pipeline_forward": analysis.manifest["hybrid_pipeline_forward"],
+                "hybrid_pipeline_overlap": analysis.manifest["hybrid_pipeline_overlap"],
+            }
+            for analysis in analyses
+            if analysis.manifest["hybrid_pipeline_forward"] not in (1, True)
+            or bool(analysis.manifest["hybrid_pipeline_overlap"]) != (analysis.manifest["condition"] == "experiment")
+        }
+        if invalid_modes:
+            _fail(
+                "performance targets require schedule-matched chunk forwarding with overlap disabled "
+                f"for baseline and enabled for experiment: {invalid_modes}"
+            )
         required_tags = PERFORMANCE_TAGS + CORRECTNESS_GUARDRAIL_TAGS
         for analysis in analyses:
             context = f"{analysis.manifest['condition']} seed={analysis.manifest['seed']}"
@@ -1448,6 +1502,14 @@ def _build_comparison(
             _fail("correctness targets require rollout/truncated_ratio for every paired run")
         if any(value > 0.02 for value in truncation_deltas):
             _fail(f"a paired truncation-rate increase exceeds 2 percentage points: {truncation_deltas}")
+
+        for analysis in analyses:
+            ppo_kl = analysis.summary["metrics"]["train/ppo_kl"]["mean"]
+            pg_clipfrac = analysis.summary["metrics"]["train/pg_clipfrac"]["mean"]
+            if abs(ppo_kl) > 1e-7:
+                _fail(f"{analysis.run_dir} same-weight train/ppo_kl exceeds 1e-7: {ppo_kl}")
+            if abs(pg_clipfrac) > 1e-7:
+                _fail(f"{analysis.run_dir} same-weight train/pg_clipfrac exceeds 1e-7: {pg_clipfrac}")
 
         staleness_deltas = [row["producer_lead_at_first_forward:delta"] for row in paired]
         if any(value > 0.25 for value in staleness_deltas):

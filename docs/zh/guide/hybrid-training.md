@@ -184,6 +184,7 @@ Hybrid 可选地从 TransferQueue 按固定 sample count 增量请求 actor chun
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `--hybrid-pipeline-forward` | 关闭 | 足量 sample ready 后立即 fetch 固定 actor chunk 并执行 forward |
+| `--hybrid-pipeline-overlap` / `--no-hybrid-pipeline-overlap` | 开启 | chunk ready 后立即 forward；或先 fetch 全部相同 chunk，作为调度匹配的性能对照 |
 | `--hybrid-pipeline-trace-dir PATH` | 未设置 | 记录不含样本内容的 producer、fetch、restore、forward、advantage 和 optimizer 事件 |
 | `--hybrid-pipeline-fetch-timeout-s SECONDS` | `600` | chunk 未完整到达时，带 rollout/mini/chunk 上下文终止等待 |
 
@@ -213,6 +214,12 @@ log-prob 按 chunk 计算、训练 forward 却按另一种完整 batch 分组，
 保持整个 optimizer mini 只更新一次的同时，对齐 old-policy 与训练 forward
 的计算形状。因此该开关强制要求 `--use-dynamic-batch-size`；batch 模式不兼容
 时会在 actor 启动阶段直接失败。
+
+`--no-hybrid-pipeline-overlap` 只改变同一组 chunk 操作的执行顺序：actor
+先 fetch 完所有 chunk，再开始任何 chunk forward。chunk 内动态 microbatch
+调度及合并后的单次 optimizer update 均保持不变，因此它是因果性能比较的
+注册 baseline。完全去掉 `--hybrid-pipeline-forward` 仍是兼容性回滚方式，
+但 full-batch packing 不属于调度匹配的性能对照。
 
 首版支持范围有意收窄；不支持的组合会 fail fast，不会静默回退：
 
@@ -257,6 +264,7 @@ bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
 | `CHECKPOINT_SAVE` | `1` | 设为 `0` 时不传 `--save*`；改用独立 rollout 与 TensorBoard 输出目录 |
 | `ROLLOUT_RESULT_DIR` / `TENSORBOARD_DIR` | 保存开启时不覆盖；关闭时为 `${EXP_DIR}/rollout_result` 和 `${EXP_DIR}/tensorboard_log` | 在 no-save 运行中保留原始结果和标量；`TENSORBOARD_DIR` 会导出给 MetricsService |
 | `NUM_ITERS_PER_TRAIN_UPDATE` | `2` | 设置每个 optimizer mini 中按完整 prompt group 对齐的 producer/actor 分块数 |
+| `HYBRID_PIPELINE_OVERLAP` | `1` | 仅在 `HYBRID_PIPELINE_FORWARD=1` 时设为 `0`，运行调度匹配的 no-overlap 对照 |
 | `ROLLOUT_MAX_RESPONSE_LEN` / `ROLLOUT_MAX_PROMPT_LEN` / `ROLLOUT_MAX_CONTEXT_LEN` | `10240` / `2048` / `12288` | 固定生成和上下文上限 |
 | `ACTOR_MAX_TOKENS_PER_GPU` | `12288` | 控制 dynamic-batch actor microbatch 的 token 上限 |
 | `HYBRID_ACTOR_GPUS` / `HYBRID_ROLLOUT_GPUS` | `4` / `4` | 构造 Hybrid placement resource |
@@ -269,9 +277,10 @@ bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
 
 参考配置的 `global_batch_size=256`、`n_samples_per_prompt=8`。将
 `NUM_ITERS_PER_TRAIN_UPDATE` 设为 `4` 时，每个 optimizer mini 会形成四个
-64-sample stage，每个 stage 包含八组完整 prompt。成对比较中的 baseline 与
-experiment 必须使用同一个值：baseline 等完整 mini 到齐后统一 forward，
-实验开关开启时则依次 fetch/forward 四个 stage。
+64-sample stage，每个 stage 包含八组完整 prompt。严格配对中的 baseline 与
+experiment 都启用 chunk forward 并使用相同分块数。baseline 设置
+`HYBRID_PIPELINE_OVERLAP=0`，先 fetch 完四个 stage 再依次 forward；experiment
+设置为 `1`，每个 stage ready 后立即 forward，并与后续 stage 的生成重叠。
 
 例如，以下命令是资源受限环境中的 no-save Qwen3-VL-8B 配置，可用于明确
 标注资源条件的 smoke 或配对性能实验，但结果不能与默认 8 卡 Qwen3.5 配方
@@ -310,6 +319,11 @@ python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
   --validate-only
 ```
 
+每个配对 seed 中，baseline 使用
+`HYBRID_PIPELINE_FORWARD=1 HYBRID_PIPELINE_OVERLAP=0`，experiment 使用
+`HYBRID_PIPELINE_FORWARD=1 HYBRID_PIPELINE_OVERLAP=1`。candidate commit、
+模型、数据、长度上限、拓扑、seed、镜像及硬件指纹等其余 manifest 字段必须一致。
+
 比较两次 baseline 和两次 experiment，并生成注册的 CSV、JSON 与曲线：
 
 ```bash
@@ -328,9 +342,12 @@ python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
 fetch/forward 次数仍严格固定。严格 producer 重叠定义为首个 actor forward
 早于 producer 最后一次 put 的开始时刻；最后一次 put 的完成时刻仅作为传输
 阶段诊断，因为其 trace 写入可能在调度上晚于 consumer。`--enforce-targets`
-还会检查每次实验的严格 producer 重叠比例、
+还会检查 baseline 在首次 forward 前已 fetch 完全部 chunk、experiment 在
+最后一次 fetch 完成前已开始 forward、每次实验的严格 producer 重叠比例、
 step-time p95、命令指定数量的 GPU NVML 覆盖、峰值显存、token/多模态字节工作量和
-raw-reward、截断率、staleness 非劣护栏。aggregate throughput 使用
+raw-reward、截断率、staleness、同权重 PPO KL 与 policy clip fraction 护栏。
+同权重 `abs(train/ppo_kl)` 与 `abs(train/pg_clipfrac)` 都必须不超过 `1e-7`。
+aggregate throughput 使用
 `sum(step_tokens) / sum(step_time)`，不会对 per-step rate 做简单平均。
 截断率护栏读取 rollout 侧的 `rollout/truncated_ratio`；训练侧
 `rollout/truncated` 在分块聚合时可能被一个 step 累加多次，因此不作为截断率
