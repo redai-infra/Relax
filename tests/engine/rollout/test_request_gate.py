@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -14,30 +12,6 @@ from relax.engine.rollout import request_gate
 
 
 _TIMEOUT = 1.0
-_REQUEST_EVENT_FIELDS = {
-    "request_id",
-    "turn_index",
-    "relative_start_s",
-    "permit_wait_s",
-    "request_duration_s",
-    "total_duration_s",
-    "queue_depth_at_start",
-    "queue_depth_at_acquire",
-    "in_flight_at_start",
-    "in_flight_at_end",
-    "capacity",
-    "outcome",
-    "exception_type",
-    "reentrant",
-}
-
-
-class _Recorder:
-    def __init__(self) -> None:
-        self.events: list[request_gate.RequestEvent] = []
-
-    def record(self, event: request_gate.RequestEvent) -> None:
-        self.events.append(event)
 
 
 async def _wait_for_waiter(gate: request_gate.InferenceRequestGate) -> None:
@@ -53,22 +27,6 @@ async def _wait_for_waiter(gate: request_gate.InferenceRequestGate) -> None:
 
 async def _noop_request() -> None:
     return None
-
-
-def _assert_event_payload(payload: dict[str, Any]) -> None:
-    assert set(payload) == _REQUEST_EVENT_FIELDS
-    assert len(payload["request_id"]) == 32
-    int(payload["request_id"], 16)
-    for field in ("relative_start_s", "permit_wait_s", "request_duration_s", "total_duration_s"):
-        assert payload[field] >= 0
-    assert payload["total_duration_s"] >= payload["permit_wait_s"]
-    assert payload["total_duration_s"] >= payload["request_duration_s"]
-    for field in ("queue_depth_at_start", "queue_depth_at_acquire"):
-        assert type(payload[field]) is int
-        assert payload[field] >= 0
-    for field in ("in_flight_at_start", "in_flight_at_end"):
-        assert type(payload[field]) is int
-        assert 0 <= payload[field] <= payload["capacity"]
 
 
 async def test_request_gate_enforces_capacity_and_recovers() -> None:
@@ -124,8 +82,7 @@ async def test_request_gate_releases_after_exception() -> None:
 
 
 async def test_request_gate_releases_after_holding_and_waiting_cancellation() -> None:
-    recorder = _Recorder()
-    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False, recorder=recorder)
+    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False)
     holder_entered = asyncio.Event()
     release_holder = asyncio.Event()
 
@@ -154,7 +111,6 @@ async def test_request_gate_releases_after_holding_and_waiting_cancellation() ->
                 task.cancel()
         await asyncio.gather(*(task for task in (holder, waiter) if task is not None), return_exceptions=True)
 
-    assert [event.outcome for event in recorder.events].count("cancelled") == 2
     await asyncio.wait_for(gate.run(_noop_request), timeout=_TIMEOUT)
     assert gate.semaphore._value == 1
 
@@ -207,8 +163,7 @@ async def test_request_gate_permit_rechecks_abort_after_wait() -> None:
 
 
 async def test_request_gate_borrows_only_within_the_same_task() -> None:
-    recorder = _Recorder()
-    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False, recorder=recorder)
+    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False)
 
     async def inner() -> str:
         return "nested"
@@ -221,9 +176,6 @@ async def test_request_gate_borrows_only_within_the_same_task() -> None:
         return result
 
     assert await asyncio.wait_for(gate.run(outer), timeout=_TIMEOUT) == "nested"
-    assert len(recorder.events) == 3
-    assert sum(event.reentrant for event in recorder.events) == 1
-    assert [event.outcome for event in recorder.events].count("error") == 1
     assert gate.semaphore._value == 1
 
 
@@ -274,111 +226,21 @@ async def test_request_gate_clears_stale_inherited_lease() -> None:
     assert gate.semaphore._value == 1
 
 
-async def test_request_event_recorder_reports_requests_after_release() -> None:
-    released_values: list[int] = []
-    gate: request_gate.InferenceRequestGate
-
-    class ReleaseObservingRecorder(_Recorder):
-        def record(self, event: request_gate.RequestEvent) -> None:
-            super().record(event)
-            released_values.append(gate.semaphore._value)
-
-    recorder = ReleaseObservingRecorder()
-    aborted = False
-    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: aborted, recorder=recorder)
-
-    async def sensitive_request() -> str:
-        return "sensitive-response-body"
-
-    assert await gate.run(sensitive_request, turn_index=7) == "sensitive-response-body"
-
-    error = RuntimeError("sensitive-error-message")
-
-    async def fail() -> None:
-        raise error
-
-    with pytest.raises(RuntimeError) as exc_info:
-        await gate.run(fail)
-    assert exc_info.value is error
-
-    factory_calls = 0
-
-    async def skipped() -> None:
-        nonlocal factory_calls
-        factory_calls += 1
-
-    aborted = True
-    with pytest.raises(request_gate.GenerationAborted):
-        await gate.run(skipped)
-
-    payloads = [asdict(event) for event in recorder.events]
-    assert [payload["outcome"] for payload in payloads] == ["success", "error", "aborted"]
-    assert payloads[0]["turn_index"] == 7
-    assert payloads[1]["exception_type"] == "RuntimeError"
-    assert payloads[2]["request_duration_s"] == 0.0
-    assert factory_calls == 0
-    for payload in payloads:
-        _assert_event_payload(payload)
-    assert released_values == [1, 1, 1]
-    assert "sensitive-response-body" not in repr(payloads)
-    assert "sensitive-error-message" not in repr(payloads)
-
-
-async def test_request_event_recorder_failure_is_isolated() -> None:
-    class FailingRecorder:
-        def record(self, event: request_gate.RequestEvent) -> None:
-            del event
-            raise RuntimeError("recorder failed")
-
-    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False, recorder=FailingRecorder())
-
-    async def request() -> str:
-        return "request result"
-
-    assert await gate.run(request) == "request result"
-    assert gate.semaphore._value == 1
-
-
-@pytest.mark.parametrize("turn_index", ["sensitive-user-metadata", True])
-async def test_request_event_rejects_non_integer_turn_index(turn_index: Any) -> None:
-    recorder = _Recorder()
-    gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False, recorder=recorder)
-    factory_calls = 0
-
-    async def request() -> None:
-        nonlocal factory_calls
-        factory_calls += 1
-
-    with pytest.raises(TypeError, match="turn_index must be an int or None"):
-        await gate.run(request, turn_index=turn_index)
-
-    assert factory_calls == 0
-    assert recorder.events == []
-    assert gate.semaphore._value == 1
-
-
 async def test_request_gate_releases_when_post_acquire_setup_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = request_gate.InferenceRequestGate(capacity=1, is_aborted=lambda: False)
-    original_monotonic = request_gate.monotonic
-    calls = 0
 
     class SetupFailure(BaseException):
         pass
 
-    def fail_after_acquire() -> float:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise SetupFailure
-        return original_monotonic()
+    def fail_after_acquire(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise SetupFailure
 
-    monkeypatch.setattr(request_gate, "monotonic", fail_after_acquire)
+    monkeypatch.setattr(request_gate, "_Lease", fail_after_acquire)
     with pytest.raises(SetupFailure):
         async with gate.permit():
             pytest.fail("permit body must not run")
 
-    assert gate._queue_depth == 0
-    assert gate._in_flight == 0
     assert gate.semaphore._value == 1
 
 
@@ -404,9 +266,7 @@ def test_request_gate_module_contract() -> None:
         "contextlib",
         "contextvars",
         "dataclasses",
-        "time",
         "typing",
-        "uuid",
     }
     assert request_gate.__all__ == []
 

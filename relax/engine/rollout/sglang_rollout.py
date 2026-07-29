@@ -3,12 +3,10 @@
 import asyncio
 import copy
 import inspect
-import json
 import uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict
 from time import monotonic
 from typing import Any, TypeVar
 
@@ -28,7 +26,6 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.engine.rollout.request_gate import (
     GenerationAborted,
     InferenceRequestGate,
-    RequestEvent,
     request_scoped_generate,
 )
 from relax.utils.async_utils import run
@@ -43,7 +40,7 @@ from relax.utils.data.processing_utils import (
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import get, post
-from relax.utils.logging_utils import LOG_LEVEL, get_logger
+from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.timer import Timer
@@ -58,11 +55,6 @@ __all__ = ["GenerateState", "GenerationAborted", "generate_rollout", "request_sc
 logger = get_logger(__name__)
 
 _Result = TypeVar("_Result")
-
-
-class _RequestEventLogger:
-    def record(self, event: RequestEvent) -> None:
-        logger.debug("request_event=%s", json.dumps(asdict(event), sort_keys=True, separators=(",", ":")))
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -96,7 +88,6 @@ class GenerateState(metaclass=SingletonMeta):
         self._request_gate = InferenceRequestGate(
             capacity=request_capacity,
             is_aborted=lambda: self.aborted,
-            recorder=_RequestEventLogger() if LOG_LEVEL == "DEBUG" else None,
         )
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
@@ -135,12 +126,10 @@ class GenerateState(metaclass=SingletonMeta):
     async def run_request(
         self,
         request_factory: Callable[[], Awaitable[_Result]],
-        *,
-        turn_index: int | None = None,
     ) -> _Result:
         """Run one lazily created inference request under the shared
         concurrency limit."""
-        return await self._request_gate.run(request_factory, turn_index=turn_index)
+        return await self._request_gate.run(request_factory)
 
     @asynccontextmanager
     async def _request_permit(self) -> AsyncIterator[None]:
@@ -494,6 +483,9 @@ async def generate_and_rm(
         return sample
 
     state = GenerateState(args)
+    if state.aborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None

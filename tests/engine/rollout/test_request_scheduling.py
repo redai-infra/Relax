@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from argparse import Namespace
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
@@ -19,22 +18,6 @@ from relax.utils.types import Sample
 
 Runner = Callable[[Any, Sample], Awaitable[None]]
 _TIMEOUT = 2.0
-_ALLOWED_REQUEST_EVENT_FIELDS = {
-    "request_id",
-    "turn_index",
-    "relative_start_s",
-    "permit_wait_s",
-    "request_duration_s",
-    "total_duration_s",
-    "queue_depth_at_start",
-    "queue_depth_at_acquire",
-    "in_flight_at_start",
-    "in_flight_at_end",
-    "capacity",
-    "outcome",
-    "exception_type",
-    "reentrant",
-}
 
 
 class _Tokenizer:
@@ -73,14 +56,6 @@ class _RequestProbe:
                 await gate.wait()
         finally:
             self.in_flight -= 1
-
-
-class _CapturedLogger:
-    def __init__(self) -> None:
-        self.debug_messages: list[str] = []
-
-    def debug(self, message: str, *args: Any) -> None:
-        self.debug_messages.append(message % args)
 
 
 def _make_state(capacity: int) -> Any:
@@ -232,48 +207,21 @@ async def test_generate_state_encapsulates_request_gate(monkeypatch: pytest.Monk
         sglang_rollout.GenerateState.clear_instances()
 
 
-@pytest.mark.parametrize(("log_level", "expected_count"), (("INFO", 0), ("DEBUG", 1)))
-async def test_default_request_logging_is_debug_only_and_redacted(
+async def test_generate_and_rm_aborted_sample_skips_custom_function_import(
     monkeypatch: pytest.MonkeyPatch,
-    log_level: str,
-    expected_count: int,
 ) -> None:
-    captured_logger = _CapturedLogger()
-    monkeypatch.setattr(sglang_rollout, "load_tokenizer", lambda *args, **kwargs: _Tokenizer())
-    monkeypatch.setattr(sglang_rollout, "load_processor", lambda *args, **kwargs: None)
-    monkeypatch.setattr(sglang_rollout.opd, "is_opd_enabled", lambda args: False)
-    monkeypatch.setattr(sglang_rollout, "LOG_LEVEL", log_level)
-    monkeypatch.setattr(sglang_rollout, "logger", captured_logger)
+    state = _make_state(capacity=1)
+    state.aborted = True
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
 
-    async def fake_post(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
-        del url, payload, headers
-        return {
-            "text": "sensitive-response-body",
-            "meta_info": {
-                "finish_reason": {"type": "stop"},
-                "output_token_logprobs": [[-0.1, 10]],
-            },
-        }
+    def fail_load_function(path: str) -> None:
+        pytest.fail(f"load_function must not be called for an aborted sample: {path}")
 
-    monkeypatch.setattr(sglang_rollout, "post", fake_post)
-    sglang_rollout.GenerateState.clear_instances()
+    monkeypatch.setattr(sglang_rollout, "load_function", fail_load_function)
 
-    try:
-        result = await _run_sample(_make_args(), Sample(prompt="sensitive-prompt-body"))
-    finally:
-        sglang_rollout.GenerateState.clear_instances()
+    result = await _run_sample(_make_args(), _make_sample(path="unused.module.generate"))
 
-    assert result.status == Sample.Status.COMPLETED
-    assert len(captured_logger.debug_messages) == expected_count
-    if expected_count:
-        message = captured_logger.debug_messages[0]
-        prefix = "request_event="
-        assert message.startswith(prefix)
-        payload = json.loads(message.removeprefix(prefix))
-        assert set(payload) == _ALLOWED_REQUEST_EVENT_FIELDS
-        assert payload["outcome"] == "success"
-        assert "sensitive-prompt-body" not in message
-        assert "sensitive-response-body" not in message
+    assert result.status == Sample.Status.ABORTED
 
 
 async def test_generate_and_rm_keeps_legacy_custom_generator_bounded(monkeypatch: pytest.MonkeyPatch) -> None:

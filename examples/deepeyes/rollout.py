@@ -215,7 +215,6 @@ async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params
 
 async def _run_inference_step(
     state: GenerateState,
-    turn_index: int,
     url: str,
     tokens: list[int],
     sampling_params: dict,
@@ -236,7 +235,7 @@ async def _run_inference_step(
     async def _send_request() -> dict[str, Any]:
         return await post(url, payload)
 
-    output = await state.run_request(_send_request, turn_index=turn_index)
+    output = await state.run_request(_send_request)
     response_text = output["text"]
     if "output_token_logprobs" in output["meta_info"]:
         new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -491,7 +490,6 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                     meta_info,
                 ) = await _run_inference_step(
                     state,
-                    turn_idx,
                     url,
                     sample.tokens,
                     cur_sampling_params,

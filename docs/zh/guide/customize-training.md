@@ -142,6 +142,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 ```python
 from relax.engine.rollout.sglang_rollout import GenerateState, request_scoped_generate
 from relax.utils.http_utils import post
+from relax.utils.types import Sample
 
 @request_scoped_generate
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -150,7 +151,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     env = build_env(sample=sample, args=args); env.reset()
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
-    for turn in range(args.max_turns):
+    for _ in range(args.max_turns):
 
         async def send_request():
             payload = {
@@ -160,7 +161,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             }
             return await post(url, payload)
 
-        output = await state.run_request(send_request, turn_index=turn)
+        output = await state.run_request(send_request)
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
