@@ -365,7 +365,7 @@ def _start_managed_multi_teacher(
 
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
-    opd_teacher_key = getattr(args, "opd_teacher_key", "data_source")
+    opd_teacher_key = getattr(args, "opd_teacher_key", None) or "data_source"
     logger.info(f"[MOPD teacher] all teachers ready. key='{opd_teacher_key}', routes={list(url_routes.keys())}")
 
     # Return the shared PG so the controller reuses it for actor/rollout. Second
@@ -518,8 +518,12 @@ def add_opd_arguments(parser: Any) -> Any:
     parser.add_argument(
         "--opd-teacher-key",
         type=str,
-        default="data_source",
-        help=("Sample metadata field used as the routing key for --opd-teacher-routes. Default: 'data_source'."),
+        default=None,
+        help=(
+            "Sample metadata field used as the routing key for --opd-teacher-routes. "
+            "Falls back to 'data_source' when OPD is enabled; kept None by default so "
+            "compute_mopd_metrics stays a no-op (no per-source logging) in non-OPD runs."
+        ),
     )
     parser.add_argument(
         "--teacher-hf-checkpoint",
@@ -676,6 +680,14 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
 
     if not getattr(args, "use_opd", False):
         return
+
+    # OPD is enabled here. Backfill the routing key so teacher routing AND the
+    # per-source metrics (compute_mopd_metrics) get a consistent value even when
+    # the user didn't pass --opd-teacher-key. The arg default stays None so that
+    # compute_mopd_metrics remains a no-op in non-OPD runs.
+    if getattr(args, "opd_teacher_key", None) is None:
+        args.opd_teacher_key = "data_source"
+
     if args.opd_type is None:
         raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
     if args.opd_teacher_timeout_s <= 0:
@@ -778,7 +790,7 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
             log.info(
                 "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
                 len(routes_map),
-                getattr(args, "opd_teacher_key", "data_source"),
+                getattr(args, "opd_teacher_key", None) or "data_source",
                 list(routes_map.keys()),
             )
             if getattr(args, "teacher_hf_checkpoint", None) is not None:
@@ -1475,15 +1487,23 @@ def compute_mopd_metrics(args: Namespace, all_samples: list) -> dict:
 
         teacher_lp_seq: list[float] = []
         student_lp_seq: list[float] = []
+        gap_seq: list[float] = []
         rkl_seq: list[float] = []
 
         for s in samples:
             t_lp = s.teacher_log_probs
             s_lp = s.rollout_log_probs
-            if t_lp and len(t_lp) > 0:
-                teacher_lp_seq.append(sum(t_lp) / len(t_lp))
-            if s_lp and len(s_lp) > 0:
-                student_lp_seq.append(sum(s_lp) / len(s_lp))
+            t_mean = sum(t_lp) / len(t_lp) if t_lp and len(t_lp) > 0 else None
+            s_mean = sum(s_lp) / len(s_lp) if s_lp and len(s_lp) > 0 else None
+            if t_mean is not None:
+                teacher_lp_seq.append(t_mean)
+            if s_mean is not None:
+                student_lp_seq.append(s_mean)
+            # Pair gap/rkl per-sample: only when THIS sample has both teacher and
+            # student log probs, so the values stay aligned to one sample (the
+            # marginal teacher_lp_seq/student_lp_seq lists can differ in membership).
+            if t_mean is not None and s_mean is not None:
+                gap_seq.append(s_mean - t_mean)
             if t_lp and s_lp:
                 n_tok = min(len(t_lp), len(s_lp))
                 if n_tok > 0:
@@ -1493,10 +1513,8 @@ def compute_mopd_metrics(args: Namespace, all_samples: list) -> dict:
             log_dict[prefix + "teacher_logp"] = sum(teacher_lp_seq) / len(teacher_lp_seq)
         if student_lp_seq:
             log_dict[prefix + "student_logp"] = sum(student_lp_seq) / len(student_lp_seq)
-        if teacher_lp_seq and student_lp_seq and len(teacher_lp_seq) == len(student_lp_seq):
-            log_dict[prefix + "logp_gap"] = sum(s - t for s, t in zip(student_lp_seq, teacher_lp_seq)) / len(
-                teacher_lp_seq
-            )
+        if gap_seq:
+            log_dict[prefix + "logp_gap"] = sum(gap_seq) / len(gap_seq)
         if rkl_seq:
             log_dict[prefix + "rkl_approx"] = sum(rkl_seq) / len(rkl_seq)
 
