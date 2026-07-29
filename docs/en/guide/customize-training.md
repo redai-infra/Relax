@@ -183,7 +183,6 @@ async def generate(
 - **request-aware (recommended)**: use both `@request_model_aware` and a required keyword-only `request_model` parameter. Marker/signature mismatches raise `TypeError` before execution (no silent fallback).
 - **legacy**: unmarked custom generate keeps session-level gating (full multi-turn including env still holds one slot) with the original call signature.
 - Do not bypass `request_model` by calling `post()` directly; bypassed requests are outside the framework concurrency guarantee.
-- The evaluation abort exception is already bound into the injected `request_model`; declare `evaluation` only when your business logic needs it.
 :::
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.

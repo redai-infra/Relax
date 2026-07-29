@@ -182,7 +182,6 @@ async def generate(
 - **request-aware（推荐）**：同时满足 `@request_model_aware` 与必需的 keyword-only 参数 `request_model`。marker 与签名不一致时会在执行前抛出 `TypeError`，不会静默回退。
 - **legacy**：未标记的 custom generate 保持原会话级限流（完整多轮含环境阶段仍占一个槽位），调用签名不变。
 - 不要绕过 `request_model` 直接调用 `post()`；绕过的请求不在框架并发保证范围内。
-- `evaluation` 对 abort 的例外已绑定在注入的 `request_model` 上；业务无需仅为 admission 声明 `evaluation`。
 :::
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。

@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 from argparse import Namespace
 from contextlib import contextmanager
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -161,7 +160,7 @@ async def test_deepeyes_env_phase_allows_short_request_interleave() -> None:
     fake_tokenizer = MagicMock()
     fake_tokenizer.decode.return_value = "decoded"
     fake_state = SimpleNamespace(tokenizer=fake_tokenizer, processor=None)
-    request_model = partial(scheduler.request, evaluation=False)
+    request_model = scheduler.request
     inference_calls = 0
     real_run_inference = deepeyes_rollout._run_inference_step
 
@@ -281,7 +280,7 @@ async def test_generate_and_rm_bad_marker_signature_raises_before_run() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generate_and_rm_evaluation_continues_when_aborted() -> None:
+async def test_generate_and_rm_evaluation_respects_aborted_state() -> None:
     ran = False
 
     @request_model_aware
@@ -322,5 +321,5 @@ async def test_generate_and_rm_evaluation_continues_when_aborted() -> None:
             {},
             evaluation=True,
         )
-        assert ran is True
-        assert out_eval.status == Sample.Status.COMPLETED
+        assert ran is False
+        assert out_eval.status == Sample.Status.ABORTED

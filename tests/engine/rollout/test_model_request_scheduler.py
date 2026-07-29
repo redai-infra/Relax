@@ -5,16 +5,18 @@
 from __future__ import annotations
 
 import asyncio
-from functools import partial
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from relax.engine.rollout import sglang_rollout as rollout_mod
 from relax.engine.rollout.sglang_rollout import (
     ModelRequestScheduler,
     RolloutRequestAborted,
     _is_request_model_aware,
+    _model_request_capacity,
     _validate_request_model_signature,
     request_model_aware,
 )
@@ -28,6 +30,47 @@ class _FakeState:
 def _scheduler(capacity: int = 1) -> tuple[ModelRequestScheduler, _FakeState]:
     state = _FakeState()
     return ModelRequestScheduler(state, capacity), state
+
+
+@pytest.mark.parametrize("capacity", [0, -1])
+def test_model_request_scheduler_rejects_non_positive_capacity(capacity: int) -> None:
+    with pytest.raises(ValueError, match="capacity must be positive"):
+        _scheduler(capacity=capacity)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"sglang_server_concurrency": 0}, "sglang_server_concurrency"),
+        ({"rollout_num_gpus": 0}, "rollout_num_gpus"),
+        ({"rollout_num_gpus_per_engine": 0}, "rollout_num_gpus_per_engine"),
+        ({"rollout_num_gpus": 1, "rollout_num_gpus_per_engine": 2}, "capacity must be positive"),
+    ],
+)
+def test_model_request_capacity_rejects_invalid_configuration(overrides: dict[str, int], message: str) -> None:
+    values = {
+        "sglang_server_concurrency": 2,
+        "rollout_num_gpus": 8,
+        "rollout_num_gpus_per_engine": 2,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=message):
+        _model_request_capacity(SimpleNamespace(**values))
+
+
+def test_model_request_capacity_uses_configured_engine_count() -> None:
+    args = SimpleNamespace(
+        sglang_server_concurrency=4,
+        rollout_num_gpus=8,
+        rollout_num_gpus_per_engine=2,
+    )
+    assert _model_request_capacity(args) == 16
+
+
+def test_generate_keeps_request_model_optional_for_direct_callers() -> None:
+    parameter = inspect.signature(rollout_mod.generate).parameters["request_model"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
 
 
 class _ActiveCounter:
@@ -246,7 +289,7 @@ async def test_mixed_ordinary_aware_legacy_respect_shared_capacity() -> None:
         counter.leave()
         return "legacy"
 
-    request_model = partial(scheduler.request, evaluation=False)
+    request_model = scheduler.request
 
     @request_model_aware
     async def aware_session(args, sample, sampling_params, *, request_model):
@@ -254,7 +297,7 @@ async def test_mixed_ordinary_aware_legacy_respect_shared_capacity() -> None:
         return sample
 
     with patch("relax.engine.rollout.sglang_rollout.post", side_effect=fake_post):
-        t_legacy = asyncio.create_task(scheduler.run_legacy(legacy_op, evaluation=False))
+        t_legacy = asyncio.create_task(scheduler.run_legacy(legacy_op))
         t_ordinary = asyncio.create_task(scheduler.request("http://x", {"kind": "ordinary"}))
         await asyncio.wait_for(two_holding.wait(), timeout=1.0)
         assert counter.active == 2

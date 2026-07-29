@@ -7,7 +7,6 @@ import uuid
 from argparse import Namespace
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
-from functools import partial
 from time import monotonic
 from typing import Any, Protocol
 
@@ -108,7 +107,25 @@ def _validate_request_model_signature(fn: Callable) -> None:
 
 
 def _model_request_capacity(args: Namespace) -> int:
-    return args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+    concurrency = args.sglang_server_concurrency
+    rollout_num_gpus = args.rollout_num_gpus
+    rollout_num_gpus_per_engine = args.rollout_num_gpus_per_engine
+    if concurrency <= 0:
+        raise ValueError(f"sglang_server_concurrency must be positive, got {concurrency}")
+    if rollout_num_gpus <= 0:
+        raise ValueError(f"rollout_num_gpus must be positive, got {rollout_num_gpus}")
+    if rollout_num_gpus_per_engine <= 0:
+        raise ValueError(f"rollout_num_gpus_per_engine must be positive, got {rollout_num_gpus_per_engine}")
+
+    capacity = concurrency * rollout_num_gpus // rollout_num_gpus_per_engine
+    if capacity <= 0:
+        raise ValueError(
+            "model request capacity must be positive, got "
+            f"{capacity} from sglang_server_concurrency={concurrency}, "
+            f"rollout_num_gpus={rollout_num_gpus}, "
+            f"rollout_num_gpus_per_engine={rollout_num_gpus_per_engine}"
+        )
+    return capacity
 
 
 # Admit logical SGLang model requests with a shared BoundedSemaphore.
@@ -116,6 +133,8 @@ def _model_request_capacity(args: Namespace) -> int:
 # Custom code receives only a bound request_model callable, never this object.
 class ModelRequestScheduler:
     def __init__(self, state: "GenerateState", capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError(f"model request capacity must be positive, got {capacity}")
         self._state = state
         self._semaphore = asyncio.BoundedSemaphore(capacity)
         self.capacity = capacity
@@ -123,11 +142,9 @@ class ModelRequestScheduler:
     async def _run_with_slot(
         self,
         operation: Callable[[], Awaitable[Any]],
-        *,
-        evaluation: bool,
     ) -> Any:
         async with self._semaphore:
-            if self._state.aborted and not evaluation:
+            if self._state.aborted:
                 raise RolloutRequestAborted("Rollout aborted; refusing model request")
             return await operation()
 
@@ -137,21 +154,18 @@ class ModelRequestScheduler:
         payload: dict[str, Any],
         *,
         headers: dict[str, str] | None = None,
-        evaluation: bool = False,
     ) -> Any:
         async def send_request() -> Any:
             return await post(url, payload, headers=headers)
 
-        return await self._run_with_slot(send_request, evaluation=evaluation)
+        return await self._run_with_slot(send_request)
 
     # Hold one slot for an entire legacy custom generate session.
     async def run_legacy(
         self,
         operation: Callable[[], Awaitable[Any]],
-        *,
-        evaluation: bool,
     ) -> Any:
-        return await self._run_with_slot(operation, evaluation=evaluation)
+        return await self._run_with_slot(operation)
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -357,7 +371,7 @@ async def generate(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
     *,
-    request_model: RequestModel,
+    request_model: RequestModel | None = None,
 ) -> Sample:
     # Generate using traditional SGLang router with token-based workflow.
     # request_model admits one logical SGLang HTTP call; multimodal encode /
@@ -366,6 +380,8 @@ async def generate(
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
+    if request_model is None:
+        request_model = state.model_request_scheduler.request
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, (
@@ -574,12 +590,12 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # Fast abort: evaluation must continue even when training rollout is aborted.
-    if state.aborted and not evaluation:
+    # Do not start new model requests after the rollout has been aborted.
+    if state.aborted:
         sample.status = Sample.Status.ABORTED
         return sample
 
-    request_model = partial(state.model_request_scheduler.request, evaluation=evaluation)
+    request_model = state.model_request_scheduler.request
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
 
     try:
@@ -600,7 +616,7 @@ async def generate_and_rm(
                             return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
                         return await custom_generate_func(args, sample, sampling_params)
 
-                sample = await state.model_request_scheduler.run_legacy(_legacy_custom, evaluation=evaluation)
+                sample = await state.model_request_scheduler.run_legacy(_legacy_custom)
         else:
             with state.dp_rank_context() as _:
                 sample = await generate(
