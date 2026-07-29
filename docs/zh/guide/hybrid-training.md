@@ -312,6 +312,9 @@ fetch/forward 次数仍严格固定。严格 producer 重叠定义为首个 acto
 step-time p95、8 卡 NVML 覆盖、峰值显存、token/多模态字节工作量和
 raw-reward、截断率、staleness 非劣护栏。aggregate throughput 使用
 `sum(step_tokens) / sum(step_time)`，不会对 per-step rate 做简单平均。
+截断率护栏读取 rollout 侧的 `rollout/truncated_ratio`；训练侧
+`rollout/truncated` 在分块聚合时可能被一个 step 累加多次，因此不作为截断率
+统计口径。
 GPU utilization 与低于 10% 的 idle ratio 只使用墙钟时间落入预注册稳态
 step 区间的 500 ms NVML 样本；区间由 TensorBoard `perf/step_time` 的
 step end wall time 和 duration 重建。sampled peak VRAM 仍使用 full-run
@@ -320,6 +323,10 @@ step end wall time 和 duration 重建。sampled peak VRAM 仍使用 full-run
 身份完全一致，并存在非空的输入 hash、依赖 freeze、wheel hash 和 launcher log。
 manifest 还会记录并交叉校验 `max_staleness`、global/rollout batch size、
 每 prompt 样本数和 actor chunk 数，避免分析器 CLI 与实际工作负载静默不一致。
+在计算任何配对统计前，分析器还要求模型、模型配置、数据路径、prompt/response/
+context 上限、actor token 预算、actor/rollout 资源拓扑、SGLang 确定性与显存
+配置、物理卡到容器卡映射、checkpoint 模式以及 debug 捕获/回放配置完全一致；
+字段缺失或取值不同都会 fail closed。
 staleness 曲线来自 trace：在 actor 首次 forward 时，用已完成 put 的最大
 producer rollout ID 减去当前 actor rollout ID；若 producer 的 trace 写入稍晚，
 已完成的 actor fetch 本身可证明当前 rollout 已 ready。该值不得超过 manifest

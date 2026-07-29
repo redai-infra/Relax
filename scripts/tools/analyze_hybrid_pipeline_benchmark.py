@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import sys
 from collections import defaultdict
@@ -58,7 +59,7 @@ PERFORMANCE_TAGS = (
 COMPARISON_PERFORMANCE_TAGS = PERFORMANCE_TAGS + ("perf/wall_clock_samples_per_s",)
 CORRECTNESS_GUARDRAIL_TAGS = (
     "rollout/raw_reward",
-    "rollout/truncated",
+    "rollout/truncated_ratio",
     "train/loss",
     "train/grad_norm",
 )
@@ -111,6 +112,29 @@ COMPARISON_FIXED_MANIFEST_FIELDS = (
     "transferqueue_commit",
     "python",
     "entrypoint",
+)
+COMPARISON_WORKLOAD_MANIFEST_FIELDS = (
+    "schema_version",
+    "baseline_commit",
+    "model_variant",
+    "model_name",
+    "model_dir",
+    "model_config_file",
+    "data_file",
+    "rollout_max_response_len",
+    "rollout_max_prompt_len",
+    "rollout_max_context_len",
+    "actor_max_tokens_per_gpu",
+    "resource",
+    "rollout_num_gpus_per_engine",
+    "physical_gpu_indices",
+    "container_cuda_visible_devices",
+    "checkpoint_save",
+    "sglang_deterministic_inference",
+    "sglang_mem_fraction_static",
+    "load_debug_rollout_data",
+    "save_debug_rollout_data",
+    "save_debug_train_data",
 )
 REPRODUCIBILITY_ARTIFACTS = (
     "pip-freeze.txt",
@@ -667,6 +691,9 @@ def _load_tensorboard_scalars(run_dir: Path) -> list[dict[str, Any]]:
     event_paths = sorted(path for path in run_dir.rglob("events.out.tfevents.*") if path.is_file())
     if not event_paths:
         return []
+    # TensorBoard 2.10's generated protobuf bindings need the pure-Python
+    # compatibility path when the host has a newer protobuf runtime.
+    os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
     try:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
     except ImportError:
@@ -1026,7 +1053,16 @@ def _build_comparison(
     if set(by_condition) != {"baseline", "experiment"}:
         _fail(f"comparison requires conditions named 'baseline' and 'experiment', got {sorted(by_condition)}")
 
-    for field in COMPARISON_FIXED_MANIFEST_FIELDS:
+    comparison_fields = COMPARISON_FIXED_MANIFEST_FIELDS + COMPARISON_WORKLOAD_MANIFEST_FIELDS
+    missing_workload_fields = {
+        str(analysis.run_dir): sorted(set(COMPARISON_WORKLOAD_MANIFEST_FIELDS) - set(analysis.manifest))
+        for analysis in analyses
+        if set(COMPARISON_WORKLOAD_MANIFEST_FIELDS) - set(analysis.manifest)
+    }
+    if missing_workload_fields:
+        _fail(f"comparison manifests are missing workload fields: {missing_workload_fields}")
+
+    for field in comparison_fields:
         values = {json.dumps(analysis.manifest[field], sort_keys=True) for analysis in analyses}
         if len(values) != 1:
             _fail(f"comparison requires identical manifest field {field!r}, got {sorted(values)}")
@@ -1306,9 +1342,9 @@ def _build_comparison(
         if statistics.fmean(accuracy_deltas) < -0.02:
             _fail(f"mean paired raw-reward/accuracy drop exceeds 2 percentage points: {accuracy_deltas}")
 
-        truncation_deltas = [row.get("rollout/truncated:delta") for row in paired]
+        truncation_deltas = [row.get("rollout/truncated_ratio:delta") for row in paired]
         if any(value is None for value in truncation_deltas):
-            _fail("correctness targets require rollout/truncated for every paired run")
+            _fail("correctness targets require rollout/truncated_ratio for every paired run")
         if any(value > 0.02 for value in truncation_deltas):
             _fail(f"a paired truncation-rate increase exceeds 2 percentage points: {truncation_deltas}")
 

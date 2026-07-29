@@ -322,6 +322,9 @@ checks per-run strict producer overlap, step-time p95,
 eight-GPU NVML coverage, peak VRAM, token/multimodal-byte workload, and the
 raw-reward, truncation-rate, and staleness guardrails. It uses `sum(step_tokens) /
 sum(step_time)` for aggregate throughput rather than averaging per-step rates.
+The truncation guardrail reads the rollout-side
+`rollout/truncated_ratio`; the training-side `rollout/truncated` scalar is not
+used because chunk aggregation can sum that value more than once per step.
 GPU utilization and the below-10% idle ratio use only 500 ms NVML samples
 whose wall time falls inside the registered steady step intervals reconstructed
 from TensorBoard `perf/step_time`; sampled peak VRAM remains a full-run safety
@@ -332,6 +335,11 @@ dependency freeze, wheel hash, and launcher log for every run.
 The manifest also records and cross-checks `max_staleness`, global/rollout
 batch sizes, samples per prompt, and actor chunk count, so CLI expectations
 cannot silently disagree with the measured workload.
+Before any paired statistics are calculated, the analyzer also requires
+identical model/config/data paths, prompt/response/context limits, actor token
+budget, actor/rollout resource topology, SGLang determinism and memory
+settings, physical-to-container GPU mapping, checkpoint mode, and debug
+capture/replay settings. Missing workload fields or any mismatch fail closed.
 The staleness curve is the trace-derived producer lead at the first actor
 forward: the largest completed producer rollout ID minus the actor rollout ID
 at that timestamp. The current rollout is considered ready once its actor fetch

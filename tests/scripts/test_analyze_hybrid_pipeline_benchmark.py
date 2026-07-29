@@ -530,7 +530,7 @@ def _comparison_analysis(
         "perf/step_time": {"mean": 20.0, "p95": 21.0},
         "perf/hybrid_phase1_time": {"mean": phase1},
         "rollout/raw_reward": {"mean": accuracy},
-        "rollout/truncated": {"mean": 0.0},
+        "rollout/truncated_ratio": {"mean": 0.0},
         "train/loss": {"mean": 1.0},
         "train/grad_norm": {"mean": 0.5},
     }
@@ -555,7 +555,7 @@ def _comparison_analysis(
         "perf/step_time": 20.0,
         "perf/hybrid_phase1_time": phase1,
         "rollout/raw_reward": accuracy,
-        "rollout/truncated": 0.0,
+        "rollout/truncated_ratio": 0.0,
         "train/loss": 1.0,
         "train/grad_norm": 0.5,
     }
@@ -585,6 +585,27 @@ def _comparison_analysis(
             "transferqueue_commit": "e" * 40,
             "python": "3.12.3",
             "entrypoint": "bash target.sh hybrid-async",
+            "schema_version": 1,
+            "baseline_commit": "f" * 40,
+            "model_variant": "qwen3vl8b",
+            "model_name": "Qwen3-VL-8B-Instruct",
+            "model_dir": "/data01/LWX/Qwen3-VL-8B-Instruct",
+            "model_config_file": "/workspace/Relax/scripts/models/qwen3-vl-8B.sh",
+            "data_file": "/data01/LWX/openr1mm/train.parquet",
+            "rollout_max_response_len": 1024,
+            "rollout_max_prompt_len": 2048,
+            "rollout_max_context_len": 3072,
+            "actor_max_tokens_per_gpu": 6144,
+            "resource": {"actor": [1, 4], "rollout": [1, 1]},
+            "rollout_num_gpus_per_engine": 1,
+            "physical_gpu_indices": [0, 1, 2, 3, 5],
+            "container_cuda_visible_devices": [0, 1, 2, 3, 4],
+            "checkpoint_save": False,
+            "sglang_deterministic_inference": 1,
+            "sglang_mem_fraction_static": 0.8,
+            "load_debug_rollout_data": None,
+            "save_debug_rollout_data": None,
+            "save_debug_train_data": None,
         },
         trace_rows=trace_rows,
         actor_rank_rows=[],
@@ -660,6 +681,30 @@ def test_comparison_rejects_mixed_candidate_commits():
         )
 
 
+def test_comparison_rejects_mixed_or_incomplete_workload_manifests():
+    analyses = [
+        _comparison_analysis("baseline", 1, 100, 10),
+        _comparison_analysis("experiment", 1, 106, 8),
+    ]
+    analyses[1].manifest["rollout_max_response_len"] = 2048
+
+    with pytest.raises(analyzer.BenchmarkValidationError, match="rollout_max_response_len"):
+        analyzer._build_comparison(
+            analyses,
+            windows=((4, 8), (9, 13), (14, 18)),
+            enforce_targets=False,
+        )
+
+    analyses[1].manifest["rollout_max_response_len"] = 1024
+    del analyses[1].manifest["physical_gpu_indices"]
+    with pytest.raises(analyzer.BenchmarkValidationError, match="missing workload fields"):
+        analyzer._build_comparison(
+            analyses,
+            windows=((4, 8), (9, 13), (14, 18)),
+            enforce_targets=False,
+        )
+
+
 def test_comparison_plot_bundle_is_generated(tmp_path, monkeypatch):
     analyses = [
         _comparison_analysis("baseline", 1, 100, 10),
@@ -729,7 +774,7 @@ def test_preregistered_guardrails_fail_closed(guardrail, error):
     elif guardrail == "accuracy":
         experiment.summary["metrics"]["rollout/raw_reward"]["mean"] = 0.46
     elif guardrail == "truncation":
-        experiment.summary["metrics"]["rollout/truncated"]["mean"] = 0.03
+        experiment.summary["metrics"]["rollout/truncated_ratio"]["mean"] = 0.03
     elif guardrail == "staleness":
         for row in experiment.trace_rows:
             row["producer_lead_at_first_forward"] = 1.3
