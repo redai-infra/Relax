@@ -11,7 +11,12 @@
 #
 # The baseline no longer depends on the sample it scores, which makes it
 # unbiased, and no standard-deviation scaling is applied. Everything else
-# matches GRPO, so this script differs from a GRPO run only in RLOO_ARGS.
+# matches GRPO *except the objective*: RLOO uses unclipped REINFORCE
+#   L_i = -sg(A_i) * log pi(y_i)
+# rather than PPO-Clip, so --eps-clip does not apply.
+#
+# One optimizer step per rollout is deliberate: RLOO has no importance-ratio
+# correction, so it assumes the sampling policy equals the training policy.
 #
 # Usage:
 #   MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
@@ -108,7 +113,8 @@ RLOO_ARGS=(
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
-   --eps-clip 0.2
+   # No --eps-clip: RLOO is unclipped REINFORCE, so the clip margins are inert
+   # and train/pg_clipfrac stays 0. Keeping them here would only mislead.
 
    --use-rollout-logprobs
    # Reward normalization is on by default and is what builds the leave-one-out

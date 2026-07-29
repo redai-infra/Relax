@@ -202,6 +202,18 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                     f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
                 )
             group_rewards = rewards[positions]
+            if args.advantage_estimator == "rloo" and not torch.isfinite(group_rewards).all():
+                # RLOO's baseline is a whole-group reduction, so one bad reward
+                # poisons every advantage in the group. Fail with the offending
+                # positions rather than letting NaN reach the optimizer -- a
+                # non-finite reward always means the reward function is broken.
+                # Scoped to rloo so no existing estimator changes behaviour.
+                bad = [positions[i] for i in (~torch.isfinite(group_rewards)).nonzero().flatten().tolist()]
+                raise ValueError(
+                    f"Reward group {group_index} contains non-finite rewards at sample positions {bad}: "
+                    f"{[raw_rewards[i] for i in bad]}. Fix the reward function; RLOO cannot form a "
+                    f"leave-one-out baseline from a group containing NaN/Inf."
+                )
             group_rewards = group_rewards - group_rewards.mean()
             if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
                 group_rewards = group_rewards / (group_rewards.std() + 1e-6)

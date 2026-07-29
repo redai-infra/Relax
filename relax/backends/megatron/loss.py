@@ -26,6 +26,7 @@ from relax.utils.training.ppo_utils import (
     compute_log_probs,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_rloo_loss,
     compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -908,6 +909,10 @@ def policy_loss_function(
         pg_loss, pg_clipfrac = compute_sapo_loss(
             ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg
         )
+    elif args.advantage_estimator == "rloo":
+        # RLOO is unclipped REINFORCE against a leave-one-out baseline; it must not
+        # go through PPO-Clip. See compute_rloo_loss for why.
+        pg_loss, pg_clipfrac = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
     elif args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(
             log_probs=log_probs,
@@ -1047,6 +1052,22 @@ def policy_loss_function(
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if args.advantage_estimator == "rloo":
+        # RLOO-specific monitoring. The task asks for the estimator's own metrics,
+        # and the generic advantage mean is not informative here: leave-one-out
+        # advantages sum to zero per group, so their mean is ~0 by construction.
+        # What matters is the *magnitude* (does the signal survive?) and how much
+        # of the batch carries no signal at all.
+        with torch.no_grad():
+            abs_adv = sum_of_sample_mean(advantages.abs())
+            # A zero advantage means the whole group scored identically, so the
+            # group contributes no gradient. Tracking this catches a reward that
+            # has saturated (all-correct or all-wrong groups) long before the
+            # reward curve flattens.
+            no_signal = sum_of_sample_mean((advantages == 0).to(advantages.dtype))
+        reported_loss["rloo_advantage_abs"] = abs_adv.clone().detach()
+        reported_loss["rloo_no_signal_fraction"] = no_signal.clone().detach()
 
     reported_loss.update(opd_reported_loss)
 

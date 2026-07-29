@@ -2771,6 +2771,25 @@ def slime_validate_args(args):
                 "require advantage normalization. Please add `--normalize-advantages` to your command."
             )
 
+        if args.advantage_estimator == "rloo":
+            # Fail at parse time rather than let a user discover mid-run that the
+            # estimator they picked was never validated in this mode.
+            assert not args.fully_async and not args.hybrid, (
+                "RLOO is synchronous-only: run it with --colocate. Asynchronous RLOO is out of "
+                "scope for this estimator and has not been validated, so it is rejected rather "
+                "than silently allowed."
+            )
+            assert args.n_samples_per_prompt >= 2, (
+                f"RLOO needs at least 2 samples per prompt to form a leave-one-out baseline, got "
+                f"--n-samples-per-prompt {args.n_samples_per_prompt}. A group of one has no baseline "
+                f"and would train on all-zero advantages."
+            )
+            assert args.rewards_normalization, (
+                "RLOO's leave-one-out baseline is built in the reward-normalization step, so "
+                "--disable-rewards-normalization would degrade it to REINFORCE without a baseline. "
+                "Remove that flag, or pick a different --advantage-estimator."
+            )
+
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "

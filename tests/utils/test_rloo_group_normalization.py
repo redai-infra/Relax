@@ -126,3 +126,29 @@ def test_missing_group_index_raises():
     samples[0].group_index = None
     with pytest.raises(ValueError, match="group_index"):
         _post_process(_args("rloo", 2), samples)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_reward_is_rejected_with_the_offending_position(bad):
+    """RLOO rejects non-finite rewards instead of propagating them.
+
+    The baseline is a whole-group reduction, so one bad reward poisons every
+    advantage in the group. Failing with the sample position is actionable;
+    letting NaN reach the optimizer is not.
+    """
+    rewards = [1.0, 0.0, bad, 0.0]
+    with pytest.raises(ValueError, match=r"non-finite rewards at sample positions \[2\]"):
+        _post_process(_args("rloo", len(rewards)), _samples(rewards))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_grpo_behaviour_on_non_finite_rewards_is_unchanged(bad):
+    """The rejection is scoped to RLOO; GRPO must behave exactly as before.
+
+    Guards the PR's central promise that no existing estimator changes.
+    """
+    rewards = [1.0, 0.0, bad, 0.0]
+    _, normalized = _post_process(_args("grpo", len(rewards)), _samples(rewards))
+    assert not all(v == v for v in normalized) or any(abs(v) == float("inf") for v in normalized), (
+        "GRPO should still propagate the non-finite value rather than raise"
+    )

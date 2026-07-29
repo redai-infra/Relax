@@ -20,6 +20,7 @@ import torch
 
 from relax.utils.training.ppo_utils import (
     compute_policy_loss,
+    compute_rloo_loss,
     get_rloo_advantages,
     scale_centered_rewards_for_rloo,
 )
@@ -121,9 +122,11 @@ def test_integer_rewards_promote_instead_of_truncating():
 def test_non_finite_reward_contaminates_only_its_own_group(bad):
     """A non-finite reward propagates across its whole group.
 
-    Documented as a known limitation rather than silently masked: the baseline
-    is a group-wide sum, so one bad sample poisons its group. Callers must
-    filter upstream; zeroing it here would hide a broken reward function.
+    This helper is deliberately transparent: the baseline is a group-wide sum, so
+    one bad sample poisons its group, and zeroing it here would hide a broken
+    reward function. Rejection happens one level up, in ``post_process_rewards``
+    (see ``test_non_finite_reward_is_rejected_with_the_offending_position``), where
+    the sample position is still known and can be reported.
     """
     rewards = torch.tensor([1.0, 0.0, bad, 0.0], dtype=torch.float64)
     advantages = get_rloo_advantages(rewards)
@@ -215,4 +218,78 @@ def test_policy_loss_rloo_and_grpo_differ_only_by_advantage_scale():
 
     assert torch.allclose(rloo_loss / grpo_loss, rloo_adv / grpo_adv, atol=1e-12), (
         "the loss ratio must track the advantage ratio exactly"
+    )
+
+
+def test_rloo_loss_is_unclipped_reinforce():
+    """RLOO's loss is -A * log pi, with no trust region at all.
+
+    Pinned against PPO-Clip because the difference is the whole point: reusing the
+    clipped objective would make this "GRPO with a leave-one-out baseline" rather
+    than RLOO as published, and clipping would bias an estimator chosen for being
+    unbiased.
+    """
+    advantages = torch.tensor([1.0, -1 / 3, -1 / 3, -1 / 3], dtype=torch.float64)
+    log_probs = torch.tensor([-0.5, -1.0, -2.0, -0.25], dtype=torch.float64)
+
+    pg_loss, clipfrac = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
+
+    assert torch.allclose(pg_loss, -(advantages * log_probs), atol=1e-12)
+    assert float(clipfrac.abs().sum()) == 0.0, "RLOO clips nothing, so clipfrac must be all zero"
+    assert pg_loss.shape == log_probs.shape, "loss must stay element-wise; the caller reduces"
+
+
+def test_rloo_loss_ignores_the_ratio_that_ppo_clip_would_use():
+    """A large policy shift changes PPO-Clip's loss but must not change RLOO's.
+
+    At ratio 1.5 PPO-Clip clamps the positive-advantage token; RLOO has no
+    ratio term, so its loss depends only on the current log-prob.
+    """
+    advantages = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    log_probs = torch.tensor([-0.5, -0.5], dtype=torch.float64)
+    ppo_kl = torch.full_like(advantages, -math.log(1.5))
+
+    rloo_loss, _ = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
+    clipped, clipfrac = compute_policy_loss(ppo_kl, advantages, eps_clip=0.2, eps_clip_high=0.2)
+
+    assert float(clipfrac.sum()) > 0, "the reference PPO-Clip case must actually clip"
+    assert not torch.allclose(rloo_loss, clipped), "RLOO must not reproduce the clipped objective"
+
+
+def test_rloo_loss_gradient_flows_only_through_log_probs():
+    """Advantages are detached: they scale the gradient but receive none."""
+    advantages = torch.tensor([0.75, -0.75], dtype=torch.float64, requires_grad=True)
+    log_probs = torch.tensor([-0.5, -1.5], dtype=torch.float64, requires_grad=True)
+
+    pg_loss, _ = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
+    pg_loss.sum().backward()
+
+    assert advantages.grad is None, "advantages must be detached, not a gradient path"
+    assert torch.allclose(log_probs.grad, -advantages.detach(), atol=1e-12)
+
+
+def test_empty_response_contributes_no_loss_but_still_feeds_the_baseline():
+    """A zero-valid-token response must not affect the loss, yet must still
+    count.
+
+    Acceptance criterion 2 names "empty response" explicitly. The two halves are
+    separate: the sample contributes nothing to the objective (its mask is all
+    zero), but its reward still participates in the other samples' leave-one-out
+    baselines -- dropping it would bias every other advantage in the group.
+    """
+    rewards = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    advantages = get_rloo_advantages(rewards)
+
+    # The empty sample is index 3; an all-zero mask means no valid response token.
+    log_probs = torch.tensor([-0.5, -1.0, -2.0, -0.25], dtype=torch.float64)
+    mask = torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float64)
+
+    pg_loss, _ = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
+    masked = pg_loss * mask
+
+    assert float(masked[3]) == 0.0, "an empty response must contribute exactly zero loss"
+    # Its reward is still in the baseline: dropping it would change the others.
+    without_it = get_rloo_advantages(rewards[:3])
+    assert not torch.allclose(advantages[:3], without_it), (
+        "the empty sample's reward must still participate in the other baselines"
     )

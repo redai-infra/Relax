@@ -241,7 +241,17 @@ RLOO 的 advantage 量级小于默认 GRPO，因为二值 reward 下组内标准
 
 Adam 对梯度的常数缩放基本不敏感，所以这**基本不构成**重调 `--lr` 的理由。但它对 `--clip-grad` 有影响 —— 裁剪会破坏这种不变性：在 Megatron 默认的 `--clip-grad 1.0` 下，同一组实验里 GRPO 有 **68% 的 step 被裁剪，RLOO 只有 2%**。切换算法时应重新审视 `--clip-grad`，而不是 `--lr`。
 
-下游的 PPO-Clip 策略损失、KL loss、TIS 以及 DP/CP 切分均保持不变。
+#### 损失是 REINFORCE，不是 PPO-Clip
+
+RLOO 的目标函数是针对 leave-one-out baseline 的原始 REINFORCE，没有信任域：
+
+$$L_i = -\operatorname{sg}(\hat{A}_i)\,\log \pi_\theta(y_i)$$
+
+这是与本页其他组相对估计器（它们都包在 PPO-Clip 外）的**有意分歧**。复用裁剪目标会让它变成「带 leave-one-out baseline 的 GRPO」而非论文里的 RLOO，而裁剪本身会给一个正是因无偏才被选用的估计器引入偏差。因此 **`--eps-clip` 与 `--eps-clip-high` 对 RLOO 无效**，`train/pg_clipfrac` 恒为 0。
+
+由于没有重要性比值校正，RLOO 假定采样策略等于训练策略。这在每轮 1 个 optimizer step 时成立；若用多个内层 epoch，估计量就变成 off-policy，论文的保证不再适用。仓库提供的 recipe 保持每轮 1 步。
+
+下游其余部分 —— KL loss、TIS、DP/CP 切分、归约 —— 均保持不变。
 
 ### 关键参数
 
@@ -251,7 +261,8 @@ Adam 对梯度的常数缩放基本不敏感，所以这**基本不构成**重�
 | `--n-samples-per-prompt` | `1` | 必须 $\geq 2$；组内只有 1 个样本时没有 leave-one-out baseline，advantage 记为 0 |
 | `--disable-rewards-normalization` | 关闭 | 保持关闭。该开关会完全跳过组内 baseline，直接把原始 reward 当作 advantage |
 | `--disable-grpo-std-normalization` | 关闭 | 对 RLOO 无效 —— std 分支只针对 GRPO 家族，没有可禁用的对象 |
-| `--eps-clip` | `0.2` | 裁剪边距，与 GRPO 相同 |
+| `--eps-clip` | `0.2` | **无效** —— RLOO 不裁剪，`train/pg_clipfrac` 恒为 0 |
+| `--fully-async` / `--hybrid` | 关闭 | **启动即拒绝。** RLOO 仅支持同步，异步从未验证 |
 
 ### 快速开始
 
@@ -273,14 +284,8 @@ bash examples/algorithms/run-qwen3-0.6B-1xgpu-gsm8k-rloo.sh
 ```
 
 ::: warning
-RLOO 目前仅在 colocate（同步）模式下**实际运行过**。fully-async 至少需要 2 张 GPU
-—— 非 colocate 模式下 `Controller._validate_gpu_resources` 会把各角色的 GPU 数求和
-（`relax/core/controller.py:330`），而 fully-async 的最小角色集是 actor + rollout ——
-因此在本次使用的单卡机器上无法进行异步实测。
-
-不过 RLOO 在这一维度上预期没有差异：它唯一改动的是 `post_process_rewards` 里的组内
-baseline，而这里是同步与异步**共用的唯一**归一化入口（所有调用方都经
-`convert_samples_to_train_data` 到达）。异步路径不会重新计算 advantage。
+RLOO **仅支持同步，且在启动时强制**：`--fully-async` 与 `--hybrid` 会被直接拒绝而非
+静默放行 —— 异步 RLOO 不在范围内且从未验证。请使用 `--colocate`。
 :::
 
 ### 适用场景
@@ -304,7 +309,7 @@ baseline，而这里是同步与异步**共用的唯一**归一化入口（所�
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
-| **RLOO** | Leave-one-out baseline，不做 std 缩放 | PPO-Clip（硬裁剪） | 可选 KL loss |
+| **RLOO** | Leave-one-out baseline，不做 std 缩放 | **无裁剪 REINFORCE** | 可选 KL loss |
 
 ## 下一步
 

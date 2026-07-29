@@ -332,6 +332,47 @@ def compute_cispo_loss(
     return pg_loss, clipfrac
 
 
+def compute_rloo_loss(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes the RLOO policy-gradient loss: unclipped REINFORCE.
+
+    RLOO's objective is plain REINFORCE against a leave-one-out baseline, with no
+    trust region at all (https://arxiv.org/abs/2402.14740):
+
+        L_i = -stop_grad(A_i) * log pi_theta(y_i)
+
+    This is deliberately *not* PPO-Clip. Reusing the clipped objective would make
+    the estimator "GRPO with a leave-one-out baseline" rather than RLOO as
+    published, and the clipping would additionally bias an estimator whose whole
+    point is being unbiased.
+
+    Relationship to the neighbouring losses: this is ``compute_cispo_loss`` with
+    the importance-ratio coefficient fixed at 1, i.e. no clipping and no ratio
+    correction. Gradients flow ONLY through ``log_probs``.
+
+    Note on off-policy drift: with no ratio correction, RLOO assumes the sampling
+    policy equals the training policy. That holds under one optimizer step per
+    rollout; with several inner epochs the estimator is off-policy and the paper's
+    guarantees no longer apply. The recipe therefore keeps one step per rollout.
+
+    Args:
+        log_probs: Current-policy log-probabilities (the only gradient source).
+            Shape: ``[total_tokens]``.
+        advantages: Advantage values, shape matches ``log_probs``.
+
+    Returns:
+        pg_loss: Element-wise loss (negative objective). NO reduction applied --
+            the caller's reduction decides whether this ends up sequence-mean or
+            token-weighted.
+        clipfrac: All zeros, since nothing is clipped. Returned only to keep the
+            call signature uniform with the other estimators' losses.
+    """
+    pg_loss = -(advantages.detach() * log_probs)
+    return pg_loss, torch.zeros_like(pg_loss)
+
+
 @torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,

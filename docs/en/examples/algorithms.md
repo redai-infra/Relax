@@ -241,7 +241,17 @@ RLOO's advantages are smaller in magnitude than default GRPO's, because the grou
 
 Adam is largely invariant to a constant gradient rescale, so this is mostly *not* a reason to retune `--lr`. It does matter for `--clip-grad`, which breaks that invariance: at Megatron's default `--clip-grad 1.0`, the same run clipped **68% of steps under GRPO but only 2% under RLOO**. Revisit `--clip-grad` rather than `--lr` when switching.
 
-Everything downstream — the PPO-Clip policy loss, KL loss, TIS, DP/CP splitting — is unchanged.
+#### The loss is REINFORCE, not PPO-Clip
+
+RLOO's objective is plain REINFORCE against the leave-one-out baseline, with no trust region:
+
+$$L_i = -\operatorname{sg}(\hat{A}_i)\,\log \pi_\theta(y_i)$$
+
+This is a deliberate departure from the other group-relative estimators here, which all wrap PPO-Clip. Reusing the clipped objective would make this "GRPO with a leave-one-out baseline" rather than RLOO as published, and the clipping would bias an estimator chosen precisely for being unbiased. Consequently **`--eps-clip` and `--eps-clip-high` have no effect under RLOO**, and `train/pg_clipfrac` is always 0.
+
+Because there is no importance-ratio correction, RLOO assumes the sampling policy equals the training policy. That holds with one optimizer step per rollout; with several inner epochs the estimator becomes off-policy and the paper's guarantees no longer apply. The provided recipe keeps one step per rollout.
+
+Everything else downstream — KL loss, TIS, DP/CP splitting, the reduction — is unchanged.
 
 ### Key Parameters
 
@@ -251,7 +261,8 @@ Everything downstream — the PPO-Clip policy loss, KL loss, TIS, DP/CP splittin
 | `--n-samples-per-prompt` | `1` | Must be $\geq 2$; a group of one has no leave-one-out baseline and gets a zero advantage |
 | `--disable-rewards-normalization` | off | Leave off. This flag skips the group baseline entirely, leaving the raw reward as the advantage |
 | `--disable-grpo-std-normalization` | off | No effect under RLOO — the std branch is GRPO-family only, so there is nothing to disable |
-| `--eps-clip` | `0.2` | Clipping margin, same as GRPO |
+| `--eps-clip` | `0.2` | **No effect** — RLOO does not clip; `train/pg_clipfrac` stays 0 |
+| `--fully-async` / `--hybrid` | off | **Rejected at startup.** RLOO is synchronous-only and asynchronous RLOO was never validated |
 
 ### Quick Start
 
@@ -273,16 +284,9 @@ bash examples/algorithms/run-qwen3-0.6B-1xgpu-gsm8k-rloo.sh
 ```
 
 ::: warning
-RLOO has only been **run** in colocate (synchronous) mode. Fully-async needs at
-least two GPUs — `Controller._validate_gpu_resources` sums per-role GPU counts in
-non-colocate mode (`relax/core/controller.py:330`), and the minimum fully-async
-role set is actor + rollout — so no async run was possible on the single-GPU host
-used here.
-
-That said, RLOO is not expected to behave differently: the only code it changes on
-this axis is the group baseline inside `post_process_rewards`, which is the single
-normalization funnel for both modes (every caller reaches it through
-`convert_samples_to_train_data`). Nothing in the async path recomputes advantages.
+RLOO is **synchronous-only and enforced as such**: `--fully-async` and `--hybrid` are
+rejected at startup rather than silently allowed, because asynchronous RLOO is out of
+scope and was never validated. Use `--colocate`.
 :::
 
 ### When to Use
@@ -306,7 +310,7 @@ Against `--disable-grpo-std-normalization`, the difference is only the constant 
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
-| **RLOO** | Leave-one-out baseline, no std scaling | PPO-Clip (hard clip) | Optional KL loss |
+| **RLOO** | Leave-one-out baseline, no std scaling | **Unclipped REINFORCE** | Optional KL loss |
 
 ## Next Steps
 
