@@ -50,8 +50,9 @@ class _CPSplitSimulator:
     validated in a single process.
 
     ``full`` is the canonical full-response tensor; each rank's local chunk is
-    ``full[:mid]`` (rank 0) / ``full[mid:]`` (rank 1). ``all_gather`` returns the
-    full tensor; ``slice`` returns the calling rank's chunk of the full result.
+    ``full[:mid]`` (rank 0) / ``full[mid:]`` (rank 1). ``all_gather`` returns
+    the full tensor; ``slice`` returns the calling rank's chunk of the full
+    result.
     """
 
     def __init__(self, full: torch.Tensor):
@@ -75,8 +76,11 @@ class _CPSplitSimulator:
 
 class TestReinforcePlusPlusCPWiring:
     """Wiring check: the CP-aware return must gather the full response before
-    computing, then slice consistently. Zig-zag chunking correctness is
-    ``cp_utils``' responsibility (shared infra) and is out of scope here."""
+    computing, then slice consistently.
+
+    Zig-zag chunking correctness is ``cp_utils``' responsibility (shared infra)
+    and is out of scope here.
+    """
 
     def test_local_chunks_concatenate_to_full_return(self, monkeypatch):
         pytest.importorskip("torch")
@@ -171,7 +175,8 @@ class TestReinforcePlusPlusBaselineCPLocality:
 
 class TestDPMaskedWhitenInvariance:
     """DP partition must not change ``distributed_masked_whiten`` per-token
-    output (the ``--normalize-advantages`` path used by REINFORCE++ variants)."""
+    output (the ``--normalize-advantages`` path used by REINFORCE++
+    variants)."""
 
     @staticmethod
     def _local_stats(values, mask):

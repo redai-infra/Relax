@@ -38,7 +38,8 @@ def _cfg(**kwargs):
 
 
 class TestReinforceRegistry:
-    """The two REINFORCE++ variants are registered and reuse the GRPO topology."""
+    """The two REINFORCE++ variants are registered and reuse the GRPO
+    topology."""
 
     @pytest.mark.parametrize("key", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
     def test_variant_is_registered(self, key):

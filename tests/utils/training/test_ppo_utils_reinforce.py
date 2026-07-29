@@ -33,10 +33,11 @@ import torch
 def install_fake_megatron(monkeypatch, *, cp_size: int = 1) -> None:
     """Install a minimal fake ``megatron.core.mpu`` with the given ``cp_size``.
 
-    Mirrors the convention in ``tests/backends/megatron/test_ppo_gae_parity.py``
-    so ``ppo_utils`` can be imported and its CP-aware code path runs in plain
-    single-process mode. When ``cp_size == 1`` the ``all_gather_with_cp`` /
-    ``slice_log_prob_with_cp`` helpers are never reached.
+    Mirrors the convention in
+    ``tests/backends/megatron/test_ppo_gae_parity.py`` so ``ppo_utils`` can be
+    imported and its CP-aware code path runs in plain single-process mode. When
+    ``cp_size == 1`` the ``all_gather_with_cp`` / ``slice_log_prob_with_cp``
+    helpers are never reached.
     """
     megatron = ModuleType("megatron")
     core = ModuleType("megatron.core")
@@ -61,7 +62,8 @@ def reference_reinforce_plus_plus_returns(
     kl_coef: float,
     gamma: float,
 ) -> list[torch.Tensor]:
-    """Plain-torch reference for ``get_reinforce_plus_plus_returns`` (cp_size=1).
+    """Plain-torch reference for ``get_reinforce_plus_plus_returns``
+    (cp_size=1).
 
     For each sequence the per-token reward is ``-kl_coef * (kl * mask)`` with the
     scalar terminal reward added at the last masked (response) token, followed by
@@ -88,7 +90,8 @@ def reference_reinforce_plus_plus_baseline_advantages(
     kl: list[torch.Tensor],
     kl_coef: float,
 ) -> list[torch.Tensor]:
-    """Plain-torch reference for ``get_reinforce_plus_plus_baseline_advantages``.
+    """Plain-torch reference for
+    ``get_reinforce_plus_plus_baseline_advantages``.
 
     ``advantage = (reward - group_baseline) - kl_coef * kl`` broadcast to every
     token. The group baseline is assumed already subtracted from ``rewards``
@@ -153,7 +156,8 @@ def make_batch(seq_lens, n_response_per_seq, *, reward_fn, seed: int = 0):
 
 
 class TestReinforcePlusPlusReturns:
-    """Element-by-element correctness of ``get_reinforce_plus_plus_returns``."""
+    """Element-by-element correctness of
+    ``get_reinforce_plus_plus_returns``."""
 
     def test_matches_reference_variable_length(self, monkeypatch):
         pytest.importorskip("torch")
@@ -214,7 +218,8 @@ class TestReinforcePlusPlusReturns:
             assert torch.allclose(actual[i][0], token_rewards.sum(), atol=1e-6)
 
     def test_all_zero_reward(self, monkeypatch):
-        """All-zero rewards ⇒ returns reduce to discounted -kl_coef*kl on response."""
+        """All-zero rewards ⇒ returns reduce to discounted -kl_coef*kl on
+        response."""
         pytest.importorskip("torch")
         install_fake_megatron(monkeypatch)
         from relax.utils.training.ppo_utils import get_reinforce_plus_plus_returns
@@ -272,8 +277,8 @@ class TestReinforcePlusPlusReturns:
         assert torch.allclose(actual[0][last_idx - 1], torch.tensor(0.9), atol=1e-6)
 
     def test_reward_only_at_last_masked_token(self, monkeypatch):
-        """The scalar reward must be injected at the last *response* token only,
-        never into masked prompt/padding positions, and padding after the
+        """The scalar reward must be injected at the last *response* token
+        only, never into masked prompt/padding positions, and padding after the
         response must stay zero."""
         pytest.importorskip("torch")
         install_fake_megatron(monkeypatch)
@@ -327,7 +332,8 @@ class TestReinforcePlusPlusReturns:
 
 
 class TestReinforcePlusPlusBaselineAdvantages:
-    """Element-by-element correctness of ``get_reinforce_plus_plus_baseline_advantages``."""
+    """Element-by-element correctness of
+    ``get_reinforce_plus_plus_baseline_advantages``."""
 
     def test_matches_reference(self, monkeypatch):
         pytest.importorskip("torch")
@@ -392,8 +398,9 @@ class TestReinforcePlusPlusBaselineAdvantages:
 
 
 class TestPolicyLossForReinforce:
-    """REINFORCE++ variants fall into the ``else`` branch of policy_loss_function
-    and reuse ``compute_policy_loss``; verify it against an independent ref."""
+    """REINFORCE++ variants fall into the ``else`` branch of
+    policy_loss_function and reuse ``compute_policy_loss``; verify it against
+    an independent ref."""
 
     def test_matches_reference(self):
         pytest.importorskip("torch")
