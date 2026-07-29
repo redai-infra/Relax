@@ -30,6 +30,7 @@ def test_hybrid_pipeline_runtime_rechecks_supported_parallel_topology(monkeypatc
         offload_train=False,
         offload_rollout=False,
         compute_advantages_and_returns=True,
+        use_dynamic_batch_size=True,
     )
     actor.weights_backuper = SimpleNamespace(backup_tags={"actor"})
     rollout_plan = SimpleNamespace(
@@ -48,6 +49,11 @@ def test_hybrid_pipeline_runtime_rechecks_supported_parallel_topology(monkeypatc
 
     assert chunk_plan.chunks_per_mini == 2
     assert chunk_plan.chunk_local_samples == 2
+
+    actor.args.use_dynamic_batch_size = False
+    with pytest.raises(RuntimeError, match="requires use_dynamic_batch_size=True"):
+        actor._validate_hybrid_pipeline_runtime(rollout_plan, dp_size=1)
+    actor.args.use_dynamic_batch_size = True
 
     monkeypatch.setattr(actor_module.mpu, "get_context_parallel_world_size", lambda: 1)
     with pytest.raises(RuntimeError, match="requires TP=2, CP=2, EP=1, and ETP=1"):
@@ -155,9 +161,12 @@ def test_train_hybrid_wires_one_update_around_flagged_actor_chunks(
     actor._get_data_from_transfer_queue = get_data
     actor.all_consumed = lambda *_args, **_kwargs: False
     actor._restore_hybrid_pipeline_actor = lambda **kwargs: events.append(("restore", kwargs["chunk_index"]))
-    actor._hybrid_actor_forward_without_switch = lambda _batch, **kwargs: events.append(
-        ("forward", kwargs["chunk_index"])
-    )
+
+    def forward_chunk(batch, **kwargs):
+        events.append(("forward", kwargs["chunk_index"]))
+        return [list(range(len(batch["total_lengths"])))]
+
+    actor._hybrid_actor_forward_without_switch = forward_chunk
     actor._hybrid_forward_subbatch = lambda _batch, **kwargs: events.append(("forward", kwargs["chunk_index"]))
     actor._switch_model = lambda tag: events.append(("switch", tag))
     actor._wait_for_previous_eval = lambda: None
@@ -182,7 +191,18 @@ def test_train_hybrid_wires_one_update_around_flagged_actor_chunks(
     )
     monkeypatch.setattr(actor_module, "log_rollout_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(actor_module, "get_data_iterator", lambda *_args, **_kwargs: ([], []))
-    monkeypatch.setattr(actor_module, "train", lambda *_args, **_kwargs: events.append("optimizer"))
+
+    def train(_rollout_id, _model, _optimizer, _scheduler, data_iterator, num_microbatches):
+        events.append(
+            (
+                "optimizer_schedule",
+                data_iterator[0].micro_batch_indices if pipeline_enabled else None,
+                num_microbatches,
+            )
+        )
+        events.append("optimizer")
+
+    monkeypatch.setattr(actor_module, "train", train)
     monkeypatch.setattr(actor_module.train_dump_utils, "save_debug_train_data", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(actor_module, "Timer", lambda: SimpleNamespace(seq_lens=None))
     monkeypatch.setattr(actor_module, "log_perf_data", lambda *_args, **_kwargs: None)
@@ -204,3 +224,10 @@ def test_train_hybrid_wires_one_update_around_flagged_actor_chunks(
     assert events.count("advantages") == 1
     assert events.count("optimizer") == 1
     assert events.count("update_weights") == 1
+    optimizer_schedule = next(
+        event for event in events if isinstance(event, tuple) and event[0] == "optimizer_schedule"
+    )
+    if pipeline_enabled:
+        assert optimizer_schedule[1:] == ([[0, 1], [2, 3]], [2])
+    else:
+        assert optimizer_schedule[1:] == (None, [])

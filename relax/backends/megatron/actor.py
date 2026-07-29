@@ -64,6 +64,7 @@ from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.training.hybrid_forward_pipeline import (
+    canonicalize_hybrid_microbatch_schedule,
     execute_hybrid_forward_mini,
     fetch_exact_chunk_with_timeout,
 )
@@ -1220,6 +1221,8 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         if not self.args.compute_advantages_and_returns:
             raise RuntimeError("--hybrid-pipeline-forward requires compute_advantages_and_returns=True")
+        if not self.args.use_dynamic_batch_size:
+            raise RuntimeError("--hybrid-pipeline-forward requires use_dynamic_batch_size=True")
         return build_hybrid_forward_chunk_plan(self.args, rollout_plan, dp_size)
 
     def _restore_hybrid_pipeline_actor(
@@ -1261,7 +1264,7 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_id: int,
         chunk_index: int,
         global_indexes: list[int],
-    ) -> None:
+    ) -> list[list[int]]:
         if self._active_model_tag != "actor":
             raise RuntimeError(
                 "--hybrid-pipeline-forward requires the actor model to remain active before "
@@ -1269,6 +1272,24 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
+        if len(data_iterator) != 1 or len(num_microbatches) != 1:
+            raise RuntimeError(
+                "--hybrid-pipeline-forward expected one PP/VPP iterator and one optimizer step "
+                f"per chunk, got iterators={len(data_iterator)}, steps={num_microbatches}"
+            )
+        microbatch_indices = data_iterator[0].micro_batch_indices
+        if microbatch_indices is None:
+            raise RuntimeError("--hybrid-pipeline-forward requires an explicit dynamic microbatch schedule")
+        forward_schedule = [list(indices) for indices in microbatch_indices]
+        flattened_schedule = [index for indices in forward_schedule for index in indices]
+        if len(forward_schedule) != num_microbatches[0] or sorted(flattened_schedule) != list(
+            range(len(sub_batch["total_lengths"]))
+        ):
+            raise RuntimeError(
+                "--hybrid-pipeline-forward produced an invalid chunk microbatch schedule: "
+                f"chunk_index={chunk_index}, microbatches={len(forward_schedule)}, "
+                f"expected_microbatches={num_microbatches[0]}, samples={len(flattened_schedule)}"
+            )
         emit_hybrid_pipeline_event(
             self.args,
             "actor_forward_start",
@@ -1292,6 +1313,7 @@ class MegatronTrainRayActor(TrainRayActor):
             raise RuntimeError(
                 f"--hybrid-pipeline-forward actor tag changed during chunk forward: {self._active_model_tag!r}"
             )
+        return forward_schedule
 
     def _fetch_hybrid_pipeline_chunk(
         self,
@@ -1494,6 +1516,21 @@ class MegatronTrainRayActor(TrainRayActor):
         collected_batches: list[RolloutBatch] = []
         collected_global_indexes: list[int] = []
         rollout_mini_local_sample_counts: list[int] = []
+        pipeline_chunk_schedules: list[tuple[list[int], list[list[int]]]] = []
+
+        def forward_pipeline_chunk(
+            sub_batch: RolloutBatch,
+            tq_batch_index: int,
+            global_indexes: list[int],
+        ) -> None:
+            forward_schedule = self._hybrid_actor_forward_without_switch(
+                sub_batch,
+                rollout_id=rollout_id,
+                chunk_index=tq_batch_index,
+                global_indexes=global_indexes,
+            )
+            pipeline_chunk_schedules.append((list(global_indexes), forward_schedule))
+
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1524,14 +1561,7 @@ class MegatronTrainRayActor(TrainRayActor):
                                 sample_count=batch_size,
                             ),
                             fetch_chunk=fetch_debug_chunk,
-                            forward_chunk=lambda sub_batch, tq_batch_index, global_indexes: (
-                                self._hybrid_actor_forward_without_switch(
-                                    sub_batch,
-                                    rollout_id=rollout_id,
-                                    chunk_index=tq_batch_index,
-                                    global_indexes=global_indexes,
-                                )
-                            ),
+                            forward_chunk=forward_pipeline_chunk,
                         )
                     mini_batch, canonical_indexes = canonicalize_rollout_chunks(
                         mini_chunks,
@@ -1594,14 +1624,7 @@ class MegatronTrainRayActor(TrainRayActor):
                                 sample_count=batch_size,
                             ),
                             fetch_chunk=fetch_pipeline_chunk,
-                            forward_chunk=lambda sub_batch, tq_batch_index, global_indexes: (
-                                self._hybrid_actor_forward_without_switch(
-                                    sub_batch,
-                                    rollout_id=rollout_id,
-                                    chunk_index=tq_batch_index,
-                                    global_indexes=global_indexes,
-                                )
-                            ),
+                            forward_chunk=forward_pipeline_chunk,
                         )
 
                     mini_batch, canonical_indexes = canonicalize_rollout_chunks(
@@ -1704,6 +1727,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # ── Phase 2: Merge sub-batches and compute advantages with correct global normalization ──
         if pipeline_enabled:
             rollout_data = concat_rollout_batches(collected_batches)
+            pipeline_train_microbatch_indices = canonicalize_hybrid_microbatch_schedule(
+                pipeline_chunk_schedules,
+                collected_global_indexes,
+            )
         else:
             # Keep the flag-off merge path byte-for-byte compatible with the
             # pre-optimization implementation.
@@ -1744,7 +1771,17 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # ── Phase 3: Train on the full merged batch ──
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            if pipeline_enabled:
+                data_iterator = [
+                    DataIterator(
+                        rollout_data,
+                        micro_batch_indices=pipeline_train_microbatch_indices,
+                        max_tokens_per_gpu=self.args.max_tokens_per_gpu,
+                    )
+                ]
+                num_microbatches = [len(pipeline_train_microbatch_indices)]
+            else:
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):

@@ -198,13 +198,26 @@ global-index fingerprint are conserved. The optional path:
 2. fetches and forwards chunk 0 while rollout can continue producing chunk 1;
 3. fetches and forwards chunk 1;
 4. orders every per-sample field by `BatchMeta.global_indexes`;
-5. computes advantages once over all 256 samples and performs one optimizer
+5. records each chunk's dynamically balanced microbatch schedule, translates
+   it to the canonical merged-batch indexes, and replays the same sample
+   grouping and order during training;
+6. computes advantages once over all 256 samples and performs one optimizer
    step.
 
 It does not change producer transfer policy, multimodal preprocessing, pixel
 tensor values, GRPO group boundaries, reward normalization, or optimizer
 semantics. The additional actor fetch is intended to expose rollout/actor
 overlap, not to reduce work.
+
+The schedule replay is a correctness requirement, not a performance tuning
+heuristic. Packed multimodal kernels can produce batch-shape-dependent BF16
+rounding differences. Comparing chunked old-policy log-probs with a differently
+packed full-batch training forward would therefore create a non-zero PPO ratio
+before any weight update. Replaying the exact chunk microbatches keeps the
+old-policy and training forward shapes aligned while retaining one optimizer
+update over the complete mini. For this reason, the switch requires
+`--use-dynamic-batch-size`; an incompatible batch mode fails during actor
+startup.
 
 The first implementation is intentionally limited and fails fast instead of
 silently falling back:
@@ -217,7 +230,7 @@ silently falling back:
 | Parallel topology | TP=2, DP=1, PP=1, VPP=1, CP=2, EP=1, ETP=1 |
 | Offload | `offload_train=False`, `offload_rollout=False` |
 | Dropout | Attention and hidden dropout both zero |
-| Batch policy | Exactly one fixed optimizer mini per rollout (`rollout_batch_size * n_samples_per_prompt == global_batch_size`); no partial or dynamic-global batch |
+| Batch policy | Dynamic microbatching; exactly one fixed optimizer mini per rollout (`rollout_batch_size * n_samples_per_prompt == global_batch_size`); no partial or dynamic-global batch |
 | Log-prob source | Actor-computed log-prob; no true-on-policy or rollout-log-prob shortcut |
 | TensorBackuper | Normal enabled backuper with only the `actor` tag |
 

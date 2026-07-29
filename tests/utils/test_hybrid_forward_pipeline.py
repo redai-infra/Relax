@@ -3,6 +3,7 @@
 import pytest
 
 from relax.utils.training.hybrid_forward_pipeline import (
+    canonicalize_hybrid_microbatch_schedule,
     execute_hybrid_forward_mini,
     fetch_exact_chunk_with_timeout,
 )
@@ -62,6 +63,37 @@ def test_restore_occurs_once_per_optimizer_mini():
         )
 
     assert restore_calls == [0, 2, 4]
+
+
+def test_chunk_microbatch_schedule_is_replayed_on_canonical_batch():
+    schedule = canonicalize_hybrid_microbatch_schedule(
+        [
+            ([12, 10], [[1], [0]]),
+            ([13, 11], [[0, 1]]),
+        ],
+        [10, 11, 12, 13],
+    )
+
+    assert schedule == [[0], [2], [3, 1]]
+
+
+@pytest.mark.parametrize(
+    ("chunk_schedules", "canonical_indexes", "error"),
+    [
+        ([([10, 11], [[0]])], [10, 11], "cover each local sample exactly once"),
+        ([([10, 11], [[0, 0], [1]])], [10, 11], "cover each local sample exactly once"),
+        ([([10, 11], [[0, 2]])], [10, 11], "out-of-range local index"),
+        ([([10], [[0]])], [10, 11], "cover each canonical global index exactly once"),
+        ([([10, 12], [[0, 1]])], [10, 11], "outside canonical_global_indexes"),
+    ],
+)
+def test_chunk_microbatch_schedule_rejects_incomplete_or_invalid_coverage(
+    chunk_schedules,
+    canonical_indexes,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
+        canonicalize_hybrid_microbatch_schedule(chunk_schedules, canonical_indexes)
 
 
 def test_invalid_chunk_count_fails_before_restore():

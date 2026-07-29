@@ -198,11 +198,21 @@ global-index fingerprint 完整守恒即可。打开开关后：
 2. chunk 0 ready 后立即 fetch 和 forward，此时 rollout 可继续产生 chunk 1；
 3. 再 fetch 和 forward chunk 1；
 4. 按 `BatchMeta.global_indexes` 对所有 per-sample 字段恢复确定顺序；
-5. 在完整 256 samples 上只计算一次 advantage，并只执行一次 optimizer step。
+5. 记录每个 chunk 的动态均衡 microbatch 调度，将其映射为合并 batch 中的
+   canonical index，并在训练 forward/backward 中回放相同的样本分组与顺序；
+6. 在完整 256 samples 上只计算一次 advantage，并只执行一次 optimizer step。
 
 该路径不修改 producer 传输策略、多模态预处理、pixel tensor 数值、GRPO
 group 边界、reward normalization 或 optimizer 语义。多出的一次 actor fetch
 用于暴露 rollout/actor 重叠窗口，而不是减少工作量。
+
+microbatch 调度回放是正确性约束，而不是性能调参。多模态 packed kernel
+在 BF16 下可能因 batch shape 不同产生数值舍入差异；如果 old-policy
+log-prob 按 chunk 计算、训练 forward 却按另一种完整 batch 分组，就会在
+权重尚未更新时产生非零 PPO ratio。回放完全相同的 chunk microbatch，可在
+保持整个 optimizer mini 只更新一次的同时，对齐 old-policy 与训练 forward
+的计算形状。因此该开关强制要求 `--use-dynamic-batch-size`；batch 模式不兼容
+时会在 actor 启动阶段直接失败。
 
 首版支持范围有意收窄；不支持的组合会 fail fast，不会静默回退：
 
@@ -214,7 +224,7 @@ group 边界、reward normalization 或 optimizer 语义。多出的一次 actor
 | 并行拓扑 | TP=2、DP=1、PP=1、VPP=1、CP=2、EP=1、ETP=1 |
 | Offload | `offload_train=False`、`offload_rollout=False` |
 | Dropout | attention/hidden dropout 均为 0 |
-| Batch 策略 | 每次 rollout 恰好一个固定 optimizer mini（`rollout_batch_size * n_samples_per_prompt == global_batch_size`）；不支持 partial/dynamic-global batch |
+| Batch 策略 | 使用 dynamic microbatch；每次 rollout 恰好一个固定 optimizer mini（`rollout_batch_size * n_samples_per_prompt == global_batch_size`）；不支持 partial/dynamic-global batch |
 | Log-prob 来源 | actor 计算；不支持 true-on-policy 或 rollout-log-prob 快捷路径 |
 | TensorBackuper | 启用普通 backuper，且只有 `actor` tag |
 

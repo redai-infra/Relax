@@ -2,7 +2,7 @@
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 
@@ -28,6 +28,72 @@ def execute_hybrid_forward_mini(
         forward_chunk(batch, batch_index, global_indexes)
         chunks.append((batch, global_indexes))
     return chunks
+
+
+def canonicalize_hybrid_microbatch_schedule(
+    chunk_schedules: Sequence[tuple[Sequence[int], Sequence[Sequence[int]]]],
+    canonical_global_indexes: Sequence[int],
+) -> list[list[int]]:
+    """Translate chunk-local forward schedules into merged-batch indexes.
+
+    The actor old-logprob forward chooses its dynamic microbatches independently
+    for each producer chunk. Training must replay those exact sample groups and
+    their order; otherwise batch-shape-dependent numerics create an artificial
+    PPO ratio even though the weights did not change.
+    """
+    canonical_indexes = list(canonical_global_indexes)
+    if not canonical_indexes:
+        raise ValueError("canonical_global_indexes must not be empty")
+    if not all(type(index) is int for index in canonical_indexes):
+        raise TypeError("canonical_global_indexes must contain only int values")
+    if len(set(canonical_indexes)) != len(canonical_indexes):
+        raise ValueError("canonical_global_indexes must not contain duplicates")
+
+    canonical_positions = {index: position for position, index in enumerate(canonical_indexes)}
+    observed_global_indexes: list[int] = []
+    merged_schedule: list[list[int]] = []
+
+    for chunk_index, (global_indexes, local_schedule) in enumerate(chunk_schedules):
+        chunk_global_indexes = list(global_indexes)
+        if not chunk_global_indexes:
+            raise ValueError(f"chunk {chunk_index} global_indexes must not be empty")
+        if not all(type(index) is int for index in chunk_global_indexes):
+            raise TypeError(f"chunk {chunk_index} global_indexes must contain only int values")
+
+        flattened_local_indexes: list[int] = []
+        for microbatch_index, local_indexes in enumerate(local_schedule):
+            normalized_local_indexes = list(local_indexes)
+            if not normalized_local_indexes:
+                raise ValueError(f"chunk {chunk_index} microbatch {microbatch_index} must not be empty")
+            if not all(type(index) is int for index in normalized_local_indexes):
+                raise TypeError(f"chunk {chunk_index} microbatch {microbatch_index} must contain only int indexes")
+            try:
+                merged_schedule.append(
+                    [
+                        canonical_positions[chunk_global_indexes[local_index]]
+                        for local_index in normalized_local_indexes
+                    ]
+                )
+            except IndexError as exc:
+                raise ValueError(
+                    f"chunk {chunk_index} microbatch {microbatch_index} contains an out-of-range local index"
+                ) from exc
+            except KeyError as exc:
+                raise ValueError(
+                    f"chunk {chunk_index} references global index {exc.args[0]} outside canonical_global_indexes"
+                ) from exc
+            flattened_local_indexes.extend(normalized_local_indexes)
+
+        expected_local_indexes = list(range(len(chunk_global_indexes)))
+        if sorted(flattened_local_indexes) != expected_local_indexes:
+            raise ValueError(f"chunk {chunk_index} microbatch schedule must cover each local sample exactly once")
+        observed_global_indexes.extend(chunk_global_indexes)
+
+    if sorted(observed_global_indexes) != sorted(canonical_indexes):
+        raise ValueError("chunk schedules must cover each canonical global index exactly once")
+    if sorted(index for microbatch in merged_schedule for index in microbatch) != list(range(len(canonical_indexes))):
+        raise ValueError("merged microbatch schedule must cover the merged batch exactly once")
+    return merged_schedule
 
 
 def fetch_exact_chunk_with_timeout(
