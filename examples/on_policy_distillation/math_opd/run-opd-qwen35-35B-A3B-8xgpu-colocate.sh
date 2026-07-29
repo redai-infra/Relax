@@ -1,12 +1,16 @@
-
-
 #!/bin/bash
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+#
+# STEP_1(grpo, obtain math teacher)
+# EXP_DIR=/path/to/your/exp_dir bash scripts/training/text/run-qwen35-35B-A3B-8xgpu-colocate.sh
+#
+# STEP_2(opd)
+# EXP_DIR=/path/to/your/exp_dir bash examples/on_policy_distillation/math_opd/run-opd-qwen35-35B-A3B-8xgpu-colocate.sh
+
 set -ex
 set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
-# # topk 
-# export RELAX_OPD_PER_POS_TOKEN_IDS=1 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -14,34 +18,24 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../../scripts/entrypoint/local.sh"
 fi
 
-source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
+source "${MODEL_CONFIG_DIR}/qwen35-35B-A3B.sh"
 
-PROJECT_NAME="${PROJECT_NAME:=Relax/recipes/opd_baseline}"
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/mathopd}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=50}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
-ROLLOUT_BATCH_SIZE=1024          
-ROLLOUT_N_GROUPS=1              
-ROLLOUT_RESP_LENGTH=16384     
-EVAL_ROLLOUT_RESP_LENGTH=16384   
+# STUDENT: the pre-RL checkpoint (standard Qwen3.5-35B-A3B).
+STUDENT_MODEL_NAME="${STUDENT_MODEL_NAME:-Qwen3.5-35B-A3B}"
+# TEACHER: RL-trained math checkpoint(from STEP_1)
+TEACHER_MODEL_NAME="${TEACHER_MODEL_NAME:-Qwen3.5-35B-A3B-GRPO-dapomath17k-400step}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${MODEL_DIR}/${TEACHER_MODEL_NAME}}"
 
-OPD_KL_COEF=1.0
-OPD_LOSS_COEF=0.0
-OPD_KL_TYPE=reverse_kl
-OPD_TOKEN_SELECTION=student_sampled
-
-STUDENT_MODEL_NAME=Qwen3-4B
-TEACHER_MODEL_NAME=Qwen3-4B-Non-Thinking-RL-Math-Step500
-
-ROLLOUT_GPUS=4
-TEACHER_GPUS=4
-ACTOR_GPUS=8
-
-EXP_NAME=opd-baseline-sampled-${STUDENT_MODEL_NAME}-teacher-${TEACHER_MODEL_NAME}-opd_${OPD_KL_TYPE}_${OPD_TOKEN_SELECTION}_klcoef${OPD_KL_COEF}_rollout_${ROLLOUT_BATCH_SIZE}_${ROLLOUT_N_GROUPS}_${ROLLOUT_RESP_LENGTH}_${ROLLOUT_TEMPERATURE}_${ROLLOUT_TOP_P}_eval_rollout_${EVAL_ROLLOUT_RESP_LENGTH}_${EVAL_ROLLOUT_TEMPERATURE}_${EVAL_ROLLOUT_TOP_P}-${now}
+EXP_NAME=opd-mathopd-${STUDENT_MODEL_NAME}-teacher-${TEACHER_MODEL_NAME}-${now}
 SAVE_DIR=${EXP_DIR}/save/${EXP_NAME}
 mkdir -p "${SAVE_DIR}"
+
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/${STUDENT_MODEL_NAME}/
    --ref-load ${MODEL_DIR}/${STUDENT_MODEL_NAME}/
@@ -50,63 +44,56 @@ CKPT_ARGS=(
    --save-interval 2000
 )
 
-PROMPT_SET=${DATA_DIR}/G-OPD-Training-Data/DeepMath-103K/train_filtered_level6.jsonl
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
    --label-key label
-   --metadata-key metadata
    --apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking": false}'
    --rollout-shuffle
 
-   --rm-type math
+   --rm-type dapo
+   --reward-key score
 
    --num-rollout              ${NUM_ROLLOUT}
-   --rollout-batch-size       ${ROLLOUT_BATCH_SIZE}
-   --n-samples-per-prompt     ${ROLLOUT_N_GROUPS}
-   --rollout-max-prompt-len   2048
-   --rollout-max-response-len ${ROLLOUT_RESP_LENGTH}
-   --rollout-temperature      1.0
-   --rollout-top-p 1.0
-   --global-batch-size $((ROLLOUT_BATCH_SIZE * ROLLOUT_N_GROUPS))
+   --rollout-batch-size       128
+   --n-samples-per-prompt     1
+   --rollout-max-response-len 8192
+   --rollout-temperature      1
+   --global-batch-size 128
    --use-fault-tolerance
-   --use-streaming-dataset
-
-   --rollout-health-check-interval 60
-   --rollout-health-check-timeout 120
-   --rollout-health-check-max-consecutive-failures 3
-   --rollout-health-check-first-wait 300
+   --balance-data
 )
 
 EVAL_ARGS=(
-   --eval-interval 10
-   --eval-prompt-data aime2024 ${DATA_DIR}/G-OPD-Training-Data/AIME2024/test.jsonl
-   --n-samples-per-eval-prompt 32
-   --eval-max-response-len ${EVAL_ROLLOUT_RESP_LENGTH}
-   --eval-top-p 1.0
-   --eval-temperature 1
+   --log-passrate
+   # --skip-eval-before-train
+   --eval-interval 5
+   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 8192
+   --eval-top-p 0.7
 )
 
 OPD_ARGS=(
    --use-opd
    --opd-type sglang
 
-   --teacher-hf-checkpoint ${MODEL_DIR}/${TEACHER_MODEL_NAME}/
+   --teacher-hf-checkpoint ${TEACHER_MODEL_PATH}
    --warm-hf-checkpoint-page-cache
 
-   --teacher-sglang-mem-fraction-static 0.7
+   --teacher-sglang-mem-fraction-static 0.5
    --teacher-num-gpus-per-engine 4
    --teacher-sglang-disable-cuda-graph
 
-   --opd-kl-coef ${OPD_KL_COEF}
-   --opd-loss-coef ${OPD_LOSS_COEF}
-   --opd-kl-type ${OPD_KL_TYPE}
-   --opd-token-selection ${OPD_TOKEN_SELECTION}
+   --opd-kl-coef 1.0
+   --opd-loss-coef 0.0
+   --opd-kl-type reverse_kl
+   --opd-token-selection student_sampled
 
-   --opd-teacher-timeout-s ${OPD_TEACHER_TIMEOUT_S:-6000}
+   --opd-teacher-timeout-s 6000
    --use-rollout-logprobs
-   
+
    --opd-disable-rl-reward
 )
 
@@ -118,7 +105,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-5
+   --lr 1e-6
    --lr-decay-style constant
    --weight-decay 0.01
    --adam-beta1 0.9
@@ -129,28 +116,27 @@ OPTIMIZER_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size ${TP_SIZE:-2}
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
+   --expert-model-parallel-size 8
+   --expert-tensor-parallel-size 1
    --calculate-per-token-loss
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
-
    --use-dynamic-batch-size
-   --max-tokens-per-gpu ${ACTOR_MAX_TOKENS_PER_GPU:-16384}
+   --max-tokens-per-gpu 8192
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
-   --sglang-mem-fraction-static ${STUDENT_MEM_FRACTION:-0.7}
+   --rollout-num-gpus-per-engine 4
+   --sglang-mem-fraction-static 0.6
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
    --sglang-max-running-requests 64
 )
-
 
 WANDB_ARGS=(
    --use-clearml
@@ -182,7 +168,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource "{\"actor\": [1, ${ACTOR_GPUS}], \"rollout\": [1, ${ROLLOUT_GPUS}], \"teacher\": [1, ${TEACHER_GPUS}]}" \
+   --resource "{\"actor\": [1, 8], \"rollout\": [1, 4], \"teacher\": [1, 4]}" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
@@ -198,4 +184,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD}" \
    "${MISC_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
-   2>&1 | tee log/opd-baseline-sampled-8xgpu-${STUDENT_MODEL_NAME}-teacher-${TEACHER_MODEL_NAME}-colocate-${now}.log
+   2>&1 | tee log/${EXP_NAME}.log

@@ -26,10 +26,10 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
-    _ENCODE_EXECUTOR,
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
     async_encode_video_tensor_for_rollout_engine,
+    configure_encode_executor,
     load_processor,
     load_tokenizer,
 )
@@ -61,6 +61,11 @@ class GenerateState(metaclass=SingletonMeta):
 
         # OPD manager (singleton — one OpdManager per GenerateState)
         self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+
+        # Media-encoding thread pool for this rollout worker process, sized by
+        # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
+        # affinity-aware default). Held on state so consumers use it explicitly.
+        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
@@ -206,7 +211,7 @@ async def _run_image_processor(
             prompt_ids = expand_kimi_k25_placeholders(state.processor, prompt_ids, train_inputs)
             return prompt_ids, train_inputs
 
-        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(_ENCODE_EXECUTOR, _run_processor)
+        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(state.encode_executor, _run_processor)
 
     return processor_prompt_ids, mm_train_inputs, monotonic() - t_start
 
@@ -297,6 +302,13 @@ async def generate(
 
     if state.opd_manager and not evaluation:
         state.opd_manager.before_rollout(payload)
+    # LoRA adapter mode: route generation through the trained adapter registered on the engine
+    # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
+    # base model only and rollouts would not reflect the trained policy.
+    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+        from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+        payload["lora_path"] = LORA_ADAPTER_NAME
 
     _t_mm_encode: float | None = None
     if _has_media:
@@ -1022,7 +1034,7 @@ async def generate_rollout_async(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = dict(timing_metrics)
-        if args.partial_rollout:
+        if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
             )
@@ -1228,7 +1240,11 @@ def generate_rollout(
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
-    if not args.fully_async:
+    # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
+    # prefetched generation is almost always aborted by the next step's pause_generation and its
+    # truncated samples would pollute the next rollout. Other modes keep the optimization.
+    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    if not args.fully_async and not _lora_adapter_mode:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")

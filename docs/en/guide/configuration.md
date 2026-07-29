@@ -272,7 +272,7 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `on_policy_distillation`, `sapo` | Advantage estimator. Note: OPD is now independent of advantage estimator; enable OPD on any estimator with `--opd-kl-coef > 0` |
+| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `ppo`, `sapo`, `cispo` | Advantage estimator. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
 | `--normalize-advantages` | flag | False | - | Whether to normalize advantages |
 | `--disable-grpo-std-normalization` | flag | - | - | Disable GRPO standard deviation normalization (from [Dr.GRPO](https://arxiv.org/pdf/2503.20783)) |
 | `--disable-rewards-normalization` | flag | - | - | Disable reward normalization |
@@ -290,13 +290,24 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--value-clip` | float | 0.2 | - | Value function clipping range |
 | `--entropy-coef` | float | 0.0 | - | Entropy loss coefficient |
 
+### PPO Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--gamma` | float | 1.0 | Discount factor for PPO GAE |
+| `--lambd` | float | 1.0 | Lambda for PPO GAE |
+| `--value-clip` | float | 0.2 | Clipping range for PPO Critic value loss |
+| `--use-rollout-logprobs` | flag | False | Use Rollout logprobs as PPO old-policy logprobs; required by the provided colocate topology |
+
+PPO currently supports synchronous colocate mode and requires `critic` and `advantages` entries in `--resource`. See [PPO Training](./ppo-training.md) for resource topology, checkpoint consistency, and KL constraints.
+
 ### KL Divergence Related
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--kl-coef` | float | 0.0 | KL penalty coefficient for reward shaping (applied to reward signal before advantage calculation). Cannot be non-zero simultaneously with `--kl-loss-coef` |
-| `--use-kl-loss` | flag | False | Whether to use KL loss in GRPO |
-| `--kl-loss-coef` | float | 0.0 | KL penalty coefficient added to final PPO loss. Cannot be non-zero simultaneously with `--kl-coef` |
+| `--kl-coef` | float | 0.0 | KL penalty coefficient for reward shaping. Synchronous PPO resets non-zero values to `0.0`. Cannot be non-zero simultaneously with `--kl-loss-coef` |
+| `--use-kl-loss` | flag | False | Enable loss-level KL for GRPO-like algorithms. Synchronous PPO automatically disables this option |
+| `--kl-loss-coef` | float | 0.0 | KL penalty coefficient added to the final policy loss. Cannot be non-zero simultaneously with `--kl-coef` |
 | `--kl-loss-type` | str | k1 | `k1`, `k2`, `k3`, `low_var_kl` | KL loss type |
 | `--use-unbiased-kl` | flag | False | Enable unbiased KL estimation |
 | `--ref-update-interval` | int | None | Reference model update interval in Rollout steps. None means no update |
@@ -314,6 +325,8 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 |-----------|------|---------|-------------|
 | `--num-critic-only-steps` | int | 0 | Number of steps to train Critic only |
 | `--critic-train-only` | flag | False | Train Critic model only |
+| `--critic-load` | str | None | Critic checkpoint to load. When None, equals `--load` |
+| `--critic-save` | str | None | Critic checkpoint output directory |
 | `--critic-lr` | float | None | Critic learning rate. When None, equals `--lr` |
 | `--critic-lr-warmup-iters` | int | 0 | Number of iterations for linear warmup of Critic model |
 
