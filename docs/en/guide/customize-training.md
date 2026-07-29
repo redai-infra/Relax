@@ -116,13 +116,21 @@ python scripts/tools/process_avqa.py \
 
 ## Custom Reward Methods
 
-You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
+You can define `reward_func(args, sample: Sample, **kwargs) -> float | dict` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # Custom reward_func may return a dict; if so, specify which key corresponds to the actual reward score
 --reward-key score
 ```
+
+Synchronous `reward_func` runs in the `RewardWorker` process pool so it does
+not block the rollout event loop. Asynchronous `async def reward_func(...)`
+continues to run in the event loop and is directly awaited. The concurrency
+limit is controlled by `--reward-max-concurrency`, and the number of worker
+processes is controlled by `--reward-num-workers`. When `--group-rm` is set,
+the custom reward receives the whole group as a `samples` list and returns one
+reward per sample.
 
 ## Custom Generate Function
 

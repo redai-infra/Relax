@@ -115,13 +115,19 @@ python scripts/tools/process_avqa.py \
 
 ## 自定义 Reward 方法
 
-您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
+您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float | dict`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # 自定义 reward_func 允许返回 dict，但若如此您需要明确哪个 key 对应于实际的 reward 得分
 --reward-key score
 ```
+
+同步 `reward_func` 会在 `RewardWorker` 进程池内执行，避免阻塞 rollout 的 event loop；
+异步 `async def reward_func(...)` 会保持在 event loop 内直接 `await`。并发上限由
+`--reward-max-concurrency` 控制，worker 进程数量由 `--reward-num-workers` 控制。
+开启 `--group-rm` 时，custom reward 接收整个 group 的 `samples` 列表并返回逐样本
+reward 列表。
 
 ## 自定义 Generate 函数
 

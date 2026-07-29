@@ -433,7 +433,7 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--rm-type` | str | None | Built-in reward model type |
-| `--custom-rm-path` | str | None | Custom reward function path. Function signature: `def custom_rm(args, sample) -> float` |
+| `--custom-rm-path` | str | None | Custom reward function path. Sync functions run in the `RewardWorker` process pool; async functions are directly awaited. Single-sample signature: `def custom_rm(args, sample) -> float \| dict`; with `--group-rm`: `def custom_rm(args, samples) -> list[float \| dict]` |
 | `--reward-key` | str | None | Key to extract reward value when reward function returns dict |
 | `--eval-reward-key` | str | None | Reward key for evaluation. When None, equals `--reward-key` |
 | `--group-rm` | flag | False | Whether to compute reward for entire group |

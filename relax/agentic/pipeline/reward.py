@@ -32,24 +32,14 @@ def _effective_reward_concurrency(args, *, explicit_limit: int | None = None) ->
 
 
 async def _async_rm(args, sample):
-    custom_rm_path = args.custom_rm_path
-    if custom_rm_path:
-        from relax.utils.utils import load_function
-
-        rm_function = load_function(custom_rm_path)
-        return await rm_function(args, sample)
+    # Use the shared reward executor so custom reward isolation and concurrency
+    # are identical between regular rollout and agentic rollout.
     from relax.engine.rewards import async_rm
 
     return await async_rm(args, sample)
 
 
 async def _batched_async_rm(args, samples):
-    custom_rm_path = args.custom_rm_path
-    if custom_rm_path:
-        from relax.utils.utils import load_function
-
-        rm_function = load_function(custom_rm_path)
-        return await rm_function(args, samples)
     from relax.engine.rewards import batched_async_rm
 
     return await batched_async_rm(args, samples)
