@@ -92,6 +92,7 @@ from .data import (
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .weight_update.colocate_handoff import ColocateWeightHandoff
 from .weight_update.common import named_params_and_buffers
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
@@ -297,15 +298,40 @@ class MegatronTrainRayActor(TrainRayActor):
                 getattr(self.hf_config, "quantization_config", None),
                 args.hf_checkpoint,
             )
+            if getattr(self.args, "colocate_weight_handoff", False):
+                config_name = type(self.hf_config).__name__
+                text_config = getattr(self.hf_config, "text_config", self.hf_config)
+                if (
+                    config_name != "Qwen3VLConfig"
+                    or getattr(text_config, "hidden_size", None) != 2560
+                    or getattr(text_config, "num_hidden_layers", None) != 36
+                ):
+                    raise RuntimeError(
+                        "--colocate-weight-handoff V1 only supports Qwen3-VL-4B; "
+                        f"got {config_name}, hidden_size={getattr(text_config, 'hidden_size', None)}, "
+                        f"num_hidden_layers={getattr(text_config, 'num_hidden_layers', None)}"
+                    )
+                if push_quant_config:
+                    raise RuntimeError("--colocate-weight-handoff does not support quantized checkpoints")
             self.weight_updater = update_weight_cls(
                 self.args,
                 self.model,
-                weights_getter=lambda: self.weights_backuper.get("actor"),
+                weights_getter=self._get_actor_weights_for_rollout,
                 model_name=type(self.hf_config).__name__.lower()
                 if self.args.model_name is None
                 else self.args.model_name,
                 quantization_config=push_quant_config,
             )
+            self.colocate_handoff = None
+            if getattr(self.args, "colocate_weight_handoff", False):
+                self.colocate_handoff = ColocateWeightHandoff(
+                    args=self.args,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    weights_backuper=self.weights_backuper,
+                    weight_updater=self.weight_updater,
+                    memory_saver_enabled=self._torch_memory_saver_enabled,
+                )
         else:
             is_pp_src_rank = (
                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -359,7 +385,10 @@ class MegatronTrainRayActor(TrainRayActor):
             # recover to actor in the end.
             self._switch_model("actor")
             if self._per_step_rollout:
-                self.sleep()
+                if getattr(self.args, "colocate_weight_handoff", False):
+                    self.colocate_handoff.offload_initial_train_state()
+                else:
+                    self.sleep()
 
         self.rollout_engines = None
 
@@ -425,6 +454,33 @@ class MegatronTrainRayActor(TrainRayActor):
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _get_actor_weights_for_rollout(self):
+        handoff = getattr(self, "colocate_handoff", None)
+        if handoff is not None and handoff.has_live_train_weights:
+            return dict(
+                named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                    translate_gpu_to_cpu=False,
+                )
+            )
+        return self.weights_backuper.get("actor")
+
+    def _activate_actor_weights(self) -> None:
+        handoff = getattr(self, "colocate_handoff", None)
+        if handoff is None:
+            self._switch_model("actor")
+            return
+        if not handoff.has_live_train_weights:
+            handoff.activate_train_weights()
+        self._active_model_tag = "actor"
+
+    def set_rollout_manager(self, rollout_manager):
+        super().set_rollout_manager(rollout_manager)
+        if getattr(self, "colocate_handoff", None) is not None:
+            self.colocate_handoff.set_rollout_manager(rollout_manager)
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -619,7 +675,11 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
 
         if self.args.offload_train and self._per_step_rollout:
-            self.wake_up()
+            if getattr(self.args, "colocate_weight_handoff", False):
+                self.colocate_handoff.prepare_train()
+                self._active_model_tag = None
+            else:
+                self.wake_up()
 
         if self.args.debug_train_only:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for debug with mcore.")
@@ -843,7 +903,10 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
 
-                self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+                if self.args.keep_old_actor:
+                    self._switch_model("old_actor")
+                else:
+                    self._activate_actor_weights()
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
@@ -863,7 +926,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Restore model tag before train (keep_old_actor may have switched to old_actor).
                 if self._active_model_tag != "actor":
-                    self._switch_model("actor")
+                    self._activate_actor_weights()
 
             if should_compute_gae_in_actor:
                 if self.args.use_critic and "values" not in rollout_data:
@@ -878,6 +941,8 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
+            if self._active_model_tag != "actor":
+                self._activate_actor_weights()
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
@@ -900,7 +965,8 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        if not getattr(self.args, "colocate_weight_handoff", False):
+            self.weights_backuper.backup("actor")
 
         # Update ref model if needed
         if (
@@ -948,7 +1014,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+        if not getattr(self.args, "colocate_weight_handoff", False):
+            log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -959,10 +1026,14 @@ class MegatronTrainRayActor(TrainRayActor):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
-            if self.args.offload_train:
+            if self.args.offload_train and not getattr(self.args, "colocate_weight_handoff", False):
                 self.sleep()
             if has_rollout:
                 self.update_weights()
+        if getattr(self.args, "colocate_weight_handoff", False):
+            # The handoff timers are recorded by update_weights(), so emit this
+            # step's metrics only after the transition has completed.
+            log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
@@ -1574,7 +1645,11 @@ class MegatronTrainRayActor(TrainRayActor):
         # torch dist may trigger nccl communication during saving; resume the
         # paused model (process groups + tms) so save can issue collectives and
         # touch GPU tensors.
-        if self.args.offload_train and self._per_step_rollout:
+        if (
+            self.args.offload_train
+            and self._per_step_rollout
+            and not getattr(self.args, "colocate_weight_handoff", False)
+        ):
             reload_process_groups()
 
         if self.args.async_save:
@@ -1597,12 +1672,20 @@ class MegatronTrainRayActor(TrainRayActor):
 
             save_hf_model(self.args, rollout_id, self.model)
 
-        if self.args.offload_train and self._per_step_rollout:
+        if (
+            self.args.offload_train
+            and self._per_step_rollout
+            and not getattr(self.args, "colocate_weight_handoff", False)
+        ):
             destroy_process_groups()
 
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
+            return
+
+        if getattr(self.args, "colocate_weight_handoff", False):
+            self.colocate_handoff.to_rollout()
             return
 
         if self.args.offload_train:

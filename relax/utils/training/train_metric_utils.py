@@ -34,7 +34,10 @@ def log_perf_data_raw(
     if not is_primary_rank:
         return
 
-    log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
+    value_metrics = {"colocate_peak_gpu_memory_gib", "colocate_weight_host_transfer_gib"}
+    log_dict = {
+        (f"perf/{key}" if key in value_metrics else f"perf/{key}_time"): val for key, val in log_dict_raw.items()
+    }
 
     if timer_instance.seq_lens:
         log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)

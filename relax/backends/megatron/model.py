@@ -7,7 +7,7 @@ import os
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -24,6 +24,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_model_config, unwrap_model
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
+from torch_memory_saver import torch_memory_saver
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_sft_mode
@@ -45,6 +46,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .weight_update.static_state import relocate_colocate_static_tensors
 
 
 logger = get_logger(__name__)
@@ -263,11 +265,28 @@ def setup_model_and_optimizer(
     if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
         _relax_gdn_cp_config_assert()
 
-    model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
-        ModelType.encoder_or_decoder,
-        wrap_with_ddp=role in ["actor", "critic"],
+    handoff_enabled = role == "actor" and getattr(args, "colocate_weight_handoff", False)
+    allocated_before = torch.cuda.memory_allocated() if handoff_enabled else 0
+    model_allocation = (
+        torch_memory_saver.region(tag="colocate_train_model", enable_cpu_backup=False)
+        if handoff_enabled
+        else nullcontext()
     )
+    with model_allocation:
+        model = get_model(
+            wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
+            ModelType.encoder_or_decoder,
+            wrap_with_ddp=role in ["actor", "critic"],
+        )
+    if handoff_enabled:
+        args._colocate_train_model_bytes = max(torch.cuda.memory_allocated() - allocated_before, 0)
+        # This must run after leaving model_allocation so the clone lives in the
+        # default CUDA pool and keeps its contents across no-backup TMS resumes.
+        relocated_bytes = relocate_colocate_static_tensors(model)
+        logger.info(
+            "Relocated %d bytes of Qwen3-VL static rotary state outside the colocate train model region",
+            relocated_bytes,
+        )
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from

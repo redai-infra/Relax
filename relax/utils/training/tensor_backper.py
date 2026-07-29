@@ -41,6 +41,10 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def discard(self, tag: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def restore(self, tag: str):
         raise NotImplementedError
 
@@ -70,6 +74,9 @@ class _TensorBackuperNormal(TensorBackuper):
     def copy(self, *, src_tag: str, dst_tag: str):
         for name in self._backups[dst_tag]:
             self._backups[dst_tag][name].copy_(self._backups[src_tag][name])
+
+    def discard(self, tag: str) -> None:
+        self._backups.pop(tag, None)
 
     @torch.no_grad()
     def restore(self, tag: str) -> None:
@@ -106,6 +113,11 @@ class _TensorBackuperNoop(TensorBackuper):
         assert tag == self._single_tag
         assert _compute_hash_dict(dict(self._source_getter())) == self._backup_hash_dict
         device_utils.synchronize()
+
+    def discard(self, tag: str) -> None:
+        if tag != self._single_tag:
+            raise ValueError(f"Cannot discard unknown tensor backup tag: {tag}")
+        self._backup_hash_dict = None
 
 
 def _compute_hash_dict(tensors: dict[str, torch.Tensor]):

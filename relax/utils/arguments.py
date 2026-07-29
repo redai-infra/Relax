@@ -236,6 +236,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--colocate-weight-handoff",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the experimental GPU-direct bidirectional weight handoff between "
+                    "Megatron and SGLang in synchronous colocate mode. Disabled by default."
+                ),
+            )
+            parser.add_argument(
                 "--offload",
                 action="store_true",
                 default=False,
@@ -2553,6 +2562,60 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _validate_colocate_weight_handoff(args) -> None:
+    if not getattr(args, "colocate_weight_handoff", False):
+        return
+
+    errors = []
+    if not getattr(args, "colocate", False) or getattr(args, "fully_async", False):
+        errors.append("requires synchronous --colocate mode")
+    if getattr(args, "train_backend", "megatron") != "megatron":
+        errors.append("requires the Megatron training backend")
+    if not getattr(args, "offload_train", False) or not getattr(args, "offload_rollout", False):
+        errors.append("requires --offload-train and --offload-rollout")
+    if getattr(args, "tensor_model_parallel_size", None) != 2:
+        errors.append("requires Megatron tensor parallel size 2")
+    if getattr(args, "pipeline_model_parallel_size", 1) != 1:
+        errors.append("requires Megatron pipeline parallel size 1")
+    if getattr(args, "expert_model_parallel_size", 1) != 1:
+        errors.append("requires Megatron expert parallel size 1")
+    if getattr(args, "context_parallel_size", 1) != 1:
+        errors.append("requires Megatron context parallel size 1")
+    if getattr(args, "rollout_num_gpus_per_engine", None) != 1:
+        errors.append("requires one GPU per SGLang engine (TP=1)")
+    if getattr(args, "sglang_pp_size", 1) != 1 or getattr(args, "sglang_ep_size", 1) != 1:
+        errors.append("requires SGLang PP=1 and EP=1")
+    if getattr(args, "sglang_data_parallel_size", 1) != 1:
+        errors.append("requires SGLang DP=1")
+    if getattr(args, "rollout_external", False) or getattr(args, "sglang_config", None):
+        errors.append("does not support external or custom multi-group rollout layouts")
+    if not getattr(args, "bf16", False) or getattr(args, "fp16", False):
+        errors.append("requires unquantized BF16 weights")
+    if not getattr(args, "use_distributed_optimizer", False):
+        errors.append("requires Megatron DistributedOptimizer")
+    if not getattr(args, "enable_weights_backuper", True):
+        errors.append("requires the initialization-only actor CPU backup")
+    if getattr(args, "num_layers", None) != 36 or getattr(args, "hidden_size", None) != 2560:
+        errors.append("only supports the Qwen3-VL-4B training shape")
+    if getattr(args, "megatron_to_hf_mode", None) != "bridge":
+        errors.append("requires --megatron-to-hf-mode bridge")
+    if getattr(args, "sglang_speculative_algorithm", None):
+        errors.append("does not support speculative decoding")
+    if getattr(args, "sglang_quantization", None):
+        errors.append("does not support quantized SGLang weights")
+    if getattr(args, "use_critic", False):
+        errors.append("does not support a critic")
+    if getattr(args, "genrm_model_path", None):
+        errors.append("does not support a colocated generative reward model")
+    if is_managed_opd_teacher_enabled(args) or getattr(args, "opd_teacher_load", None):
+        errors.append("does not support a teacher model")
+    if getattr(args, "keep_old_actor", False):
+        errors.append("does not support --keep-old-actor")
+
+    if errors:
+        raise ValueError("--colocate-weight-handoff " + "; ".join(errors))
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -3014,6 +3077,8 @@ def slime_validate_args(args):
 
     if args.use_critic:
         args.offload_train = True
+
+    _validate_colocate_weight_handoff(args)
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

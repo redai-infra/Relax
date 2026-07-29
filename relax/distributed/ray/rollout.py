@@ -559,12 +559,12 @@ class EngineGroup:
         ]
         return init_handles, port_cursors
 
-    def offload(self):
+    def offload(self, tags: list[str] | None = None):
         """Fire release_memory_occupation on all engines (non-blocking).
 
         Returns a list of Ray ObjectRefs.
         """
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        return [engine.release_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
 
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
@@ -734,11 +734,11 @@ class RolloutServer:
                 [engine.resume_memory_occupation.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]) for engine in new_engines_all]
             )
 
-    def offload(self):
+    def offload(self, tags: list[str] | None = None):
         """Release memory occupation across all groups (concurrent)."""
         handles = []
         for g in self.engine_groups:
-            handles.extend(g.offload())
+            handles.extend(g.offload(tags))
         return ray.get(handles) if handles else []
 
     def onload(self, tags: list[str] | None = None):
@@ -1128,18 +1128,18 @@ class RolloutManager(ReloadableMixin):
         except Exception as e:
             logger.warning(f"Failed to load data source: {e}")
 
-    async def offload(self):
-        self._offload_local()
+    async def offload(self, tags: list[str] | None = None):
+        self._offload_local(tags)
 
-    def _offload_local(self):
+    def _offload_local(self, tags: list[str] | None = None):
         """Sync body of offload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
-        if self.status == "offload":
+        if self.status == "offload" and tags is None:
             logger.info("Rollout already offloaded; skipping")
             return
         self.health_monitoring_pause()
         for srv in self.servers.values():
-            srv.offload()
+            srv.offload(tags)
         self.status = "offload"
 
     async def onload(self, tags: list[str] | None = None):

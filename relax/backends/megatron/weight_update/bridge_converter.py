@@ -3,7 +3,7 @@
 import dataclasses
 import re
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,6 +43,7 @@ class BridgeConverter:
         self._model = model
         self._quantization_config = quantization_config
         self._bridge_task_map: dict[str, Any] | None = None
+        self._bridge: Any = None
         self._bridge_mapping_registry: Any = None
         self._bridge_expert_transposes_down: bool = True
         self._configs_broadcast_done: bool = False
@@ -74,6 +75,7 @@ class BridgeConverter:
         from relax.utils.megatron_bridge_utils import patch_megatron_model
 
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
+        self._bridge = bridge._model_bridge
         with patch_megatron_model(self._model):
             tasks = bridge.get_conversion_tasks(self._model)
 
@@ -138,6 +140,106 @@ class BridgeConverter:
                 break
 
         logger.info("Bridge task map initialized with %d local tasks", len(self._bridge_task_map))
+
+    def get_hf_to_megatron_tasks(self) -> list[Any]:
+        """Return the resolved Bridge load tasks owned by this PP rank."""
+        self.init_tasks()
+        self.broadcast_and_apply_configs()
+        return sorted(
+            (
+                task
+                for task in self._bridge_task_map.values()
+                if task.param_weight is not None and task.megatron_module is not None
+            ),
+            key=lambda task: (task.vp_stage or 0, task.param_name),
+        )
+
+    def get_required_hf_names(self) -> list[str]:
+        """Return the unique HF tensors needed to restore local Megatron
+        weights."""
+        return self.get_required_hf_names_for_tasks(self.get_hf_to_megatron_tasks())
+
+    @staticmethod
+    def get_required_hf_names_for_tasks(tasks: Sequence[Any]) -> list[str]:
+        """Return unique HF source names for a sequence of Bridge tasks."""
+        names: list[str] = []
+        seen: set[str] = set()
+        for task in tasks:
+            hf_param = task.mapping.hf_param
+            task_names = [hf_param] if isinstance(hf_param, str) else list(hf_param.values())
+            for name in task_names:
+                if name not in seen:
+                    names.append(name)
+                    seen.add(name)
+        return names
+
+    def get_hf_to_megatron_task_groups(self, max_bytes: int) -> list[tuple[list[Any], list[str]]]:
+        """Group complete Bridge tasks for bounded, partial conversion.
+
+        A fused mapping such as QKV is never split because its three HF tensors
+        must be available to Bridge at the same time.  Target shard bytes
+        multiplied by TP size are a conservative estimate of the full TP1 HF
+        source size used by SGLang. These groups only bound temporary tensor
+        lifetime; no persistent conversion bucket is allocated.
+        """
+        if max_bytes <= 0:
+            raise ValueError(f"max_bytes must be positive, got {max_bytes}")
+
+        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+        chunks: list[tuple[list[Any], list[str]]] = []
+        current_tasks: list[Any] = []
+        current_bytes = 0
+        for task in self.get_hf_to_megatron_tasks():
+            task_bytes = task.param_weight.numel() * task.param_weight.element_size() * tp_size
+            if current_tasks and current_bytes + task_bytes > max_bytes:
+                chunks.append((current_tasks, self.get_required_hf_names_for_tasks(current_tasks)))
+                current_tasks = []
+                current_bytes = 0
+            current_tasks.append(task)
+            current_bytes += task_bytes
+        if current_tasks:
+            chunks.append((current_tasks, self.get_required_hf_names_for_tasks(current_tasks)))
+        return chunks
+
+    @torch.no_grad()
+    def load_hf_views(self, state: Mapping[str, torch.Tensor], tasks: Sequence[Any] | None = None) -> int:
+        """Convert CUDA HF views and overwrite the existing local Megatron
+        shards."""
+        tasks = list(tasks) if tasks is not None else self.get_hf_to_megatron_tasks()
+        required_names = self.get_required_hf_names_for_tasks(tasks)
+        missing = [name for name in required_names if name not in state]
+        if missing:
+            raise ValueError(f"SGLang export is missing {len(missing)} weights: {missing[:8]}")
+
+        task_by_key = {(task.vp_stage or 0, task.param_name): task for task in tasks}
+        source = SimpleNamespace(state=state)
+        converted_count = 0
+        for converted in self._bridge.stream_weights_hf_to_megatron(
+            source,
+            self._model,
+            conversion_tasks=tasks,
+        ):
+            key = (converted.vp_stage or 0, converted.param_name)
+            task = task_by_key.get(key)
+            if task is None:
+                raise ValueError(f"Bridge returned an unknown Megatron weight: {key}")
+            target = task.param_weight
+            if converted.weight.shape != target.shape:
+                raise ValueError(
+                    f"Shape mismatch for {task.global_param_name}: "
+                    f"export={tuple(converted.weight.shape)}, target={tuple(target.shape)}"
+                )
+            if converted.weight.dtype != target.dtype:
+                raise ValueError(
+                    f"Dtype mismatch for {task.global_param_name}: "
+                    f"export={converted.weight.dtype}, target={target.dtype}"
+                )
+            target.copy_(converted.weight)
+            converted_count += 1
+
+        if converted_count != len(tasks):
+            raise ValueError(f"Bridge converted {converted_count} weights, expected {len(tasks)}")
+        return converted_count
 
     def broadcast_and_apply_configs(self) -> None:
         """Broadcast ``_config_map`` across PP ranks and patch remaining tasks.

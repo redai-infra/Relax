@@ -237,7 +237,11 @@ class Actor(Base):
         # by /predict, no async GPU contention.
         if is_sft_mode(self.config):
             return True
-        if self.config.offload_rollout and self._rollout_barrier is not None:
+        if (
+            self.config.offload_rollout
+            and self._rollout_barrier is not None
+            and not getattr(self.config, "colocate_weight_handoff", False)
+        ):
             self._rollout_barrier.wait_offloaded_sync()
 
         # PPO colocate: also block until critic has finished this round
@@ -250,7 +254,6 @@ class Actor(Base):
             and self.step >= getattr(self.config, "num_critic_only_steps", 0)
         ):
             self._peer_barrier.wait_completed_round_sync(self.step)
-
         return True
 
     def _execute_training(self) -> bool:

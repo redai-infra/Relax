@@ -88,6 +88,13 @@ class UpdateWeightFromTensor:
         self._model_update_groups = None
         self.distributed_rollout_engines: list[ActorHandle] = []
 
+    @property
+    def bridge_converter(self):
+        converter = getattr(self._hf_weight_iterator, "_bridge_converter", None)
+        if converter is None:
+            raise RuntimeError("Colocate weight handoff requires the Megatron Bridge weight iterator")
+        return converter
+
     def connect_rollout_engines(
         self,
         rollout_engines: Sequence[ActorHandle],
