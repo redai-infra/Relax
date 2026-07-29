@@ -441,6 +441,17 @@ def get_reinforce_plus_plus_returns(
     Returns:
         List[torch.Tensor]: A list of return (G_t) tensors for the
                             local sequence chunks owned by the current GPU rank.
+
+    Convention notes (see ``docs/algorithms/reinforce_plus_plus.md``):
+      * The scalar ``rewards[i]`` is injected **only** at the last masked
+        (response) token; prompt/padding tokens never receive it, and tokens
+        after the last response token stay zero.
+      * CP-aware: each rank gathers the full response (``all_gather_with_cp``),
+        computes G_t on the full sequence, then slices its local chunk
+        (``slice_log_prob_with_cp``); CP sharding is invariant on valid tokens.
+      * Unlike ``reinforce_plus_plus_baseline``, no group baseline is subtracted
+        (raw ``rewards`` are used); advantage whitening is applied later in the
+        sync path when ``--normalize-advantages`` is set.
     """
     from megatron.core import mpu
 
@@ -496,14 +507,30 @@ def get_reinforce_plus_plus_baseline_advantages(
     """Calculates the unwhitened advantages for the REINFORCE++-baseline
     algorithm.
 
-    Broadcasting the scalar (reward - group_baseline) to each token.
+    Broadcasting the scalar ``(reward - group_baseline) - kl_coef * kl`` to each
+    token, i.e. the per-token KL penalty is subtracted from the broadcast
+    scalar advantage and there is **no discounting** (contrast
+    ``get_reinforce_plus_plus_returns``, which uses a discounted Monte-Carlo
+    return).
+
+    Baseline convention (see ``docs/algorithms/reinforce_plus_plus.md``): the group
+    baseline is **not** subtracted here. It is subtracted upstream in
+    ``relax.utils.utils.post_process_rewards`` (group-mean, no std division —
+    unlike GRPO/GSPO/SAPO/CISPO which additionally divide by group std). The
+    ``rewards`` passed in therefore already carry ``(r - group_mean)``. The
+    optional ``--normalize-advantages`` whitening is applied later in the sync
+    path ``relax/backends/megatron/loss.py:compute_advantages_and_returns``.
 
     Args:
         rewards (Tensor): A tensor of scalar rewards, where the group-wise
-                                baseline has already been subtracted.
+                                baseline has already been subtracted upstream.
         kl (list[Tensor]): A list of per-token KL divergence tensors. Used to
                                  get the shape for broadcasting.
-        loss_masks (list[Tensor]): A list of per-token loss masks.
+        loss_masks (list[Tensor]): A list of per-token loss masks. Accepted for
+                                 API symmetry with
+                                 ``get_reinforce_plus_plus_returns``; not used
+                                 here because the per-token mask is enforced
+                                 downstream in loss reduction.
         kl_coef (float): Coefficient for the KL penalty.
 
     Returns:

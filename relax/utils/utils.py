@@ -184,6 +184,13 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
+        # Group-mean baseline subtraction. Note the convention difference (see
+        # docs/algorithms/reinforce_plus_plus.md): GRPO/GSPO/SAPO/CISPO also
+        # divide by group std below, whereas reinforce_plus_plus_baseline only
+        # subtracts the group mean (no std) — its advantage function then
+        # broadcasts (reward - group_mean) - kl_coef * kl per token.
+        # reinforce_plus_plus (non-baseline) is intentionally NOT here: it uses
+        # raw rewards with a discounted Monte-Carlo return and no group baseline.
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)
         positions_by_group: dict[int, list[int]] = {}
