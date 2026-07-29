@@ -3,7 +3,9 @@
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,6 +20,46 @@ SPEC.loader.exec_module(analyzer)
 FINGERPRINT_0 = "00000000000000000000000000000001"
 FINGERPRINT_1 = "00000000000000000000000000000002"
 FULL_FINGERPRINT = "00000000000000000000000000000003"
+
+
+def _install_fake_matplotlib(monkeypatch):
+    """Install the plotting API subset used by the analyzer for minimal CI."""
+    matplotlib = types.ModuleType("matplotlib")
+    matplotlib.__path__ = []
+    matplotlib.use = MagicMock()
+    pyplot = types.ModuleType("matplotlib.pyplot")
+    pyplot.tight_layout = MagicMock()
+    pyplot.close = MagicMock()
+    pyplot.figure = MagicMock()
+    pyplot.plot = MagicMock()
+    pyplot.xlabel = MagicMock()
+    pyplot.ylabel = MagicMock()
+    pyplot.legend = MagicMock()
+    pyplot.title = MagicMock()
+    pyplot.savefig = MagicMock(side_effect=lambda path, **_kwargs: Path(path).write_bytes(b"deterministic plot"))
+
+    def axes(count):
+        return [MagicMock() for _ in range(count)]
+
+    matrix_axes = {(row, column): MagicMock() for row in range(2) for column in range(2)}
+    for axis in matrix_axes.values():
+        axis.get_legend_handles_labels.return_value = ([], [])
+
+    class AxesGrid:
+        def __getitem__(self, key):
+            return matrix_axes[key]
+
+    pyplot.subplots = MagicMock(
+        side_effect=[
+            (MagicMock(), axes(2)),
+            (MagicMock(), axes(3)),
+            (MagicMock(), AxesGrid()),
+            (MagicMock(), axes(2)),
+        ]
+    )
+    matplotlib.pyplot = pyplot
+    monkeypatch.setitem(sys.modules, "matplotlib", matplotlib)
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", pyplot)
 
 
 def _event(
@@ -608,7 +650,7 @@ def test_comparison_rejects_mixed_candidate_commits():
         )
 
 
-def test_comparison_plot_bundle_is_generated(tmp_path):
+def test_comparison_plot_bundle_is_generated(tmp_path, monkeypatch):
     analyses = [
         _comparison_analysis("baseline", 1, 100, 10),
         _comparison_analysis("experiment", 1, 106, 8),
@@ -620,6 +662,9 @@ def test_comparison_plot_bundle_is_generated(tmp_path):
         windows=((4, 8), (9, 13), (14, 18)),
         enforce_targets=True,
     )
+
+    if importlib.util.find_spec("matplotlib") is None:
+        _install_fake_matplotlib(monkeypatch)
 
     generated = analyzer._plot_comparison(
         analyses,
@@ -636,6 +681,16 @@ def test_comparison_plot_bundle_is_generated(tmp_path):
         "task21_window_summary.png",
     }
     assert all(Path(path).stat().st_size > 0 for path in generated)
+
+
+def test_comparison_plot_bundle_fails_fast_without_matplotlib(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "matplotlib", None)
+
+    with pytest.raises(
+        analyzer.BenchmarkValidationError,
+        match="plot generation requires the optional dependency 'matplotlib'",
+    ):
+        analyzer._plot_comparison([], {}, tmp_path, ())
 
 
 @pytest.mark.parametrize(

@@ -1338,8 +1338,11 @@ def _plot_comparison(
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-    except ImportError:
-        return []
+    except ImportError as exc:
+        raise BenchmarkValidationError(
+            "comparison plot generation requires the optional dependency "
+            "'matplotlib'; install it in the benchmark environment"
+        ) from exc
 
     output_dir.mkdir(parents=True, exist_ok=True)
     generated = []
