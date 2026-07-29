@@ -420,13 +420,25 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
-| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
+| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。批量调用默认保留旧的 `def custom_rm(args, samples)` 契约。 |
+| `--custom-rm-per-sample` | flag | False | 显式让非 group 的批量 custom reward 逐样本调用。启用 `--group-rm` 时忽略此开关。 |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |
 | `--group-rm` | flag | False | 是否对整个 group 做 Reward 计算 |
 | `--rm-url` | str | None | 远程 Reward 模型服务 URL（用于 `--rm-type remote_rm`） |
 | `--custom-reward-post-process-path` | str | None | 自定义 reward 后处理函数路径。默认是 GRPO 的归一化处理 |
 | `--custom-convert-samples-to-train-data-path` | str | None | 自定义样本到训练数据的转换函数。签名：`def convert_samples_to_train_data(args, samples) -> dict` |
+
+### Custom Reward 批量兼容性
+
+现有 batch custom reward 无需修改即可保持兼容：不要设置 `--custom-rm-per-sample`，并继续使用 `def custom_rm(args, samples)` 签名。
+
+如需迁移到逐样本并发执行：
+
+1. 将函数的第二个参数从 `samples` 改为单个 `sample`。
+2. 在启动命令中添加 `--custom-rm-per-sample`。
+
+Relax 收集逐样本结果时会保持输入顺序。同步函数在 RewardWorker 池中运行，异步函数仍在调用方进程中运行。`--group-rm` 始终优先生效；即使同时设置 `--custom-rm-per-sample`，也只会将完整 sample 列表传入一次。如果取消后同步函数仍阻塞 Worker，Relax 可能替换该 Worker；下一次请求会重新构建其 custom function 缓存。
 
 ---
 

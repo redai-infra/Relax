@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Custom reward fixtures used by Task 19 integration tests."""
+"""Custom reward fixtures used by RewardExecutor integration tests."""
 
 import asyncio
 import functools
@@ -30,6 +30,15 @@ def sync_timed_reward(args, sample, **kwargs):
         "started_at": started_at,
         "finished_at": time.monotonic(),
     }
+
+
+def sync_cancellable_reward(args, sample, **kwargs):
+    if sample.response == "block":
+        import ray
+
+        ray.get(args.test_probe.mark_started.remote(os.getpid()))
+        time.sleep(args.test_reward_delay)
+    return {"pid": os.getpid(), "index": sample.index}
 
 
 def sync_maybe_failing_reward(args, sample, **kwargs):

@@ -1962,7 +1962,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Path to the custom reward model function. "
                     "If set, we will use this function to calculate the reward instead of the default one. "
-                    "The function should have the signature `def custom_rm(args, sample) -> float`."
+                    "Batched calls use the legacy `def custom_rm(args, samples)` contract by default."
+                ),
+            )
+            parser.add_argument(
+                "--custom-rm-per-sample",
+                action="store_true",
+                default=False,
+                help=(
+                    "Opt in to calling a custom reward once per sample for non-group batches. "
+                    "By default, batched custom rewards receive the complete sample list for backward compatibility. "
+                    "When enabled, use the `def custom_rm(args, sample)` signature."
                 ),
             )
             parser.add_argument(
@@ -1999,11 +2009,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=64,
                 help=(
-                    "Maximum number of concurrent reward computations (per sample; "
-                    "group_rm=False scores by sample). This controls the global "
+                    "Maximum number of concurrent reward computations. This controls the global "
                     "asyncio.Semaphore that limits how many reward tasks run at once. "
-                    "Reward counts by sample, so over_sampling=N groups x n_samples = N*ns "
-                    "samples per step flow through this gate. Each sample fans out to several "
+                    "Built-in rewards and custom rewards using --custom-rm-per-sample count by sample; "
+                    "legacy and group custom rewards count once per batch or group. Each sample may fan out to several "
                     "LLM judges, so when raising this keep it within the upstream judge "
                     "endpoint concurrency (see reward_config *.yaml max_concurrency). "
                     "Default 64; set explicitly on the launch command when over-sampling."

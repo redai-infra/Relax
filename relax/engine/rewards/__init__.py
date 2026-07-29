@@ -28,6 +28,7 @@ from .openr1mm import get_openr1mm_rule_based_reward
 
 logger = get_logger(__name__)
 _shared_session: aiohttp.ClientSession | None = None
+_ACTOR_CANCEL_GRACE_SECONDS = 1.0
 
 
 def _reload_function_in_process(function_path: str) -> object:
@@ -70,6 +71,9 @@ class RewardWorker:
 
     def __init__(self):
         self._custom_rm_functions: dict[str, tuple[tuple[str, int], object]] = {}
+
+    def ping(self) -> None:
+        """Return once this single-threaded actor can accept more work."""
 
     def compute(self, rm_type: str, response: str, label, metadata: dict | None = None):
         """Dispatch to the appropriate synchronous reward function.
@@ -147,6 +151,7 @@ class RewardExecutor:
         self._num_workers = num_workers
         self._semaphore: asyncio.Semaphore | None = None
         self._workers: list = []
+        self._worker_locks: list[asyncio.Lock] = []
         self._worker_index = 0
         self._custom_rm_functions: dict[str, tuple[tuple[str, int], object]] = {}
 
@@ -174,16 +179,17 @@ class RewardExecutor:
                 ).remote()
                 for i in range(self._num_workers)
             ]
+            self._worker_locks = [asyncio.Lock() for _ in range(self._num_workers)]
             logger.info(
                 "RewardExecutor: created %d RewardWorker actors (max_concurrency=%s)",
                 self._num_workers,
                 self._max_concurrency,
             )
 
-    def _next_worker(self):
-        worker = self._workers[self._worker_index % self._num_workers]
+    def _next_worker_index(self) -> int:
+        worker_index = self._worker_index % self._num_workers
         self._worker_index += 1
-        return worker
+        return worker_index
 
     def _get_custom_rm_function(self, custom_rm_path: str):
         reload_token = get_reload_token(custom_rm_path)
@@ -209,15 +215,52 @@ class RewardExecutor:
 
         return is_async(function) or is_async(getattr(function, "__call__", None))
 
-    @staticmethod
-    async def _await_actor_ref(ref):
+    def _replace_worker(self, worker_index: int, worker) -> None:
+        """Hard-kill a stuck worker and replace its pool slot.
+
+        Ray also fails any other calls already queued on the killed actor; new
+        calls use the replacement handle stored in the pool.
+        """
+        if self._workers[worker_index] is not worker:
+            return
+
+        try:
+            ray.kill(worker, no_restart=True)
+        except Exception:
+            logger.warning("Failed to kill unresponsive reward worker %d", worker_index, exc_info=True)
+
+        # Use an unnamed actor here so replacement does not race with Ray
+        # releasing the killed actor's stable name.
+        self._workers[worker_index] = RewardWorker.remote()
+        logger.warning("Replaced unresponsive reward worker %d after task cancellation", worker_index)
+
+    async def _cancel_actor_ref(self, ref, worker_index: int, worker) -> None:
+        try:
+            ray.cancel(ref, force=False, recursive=True)
+        except Exception:
+            logger.warning("Failed to cancel reward actor task", exc_info=True)
+
+        # A cancelled ObjectRef does not prove that a synchronous actor method
+        # stopped. Probe the same single-threaded actor and replace it if the
+        # method still occupies the worker after the grace period.
+        try:
+            ping_ref = worker.ping.remote()
+            await asyncio.wait_for(ping_ref, timeout=_ACTOR_CANCEL_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            self._replace_worker(worker_index, worker)
+        except asyncio.CancelledError:
+            self._replace_worker(worker_index, worker)
+            raise
+        except Exception:
+            # The worker may already have died or been replaced by another
+            # concurrent cancellation. Ensure this slot remains usable.
+            self._replace_worker(worker_index, worker)
+
+    async def _await_actor_ref(self, ref, worker_index: int, worker):
         try:
             return await ref
         except asyncio.CancelledError:
-            try:
-                ray.cancel(ref, force=False, recursive=True)
-            except Exception:
-                logger.warning("Failed to cancel reward actor task", exc_info=True)
+            await self._cancel_actor_ref(ref, worker_index, worker)
             raise
 
     @staticmethod
@@ -240,9 +283,11 @@ class RewardExecutor:
                 return await rm_function(args, sample, **kwargs)
 
             self._ensure_workers()
-            worker = self._next_worker()
-            ref = worker.compute_custom.remote(custom_rm_path, reload_token, args, sample, kwargs)
-            return await self._await_actor_ref(ref)
+            worker_index = self._next_worker_index()
+            async with self._worker_locks[worker_index]:
+                worker = self._workers[worker_index]
+                ref = worker.compute_custom.remote(custom_rm_path, reload_token, args, sample, kwargs)
+                return await self._await_actor_ref(ref, worker_index, worker)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -300,9 +345,11 @@ class RewardExecutor:
         # Default to sync path for any non-empty rm_type not in async dispatch
         if rm_type:
             self._ensure_workers()
-            worker = self._next_worker()
-            ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
-            return await self._await_actor_ref(ref)
+            worker_index = self._next_worker_index()
+            async with self._worker_locks[worker_index]:
+                worker = self._workers[worker_index]
+                ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
+                return await self._await_actor_ref(ref, worker_index, worker)
 
         # --- no rm_type specified -----------------------------------------
         raise NotImplementedError("Rule-based RM type is not specified.")
@@ -381,8 +428,12 @@ async def batched_async_rm(
     **kwargs,
 ) -> list[int | float | dict[str, Any]]:
     use_custom_reward = args.custom_rm_path is not None and not kwargs.get("ignore_custom", False)
-    if use_custom_reward and getattr(args, "group_rm", False):
-        # Group reward functions receive the complete group in one call.
+    per_sample_custom_reward = (
+        use_custom_reward and getattr(args, "custom_rm_per_sample", False) and not getattr(args, "group_rm", False)
+    )
+    if use_custom_reward and not per_sample_custom_reward:
+        # Preserve the legacy custom reward contract unless per-sample mode is
+        # explicitly enabled. Group rewards always receive the complete list.
         return await async_rm(args, samples, **kwargs)
 
     async def score_sample(position: int, sample: Sample):
@@ -391,7 +442,7 @@ async def batched_async_rm(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if not use_custom_reward:
+            if not per_sample_custom_reward:
                 raise
             raise RuntimeError(f"Custom reward {args.custom_rm_path!r} failed at batch position {position}") from exc
 
