@@ -334,11 +334,16 @@ step end wall time 和 duration 重建。sampled peak VRAM 仍使用 full-run
 launcher log，以及值为 0 的训练、验证和最终退出状态文件。
 manifest 还会记录并交叉校验 `max_staleness`、global/rollout batch size、
 每 prompt 样本数和 actor chunk 数，避免分析器 CLI 与实际工作负载静默不一致。
+注册的四阶段协议还要求每个 rollout 恰好执行四次、每次 64 sample 的 producer
+put；producer 重新分组会导致验证失败。
 在计算任何配对统计前，分析器还要求模型、模型配置、数据路径、prompt/response/
 context 上限、actor token 预算、actor/rollout 资源拓扑、SGLang 确定性与显存
 配置、物理卡到容器卡映射、checkpoint 模式以及 debug 捕获/回放配置完全一致；
-字段缺失或取值不同都会 fail closed。成对 run 的 global-index fingerprint
-必须精确一致；启用 SGLang 确定性推理时，总 token、response token 与多模态
+字段缺失或取值不同都会 fail closed。
+此外还要求 hostname，以及由 GPU UUID、型号、PCI 地址和驱动版本生成的
+SHA-256 硬件指纹完全一致。
+成对 run 的 global-index fingerprint 必须精确一致；启用 SGLang 确定性推理时，
+总 token、response token 与多模态
 tensor 字节数也必须精确一致，不使用容差。comparison JSON 同时报告重复实验
 的均值、中位数、范围、总体标准差和变异系数。
 staleness 曲线来自 trace：在 actor 首次 forward 时，用已完成 put 的最大

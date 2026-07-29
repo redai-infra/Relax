@@ -349,11 +349,15 @@ exit-status artifacts for every run.
 The manifest also records and cross-checks `max_staleness`, global/rollout
 batch sizes, samples per prompt, and actor chunk count, so CLI expectations
 cannot silently disagree with the measured workload.
+The registered four-stage protocol additionally requires exactly four producer
+puts of 64 samples for every rollout; regrouped producer puts fail validation.
 Before any paired statistics are calculated, the analyzer also requires
 identical model/config/data paths, prompt/response/context limits, actor token
 budget, actor/rollout resource topology, SGLang determinism and memory
 settings, physical-to-container GPU mapping, checkpoint mode, and debug
 capture/replay settings. Missing workload fields or any mismatch fail closed.
+The hostname and a SHA-256 fingerprint over GPU UUID, model, PCI address, and
+driver version must also match across the comparison.
 Paired global-index fingerprints must match exactly. When deterministic SGLang
 inference is enabled, total, response, and multimodal-byte workloads must also
 match exactly rather than within a tolerance. The comparison JSON reports the

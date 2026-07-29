@@ -126,6 +126,7 @@ def _write_run(
         json.dumps(
             {
                 "condition": "experiment" if pipeline_enabled else "baseline",
+                "hostname": hostname,
                 "order": "B1" if pipeline_enabled else "A1",
                 "seed": 7,
                 "rollout_seed": 7,
@@ -330,6 +331,28 @@ def test_producer_put_grouping_is_independent_from_actor_chunks(tmp_path, produc
     assert analysis.trace_rows[0]["producer_put_count"] == producer_put_count
     assert analysis.trace_rows[0]["actor_fetch_count"] == 2
     assert analysis.trace_rows[0]["actor_forward_count"] == 2
+
+
+def test_registered_producer_stage_shape_is_enforced(tmp_path):
+    run_dir = _write_run(tmp_path, producer_put_count=2)
+
+    analysis = analyzer.analyze_run(
+        run_dir,
+        windows=((4, 4),),
+        expected_samples=4,
+        expected_actor_chunks=2,
+        expected_producer_chunks=2,
+    )
+    assert analysis.trace_rows[0]["producer_put_count"] == 2
+
+    with pytest.raises(analyzer.BenchmarkValidationError, match="expected 4 producer chunks"):
+        analyzer.analyze_run(
+            run_dir,
+            windows=((4, 4),),
+            expected_samples=4,
+            expected_actor_chunks=2,
+            expected_producer_chunks=4,
+        )
 
 
 def test_delayed_put_done_is_not_strict_producer_overlap(tmp_path):
@@ -566,6 +589,7 @@ def _comparison_analysis(
     return analyzer.RunAnalysis(
         run_dir=Path(f"/{condition}-{seed}"),
         manifest={
+            "hostname": "test-host",
             "condition": condition,
             "order": ("A" if condition == "baseline" else "B") + str(seed),
             "seed": seed,
@@ -601,6 +625,7 @@ def _comparison_analysis(
             "rollout_num_gpus_per_engine": 1,
             "physical_gpu_indices": [0, 1, 2, 3, 5],
             "container_cuda_visible_devices": [0, 1, 2, 3, 4],
+            "gpu_hardware_fingerprint": "9" * 64,
             "checkpoint_save": False,
             "sglang_deterministic_inference": 1,
             "sglang_mem_fraction_static": 0.8,

@@ -73,6 +73,7 @@ QUALITY_TAG_FRAGMENTS = (
     "staleness",
 )
 RUN_MANIFEST_REQUIRED_FIELDS = {
+    "hostname",
     "condition",
     "order",
     "seed",
@@ -97,6 +98,7 @@ RUN_MANIFEST_REQUIRED_FIELDS = {
     "entrypoint",
 }
 COMPARISON_FIXED_MANIFEST_FIELDS = (
+    "hostname",
     "num_rollout",
     "max_staleness",
     "global_batch_size",
@@ -129,6 +131,7 @@ COMPARISON_WORKLOAD_MANIFEST_FIELDS = (
     "rollout_num_gpus_per_engine",
     "physical_gpu_indices",
     "container_cuda_visible_devices",
+    "gpu_hardware_fingerprint",
     "checkpoint_save",
     "sglang_deterministic_inference",
     "sglang_mem_fraction_static",
@@ -277,7 +280,7 @@ def _validate_run_manifest(
     if trace_dir != expected_trace_dir:
         _fail(f"{run_dir} manifest trace directory is {trace_dir}, expected {expected_trace_dir}")
 
-    for key in ("condition", "order", "git_branch", "python", "entrypoint"):
+    for key in ("hostname", "condition", "order", "git_branch", "python", "entrypoint"):
         if not isinstance(manifest[key], str) or not manifest[key].strip():
             _fail(f"{run_dir} manifest field {key!r} must be a non-empty string")
 
@@ -304,6 +307,12 @@ def _validate_run_manifest(
         length=40,
         context=f"{run_dir} transferqueue_commit",
     )
+    if "gpu_hardware_fingerprint" in manifest:
+        _validate_hex_digest(
+            manifest["gpu_hardware_fingerprint"],
+            length=64,
+            context=f"{run_dir} gpu_hardware_fingerprint",
+        )
 
 
 def _require_reproducibility_artifacts(run_dir: Path) -> None:
@@ -443,6 +452,7 @@ def _analyze_trace(
     pipeline_enabled: bool,
     expected_samples: int,
     expected_actor_chunks: int,
+    expected_producer_chunks: int | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     producer_by_rollout: dict[int, list[dict[str, Any]]] = defaultdict(list)
     actor_by_rollout_stream: dict[tuple[int, tuple[str, int, int]], list[dict[str, Any]]] = defaultdict(list)
@@ -480,6 +490,22 @@ def _analyze_trace(
         put_done = [end for _, end in put_pairs]
         if any(row["sample_count"] is None for row in put_done):
             _fail(f"rollout_id={rollout_id} producer put is missing sample_count")
+        if expected_producer_chunks is not None:
+            if expected_samples % expected_producer_chunks != 0:
+                _fail(
+                    "expected_samples must be divisible by expected_producer_chunks, "
+                    f"got {expected_samples=} and {expected_producer_chunks=}"
+                )
+            expected_producer_chunk_samples = expected_samples // expected_producer_chunks
+            producer_chunk_samples = [int(row["sample_count"] or 0) for row in put_done]
+            if len(put_pairs) != expected_producer_chunks or any(
+                sample_count != expected_producer_chunk_samples for sample_count in producer_chunk_samples
+            ):
+                _fail(
+                    f"rollout_id={rollout_id} expected {expected_producer_chunks} producer "
+                    f"chunks of {expected_producer_chunk_samples} samples, got "
+                    f"{producer_chunk_samples}"
+                )
         producer_samples = sum(int(row["sample_count"]) for row in put_done)
         if producer_samples != expected_samples:
             _fail(
@@ -969,6 +995,7 @@ def analyze_run(
     windows: Sequence[tuple[int, int]] = DEFAULT_WINDOWS,
     expected_samples: int = 256,
     expected_actor_chunks: int = 2,
+    expected_producer_chunks: int | None = None,
     write_outputs: bool = True,
     require_reproducibility_artifacts: bool = False,
 ) -> RunAnalysis:
@@ -1004,6 +1031,7 @@ def analyze_run(
         pipeline_enabled=pipeline_enabled,
         expected_samples=expected_samples,
         expected_actor_chunks=expected_actor_chunks,
+        expected_producer_chunks=expected_producer_chunks,
     )
     scalar_rows = _load_tensorboard_scalars(run_dir)
     nvml_rows = _parse_nvml_rows(run_dir)
@@ -1661,7 +1689,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-actor-chunks",
         type=int,
         default=2,
-        help="Expected actor fetch/forward chunks when the pipeline is enabled; producer put grouping is dynamic.",
+        help="Expected actor fetch/forward chunks when the pipeline is enabled.",
+    )
+    parser.add_argument(
+        "--expected-producer-chunks",
+        type=int,
+        default=None,
+        help="Require an exact producer put count and equal sample count per put.",
     )
     parser.add_argument(
         "--expected-gpu-count",
@@ -1691,8 +1725,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         windows = _parse_windows(args.steady_windows)
-        if args.expected_samples <= 0 or args.expected_actor_chunks <= 0 or args.expected_gpu_count <= 0:
-            _fail("expected sample, actor chunk, and GPU counts must be positive")
+        if (
+            args.expected_samples <= 0
+            or args.expected_actor_chunks <= 0
+            or args.expected_gpu_count <= 0
+            or (args.expected_producer_chunks is not None and args.expected_producer_chunks <= 0)
+        ):
+            _fail("expected sample, actor chunk, producer chunk, and GPU counts must be positive")
         if len(args.run_dir) > 1 and args.output_dir is None:
             _fail("--output-dir is required when comparing multiple runs")
         if args.validate_only and args.enforce_targets:
@@ -1704,6 +1743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 windows=windows,
                 expected_samples=args.expected_samples,
                 expected_actor_chunks=args.expected_actor_chunks,
+                expected_producer_chunks=args.expected_producer_chunks,
                 require_reproducibility_artifacts=args.enforce_targets,
             )
             for run_dir in args.run_dir
