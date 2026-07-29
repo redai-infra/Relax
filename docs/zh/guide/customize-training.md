@@ -115,13 +115,31 @@ python scripts/tools/process_avqa.py \
 
 ## 自定义 Reward 方法
 
-您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
+在自己的 `.py` 文件中定义单样本 Reward
+`reward_func(args, sample: Sample, **kwargs) -> int | float | dict`，或 batch/group Reward
+`reward_func(args, samples: list[Sample], **kwargs) -> list[int | float | dict]`，然后在启动脚本中配置其导入路径。
+具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # 自定义 reward_func 允许返回 dict，但若如此您需要明确哪个 key 对应于实际的 reward 得分
 --reward-key score
 ```
+
+同步函数在进程隔离的 Ray `RewardWorker` Actor 中运行。使用 `async def` 声明的函数在调用方进程中直接
+`await`，不使用 worker 池。`--reward-num-workers` 设置同步 worker 数量，`--reward-max-concurrency`
+限制每个调用方进程内同时执行的 Reward 调用数。
+
+batch/group 自定义 Reward 每次接收完整的样本列表，一次调用只占用一个并发名额。自定义函数按需加载并缓存，
+直到显式触发 `custom_rm` reload。
+
+同步自定义 Reward 的输入和返回值必须可由 Ray 序列化。
+
+> **警告：外部 I/O 必须设置超时**
+>
+> 取消调用方或对应的 Ray task 只是 best-effort，**不能保证终止**已经在 `RewardWorker` 中执行的 Python
+> 函数。HTTP、RPC、数据库调用等可能阻塞的外部 I/O 操作必须显式设置 timeout。否则，该 worker 可能一直被占用，
+> 直到函数返回，后续分配到此 worker 的 Reward 调用也必须继续等待。
 
 ### 格式感知的 Reward 路由
 
