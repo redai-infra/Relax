@@ -235,6 +235,49 @@ bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
   hybrid-async
 ```
 
+同一脚本还提供默认行为不变的实验开关，避免为了 smoke 或配对基准临时修改
+脚本正文：
+
+| 环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `MODEL_CONFIG_FILE` | `qwen35-9B.sh` | 选择模型并行配置脚本 |
+| `MODEL_NAME` / `MODEL_RUN_NAME` | `Qwen3.5-9B` / `qwen35-9b` | 选择 checkpoint 子目录和日志前缀 |
+| `MODEL_CHECKPOINT_DIR` / `REFERENCE_CHECKPOINT_DIR` | `${MODEL_DIR}/${MODEL_NAME}` | 显式固定 actor 与 reference 输入 |
+| `CHECKPOINT_SAVE` | `1` | 设为 `0` 时不传 `--save*`；改用独立 rollout 与 TensorBoard 输出目录 |
+| `ROLLOUT_RESULT_DIR` / `TENSORBOARD_DIR` | 保存开启时不覆盖；关闭时为 `${EXP_DIR}/rollout_result` 和 `${EXP_DIR}/tensorboard_log` | 在 no-save 运行中保留原始结果和标量；`TENSORBOARD_DIR` 会导出给 MetricsService |
+| `ROLLOUT_MAX_RESPONSE_LEN` / `ROLLOUT_MAX_PROMPT_LEN` / `ROLLOUT_MAX_CONTEXT_LEN` | `10240` / `2048` / `12288` | 固定生成和上下文上限 |
+| `ACTOR_MAX_TOKENS_PER_GPU` | `12288` | 控制 dynamic-batch actor microbatch 的 token 上限 |
+| `HYBRID_ACTOR_GPUS` / `HYBRID_ROLLOUT_GPUS` | `4` / `4` | 构造 Hybrid placement resource |
+| `ROLLOUT_NUM_GPUS_PER_ENGINE` | `2` | 设置每个 SGLang engine 的 TP 数 |
+| `SGLANG_MEM_FRACTION_STATIC` | `0.8` | 设置 SGLang 静态显存比例 |
+
+脚本会在提交 Ray Job 前校验正整数、上下文容量、rollout GPU 可整除关系，
+以及 actor GPU 数是当前 TP=2、CP=2 拓扑的整数倍。不满足约束会直接退出，
+不会在 Ray worker 内静默降级。
+
+例如，以下命令用于资源受限环境中的 no-save Qwen3-VL-8B 功能 smoke；
+它不是 8 卡 Qwen3.5 性能结果：
+
+```bash
+MODEL_CONFIG_FILE="${MODEL_CONFIG_DIR}/qwen3-vl-8B.sh" \
+MODEL_NAME=Qwen3-VL-8B-Instruct \
+MODEL_RUN_NAME=qwen3-vl-8b \
+CHECKPOINT_SAVE=0 \
+ROLLOUT_MAX_RESPONSE_LEN=512 \
+ROLLOUT_MAX_PROMPT_LEN=2048 \
+ROLLOUT_MAX_CONTEXT_LEN=2560 \
+ACTOR_MAX_TOKENS_PER_GPU=6144 \
+HYBRID_ACTOR_GPUS=4 \
+HYBRID_ROLLOUT_GPUS=1 \
+ROLLOUT_NUM_GPUS_PER_ENGINE=1 \
+HYBRID_PIPELINE_FORWARD=1 \
+bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
+  hybrid-async
+```
+
+资源拓扑、模型或长度上限变化后，只能与完全相同配置的 baseline 做配对
+比较；不得与默认 8 卡配方合并统计。
+
 Trace 按 hostname、role、PID 和 global rank 分文件。内容仅包括时间戳、
 样本与 token 计数、多模态 tensor 字节数、CUDA 峰值以及不可逆的 global-index
 fingerprint；不会写 prompt、response、图片或样本 tensor。

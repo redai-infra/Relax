@@ -239,6 +239,51 @@ bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
   hybrid-async
 ```
 
+The same launcher provides default-preserving experiment overrides so a smoke
+run or paired benchmark does not require editing the script:
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `MODEL_CONFIG_FILE` | `qwen35-9B.sh` | Select the model-parallel configuration script |
+| `MODEL_NAME` / `MODEL_RUN_NAME` | `Qwen3.5-9B` / `qwen35-9b` | Select the checkpoint subdirectory and log prefix |
+| `MODEL_CHECKPOINT_DIR` / `REFERENCE_CHECKPOINT_DIR` | `${MODEL_DIR}/${MODEL_NAME}` | Pin actor and reference inputs explicitly |
+| `CHECKPOINT_SAVE` | `1` | Set to `0` to omit all `--save*` arguments and use separate rollout/TensorBoard outputs |
+| `ROLLOUT_RESULT_DIR` / `TENSORBOARD_DIR` | No override while saving; `${EXP_DIR}/rollout_result` and `${EXP_DIR}/tensorboard_log` without saving | Preserve raw results and scalars in no-save runs; `TENSORBOARD_DIR` is exported for MetricsService |
+| `ROLLOUT_MAX_RESPONSE_LEN` / `ROLLOUT_MAX_PROMPT_LEN` / `ROLLOUT_MAX_CONTEXT_LEN` | `10240` / `2048` / `12288` | Pin generation and context limits |
+| `ACTOR_MAX_TOKENS_PER_GPU` | `12288` | Bound dynamic-batch actor microbatch tokens |
+| `HYBRID_ACTOR_GPUS` / `HYBRID_ROLLOUT_GPUS` | `4` / `4` | Build the Hybrid placement resource |
+| `ROLLOUT_NUM_GPUS_PER_ENGINE` | `2` | Set each SGLang engine's tensor-parallel width |
+| `SGLANG_MEM_FRACTION_STATIC` | `0.8` | Set SGLang's static memory fraction |
+
+Before submitting a Ray Job, the launcher validates positive integers, context
+capacity, rollout-GPU divisibility, and that actor GPU counts are multiples of
+the current TP=2, CP=2 topology. Invalid combinations fail before Ray workers
+start instead of silently degrading.
+
+For example, this is a no-save Qwen3-VL-8B functional smoke for a constrained
+machine. It is not an 8-GPU Qwen3.5 performance result:
+
+```bash
+MODEL_CONFIG_FILE="${MODEL_CONFIG_DIR}/qwen3-vl-8B.sh" \
+MODEL_NAME=Qwen3-VL-8B-Instruct \
+MODEL_RUN_NAME=qwen3-vl-8b \
+CHECKPOINT_SAVE=0 \
+ROLLOUT_MAX_RESPONSE_LEN=512 \
+ROLLOUT_MAX_PROMPT_LEN=2048 \
+ROLLOUT_MAX_CONTEXT_LEN=2560 \
+ACTOR_MAX_TOKENS_PER_GPU=6144 \
+HYBRID_ACTOR_GPUS=4 \
+HYBRID_ROLLOUT_GPUS=1 \
+ROLLOUT_NUM_GPUS_PER_ENGINE=1 \
+HYBRID_PIPELINE_FORWARD=1 \
+bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
+  hybrid-async
+```
+
+After changing the model, resource topology, or length limits, compare only
+against a baseline with the identical configuration. Do not pool such runs
+with the default 8-GPU recipe.
+
 Trace files are separated by hostname, role, PID, and global rank. They contain
 timestamps, counts, token totals, multimodal tensor byte counts, CUDA peaks,
 and an irreversible global-index fingerprint; prompts, responses, images, and

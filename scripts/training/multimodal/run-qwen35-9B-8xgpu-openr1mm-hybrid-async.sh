@@ -21,14 +21,29 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
-# source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
+MODEL_CONFIG_FILE="${MODEL_CONFIG_FILE:-${MODEL_CONFIG_DIR}/qwen35-9B.sh}"
+if [ ! -f "${MODEL_CONFIG_FILE}" ]; then
+    echo "MODEL_CONFIG_FILE does not exist: ${MODEL_CONFIG_FILE}" >&2
+    exit 2
+fi
+source "${MODEL_CONFIG_FILE}"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/fully_async_openr1mm}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+MODEL_NAME="${MODEL_NAME:-Qwen3.5-9B}"
+MODEL_RUN_NAME="${MODEL_RUN_NAME:-qwen35-9b}"
+MODEL_CHECKPOINT_DIR="${MODEL_CHECKPOINT_DIR:-${MODEL_DIR}/${MODEL_NAME}}"
+REFERENCE_CHECKPOINT_DIR="${REFERENCE_CHECKPOINT_DIR:-${MODEL_CHECKPOINT_DIR}}"
+
+CHECKPOINT_SAVE="${CHECKPOINT_SAVE:-1}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${EXP_DIR}/${MODEL_NAME}_mcore_8xgpu/}"
+CHECKPOINT_SAVE_INTERVAL="${CHECKPOINT_SAVE_INTERVAL:-100}"
+MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-1}"
+ROLLOUT_RESULT_DIR="${ROLLOUT_RESULT_DIR:-}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-}"
 
 HYBRID_PIPELINE_FORWARD="${HYBRID_PIPELINE_FORWARD:-0}"
 HYBRID_PIPELINE_TRACE_DIR="${HYBRID_PIPELINE_TRACE_DIR:-}"
@@ -36,6 +51,34 @@ HYBRID_PIPELINE_FETCH_TIMEOUT_S="${HYBRID_PIPELINE_FETCH_TIMEOUT_S:-600}"
 SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-0}"
 SEED="${SEED:-}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-}"
+
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-10240}"
+ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-2048}"
+ROLLOUT_MAX_CONTEXT_LEN="${ROLLOUT_MAX_CONTEXT_LEN:-12288}"
+ACTOR_MAX_TOKENS_PER_GPU="${ACTOR_MAX_TOKENS_PER_GPU:-12288}"
+HYBRID_ACTOR_GPUS="${HYBRID_ACTOR_GPUS:-4}"
+HYBRID_ROLLOUT_GPUS="${HYBRID_ROLLOUT_GPUS:-4}"
+SYNC_GPUS="${SYNC_GPUS:-8}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.8}"
+
+require_positive_integer() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${name} must be a positive integer, got ${value}" >&2
+        exit 2
+    fi
+}
+
+require_fraction() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "${value}" =~ ^(0\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
+        echo "${name} must be greater than 0 and at most 1, got ${value}" >&2
+        exit 2
+    fi
+}
 
 case "${MODE}" in
   hybrid-async|sync) ;;
@@ -58,11 +101,92 @@ case "${SGLANG_DETERMINISTIC_INFERENCE}" in
     exit 2
     ;;
 esac
+case "${CHECKPOINT_SAVE}" in
+  0|1) ;;
+  *)
+    echo "CHECKPOINT_SAVE must be 0 or 1, got ${CHECKPOINT_SAVE}" >&2
+    exit 2
+    ;;
+esac
 if [ "${MODE}" != "hybrid-async" ] && {
     [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] || [ -n "${HYBRID_PIPELINE_TRACE_DIR}" ];
 }; then
     echo "Hybrid pipeline forward/trace options require MODE=hybrid-async" >&2
     exit 2
+fi
+
+for item in \
+    "NUM_ROLLOUT:${NUM_ROLLOUT}" \
+    "HYBRID_PIPELINE_FETCH_TIMEOUT_S:${HYBRID_PIPELINE_FETCH_TIMEOUT_S}" \
+    "ROLLOUT_MAX_RESPONSE_LEN:${ROLLOUT_MAX_RESPONSE_LEN}" \
+    "ROLLOUT_MAX_PROMPT_LEN:${ROLLOUT_MAX_PROMPT_LEN}" \
+    "ROLLOUT_MAX_CONTEXT_LEN:${ROLLOUT_MAX_CONTEXT_LEN}" \
+    "ACTOR_MAX_TOKENS_PER_GPU:${ACTOR_MAX_TOKENS_PER_GPU}" \
+    "HYBRID_ACTOR_GPUS:${HYBRID_ACTOR_GPUS}" \
+    "HYBRID_ROLLOUT_GPUS:${HYBRID_ROLLOUT_GPUS}" \
+    "SYNC_GPUS:${SYNC_GPUS}" \
+    "ROLLOUT_NUM_GPUS_PER_ENGINE:${ROLLOUT_NUM_GPUS_PER_ENGINE}"; do
+    require_positive_integer "${item%%:*}" "${item#*:}"
+done
+if [ "${CHECKPOINT_SAVE}" = "1" ]; then
+    require_positive_integer "CHECKPOINT_SAVE_INTERVAL" "${CHECKPOINT_SAVE_INTERVAL}"
+    require_positive_integer "MAX_ACTOR_CKPT_TO_KEEP" "${MAX_ACTOR_CKPT_TO_KEEP}"
+fi
+if (( ROLLOUT_MAX_CONTEXT_LEN < ROLLOUT_MAX_PROMPT_LEN + ROLLOUT_MAX_RESPONSE_LEN )); then
+    echo "ROLLOUT_MAX_CONTEXT_LEN must cover prompt + response limits" >&2
+    exit 2
+fi
+if (( HYBRID_ROLLOUT_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE != 0 )); then
+    echo "HYBRID_ROLLOUT_GPUS must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE" >&2
+    exit 2
+fi
+if (( SYNC_GPUS % ROLLOUT_NUM_GPUS_PER_ENGINE != 0 )); then
+    echo "SYNC_GPUS must be divisible by ROLLOUT_NUM_GPUS_PER_ENGINE" >&2
+    exit 2
+fi
+if (( HYBRID_ACTOR_GPUS % 4 != 0 || SYNC_GPUS % 4 != 0 )); then
+    echo "actor GPU counts must be multiples of TP(2) * CP(2)" >&2
+    exit 2
+fi
+if [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] && [ "${HYBRID_ACTOR_GPUS}" != "4" ]; then
+    echo "HYBRID_PIPELINE_FORWARD currently requires TP=2, CP=2, DP=1 (4 actor GPUs)" >&2
+    exit 2
+fi
+require_fraction "SGLANG_MEM_FRACTION_STATIC" "${SGLANG_MEM_FRACTION_STATIC}"
+
+if [ "${CHECKPOINT_SAVE}" = "0" ]; then
+    ROLLOUT_RESULT_DIR="${ROLLOUT_RESULT_DIR:-${EXP_DIR}/rollout_result}"
+    TENSORBOARD_DIR="${TENSORBOARD_DIR:-${EXP_DIR}/tensorboard_log}"
+fi
+if [ -n "${TENSORBOARD_DIR}" ]; then
+    export TENSORBOARD_DIR
+    RUNTIME_ENV_JSON_INPUT="${RUNTIME_ENV_JSON:-}"
+    if [ -z "${RUNTIME_ENV_JSON_INPUT}" ]; then
+        RUNTIME_ENV_JSON_INPUT='{}'
+    fi
+    RUNTIME_ENV_JSON="$(
+        python3 - "${RUNTIME_ENV_JSON_INPUT}" "${TENSORBOARD_DIR}" <<'PY'
+import json
+import sys
+
+runtime_env = json.loads(sys.argv[1])
+if not isinstance(runtime_env, dict):
+    raise SystemExit("RUNTIME_ENV_JSON must decode to an object")
+env_vars = runtime_env.setdefault("env_vars", {})
+if not isinstance(env_vars, dict):
+    raise SystemExit("RUNTIME_ENV_JSON env_vars must be an object")
+env_vars["TENSORBOARD_DIR"] = sys.argv[2]
+print(json.dumps(runtime_env, separators=(",", ":"), sort_keys=True))
+PY
+    )"
+fi
+
+HYBRID_RESOURCE="{\"actor\": [1, ${HYBRID_ACTOR_GPUS}], \"rollout\": [1, ${HYBRID_ROLLOUT_GPUS}]}"
+SYNC_RESOURCE="{\"actor\": [1, ${SYNC_GPUS}], \"rollout\": [1, ${SYNC_GPUS}]}"
+if [ "${MODE}" = "hybrid-async" ]; then
+    RUN_GPU_COUNT=$((HYBRID_ACTOR_GPUS + HYBRID_ROLLOUT_GPUS))
+else
+    RUN_GPU_COUNT="${SYNC_GPUS}"
 fi
 
 HYBRID_PIPELINE_ARGS=()
@@ -108,39 +232,59 @@ printf '%s\n' \
     "HYBRID_PIPELINE_FETCH_TIMEOUT_S=${HYBRID_PIPELINE_FETCH_TIMEOUT_S}" \
     "SEED=${SEED}" \
     "ROLLOUT_SEED=${ROLLOUT_SEED}" \
-    "SGLANG_DETERMINISTIC_INFERENCE=${SGLANG_DETERMINISTIC_INFERENCE}"
+    "SGLANG_DETERMINISTIC_INFERENCE=${SGLANG_DETERMINISTIC_INFERENCE}" \
+    "MODEL_CONFIG_FILE=${MODEL_CONFIG_FILE}" \
+    "MODEL_CHECKPOINT_DIR=${MODEL_CHECKPOINT_DIR}" \
+    "REFERENCE_CHECKPOINT_DIR=${REFERENCE_CHECKPOINT_DIR}" \
+    "CHECKPOINT_SAVE=${CHECKPOINT_SAVE}" \
+    "CHECKPOINT_DIR=${CHECKPOINT_DIR}" \
+    "ROLLOUT_RESULT_DIR=${ROLLOUT_RESULT_DIR}" \
+    "TENSORBOARD_DIR=${TENSORBOARD_DIR}" \
+    "ACTOR_MAX_TOKENS_PER_GPU=${ACTOR_MAX_TOKENS_PER_GPU}" \
+    "HYBRID_RESOURCE=${HYBRID_RESOURCE}" \
+    "SYNC_RESOURCE=${SYNC_RESOURCE}" \
+    "RUN_GPU_COUNT=${RUN_GPU_COUNT}"
 
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
-   --ref-load ${MODEL_DIR}/Qwen3.5-9B
-   # --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct
+   --hf-checkpoint "${MODEL_CHECKPOINT_DIR}"
+   --ref-load "${REFERENCE_CHECKPOINT_DIR}"
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
-   # --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct
-   # --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
-   --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
-   --save-interval 100
-   --max-actor-ckpt-to-keep 1
 )
+if [ "${CHECKPOINT_SAVE}" = "1" ]; then
+    CKPT_ARGS+=(
+        --save "${CHECKPOINT_DIR}"
+        --save-interval "${CHECKPOINT_SAVE_INTERVAL}"
+        --max-actor-ckpt-to-keep "${MAX_ACTOR_CKPT_TO_KEEP}"
+    )
+fi
 
-PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
+OUTPUT_ARGS=()
+if [ -n "${ROLLOUT_RESULT_DIR}" ]; then
+    OUTPUT_ARGS+=(--rollout-result-dir "${ROLLOUT_RESULT_DIR}")
+fi
+if [ -n "${TENSORBOARD_DIR}" ]; then
+    OUTPUT_ARGS+=(--tensorboard-dir "${TENSORBOARD_DIR}")
+fi
+
+PROMPT_SET="${PROMPT_SET:-${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet}"
 
 SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
 
 ROLLOUT_ARGS=(
-   --prompt-data ${PROMPT_SET}
+   --prompt-data "${PROMPT_SET}"
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
    --rm-type openr1mm
-   --num-rollout ${NUM_ROLLOUT}
+   --num-rollout "${NUM_ROLLOUT}"
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 10240
-   --rollout-max-prompt-len 2048
-   --rollout-max-context-len 12288
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
+   --rollout-max-prompt-len "${ROLLOUT_MAX_PROMPT_LEN}"
+   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
    --rollout-temperature 0.8
    --global-batch-size 256
    --multimodal-keys '{"image":"image"}'
@@ -164,7 +308,7 @@ PERF_ARGS=(
    # --micro-batch-size 16
    # --qkv-format bshd
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 12288
+   --max-tokens-per-gpu "${ACTOR_MAX_TOKENS_PER_GPU}"
    --no-rope-fusion
 )
 
@@ -198,13 +342,13 @@ WANDB_ARGS=(
    --use-tensorboard
    --use-clearml
    --use-metrics-service
-   --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9b-GRPO-gpu8-${MODE}-${now}
+   --tb-project-name "${PROJECT_NAME}"
+   --tb-experiment-name "${MODEL_RUN_NAME}-GRPO-gpu${RUN_GPU_COUNT}-${MODE}-${now}"
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.8
+   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
+   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
 )
 
 MISC_ARGS=(
@@ -225,7 +369,7 @@ if [ "${MODE}" = "hybrid-async" ]; then
      ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
         --runtime-env-json="${RUNTIME_ENV_JSON}" \
         -- python3 -m relax.entrypoints.train \
-        --resource '{"actor": [1, 4], "rollout": [1, 4]}'\
+        --resource "${HYBRID_RESOURCE}" \
    --max-staleness 2 \
         --num-data-storage-units 1 \
         --num-iters-per-train-update 2  \
@@ -236,18 +380,19 @@ if [ "${MODE}" = "hybrid-async" ]; then
         "${DEBUG_ARGS[@]}" \
         "${MODEL_ARGS[@]}" \
         "${CKPT_ARGS[@]}" \
+        "${OUTPUT_ARGS[@]}" \
         "${ROLLOUT_ARGS[@]}" \
         "${OPTIMIZER_ARGS[@]}" \
         "${GRPO_ARGS[@]}" \
         "${WANDB_ARGS[@]}" \
         "${PERF_ARGS[@]}" \
         "${SGLANG_ARGS[@]}" \
-        "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_DIR}/qwen35-9b-GRPO-gpu8-hybrid-async-${now}.log"
+        "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_DIR}/${MODEL_RUN_NAME}-GRPO-gpu${RUN_GPU_COUNT}-hybrid-async-${now}.log"
 else
     ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
          --runtime-env-json="${RUNTIME_ENV_JSON}" \
          -- python3 -m relax.entrypoints.train \
-         --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+         --resource "${SYNC_RESOURCE}" \
          --max-staleness 0 \
          --num-data-storage-units 1 \
          --colocate \
@@ -257,11 +402,12 @@ else
          "${DEBUG_ARGS[@]}" \
          "${MODEL_ARGS[@]}" \
          "${CKPT_ARGS[@]}" \
+         "${OUTPUT_ARGS[@]}" \
          "${ROLLOUT_ARGS[@]}" \
          "${OPTIMIZER_ARGS[@]}" \
          "${GRPO_ARGS[@]}" \
          "${WANDB_ARGS[@]}" \
          "${PERF_ARGS[@]}" \
          "${SGLANG_ARGS[@]}" \
-         "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_DIR}/qwen35-9b-GRPO-gpu8-fully-sync-${now}.log"
+         "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_DIR}/${MODEL_RUN_NAME}-GRPO-gpu${RUN_GPU_COUNT}-fully-sync-${now}.log"
 fi
