@@ -117,11 +117,12 @@ class OpdManager:
         return self.opsd_worker is not None
 
     def schema_opd_transfer_data(self) -> list[str]:
+        eopd = getattr(self.args, "use_eopd", False)
         fields: list[str] = []
         if self.topk_worker is not None:
-            fields.extend(self.topk_worker.topk_transfer_fields())
+            fields.extend(self.topk_worker.topk_transfer_fields(eopd=eopd))
         if self.sampled_worker is not None:
-            fields.extend(self.sampled_worker.sampled_transfer_fields())
+            fields.extend(self.sampled_worker.sampled_transfer_fields(eopd=eopd))
         return fields
 
     def produce_opd_transfer_data(self, samples: list[Sample], train_data: dict) -> None:
@@ -145,6 +146,11 @@ class OpdManager:
         elif self.sampled_worker is not None:
             train_data[opd_main_worker.SampledTokenWorker.TRANSFER_TEACHER_LOG_PROBS] = [
                 s.teacher_log_probs if s.teacher_log_probs is not None else [] for s in samples
+            ]
+
+        if getattr(self.args, "use_eopd", False):
+            train_data["teacher_entropy"] = [
+                s.teacher_entropy if s.teacher_entropy is not None else [] for s in samples
             ]
 
     def before_rollout(self, payload: dict) -> None:
@@ -302,6 +308,11 @@ class OpdManager:
                 sample.teacher_at_student_topk_log_probs = self.topk_worker.parse_prefill_other_topk(
                     resp_obj, response_length
                 )
+
+        if getattr(self.args, "use_eopd", False):
+            entropy = resp_obj.entropy_1d()
+            if entropy is not None and len(entropy) >= response_length:
+                sample.teacher_entropy = [float(v) for v in entropy[1 : 1 + response_length]]
 
         return True
 

@@ -54,11 +54,17 @@ def _base_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def test_eopd_requires_megatron_type(opd_utils_module, monkeypatch, tmp_path):
+def test_eopd_rejects_unknown_opd_type(opd_utils_module, monkeypatch, tmp_path):
+    args = _base_args(opd_type="unknown_type", opd_teacher_load=None, opd_teacher_url="http://t/generate")
+    monkeypatch.setattr("os.path.exists", lambda p: True)
+    with pytest.raises(ValueError, match="megatron.*sglang"):
+        opd_utils_module.validate_opd_args(args, is_sft=False)
+
+
+def test_eopd_accepts_sglang_type(opd_utils_module, monkeypatch):
     args = _base_args(opd_type="sglang", opd_teacher_load=None, opd_teacher_url="http://t/generate")
     monkeypatch.setattr("os.path.exists", lambda p: True)
-    with pytest.raises(ValueError, match="megatron"):
-        opd_utils_module.validate_opd_args(args, is_sft=False)
+    opd_utils_module.validate_opd_args(args, is_sft=False)
 
 
 def test_eopd_requires_loss_mode(opd_utils_module, monkeypatch):

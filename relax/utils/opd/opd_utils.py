@@ -858,8 +858,8 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
 
     # EOPD validation
     if getattr(args, "use_eopd", False):
-        if args.opd_type != "megatron":
-            raise ValueError("--use-eopd requires --opd-type=megatron (teacher entropy needs full-vocab logits).")
+        if args.opd_type not in ("megatron", "sglang"):
+            raise ValueError("--use-eopd requires --opd-type=megatron or --opd-type=sglang.")
         if opd_loss_coef == 0.0:
             raise ValueError("--use-eopd requires --opd-loss-coef > 0 (loss mode).")
         eopd_top_k = int(getattr(args, "eopd_fkl_top_k", 0) or 0)

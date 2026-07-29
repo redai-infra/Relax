@@ -195,6 +195,11 @@ def _launch_server_with_patches(server_args: ServerArgs):
 
         apply_opd_preexpanded_patch()
 
+    if os.environ.get("RELAX_OPD_ENTROPY_PATCH", "0") == "1":
+        from relax.utils.opd.opd_sglang_entropy_patch import apply_opd_entropy_patch
+
+        apply_opd_entropy_patch()
+
     if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:

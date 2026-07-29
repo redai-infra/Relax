@@ -72,6 +72,15 @@ class LogprobResponse:
         pair = self._decode_topk_2d("input_token_ids_logprobs", response_length, top_k)
         return pair[1] if pair is not None else None
 
+    def entropy_1d(self) -> np.ndarray | None:
+        """Decode per-token entropy injected by the EOPD entropy patch."""
+        raw = self.meta.get("relax_input_entropy_b64")
+        if not raw:
+            return None
+        b64_str = raw[0] if isinstance(raw, list) else raw
+        val = self._b64_decode(b64_str, "float32")
+        return val if val.size else None
+
 
 def build_prefill_payload_base(input_ids: list[int], logprob_start_len: int) -> dict:
     return {
@@ -91,8 +100,11 @@ class SampledTokenWorker:
     def from_args(cls, args) -> "SampledTokenWorker":
         return cls()
 
-    def sampled_transfer_fields(self) -> list[str]:
-        return [self.TRANSFER_TEACHER_LOG_PROBS, self.TRANSFER_STUDENT_LOG_PROBS]
+    def sampled_transfer_fields(self, eopd: bool = False) -> list[str]:
+        fields = [self.TRANSFER_TEACHER_LOG_PROBS, self.TRANSFER_STUDENT_LOG_PROBS]
+        if eopd:
+            fields.append(self.TRANSFER_TEACHER_ENTROPY)
+        return fields
 
 
 class TopkWorker:
@@ -271,12 +283,14 @@ class TopkWorker:
         out[self.TRANSFER_K_LENGTHS] = k_lengths
         return out
 
-    def topk_transfer_fields(self) -> list[str]:
+    def topk_transfer_fields(self, eopd: bool = False) -> list[str]:
         fields: list[str] = [self.TRANSFER_TOKEN_IDS, self.TRANSFER_TEACHER_LOG_PROBS]
         if self.is_advantage:
             fields.append(self.TRANSFER_STUDENT_LOG_PROBS)
         if self.spec.name == "union":
             fields.append(self.TRANSFER_K_LENGTHS)
+        if eopd:
+            fields.append(self.TRANSFER_TEACHER_ENTROPY)
         return fields
 
 
