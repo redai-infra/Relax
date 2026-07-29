@@ -1,0 +1,120 @@
+[
+  {
+    "name": "missing_resource",
+    "expected_rule": "CONFIG_RESOURCE_REQUIRED",
+    "config": {"resource": null}
+  },
+  {
+    "name": "invalid_resource_shape",
+    "expected_rule": "CONFIG_RESOURCE_SHAPE",
+    "config": {"resource": {"actor": [2, 8], "rollout": [1, 8]}}
+  },
+  {
+    "name": "unsupported_algorithm",
+    "expected_rule": "CONFIG_ALGORITHM_SUPPORTED",
+    "config": {"advantage_estimator": "unknown_algo"}
+  },
+  {
+    "name": "missing_required_role",
+    "expected_rule": "CONFIG_REQUIRED_ROLES",
+    "config": {"resource": {"actor": [1, 8]}}
+  },
+  {
+    "name": "mode_conflict",
+    "expected_rule": "CONFIG_MODE_CONFLICT",
+    "config": {"fully_async": true, "colocate": true, "hybrid": false}
+  },
+  {
+    "name": "debug_mode_conflict",
+    "expected_rule": "CONFIG_DEBUG_MODE_CONFLICT",
+    "config": {"debug_rollout_only": true, "debug_train_only": true}
+  },
+  {
+    "name": "ppo_missing_critic",
+    "expected_rule": "CONFIG_PPO_TOPOLOGY",
+    "config": {"advantage_estimator": "ppo", "resource": {"actor": [1, 8], "rollout": [1, 8]}}
+  },
+  {
+    "name": "sft_missing_prompt_data",
+    "expected_rule": "CONFIG_SFT_REQUIREMENTS",
+    "config": {"loss_type": "sft", "resource": {"sft": [1, 0], "actor": [1, 8]}, "prompt_data": null}
+  },
+  {
+    "name": "missing_batch_size",
+    "expected_rule": "CONFIG_BATCH_SIZE",
+    "config": {"rollout_batch_size": null, "global_batch_size": null}
+  },
+  {
+    "name": "missing_rollout_count",
+    "expected_rule": "CONFIG_ROLLOUT_COUNT",
+    "config": {"num_rollout": null, "num_epoch": null}
+  },
+  {
+    "name": "bad_oversampling",
+    "expected_rule": "CONFIG_OVERSAMPLING",
+    "config": {"over_sampling_batch_size": 2, "rollout_batch_size": 4}
+  },
+  {
+    "name": "dynamic_batch_without_budget",
+    "expected_rule": "CONFIG_DYNAMIC_BATCH",
+    "config": {"use_dynamic_batch_size": true, "max_tokens_per_gpu": null}
+  },
+  {
+    "name": "context_budget_too_small",
+    "expected_rule": "CONFIG_CONTEXT_LENGTH",
+    "config": {
+      "use_dynamic_batch_size": true,
+      "max_tokens_per_gpu": 1024,
+      "context_parallel_size": 1,
+      "rollout_max_context_len": 2048
+    }
+  },
+  {
+    "name": "sglang_bad_parallel",
+    "expected_rule": "CONFIG_SGLANG_PARALLEL",
+    "config": {"rollout_num_gpus_per_engine": 3, "sglang_pp_size": 2}
+  },
+  {
+    "name": "eval_interval_missing_dataset",
+    "expected_rule": "CONFIG_EVAL",
+    "config": {"eval_interval": 10, "eval_datasets": null, "eval_prompt_data": null}
+  },
+  {
+    "name": "save_interval_without_save",
+    "expected_rule": "CONFIG_SAVE",
+    "config": {"save_interval": 10, "save": null}
+  },
+  {
+    "name": "genrm_bad_split",
+    "expected_rule": "CONFIG_GENRM_COLOCATE",
+    "config": {
+      "genrm_model_path": "/tmp/genrm",
+      "colocate": true,
+      "rollout_num_gpus": 3,
+      "genrm_num_gpus": 3,
+      "actor_num_gpus_per_node": 8,
+      "actor_num_nodes": 1,
+      "resource": {"actor": [1, 8], "rollout": [1, 3], "genrm": [1, 3]}
+    }
+  },
+  {
+    "name": "missing_local_path",
+    "expected_rule": "CONFIG_PATHS",
+    "config": {"prompt_data": "./tests/doctor/fixtures/not_exists.jsonl"}
+  },
+  {
+    "name": "lora_conflict",
+    "expected_rule": "CONFIG_LORA",
+    "config": {"lora_rank": 8, "lora_merge_mode": true, "lora_adapter_mode": true}
+  },
+  {
+    "name": "qkv_dynamic_batch",
+    "expected_rule": "CONFIG_QKV_FORMAT",
+    "config": {"qkv_format": "bshd", "use_dynamic_batch_size": true}
+  },
+  {
+    "name": "rotate_ckpt_missing_options",
+    "expected_rule": "CONFIG_ROTATE_CKPT",
+    "config": {"rotate_ckpt": true, "save": null, "save_interval": null, "async_save": false}
+  }
+]
