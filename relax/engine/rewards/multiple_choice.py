@@ -2,6 +2,7 @@
 
 import re
 
+from relax.engine.rewards.registry import register_reward
 
 ANS_TAG = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.S)
 
@@ -16,3 +17,13 @@ def get_multiple_choice_reward(response, label):
     label = extract_answer(label)
     reward = 1.0 if response == label else 0.0
     return reward
+
+
+@register_reward("multiple_choice")
+def multiple_choice_reward(response, label, metadata=None):
+    """Reward function for the ``multiple_choice`` type.
+
+    Registered via ``@register_reward("multiple_choice")`` so it
+    participates in the format-aware reward routing system.
+    """
+    return get_multiple_choice_reward(response, label)
