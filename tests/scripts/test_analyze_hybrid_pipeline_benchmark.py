@@ -22,6 +22,16 @@ FINGERPRINT_1 = "00000000000000000000000000000002"
 FULL_FINGERPRINT = "00000000000000000000000000000003"
 
 
+def test_parser_help_renders_percent_targets(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        analyzer.build_parser().parse_args(["--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--enforce-targets" in output
+    assert "5% throughput, 15% phase-1, and 80% overlap" in " ".join(output.split())
+
+
 def _install_fake_matplotlib(monkeypatch):
     """Install the plotting API subset used by the analyzer for minimal CI."""
     matplotlib = types.ModuleType("matplotlib")

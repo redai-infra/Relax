@@ -1568,7 +1568,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enforce-targets",
         action="store_true",
-        help="Require the preregistered 5% throughput, 15% phase-1, and 80% overlap targets.",
+        help="Require the preregistered 5%% throughput, 15%% phase-1, and 80%% overlap targets.",
     )
     parser.add_argument(
         "--no-plots",
