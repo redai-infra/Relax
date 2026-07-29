@@ -119,6 +119,29 @@ def test_hybrid_forward_chunk_plan_matches_producer_granularity(monkeypatch):
     ] == [0, 1, 2, 3, 4, 5]
 
 
+def test_hybrid_forward_chunk_plan_supports_four_prompt_aligned_stages(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=4,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=1)
+
+    chunk_plan = data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=1)
+
+    assert chunk_plan.chunks_per_mini == 4
+    assert chunk_plan.chunk_global_samples == 64
+    assert chunk_plan.chunk_local_samples == 64
+    assert [
+        chunk_plan.transfer_queue_batch_index(mini_index, chunk_index)
+        for mini_index in range(2)
+        for chunk_index in range(chunk_plan.chunks_per_mini)
+    ] == list(range(8))
+
+
 @pytest.mark.parametrize(
     ("num_iters", "global_batch_size", "n_samples_per_prompt", "error"),
     [

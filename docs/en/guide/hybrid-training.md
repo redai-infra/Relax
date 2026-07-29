@@ -235,6 +235,7 @@ The reference launcher exposes the options as environment variables:
 HYBRID_PIPELINE_FORWARD=1 \
 HYBRID_PIPELINE_TRACE_DIR=/data01/LWX/relax-task21/runs/smoke/timeline \
 HYBRID_PIPELINE_FETCH_TIMEOUT_S=600 \
+NUM_ITERS_PER_TRAIN_UPDATE=4 \
 bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
   hybrid-async
 ```
@@ -249,6 +250,7 @@ run or paired benchmark does not require editing the script:
 | `MODEL_CHECKPOINT_DIR` / `REFERENCE_CHECKPOINT_DIR` | `${MODEL_DIR}/${MODEL_NAME}` | Pin actor and reference inputs explicitly |
 | `CHECKPOINT_SAVE` | `1` | Set to `0` to omit all `--save*` arguments and use separate rollout/TensorBoard outputs |
 | `ROLLOUT_RESULT_DIR` / `TENSORBOARD_DIR` | No override while saving; `${EXP_DIR}/rollout_result` and `${EXP_DIR}/tensorboard_log` without saving | Preserve raw results and scalars in no-save runs; `TENSORBOARD_DIR` is exported for MetricsService |
+| `NUM_ITERS_PER_TRAIN_UPDATE` | `2` | Set the prompt-group-aligned producer and actor chunk count for each optimizer mini |
 | `ROLLOUT_MAX_RESPONSE_LEN` / `ROLLOUT_MAX_PROMPT_LEN` / `ROLLOUT_MAX_CONTEXT_LEN` | `10240` / `2048` / `12288` | Pin generation and context limits |
 | `ACTOR_MAX_TOKENS_PER_GPU` | `12288` | Bound dynamic-batch actor microbatch tokens |
 | `HYBRID_ACTOR_GPUS` / `HYBRID_ROLLOUT_GPUS` | `4` / `4` | Build the Hybrid placement resource |
@@ -260,8 +262,17 @@ capacity, rollout-GPU divisibility, and that actor GPU counts are multiples of
 the current TP=2, CP=2 topology. Invalid combinations fail before Ray workers
 start instead of silently degrading.
 
-For example, this is a no-save Qwen3-VL-8B functional smoke for a constrained
-machine. It is not an 8-GPU Qwen3.5 performance result:
+With the reference `global_batch_size=256` and
+`n_samples_per_prompt=8`, setting `NUM_ITERS_PER_TRAIN_UPDATE=4` creates four
+64-sample stages. Each stage therefore contains eight complete prompt groups.
+Baseline and experiment runs in a pair must use the same value: the baseline
+waits for and forwards the full mini, while the optional pipeline fetches and
+forwards the four stages incrementally.
+
+For example, this is a no-save Qwen3-VL-8B configuration for a constrained
+machine. It may be used for a resource-qualified smoke or paired performance
+benchmark, but its results must be labeled separately from the default 8-GPU
+Qwen3.5 recipe:
 
 ```bash
 MODEL_CONFIG_FILE="${MODEL_CONFIG_DIR}/qwen3-vl-8B.sh" \
@@ -272,6 +283,7 @@ ROLLOUT_MAX_RESPONSE_LEN=512 \
 ROLLOUT_MAX_PROMPT_LEN=2048 \
 ROLLOUT_MAX_CONTEXT_LEN=2560 \
 ACTOR_MAX_TOKENS_PER_GPU=6144 \
+NUM_ITERS_PER_TRAIN_UPDATE=4 \
 HYBRID_ACTOR_GPUS=4 \
 HYBRID_ROLLOUT_GPUS=1 \
 ROLLOUT_NUM_GPUS_PER_ENGINE=1 \
@@ -319,7 +331,8 @@ before the producer starts its final put. The final put completion is retained
 only as a transfer-stage diagnostic because its trace write can lose a
 scheduling race with the consumer. With `--enforce-targets`, the analyzer also
 checks per-run strict producer overlap, step-time p95,
-eight-GPU NVML coverage, peak VRAM, token/multimodal-byte workload, and the
+the configured expected-GPU NVML coverage, peak VRAM,
+token/multimodal-byte workload, and the
 raw-reward, truncation-rate, and staleness guardrails. It uses `sum(step_tokens) /
 sum(step_time)` for aggregate throughput rather than averaging per-step rates.
 The truncation guardrail reads the rollout-side
@@ -330,8 +343,9 @@ whose wall time falls inside the registered steady step intervals reconstructed
 from TensorBoard `perf/step_time`; sampled peak VRAM remains a full-run safety
 metric.
 The strict comparison additionally requires a clean run manifest, identical
-candidate/image/TransferQueue identities, and non-empty input hashes,
-dependency freeze, wheel hash, and launcher log for every run.
+candidate/image/TransferQueue identities, verified static-input hashes,
+dependency freeze, wheel hash, launcher log, and zero training/validation/final
+exit-status artifacts for every run.
 The manifest also records and cross-checks `max_staleness`, global/rollout
 batch sizes, samples per prompt, and actor chunk count, so CLI expectations
 cannot silently disagree with the measured workload.
@@ -340,6 +354,11 @@ identical model/config/data paths, prompt/response/context limits, actor token
 budget, actor/rollout resource topology, SGLang determinism and memory
 settings, physical-to-container GPU mapping, checkpoint mode, and debug
 capture/replay settings. Missing workload fields or any mismatch fail closed.
+Paired global-index fingerprints must match exactly. When deterministic SGLang
+inference is enabled, total, response, and multimodal-byte workloads must also
+match exactly rather than within a tolerance. The comparison JSON reports the
+mean, median, range, population standard deviation, and coefficient of
+variation across paired repeats.
 The staleness curve is the trace-derived producer lead at the first actor
 forward: the largest completed producer rollout ID minus the actor rollout ID
 at that timestamp. The current rollout is considered ready once its actor fetch
@@ -353,6 +372,12 @@ To roll back, omit `--hybrid-pipeline-forward` (or set
 Before widening the support matrix, add collective-order and restore-count
 tests for the new DP/PP/VPP or role graph, then rerun frozen-input parity,
 multimodal smoke, and paired performance measurements.
+
+`--steady-windows 0-0` deliberately measures a fresh-process first optimizer
+step. It is useful when only one training step fits the fixed resource window,
+but it is not a steady-state throughput claim. Label it as a paired first-step
+benchmark, balance launch order across at least two seeds, and use later
+multi-step windows whenever resources permit.
 
 ______________________________________________________________________
 

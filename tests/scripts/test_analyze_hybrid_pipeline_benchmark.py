@@ -546,6 +546,7 @@ def _comparison_analysis(
             "actor_response_tokens": 5_000 + seed,
             "actor_multimodal_tensor_bytes": 1_000_000 + seed,
             "producer_lead_at_first_forward": 1.0,
+            "producer_global_indexes_fingerprint": f"{seed:032x}",
         }
         for rollout_id in range(4, 19)
     ]
@@ -649,6 +650,8 @@ def test_preregistered_targets_pass_and_fail_deterministically():
     assert comparison["hybrid_phase1_geomean_reduction"] == pytest.approx(0.2)
     assert comparison["experiment_steady_producer_overlap_ratio"] == 1.0
     assert len(comparison["window_speedups"]) == 6
+    assert comparison["distributions"]["paired_step_token_per_s_speedup"]["count"] == 2
+    assert comparison["distributions"]["baseline_step_token_per_s"]["coefficient_of_variation"] > 0
 
     failing = [
         _comparison_analysis("baseline", 1, 100, 10),
@@ -698,6 +701,21 @@ def test_comparison_rejects_mixed_or_incomplete_workload_manifests():
     analyses[1].manifest["rollout_max_response_len"] = 1024
     del analyses[1].manifest["physical_gpu_indices"]
     with pytest.raises(analyzer.BenchmarkValidationError, match="missing workload fields"):
+        analyzer._build_comparison(
+            analyses,
+            windows=((4, 8), (9, 13), (14, 18)),
+            enforce_targets=False,
+        )
+
+
+def test_comparison_rejects_changed_global_index_fingerprint():
+    analyses = [
+        _comparison_analysis("baseline", 1, 100, 10),
+        _comparison_analysis("experiment", 1, 106, 8),
+    ]
+    analyses[1].trace_rows[0]["producer_global_indexes_fingerprint"] = "f" * 32
+
+    with pytest.raises(analyzer.BenchmarkValidationError, match="global-index fingerprints differ"):
         analyzer._build_comparison(
             analyses,
             windows=((4, 8), (9, 13), (14, 18)),
@@ -757,7 +775,7 @@ def test_comparison_plot_bundle_fails_fast_without_matplotlib(tmp_path, monkeypa
         ("staleness", "average producer-lead increase exceeds 0.25"),
         ("staleness_max", "observed producer lead exceeds configured max_staleness=2"),
         ("vram", "peak VRAM increased"),
-        ("workload", "actor_total_tokens changed by more than 1%"),
+        ("workload", "actor_total_tokens must match exactly"),
     ],
 )
 def test_preregistered_guardrails_fail_closed(guardrail, error):
@@ -792,3 +810,19 @@ def test_preregistered_guardrails_fail_closed(guardrail, error):
             windows=((4, 8), (9, 13), (14, 18)),
             enforce_targets=True,
         )
+
+
+def test_reproducibility_artifacts_require_all_zero_exit_statuses(tmp_path):
+    run_dir = tmp_path / "run"
+    for relative_path in analyzer.REPRODUCIBILITY_ARTIFACTS:
+        path = run_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("captured\n", encoding="utf-8")
+    for relative_path in analyzer.EXIT_STATUS_ARTIFACTS:
+        (run_dir / relative_path).write_text("0\n", encoding="utf-8")
+
+    analyzer._require_reproducibility_artifacts(run_dir)
+
+    (run_dir / "validation_exit_status.txt").write_text("2\n", encoding="utf-8")
+    with pytest.raises(analyzer.BenchmarkValidationError, match="non-zero or invalid"):
+        analyzer._require_reproducibility_artifacts(run_dir)

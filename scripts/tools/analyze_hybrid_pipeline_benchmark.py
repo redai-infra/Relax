@@ -141,6 +141,12 @@ REPRODUCIBILITY_ARTIFACTS = (
     "inputs.sha256",
     "transferqueue-wheel.sha256",
     "logs/launcher.log",
+    "manifests/static-input-verification.log",
+)
+EXIT_STATUS_ARTIFACTS = (
+    "training_exit_status.txt",
+    "validation_exit_status.txt",
+    "exit_status.txt",
 )
 
 
@@ -308,6 +314,16 @@ def _require_reproducibility_artifacts(run_dir: Path) -> None:
             missing.append(relative_path)
     if missing:
         _fail(f"{run_dir} is missing non-empty reproducibility artifacts {missing}")
+    for relative_path in EXIT_STATUS_ARTIFACTS:
+        path = run_dir / relative_path
+        if not path.is_file():
+            _fail(f"{run_dir} is missing exit-status artifact {relative_path}")
+        try:
+            status = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            _fail(f"cannot read {path}: {exc}")
+        if status != "0":
+            _fail(f"{run_dir} has non-zero or invalid {relative_path}: {status!r}")
 
 
 def _load_trace_rows(run_dir: Path) -> list[dict[str, Any]]:
@@ -1037,6 +1053,23 @@ def _geometric_mean(values: Iterable[float]) -> float:
     return math.exp(statistics.fmean(math.log(value) for value in values))
 
 
+def _distribution_summary(values: Iterable[float]) -> dict[str, float | int]:
+    samples = list(values)
+    if not samples:
+        _fail("distribution summary requires at least one value")
+    mean = statistics.fmean(samples)
+    stddev = statistics.pstdev(samples)
+    return {
+        "count": len(samples),
+        "mean": mean,
+        "median": statistics.median(samples),
+        "min": min(samples),
+        "max": max(samples),
+        "population_stddev": stddev,
+        "coefficient_of_variation": stddev / abs(mean) if mean else 0.0,
+    }
+
+
 def _build_comparison(
     analyses: Sequence[RunAnalysis],
     *,
@@ -1126,6 +1159,22 @@ def _build_comparison(
     window_speedups = []
     for seed, pair in sorted(by_seed.items(), key=lambda item: str(item[0])):
         row: dict[str, Any] = {"seed": seed}
+        baseline_fingerprints = {
+            int(trace_row["rollout_id"]): trace_row["producer_global_indexes_fingerprint"]
+            for trace_row in pair["baseline"].trace_rows
+            if int(trace_row["rollout_id"]) in steady_steps
+        }
+        experiment_fingerprints = {
+            int(trace_row["rollout_id"]): trace_row["producer_global_indexes_fingerprint"]
+            for trace_row in pair["experiment"].trace_rows
+            if int(trace_row["rollout_id"]) in steady_steps
+        }
+        if baseline_fingerprints != experiment_fingerprints:
+            _fail(
+                f"seed {seed} producer global-index fingerprints differ between "
+                f"baseline and experiment: baseline={baseline_fingerprints}, "
+                f"experiment={experiment_fingerprints}"
+            )
         for tag in COMPARISON_PERFORMANCE_TAGS:
             baseline_metrics = pair["baseline"].summary["metrics"].get(tag, {})
             experiment_metrics = pair["experiment"].summary["metrics"].get(tag, {})
@@ -1268,6 +1317,24 @@ def _build_comparison(
             else None
         ),
         "experiment_steady_producer_overlap_ratio_by_run": experiment_producer_overlap_by_run,
+        "distributions": {
+            "baseline_step_token_per_s": _distribution_summary(
+                row["perf/step_token_per_s:baseline"] for row in paired if "perf/step_token_per_s:baseline" in row
+            ),
+            "experiment_step_token_per_s": _distribution_summary(
+                row["perf/step_token_per_s:experiment"] for row in paired if "perf/step_token_per_s:experiment" in row
+            ),
+            "paired_step_token_per_s_speedup": _distribution_summary(
+                row["perf/step_token_per_s:improvement"]
+                for row in paired
+                if "perf/step_token_per_s:improvement" in row
+            ),
+            "paired_hybrid_phase1_reduction": _distribution_summary(
+                row["perf/hybrid_phase1_time:improvement"]
+                for row in paired
+                if "perf/hybrid_phase1_time:improvement" in row
+            ),
+        },
     }
 
     if enforce_targets:
@@ -1313,6 +1380,7 @@ def _build_comparison(
             seed = row["seed"]
             if row["actor_fetch_samples:baseline"] != row["actor_fetch_samples:experiment"]:
                 _fail(f"seed {seed} actor fetch sample count changed")
+            deterministic = int(by_seed[seed]["baseline"].manifest["sglang_deterministic_inference"]) == 1
             for field in (
                 "actor_total_tokens",
                 "actor_response_tokens",
@@ -1323,7 +1391,12 @@ def _build_comparison(
                 if baseline_total <= 0 or experiment_total <= 0:
                     _fail(f"seed {seed} {field} must be positive, got {baseline_total}, {experiment_total}")
                 relative_delta = row[f"{field}:relative_delta"]
-                if abs(relative_delta) > 0.01:
+                if deterministic and baseline_total != experiment_total:
+                    _fail(
+                        f"seed {seed} {field} must match exactly under deterministic "
+                        f"inference, got {baseline_total} and {experiment_total}"
+                    )
+                if not deterministic and abs(relative_delta) > 0.01:
                     _fail(f"seed {seed} {field} changed by more than 1%: {relative_delta:.4%}")
 
             vram_baseline = row.get("nvml_peak_memory_mib:baseline")

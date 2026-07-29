@@ -7,13 +7,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LAUNCHER = (
-    REPO_ROOT
-    / "scripts"
-    / "training"
-    / "multimodal"
-    / "run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh"
-)
+LAUNCHER = REPO_ROOT / "scripts" / "training" / "multimodal" / "run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh"
 
 
 def _argument_value(arguments: list[str], flag: str) -> str:
@@ -94,6 +88,7 @@ def test_launcher_preserves_default_qwen35_recipe(tmp_path):
     assert _argument_value(arguments, "--rollout-max-context-len") == "12288"
     assert _argument_value(arguments, "--max-tokens-per-gpu") == "12288"
     assert _argument_value(arguments, "--rollout-num-gpus-per-engine") == "2"
+    assert _argument_value(arguments, "--num-iters-per-train-update") == "2"
     assert _argument_value(arguments, "--save") == f"{tmp_path / 'exp' / 'Qwen3.5-9B_mcore_8xgpu'}/"
     assert _argument_value(arguments, "--save-interval") == "100"
     assert "--rollout-result-dir" not in arguments
@@ -115,18 +110,18 @@ def test_launcher_supports_no_save_memory_safe_smoke_configuration(tmp_path):
             "ACTOR_MAX_TOKENS_PER_GPU": "6144",
             "HYBRID_ROLLOUT_GPUS": "1",
             "ROLLOUT_NUM_GPUS_PER_ENGINE": "1",
+            "NUM_ITERS_PER_TRAIN_UPDATE": "4",
         },
     )
 
     assert result.returncode == 0, result.stderr
     assert _argument_value(arguments, "--resource") == '{"actor": [1, 4], "rollout": [1, 1]}'
-    assert _argument_value(arguments, "--hf-checkpoint") == str(
-        tmp_path / "models" / "Qwen3-VL-8B-Instruct"
-    )
+    assert _argument_value(arguments, "--hf-checkpoint") == str(tmp_path / "models" / "Qwen3-VL-8B-Instruct")
     assert _argument_value(arguments, "--rollout-max-response-len") == "512"
     assert _argument_value(arguments, "--rollout-max-context-len") == "2560"
     assert _argument_value(arguments, "--max-tokens-per-gpu") == "6144"
     assert _argument_value(arguments, "--rollout-num-gpus-per-engine") == "1"
+    assert _argument_value(arguments, "--num-iters-per-train-update") == "4"
     assert "--save" not in arguments
     assert "--save-interval" not in arguments
     assert _argument_value(arguments, "--rollout-result-dir") == str(tmp_path / "exp" / "rollout_result")
@@ -148,5 +143,20 @@ def test_launcher_rejects_invalid_checkpoint_switch_before_ray(tmp_path):
 
     assert result.returncode == 2
     assert "CHECKPOINT_SAVE must be 0 or 1" in result.stderr
+    assert arguments == []
+    assert not capture_path.exists()
+
+
+def test_launcher_rejects_invalid_actor_chunk_count_before_ray(tmp_path):
+    result, arguments, capture_path, _ = _run_launcher(
+        tmp_path,
+        overrides={
+            "HYBRID_PIPELINE_FORWARD": "1",
+            "NUM_ITERS_PER_TRAIN_UPDATE": "1",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "requires NUM_ITERS_PER_TRAIN_UPDATE >= 2" in result.stderr
     assert arguments == []
     assert not capture_path.exists()

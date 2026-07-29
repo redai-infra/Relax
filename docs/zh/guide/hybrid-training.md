@@ -231,6 +231,7 @@ chunk 大小必须精确重建 optimizer mini，并且是 `n_samples_per_prompt`
 HYBRID_PIPELINE_FORWARD=1 \
 HYBRID_PIPELINE_TRACE_DIR=/data01/LWX/relax-task21/runs/smoke/timeline \
 HYBRID_PIPELINE_FETCH_TIMEOUT_S=600 \
+NUM_ITERS_PER_TRAIN_UPDATE=4 \
 bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
   hybrid-async
 ```
@@ -245,6 +246,7 @@ bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
 | `MODEL_CHECKPOINT_DIR` / `REFERENCE_CHECKPOINT_DIR` | `${MODEL_DIR}/${MODEL_NAME}` | 显式固定 actor 与 reference 输入 |
 | `CHECKPOINT_SAVE` | `1` | 设为 `0` 时不传 `--save*`；改用独立 rollout 与 TensorBoard 输出目录 |
 | `ROLLOUT_RESULT_DIR` / `TENSORBOARD_DIR` | 保存开启时不覆盖；关闭时为 `${EXP_DIR}/rollout_result` 和 `${EXP_DIR}/tensorboard_log` | 在 no-save 运行中保留原始结果和标量；`TENSORBOARD_DIR` 会导出给 MetricsService |
+| `NUM_ITERS_PER_TRAIN_UPDATE` | `2` | 设置每个 optimizer mini 中按完整 prompt group 对齐的 producer/actor 分块数 |
 | `ROLLOUT_MAX_RESPONSE_LEN` / `ROLLOUT_MAX_PROMPT_LEN` / `ROLLOUT_MAX_CONTEXT_LEN` | `10240` / `2048` / `12288` | 固定生成和上下文上限 |
 | `ACTOR_MAX_TOKENS_PER_GPU` | `12288` | 控制 dynamic-batch actor microbatch 的 token 上限 |
 | `HYBRID_ACTOR_GPUS` / `HYBRID_ROLLOUT_GPUS` | `4` / `4` | 构造 Hybrid placement resource |
@@ -255,8 +257,15 @@ bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
 以及 actor GPU 数是当前 TP=2、CP=2 拓扑的整数倍。不满足约束会直接退出，
 不会在 Ray worker 内静默降级。
 
-例如，以下命令用于资源受限环境中的 no-save Qwen3-VL-8B 功能 smoke；
-它不是 8 卡 Qwen3.5 性能结果：
+参考配置的 `global_batch_size=256`、`n_samples_per_prompt=8`。将
+`NUM_ITERS_PER_TRAIN_UPDATE` 设为 `4` 时，每个 optimizer mini 会形成四个
+64-sample stage，每个 stage 包含八组完整 prompt。成对比较中的 baseline 与
+experiment 必须使用同一个值：baseline 等完整 mini 到齐后统一 forward，
+实验开关开启时则依次 fetch/forward 四个 stage。
+
+例如，以下命令是资源受限环境中的 no-save Qwen3-VL-8B 配置，可用于明确
+标注资源条件的 smoke 或配对性能实验，但结果不能与默认 8 卡 Qwen3.5 配方
+合并：
 
 ```bash
 MODEL_CONFIG_FILE="${MODEL_CONFIG_DIR}/qwen3-vl-8B.sh" \
@@ -267,6 +276,7 @@ ROLLOUT_MAX_RESPONSE_LEN=512 \
 ROLLOUT_MAX_PROMPT_LEN=2048 \
 ROLLOUT_MAX_CONTEXT_LEN=2560 \
 ACTOR_MAX_TOKENS_PER_GPU=6144 \
+NUM_ITERS_PER_TRAIN_UPDATE=4 \
 HYBRID_ACTOR_GPUS=4 \
 HYBRID_ROLLOUT_GPUS=1 \
 ROLLOUT_NUM_GPUS_PER_ENGINE=1 \
@@ -309,7 +319,7 @@ fetch/forward 次数仍严格固定。严格 producer 重叠定义为首个 acto
 早于 producer 最后一次 put 的开始时刻；最后一次 put 的完成时刻仅作为传输
 阶段诊断，因为其 trace 写入可能在调度上晚于 consumer。`--enforce-targets`
 还会检查每次实验的严格 producer 重叠比例、
-step-time p95、8 卡 NVML 覆盖、峰值显存、token/多模态字节工作量和
+step-time p95、命令指定数量的 GPU NVML 覆盖、峰值显存、token/多模态字节工作量和
 raw-reward、截断率、staleness 非劣护栏。aggregate throughput 使用
 `sum(step_tokens) / sum(step_time)`，不会对 per-step rate 做简单平均。
 截断率护栏读取 rollout 侧的 `rollout/truncated_ratio`；训练侧
@@ -320,13 +330,17 @@ step 区间的 500 ms NVML 样本；区间由 TensorBoard `perf/step_time` 的
 step end wall time 和 duration 重建。sampled peak VRAM 仍使用 full-run
 安全口径。
 严格比较还要求每次 run 的 manifest 为 clean tree，candidate/image/TransferQueue
-身份完全一致，并存在非空的输入 hash、依赖 freeze、wheel hash 和 launcher log。
+身份完全一致，并存在已校验的静态输入 hash、依赖 freeze、wheel hash、
+launcher log，以及值为 0 的训练、验证和最终退出状态文件。
 manifest 还会记录并交叉校验 `max_staleness`、global/rollout batch size、
 每 prompt 样本数和 actor chunk 数，避免分析器 CLI 与实际工作负载静默不一致。
 在计算任何配对统计前，分析器还要求模型、模型配置、数据路径、prompt/response/
 context 上限、actor token 预算、actor/rollout 资源拓扑、SGLang 确定性与显存
 配置、物理卡到容器卡映射、checkpoint 模式以及 debug 捕获/回放配置完全一致；
-字段缺失或取值不同都会 fail closed。
+字段缺失或取值不同都会 fail closed。成对 run 的 global-index fingerprint
+必须精确一致；启用 SGLang 确定性推理时，总 token、response token 与多模态
+tensor 字节数也必须精确一致，不使用容差。comparison JSON 同时报告重复实验
+的均值、中位数、范围、总体标准差和变异系数。
 staleness 曲线来自 trace：在 actor 首次 forward 时，用已完成 put 的最大
 producer rollout ID 减去当前 actor rollout ID；若 producer 的 trace 写入稍晚，
 已完成的 actor fetch 本身可证明当前 rollout 已 ready。该值不得超过 manifest
@@ -336,6 +350,11 @@ producer rollout ID 减去当前 actor rollout ID；若 producer 的 trace 写�
 `HYBRID_PIPELINE_FORWARD=0`；无需转换 checkpoint 或数据集。若要扩展
 DP/PP/VPP 或 role graph，必须先新增 collective-order 与 restore-count 测试，
 再重跑 frozen-input parity、多模态 smoke 和成对性能实验。
+
+`--steady-windows 0-0` 明确统计“每次启动新进程后的第一个 optimizer step”。
+它适用于固定资源窗口只能容纳单步训练的场景，但不能表述为稳态吞吐。报告中
+应称为配对 first-step benchmark，至少使用两个 seed 并平衡启动顺序；资源允许
+时仍应补充后续多 step 的稳态窗口。
 
 ______________________________________________________________________
 
