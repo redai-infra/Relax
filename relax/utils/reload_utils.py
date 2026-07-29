@@ -17,6 +17,29 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+class ReloadGenerationRegistry:
+    """Instance-scoped generation counters for IMMEDIATE reloadable callables.
+
+    Keyed by (module_name, module_path). Only successful reloads bump the
+    counter. Consumers (e.g. RewardExecutor) read via ``current()``.
+    """
+
+    def __init__(self) -> None:
+        self._generations: Dict[tuple[str, str], int] = {}
+
+    def bump(self, module_name: str, module_path: str) -> int:
+        key = (module_name, module_path)
+        next_gen = self._generations.get(key, 0) + 1
+        self._generations[key] = next_gen
+        return next_gen
+
+    def current(self, module_name: str, module_path: Optional[str] = None) -> int:
+        if module_path is not None:
+            return self._generations.get((module_name, module_path), 0)
+        matching = [gen for (name, _), gen in self._generations.items() if name == module_name]
+        return max(matching) if matching else 0
+
+
 class ReloadScope(Enum):
     """Define the reload scope of functions.
 
@@ -383,13 +406,17 @@ class ReloadableMixin:
             logger.info(f"Refreshed sys.modules cache for {module_path}")
             message = f"Module '{module_name}' reloaded - will take effect on next call"
 
-        return {
+        result = {
             "success": True,
             "module_name": module_name,
             "module_path": module_path,
             "scope": func_def.scope.value,
             "message": message,
         }
+        registry = getattr(self, "_reload_generations", None)
+        if isinstance(registry, ReloadGenerationRegistry):
+            result["generation"] = registry.bump(module_name, module_path)
+        return result
 
     def reload_module(self, module_name: str, module_path: str = None) -> Dict[str, Any]:
         """Hot-reload the specified module and update function references.

@@ -433,7 +433,9 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
-| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
+| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。支持 sync `def`（Ray Worker 进程）、`async def`（Driver await）、以及 group `list[Sample]` 入参 |
+| `--reward-max-concurrency` | int | 64 | Reward 逻辑并发上限（含 custom sync/async） |
+| `--reward-num-workers` | int | 16 | 同步 Reward（含 sync custom）使用的 Ray Worker 数量 |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |
 | `--group-rm` | flag | False | 是否对整个 group 做 Reward 计算 |
