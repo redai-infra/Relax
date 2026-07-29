@@ -15,7 +15,12 @@ def sync_reward(args, sample: Sample, **kwargs) -> float:
 
 
 def sync_reward_with_pid(args, sample: Sample, **kwargs) -> dict[str, Any]:
-    return {"score": 1.0, "pid": os.getpid(), "has_rm_type": hasattr(args, "rm_type")}
+    return {
+        "score": 1.0,
+        "pid": os.getpid(),
+        "has_rm_type": hasattr(args, "rm_type"),
+        "threshold": getattr(args, "reward_threshold", None),
+    }
 
 
 def sync_slow_reward_tracked(args, sample: Sample, **kwargs) -> float:

@@ -142,7 +142,7 @@ def group_reward_func(args, samples: list[Sample], **kwargs) -> list[float | dic
 说明：
 
 - 仅 `async def`（可被 `inspect.iscoroutinefunction` 识别）走异步路径；同步函数即使返回 awaitable 也会报错。
-- Sync custom 在 Worker 中只能看到白名单字段（如 `custom_rm_path` / `rm_type` / `reward_key` 等）以及调用方显式传入的 `custom_options`；不要依赖完整训练 `Namespace` 中的模型、Tokenizer 等对象。
+- Sync custom 在 Worker 中能看到白名单字段（如 `custom_rm_path` / `rm_type` / `reward_key` 等），以及从训练 `args` 自动拷贝的 JSON 标量字段；显式 `custom_options` 同名时优先。模型、Tokenizer 等不可序列化对象不会传入；需要时请用 `custom_options`。
 - 装饰器请使用 `functools.wraps`，否则可能无法正确识别 async。
 - `custom_rm` 热重载（`ReloadScope.IMMEDIATE`）在 `RolloutManager` 已绑定 generation provider 时，于**下一次**调用生效；未绑定路径 generation 固定为 `0`，不宣称自动传播热重载。
 

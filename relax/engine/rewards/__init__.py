@@ -165,6 +165,9 @@ class RewardWorker:
             )
         return result
 
+    def custom_load_count(self, path: str) -> int:
+        return self._custom_resolver.load_count(path)
+
 
 # ---------------------------------------------------------------------------
 # RewardExecutor: manages the worker pool and global concurrency
@@ -218,7 +221,7 @@ class RewardExecutor:
             implementation_version=IMPLEMENTATION_VERSION,
         )
 
-    def _ensure_workers(self):
+    async def _ensure_workers(self):
         expected = self._expected_fingerprint()
         if self._workers and self._worker_fingerprint is not None and self._worker_fingerprint != expected:
             raise RuntimeError(
@@ -234,8 +237,7 @@ class RewardExecutor:
                 ).remote()
                 for i in range(self._num_workers)
             ]
-            # One batched wait instead of N sequential ray.get calls.
-            ray.get([worker.ensure_fingerprint.remote(fingerprint) for worker in workers])
+            await asyncio.gather(*[worker.ensure_fingerprint.remote(fingerprint) for worker in workers])
             self._workers = workers
             self._worker_fingerprint = expected
             logger.info(
@@ -295,7 +297,7 @@ class RewardExecutor:
             return await async_handler(args, sample)
 
         if rm_type:
-            self._ensure_workers()
+            await self._ensure_workers()
             worker = self._next_worker()
             ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
             return await ref
@@ -345,7 +347,7 @@ class RewardExecutor:
                 generation=generation,
                 custom_options=custom_options,
             )
-            self._ensure_workers()
+            await self._ensure_workers()
             worker = self._next_worker()
             ref = worker.compute_custom.remote(
                 path=path,

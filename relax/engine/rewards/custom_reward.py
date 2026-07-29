@@ -14,6 +14,35 @@ from relax.utils.types import Sample
 
 IMPLEMENTATION_VERSION = 1
 
+_CONFIG_FIELD_KEYS = frozenset(
+    {
+        "custom_rm_path",
+        "group_rm",
+        "reward_key",
+        "rm_type",
+        "rm_url",
+        "implementation_version",
+        "generation",
+        "custom_options",
+    }
+)
+
+# Known heavy / non-serializable training attrs never auto-copied into Workers.
+_AUTO_PICK_DENYLIST = frozenset(
+    {
+        "model",
+        "tokenizer",
+        "processor",
+        "hf_tokenizer",
+        "hf_processor",
+        "train_data",
+        "eval_data",
+        "rollout_engine",
+        "actor",
+        "critic",
+    }
+)
+
 
 class CustomRewardError(RuntimeError):
     """Driver-boundary error that attaches custom path and sample identity."""
@@ -41,13 +70,39 @@ class RewardWorkerConfig:
         return ns
 
 
+def _is_jsonish(value: Any, *, depth: int = 0) -> bool:
+    if depth > 2:
+        return False
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_is_jsonish(item, depth=depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_jsonish(item, depth=depth + 1) for key, item in value.items())
+    return False
+
+
+def pick_primitive_arg_attrs(args: Any) -> dict[str, Any]:
+    """Copy JSON-ish scalar attrs from training args for sync Worker compatibility."""
+    source = vars(args) if hasattr(args, "__dict__") else {}
+    picked: dict[str, Any] = {}
+    for key, value in source.items():
+        if key.startswith("_") or key in _CONFIG_FIELD_KEYS or key in _AUTO_PICK_DENYLIST:
+            continue
+        if _is_jsonish(value):
+            picked[key] = value
+    return picked
+
+
 def build_reward_worker_config(
     args: Any,
     *,
     generation: int = 0,
     custom_options: dict[str, Any] | None = None,
 ) -> RewardWorkerConfig:
-    options = dict(custom_options or {})
+    # auto-pick first; explicit custom_options win on key conflicts.
+    options = pick_primitive_arg_attrs(args)
+    options.update(dict(custom_options or {}))
     return RewardWorkerConfig(
         custom_rm_path=getattr(args, "custom_rm_path", None),
         group_rm=bool(getattr(args, "group_rm", False)),
@@ -93,6 +148,10 @@ class CustomRewardResolver:
 
     def __init__(self) -> None:
         self._cache: dict[tuple[str, int], ResolvedCustomReward] = {}
+        self._load_counts: dict[str, int] = {}
+
+    def load_count(self, path: str) -> int:
+        return self._load_counts.get(path, 0)
 
     def ensure_loaded(self, path: str, generation: int, *, refresh_modules: bool = False) -> ResolvedCustomReward:
         key = (path, generation)
@@ -107,6 +166,7 @@ class CustomRewardResolver:
                 raise RuntimeError(f"Failed to refresh custom reward module for path={path!r}")
         else:
             function = load_function(path)
+        self._load_counts[path] = self._load_counts.get(path, 0) + 1
         resolved = ResolvedCustomReward(
             function=function,
             is_async=is_async_callable(function),

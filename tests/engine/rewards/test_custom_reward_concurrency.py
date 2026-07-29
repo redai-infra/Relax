@@ -110,11 +110,12 @@ async def _measured_overlap_peak(
 
 @pytest.mark.asyncio
 async def test_sync_custom_runs_in_worker_process():
-    args = _args(f"{FIXTURE}.sync_reward_with_pid", reward_key="score")
+    args = _args(f"{FIXTURE}.sync_reward_with_pid", reward_key="score", reward_threshold=0.5)
     result = await async_rm(args, _sample())
     assert isinstance(result, dict)
     assert result["pid"] != os.getpid()
     assert result["has_rm_type"] is True
+    assert result["threshold"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -234,3 +235,64 @@ async def test_agentic_dispatch_does_not_double_semaphore():
 
     results = await asyncio.wait_for(asyncio.gather(run_one(0), run_one(1)), timeout=5)
     assert all(r.reward == 1.0 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_sync_recovers_after_custom_exception():
+    fail_args = _args(f"{FIXTURE}.sync_raises", reward_num_workers=2)
+    ok_args = _args(f"{FIXTURE}.sync_reward", reward_num_workers=2)
+    with pytest.raises(CustomRewardError):
+        await async_rm(fail_args, _sample(index=1))
+    reward = await asyncio.wait_for(async_rm(ok_args, _sample()), timeout=10)
+    assert reward == 1.0
+
+
+@pytest.mark.asyncio
+async def test_worker_loads_custom_function_once_per_generation():
+    path = f"{FIXTURE}.sync_reward"
+    args = _args(path, reward_num_workers=1)
+    executor = RewardExecutor.get_or_create(max_concurrency=4, num_workers=1)
+    await executor.execute_custom_sample(args, _sample(index=0))
+    await executor.execute_custom_sample(args, _sample(index=1))
+    worker = executor._workers[0]
+    assert ray.get(worker.custom_load_count.remote(path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_init_does_not_block_event_loop():
+    ticks: list[float] = []
+
+    async def heartbeat():
+        for _ in range(8):
+            ticks.append(1.0)
+            await asyncio.sleep(0.01)
+
+    args = _args(f"{FIXTURE}.sync_reward", reward_num_workers=4)
+    executor = RewardExecutor.get_or_create(max_concurrency=4, num_workers=4)
+    reward, _ = await asyncio.wait_for(
+        asyncio.gather(executor.execute_custom_sample(args, _sample()), heartbeat()),
+        timeout=30,
+    )
+    assert reward == 1.0
+    assert len(ticks) >= 2
+
+
+@pytest.mark.asyncio
+async def test_auto_pick_primitives_visible_on_worker_args():
+    from relax.engine.rewards.custom_reward import build_reward_worker_config, pick_primitive_arg_attrs
+
+    args = _args(
+        f"{FIXTURE}.sync_reward",
+        reward_threshold=0.75,
+        task_name="math",
+        tokenizer=object(),
+    )
+    picked = pick_primitive_arg_attrs(args)
+    assert picked["reward_threshold"] == 0.75
+    assert picked["task_name"] == "math"
+    assert "tokenizer" not in picked
+
+    config = build_reward_worker_config(args, custom_options={"task_name": "override"})
+    ns = config.as_namespace()
+    assert ns.reward_threshold == 0.75
+    assert ns.task_name == "override"
