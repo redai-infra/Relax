@@ -4,7 +4,9 @@ import importlib
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 
 
 try:
@@ -63,6 +65,33 @@ def _rollout_batch(start: int, count: int) -> dict:
         "rewards": [1.0] * count,
         "raw_reward": [1.0] * count,
     }
+
+
+def test_debug_rollout_chunking_slices_every_per_sample_container():
+    assert actor_module is not None
+    shared = {"source": "frozen-rollout"}
+    rollout_data = {
+        "tokens": [[0], [1], [2], [3]],
+        "total_lengths": [1, 1, 1, 1],
+        "tensor_field": torch.arange(8).reshape(4, 2),
+        "array_field": np.arange(12).reshape(4, 3),
+        "tuple_field": ("a", "b", "c", "d"),
+        "shared": shared,
+    }
+
+    chunks = actor_module.MegatronTrainRayActor._split_rollout_batch(rollout_data, 2)
+
+    assert len(chunks) == 2
+    assert chunks[0]["tokens"] == [[0], [1]]
+    assert chunks[1]["tokens"] == [[2], [3]]
+    assert torch.equal(chunks[0]["tensor_field"], torch.tensor([[0, 1], [2, 3]]))
+    assert torch.equal(chunks[1]["tensor_field"], torch.tensor([[4, 5], [6, 7]]))
+    np.testing.assert_array_equal(chunks[0]["array_field"], np.arange(6).reshape(2, 3))
+    np.testing.assert_array_equal(chunks[1]["array_field"], np.arange(6, 12).reshape(2, 3))
+    assert chunks[0]["tuple_field"] == ("a", "b")
+    assert chunks[1]["tuple_field"] == ("c", "d")
+    assert chunks[0]["shared"] is shared
+    assert chunks[1]["shared"] is shared
 
 
 @pytest.mark.parametrize(

@@ -136,14 +136,12 @@ def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
             return value
         if isinstance(value, (list, tuple)) and len(value) == num_samples:
             return value[start:end]
-        ndim = getattr(value, "ndim", None)
-        size = getattr(value, "size", None)
-        if ndim and ndim > 0 and callable(size):
-            try:
-                if int(size(0)) == num_samples:
-                    return value[start:end]
-            except (TypeError, ValueError, IndexError):
-                pass
+        shape = getattr(value, "shape", None)
+        try:
+            if shape is not None and len(shape) > 0 and int(shape[0]) == num_samples:
+                return value[start:end]
+        except (TypeError, ValueError, IndexError):
+            pass
         return value
 
     return {k: _slice(v) for k, v in rollout_data.items()}
@@ -1366,27 +1364,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @staticmethod
     def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
-        """Split a merged rollout batch (dict of per-sample lists) into at most
-        ``num_chunks`` roughly equal sub-batches along the sample dimension.
-
-        Keys whose value is not a per-sample list are copied into every chunk
-        unchanged. Used by the debug_train_only path to feed the collected-
-        sub-batch forward loop (one global batch per chunk).
-        """
+        """Split a debug rollout into roughly equal per-sample chunks."""
         num_samples = len(rollout_data["tokens"])
         num_chunks = max(1, min(num_chunks, num_samples))
         chunk_size = (num_samples + num_chunks - 1) // num_chunks
-        chunks: List[RolloutBatch] = []
-        for start in range(0, num_samples, chunk_size):
-            end = min(start + chunk_size, num_samples)
-            chunk: RolloutBatch = {}
-            for key, value in rollout_data.items():
-                if isinstance(value, list) and len(value) == num_samples:
-                    chunk[key] = value[start:end]
-                else:
-                    chunk[key] = value
-            chunks.append(chunk)
-        return chunks
+        return [
+            _slice_rollout_batch(rollout_data, start, min(start + chunk_size, num_samples))
+            for start in range(0, num_samples, chunk_size)
+        ]
 
     def _use_streaming_fwd(self) -> bool:
         """Whether ref / actor_fwd forward should stream via token-budget
