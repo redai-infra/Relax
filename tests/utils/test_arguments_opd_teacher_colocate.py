@@ -56,6 +56,26 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected_rm_type", "expected_fallback"),
+    [
+        ([], None, "zero"),
+        (["--rm-type", "math"], "math", "zero"),
+        (["--rm-type-fallback", "multiple_choice"], None, "multiple_choice"),
+        (["--rm-type-fallback", "error"], None, "error"),
+    ],
+)
+def test_reward_route_options(arguments_module, argv, expected_rm_type, expected_fallback):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args(argv)
+
+    assert args.rm_type == expected_rm_type
+    assert args.rm_type_fallback == expected_fallback
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",

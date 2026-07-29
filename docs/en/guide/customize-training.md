@@ -114,6 +114,29 @@ python scripts/tools/process_avqa.py \
   --md-dir /root/AVQA-R1-6K/AVQA_R1/train
 ```
 
+## Mixed Built-in Reward Routing
+
+A batch can select different built-in rewards through each sample's `metadata.rm_type`. Prefer stamping the
+type during dataset preprocessing:
+
+```jsonl
+{"prompt":"Compute 3 * 3.","label":"9","metadata":{"rm_type":"math"}}
+{"prompt":"Choose A, B, or C.","label":"<answer>B</answer>","metadata":{"rm_type":"multiple_choice"}}
+```
+
+The default data keys and fallback behavior are configured as follows:
+
+```bash
+--label-key label
+--metadata-key metadata
+--rm-type-fallback zero
+```
+
+`metadata.rm_type` takes precedence over the global `--rm-type`. When no per-sample type is present, an explicit
+`--rm-type` preserves the existing global behavior. If neither is present, Relax conservatively recognizes only
+unambiguous math and multiple-choice label formats. Unknown, missing, or conflicting types return zero and emit a
+warning by default. `--rm-type-fallback` can instead name a registered reward or use `error` for strict failure.
+
 ## Custom Reward Methods
 
 You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.

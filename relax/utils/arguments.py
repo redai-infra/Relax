@@ -2037,7 +2037,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--rm-type",
                 type=str,
                 default=None,
-                help="Type of the reward model",
+                help=(
+                    "Global reward type used when a sample does not provide metadata.rm_type. "
+                    "If unset, registered label matchers may select a reward per sample."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default="zero",
+                help=(
+                    "Action for an unknown, missing, or conflicting reward route: 'zero' returns "
+                    "a zero reward with a warning, 'error' raises, and a registered reward type "
+                    "dispatches to that fallback. Default: zero."
+                ),
             )
             parser.add_argument(
                 "--reward-key",

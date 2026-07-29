@@ -2,6 +2,7 @@
 
 import asyncio
 import random
+from typing import Any
 
 import aiohttp
 import ray
@@ -19,10 +20,19 @@ from .math_utils import extract_answer as extract_boxed_answer
 from .math_utils import grade_answer_verl
 from .multiple_choice import get_multiple_choice_reward
 from .openr1mm import get_openr1mm_rule_based_reward
+from .registry import (
+    RewardRegistry,
+    RewardSpec,
+    RouteDecision,
+    match_math_label,
+    match_multiple_choice_label,
+    resolve_reward_route,
+)
 
 
 logger = get_logger(__name__)
 _shared_session: aiohttp.ClientSession | None = None
+REWARD_REGISTRY = RewardRegistry()
 
 
 def _get_shared_session() -> aiohttp.ClientSession:
@@ -35,6 +45,64 @@ def _get_shared_session() -> aiohttp.ClientSession:
         timeout = aiohttp.ClientTimeout(total=120)
         _shared_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     return _shared_session
+
+
+def _reward_deepscaler(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    del metadata
+    return get_deepscaler_rule_based_reward(response, label)
+
+
+def _reward_geo3k(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    del metadata
+    from .geo3k import get_geo3k_reward
+
+    return get_geo3k_reward(response, label)
+
+
+def _reward_openr1mm(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    del metadata
+    return get_openr1mm_rule_based_reward(response, label)
+
+
+def _reward_multiple_choice(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    del metadata
+    return get_multiple_choice_reward(response, label)
+
+
+def _reward_dapo(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    del metadata
+    return compute_score_dapo(response, label)
+
+
+def _reward_math(response: str, label: Any, metadata: dict[str, Any]) -> int:
+    del metadata
+    return 1 if grade_answer_verl(response, label) else 0
+
+
+def _reward_mopd(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    from .mopd import get_mopd_reward
+
+    return get_mopd_reward(response, label, metadata)
+
+
+def _reward_f1(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    del metadata
+    return f1_score(response, label)[0]
+
+
+def _reward_gpqa(response: str, label: Any, metadata: dict[str, Any]) -> float:
+    return compute_gpqa_reward(response, label, metadata=metadata)
+
+
+def _reward_ifbench(response: str, label: Any, metadata: dict[str, Any]) -> Any:
+    from .ifbench import compute_ifbench_reward
+
+    return compute_ifbench_reward(response, label, metadata=metadata)
+
+
+def _reward_random(response: str, label: Any, metadata: dict[str, Any]) -> int:
+    del response, label, metadata
+    return random.randint(0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -58,41 +126,17 @@ class RewardWorker:
     does not need to hold any state.
     """
 
-    def compute(self, rm_type: str, response: str, label, metadata: dict | None = None):
+    def compute(self, rm_type: str, response: str, label: Any, metadata: dict | None = None) -> Any:
         """Dispatch to the appropriate synchronous reward function.
 
         Returns the same value the original function would return.
         """
-        if rm_type == "deepscaler":
-            return get_deepscaler_rule_based_reward(response, label)
-        elif rm_type == "geo3k":
-            from .geo3k import get_geo3k_reward
-
-            return get_geo3k_reward(response, label)
-        elif rm_type == "openr1mm":
-            return get_openr1mm_rule_based_reward(response, label)
-        elif rm_type == "multiple_choice":
-            return get_multiple_choice_reward(response, label)
-        elif rm_type == "dapo":
-            return compute_score_dapo(response, label)
-        elif rm_type == "math":
-            return 1 if grade_answer_verl(response, label) else 0
-        elif rm_type == "mopd":
-            from .mopd import get_mopd_reward
-
-            return get_mopd_reward(response, label, metadata)
-        elif rm_type == "f1":
-            return f1_score(response, label)[0]
-        elif rm_type == "gpqa":
-            return compute_gpqa_reward(response, label, metadata=metadata)
-        elif rm_type == "ifbench":
-            from .ifbench import compute_ifbench_reward
-
-            return compute_ifbench_reward(response, label, metadata=metadata)
-        elif rm_type == "random":
-            return random.randint(0, 1)
-        else:
+        spec = REWARD_REGISTRY.get(rm_type)
+        if spec is None:
             raise NotImplementedError(f"RewardWorker: unknown rm_type={rm_type!r}")
+        if spec.mode != "sync":
+            raise TypeError(f"RewardWorker cannot execute asynchronous reward type {rm_type!r}.")
+        return spec.handler(response, label, metadata or {})
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +156,7 @@ class RewardExecutor:
         self._semaphore: asyncio.Semaphore | None = None
         self._workers: list = []
         self._worker_index = 0
+        self._warned_route_failures: set[tuple[str | None, str | None, str, str | None]] = set()
 
     # -- singleton access -----------------------------------------------------
 
@@ -147,34 +192,24 @@ class RewardExecutor:
         self._worker_index += 1
         return worker
 
+    def _warn_route_once(self, decision: RouteDecision, sample: Sample) -> None:
+        key = (decision.reason, decision.requested_type, decision.action, decision.reward_type)
+        if key in self._warned_route_failures:
+            return
+        self._warned_route_failures.add(key)
+        logger.warning(
+            "Reward routing fallback: reason=%s source=%s requested_type=%r action=%s "
+            "selected_type=%r group_index=%r sample_index=%r",
+            decision.reason,
+            decision.source,
+            decision.requested_type,
+            decision.action,
+            decision.reward_type,
+            sample.group_index,
+            sample.index,
+        )
+
     # -- public API -----------------------------------------------------------
-
-    # Async rm_types run in the event loop (not dispatched to worker pool).
-    _ASYNC_RM_DISPATCH = {
-        "remote_rm": lambda args, sample: remote_rm(args, sample),
-        "dapo-genrm": lambda args, sample: async_compute_score_genrm(args, sample),
-        # `dummy` returns 0 without any computation. Use it when the real
-        # reward is produced elsewhere (e.g., --custom-reward-post-process-path
-        # does batched GenRM scoring after all rollout finishes).
-        "dummy": lambda args, sample: _dummy_reward(args),
-    }
-
-    # CPU-bound / thread-unsafe rm_types dispatched to the Ray worker pool.
-    _SYNC_RM_TYPES = frozenset(
-        {
-            "deepscaler",
-            "geo3k",
-            "openr1mm",
-            "multiple_choice",
-            "dapo",
-            "math",
-            "mopd",
-            "f1",
-            "gpqa",
-            "ifbench",
-            "random",
-        }
-    )
 
     async def execute(self, args, sample: Sample, **kwargs):
         """Execute a single reward computation with concurrency control.
@@ -193,28 +228,42 @@ class RewardExecutor:
                 return await rm_function(args, sample, **kwargs)
 
             metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-            rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
+            decision = resolve_reward_route(
+                registry=REWARD_REGISTRY,
+                metadata=metadata,
+                label=sample.label,
+                explicit_rm_type=getattr(args, "rm_type", None),
+                fallback_type=getattr(args, "rm_type_fallback", "zero"),
+            )
+            if decision.reason is not None:
+                self._warn_route_once(decision, sample)
+            if decision.action == "zero":
+                return await _dummy_reward(args)
+            if decision.action == "error":
+                raise ValueError(
+                    f"Unable to route reward: reason={decision.reason}, source={decision.source}, "
+                    f"requested_type={decision.requested_type!r}."
+                )
+
+            spec = REWARD_REGISTRY.get(decision.reward_type)
+            if spec is None:
+                raise RuntimeError(f"Resolved reward type {decision.reward_type!r} is not registered.")
+
             response = sample.response
             label = sample.label
-            if rm_type.startswith("boxed_"):
+            if decision.boxed:
                 response = extract_boxed_answer(response) or ""
-                rm_type = rm_type[len("boxed_") :]
 
-            # --- async rm types: run in event loop -----------------------
-            async_handler = self._ASYNC_RM_DISPATCH.get(rm_type)
-            if async_handler is not None:
-                return await async_handler(args, sample)
+            if spec.mode == "async":
+                return await spec.handler(args, sample)
 
-            # --- sync rm types: dispatch to worker pool ------------------
-            # Default to sync path for any non-empty rm_type not in async dispatch
-            if rm_type:
+            if spec.mode == "sync":
                 self._ensure_workers()
                 worker = self._next_worker()
-                ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
+                ref = worker.compute.remote(spec.name, response, label, metadata=metadata)
                 return await ref
 
-            # --- no rm_type specified -----------------------------------------
-            raise NotImplementedError("Rule-based RM type is not specified.")
+            raise RuntimeError(f"Registered reward type {spec.name!r} has invalid mode {spec.mode!r}.")
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +280,11 @@ async def _dummy_reward(args):
     if reward_key:
         return {reward_key: 0.0}
     return 0.0
+
+
+async def _dummy_reward_handler(args, sample: Sample) -> float | dict[str, float]:
+    del sample
+    return await _dummy_reward(args)
 
 
 async def remote_rm(args, sample: Sample, max_retries: int = 10):
@@ -281,3 +335,21 @@ async def batched_async_rm(
     tasks = [async_rm(args, sample, **kwargs) for sample in samples]
     rewards = await asyncio.gather(*tasks)
     return rewards
+
+
+# Adding a built-in reward requires a handler adapter and one registration line;
+# RewardWorker and RewardExecutor do not need reward-specific branches.
+REWARD_REGISTRY.register(RewardSpec("deepscaler", "sync", _reward_deepscaler))
+REWARD_REGISTRY.register(RewardSpec("geo3k", "sync", _reward_geo3k))
+REWARD_REGISTRY.register(RewardSpec("openr1mm", "sync", _reward_openr1mm))
+REWARD_REGISTRY.register(RewardSpec("multiple_choice", "sync", _reward_multiple_choice, match_multiple_choice_label))
+REWARD_REGISTRY.register(RewardSpec("dapo", "sync", _reward_dapo))
+REWARD_REGISTRY.register(RewardSpec("math", "sync", _reward_math, match_math_label))
+REWARD_REGISTRY.register(RewardSpec("mopd", "sync", _reward_mopd))
+REWARD_REGISTRY.register(RewardSpec("f1", "sync", _reward_f1))
+REWARD_REGISTRY.register(RewardSpec("gpqa", "sync", _reward_gpqa))
+REWARD_REGISTRY.register(RewardSpec("ifbench", "sync", _reward_ifbench))
+REWARD_REGISTRY.register(RewardSpec("random", "sync", _reward_random))
+REWARD_REGISTRY.register(RewardSpec("remote_rm", "async", remote_rm))
+REWARD_REGISTRY.register(RewardSpec("dapo-genrm", "async", async_compute_score_genrm))
+REWARD_REGISTRY.register(RewardSpec("dummy", "async", _dummy_reward_handler))
