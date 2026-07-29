@@ -433,13 +433,25 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--rm-type` | str | None | Built-in reward model type |
-| `--custom-rm-path` | str | None | Custom reward function path. Function signature: `def custom_rm(args, sample) -> float` |
+| `--custom-rm-path` | str | None | Custom reward function path. Batched calls use the legacy `def custom_rm(args, samples)` contract by default. |
+| `--custom-rm-per-sample` | flag | False | Explicitly call a custom reward once per sample for non-group batches. Ignored when `--group-rm` is enabled. |
 | `--reward-key` | str | None | Key to extract reward value when reward function returns dict |
 | `--eval-reward-key` | str | None | Reward key for evaluation. When None, equals `--reward-key` |
 | `--group-rm` | flag | False | Whether to compute reward for entire group |
 | `--rm-url` | str | None | Remote reward model service URL (for `--rm-type remote_rm`) |
 | `--custom-reward-post-process-path` | str | None | Custom reward postprocessing function path. Default is GRPO normalization |
 | `--custom-convert-samples-to-train-data-path` | str | None | Custom function to convert samples to training data. Signature: `def convert_samples_to_train_data(args, samples) -> dict` |
+
+### Custom Reward Batch Compatibility
+
+Existing batch custom rewards remain compatible without changes: leave `--custom-rm-per-sample` unset and keep the `def custom_rm(args, samples)` signature.
+
+To migrate a custom reward to concurrent per-sample execution:
+
+1. Change its second parameter from `samples` to a single `sample`.
+2. Add `--custom-rm-per-sample` to the launch command.
+
+Relax preserves input order when collecting per-sample results. Synchronous functions run in the RewardWorker pool, while asynchronous functions remain in the caller process. `--group-rm` always takes precedence and passes the complete sample list once, even if `--custom-rm-per-sample` is also set. If cancellation leaves a synchronous function blocking a Worker, Relax may replace that Worker; its custom-function cache is then rebuilt on the next request.
 
 ---
 

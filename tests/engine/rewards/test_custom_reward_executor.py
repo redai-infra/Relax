@@ -1,0 +1,468 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+import asyncio
+import os
+from types import SimpleNamespace
+
+import pytest
+import ray
+
+import relax.engine.rewards as rewards_module
+from relax.agentic.pipeline import reward as agentic_reward
+from relax.engine.rewards import RewardExecutor, async_rm, batched_async_rm
+from relax.utils.reload_utils import ReloadableMixin
+from relax.utils.types import Sample
+
+
+_FIXTURE_MODULE = "tests.engine.rewards.custom_reward_fixtures"
+
+
+@ray.remote
+class _RewardStartProbe:
+    def __init__(self):
+        self._started_pid = None
+
+    def mark_started(self, pid: int) -> None:
+        self._started_pid = pid
+
+    def get_started_pid(self) -> int | None:
+        return self._started_pid
+
+
+def _make_args(custom_name: str, **overrides) -> SimpleNamespace:
+    defaults = {
+        "custom_rm_path": f"{_FIXTURE_MODULE}.{custom_name}",
+        "custom_rm_per_sample": False,
+        "group_rm": False,
+        "reward_max_concurrency": 4,
+        "reward_num_workers": 2,
+        "rm_type": None,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _make_sample(index: int, response: str = "ok") -> Sample:
+    return Sample(index=index, group_index=index // 2, response=response, label=str(index))
+
+
+def _kill_executor_workers() -> None:
+    executor = RewardExecutor._instance
+    if executor is None:
+        return
+    for worker in executor._workers:
+        try:
+            ray.kill(worker)
+        except Exception:
+            pass
+    executor._workers = []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ray_runtime():
+    started_here = not ray.is_initialized()
+    if started_here:
+        ray.init(num_cpus=4, ignore_reinit_error=True)
+    yield
+    if started_here:
+        ray.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _reset_executor():
+    _kill_executor_workers()
+    RewardExecutor._instance = None
+    yield
+    _kill_executor_workers()
+    RewardExecutor._instance = None
+
+
+@pytest.mark.asyncio
+async def test_sync_custom_reward_runs_in_worker_process_and_forwards_kwargs():
+    args = _make_args("sync_process_reward")
+    sample = _make_sample(7)
+
+    result = await async_rm(args, sample, marker="forwarded")
+
+    assert result["pid"] != os.getpid()
+    assert result["index"] == 7
+    assert result["response"] == "ok"
+    assert result["marker"] == "forwarded"
+
+
+@pytest.mark.asyncio
+async def test_async_custom_reward_is_awaited_in_caller_process():
+    args = _make_args("async_process_reward")
+    sample = _make_sample(3)
+
+    result = await async_rm(args, sample, marker="direct")
+
+    assert result == {"pid": os.getpid(), "index": 3, "marker": "direct"}
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_decorated_async_custom_reward_is_awaited_in_caller_process():
+    args = _make_args("decorated_async_process_reward")
+
+    result = await async_rm(args, _make_sample(4))
+
+    assert result == {"pid": os.getpid(), "index": 4}
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_agentic_async_custom_reward_supports_unlimited_concurrency():
+    args = _make_args("async_process_reward", reward_max_concurrency=None)
+
+    result = await agentic_reward._async_rm(args, _make_sample(5))
+
+    assert result["pid"] == os.getpid()
+    assert RewardExecutor._instance._semaphore is None
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_custom_function_is_loaded_once_in_caller(monkeypatch):
+    load_count = 0
+    original_load_function = rewards_module.load_function
+
+    def counted_load_function(path):
+        nonlocal load_count
+        load_count += 1
+        return original_load_function(path)
+
+    monkeypatch.setattr(rewards_module, "load_function", counted_load_function)
+    args = _make_args("async_process_reward")
+
+    await async_rm(args, _make_sample(0))
+    await async_rm(args, _make_sample(1))
+
+    assert load_count == 1
+
+
+@pytest.mark.asyncio
+async def test_async_custom_reward_observes_module_hot_reload():
+    args = _make_args("async_reloadable_reward")
+
+    first = await async_rm(args, _make_sample(0))
+    reloader = ReloadableMixin()
+    reloader.args = args
+    assert reloader.reload_module("custom_rm")["success"]
+    second = await async_rm(args, _make_sample(1))
+
+    assert second["generation"] == first["generation"] + 1
+    assert first["pid"] == second["pid"] == os.getpid()
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_sync_custom_reward_propagates_hot_reload_to_worker():
+    args = _make_args("sync_reloadable_reward", reward_num_workers=1)
+
+    first = await async_rm(args, _make_sample(0))
+    reloader = ReloadableMixin()
+    reloader.args = args
+    assert reloader.reload_module("custom_rm")["success"]
+    second = await async_rm(args, _make_sample(1))
+
+    assert second["generation"] == first["generation"] + 1
+    assert first["pid"] == second["pid"]
+    assert first["pid"] != os.getpid()
+
+
+@pytest.mark.asyncio
+async def test_sync_custom_function_is_loaded_once_per_worker():
+    args = _make_args(
+        "counted_sync_reward",
+        reward_max_concurrency=4,
+        reward_num_workers=2,
+        custom_rm_per_sample=True,
+    )
+
+    results = await batched_async_rm(args, [_make_sample(index) for index in range(6)])
+
+    assert len({result["pid"] for result in results}) == 2
+    assert all(result["load_count"] == 1 for result in results)
+
+
+@pytest.mark.asyncio
+async def test_reward_num_workers_limits_worker_process_count():
+    args = _make_args(
+        "sync_timed_reward",
+        reward_max_concurrency=8,
+        reward_num_workers=3,
+        test_reward_delay=0.05,
+        custom_rm_per_sample=True,
+    )
+
+    results = await asyncio.wait_for(batched_async_rm(args, [_make_sample(index) for index in range(9)]), timeout=15)
+
+    assert len({result["pid"] for result in results}) == 3
+    assert [result["index"] for result in results] == list(range(9))
+
+
+def _peak_parallel_intervals(results: list[dict]) -> int:
+    events = []
+    for result in results:
+        events.append((result["started_at"], 1))
+        events.append((result["finished_at"], -1))
+    active = 0
+    peak = 0
+    for _, delta in sorted(events, key=lambda event: (event[0], event[1])):
+        active += delta
+        peak = max(peak, active)
+    return peak
+
+
+@pytest.mark.asyncio
+async def test_reward_max_concurrency_limits_inflight_custom_rewards():
+    args = _make_args(
+        "sync_timed_reward",
+        reward_max_concurrency=2,
+        reward_num_workers=4,
+        test_reward_delay=0.1,
+        custom_rm_per_sample=True,
+    )
+
+    results = await asyncio.wait_for(batched_async_rm(args, [_make_sample(index) for index in range(8)]), timeout=15)
+
+    assert _peak_parallel_intervals(results) == 2
+    assert [result["index"] for result in results] == list(range(8))
+
+
+@pytest.mark.asyncio
+async def test_sync_custom_reward_error_identifies_sample_and_releases_limit():
+    args = _make_args(
+        "sync_maybe_failing_reward",
+        reward_max_concurrency=1,
+        reward_num_workers=1,
+    )
+    failing_sample = _make_sample(17, response="fail")
+
+    with pytest.raises(RuntimeError, match=r"index=17"):
+        await asyncio.wait_for(async_rm(args, failing_sample), timeout=10)
+
+    result = await asyncio.wait_for(async_rm(args, _make_sample(18)), timeout=10)
+    assert result == 18.0
+
+
+@pytest.mark.asyncio
+async def test_non_group_custom_reward_preserves_batch_call_compatibility():
+    args = _make_args("sync_group_reward", group_rm=False)
+    del args.custom_rm_per_sample
+    samples = [_make_sample(index) for index in range(6)]
+
+    results = await batched_async_rm(args, samples)
+
+    assert results == [float(index) for index in range(6)]
+
+
+@pytest.mark.asyncio
+async def test_group_custom_reward_keeps_batch_call_compatibility():
+    args = _make_args("sync_group_reward", group_rm=True, custom_rm_per_sample=True)
+    samples = [_make_sample(index) for index in range(4)]
+
+    results = await batched_async_rm(args, samples)
+
+    assert results == [0.0, 1.0, 2.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_async_group_custom_reward_keeps_batch_call_compatibility():
+    args = _make_args("async_group_reward", group_rm=True, custom_rm_per_sample=True)
+    samples = [_make_sample(index) for index in range(4)]
+
+    results = await batched_async_rm(args, samples)
+
+    assert results == [0.0, 1.0, 2.0, 3.0]
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_non_group_async_custom_reward_preserves_batch_call_compatibility():
+    args = _make_args("async_group_reward", group_rm=False)
+    samples = [_make_sample(index) for index in range(4)]
+
+    results = await batched_async_rm(args, samples)
+
+    assert results == [0.0, 1.0, 2.0, 3.0]
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_per_sample_async_custom_reward_preserves_input_order():
+    args = _make_args("async_process_reward", custom_rm_per_sample=True)
+    samples = [_make_sample(index) for index in range(4)]
+
+    results = await batched_async_rm(args, samples)
+
+    assert [result["index"] for result in results] == list(range(4))
+    assert all(result["pid"] == os.getpid() for result in results)
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_custom_reward_empty_batch_calls_batch_function():
+    args = _make_args("sync_group_reward")
+
+    results = await batched_async_rm(args, [])
+
+    assert results == []
+    assert len(RewardExecutor._instance._workers) == args.reward_num_workers
+
+
+@pytest.mark.asyncio
+async def test_per_sample_custom_reward_empty_batch_does_not_create_workers():
+    args = _make_args("sync_process_reward", custom_rm_per_sample=True)
+
+    results = await batched_async_rm(args, [])
+
+    assert results == []
+    assert RewardExecutor._instance is None
+
+
+@pytest.mark.asyncio
+async def test_group_batch_ignore_custom_scores_builtin_reward_per_sample():
+    args = _make_args("sync_group_reward", group_rm=False, custom_rm_per_sample=True, rm_type="dummy")
+    samples = [_make_sample(index) for index in range(4)]
+
+    results = await batched_async_rm(args, samples, ignore_custom=True)
+
+    assert results == [0.0, 0.0, 0.0, 0.0]
+    assert RewardExecutor._instance._workers == []
+
+
+@pytest.mark.asyncio
+async def test_non_group_ignore_custom_preserves_builtin_error():
+    args = _make_args("sync_process_reward", rm_type=None)
+
+    with pytest.raises(NotImplementedError, match="Rule-based RM type is not specified"):
+        await batched_async_rm(args, [_make_sample(0)], ignore_custom=True)
+
+
+@pytest.mark.asyncio
+async def test_per_sample_custom_reward_failure_cancels_and_drains_siblings(monkeypatch):
+    args = _make_args("async_process_reward", custom_rm_per_sample=True)
+    samples = [_make_sample(0), _make_sample(1, response="fail"), _make_sample(2)]
+    started = set()
+    cancelled = set()
+
+    async def fake_async_rm(received_args, sample, **kwargs):
+        assert received_args is args
+        started.add(sample.index)
+        while len(started) < len(samples):
+            await asyncio.sleep(0)
+        if sample.response == "fail":
+            raise ValueError("intentional failure")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(sample.index)
+            raise
+
+    monkeypatch.setattr(rewards_module, "async_rm", fake_async_rm)
+
+    with pytest.raises(RuntimeError, match=rf"{args.custom_rm_path!r} failed at batch position 1"):
+        await batched_async_rm(args, samples)
+
+    assert started == {0, 1, 2}
+    assert cancelled == {0, 2}
+
+
+@pytest.mark.asyncio
+async def test_per_sample_custom_reward_cancellation_drains_all_samples(monkeypatch):
+    args = _make_args("async_process_reward", custom_rm_per_sample=True)
+    samples = [_make_sample(index) for index in range(3)]
+    all_started = asyncio.Event()
+    started = set()
+    cancelled = set()
+
+    async def fake_async_rm(received_args, sample, **kwargs):
+        assert received_args is args
+        started.add(sample.index)
+        if len(started) == len(samples):
+            all_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(sample.index)
+            raise
+
+    monkeypatch.setattr(rewards_module, "async_rm", fake_async_rm)
+    batch_task = asyncio.create_task(batched_async_rm(args, samples))
+    await asyncio.wait_for(all_started.wait(), timeout=1)
+
+    batch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await batch_task
+
+    assert cancelled == {0, 1, 2}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sync_custom_reward_replaces_blocked_worker():
+    probe = _RewardStartProbe.remote()
+    wait_task = None
+    next_task = None
+    try:
+        args = _make_args(
+            "sync_cancellable_reward",
+            reward_max_concurrency=2,
+            reward_num_workers=1,
+            test_probe=probe,
+            test_reward_delay=30,
+        )
+        wait_task = asyncio.create_task(async_rm(args, _make_sample(0, response="block")))
+
+        started_pid = None
+        for _ in range(200):
+            started_pid = await probe.get_started_pid.remote()
+            if started_pid is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert started_pid is not None
+
+        executor = RewardExecutor._instance
+        old_worker = executor._workers[0]
+        wait_task.cancel()
+        next_task = asyncio.create_task(async_rm(args, _make_sample(1)))
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(wait_task, timeout=10)
+
+        result = await asyncio.wait_for(next_task, timeout=10)
+        assert result["index"] == 1
+        assert result["pid"] != started_pid
+        assert executor._workers[0] is not old_worker
+    finally:
+        for task in (wait_task, next_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (wait_task, next_task) if task is not None), return_exceptions=True)
+        ray.kill(probe)
+
+
+@pytest.mark.asyncio
+async def test_agentic_reward_helpers_delegate_to_shared_executor(monkeypatch):
+    args = _make_args("async_process_reward")
+    sample = _make_sample(5)
+    calls = []
+
+    async def fake_async_rm(received_args, received_sample):
+        calls.append(("single", received_args, received_sample))
+        return 5.0
+
+    async def fake_batched_async_rm(received_args, received_samples):
+        calls.append(("batch", received_args, received_samples))
+        return [5.0]
+
+    monkeypatch.setattr(rewards_module, "async_rm", fake_async_rm)
+    monkeypatch.setattr(rewards_module, "batched_async_rm", fake_batched_async_rm)
+
+    assert await agentic_reward._async_rm(args, sample) == 5.0
+    assert await agentic_reward._batched_async_rm(args, [sample]) == [5.0]
+    assert calls == [
+        ("single", args, sample),
+        ("batch", args, [sample]),
+    ]

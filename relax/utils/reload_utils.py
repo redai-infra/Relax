@@ -7,6 +7,7 @@ reloaded at runtime without restarting the service.
 
 import importlib
 import sys
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -15,6 +16,8 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+_RELOAD_SESSION_ID = uuid.uuid4().hex
+_RELOAD_GENERATIONS: Dict[str, int] = {}
 
 
 class ReloadScope(Enum):
@@ -242,6 +245,11 @@ def get_reloadable_by_scope(scope: ReloadScope) -> List[ReloadableFunction]:
     return [f for f in RELOADABLE_FUNCTIONS if f.scope == scope]
 
 
+def get_reload_token(module_path: str) -> tuple[str, int]:
+    """Return the process-session token for a reloadable function path."""
+    return _RELOAD_SESSION_ID, _RELOAD_GENERATIONS.get(module_path, 0)
+
+
 def reload_function(module_path: str) -> Optional[Callable]:
     """Reload the function at the specified path.
 
@@ -268,7 +276,9 @@ def reload_function(module_path: str) -> Optional[Callable]:
         else:
             py_module = importlib.import_module(py_module_path)
 
-        return getattr(py_module, attr_name)
+        function = getattr(py_module, attr_name)
+        _RELOAD_GENERATIONS[module_path] = _RELOAD_GENERATIONS.get(module_path, 0) + 1
+        return function
     except Exception as e:
         logger.error(f"Failed to reload function from {module_path}: {e}")
         return None
