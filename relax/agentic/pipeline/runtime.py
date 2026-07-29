@@ -28,7 +28,7 @@ import ray
 import torch
 
 from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
-from relax.agentic.pipeline import GroupKey, sample_group_key
+from relax.agentic.pipeline import ExportMode, GroupKey, PendingExportUnit, sample_group_key
 from relax.agentic.pipeline.prepare import (
     ExecutionBatchInput,
     PrepareGroupSpec,
@@ -46,6 +46,8 @@ from relax.agentic.session.state import (
     FinalizedResultTransport,
     TrainingFieldArtifact,
     check_messages,
+    normalize_template_kwargs,
+    normalize_tools,
 )
 from relax.utils.http_utils import post
 from relax.utils.logging_utils import get_logger
@@ -101,13 +103,13 @@ class RuntimeGroup:
     admission_rollout_id: int
     request_ids: set[str] = field(default_factory=set)
     materialized_slot_idxs: set[int] = field(default_factory=set)
-    materialized_samples_by_slot: dict[int, list[Sample]] = field(default_factory=dict)
+    materialized_units_by_slot: dict[int, list[PendingExportUnit]] = field(default_factory=dict)
 
     def add_materialized_record(self, record: dict[str, Any], *, store_samples: bool) -> None:
         slot_idx = int(record["slot_idx"])
         self.materialized_slot_idxs.add(slot_idx)
         if store_samples:
-            self.materialized_samples_by_slot[slot_idx] = record["samples"]
+            self.materialized_units_by_slot[slot_idx] = record["pending_units"]
 
     def is_complete(self) -> bool:
         return len(self.materialized_slot_idxs) >= self.expected_count
@@ -118,13 +120,13 @@ class RuntimeGroup:
     def materialized_group(self) -> list[Sample]:
         completed_group: list[Sample] = []
         for idx in range(self.expected_count):
-            samples = self.materialized_samples_by_slot.get(idx)
-            if samples is None:
+            units = self.materialized_units_by_slot.get(idx)
+            if units is None:
                 raise RuntimeError(
                     f"RuntimeGroup cannot build a materialized group before all stored slots are ready: "
                     f"group_key={self.group_key!r}, missing_slot={idx}."
                 )
-            completed_group.extend(samples)
+            completed_group.extend(unit.sample for unit in units)
         return completed_group
 
 
@@ -159,11 +161,14 @@ class SessionInput:
 class SessionOutput:
     metadata: dict[str, Any] = field(default_factory=dict)
     reward: RewardValue = None
+    records: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "SessionOutput":
         if not isinstance(payload, dict):
             raise TypeError(f"SessionOutput payload must be a JSON object, got {type(payload)}")
+        if "messages" in payload:
+            return cls.from_records([payload])
         unknown_keys = set(payload) - {"metadata", "reward"}
         if unknown_keys:
             # Be lenient: example agents often want to dump debug fields
@@ -181,6 +186,68 @@ class SessionOutput:
         if reward is not None and not isinstance(reward, (int, float, dict)):
             raise TypeError("SessionOutput 'reward' must be null, number, or JSON object")
         return cls(metadata=metadata, reward=reward)
+
+    @classmethod
+    def from_records(cls, records: list[dict[str, Any]]) -> "SessionOutput":
+        normalized_records = [_normalize_session_output_record(record) for record in records]
+        seen_names: set[str] = set()
+        for record in normalized_records:
+            name = record["name"]
+            if name in seen_names:
+                raise TypeError(f"Session output record name must be unique within one explicit export: {name!r}")
+            seen_names.add(name)
+        return cls(records=normalized_records)
+
+
+def _normalize_session_output_record(record: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise TypeError(f"Session output record must be a JSON object, got {type(record)}")
+    unknown_keys = set(record) - {"name", "messages", "tools", "chat_template_kwargs", "metadata", "reward"}
+    if unknown_keys:
+        logger.warning(
+            "Session output record ignoring unknown keys: %s. Only 'name', 'messages', 'tools', "
+            "'chat_template_kwargs', 'metadata', and 'reward' are consumed by Relax.",
+            sorted(unknown_keys),
+        )
+    if "messages" not in record:
+        raise TypeError("Session output record must include 'messages'")
+    name = record.get("name")
+    if not isinstance(name, str) or not name:
+        raise TypeError("Session output record must include non-empty string 'name'")
+    metadata = record.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise TypeError("Session output record 'metadata' must be a JSON object")
+    reward = record.get("reward")
+    if reward is not None and not isinstance(reward, (int, float, dict)):
+        raise TypeError("Session output record 'reward' must be null, number, or JSON object")
+    normalized_record = {
+        "name": name,
+        "messages": check_messages(record["messages"]),
+        "metadata": copy.deepcopy(metadata),
+    }
+    if "reward" in record:
+        normalized_record["reward"] = copy.deepcopy(reward)
+    if "tools" in record:
+        normalized_record["tools"] = normalize_tools(record["tools"])
+    if "chat_template_kwargs" in record:
+        normalized_record["chat_template_kwargs"] = normalize_template_kwargs(record["chat_template_kwargs"])
+    return normalized_record
+
+
+def _session_output_from_text(raw_text: str) -> SessionOutput:
+    stripped = raw_text.strip()
+    if not stripped:
+        return SessionOutput()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        records = [json.loads(line) for line in stripped.splitlines() if line.strip()]
+        return SessionOutput.from_records(records)
+    if isinstance(parsed, dict):
+        return SessionOutput.from_payload(parsed)
+    if isinstance(parsed, list):
+        raise TypeError("Session output explicit records must be written as JSONL, not a JSON array")
+    raise TypeError(f"Managed command output must be a JSON object or JSONL records, got {type(parsed)}")
 
 
 @dataclass(frozen=True)
@@ -349,7 +416,7 @@ async def execute_managed_session_input(
         output_read_at = time.time()
         if output_path.exists():
             try:
-                session_output = SessionOutput.from_payload(json.loads(output_path.read_text(encoding="utf-8")))
+                session_output = _session_output_from_text(output_path.read_text(encoding="utf-8"))
             except Exception as exc:
                 raise AgentExecutionError(
                     f"Managed command agent produced invalid output.\n{combined_output}".rstrip()
@@ -365,6 +432,7 @@ async def execute_managed_session_input(
             "reward": session_output.reward,
             "_session_id": session_input.session_id,
             "_session_output_metadata": session_output_metadata,
+            "_session_output_records": session_output.records,
             "_agentic_trace_events": {},
         }
         profile = payload["_agentic_trace_events"]
@@ -796,8 +864,6 @@ class ManagedSessionRunner:
         if not unique_handles:
             return 0
         tasks = [self._tasks_by_handle[session_handle] for session_handle in unique_handles]
-        for session_handle in unique_handles:
-            self._clear_session_timeout_clock(session_handle)
         if signal_before_wait is not None:
             for session_handle in unique_handles:
                 task = self._tasks_by_handle[session_handle]
@@ -811,6 +877,8 @@ class ManagedSessionRunner:
                         forget=True,
                     )
                 task.cancel()
+        for session_handle in unique_handles:
+            self._clear_session_timeout_clock(session_handle)
         await asyncio.gather(*tasks, return_exceptions=True)
         for session_handle in unique_handles:
             self._tasks_by_handle.pop(session_handle, None)
@@ -1380,11 +1448,13 @@ class _ServeHandleChatControlClient:
         session_id: str,
         metadata: dict[str, Any] | None = None,
         reward: float | dict[str, Any] | None = None,
+        output_records: list[dict[str, Any]] | None = None,
     ) -> FinalizedResultTransport:
         return await self._handle.finalize_and_discard.remote(
             session_id=session_id,
             metadata=metadata,
             reward=reward,
+            output_records=output_records,
         )
 
     async def discard_session(self, *, session_id: str) -> bool:
@@ -1516,7 +1586,7 @@ class RuntimeDomain:
         self._interrupted_close_accounting_refresh_interval_s = 0.5
         self.session_debug_state: dict[str, Any] | None = None
         self._ready_materialized_batches: list[list[dict[str, Any]]] = []
-        self._ready_materialized_groups: list[list[Sample]] = []
+        self._ready_materialized_groups: list[tuple[GroupKey, list[Sample]]] = []
         self._output_ready_event = asyncio.Event()
         self._ready_materialized_session_count = 0
         self._emitted_materialized_session_count_total = 0
@@ -1569,8 +1639,8 @@ class RuntimeDomain:
         for records in self._ready_materialized_batches:
             for record in records:
                 dropped_group_keys.add(record["group_key"])
-        for group in self._ready_materialized_groups:
-            dropped_group_keys.add(sample_group_key(group))
+        for group_key, _group in self._ready_materialized_groups:
+            dropped_group_keys.add(group_key)
 
         for group_key in list(dropped_group_keys):
             await self._drop_runtime_group_resources(group_key=group_key)
@@ -1876,7 +1946,9 @@ class RuntimeDomain:
             if self._ready_materialized_session_count < 0:
                 raise RuntimeError("RuntimeDomain ready materialized session count underflow after group discard.")
         self._ready_materialized_groups = [
-            group for group in self._ready_materialized_groups if sample_group_key(group) != group_key
+            (ready_group_key, group)
+            for ready_group_key, group in self._ready_materialized_groups
+            if ready_group_key != group_key
         ]
 
     def debug_snapshot(self) -> dict[str, Any]:
@@ -1908,16 +1980,7 @@ class RuntimeDomain:
             "runtime_groups": len(self.runtime_groups_by_key),
             "runtime_materialized_records": sum(group.slot_count() for group in self.runtime_groups_by_key.values()),
             "runtime_group_details": _summarize_runtime_groups(self.runtime_groups_by_key),
-            "interrupted_current_groups": self.interrupted_group_count_for_step(
-                rollout_id=self.rollout_id,
-                previous=False,
-            )
-            if self.rollout_id is not None
-            else 0,
-            "interrupted_previous_groups": self.interrupted_group_count_for_step(
-                rollout_id=self.rollout_id,
-                previous=True,
-            )
+            "interrupted_groups": self._interrupted_group_count_for_step(rollout_id=self.rollout_id)
             if self.rollout_id is not None
             else 0,
             "prepare_gate_blocked_ir_count": self._cached_session_debug_total("prepare_gate_blocked_ir_count"),
@@ -1935,48 +1998,29 @@ class RuntimeDomain:
         ready_batch_group_keys = {
             record["group_key"] for records in self._ready_materialized_batches for record in records
         }
-        ready_group_keys = {sample_group_key(group) for group in self._ready_materialized_groups}
+        ready_group_keys = {group_key for group_key, _group in self._ready_materialized_groups}
         return set(self.runtime_groups_by_key) | ready_batch_group_keys | ready_group_keys
 
     def accounting_snapshot(self) -> dict[str, int]:
         ready_batch_group_keys = {
             record["group_key"] for records in self._ready_materialized_batches for record in records
         }
-        ready_group_keys = {sample_group_key(group) for group in self._ready_materialized_groups}
+        ready_group_keys = {group_key for group_key, _group in self._ready_materialized_groups}
         resident_group_keys = self.resident_group_keys()
-        rollout_id = self.rollout_id
-        interrupted_current_groups = 0
-        interrupted_previous_groups = 0
-        if rollout_id is not None:
-            interrupted_current_groups = self.interrupted_group_count_for_step(
-                rollout_id=rollout_id,
-                previous=False,
-            )
-            interrupted_previous_groups = self.interrupted_group_count_for_step(
-                rollout_id=rollout_id,
-                previous=True,
-            )
+        interrupted_groups = self._interrupted_group_count_for_step(rollout_id=self.require_rollout_id())
         return {
             "resident_groups": len(resident_group_keys),
             "runtime_groups": len(self.runtime_groups_by_key),
             "ready_materialized_batch_groups": len(ready_batch_group_keys),
             "ready_materialized_groups": len(ready_group_keys),
             "runtime_slots": len(self.runtime_slots_by_request_id),
-            "interrupted_current_groups": interrupted_current_groups,
-            "interrupted_previous_groups": interrupted_previous_groups,
+            "interrupted_groups": interrupted_groups,
         }
 
     def _interrupted_close_accounting_snapshot(self, *, rollout_id: int) -> dict[str, int]:
         return {
             "interrupted_sessions": len(self._aborted_resume_session_ids_by_rollout.get(rollout_id, set())),
-            "interrupted_current_groups": self.interrupted_group_count_for_step(
-                rollout_id=rollout_id,
-                previous=False,
-            ),
-            "interrupted_previous_groups": self.interrupted_group_count_for_step(
-                rollout_id=rollout_id,
-                previous=True,
-            ),
+            "interrupted_groups": self._interrupted_group_count_for_step(rollout_id=rollout_id),
         }
 
     async def refresh_interrupted_close_accounting(self) -> dict[str, int]:
@@ -1998,20 +2042,15 @@ class RuntimeDomain:
         self._interrupted_close_accounting_last_refresh_at = time.monotonic()
         return self._interrupted_close_accounting_snapshot(rollout_id=rollout_id)
 
-    def interrupted_group_count_for_step(self, *, rollout_id: int, previous: bool) -> int:
-        return len(self._interrupted_group_keys_for_step(rollout_id=rollout_id, previous=previous))
+    def _interrupted_group_count_for_step(self, *, rollout_id: int) -> int:
+        return len(self._interrupted_group_keys_for_step(rollout_id=rollout_id))
 
-    def _interrupted_group_keys_for_step(self, *, rollout_id: int, previous: bool) -> set[GroupKey]:
+    def _interrupted_group_keys_for_step(self, *, rollout_id: int) -> set[GroupKey]:
         aborted_session_ids = self._aborted_resume_session_ids_by_rollout.get(rollout_id, set())
         if not aborted_session_ids:
             return set()
         accounted_group_keys: set[GroupKey] = set()
         for group_key, group in self.runtime_groups_by_key.items():
-            if previous:
-                if group.admission_rollout_id >= rollout_id:
-                    continue
-            elif group.admission_rollout_id != rollout_id:
-                continue
             aborted_slot_count = 0
             for request_id in group.request_ids:
                 slot = self.runtime_slots_by_request_id.get(request_id)
@@ -2362,6 +2401,9 @@ class RuntimeDomain:
         finalize_metadata = result_payload["_session_output_metadata"]
         if not isinstance(finalize_metadata, dict):
             raise TypeError("Managed result payload '_session_output_metadata' must be a dict")
+        output_records = result_payload["_session_output_records"]
+        if not isinstance(output_records, list):
+            raise TypeError("Managed result payload '_session_output_records' must be a list")
         mark_agentic_event(framework_events, "managed_session_runner_start_at", session_runner_started_at)
         mark_agentic_event(framework_events, "managed_session_runner_end_at")
         finalize_client = self._ensure_service_client()
@@ -2370,6 +2412,7 @@ class RuntimeDomain:
             session_id=result_payload["_session_id"],
             metadata=copy.deepcopy(finalize_metadata),
             reward=result_payload["reward"],
+            output_records=copy.deepcopy(output_records),
         )
         mark_agentic_event(framework_events, "managed_finalize_request_end_at")
         transport_metadata = copy.deepcopy(transport.metadata) if isinstance(transport.metadata, dict) else {}
@@ -2496,7 +2539,7 @@ class RuntimeDomain:
         self._drained_materialized_session_count_total += materialized_session_count
         materialized_batches = list(self._ready_materialized_batches)
         self._ready_materialized_batches.clear()
-        ready_groups = list(self._ready_materialized_groups)
+        ready_groups = [group for _group_key, group in self._ready_materialized_groups]
         self._ready_materialized_groups.clear()
         return ExecutionDispatch(
             materialized_batches=materialized_batches,
@@ -3002,7 +3045,7 @@ class RuntimeDomain:
         session_id: str,
         result_transport: FinalizedResultTransport,
     ) -> dict[str, Any]:
-        exported_samples = await self._export_samples_from_transport(
+        pending_units = await self._export_units_from_transport(
             session_id=session_id,
             envelope=dispatch_context.envelope,
             result_transport=result_transport,
@@ -3014,7 +3057,8 @@ class RuntimeDomain:
             "expected_count": dispatch_context.expected_count,
             "slot_idx": dispatch_context.slot_idx,
             "session_id": session_id,
-            "samples": exported_samples,
+            "pending_units": pending_units,
+            "samples": [unit.sample for unit in pending_units],
         }
 
     def _emit_session_materialization_batch(self, records: list[dict[str, Any]]) -> None:
@@ -3024,8 +3068,8 @@ class RuntimeDomain:
         self._ready_materialized_session_count += len(records)
         self._emitted_materialized_session_count_total += len(records)
         for record in records:
-            for sample in record["samples"]:
-                mark_metadata_agentic_event(sample.metadata, "materialize_ready_at", ready_at)
+            for unit in record["pending_units"]:
+                mark_metadata_agentic_event(unit.sample.metadata, "materialize_ready_at", ready_at)
         for record in records:
             group = self.runtime_groups_by_key.get(record["group_key"])
             if group is None:
@@ -3033,41 +3077,59 @@ class RuntimeDomain:
             group.add_materialized_record(record, store_samples=bool(self.args.group_rm))
             if group.is_complete() and self.args.group_rm:
                 completed_group = group.materialized_group()
-                self._ready_materialized_groups.append(completed_group)
+                self._ready_materialized_groups.append((record["group_key"], completed_group))
         self._ready_materialized_batches.append(list(records))
         self._output_ready_event.set()
 
-    async def _export_samples_from_transport(
+    async def _export_units_from_transport(
         self,
         *,
         session_id: str,
         envelope: RequestEnvelope,
         result_transport: FinalizedResultTransport,
-    ) -> list[Sample]:
+    ) -> list[PendingExportUnit]:
         if result_transport.status in {"discarded", "non_finalizable"}:
             raise RuntimeError(f"Cannot export samples from {result_transport.status!r} transport.")
         artifact_ref = result_transport.artifact_ref
         if artifact_ref is None:
             raise RuntimeError("Agentic export requires artifact_ref in FinalizedResultTransport")
         artifact = await _resolve_object_async(artifact_ref, executor=self._runtime_resources.compiler.cpu_executor)
-        if isinstance(artifact, TrainingFieldArtifact):
-            sample = artifact.to_sample()
-        elif isinstance(artifact, dict):
-            sample = TrainingFieldArtifact(sample_payload=artifact).to_sample()
-        else:
-            raise RuntimeError(
-                "Agentic export requires artifact_ref to resolve to TrainingFieldArtifact-compatible payload."
+        if not (isinstance(artifact, dict) and isinstance(artifact.get("units"), list)):
+            raise RuntimeError("Agentic export requires artifact_ref to resolve to a payload with a units list.")
+        unit_payloads = artifact["units"]
+        if len(unit_payloads) > 1:
+            if not getattr(self.args, "use_dynamic_batch_size", False):
+                raise RuntimeError("Agentic explicit export with multiple rows requires --use-dynamic-batch-size.")
+
+        units: list[PendingExportUnit] = []
+        for unit_payload in unit_payloads:
+            if not isinstance(unit_payload, dict):
+                raise RuntimeError("Agentic export unit payload must be a dict.")
+            sample_payload = unit_payload["sample_payload"]
+            if not isinstance(sample_payload, dict):
+                raise RuntimeError("Agentic export unit payload must include a sample_payload dict.")
+            sample = TrainingFieldArtifact(sample_payload=sample_payload).to_sample()
+            sample.group_index = envelope.seed.group_index
+            sample.index = envelope.seed.index
+            sample.label = envelope.seed.label
+            sample.train_metadata = envelope.seed.train_metadata
+            sample.metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+            sample.session_id = session_id
+            _overlay_sample_metadata(base_metadata=sample.metadata, overlay_metadata=envelope.metadata)
+            _overlay_sample_metadata(base_metadata=sample.metadata, overlay_metadata=result_transport.metadata)
+            mark_metadata_agentic_event(sample.metadata, "materialize_harvest_at")
+            spans = unit_payload["assistant_token_spans"]
+            unit_name = unit_payload["name"]
+            setattr(sample, "_agentic_export_name", unit_name)
+            units.append(
+                PendingExportUnit(
+                    name=unit_name,
+                    sample=sample,
+                    assistant_token_spans=[(int(start), int(end)) for start, end in spans],
+                    mode=ExportMode(str(unit_payload["mode"])),
+                )
             )
-        sample.group_index = envelope.seed.group_index
-        sample.index = envelope.seed.index
-        sample.label = envelope.seed.label
-        sample.train_metadata = envelope.seed.train_metadata
-        sample.metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        sample.session_id = session_id
-        _overlay_sample_metadata(base_metadata=sample.metadata, overlay_metadata=envelope.metadata)
-        _overlay_sample_metadata(base_metadata=sample.metadata, overlay_metadata=result_transport.metadata)
-        mark_metadata_agentic_event(sample.metadata, "materialize_harvest_at")
-        return [sample]
+        return units
 
 
 # Runtime backend resources

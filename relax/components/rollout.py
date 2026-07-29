@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.http_utils import _wrap_ipv6
 
@@ -346,6 +347,11 @@ class Rollout(Base):
         self._sglang_base_url: Optional[str] = None
         self._proxy_client: Optional[httpx.AsyncClient] = None
 
+        # Wired by controller in colocate: rollout must wait for all sharing
+        # peers (actor, critic, ...) to finish round N (sleep GPU) before
+        # waking SGLang for round N+1. Stays ``None`` in fully_async.
+        self._peer_barrier: Optional[PeerStepBarrier] = None
+
     def _should_eval(self, local_step):
         if self.config.eval_interval is None or self.config.eval_prompt_data is None:
             return False
@@ -373,6 +379,15 @@ class Rollout(Base):
 
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
+
+    def set_barriers(
+        self,
+        *,
+        rollout: Any = None,  # accepted for interface parity; rollout doesn't gate on itself
+        peers: Optional[PeerStepBarrier] = None,
+    ) -> None:
+        del rollout
+        self._peer_barrier = peers
 
     async def _run_eval_with_mark(self, rollout_id: int) -> None:
         await self.rollout_manager.eval.remote(rollout_id=rollout_id)
@@ -447,6 +462,26 @@ class Rollout(Base):
                     should_continue = rollout_done or satisfy_staleness(
                         partition_list, local_step, self.config.max_staleness
                     )
+                    # Colocate barrier: don't start round N+1 until every
+                    # sharing peer (actor / critic / ...) has advanced its step
+                    # past `local_step` — their step increments after
+                    # ``async_train`` returns (which includes the post-train
+                    # sleep), guaranteeing the GPU is released before SGLang
+                    # tries to resume.
+                    if (
+                        should_continue
+                        and not rollout_done
+                        and self._peer_barrier is not None
+                        and not self._peer_barrier.is_empty()
+                    ):
+                        pending = await self._peer_barrier.list_pending_async(local_step)
+                        if pending:
+                            should_continue = False
+                            if wait_count % 30 == 0:
+                                desc = ", ".join(f"{r}(step={s})" for r, s in pending)
+                                self._logger.info(
+                                    f"Rollout {local_step}: waiting for peers to finish round {local_step}: {desc}"
+                                )
                     if not should_continue:
                         should_log = (wait_count >= 1200 and wait_count % 30 == 0) or (
                             600 <= wait_count < 1200 and wait_count % 60 == 0
