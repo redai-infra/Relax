@@ -2,7 +2,7 @@
 
 Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。本文档覆盖 PPO 与主要 GRPO-family 算法（OPD 在线策略蒸馏请参阅[单独文档](./on-policy-distillation.md)）。
 
-GRPO、CISPO、GSPO 与 SAPO 使用相同的服务拓扑，可以直接在现有脚本中替换算法参数块。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
+GRPO、CISPO、GSPO、SAPO 与 RLOO 使用相同的服务拓扑，可以直接在现有脚本中替换算法参数块。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
 ---
 
@@ -202,6 +202,99 @@ SAPO_ARGS=(
 
 ---
 
+## RLOO
+
+RLOO（REINFORCE Leave-One-Out）保留 GRPO 的组内采样，但改变 baseline 的构造方式：每个样本与组内**其他**样本的均值比较，而不是与包含自身的组均值比较。
+
+参考文献：[Back to Basics: Revisiting REINFORCE-Style Optimization for Learning from Human Feedback in LLMs](https://arxiv.org/abs/2402.14740)。
+
+### 算法原理
+
+对同一 prompt 的 $k$ 条回复，奖励为 $R_1 \dots R_k$：
+
+$$\hat{A}_i = R_i - \frac{1}{k-1}\sum_{j \neq i} R_j$$
+
+由于 baseline 不含 $R_i$，它与被评估的样本统计独立，因此该估计量是无偏的。GRPO 的 baseline 包含 $R_i$，因此 baseline 与样本**正相关**（$\operatorname{Cov}(R_i, \bar{R}) = \operatorname{Var}(R)/k$）。这一相关性会收缩 advantage：$R_i - \bar{R}$ 恰好是留一法取值的 $\frac{k-1}{k}$ 倍，而下面的 $k/(k-1)$ 因子正是把它抵消回来。
+
+两种形式在代数上等价：
+
+$$\hat{A}_i = \frac{k}{k-1}\left(R_i - \bar{R}\right)$$
+
+即 RLOO 等于组内中心化奖励乘以 $k/(k-1)$。由此有两点推论：
+
+- **不做标准差缩放。** GRPO 除以组内标准差，这会让各组之间相互重新加权：奖励接近一致的组，其微小差异会被放大。RLOO 用的因子与组内离散度无关，因此各组保持原有的相对权重。这正是 Dr. GRPO 对 std 归一化提出的质疑。
+- **组内 advantage 仍然和为零**，因此 reduction 与日志行为与 GRPO 完全一致。
+
+#### 与 `--disable-grpo-std-normalization` 的关系
+
+这一点值得明说，因为两者关系很近：关闭 std 归一化后，GRPO 给出的正是 $R_i - \bar{R}$，于是
+
+$$\hat{A}^\text{RLOO}_i = \frac{k}{k-1}\,\hat{A}^{\text{GRPO,\,no-std}}_i$$
+
+逐元素成立。Relax 要求每组样本数严格等于 `--n-samples-per-prompt`，因此 $k$ 在一次运行内恒定，该因子是一个**全局常数**。也就是说，RLOO 并非与 `--disable-grpo-std-normalization` 不同的加权方式，而是该估计量配上使 leave-one-out 基线无偏的那个特定常数。在 Adam 下，loss 上的全局常数在参数更新中基本被抵消 —— 所以选 RLOO 的理由是"要那个有名字的无偏估计量"，而不是期待得到不同的梯度方向。
+
+真正有差别的比较对象是**默认的** GRPO：它除以每组各自的标准差，确实会改变各组之间的相对权重。
+
+#### 对梯度裁剪的影响
+
+RLOO 的 advantage 量级小于默认 GRPO，因为二值 reward 下组内标准差通常远小于 1。在 Qwen3-0.6B / GSM8K、$k = 8$、`--lr` 相同的实测中，`train/grad_norm` 均值 RLOO 为 0.47、GRPO 为 1.04。
+
+Adam 对梯度的常数缩放基本不敏感，所以这**基本不构成**重调 `--lr` 的理由。但它对 `--clip-grad` 有影响 —— 裁剪会破坏这种不变性：在 Megatron 默认的 `--clip-grad 1.0` 下，同一组实验里 GRPO 有 **68% 的 step 被裁剪，RLOO 只有 2%**。切换算法时应重新审视 `--clip-grad`，而不是 `--lr`。
+
+下游的 PPO-Clip 策略损失、KL loss、TIS 以及 DP/CP 切分均保持不变。
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--advantage-estimator rloo` | — | 启用 RLOO |
+| `--n-samples-per-prompt` | `1` | 必须 $\geq 2$；组内只有 1 个样本时没有 leave-one-out baseline，advantage 记为 0 |
+| `--disable-rewards-normalization` | 关闭 | 保持关闭。该开关会完全跳过组内 baseline，直接把原始 reward 当作 advantage |
+| `--disable-grpo-std-normalization` | 关闭 | 对 RLOO 无效 —— std 分支只针对 GRPO 家族，没有可禁用的对象 |
+| `--eps-clip` | `0.2` | 裁剪边距，与 GRPO 相同 |
+
+### 快速开始
+
+在任意 GRPO 脚本中把 `GRPO_ARGS` 替换为 `RLOO_ARGS`：
+
+```bash
+RLOO_ARGS=(
+   --advantage-estimator rloo
+   --eps-clip 0.2
+)
+```
+
+仓库提供了一份完整的单卡 GSM8K 配置：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+bash examples/algorithms/run-qwen3-0.6B-1xgpu-gsm8k-rloo.sh
+```
+
+::: warning
+RLOO 目前仅在 colocate（同步）模式下**实际运行过**。fully-async 至少需要 2 张 GPU
+—— 非 colocate 模式下 `Controller._validate_gpu_resources` 会把各角色的 GPU 数求和
+（`relax/core/controller.py:330`），而 fully-async 的最小角色集是 actor + rollout ——
+因此在本次使用的单卡机器上无法进行异步实测。
+
+不过 RLOO 在这一维度上预期没有差异：它唯一改动的是 `post_process_rewards` 里的组内
+baseline，而这里是同步与异步**共用的唯一**归一化入口（所有调用方都经
+`convert_samples_to_train_data` 到达）。异步路径不会重新计算 advantage。
+:::
+
+### 适用场景
+
+与**默认** GRPO 相比，实质差异在于 RLOO 不除以每组各自的标准差：
+
+- 组内标准差小且不稳定的奖励分布 —— 此时除以它，等于按"这组恰好有多整齐"而不是"这组有多少信息量"来重新加权
+- GRPO 下 `--clip-grad` 频繁触发的场景 —— RLOO 的 advantage 量级更小，被裁剪的步数更少（见上文）
+- 排查训练异常时，作为有名字的无偏参照点，判断问题是否来自 advantage 估计器
+
+与 `--disable-grpo-std-normalization` 相比，差异只是那个常数 $k/(k-1)$，它的作用是让 leave-one-out 基线无偏。该修正在小组规模下更大（$k = 4$ 时为 $1.33$，$k = 16$ 时为 $1.07$），但它终究是常数，因此在 Adam 下不要期待由它带来行为变化。
+
+---
+
 ## 算法对比
 
 | 算法 | Advantage 计算 | 策略损失 | KL 约束方式 |
@@ -211,6 +304,7 @@ SAPO_ARGS=(
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
+| **RLOO** | Leave-one-out baseline，不做 std 缩放 | PPO-Clip（硬裁剪） | 可选 KL loss |
 
 ## 下一步
 

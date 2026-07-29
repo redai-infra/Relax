@@ -1572,6 +1572,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "rloo",
                 ],
                 default="grpo",
                 help=(

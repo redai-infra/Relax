@@ -417,6 +417,66 @@ def get_grpo_returns(
     return returns
 
 
+def get_rloo_advantages(rewards: torch.Tensor) -> torch.Tensor:
+    """RLOO advantages: leave-one-out baseline, no std scaling.
+
+    Each sample is scored against the mean of the *other* ``k - 1`` samples, which
+    keeps the baseline independent of the sample it evaluates and therefore
+    unbiased (https://arxiv.org/abs/2402.14740)::
+
+        A_i = R_i - mean(R_j for j != i)
+
+    Args:
+        rewards: Raw (un-centered) rewards of a single group, shape ``[k]``.
+
+    Returns:
+        Advantages with the same shape as ``rewards``. Floating-point dtypes are
+        preserved; integer rewards are promoted by the division rather than
+        truncated. A group of one has no leave-one-out baseline, so its
+        advantage is zero.
+
+    Raises:
+        ValueError: If ``rewards`` is not 1-D. The baseline is a whole-group
+            reduction, so a 2-D input would silently be treated as one large
+            group and return wrong numbers rather than failing.
+    """
+    if rewards.dim() != 1:
+        raise ValueError(f"rewards must be 1-D (one group), got shape {tuple(rewards.shape)}.")
+    k = rewards.numel()
+    if k < 2:
+        return torch.zeros_like(rewards)
+    return (rewards * k - rewards.sum()) / (k - 1)
+
+
+def scale_centered_rewards_for_rloo(centered_rewards: torch.Tensor) -> torch.Tensor:
+    """Turn group-centered rewards into RLOO advantages.
+
+    ``A_i = R_i - mean(R_j for j != i)`` is algebraically ``k / (k - 1)`` times the
+    group-centered reward, so callers that already subtracted the group mean only
+    need this rescale instead of recomputing the baseline. Kept separate from
+    :func:`get_rloo_advantages` so both forms can be cross-checked in tests.
+
+    Args:
+        centered_rewards: Rewards of a single group after subtracting the group
+            mean, shape ``[k]``.
+
+    Returns:
+        Advantages with the same shape and dtype -- scaling by a Python float does
+        not upcast a float32 input. A group of one is zeroed, matching
+        :func:`get_rloo_advantages`.
+
+    Raises:
+        ValueError: If ``centered_rewards`` is not 1-D, for the same reason as
+            :func:`get_rloo_advantages`.
+    """
+    if centered_rewards.dim() != 1:
+        raise ValueError(f"centered_rewards must be 1-D (one group), got shape {tuple(centered_rewards.shape)}.")
+    k = centered_rewards.numel()
+    if k < 2:
+        return torch.zeros_like(centered_rewards)
+    return centered_rewards * (k / (k - 1))
+
+
 def get_reinforce_plus_plus_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],

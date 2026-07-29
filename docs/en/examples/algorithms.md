@@ -2,7 +2,7 @@
 
 Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-GRPO, CISPO, GSPO, and SAPO share the same service topology, so their argument blocks can be swapped in existing scripts. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+GRPO, CISPO, GSPO, SAPO, and RLOO share the same service topology, so their argument blocks can be swapped in existing scripts. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
 ---
 
@@ -202,6 +202,101 @@ SAPO_ARGS=(
 
 ---
 
+## RLOO
+
+RLOO (REINFORCE Leave-One-Out) keeps GRPO's group sampling but changes the baseline: each sample is scored against the mean of the **other** samples in its group rather than against the group mean including itself.
+
+Reference: [Back to Basics: Revisiting REINFORCE-Style Optimization for Learning from Human Feedback in LLMs](https://arxiv.org/abs/2402.14740).
+
+### How It Works
+
+For a group of $k$ responses to the same prompt with rewards $R_1 \dots R_k$:
+
+$$\hat{A}_i = R_i - \frac{1}{k-1}\sum_{j \neq i} R_j$$
+
+Because the baseline excludes $R_i$, it is statistically independent of the sample it evaluates, which makes the estimator unbiased. GRPO's baseline includes $R_i$, so baseline and sample are **positively** correlated ($\operatorname{Cov}(R_i, \bar{R}) = \operatorname{Var}(R)/k$). That correlation shrinks the advantage: $R_i - \bar{R}$ is exactly $\frac{k-1}{k}$ times the leave-one-out value, which is what the $k/(k-1)$ factor below undoes.
+
+The two forms are algebraically related:
+
+$$\hat{A}_i = \frac{k}{k-1}\left(R_i - \bar{R}\right)$$
+
+so RLOO is the group-centered reward rescaled by $k/(k-1)$. Two consequences follow:
+
+- **No standard-deviation scaling.** GRPO divides by the group standard deviation, which reweights groups against each other: a group whose rewards are nearly identical gets its small differences amplified. RLOO applies a single factor that does not depend on the group's spread, so groups keep their relative weight. This is the same concern Dr. GRPO raises about std normalization.
+- **Advantages still sum to zero** within each group, so the reduction and logging behaviour is identical to GRPO.
+
+#### Relationship to `--disable-grpo-std-normalization`
+
+Worth being explicit, because the two are closely related: with std normalization disabled, GRPO produces exactly $R_i - \bar{R}$, so
+
+$$\hat{A}^\text{RLOO}_i = \frac{k}{k-1}\,\hat{A}^{\text{GRPO,\,no-std}}_i$$
+
+element-wise. Relax requires every group to have exactly `--n-samples-per-prompt` samples, so $k$ is constant within a run and that factor is a **global constant**. RLOO is therefore not a different reweighting from `--disable-grpo-std-normalization`; it is that estimator with the specific constant that makes the leave-one-out baseline unbiased. Under Adam a global constant on the loss largely cancels in the update, so choose RLOO when you want the named, unbiased estimator — not in the expectation of a different gradient direction.
+
+The comparison that does differ is against **default** GRPO, which divides by the per-group std and so does reweight groups relative to each other.
+
+#### Effect on gradient clipping
+
+RLOO's advantages are smaller in magnitude than default GRPO's, because the group std for binary rewards is typically well below 1. Measured on Qwen3-0.6B / GSM8K at $k = 8$ and identical `--lr`, `train/grad_norm` averaged 0.47 for RLOO versus 1.04 for GRPO.
+
+Adam is largely invariant to a constant gradient rescale, so this is mostly *not* a reason to retune `--lr`. It does matter for `--clip-grad`, which breaks that invariance: at Megatron's default `--clip-grad 1.0`, the same run clipped **68% of steps under GRPO but only 2% under RLOO**. Revisit `--clip-grad` rather than `--lr` when switching.
+
+Everything downstream — the PPO-Clip policy loss, KL loss, TIS, DP/CP splitting — is unchanged.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--advantage-estimator rloo` | — | Enable RLOO |
+| `--n-samples-per-prompt` | `1` | Must be $\geq 2$; a group of one has no leave-one-out baseline and gets a zero advantage |
+| `--disable-rewards-normalization` | off | Leave off. This flag skips the group baseline entirely, leaving the raw reward as the advantage |
+| `--disable-grpo-std-normalization` | off | No effect under RLOO — the std branch is GRPO-family only, so there is nothing to disable |
+| `--eps-clip` | `0.2` | Clipping margin, same as GRPO |
+
+### Quick Start
+
+Replace `GRPO_ARGS` with `RLOO_ARGS` in any GRPO script:
+
+```bash
+RLOO_ARGS=(
+   --advantage-estimator rloo
+   --eps-clip 0.2
+)
+```
+
+A complete single-GPU recipe on GSM8K is provided:
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+bash examples/algorithms/run-qwen3-0.6B-1xgpu-gsm8k-rloo.sh
+```
+
+::: warning
+RLOO has only been **run** in colocate (synchronous) mode. Fully-async needs at
+least two GPUs — `Controller._validate_gpu_resources` sums per-role GPU counts in
+non-colocate mode (`relax/core/controller.py:330`), and the minimum fully-async
+role set is actor + rollout — so no async run was possible on the single-GPU host
+used here.
+
+That said, RLOO is not expected to behave differently: the only code it changes on
+this axis is the group baseline inside `post_process_rewards`, which is the single
+normalization funnel for both modes (every caller reaches it through
+`convert_samples_to_train_data`). Nothing in the async path recomputes advantages.
+:::
+
+### When to Use
+
+Against **default** GRPO, the substantive difference is that RLOO does not divide by the per-group standard deviation:
+
+- Reward distributions where the group std is small and unstable, so dividing by it reweights groups by how uniform they happen to be rather than by how informative they are
+- Workloads where `--clip-grad` binds often under GRPO — RLOO's smaller advantage magnitudes leave more steps unclipped (see above)
+- As a named, unbiased reference point when diagnosing whether the advantage estimator is implicated in a training pathology
+
+Against `--disable-grpo-std-normalization`, the difference is only the constant $k/(k-1)$, which is what makes the leave-one-out baseline unbiased. That correction is larger for small groups ($1.33$ at $k = 4$, $1.07$ at $k = 16$), but it is still a constant, so do not expect a behavioural change from it under Adam.
+
+---
+
 ## Algorithm Comparison
 
 | Algorithm | Advantage Computation | Policy Loss | KL Constraint |
@@ -211,6 +306,7 @@ SAPO_ARGS=(
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
+| **RLOO** | Leave-one-out baseline, no std scaling | PPO-Clip (hard clip) | Optional KL loss |
 
 ## Next Steps
 
