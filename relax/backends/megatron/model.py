@@ -1508,16 +1508,17 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
         path.mkdir(parents=True, exist_ok=True)
 
-        # RL-trained Megatron models drop the base model's MTP module, so the
-        # weight iterator never yields the base checkpoint's `mtp.*` tensors.
-        # Those tensors share safetensors shards with real LM tensors; with
-        # strict=True the bridge refuses to write those shards and silently
-        # truncates the export. Mirror the offline converter
-        # (scripts/tools/convert_torch_dist_to_hf_bridge.py): tolerate the
-        # missing MTP keys so the shard's LM tensors are still written.
-        allow_missing_mtp_keys = bool(getattr(args, "mtp_num_layers", 0)) and not getattr(
-            args, "enable_mtp_training", False
-        )
+        # A base HF model can define MTP layers that a model trained without MTP
+        # never emits; those tensors share safetensors shards with real LM tensors
+        # (lm_head, final norm, last layers), and with strict=True the bridge
+        # refuses to write those shards and silently truncates the export. Decide
+        # strictness from the *reference* model (args.hf_checkpoint): for standard
+        # RL/SFT jobs args.mtp_num_layers is None, so keying off the training model
+        # (as before) never triggered and left the export truncated.
+        from relax.utils.hf_export import reconcile_hf_export_index, reference_expects_mtp
+
+        model_has_mtp = bool(getattr(args, "mtp_num_layers", 0))
+        allow_missing_mtp_keys = reference_expects_mtp(args.hf_checkpoint) and not model_has_mtp
         strict = not allow_missing_mtp_keys
 
         with patch_megatron_model(model):
@@ -1526,6 +1527,21 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
                 path=path,
                 strict=strict,
             )
+
+        # When MTP keys are tolerated as missing (strict=False above), Megatron-Bridge's
+        # non-distributed save still lists those mtp.* keys in model.safetensors.index.json
+        # while omitting them from the shards ("ghost" keys), and the base MTP weights are
+        # absent. Reconcile: rebuild the index from the tensors actually written and
+        # supplement MTP from the base HF model, so the checkpoint loads cleanly (incl.
+        # EAGLE speculative decoding). The bridge writes on WORLD rank 0, so run the
+        # reconcile there too (the output lives on shared storage).
+        is_export_writer = (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
+        )
+        if allow_missing_mtp_keys and is_export_writer:
+            reconcile_hf_export_index(str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=True)
+
         if is_lora_enabled(args):
             _save_lora_to_checkpoint(model, str(path), args, bridge=bridge)
         if should_log:
