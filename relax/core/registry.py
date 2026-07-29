@@ -80,35 +80,28 @@ class ROLES_PPO_FULLY_ASYNC_ON_POLICY(StrEnum):
     reference: str = "reference"
 
 
+# GRPO-family algorithms (GRPO, GSPO, SAPO, CISPO, REINFORCE++,
+# REINFORCE++-baseline) share the same service topology — they differ only in
+# advantage/loss computation, dispatched by `--advantage-estimator` inside the
+# Advantages component and `policy_loss_function`. Registering each variant
+# here keeps the algorithm list a single source of truth (task #27: registry
+# dispatch instead of if/elif chains) and lets the Controller validate the key
+# end-to-end. REINFORCE++ variants reuse the GRPO topology (no critic).
+_GRPO_TOPOLOGY = {
+    ROLES.rollout: Rollout,
+    ROLES.actor: Actor,
+    ROLES.advantages: Advantages,
+    ROLES.reference: ActorFwd,
+    ROLES.actor_fwd: ActorFwd,
+}
+
 ALGOS = {
-    "grpo": {
-        ROLES.rollout: Rollout,
-        ROLES.actor: Actor,
-        ROLES.advantages: Advantages,
-        ROLES.reference: ActorFwd,
-        ROLES.actor_fwd: ActorFwd,
-    },
-    "gspo": {
-        ROLES.rollout: Rollout,
-        ROLES.actor: Actor,
-        ROLES.advantages: Advantages,
-        ROLES.reference: ActorFwd,
-        ROLES.actor_fwd: ActorFwd,
-    },
-    "sapo": {
-        ROLES.rollout: Rollout,
-        ROLES.actor: Actor,
-        ROLES.advantages: Advantages,
-        ROLES.reference: ActorFwd,
-        ROLES.actor_fwd: ActorFwd,
-    },
-    "cispo": {
-        ROLES.rollout: Rollout,
-        ROLES.actor: Actor,
-        ROLES.advantages: Advantages,
-        ROLES.reference: ActorFwd,
-        ROLES.actor_fwd: ActorFwd,
-    },
+    "grpo": dict(_GRPO_TOPOLOGY),
+    "gspo": dict(_GRPO_TOPOLOGY),
+    "sapo": dict(_GRPO_TOPOLOGY),
+    "cispo": dict(_GRPO_TOPOLOGY),
+    "reinforce_plus_plus": dict(_GRPO_TOPOLOGY),
+    "reinforce_plus_plus_baseline": dict(_GRPO_TOPOLOGY),
     "sft": {
         ROLES.sft: SFT,
         ROLES.actor: Actor,
