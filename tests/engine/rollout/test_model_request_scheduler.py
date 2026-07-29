@@ -44,7 +44,10 @@ def test_model_request_scheduler_rejects_non_positive_capacity(capacity: int) ->
         ({"sglang_server_concurrency": 0}, "sglang_server_concurrency"),
         ({"rollout_num_gpus": 0}, "rollout_num_gpus"),
         ({"rollout_num_gpus_per_engine": 0}, "rollout_num_gpus_per_engine"),
-        ({"rollout_num_gpus": 1, "rollout_num_gpus_per_engine": 2}, "capacity must be positive"),
+        (
+            {"sglang_server_concurrency": 1, "rollout_num_gpus": 1, "rollout_num_gpus_per_engine": 2},
+            "capacity must be positive",
+        ),
     ],
 )
 def test_model_request_capacity_rejects_invalid_configuration(overrides: dict[str, int], message: str) -> None:
