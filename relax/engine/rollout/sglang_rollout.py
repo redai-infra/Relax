@@ -3,12 +3,14 @@
 import asyncio
 import copy
 import inspect
+import json
 import uuid
 from argparse import Namespace
-from collections.abc import Callable
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import asdict
 from time import monotonic
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 import pybase64
@@ -23,6 +25,12 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.request_gate import (
+    GenerationAborted,
+    InferenceRequestGate,
+    RequestEvent,
+    request_scoped_generate,
+)
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -35,7 +43,7 @@ from relax.utils.data.processing_utils import (
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import get, post
-from relax.utils.logging_utils import get_logger
+from relax.utils.logging_utils import LOG_LEVEL, get_logger
 from relax.utils.misc import SingletonMeta, load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.timer import Timer
@@ -45,9 +53,16 @@ from relax.utils.types import Sample
 from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_batch_to_data_system
 
 
-__all__ = ["generate_rollout"]
+__all__ = ["GenerateState", "GenerationAborted", "generate_rollout", "request_scoped_generate"]
 
 logger = get_logger(__name__)
+
+_Result = TypeVar("_Result")
+
+
+class _RequestEventLogger:
+    def record(self, event: RequestEvent) -> None:
+        logger.debug("request_event=%s", json.dumps(asdict(event), sort_keys=True, separators=(",", ":")))
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -77,8 +92,11 @@ class GenerateState(metaclass=SingletonMeta):
                 except Exception as e:
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        request_capacity = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self._request_gate = InferenceRequestGate(
+            capacity=request_capacity,
+            is_aborted=lambda: self.aborted,
+            recorder=_RequestEventLogger() if LOG_LEVEL == "DEBUG" else None,
         )
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
@@ -113,6 +131,22 @@ class GenerateState(metaclass=SingletonMeta):
         finally:
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
+
+    async def run_request(
+        self,
+        request_factory: Callable[[], Awaitable[_Result]],
+        *,
+        turn_index: int | None = None,
+    ) -> _Result:
+        """Run one lazily created inference request under the shared
+        concurrency limit."""
+        return await self._request_gate.run(request_factory, turn_index=turn_index)
+
+    @asynccontextmanager
+    async def _request_permit(self) -> AsyncIterator[None]:
+        """Hold one admission slot for the legacy whole-generator fallback."""
+        async with self._request_gate.permit():
+            yield
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -340,9 +374,17 @@ async def generate(
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
-    _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
-    _t_generate = monotonic() - _t_generate_start
+    _t_generate = 0.0
+
+    async def _send_request() -> dict[str, Any]:
+        nonlocal _t_generate
+        _t_generate_start = monotonic()
+        try:
+            return await post(url, payload, headers=headers)
+        finally:
+            _t_generate = monotonic() - _t_generate_start
+
+    output = await state.run_request(_send_request)
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -460,18 +502,13 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
 
+    async def _dispatch_generate() -> None:
+        nonlocal sample
         with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
-
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
+            if custom_generate_func is not None:
                 # if signature has evaluation, pass evaluation
                 if "evaluation" in inspect.signature(custom_generate_func).parameters:
                     sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
@@ -479,6 +516,22 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+
+    uses_request_scoped_admission = (
+        custom_generate_func is not None and getattr(custom_generate_func, "manages_inference_permit", False) is True
+    )
+    try:
+        if custom_generate_func is not None and not uses_request_scoped_admission:
+            async with state._request_permit():
+                await _dispatch_generate()
+        else:
+            if state.aborted:
+                sample.status = Sample.Status.ABORTED
+                return sample
+            await _dispatch_generate()
+    except GenerationAborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
