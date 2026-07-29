@@ -6,7 +6,7 @@
 # The Ray cluster is managed externally — do NOT kill ray or start a new cluster.
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen35-9B-8xgpu-async.sh [async|sync]
+#   bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh [hybrid-async|sync]
 
 set -ex
 set -o pipefail
@@ -29,6 +29,86 @@ EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+
+HYBRID_PIPELINE_FORWARD="${HYBRID_PIPELINE_FORWARD:-0}"
+HYBRID_PIPELINE_TRACE_DIR="${HYBRID_PIPELINE_TRACE_DIR:-}"
+HYBRID_PIPELINE_FETCH_TIMEOUT_S="${HYBRID_PIPELINE_FETCH_TIMEOUT_S:-600}"
+SGLANG_DETERMINISTIC_INFERENCE="${SGLANG_DETERMINISTIC_INFERENCE:-0}"
+SEED="${SEED:-}"
+ROLLOUT_SEED="${ROLLOUT_SEED:-}"
+
+case "${MODE}" in
+  hybrid-async|sync) ;;
+  *)
+    echo "MODE must be hybrid-async or sync, got ${MODE}" >&2
+    exit 2
+    ;;
+esac
+case "${HYBRID_PIPELINE_FORWARD}" in
+  0|1) ;;
+  *)
+    echo "HYBRID_PIPELINE_FORWARD must be 0 or 1, got ${HYBRID_PIPELINE_FORWARD}" >&2
+    exit 2
+    ;;
+esac
+case "${SGLANG_DETERMINISTIC_INFERENCE}" in
+  0|1) ;;
+  *)
+    echo "SGLANG_DETERMINISTIC_INFERENCE must be 0 or 1, got ${SGLANG_DETERMINISTIC_INFERENCE}" >&2
+    exit 2
+    ;;
+esac
+if [ "${MODE}" != "hybrid-async" ] && {
+    [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] || [ -n "${HYBRID_PIPELINE_TRACE_DIR}" ];
+}; then
+    echo "Hybrid pipeline forward/trace options require MODE=hybrid-async" >&2
+    exit 2
+fi
+
+HYBRID_PIPELINE_ARGS=()
+if [ "${HYBRID_PIPELINE_FORWARD}" = "1" ]; then
+    HYBRID_PIPELINE_ARGS+=(
+        --hybrid-pipeline-forward
+        --hybrid-pipeline-fetch-timeout-s "${HYBRID_PIPELINE_FETCH_TIMEOUT_S}"
+    )
+fi
+if [ -n "${HYBRID_PIPELINE_TRACE_DIR}" ]; then
+    HYBRID_PIPELINE_ARGS+=(
+        --hybrid-pipeline-trace-dir "${HYBRID_PIPELINE_TRACE_DIR}"
+    )
+fi
+
+REPRO_ARGS=()
+if [ -n "${SEED}" ]; then
+    REPRO_ARGS+=(--seed "${SEED}")
+fi
+if [ -n "${ROLLOUT_SEED}" ]; then
+    REPRO_ARGS+=(--rollout-seed "${ROLLOUT_SEED}")
+fi
+
+DEBUG_ARGS=()
+if [ -n "${SAVE_DEBUG_ROLLOUT_DATA:-}" ]; then
+    DEBUG_ARGS+=(--save-debug-rollout-data "${SAVE_DEBUG_ROLLOUT_DATA}")
+fi
+if [ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]; then
+    DEBUG_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
+fi
+if [ -n "${SAVE_DEBUG_TRAIN_DATA:-}" ]; then
+    DEBUG_ARGS+=(--save-debug-train-data "${SAVE_DEBUG_TRAIN_DATA}")
+fi
+if [ "${SGLANG_DETERMINISTIC_INFERENCE}" = "1" ]; then
+    DEBUG_ARGS+=(--sglang-enable-deterministic-inference)
+fi
+
+printf '%s\n' \
+    "MODE=${MODE}" \
+    "NUM_ROLLOUT=${NUM_ROLLOUT}" \
+    "HYBRID_PIPELINE_FORWARD=${HYBRID_PIPELINE_FORWARD}" \
+    "HYBRID_PIPELINE_TRACE_DIR=${HYBRID_PIPELINE_TRACE_DIR}" \
+    "HYBRID_PIPELINE_FETCH_TIMEOUT_S=${HYBRID_PIPELINE_FETCH_TIMEOUT_S}" \
+    "SEED=${SEED}" \
+    "ROLLOUT_SEED=${ROLLOUT_SEED}" \
+    "SGLANG_DETERMINISTIC_INFERENCE=${SGLANG_DETERMINISTIC_INFERENCE}"
 
 
 CKPT_ARGS=(
@@ -139,8 +219,9 @@ MISC_ARGS=(
 )
 
 
-mkdir -p log
-if [ ${MODE} = "hybrid-async" ]; then
+LOG_DIR="${EXP_DIR}/logs"
+mkdir -p "${LOG_DIR}"
+if [ "${MODE}" = "hybrid-async" ]; then
      ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
         --runtime-env-json="${RUNTIME_ENV_JSON}" \
         -- python3 -m relax.entrypoints.train \
@@ -150,6 +231,9 @@ if [ ${MODE} = "hybrid-async" ]; then
         --num-iters-per-train-update 2  \
          --balance-data \
         --hybrid \
+        "${HYBRID_PIPELINE_ARGS[@]}" \
+        "${REPRO_ARGS[@]}" \
+        "${DEBUG_ARGS[@]}" \
         "${MODEL_ARGS[@]}" \
         "${CKPT_ARGS[@]}" \
         "${ROLLOUT_ARGS[@]}" \
@@ -158,7 +242,7 @@ if [ ${MODE} = "hybrid-async" ]; then
         "${WANDB_ARGS[@]}" \
         "${PERF_ARGS[@]}" \
         "${SGLANG_ARGS[@]}" \
-        "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-hybrid-async-${now}.log
+        "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_DIR}/qwen35-9b-GRPO-gpu8-hybrid-async-${now}.log"
 else
     ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
          --runtime-env-json="${RUNTIME_ENV_JSON}" \
@@ -169,6 +253,8 @@ else
          --colocate \
          --use-health-check \
          --balance-data \
+         "${REPRO_ARGS[@]}" \
+         "${DEBUG_ARGS[@]}" \
          "${MODEL_ARGS[@]}" \
          "${CKPT_ARGS[@]}" \
          "${ROLLOUT_ARGS[@]}" \
@@ -177,5 +263,5 @@ else
          "${WANDB_ARGS[@]}" \
          "${PERF_ARGS[@]}" \
          "${SGLANG_ARGS[@]}" \
-         "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-fully-sync-${now}.log
+         "${MISC_ARGS[@]}"  2>&1 | tee "${LOG_DIR}/qwen35-9b-GRPO-gpu8-fully-sync-${now}.log"
 fi

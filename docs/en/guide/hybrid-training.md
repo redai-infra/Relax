@@ -14,7 +14,7 @@ Concretely, Actor and Rollout still run on **separate GPU placement groups** (li
 | Dimension           | Colocate (Sync)                          | Fully Async                                                  | Hybrid                                                                              |
 | ------------------- | ---------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
 | **GPU layout**      | Actor and Rollout time-share same GPUs   | Actor / Rollout / ActorFwd / Reference each have own GPUs    | Actor and Rollout on separate GPUs; ref / actor_fwd / adv share actor's GPUs        |
-| **Data pipeline**   | TransferQueue, batch-synchronous         | TransferQueue + StreamingDataLoader, fully streaming         | TransferQueue + sub-batch streaming (`num-iters-per-train-update`)                  |
+| **Data pipeline**   | TransferQueue, batch-synchronous         | TransferQueue + StreamingDataLoader, fully streaming         | TransferQueue optimizer minis; optional producer-chunk actor-forward pipeline       |
 | **Weight sync**     | In-process tensor copy                   | NCCL broadcast via DCS (Checkpoint Engine)                   | Sync `UpdateWeightFromTensor` to rollout; TensorBackuper for ref/actor_fwd          |
 | **Staleness**       | `max_staleness = 0` (strict on-policy)   | Configurable `max_staleness`                                 | Configurable `max_staleness`                                                        |
 | **Roles deployed**  | `actor`, `critic`, `rollout`             | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout` (same as Colocate; ref/actor_fwd live inside actor)    |
@@ -113,15 +113,21 @@ ______________________________________________________________________
 
 `relax/backends/megatron/actor.py:708` implements the hybrid training step in three phases:
 
-1. **Collect sub-batches and compute forward log-probs (small memory footprint)**
+1. **Collect optimizer minis and compute forward log-probs**
 
-   The global batch is split into `num_iters_per_train_update` sub-batches. For each sub-batch the actor:
+   The actor requests each optimizer mini derived from
+   `rollout_batch_size * n_samples_per_prompt / global_batch_size`. For each mini it:
 
    - pulls data from TransferQueue (`_get_data_from_transfer_queue("train", rollout_id, fields, batch_size, batch_index)`)
    - runs `_switch_model("ref")` (if ref weights are backed up) and computes ref log-probs
    - runs `_switch_model("teacher")` (if OPD teacher weights are backed up) and computes teacher log-probs
    - runs `_switch_model("old_actor" or "actor")` and computes current actor log-probs
-   - appends the enriched sub-batch to an in-memory list
+   - appends the enriched mini to an in-memory list
+
+   With the optional incremental actor-forward pipeline enabled, one optimizer
+   mini is consumed in fixed sample windows aligned to the rollout producer's
+   nominal transfer threshold. Physical producer put grouping may vary; this
+   actor split does not change the advantage or optimizer boundary.
 
 2. **Merge sub-batches and compute advantages globally**
 
@@ -131,7 +137,8 @@ ______________________________________________________________________
 
    A single `train(...)` call runs the optimizer step on the merged batch. Afterwards the actor backs up the new weights to the `actor` tag and (on the ref-update interval) refreshes the `ref` tag, then calls `self.update_weights()` to push the updated weights to rollout via `UpdateWeightFromTensor`.
 
-The sub-batched forward keeps peak activation memory bounded — matching Fully Async behavior — while the merged training step preserves Colocate-style global statistics.
+The forward phase remains bounded to one fetched unit at a time, while the
+merged training step preserves Colocate-style global statistics.
 
 ______________________________________________________________________
 
@@ -143,7 +150,7 @@ ______________________________________________________________________
 | ------------------------------- | ------------------------------------------------------------------------------------ |
 | `--hybrid`                      | Enable hybrid mode (resolves to `fully_async=True, colocate=True` internally)        |
 | `--resource '{...}'`            | Declare `actor` and `rollout` placement groups separately, e.g. `{"actor":[1,4],"rollout":[1,4]}` |
-| `--num-iters-per-train-update`  | Number of sub-batches per global batch (larger → smaller peak memory, more TQ polls) |
+| `--num-iters-per-train-update`  | Producer transfer threshold and the fixed actor fetch/forward chunk count |
 | `--max-staleness`               | Off-policy budget (0 = strict on-policy, >0 allows staleness)                        |
 
 ### Optional but Common
@@ -167,6 +174,133 @@ When `--hybrid` is set, `relax/utils/arguments.py` defaults the following (unles
 `--balance-data` requires `--hybrid` if you also want a streaming pipeline. The combination `--fully-async --balance-data` (without `--hybrid`) is rejected at argument parse time.
 :::
 
+### Incremental actor-forward pipeline
+
+Hybrid can optionally request fixed sample-count actor chunks from TransferQueue
+instead of waiting for a complete optimizer mini:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--hybrid-pipeline-forward` | off | Fetch and forward each fixed actor chunk as soon as enough samples are ready |
+| `--hybrid-pipeline-trace-dir PATH` | unset | Write content-free producer, fetch, restore, forward, advantage, and optimizer events |
+| `--hybrid-pipeline-fetch-timeout-s SECONDS` | `600` | Fail an incomplete chunk wait with rollout/mini/chunk context |
+
+The switch is deliberately off by default. With the reference Qwen3.5-9B
+recipe (`global_batch_size=256`, `num_iters_per_train_update=2`, DP=1), the
+producer targets 128 samples per transfer, while the actor always requests two
+complete 128-sample chunks. Producer `async_put` grouping is intentionally not
+part of the contract: `FIRST_COMPLETED` coalescing, tail flush, or backfill can
+legitimately produce one, two, or more puts as long as all 256 samples and their
+global-index fingerprint are conserved. The optional path:
+
+1. restores the actor exactly once for the optimizer mini, before waiting for
+   the first chunk;
+2. fetches and forwards chunk 0 while rollout can continue producing chunk 1;
+3. fetches and forwards chunk 1;
+4. orders every per-sample field by `BatchMeta.global_indexes`;
+5. computes advantages once over all 256 samples and performs one optimizer
+   step.
+
+It does not change producer transfer policy, multimodal preprocessing, pixel
+tensor values, GRPO group boundaries, reward normalization, or optimizer
+semantics. The additional actor fetch is intended to expose rollout/actor
+overlap, not to reduce work.
+
+The first implementation is intentionally limited and fails fast instead of
+silently falling back:
+
+| Dimension | Supported with the switch enabled |
+| --- | --- |
+| Mode | Hybrid |
+| Workload | Multimodal, dynamic-batch GRPO |
+| Forward roles | Actor only; no ref/KL, teacher/OPD, old actor, critic, or routing replay |
+| Parallel topology | TP=2, DP=1, PP=1, VPP=1, CP=2, EP=1, ETP=1 |
+| Offload | `offload_train=False`, `offload_rollout=False` |
+| Dropout | Attention and hidden dropout both zero |
+| Batch policy | Exactly one fixed optimizer mini per rollout (`rollout_batch_size * n_samples_per_prompt == global_batch_size`); no partial or dynamic-global batch |
+| Log-prob source | Actor-computed log-prob; no true-on-policy or rollout-log-prob shortcut |
+| TensorBackuper | Normal enabled backuper with only the `actor` tag |
+
+Chunk sizes must reconstruct the optimizer mini exactly and remain a multiple
+of `n_samples_per_prompt`. Duplicate, missing, underfilled, or overfilled
+`BatchMeta.global_indexes` terminate the step with an actionable error.
+Startup also requires TransferQueue `>=0.1.10.dev0` with
+`BatchMeta.global_indexes` and the `async_put(custom_meta=..., is_last=...)`
+contract; an incompatible installation fails before Ray workers or rollout
+producers can write data.
+
+The reference launcher exposes the options as environment variables:
+
+```bash
+HYBRID_PIPELINE_FORWARD=1 \
+HYBRID_PIPELINE_TRACE_DIR=/data01/LWX/relax-task21/runs/smoke/timeline \
+HYBRID_PIPELINE_FETCH_TIMEOUT_S=600 \
+bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
+  hybrid-async
+```
+
+Trace files are separated by hostname, role, PID, and global rank. They contain
+timestamps, counts, token totals, multimodal tensor byte counts, CUDA peaks,
+and an irreversible global-index fingerprint; prompts, responses, images, and
+sample tensors are never serialized.
+
+Validate one run:
+
+```bash
+python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
+  --run-dir /data01/LWX/relax-task21/runs/smoke \
+  --validate-only
+```
+
+Compare two baseline and two experiment runs and generate the registered CSV,
+JSON, and curve artifacts:
+
+```bash
+python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
+  --run-dir /data01/LWX/relax-task21/runs/A1-baseline-seed20260728 \
+  --run-dir /data01/LWX/relax-task21/runs/A2-baseline-seed20260729 \
+  --run-dir /data01/LWX/relax-task21/runs/B1-experiment-seed20260728 \
+  --run-dir /data01/LWX/relax-task21/runs/B2-experiment-seed20260729 \
+  --output-dir /data01/LWX/relax-task21/comparison \
+  --enforce-targets
+```
+
+The analyzer validates event closure, one restore and optimizer step, sample
+conservation, same-host monotonic timing, finite metrics, producer/fetch
+fingerprints, steady-step coverage, and the registered performance thresholds.
+Producer put count is diagnostic only; actor fetch/forward count remains
+strictly fixed. Strict producer overlap means the first actor forward starts
+before the producer starts its final put. The final put completion is retained
+only as a transfer-stage diagnostic because its trace write can lose a
+scheduling race with the consumer. With `--enforce-targets`, the analyzer also
+checks per-run strict producer overlap, step-time p95,
+eight-GPU NVML coverage, peak VRAM, token/multimodal-byte workload, and the
+raw-reward, truncation-rate, and staleness guardrails. It uses `sum(step_tokens) /
+sum(step_time)` for aggregate throughput rather than averaging per-step rates.
+GPU utilization and the below-10% idle ratio use only 500 ms NVML samples
+whose wall time falls inside the registered steady step intervals reconstructed
+from TensorBoard `perf/step_time`; sampled peak VRAM remains a full-run safety
+metric.
+The strict comparison additionally requires a clean run manifest, identical
+candidate/image/TransferQueue identities, and non-empty input hashes,
+dependency freeze, wheel hash, and launcher log for every run.
+The manifest also records and cross-checks `max_staleness`, global/rollout
+batch sizes, samples per prompt, and actor chunk count, so CLI expectations
+cannot silently disagree with the measured workload.
+The staleness curve is the trace-derived producer lead at the first actor
+forward: the largest completed producer rollout ID minus the actor rollout ID
+at that timestamp. The current rollout is considered ready once its actor fetch
+completes even if the producer trace write is scheduled slightly later. The
+lead must remain at most the manifest's configured `max_staleness` value
+(`2` in the reference recipe), and its paired steady mean may increase by at
+most `0.25`.
+
+To roll back, omit `--hybrid-pipeline-forward` (or set
+`HYBRID_PIPELINE_FORWARD=0`). No checkpoint or dataset conversion is needed.
+Before widening the support matrix, add collective-order and restore-count
+tests for the new DP/PP/VPP or role graph, then rerun frozen-input parity,
+multimodal smoke, and paired performance measurements.
+
 ______________________________________________________________________
 
 ## Quick Start
@@ -183,7 +317,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
     --max-staleness 2 \
     --num-data-storage-units 1 \
-    --num-iters-per-train-update 8 \
+    --num-iters-per-train-update 2 \
     --balance-data \
     --hybrid \
     "${MODEL_ARGS[@]}" \
@@ -200,9 +334,11 @@ Key points in this configuration:
 
 - 8 total GPUs split 4 + 4 between actor and rollout
 - `max-staleness 2` — actor may consume rollout output up to 2 steps behind the freshest weights
-- `num-iters-per-train-update 8` — each global batch is split into 8 sub-batches for forward passes
+- `num-iters-per-train-update 2` — rollout targets half-batch transfers and
+  the optional incremental path performs two fixed 128-sample actor fetches;
+  the physical producer put count may vary
 - `balance-data` — DP load balancing enabled
-- GRPO algorithm with `--use-kl-loss` and `--use-tis` (these are algorithm flags, orthogonal to hybrid)
+- GRPO algorithm with `--use-tis`; KL/ref forward is disabled in this recipe
 
 ______________________________________________________________________
 

@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -15,6 +16,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.hybrid_pipeline_trace import emit_hybrid_pipeline_event
 from relax.utils.types import Sample
 
 
@@ -508,9 +510,48 @@ async def transfer_batch_to_data_system(
         # fallback and defeating dynamic batching).
         total_lengths = rollout_batch.get("total_lengths", None)
         custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths] if total_lengths is not None else None
-        await data_system_client.async_put(
+        trace_enabled = bool(getattr(args, "hybrid_pipeline_trace_dir", None))
+        if trace_enabled:
+            put_start_ns = time.monotonic_ns()
+            put_event_id = f"{os.getpid()}-{put_start_ns}"
+            emit_hybrid_pipeline_event(
+                args,
+                "tq_put_start",
+                rollout_id=rollout_id,
+                role="rollout",
+                chunk_index=batch_count,
+                batch=rollout_batch,
+                monotonic_ns=put_start_ns,
+                details={
+                    "batch_count": batch_count,
+                    "is_last": is_last,
+                    "event_id": put_event_id,
+                },
+            )
+        batch_meta = await data_system_client.async_put(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )
+        if trace_enabled:
+            global_indexes = getattr(batch_meta, "global_indexes", None)
+            if global_indexes is None:
+                raise RuntimeError(
+                    "Hybrid pipeline trace requires async_put() to return "
+                    "BatchMeta.global_indexes; install the pinned TransferQueue version."
+                )
+            emit_hybrid_pipeline_event(
+                args,
+                "tq_put_done",
+                rollout_id=rollout_id,
+                role="rollout",
+                chunk_index=batch_count,
+                batch=rollout_batch,
+                global_indexes=global_indexes,
+                details={
+                    "batch_count": batch_count,
+                    "is_last": is_last,
+                    "event_id": put_event_id,
+                },
+            )
 
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:

@@ -14,7 +14,7 @@
 | 维度                | Colocate（同步）                          | Fully Async（全异步）                                        | Hybrid                                                                                |
 | ------------------- | ----------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
 | **GPU 布局**        | Actor 与 Rollout 分时复用同一组 GPU       | Actor / Rollout / ActorFwd / Reference 各自独立 GPU          | Actor 与 Rollout 独立 GPU；ref / actor_fwd / adv 复用 actor 的 GPU                    |
-| **数据流水线**      | TransferQueue，批同步                     | TransferQueue + StreamingDataLoader，完全流式                | TransferQueue + 子批次流式（`num-iters-per-train-update`）                            |
+| **数据流水线**      | TransferQueue，批同步                     | TransferQueue + StreamingDataLoader，完全流式                | TransferQueue optimizer mini；可选 producer-chunk actor-forward 流水线               |
 | **权重同步**        | 进程内 tensor 拷贝                        | 通过 DCS（Checkpoint Engine）做 NCCL broadcast               | 同步的 `UpdateWeightFromTensor` 推给 rollout；ref/actor_fwd 走 TensorBackuper          |
 | **Staleness**       | `max_staleness = 0`（严格 on-policy）     | 可配置 `max_staleness`                                       | 可配置 `max_staleness`                                                                 |
 | **部署的角色**      | `actor`, `critic`, `rollout`              | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout`（与 Colocate 相同；ref/actor_fwd 在 actor 内部）         |
@@ -115,15 +115,21 @@ ______________________________________________________________________
 
 `relax/backends/megatron/actor.py:708` 实现的 Hybrid 训练步骤分为三个阶段：
 
-1. **采集子批次并完成小批次 forward 计算（峰值显存小）**
+1. **采集 optimizer mini 并计算 forward log-probs**
 
-   全局 batch 被切分为 `num_iters_per_train_update` 份子批次。对每个子批次，actor 会：
+   actor 按
+   `rollout_batch_size * n_samples_per_prompt / global_batch_size`
+   推导 optimizer mini。对每个 mini，actor 会：
 
    - 从 TransferQueue 拉取数据（`_get_data_from_transfer_queue("train", rollout_id, fields, batch_size, batch_index)`）
    - 若已备份 ref 权重，执行 `_switch_model("ref")` 并计算 ref log-probs
    - 若已备份 teacher 权重（OPD 场景），执行 `_switch_model("teacher")` 并计算 teacher log-probs
    - 执行 `_switch_model("old_actor" 或 "actor")` 并计算当前 actor 的 log-probs
-   - 把扩充后的子批次追加到内存列表
+   - 把扩充后的 mini 追加到内存列表
+
+   打开可选增量 actor-forward 流水线后，一个 optimizer mini 会按与 rollout
+   producer 名义传输阈值对齐的固定 sample 窗口消费；物理 producer put 分组
+   可以变化，该额外 actor 切分不会改变 advantage 或 optimizer 边界。
 
 2. **合并子批次并做全局 Advantages 归一化**
 
@@ -133,7 +139,8 @@ ______________________________________________________________________
 
    一次 `train(...)` 调用基于合并后的 batch 完成优化器步进。随后 actor 把新权重备份到 `actor` tag（如果到达 ref 更新间隔，也刷新 `ref` tag），然后调用 `self.update_weights()` 通过 `UpdateWeightFromTensor` 把最新权重同步给 rollout。
 
-子批次 forward 控制了激活峰值显存（与 Fully Async 行为一致），而合并后的训练步则保留了 Colocate 风格的全局统计量。
+forward 阶段每次只处理一个已拉取单元，而合并后的训练步保留 Colocate 风格的
+全局统计量。
 
 ______________________________________________________________________
 
@@ -145,7 +152,7 @@ ______________________________________________________________________
 | ------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `--hybrid`                      | 启用 Hybrid 模式（内部展开为 `fully_async=True, colocate=True`）                                |
 | `--resource '{...}'`            | 分别声明 `actor` 与 `rollout` 的 placement group，例如 `{"actor":[1,4],"rollout":[1,4]}`        |
-| `--num-iters-per-train-update`  | 每个全局 batch 切分的子批次数量（越大 → 峰值显存越小，TransferQueue 轮询次数越多）              |
+| `--num-iters-per-train-update`  | producer 传输阈值，同时作为固定的 actor fetch/forward chunk 数量                              |
 | `--max-staleness`               | Off-policy 容忍度（0 = 严格 on-policy，>0 允许一定程度滞后）                                    |
 
 ### 常用可选参数
@@ -169,6 +176,117 @@ ______________________________________________________________________
 如果你既想做流式数据流水线，又需要 `--balance-data`，必须使用 `--hybrid`。`--fully-async --balance-data`（不带 `--hybrid`）会在参数解析阶段被拒绝。
 :::
 
+### 增量 actor-forward 流水线
+
+Hybrid 可选地从 TransferQueue 按固定 sample count 增量请求 actor chunk，
+而不是等待完整 optimizer mini：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `--hybrid-pipeline-forward` | 关闭 | 足量 sample ready 后立即 fetch 固定 actor chunk 并执行 forward |
+| `--hybrid-pipeline-trace-dir PATH` | 未设置 | 记录不含样本内容的 producer、fetch、restore、forward、advantage 和 optimizer 事件 |
+| `--hybrid-pipeline-fetch-timeout-s SECONDS` | `600` | chunk 未完整到达时，带 rollout/mini/chunk 上下文终止等待 |
+
+该开关默认关闭。参考 Qwen3.5-9B 配方中，
+`global_batch_size=256`、`num_iters_per_train_update=2`、DP=1，producer
+以 128 samples 为传输目标，而 actor 固定请求两个完整的 128-sample chunk。
+producer 的 `async_put` 分组不是契约：`FIRST_COMPLETED` 合并、tail flush 或
+backfill 都可能合法地产生 1 次、2 次或更多次 put；只要 256 samples 及
+global-index fingerprint 完整守恒即可。打开开关后：
+
+1. 每个 optimizer mini 只 restore 一次 actor，并在等待首块前执行；
+2. chunk 0 ready 后立即 fetch 和 forward，此时 rollout 可继续产生 chunk 1；
+3. 再 fetch 和 forward chunk 1；
+4. 按 `BatchMeta.global_indexes` 对所有 per-sample 字段恢复确定顺序；
+5. 在完整 256 samples 上只计算一次 advantage，并只执行一次 optimizer step。
+
+该路径不修改 producer 传输策略、多模态预处理、pixel tensor 数值、GRPO
+group 边界、reward normalization 或 optimizer 语义。多出的一次 actor fetch
+用于暴露 rollout/actor 重叠窗口，而不是减少工作量。
+
+首版支持范围有意收窄；不支持的组合会 fail fast，不会静默回退：
+
+| 维度 | 打开开关时支持的范围 |
+| --- | --- |
+| 模式 | Hybrid |
+| 负载 | 多模态、dynamic-batch GRPO |
+| Forward role | 仅 actor；不支持 ref/KL、teacher/OPD、old actor、critic、routing replay |
+| 并行拓扑 | TP=2、DP=1、PP=1、VPP=1、CP=2、EP=1、ETP=1 |
+| Offload | `offload_train=False`、`offload_rollout=False` |
+| Dropout | attention/hidden dropout 均为 0 |
+| Batch 策略 | 每次 rollout 恰好一个固定 optimizer mini（`rollout_batch_size * n_samples_per_prompt == global_batch_size`）；不支持 partial/dynamic-global batch |
+| Log-prob 来源 | actor 计算；不支持 true-on-policy 或 rollout-log-prob 快捷路径 |
+| TensorBackuper | 启用普通 backuper，且只有 `actor` tag |
+
+chunk 大小必须精确重建 optimizer mini，并且是 `n_samples_per_prompt` 的
+整数倍。`BatchMeta.global_indexes` 发生重复、缺失、少取或多取时，当前 step
+会带可定位信息直接失败。
+启动时还要求 TransferQueue `>=0.1.10.dev0`，并具备
+`BatchMeta.global_indexes` 与 `async_put(custom_meta=..., is_last=...)`
+契约；版本或 API 不兼容会在 Ray worker 和 rollout producer 写入数据前失败。
+
+参考脚本通过环境变量暴露这些参数：
+
+```bash
+HYBRID_PIPELINE_FORWARD=1 \
+HYBRID_PIPELINE_TRACE_DIR=/data01/LWX/relax-task21/runs/smoke/timeline \
+HYBRID_PIPELINE_FETCH_TIMEOUT_S=600 \
+bash scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-hybrid-async.sh \
+  hybrid-async
+```
+
+Trace 按 hostname、role、PID 和 global rank 分文件。内容仅包括时间戳、
+样本与 token 计数、多模态 tensor 字节数、CUDA 峰值以及不可逆的 global-index
+fingerprint；不会写 prompt、response、图片或样本 tensor。
+
+校验单次运行：
+
+```bash
+python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
+  --run-dir /data01/LWX/relax-task21/runs/smoke \
+  --validate-only
+```
+
+比较两次 baseline 和两次 experiment，并生成注册的 CSV、JSON 与曲线：
+
+```bash
+python scripts/tools/analyze_hybrid_pipeline_benchmark.py \
+  --run-dir /data01/LWX/relax-task21/runs/A1-baseline-seed20260728 \
+  --run-dir /data01/LWX/relax-task21/runs/A2-baseline-seed20260729 \
+  --run-dir /data01/LWX/relax-task21/runs/B1-experiment-seed20260728 \
+  --run-dir /data01/LWX/relax-task21/runs/B2-experiment-seed20260729 \
+  --output-dir /data01/LWX/relax-task21/comparison \
+  --enforce-targets
+```
+
+分析器会校验事件闭合、每 mini 一次 restore、每 step 一次 optimizer、样本
+守恒、同机 monotonic 计时、有限数值、producer/fetch fingerprint、稳态 step
+覆盖率以及预注册性能门槛。producer put 次数仅作为诊断值，actor
+fetch/forward 次数仍严格固定。严格 producer 重叠定义为首个 actor forward
+早于 producer 最后一次 put 的开始时刻；最后一次 put 的完成时刻仅作为传输
+阶段诊断，因为其 trace 写入可能在调度上晚于 consumer。`--enforce-targets`
+还会检查每次实验的严格 producer 重叠比例、
+step-time p95、8 卡 NVML 覆盖、峰值显存、token/多模态字节工作量和
+raw-reward、截断率、staleness 非劣护栏。aggregate throughput 使用
+`sum(step_tokens) / sum(step_time)`，不会对 per-step rate 做简单平均。
+GPU utilization 与低于 10% 的 idle ratio 只使用墙钟时间落入预注册稳态
+step 区间的 500 ms NVML 样本；区间由 TensorBoard `perf/step_time` 的
+step end wall time 和 duration 重建。sampled peak VRAM 仍使用 full-run
+安全口径。
+严格比较还要求每次 run 的 manifest 为 clean tree，candidate/image/TransferQueue
+身份完全一致，并存在非空的输入 hash、依赖 freeze、wheel hash 和 launcher log。
+manifest 还会记录并交叉校验 `max_staleness`、global/rollout batch size、
+每 prompt 样本数和 actor chunk 数，避免分析器 CLI 与实际工作负载静默不一致。
+staleness 曲线来自 trace：在 actor 首次 forward 时，用已完成 put 的最大
+producer rollout ID 减去当前 actor rollout ID；若 producer 的 trace 写入稍晚，
+已完成的 actor fetch 本身可证明当前 rollout 已 ready。该值不得超过 manifest
+记录的 `max_staleness`（参考配方为 `2`），paired 稳态均值最多增加 `0.25`。
+
+回滚时去掉 `--hybrid-pipeline-forward`，或设置
+`HYBRID_PIPELINE_FORWARD=0`；无需转换 checkpoint 或数据集。若要扩展
+DP/PP/VPP 或 role graph，必须先新增 collective-order 与 restore-count 测试，
+再重跑 frozen-input parity、多模态 smoke 和成对性能实验。
+
 ______________________________________________________________________
 
 ## 快速开始
@@ -185,7 +303,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     --resource '{"actor": [1, 4], "rollout": [1, 4]}' \
     --max-staleness 2 \
     --num-data-storage-units 1 \
-    --num-iters-per-train-update 8 \
+    --num-iters-per-train-update 2 \
     --balance-data \
     --hybrid \
     "${MODEL_ARGS[@]}" \
@@ -202,9 +320,10 @@ ray job submit --address="http://127.0.0.1:8265" \
 
 - 8 GPU 总量，actor 与 rollout 各占 4 张
 - `max-staleness 2` —— actor 可以消费比最新权重落后最多 2 个 step 的 rollout 输出
-- `num-iters-per-train-update 8` —— 每个全局 batch 在 forward 阶段被切分为 8 个子批次
+- `num-iters-per-train-update 2` —— rollout 以半批为传输目标，可选增量路径
+  固定执行两次 128-sample actor fetch；物理 producer put 次数可以变化
 - `balance-data` —— 启用 DP 间负载均衡
-- 算法采用 GRPO，附带 `--use-kl-loss` 与 `--use-tis`（这些是算法参数，与 Hybrid 正交）
+- 算法采用 GRPO 与 `--use-tis`；该参考配方关闭 KL/ref forward
 
 ______________________________________________________________________
 
