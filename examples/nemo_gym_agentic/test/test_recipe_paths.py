@@ -42,7 +42,6 @@ def test_each_recipe_owns_its_scripts() -> None:
             "verify_workplace_assistant_trial.py",
         },
         "r2e-gym": {
-            "eval_r2e_gym_maas.py",
             "prepare_r2e_gym.py",
             "prepare_r2e_gym.sh",
             "run-qwen35-9B-8xgpu-nemo-gym-r2e.sh",

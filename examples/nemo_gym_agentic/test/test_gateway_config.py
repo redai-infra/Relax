@@ -62,7 +62,7 @@ def test_settings_load_explicit_callback_proxy_and_timeout():
     [
         "http://user:secret@proxy.example:3128",
         "http://proxy.example:3128/path",
-        "http://proxy.example:3128?target=maas",
+        "http://proxy.example:3128?target=model",
     ],
 )
 def test_settings_reject_unsafe_callback_proxy_urls(proxy):
@@ -90,11 +90,11 @@ def test_callback_url_requires_exact_allowlisted_host():
 
 
 def test_callback_url_requires_tls_when_proxy_is_enabled():
-    allowed = frozenset({"maas.example"})
+    allowed = frozenset({"model.example"})
 
-    validate_callback_url("https://maas.example/v1", allowed, require_tls=True)
+    validate_callback_url("https://model.example/v1", allowed, require_tls=True)
     with pytest.raises(GatewayConfigError, match="must use https"):
-        validate_callback_url("http://maas.example/v1", allowed, require_tls=True)
+        validate_callback_url("http://model.example/v1", allowed, require_tls=True)
 
 
 def test_gym_graph_validation_requires_prefix_and_request_scoped_gateway_model():

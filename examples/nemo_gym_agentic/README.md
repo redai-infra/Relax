@@ -174,7 +174,7 @@ DOCKER_BUILDKIT=1 docker build \
 Dockerfile 默认基于 `${RELAX_IMAGE}`。如果要使用其他已有的 Relax tag，再显式增加
 `--build-arg RELAX_IMAGE="<image>"`，不需要从本仓库重新构建 Relax 镜像。
 
-构建上下文由 `.dockerignore` 排除所有 `env.sh`。不要把 API key、MaaS header 或代理凭据写入
+构建上下文由 `.dockerignore` 排除所有 `env.sh`。不要把 API key、模型服务 header 或代理凭据写入
 Dockerfile、README 或提交到仓库。
 
 构建后做双用途 preflight：
