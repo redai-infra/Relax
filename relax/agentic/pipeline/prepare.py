@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -63,13 +62,12 @@ class PrepareDomain:
     Lifecycle::
 
         pool = PrepareDomain(...)
-        pool.start()
 
         # per step
         pool.configure(...)
         ...  # lease / query / dispatch
 
-        pool.close()
+        await pool.shutdown()
     """
 
     # Construction
@@ -97,90 +95,35 @@ class PrepareDomain:
         self.ready_group_ids: deque[str] = deque()
         self.next_prepare_group_seq = 0
         self._ready_batches: deque[FetchBatch] = deque()
-        self._fetch_task: asyncio.Task[None] | None = None  # runs on background loop
-        self._fetch_submitted = False  # set in lock before run_coroutine_threadsafe, cleared in _bg_fetch finally
+        self._fetch_task: asyncio.Task[None] | None = None
+        self._fetch_wakeup = asyncio.Event()
         self._fetch_inflight_group_count = 0
         self._launching_group_count = 0
         self._launch_tasks: set[asyncio.Task[None]] = set()
         self._launch_error: BaseException | None = None
-
-        # Event signalling that a fetch cycle completed (success, error, or cancel).
-        # Waited on by the step thread, set by the background fetch coroutine.
-        self._fetch_ready_event = threading.Event()
         self._fetch_error: BaseException | None = None
         self._source_exhausted = False
-
-        # Background worker
-        self._worker_thread: threading.Thread | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
-        self._lock = threading.Lock()
 
     # Lifecycle
-
-    def start(self) -> None:
-        """Start the background worker thread.
-
-        Idempotent.
-        """
-        if self._worker_thread is not None:
-            return
-        self._loop = asyncio.new_event_loop()
-        self._worker_thread = threading.Thread(
-            target=self._run_loop,
-            name="resident-prepare-pool",
-            daemon=True,
-        )
-        self._worker_thread.start()
-
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def close(self) -> None:
-        """Permanently shut down the pool."""
-        if self._closed:
-            return
-        self._closed = True
-        # Pump runs on the step event-loop; setting _closed is enough to
-        # stop it (the loop checks ``not self._closed`` each iteration).
-        loop = self._loop
-        if loop is not None and loop.is_running():
-            # Cancel fetch if running (fetch runs on the background loop).
-            fetch_task = self._fetch_task
-            if fetch_task is not None and not fetch_task.done():
-                loop.call_soon_threadsafe(fetch_task.cancel)
-
-                async def _drain_and_stop() -> None:
-                    fetch_results = await asyncio.gather(fetch_task, return_exceptions=True)
-                    for result in fetch_results:
-                        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-                            raise RuntimeError("PrepareDomain fetch cleanup failed") from result
-                    loop.stop()
-
-                loop.call_soon_threadsafe(asyncio.ensure_future, _drain_and_stop())
-            else:
-                loop.call_soon_threadsafe(loop.stop)
-        # Unblock any step thread waiting on fetch.
-        self._fetch_ready_event.set()
-        if self._worker_thread is not None:
-            self._worker_thread.join(timeout=10)
-            self._worker_thread = None
-        if loop is not None and not loop.is_closed():
-            loop.close()
-            self._loop = None
 
     async def shutdown(self) -> None:
         """Stop prepare work and discard sessions still owned by the prepare
         pool."""
-        self.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._fetch_task is not None:
+            self._fetch_task.cancel()
+            await asyncio.gather(self._fetch_task, return_exceptions=True)
+            self._fetch_task = None
+        self._fetch_inflight_group_count = 0
         launch_tasks = list(self._launch_tasks)
         if launch_tasks:
             await asyncio.gather(*launch_tasks, return_exceptions=True)
         discarded_groups, discarded_sessions = await self.discard_resident_groups()
-        with self._lock:
-            self.pending_prepare_jobs.clear()
-            self._ready_batches.clear()
+        self.pending_prepare_jobs.clear()
+        self._ready_batches.clear()
         if discarded_groups:
             self._log_pool_state(
                 "discard_resident_groups",
@@ -190,8 +133,7 @@ class PrepareDomain:
 
     async def discard_resident_groups(self) -> tuple[int, int]:
         runtime_driver = self.runtime_driver
-        with self._lock:
-            group_states = list(self.prepare_groups_by_id.values())
+        group_states = list(self.prepare_groups_by_id.values())
         if not group_states:
             return 0, 0
         if runtime_driver is None:
@@ -204,10 +146,9 @@ class PrepareDomain:
 
     def _forget_prepare_group(self, group_state: PrepareGroupState) -> None:
         group_id = group_state.group_id
-        with self._lock:
-            self.prepare_groups_by_id.pop(group_id, None)
-            self.warming_group_ids = deque(gid for gid in self.warming_group_ids if gid != group_id)
-            self.ready_group_ids = deque(gid for gid in self.ready_group_ids if gid != group_id)
+        self.prepare_groups_by_id.pop(group_id, None)
+        self.warming_group_ids = deque(gid for gid in self.warming_group_ids if gid != group_id)
+        self.ready_group_ids = deque(gid for gid in self.ready_group_ids if gid != group_id)
 
     def configure(
         self,
@@ -222,13 +163,8 @@ class PrepareDomain:
             raise RuntimeError(
                 f"PrepareDomain scope mismatch: prepare_scope={self.scope_id!r} runtime_scope={runtime_scope_id!r}."
             )
-        self.start()
-        with self._lock:
-            if self._fetch_task is not None and self._fetch_task.done():
-                self._fetch_task = None
-                self._fetch_submitted = False
-            self.runtime_driver = runtime_driver
-            self.pool_target_group_count = pool_target_group_count
+        self.runtime_driver = runtime_driver
+        self.pool_target_group_count = pool_target_group_count
 
     def _resident_group_count(self) -> int:
         return len(self.warming_group_ids) + len(self.ready_group_ids)
@@ -239,26 +175,25 @@ class PrepareDomain:
     def _buffered_prepare_group_count(self) -> int:
         return sum(len(batch.sample_groups) for batch in self._ready_batches)
 
-    def _pool_group_count_locked(self) -> int:
+    def _pool_group_count(self) -> int:
         return (
             len(self.pending_prepare_jobs) + self._buffered_prepare_group_count() + self._prepare_owned_group_count()
         )
 
     def _pool_counts(self) -> dict[str, int]:
-        with self._lock:
-            pool_count = self._pool_group_count_locked()
-            return {
-                "pool": pool_count,
-                "pending": len(self.pending_prepare_jobs),
-                "launching": self._launching_group_count,
-                "warming": len(self.warming_group_ids),
-                "ready": len(self.ready_group_ids),
-                "resident": self._resident_group_count(),
-                "pool_target": self.pool_target_group_count,
-                "fetch_ready_batches": len(self._ready_batches),
-                "buffered_groups": self._buffered_prepare_group_count(),
-                "fetch_inflight": self._fetch_task is not None or self._fetch_submitted,
-            }
+        pool_count = self._pool_group_count()
+        return {
+            "pool": pool_count,
+            "pending": len(self.pending_prepare_jobs),
+            "launching": self._launching_group_count,
+            "warming": len(self.warming_group_ids),
+            "ready": len(self.ready_group_ids),
+            "resident": self._resident_group_count(),
+            "pool_target": self.pool_target_group_count,
+            "fetch_ready_batches": len(self._ready_batches),
+            "buffered_groups": self._buffered_prepare_group_count(),
+            "fetch_inflight": self._fetch_inflight_group_count > 0,
+        }
 
     def accounting_snapshot(self) -> dict[str, int]:
         counts = self._pool_counts()
@@ -287,35 +222,31 @@ class PrepareDomain:
 
         Returns the number of groups whose launch tasks were submitted.
         """
-        with self._lock:
-            for sample_group in sample_groups:
-                if not sample_group:
-                    continue
-                group_id, group_generation = self._next_prepare_group_label()
-                self.pending_prepare_jobs.append(
-                    PrepareGroupSpec(
-                        sample_group=sample_group,
-                        group_id=group_id,
-                        group_generation=group_generation,
-                    )
+        for sample_group in sample_groups:
+            if not sample_group:
+                continue
+            group_id, group_generation = self._next_prepare_group_label()
+            self.pending_prepare_jobs.append(
+                PrepareGroupSpec(
+                    sample_group=sample_group,
+                    group_id=group_id,
+                    group_generation=group_generation,
                 )
+            )
         if sample_groups:
             self._log_pool_state("accept_prepare", accepted_groups=len(sample_groups))
         return await self.launch_pending()
 
     def has_pending_prepare(self) -> bool:
-        with self._lock:
-            return bool(self.pending_prepare_jobs)
+        return bool(self.pending_prepare_jobs)
 
     # Ready / warming queries
 
     def has_ready_groups(self) -> bool:
-        with self._lock:
-            return bool(self.ready_group_ids)
+        return bool(self.ready_group_ids)
 
     def has_warming_groups(self) -> bool:
-        with self._lock:
-            return bool(self.warming_group_ids)
+        return bool(self.warming_group_ids)
 
     # Group labeling
 
@@ -331,25 +262,21 @@ class PrepareDomain:
         self._raise_launch_error_if_any()
         if not self.warming_group_ids:
             return 0
-        with self._lock:
-            runtime_driver = self.runtime_driver
+        runtime_driver = self.runtime_driver
         if runtime_driver is None:
             raise RuntimeError("PrepareDomain cannot refresh warming groups before runtime driver is bound.")
         snapshots = await status_fetcher()
         ready_count = 0
         status_by_key = {(str(item["group_id"]), int(item["group_generation"])): item for item in snapshots}
-        # Take a snapshot of current warming ids under lock, then work on
-        # the snapshot.  The pump thread may append new ids concurrently;
-        # those will remain in the deque and be picked up next refresh.
-        with self._lock:
-            snapshot_len = len(self.warming_group_ids)
+        # Launch tasks may append new ids while this coroutine awaits status.
+        # Only process the ids that existed when the status snapshot returned.
+        snapshot_len = len(self.warming_group_ids)
         still_warming: list[str] = []
         for _ in range(snapshot_len):
-            with self._lock:
-                if not self.warming_group_ids:
-                    break
-                group_id = self.warming_group_ids.popleft()
-                group_state = self.prepare_groups_by_id.get(group_id)
+            if not self.warming_group_ids:
+                break
+            group_id = self.warming_group_ids.popleft()
+            group_state = self.prepare_groups_by_id.get(group_id)
             if group_state is None or group_state.status != "warming":
                 continue
             snapshot = status_by_key.get((group_state.group_id, group_state.group_generation))
@@ -357,9 +284,8 @@ class PrepareDomain:
             ready_sessions = int(snapshot.get("ready_sessions") or 0) if snapshot else 0
             total_sessions = int(snapshot.get("total_sessions") or 0) if snapshot else 0
             if ready_sessions == expected_sessions:
-                with self._lock:
-                    group_state.status = "ready"
-                    self.ready_group_ids.append(group_id)
+                group_state.status = "ready"
+                self.ready_group_ids.append(group_id)
                 ready_count += 1
                 continue
             if drop_completed_before_ready:
@@ -387,12 +313,10 @@ class PrepareDomain:
                     ready_sessions=ready_sessions,
                 )
             still_warming.append(group_id)
-        # Re-insert still-warming ids at the front (before any newly appended
-        # ids from the pump thread) so they are checked first next time.
+        # Re-insert still-warming ids before any ids appended by launch tasks.
         if still_warming:
-            with self._lock:
-                for gid in reversed(still_warming):
-                    self.warming_group_ids.appendleft(gid)
+            for gid in reversed(still_warming):
+                self.warming_group_ids.appendleft(gid)
         if ready_count > 0:
             self._log_pool_state("warming_to_ready", promoted_groups=ready_count)
         return ready_count
@@ -403,28 +327,27 @@ class PrepareDomain:
         quota_group_count: int,
         rollout_id: int,
     ) -> ExecutionBatchInput | None:
-        with self._lock:
-            if not self.ready_group_ids:
-                return None
-            remaining_quota_groups = quota_group_count
-            leased_group_ids: list[str] = []
-            leased_groups: list[tuple[str, int]] = []
-            leased_group_states: list[Any] = []
-            retained_group_ids: deque[str] = deque()
-            while self.ready_group_ids:
-                group_id = self.ready_group_ids.popleft()
-                group_state = self.prepare_groups_by_id.get(group_id)
-                if group_state is None or group_state.status != "ready":
-                    continue
-                if remaining_quota_groups <= 0:
-                    retained_group_ids.append(group_id)
-                    continue
-                self.prepare_groups_by_id.pop(group_id, None)
-                remaining_quota_groups -= 1
-                leased_group_ids.append(group_id)
-                leased_groups.append((group_state.group_id, group_state.group_generation))
-                leased_group_states.append(group_state)
-            self.ready_group_ids = retained_group_ids
+        if not self.ready_group_ids:
+            return None
+        remaining_quota_groups = quota_group_count
+        leased_group_ids: list[str] = []
+        leased_groups: list[tuple[str, int]] = []
+        leased_group_states: list[Any] = []
+        retained_group_ids: deque[str] = deque()
+        while self.ready_group_ids:
+            group_id = self.ready_group_ids.popleft()
+            group_state = self.prepare_groups_by_id.get(group_id)
+            if group_state is None or group_state.status != "ready":
+                continue
+            if remaining_quota_groups <= 0:
+                retained_group_ids.append(group_id)
+                continue
+            self.prepare_groups_by_id.pop(group_id, None)
+            remaining_quota_groups -= 1
+            leased_group_ids.append(group_id)
+            leased_groups.append((group_state.group_id, group_state.group_generation))
+            leased_group_states.append(group_state)
+        self.ready_group_ids = retained_group_ids
         if not leased_group_ids:
             return None
         self._log_pool_state("lease_ready_groups", leased_groups=len(leased_group_ids))
@@ -438,11 +361,8 @@ class PrepareDomain:
     # Fetch
 
     async def _fetch_batch(self, requested_group_count: int) -> FetchBatch:
-        import ray
-
         # Resident agentic work stays inside the pipeline; data source fetches step input groups.
-        fetch_ref = self.data_source.get_samples.remote(requested_group_count)
-        sample_groups = await asyncio.to_thread(ray.get, fetch_ref)
+        sample_groups = await self.data_source.get_samples.remote(requested_group_count)
         if not sample_groups:
             raise PrepareSourceExhaustedError("data source returned no sample groups")
         self._assert_sample_groups(sample_groups)
@@ -460,9 +380,7 @@ class PrepareDomain:
         return FetchBatch(sample_groups=sample_groups)
 
     def start_fetch(self) -> bool:
-        """Kick a fetch on the background loop.
-
-        Non-blocking, thread-safe.
+        """Wake the resident fetch task without blocking the caller.
 
         Hard constraints:
         - Refuses when the domain is closed.
@@ -470,101 +388,70 @@ class PrepareDomain:
         - Requests exactly the current prepare-pool gap.
         - Caps ``_ready_batches`` at ``prefetch_concurrency`` (typically 1).
         """
-        with self._lock:
-            if (
-                self._closed
-                or self._source_exhausted
-                or self._fetch_task is not None
-                or self._fetch_submitted
-                or len(self._ready_batches) >= self.prefetch_concurrency
-            ):
-                return False
-            prepare_pool_gap = self.pool_target_group_count - self._pool_group_count_locked()
-            if prepare_pool_gap <= 0:
-                return False
-            requested_group_count = prepare_pool_gap
-            # Mark submitted inside the lock so that no concurrent
-            # start_fetch() can slip through before _bg_fetch() sets
-            # _fetch_task.
-            self._fetch_submitted = True
-            self._fetch_inflight_group_count = requested_group_count
+        if self._closed or self.data_source is None:
+            return False
         # Check for a cached error from a previous fetch cycle.
         err = self._fetch_error
         if err is not None:
             self._fetch_error = None
-            self._fetch_submitted = False
-            self._fetch_inflight_group_count = 0
-            if isinstance(err, PrepareSourceExhaustedError):
-                self._source_exhausted = True
-                return False
             raise err
-        self._fetch_ready_event.clear()
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            self._fetch_submitted = False
-            self._fetch_inflight_group_count = 0
+        if (
+            self._source_exhausted
+            or self._fetch_inflight_group_count > 0
+            or len(self._ready_batches) >= self.prefetch_concurrency
+        ):
             return False
-        asyncio.run_coroutine_threadsafe(self._bg_fetch(requested_group_count=requested_group_count), loop)
-        self._log_pool_state("fetch_started", requested_groups=requested_group_count)
+        prepare_pool_gap = self.pool_target_group_count - self._pool_group_count()
+        if prepare_pool_gap <= 0:
+            return False
+        self._fetch_inflight_group_count = prepare_pool_gap
+        if self._fetch_task is None:
+            self._fetch_task = asyncio.create_task(
+                self._fetch_loop(),
+                name=f"agentic-prepare-fetch:{self.scope_id}",
+            )
+        self._fetch_wakeup.set()
+        self._log_pool_state("fetch_started", requested_groups=prepare_pool_gap)
         return True
 
-    async def _bg_fetch(self, requested_group_count: int) -> None:
-        """Fetch coroutine that runs on the background event loop.
-
-        A successfully submitted fetch runs to completion unless the domain is
-        closed.  Normal rollout-step teardown preserves any inflight fetch or
-        buffered output for natural resident prepare progress in a later step.
-
-        The ``_fetch_submitted`` flag (set by ``start_fetch()`` inside
-        the lock) prevents the race where multiple coroutines are queued
-        before any of them can set ``_fetch_task``.
-        """
-        self._fetch_task = asyncio.current_task()
-        try:
-            with self._lock:
-                if self._closed:
-                    return
-            batch = await self._fetch_batch(requested_group_count=requested_group_count)
-            with self._lock:
+    async def _fetch_loop(self) -> None:
+        """Keep fetching on the resident loop whenever the pipeline requests
+        it."""
+        while True:
+            await self._fetch_wakeup.wait()
+            self._fetch_wakeup.clear()
+            requested_group_count = self._fetch_inflight_group_count
+            try:
+                batch = await self._fetch_batch(requested_group_count=requested_group_count)
                 if not self._closed:
                     self._ready_batches.append(batch)
-            self._log_pool_state(
-                "fetch_batch_buffered",
-                buffered_groups=len(batch.sample_groups),
-            )
-        except asyncio.CancelledError:
-            pass
-        except PrepareSourceExhaustedError:
-            self._source_exhausted = True
-        except Exception as exc:
-            self._fetch_error = exc
-        finally:
-            with self._lock:
-                self._fetch_task = None
-                self._fetch_submitted = False
+                self._log_pool_state(
+                    "fetch_batch_buffered",
+                    buffered_groups=len(batch.sample_groups),
+                )
+            except asyncio.CancelledError:
+                raise
+            except PrepareSourceExhaustedError:
+                self._source_exhausted = True
+            except Exception as exc:
+                self._fetch_error = exc
+            finally:
                 self._fetch_inflight_group_count = 0
-            self._fetch_ready_event.set()
 
     def has_ready_output(self) -> bool:
-        with self._lock:
-            return bool(self._ready_batches)
+        return bool(self._ready_batches)
 
     def has_inflight_work(self) -> bool:
-        with self._lock:
-            return (
-                self._fetch_task is not None
-                or self._fetch_submitted
-                or self._launching_group_count > 0
-                or self._launch_error is not None
-            )
+        return (
+            self._fetch_inflight_group_count > 0 or self._launching_group_count > 0 or self._launch_error is not None
+        )
 
     async def accept_fetched_batch(self) -> bool:
         if not self.has_ready_output():
             return False
-        with self._lock:
-            if self._closed:
-                return False
-            fetch_output = self._ready_batches.popleft()
+        if self._closed:
+            return False
+        fetch_output = self._ready_batches.popleft()
         await self.accept_prepare(fetch_output.sample_groups)
         return bool(fetch_output.sample_groups)
 
@@ -624,8 +511,7 @@ class PrepareDomain:
     def _start_launches(self, *, runtime_driver, runner_pool, prepare_groups: list[PrepareGroupSpec]) -> int:
         launched_group_count = len(prepare_groups)
         reserved_session_slots = sum(len(prepare_group.sample_group) for prepare_group in prepare_groups)
-        with self._lock:
-            self._launching_group_count += launched_group_count
+        self._launching_group_count += launched_group_count
         task = asyncio.create_task(
             self._launch_and_publish(
                 prepare_groups=prepare_groups,
@@ -662,10 +548,9 @@ class PrepareDomain:
                     await runtime_driver.discard_prepare_group(group_state=group_state)
                     self._forget_prepare_group(group_state)
                 return
-            with self._lock:
-                for group_state in group_states:
-                    self.prepare_groups_by_id[group_state.group_id] = group_state
-                    self.warming_group_ids.append(group_state.group_id)
+            for group_state in group_states:
+                self.prepare_groups_by_id[group_state.group_id] = group_state
+                self.warming_group_ids.append(group_state.group_id)
             self._log_pool_state(
                 "launch_prepare_group",
                 level="debug",
@@ -673,20 +558,17 @@ class PrepareDomain:
                 launched_sessions=sum(len(group_state.request_handles) for group_state in group_states),
             )
         except Exception as exc:
-            with self._lock:
-                self._launch_error = exc
+            self._launch_error = exc
         finally:
             runner_pool.release_launch_slots(reserved_session_slots)
-            with self._lock:
-                next_launching_count = self._launching_group_count - len(prepare_groups)
-                if next_launching_count < 0:
-                    raise RuntimeError("PrepareDomain launching group counter underflow")
-                self._launching_group_count = next_launching_count
+            next_launching_count = self._launching_group_count - len(prepare_groups)
+            if next_launching_count < 0:
+                raise RuntimeError("PrepareDomain launching group counter underflow")
+            self._launching_group_count = next_launching_count
 
     def _raise_launch_error_if_any(self) -> None:
-        with self._lock:
-            exc = self._launch_error
-            self._launch_error = None
+        exc = self._launch_error
+        self._launch_error = None
         if exc is not None:
             raise RuntimeError("prepare launch failed") from exc
 

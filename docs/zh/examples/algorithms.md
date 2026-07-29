@@ -1,8 +1,8 @@
 # 算法参考
 
-Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。本文档覆盖所有已集成的算法（OPD 在线策略蒸馏请参阅[单独文档](./on-policy-distillation.md)）。
+Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。本文档覆盖 PPO 与主要 GRPO-family 算法（OPD 在线策略蒸馏请参阅[单独文档](./on-policy-distillation.md)）。
 
-所有算法共享同一套训练脚本——只需替换脚本中的 `GRPO_ARGS` 为对应算法的参数块即可。
+GRPO、CISPO、GSPO 与 SAPO 使用相同的服务拓扑，可以直接在现有脚本中替换算法参数块。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
 ---
 
@@ -39,6 +39,49 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## PPO
+
+PPO（Proximal Policy Optimization）是一种 Actor-Critic 算法。Relax 会训练独立的 Critic 来预测 token 级 value，计算 GAE advantages 与 returns，对 Actor 使用 PPO-Clip，并对 Critic 使用裁剪 value loss。
+
+参考论文：[Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)。
+
+### 算法原理
+
+Temporal-difference residual 与 GAE 递推为：
+
+$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$$
+
+$$\hat{A}_t = \delta_t + \gamma\lambda\hat{A}_{t+1}, \qquad \hat{R}_t = \hat{A}_t + V(s_t)$$
+
+Actor 随后使用 GRPO 一节展示的裁剪策略目标，但 advantage 来自 Critic 的 token 级估计。Critic 则最小化裁剪与未裁剪 value 平方误差中的较大值。
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--advantage-estimator ppo` | — | 启用 PPO 与 Critic 服务图 |
+| `--gamma` | `1.0` | GAE 折扣因子 |
+| `--lambd` | `1.0` | GAE lambda |
+| `--eps-clip` | `0.2` | Actor 裁剪边距 |
+| `--value-clip` | `0.2` | Critic value 裁剪范围 |
+| `--num-critic-only-steps` | `0` | 初始 Critic-only 预热步数 |
+| `--critic-lr` | 与 `--lr` 相同 | Critic 学习率 |
+
+### 快速开始
+
+PPO 的服务图要求 `critic` 与 `advantages` 资源，因此不能只修改算法参数来启用。暂不支持 fully-async PPO；请使用专用同步 colocate 配置：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+EXP_DIR=/path/to/experiments \
+bash scripts/training/text/run-qwen35-9B-8xgpu-ppo.sh
+```
+
+资源拓扑、checkpoint 规则与 KL 约束详见 [PPO 训练](../guide/ppo-training.md)。
 
 ---
 
@@ -163,6 +206,7 @@ SAPO_ARGS=(
 
 | 算法 | Advantage 计算 | 策略损失 | KL 约束方式 |
 |------|---------------|---------|-----------|
+| **PPO** | Critic value + GAE | PPO-Clip（硬裁剪） | 当前同步拓扑中禁用 |
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
@@ -170,6 +214,7 @@ SAPO_ARGS=(
 
 ## 下一步
 
-- [快速开始](./quick-start.md)
+- [PPO 训练](../guide/ppo-training.md)
+- [快速开始](../guide/quick-start.md)
 - [在线策略蒸馏](./on-policy-distillation.md)
 - [生成式奖励模型](./generative-reward-model.md)

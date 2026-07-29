@@ -161,6 +161,9 @@ class Service:
     async def get_rollout_manager(self) -> Any:
         return await self.handle.get_rollout_manager.remote()
 
+    async def set_barriers(self, *, rollout: Any = None, peers: Any = None) -> None:
+        await self.handle.set_barriers.remote(rollout=rollout, peers=peers)
+
     async def set_genrm_manager(self, genrm_manager: Any) -> None:
         await self.handle.set_genrm_manager.remote(genrm_manager)
 

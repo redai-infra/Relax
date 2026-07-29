@@ -9,8 +9,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from relax.agentic.pipeline import GroupKey, SampleKey, sample_group_key, sample_key
+from relax.agentic.pipeline import ExportMode, GroupKey, PendingExportUnit, SampleKey, sample_group_key, sample_key
 from relax.agentic.profile import mark_metadata_agentic_event
+from relax.utils.misc import load_function
 
 
 def _sample_needs_reward(sample: Any) -> bool:
@@ -57,22 +58,34 @@ async def _batched_async_rm(args, samples):
 @dataclass
 class RewardWaitingGroup:
     expected_count: int
-    samples_by_slot: dict[int, list[Any]] = field(default_factory=dict)
+    units_by_slot: dict[int, list[PendingExportUnit]] = field(default_factory=dict)
 
-    def add_slot(self, *, slot_idx: int, samples: list[Any]) -> None:
-        self.samples_by_slot[slot_idx] = samples
+    def add_slot(self, *, slot_idx: int, units: list[PendingExportUnit]) -> None:
+        self.units_by_slot[slot_idx] = units
 
     def is_complete(self) -> bool:
-        return len(self.samples_by_slot) >= self.expected_count
+        return len(self.units_by_slot) >= self.expected_count
+
+    def materialized_units(self) -> list[PendingExportUnit]:
+        units: list[PendingExportUnit] = []
+        for idx in range(self.expected_count):
+            units.extend(self.units_by_slot.get(idx, []))
+        return units
 
     def materialized_group(self) -> list[Any]:
-        group: list[Any] = []
+        return [unit.sample for unit in self.materialized_units()]
+
+    def metadata_by_slot(self) -> list[dict[Any, dict[str, Any]]]:
+        payload: list[dict[Any, dict[str, Any]]] = []
         for idx in range(self.expected_count):
-            group.extend(self.samples_by_slot.get(idx, []))
-        return group
+            slot_payload: dict[Any, dict[str, Any]] = {}
+            for unit in self.units_by_slot.get(idx, []):
+                slot_payload[unit.name] = copy.deepcopy(unit.sample.metadata)
+            payload.append(slot_payload)
+        return payload
 
     def materialized_slot_count(self) -> int:
-        return len(self.samples_by_slot)
+        return len(self.units_by_slot)
 
 
 class RewardDomain:
@@ -82,17 +95,22 @@ class RewardDomain:
         args,
         group_filter: Callable[[list[Any]], bool] | None,
         max_submissions_per_step: int | None = None,
+        use_custom_advantage: bool = True,
     ) -> None:
         self.args = args
         self.group_rm = args.group_rm
         self.group_filter = group_filter
         self.max_submissions_per_step = _effective_reward_concurrency(args, explicit_limit=max_submissions_per_step)
+        custom_advantage_path = getattr(args, "agentic_custom_advantage_path", None) if use_custom_advantage else None
+        self.custom_advantage_func = (
+            load_function(custom_advantage_path) if custom_advantage_path is not None else None
+        )
         self._waiting_groups: dict[GroupKey, RewardWaitingGroup] = {}
         self._inflight_sample_tasks: dict[SampleKey, asyncio.Task] = {}
         self._inflight_group_tasks: dict[GroupKey, asyncio.Task] = {}
         self._completed_samples: dict[SampleKey, Any] = {}
         self._completed_group_results: dict[GroupKey, list[Any]] = {}
-        self._ready_dispatches: deque[list[Any]] = deque()
+        self._ready_dispatches: deque[tuple[GroupKey, list[Any]]] = deque()
         self._ready_scored_sample_count = 0
         self._progress_counted_samples: set[SampleKey] = set()
         self._reward_semaphore = (
@@ -116,8 +134,7 @@ class RewardDomain:
         for key in group_keys:
             if key in self._completed_group_results:
                 raise RuntimeError(f"RewardDomain cannot drop completed group after runtime discarded it: {key!r}")
-        for group in self._ready_dispatches:
-            key = sample_group_key(group)
+        for key, _group in self._ready_dispatches:
             if key in group_keys:
                 raise RuntimeError(f"RewardDomain cannot drop ready group after runtime discarded it: {key!r}")
         for key in group_keys:
@@ -165,6 +182,15 @@ class RewardDomain:
         self._ready_scored_sample_count = 0
         self._progress_counted_samples.clear()
 
+    @staticmethod
+    def _unit_from_sample(sample: Any) -> PendingExportUnit:
+        return PendingExportUnit(
+            name=None,
+            sample=sample,
+            assistant_token_spans=[],
+            mode=ExportMode.IMPLICIT,
+        )
+
     async def shutdown(self) -> None:
         inflight_sample_tasks = self._cancel_inflight_sample_tasks()
         inflight_group_tasks = self._cancel_inflight_group_tasks()
@@ -206,14 +232,16 @@ class RewardDomain:
                         expected_count=record["expected_count"],
                     )
                     self._waiting_groups[group_wait_key] = waiting_group
+                pending_units = record["pending_units"]
                 waiting_group.add_slot(
                     slot_idx=record["slot_idx"],
-                    samples=record["samples"],
+                    units=pending_units,
                 )
-                for sample in record["samples"]:
+                for sample in (unit.sample for unit in pending_units):
                     mark_metadata_agentic_event(sample.metadata, "reward_arrive_at")
                     self._note_scored_sample(sample)
-                self._start_missing_sample_rewards(record["samples"])
+                if self.custom_advantage_func is None:
+                    self._start_missing_sample_rewards([unit.sample for unit in pending_units])
 
     async def ingest_groups(self, groups) -> None:
         for group in groups:
@@ -228,11 +256,11 @@ class RewardDomain:
         group_wait_key = sample_group_key(group)
         self._start_missing_sample_rewards(group)
         if self._all_group_rewards_ready(group):
-            await self._finalize_group(group=group)
+            await self._finalize_group(key=group_wait_key, group=group)
             return
         self._waiting_groups[group_wait_key] = RewardWaitingGroup(
             expected_count=len(group),
-            samples_by_slot={idx: [sample] for idx, sample in enumerate(group)},
+            units_by_slot={idx: [self._unit_from_sample(sample)] for idx, sample in enumerate(group)},
         )
 
     def _start_missing_sample_rewards(self, group) -> int:
@@ -315,6 +343,29 @@ class RewardDomain:
                 return False
         return True
 
+    @staticmethod
+    def _apply_custom_advantage(value: Any, unit: PendingExportUnit) -> None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            unit.sample.custom_advantage = float(value)
+            return
+        # TODO(agentic): support assistant-turn-level advantages from list[float].
+        # TODO(agentic): support assistant-token-level advantages from list[list[float]].
+        raise TypeError("custom advantage output must be a number in this version.")
+
+    async def _run_custom_advantage(self, waiting_group: RewardWaitingGroup) -> list[Any] | None:
+        result = self.custom_advantage_func(waiting_group.metadata_by_slot())
+        if asyncio.iscoroutine(result):
+            result = await result
+        if result is None:
+            # None is the group-level drop signal from custom advantage.
+            return None
+        for slot_idx in range(waiting_group.expected_count):
+            slot_values = result[slot_idx]
+            for unit in waiting_group.units_by_slot.get(slot_idx, []):
+                self._apply_custom_advantage(slot_values[unit.name], unit)
+                self._note_scored_sample(unit.sample)
+        return waiting_group.materialized_group()
+
     def _harvest_group_reward_completions(self) -> int:
         done_keys = [key for key, task in self._inflight_group_tasks.items() if task.done()]
         for key in done_keys:
@@ -328,13 +379,24 @@ class RewardDomain:
             task = self._inflight_sample_tasks.pop(key)
             self._completed_samples[key] = task.result()
         for waiting_group in self._waiting_groups.values():
-            if waiting_group.is_complete():
+            if waiting_group.is_complete() and self.custom_advantage_func is None:
                 self._start_missing_sample_rewards(waiting_group.materialized_group())
         ready_groups: list[tuple[GroupKey, list[Any]]] = []
+        dropped_keys: list[GroupKey] = []
         for key, waiting_group in self._waiting_groups.items():
             if key in self._completed_group_results:
                 continue
             if not waiting_group.is_complete():
+                continue
+            if self.custom_advantage_func is not None:
+                group = await self._run_custom_advantage(waiting_group)
+                if group is None:
+                    group = waiting_group.materialized_group()
+                    self._drop_scored_progress_for_group(group)
+                    self._release_group_sample_reward_cache(group)
+                    dropped_keys.append(key)
+                    continue
+                ready_groups.append((key, group))
                 continue
             group = waiting_group.materialized_group()
             if not self._all_group_rewards_ready(group):
@@ -343,7 +405,9 @@ class RewardDomain:
         for key, group in ready_groups:
             self._waiting_groups.pop(key, None)
             self._completed_group_results[key] = group
-        return len(done_keys) + len(ready_groups)
+        for key in dropped_keys:
+            self._waiting_groups.pop(key, None)
+        return len(done_keys) + len(ready_groups) + len(dropped_keys)
 
     async def precompute_once(self) -> bool:
         progressed = False
@@ -359,11 +423,11 @@ class RewardDomain:
             completed_group = self._completed_group_results.pop(key, None)
             if completed_group is None:
                 continue
-            await self._finalize_group(group=completed_group)
+            await self._finalize_group(key=key, group=completed_group)
             progressed = True
         return progressed
 
-    async def _finalize_group(self, *, group) -> None:
+    async def _finalize_group(self, *, key: GroupKey, group) -> None:
         group_finalize_started_at = time.time()
         for sample in group:
             mark_metadata_agentic_event(sample.metadata, "group_finalize_start_at", group_finalize_started_at)
@@ -373,7 +437,7 @@ class RewardDomain:
             self._drop_scored_progress_for_group(group)
             self._release_group_sample_reward_cache(group)
             return
-        self._ready_dispatches.append(group)
+        self._ready_dispatches.append((key, group))
         group_finalize_ended_at = time.time()
         for sample in group:
             mark_metadata_agentic_event(sample.metadata, "group_finalize_end_at", group_finalize_ended_at)
@@ -402,13 +466,13 @@ class RewardDomain:
         else:
             remaining_groups = max_groups
         while self._ready_dispatches:
-            group = self._ready_dispatches.popleft()
+            key, group = self._ready_dispatches.popleft()
             if remaining_groups is None or remaining_groups > 0:
                 ready_groups.append(group)
                 if remaining_groups is not None:
                     remaining_groups -= 1
                 continue
-            retained_groups.append(group)
+            retained_groups.append((key, group))
         for item in reversed(retained_groups):
             self._ready_dispatches.appendleft(item)
         return ready_groups
@@ -460,7 +524,7 @@ class RewardDomain:
         keys = set(self._waiting_groups)
         keys.update(self._completed_group_results)
         keys.update(self._inflight_group_tasks)
-        keys.update(sample_group_key(group) for group in self._ready_dispatches)
+        keys.update(key for key, _group in self._ready_dispatches)
         return keys
 
     def has_inflight_work(self) -> bool:
