@@ -178,6 +178,8 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return custom_reward_post_process_func(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        return raw_rewards, [sample.custom_advantage for sample in samples]
     if (
         args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
@@ -517,6 +519,8 @@ def process_args(args: Namespace, role: str) -> None:
     args.max_tokens_per_gpu = args.log_probs_max_tokens_per_gpu
     args.only_load_weight = True
     if role == "reference":
+        args.load = args.ref_load
+    if role == "actor_fwd":
         args.load = args.ref_load
 
 

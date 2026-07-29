@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -25,7 +25,9 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
 from relax.utils.misc import load_function
+from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
 
 from .conditional_branch_sync import install_conditional_branch_sync
 
@@ -75,40 +77,6 @@ def _dump_provider_config(provider: Any, save_path: str) -> None:
     with open(json_path, "w") as f:
         json.dump(_make_json_safe(provider), f, indent=2, ensure_ascii=False)
     logger.info(f"Provider config saved to {json_path}")
-
-
-# Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
-class LinearForLastLayer(torch.nn.Linear):
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        *,
-        config: TransformerConfig,
-        bias: bool = True,
-    ) -> None:
-        super().__init__(in_features=input_size, out_features=output_size, bias=bias)
-        self.sequence_parallel = config.sequence_parallel
-        if self.sequence_parallel:
-            self.weight.sequence_parallel = True
-            if bias:
-                self.bias.sequence_parallel = True
-
-        self.weight.data.normal_(mean=0.0, std=0.02)
-        if bias:
-            self.bias.data.zero_()
-
-    def forward(
-        self,
-        input_: torch.Tensor,
-        weight: torch.Tensor | None = None,
-        runtime_gather_output: bool | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        logits = super().forward(input_)
-        logits = logits.float()
-        if self.sequence_parallel:
-            logits = tensor_parallel.gather_from_sequence_parallel_region(logits, tensor_parallel_output_grad=False)
-        return logits, None
 
 
 # CP-PROBE: one-shot forward-pre-hook on the first attention module to verify that
@@ -228,10 +196,7 @@ def get_model_provider_func(
             else:
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
             # Apply critic output layer if needed
-            if post_process and role == "critic":
-                model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
-                )
+            install_critic_value_head_in_provider(model, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -258,6 +223,7 @@ def get_model_provider_func(
             "dsa_indexer_loss_coeff",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
+            "masked_softmax_fusion",
             "bias_dropout_fusion",
             "apply_rope_fusion",
             "recompute_granularity",
@@ -359,10 +325,15 @@ def get_model_provider_func(
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
             model = original_provide(*p_args, **p_kwargs)
+            post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
+            install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
             return model
+
+        if is_lora_enabled(args):
+            provide_with_cp_probe = wrap_model_provider_with_lora(provide_with_cp_probe, args)
 
         return provide_with_cp_probe
 
@@ -468,15 +439,59 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
-        if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+        install_critic_value_head_in_provider(model, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)
         _install_cp_probe(model)
         return model
 
+    if is_lora_enabled(args):
+        model_provider = wrap_model_provider_with_lora(model_provider, args)
+
     return model_provider
+
+
+def wrap_model_provider_with_lora(original_provider, args):
+    """Wrap model provider to add LoRA support.
+
+    Only wraps if args.lora_rank > 0. Uses Megatron-Bridge's PEFT integration
+    to freeze base model and enable only LoRA parameters.
+    """
+    if not is_lora_enabled(args):
+        return original_provider
+
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
+        sig = inspect.signature(original_provider)
+        accepts_vp_stage = "vp_stage" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        if accepts_vp_stage:
+            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+        else:
+            model = original_provider(pre_process=pre_process, post_process=post_process)
+
+        try:
+            peft = build_lora_peft(args)
+            model = peft(model, training=True)
+            if dist.is_initialized() and dist.get_rank() == 0:
+                adapter_params, total_params, percentage = count_adapter_parameters(model)
+                logger.info(
+                    f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+                    f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
+                )
+        except RuntimeError:
+            # build_lora_peft already raises a clear upgrade-hint message when the
+            # Megatron-Bridge image lacks PEFT support; don't shadow it.
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to create LoRA (PEFT) wrapper. Ensure Megatron-Bridge PEFT utilities are available: {e}"
+            ) from e
+
+        return model
+
+    return wrapped_provider
 
 
 def wrap_model_provider_with_freeze(original_provider, args):

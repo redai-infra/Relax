@@ -4,13 +4,13 @@
 #
 # Qwen3.5-397B-A17B MTP SFT (messages + tool_calls mode), 128xGPU (16-node), ray-submit launch.
 #
-# Parallelism: TP=4, PP=8 (decoder-first=5, decoder-last=1, middle 6 stages * 9 layers = 60),
-# CP=4, EP=16, ETP=1. TP*PP*CP = 128 matches 128 GPUs.
+# Parallelism: TP=2, PP=8 (decoder-first=5, decoder-last=1, middle 6 stages * 9 layers = 60),
+# CP=8, EP=16, ETP=1. TP*PP*CP = 128 matches 128 GPUs.
 #
-# Context: 64K (--seq-length 65536). CP=4 切分后单卡 16384 token, 与 --max-tokens-per-gpu 等量.
+# Context: 128K. CP=8 切分后单卡 16384 token, 与 --max-tokens-per-gpu 等量.
 #
 # Usage:
-#   bash scripts/training/sft/run-qwen3.5-397B-A17B-mtp-sft-128xgpu.sh
+#   bash scripts/training/sft/run-qwen3.5-397B-A17B-mtp-sft-128k-128xgpu.sh
 
 set -ex
 set -o pipefail
@@ -56,10 +56,12 @@ SFT_ARGS=(
    --tool-key ${TOOL_KEY:-tools}
    --global-batch-size ${GLOBAL_BATCH_SIZE:-32}
    --use-dynamic-batch-size
-   # 64K 上下文: seq_length=65536 决定 RoPE/max_position_embeddings;
-   # CP=4 时单卡承担 65536/4=16384 token, 与 max-tokens-per-gpu 对齐
+   # 128K 上下文: CP=8 时单样本容量为 8*16384=131072 token
    --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-16384}
+   --sft-tq-timeout-minutes ${SFT_TQ_TIMEOUT_MINUTES:-60}
    --balance-data
+   --sft-oversize-strategy ${SFT_OVERSIZE_STRATEGY:-skip}
+   --data-pad-size-multiplier 4096
 )
 
 # MTP (Multi-Token Prediction) 参数:
@@ -71,13 +73,13 @@ MTP_ARGS=(
 )
 
 # 性能/并行参数:
-#   TP=4, PP=8, CP=4, EP=16, ETP=1, TP*PP*CP = 128
+#   TP=2, PP=8, CP=8, EP=16, ETP=1, TP*PP*CP = 128
 #   decoder-first=5, decoder-last=1, 中间 6 个 PP stage 各 9 层 (5+9*6+1=60)
 PERF_ARGS=(
-   --tensor-model-parallel-size ${TP_SIZE:-4}
+   --tensor-model-parallel-size ${TP_SIZE:-2}
    --sequence-parallel
    --pipeline-model-parallel-size ${PP_SIZE:-8}
-   --context-parallel-size ${CP_SIZE:-4}
+   --context-parallel-size ${CP_SIZE:-8}
    --expert-model-parallel-size ${EP_SIZE:-16}
    --expert-tensor-parallel-size ${ETP_SIZE:-1}
    --decoder-first-pipeline-num-layers 5

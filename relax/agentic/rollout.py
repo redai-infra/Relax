@@ -226,7 +226,6 @@ class AgenticResidentPipeline:
 
     async def _pump_once(self) -> bool:
         async with self._dataflow_lock():
-            self._assert_resident_group_count_invariant(context="pump_start")
             progressed = False
             while True:
                 tick_progressed = False
@@ -240,51 +239,23 @@ class AgenticResidentPipeline:
                     tick_progressed = True
                 if await self._pump_transfer_once():
                     tick_progressed = True
-                self._assert_resident_group_count_invariant(context="pump_tick")
                 if not tick_progressed:
                     return progressed
                 progressed = True
 
     @property
     def resident_group_count(self) -> int:
-        return self._resident_group_count_projection()[0]
-
-    def _resident_group_count_projection(self) -> tuple[int, dict[str, int]]:
         if (
             self.runtime_domain is None
             or self.reward_domain is None
             or self.transfer_domain is None
             or not hasattr(self.runtime_domain, "runtime_groups_by_key")
         ):
-            return 0, {}
-        runtime_snapshot = dict(self.runtime_domain.accounting_snapshot())
-        reward_snapshot = dict(self.reward_domain.accounting_snapshot())
-        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
+            return 0
         runtime_keys = set(self.runtime_domain.resident_group_keys())
         reward_keys = set(self.reward_domain.resident_group_keys())
         transfer_keys = set(self.transfer_domain.resident_group_keys())
-        parts = {
-            "runtime_resident_groups": int(runtime_snapshot.get("resident_groups", 0) or 0),
-            "reward_waiting_groups": int(reward_snapshot.get("waiting_groups", 0) or 0),
-            "reward_completed_groups": int(reward_snapshot.get("completed_groups", 0) or 0),
-            "reward_ready_groups": int(reward_snapshot.get("ready_groups", 0) or 0),
-            "reward_inflight_group_rewards": int(reward_snapshot.get("inflight_group_rewards", 0) or 0),
-            "transfer_ready_groups": int(transfer_snapshot.get("ready_groups", 0) or 0),
-        }
-        resident_keys = runtime_keys | reward_keys | transfer_keys
-        parts["distinct_resident_groups"] = len(resident_keys)
-        parts["duplicate_domain_group_refs"] = sum(parts.values()) - len(resident_keys)
-        return len(resident_keys), parts
-
-    def _assert_resident_group_count_invariant(self, *, context: str) -> None:
-        projected_count, parts = self._resident_group_count_projection()
-        if not parts:
-            return
-        if projected_count != parts["distinct_resident_groups"]:
-            raise RuntimeError(
-                "Agentic resident_group_count projection diverged from distinct resident keys: "
-                f"context={context}, projected={projected_count}, parts={parts}."
-            )
+        return len(runtime_keys | reward_keys | transfer_keys)
 
     async def _pump_prepare_once(self) -> bool:
         prepare_domain = self.prepare_domain
@@ -369,12 +340,13 @@ class AgenticResidentPipeline:
             progressed = True
         runtime_dispatch = runtime_domain.drain_ready_execution()
         if runtime_dispatch.materialized_batches:
-            if not reward_domain.group_rm:
+            if not reward_domain.group_rm or reward_domain.custom_advantage_func is not None:
                 reward_domain.accept_session_materializations(runtime_dispatch.materialized_batches)
             progressed = True
-        for group in runtime_dispatch.ready_groups:
-            await reward_domain.ingest_groups([group])
-            progressed = True
+        if reward_domain.custom_advantage_func is None:
+            for group in runtime_dispatch.ready_groups:
+                await reward_domain.ingest_groups([group])
+                progressed = True
         return progressed
 
     async def _pump_reward_to_transfer_once(self) -> bool:
@@ -559,8 +531,9 @@ class AgenticResidentPipeline:
         defer_terminal_shutdown_for_eval: bool = False,
     ) -> "_AgenticStepHandle":
         fully_async = args.fully_async
-        current_partition_quota = args.rollout_batch_size
         num_rollout = getattr(args, "num_rollout", None)
+        final_backfill_step = fully_async and num_rollout is not None and rollout_id >= num_rollout
+        current_partition_quota = 0 if final_backfill_step else args.rollout_batch_size
         terminal_step = num_rollout is not None and rollout_id + 1 >= num_rollout
         async with self._dataflow_lock():
             prepare_domain = self.prepare_domain
@@ -606,6 +579,7 @@ class AgenticResidentPipeline:
             rollout_id=rollout_id,
             required_group_count=current_partition_quota,
             terminal_step=terminal_step,
+            final_backfill_step=final_backfill_step,
             defer_terminal_shutdown_for_eval=defer_terminal_shutdown_for_eval,
             progress=progress,
         )
@@ -617,32 +591,17 @@ class AgenticResidentPipeline:
         transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
         return transfer_snapshot["committed_current_groups"]
 
-    def _interrupted_group_count(self, *, step_handle: "_AgenticStepHandle", previous: bool) -> int:
-        counter = getattr(self.runtime_domain, "interrupted_group_count_for_step", None)
-        if not callable(counter):
-            return 0
-        return int(counter(rollout_id=step_handle.rollout_id, previous=previous) or 0)
+    @property
+    def _final_backfill_pending(self) -> bool:
+        return self._last_step_current_deficit > 0
 
-    def _interrupted_close_accounting_enabled(self, step_handle: "_AgenticStepHandle") -> bool:
-        return bool(self.runtime_domain.args.fully_async and not step_handle.terminal_step)
+    def _interrupted_close_accounting_enabled(self) -> bool:
+        return bool(self.runtime_domain.args.fully_async)
 
     async def _refresh_close_accounting(self) -> None:
         refresher = getattr(self.runtime_domain, "refresh_interrupted_close_accounting", None)
         if callable(refresher):
             await refresher()
-
-    def _previous_partition_debt_satisfied(self, step_handle: "_AgenticStepHandle") -> bool:
-        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
-        previous_count = transfer_snapshot["committed_previous_groups"]
-        if self._interrupted_close_accounting_enabled(step_handle):
-            previous_count += self._interrupted_group_count(step_handle=step_handle, previous=True)
-        return previous_count >= transfer_snapshot["previous_partition_quota"]
-
-    def _committed_target_satisfied(self, step_handle: "_AgenticStepHandle") -> bool:
-        current_count = self._committed_target_count()
-        if self._interrupted_close_accounting_enabled(step_handle):
-            current_count += self._interrupted_group_count(step_handle=step_handle, previous=False)
-        return current_count >= step_handle.required_group_count
 
     def _remaining_previous_debt(self, transfer_snapshot: dict[str, int]) -> int:
         committed_previous_groups = transfer_snapshot["committed_previous_groups"]
@@ -693,9 +652,24 @@ class AgenticResidentPipeline:
         )
 
     def _close_status(self, step_handle: "_AgenticStepHandle") -> str | None:
-        if not self._previous_partition_debt_satisfied(step_handle):
+        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
+        committed_previous = transfer_snapshot["committed_previous_groups"]
+        previous_quota = transfer_snapshot["previous_partition_quota"]
+        if step_handle.final_backfill_step:
+            # There is no later step to carry another deficit, so final backfill
+            # closes only after the previous TQ partition is actually complete.
+            return None if committed_previous >= previous_quota else "previous_partition_debt"
+        committed_current = transfer_snapshot["committed_current_groups"]
+        if self._interrupted_close_accounting_enabled():
+            # Match the original fully-async rollout's combined FIFO window:
+            # completed and interrupted groups are fungible for soft close.
+            interrupted_groups = int(self.runtime_domain.accounting_snapshot()["interrupted_groups"])
+            accounted_groups = committed_previous + committed_current + interrupted_groups
+            target_groups = previous_quota + step_handle.required_group_count
+            return None if accounted_groups >= target_groups else "committed_target"
+        if committed_previous < previous_quota:
             return "previous_partition_debt"
-        if not self._committed_target_satisfied(step_handle):
+        if committed_current < step_handle.required_group_count:
             return "committed_target"
         return None
 
@@ -729,11 +703,12 @@ class AgenticResidentPipeline:
         )
 
     def _compact_accounting_snapshot(self, step_handle: "_AgenticStepHandle", *, phase: str) -> dict[str, object]:
-        self._assert_resident_group_count_invariant(context=phase)
         transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
+        runtime_snapshot = dict(self.runtime_domain.accounting_snapshot())
         prepare_snapshot = dict(self.prepare_domain.accounting_snapshot())
         reward_snapshot = dict(self.reward_domain.accounting_snapshot())
         resident_group_count = self.resident_group_count
+        interrupted_close_accounting = self._interrupted_close_accounting_enabled()
         previous_partition_quota = transfer_snapshot["previous_partition_quota"]
         (
             remaining_previous_debt,
@@ -746,17 +721,14 @@ class AgenticResidentPipeline:
         )
         target_data_size = previous_partition_quota + transfer_snapshot["current_partition_quota"]
         admission_current_quota = self._current_window_admission_quota(transfer_snapshot)
-        interrupted_previous_groups = self._interrupted_group_count(
-            step_handle=step_handle,
-            previous=True,
-        )
-        interrupted_current_groups = self._interrupted_group_count(
-            step_handle=step_handle,
-            previous=False,
+        interrupted_groups = runtime_snapshot["interrupted_groups"]
+        close_accounted_interrupted_groups = (
+            interrupted_groups if interrupted_close_accounting and not step_handle.final_backfill_step else 0
         )
         return {
             "phase": phase,
             "rollout_id": step_handle.rollout_id,
+            "final_backfill_step": step_handle.final_backfill_step,
             "train_target_groups": step_handle.required_group_count,
             "target_data_size": target_data_size,
             "resident_group_count": resident_group_count,
@@ -766,15 +738,17 @@ class AgenticResidentPipeline:
             "admission_current_window_groups": admission_current_window_groups,
             "admission_current_slack": admission_current_slack,
             "admission_current_quota": admission_current_quota,
-            "interrupted_previous_groups": interrupted_previous_groups,
-            "interrupted_current_groups": interrupted_current_groups,
-            "close_accounted_previous_groups": transfer_snapshot["committed_previous_groups"]
-            + (interrupted_previous_groups if self._interrupted_close_accounting_enabled(step_handle) else 0),
-            "close_accounted_current_groups": transfer_snapshot["committed_current_groups"]
-            + (interrupted_current_groups if self._interrupted_close_accounting_enabled(step_handle) else 0),
-            "finish_eligible_mode": "committed_plus_interrupted"
-            if self._interrupted_close_accounting_enabled(step_handle)
-            else "committed_current",
+            "interrupted_groups": interrupted_groups,
+            "close_accounted_groups": transfer_snapshot["committed_previous_groups"]
+            + transfer_snapshot["committed_current_groups"]
+            + close_accounted_interrupted_groups,
+            "finish_eligible_mode": (
+                "committed_previous"
+                if step_handle.final_backfill_step
+                else "committed_plus_interrupted"
+                if interrupted_close_accounting
+                else "committed_current"
+            ),
             "prepare_pool_groups": prepare_snapshot["pool_groups"],
             "prepare_pool_target_groups": prepare_snapshot["pool_target_groups"],
             "prepare_pending_groups": prepare_snapshot["pending_prepare_groups"],
@@ -795,7 +769,7 @@ class AgenticResidentPipeline:
     async def _wait_step_target(self, step_handle: "_AgenticStepHandle") -> None:
         while True:
             self._raise_resident_dataflow_error()
-            if self._interrupted_close_accounting_enabled(step_handle):
+            if self._interrupted_close_accounting_enabled():
                 await self._refresh_close_accounting()
             self._refresh_progress(step_handle)
             async with self._dataflow_lock():
@@ -951,9 +925,12 @@ class AgenticResidentPipeline:
                 step_handle.progress.close()
                 step_handle.progress = None
         await self.transfer_domain.wait_for_pending_transfers()
-        shutdown_all_irs = terminal_step and not step_handle.defer_terminal_shutdown_for_eval
+        lifecycle_terminal = terminal_step and not self._final_backfill_pending
+        shutdown_all_irs = lifecycle_terminal and not step_handle.defer_terminal_shutdown_for_eval
         await self._seal_step(step_handle, shutdown_all_irs=shutdown_all_irs)
-        if terminal_step or not (self.runtime_domain.args.partial_rollout or self.runtime_domain.args.fully_async):
+        if lifecycle_terminal or not (
+            self.runtime_domain.args.partial_rollout or self.runtime_domain.args.fully_async
+        ):
             await self._discard_resident_tail()
         await self.runtime_domain.trim_agentic_session_shards(reason=f"close_step_{step_handle.rollout_id}")
         async with self._dataflow_lock():
@@ -979,7 +956,6 @@ class AgenticResidentPipeline:
         rollout_started_at = time.monotonic()
         await start_sglang_profile(args, rollout_id)
         sglang_profile_stopped = False
-        rollout_batch_size = args.rollout_batch_size
         metric_gatherer = MetricGatherer()
         filter_path = args.dynamic_sampling_filter_path
         if filter_path:
@@ -1011,8 +987,9 @@ class AgenticResidentPipeline:
                 "accounting_start",
                 rollout=rollout_id,
                 group_size=transfer_start_snapshot["group_size"],
-                target_groups=rollout_batch_size,
+                target_groups=self.transfer_domain.target_group_count(),
                 terminal_step=terminal_step,
+                final_backfill_step=step_handle.final_backfill_step,
                 ready_groups=transfer_start_snapshot["ready_groups"],
             )
         )
@@ -1113,8 +1090,9 @@ class AgenticResidentPipeline:
                     if self.transfer_domain is None or self.transfer_domain.data_system_client is None:
                         raise RuntimeError("Agentic debug rollout cleanup requires an initialized TransferDomain.")
                     logger.info("Debug rollout only mode - data system cleanup")
+                    partition_rollout_id = rollout_id - 1 if step_handle.final_backfill_step else rollout_id
                     await self.transfer_domain.data_system_client.async_clear_partition(
-                        partition_id=f"train_{rollout_id}"
+                        partition_id=f"train_{partition_rollout_id}"
                     )
             output.metrics = agentic_metrics
             flat_samples = _assert_and_flatten_agentic_export_samples(output.samples)
@@ -1125,7 +1103,8 @@ class AgenticResidentPipeline:
                 await stop_sglang_profile(args, rollout_id)
             if not step_sealed:
                 await self.close_step(step_handle=step_handle, cleanup_only=True)
-            if terminal_step and not step_handle.defer_terminal_shutdown_for_eval:
+            lifecycle_terminal = terminal_step and (not step_sealed or not self._final_backfill_pending)
+            if lifecycle_terminal and not step_handle.defer_terminal_shutdown_for_eval:
                 await self.shutdown()
             if self._active_step_handle is step_handle:
                 self._active_step_handle = None
@@ -1158,7 +1137,6 @@ def init_agentic_resident_pipeline(args, data_source, data_system_client) -> Non
 
 def _assert_and_flatten_agentic_export_samples(groups: list[list[Sample]]) -> list[Sample]:
     flat_samples: list[Sample] = []
-    seen_session_ids: set[str] = set()
     for group in groups:
         if not isinstance(group, list):
             raise TypeError(f"Agentic export expected list[list[Sample]], got group type {type(group)}")
@@ -1166,9 +1144,6 @@ def _assert_and_flatten_agentic_export_samples(groups: list[list[Sample]]) -> li
             session_id = sample.session_id
             if not isinstance(session_id, str) or not session_id:
                 raise RuntimeError("Agentic export expects every sample to carry a non-empty session_id.")
-            if session_id in seen_session_ids:
-                raise RuntimeError(f"Agentic export expects one sample per session, got duplicate {session_id}.")
-            seen_session_ids.add(session_id)
             flat_samples.append(sample)
     return flat_samples
 
@@ -1195,6 +1170,7 @@ class _AgenticStepHandle:
     rollout_id: int
     required_group_count: int
     terminal_step: bool = False
+    final_backfill_step: bool = False
     defer_terminal_shutdown_for_eval: bool = False
     progress: RolloutProgress | None = None
     rollout_irs_gated: bool = False
@@ -1295,13 +1271,16 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, floa
     if args.advantage_estimator == "ppo":
         return {}
 
-    def _is_zero_std(samples: list[Sample]) -> bool:
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == reward for reward in rewards)
-
     all_sample_groups = group_by(all_samples, lambda sample: sample.group_index)
-    interesting_sample_groups = [group for group in all_sample_groups.values() if _is_zero_std(group)]
-    interesting_rewards = [str(round(group[0].get_reward_value(args), 1)) for group in interesting_sample_groups]
+    reward_groups = [
+        [sample.get_reward_value(args) for sample in group if sample.reward is not None]
+        for group in all_sample_groups.values()
+    ]
+    interesting_rewards = [
+        str(round(rewards[0], 1))
+        for rewards in reward_groups
+        if rewards and all(rewards[0] == reward for reward in rewards)
+    ]
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 
 
@@ -1309,9 +1288,14 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]) -> dict[str, fl
     reward_cat_key = args.log_reward_category
     if reward_cat_key is None:
         return {}
-    samples_of_reward_cat = group_by(all_samples, lambda sample: sample.reward[reward_cat_key])
+    rewarded_samples = [
+        sample for sample in all_samples if isinstance(sample.reward, dict) and reward_cat_key in sample.reward
+    ]
+    if not rewarded_samples:
+        return {}
+    samples_of_reward_cat = group_by(rewarded_samples, lambda sample: sample.reward[reward_cat_key])
     return {
-        f"error_cat/{reward_cat}": len(samples) / len(all_samples)
+        f"error_cat/{reward_cat}": len(samples) / len(rewarded_samples)
         for reward_cat, samples in samples_of_reward_cat.items()
     }
 
@@ -1401,8 +1385,11 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 def _load_eval_dataset(args, dataset_cfg: EvalDatasetConfig):
     from relax.utils.data.data import Dataset
+    from relax.utils.misc import load_function
 
     resources = get_agentic_runtime_resources(args).compiler
+    custom_prompt_path = getattr(args, "custom_prompt_path", None)
+    custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
     return Dataset(
         path=dataset_cfg.path,
         tokenizer=resources.tokenizer,
@@ -1417,6 +1404,7 @@ def _load_eval_dataset(args, dataset_cfg: EvalDatasetConfig):
         apply_chat_template_kwargs=args.apply_chat_template_kwargs,
         use_audio_in_video=args.use_audio_in_video,
         system_prompt=args.system_prompt,
+        custom_prompt_func=custom_prompt_func,
     )
 
 
@@ -1574,6 +1562,7 @@ async def _run_eval_samples(
     reward_domain = RewardDomain(
         args=args,
         group_filter=None,
+        use_custom_advantage=False,
     )
     prepare_domain.configure(
         runtime_driver=runtime_domain,
@@ -1759,8 +1748,12 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
     resident_pipeline = get_agentic_resident_pipeline()
     num_rollout = args.num_rollout
     terminal_step = num_rollout is not None and rollout_id + 1 >= num_rollout
-    defer_terminal_shutdown_for_eval = terminal_step and _post_train_eval_expected(args, rollout_id, data_source)
+    final_train_rollout_id = min(rollout_id, num_rollout - 1) if terminal_step else rollout_id
+    defer_terminal_shutdown_for_eval = terminal_step and _post_train_eval_expected(
+        args, final_train_rollout_id, data_source
+    )
     completed = False
+    final_backfill_pending = False
     try:
         output = _run_on_resident_async_loop(
             resident_pipeline.run_step(
@@ -1770,14 +1763,19 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
             )
         )
         completed = True
-        if defer_terminal_shutdown_for_eval:
+        final_backfill_pending = resident_pipeline._final_backfill_pending
+        if defer_terminal_shutdown_for_eval and not final_backfill_pending:
             with _RESIDENT_PIPELINE_LOCK:
-                _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID = rollout_id
+                _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID = final_train_rollout_id
         return output
     finally:
-        if terminal_step and (not defer_terminal_shutdown_for_eval or not completed):
+        finalize_pipeline = terminal_step and (not completed or not final_backfill_pending)
+        if finalize_pipeline and (not defer_terminal_shutdown_for_eval or not completed):
             with _RESIDENT_PIPELINE_LOCK:
                 _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID = None
                 if _RESIDENT_PIPELINE is resident_pipeline:
                     _RESIDENT_PIPELINE = None
-            _shutdown_resident_async_loop()
+            try:
+                _run_on_resident_async_loop(resident_pipeline.shutdown())
+            finally:
+                _shutdown_resident_async_loop()

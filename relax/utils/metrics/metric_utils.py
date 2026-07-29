@@ -126,7 +126,16 @@ def compute_rollout_explicit_reward_metrics(args, samples: list[Sample]) -> dict
             ):
                 continue
             append_rollout_numeric_metric_values(reward_metric_values, key=key, value=value)
-    return finalize_rollout_explicit_metric_values(reward_metric_values)
+    log_dict = finalize_rollout_explicit_metric_values(reward_metric_values)
+    if args.log_passrate:
+        rewards = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
+        if rewards:
+            log_dict |= dict_add_prefix(
+                compute_pass_rate(flat_rewards=rewards, group_size=args.n_samples_per_prompt),
+                "passrate/",
+            )
+
+    return log_dict
 
 
 def compression_ratio(
