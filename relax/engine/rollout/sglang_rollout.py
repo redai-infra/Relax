@@ -19,7 +19,6 @@ import torch
 from packaging.version import parse
 from tqdm import tqdm
 
-from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
@@ -1175,6 +1174,8 @@ async def generate_rollout_async(
             rollout_metrics["rollout/staleness/max"] = np.max(staleness_gaps).item()
             rollout_metrics["rollout/staleness/min"] = np.min(staleness_gaps).item()
             rollout_metrics["rollout/global_batch_size"] = len(data) * args.n_samples_per_prompt
+        from relax.distributed.ray.rollout import _log_rollout_data
+
         _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")
