@@ -10,6 +10,9 @@ Task 20 - claim issue #120 (task spec: #86 section 3-20). Covers acceptance V1-V
 
 Timing-sensitive cases use ``asyncio.Event`` for deterministic synchronization
 instead of wall-clock sleeps.
+
+The module is skipped when the inference stack (ray / sglang_router) is missing,
+e.g. on the CPU-only GitHub runner; it is covered by the internal nightly GPU run.
 """
 
 import asyncio
@@ -18,14 +21,23 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.engine.rollout import sglang_rollout
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
-from relax.engine.rollout.sglang_rollout import (
-    _dispatch_generate,
-    _ensure_not_holding_session_lock,
-    _holding_session_lock,
-)
 from relax.utils.types import Sample
+
+
+try:
+    from relax.engine.rollout import sglang_rollout
+    from relax.engine.rollout.sglang_rollout import (
+        _dispatch_generate,
+        _ensure_not_holding_session_lock,
+        _holding_session_lock,
+    )
+
+    HAS_DEPS = True
+except ImportError:
+    HAS_DEPS = False
+
+pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
 
 
 # --------------------------------------------------------------------------- #
@@ -336,11 +348,8 @@ class _StubTokenizer:
 
 class _IntegState:
     """Tokenizer-free GenerateState stand-in that reuses the *real* shipped
-    permit methods (bound here so production code runs without loading a
+    permit methods (attached below so production code runs without loading a
     tokenizer/processor)."""
-
-    inference_permit = sglang_rollout.GenerateState.inference_permit
-    post_generate = sglang_rollout.GenerateState.post_generate
 
     def __init__(self, capacity: int = 1) -> None:
         self.permit_manager = InferencePermitManager(capacity)
@@ -349,6 +358,13 @@ class _IntegState:
         self.tokenizer = _StubTokenizer()
         self.processor = None
         self.records = {"locked_during_post": [], "locked_during_env": [], "posts": 0}
+
+
+# Attached outside the class body: a class-level reference would run at import
+# time and defeat the HAS_DEPS guard above on the CPU-only runner.
+if HAS_DEPS:
+    _IntegState.inference_permit = sglang_rollout.GenerateState.inference_permit
+    _IntegState.post_generate = sglang_rollout.GenerateState.post_generate
 
 
 class _FakeEnv:
