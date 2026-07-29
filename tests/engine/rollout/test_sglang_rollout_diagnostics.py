@@ -9,8 +9,11 @@ base64 ``output_top_logprobs_*_b64`` fields into numpy ``(ids, logps)``.
 
 import numpy as np
 import pybase64
+import pytest
 
+from relax.engine.rollout.sglang_rollout import _aggregate_rollout_timing
 from relax.utils.opd.opd_main_worker import LogprobResponse
+from relax.utils.types import Sample
 
 
 def _b64(arr: np.ndarray) -> str:
@@ -38,3 +41,15 @@ def test_rollout_self_topk_keeps_token_id_zero_from_b64() -> None:
 
 def test_rollout_self_topk_returns_none_when_absent() -> None:
     assert LogprobResponse({"meta_info": {}}).self_topk("rollout", top_k=2) is None
+
+
+def test_rollout_timing_reports_request_permit_wait() -> None:
+    first = Sample(prompt="first")
+    first.metadata["_timing"] = {"request_permit_wait": 0.2, "generate": 1.0}
+    second = Sample(prompt="second")
+    second.metadata["_timing"] = {"request_permit_wait": 0.4, "generate": 2.0}
+
+    metrics = _aggregate_rollout_timing([first, second], [])
+
+    assert metrics["perf_detail/rollout/request_permit_wait_time/mean"] == pytest.approx(0.3)
+    assert metrics["perf_detail/rollout/request_permit_wait_time/max"] == 0.4

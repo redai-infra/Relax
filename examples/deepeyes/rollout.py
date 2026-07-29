@@ -14,6 +14,7 @@ import pybase64
 import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
+from relax.engine.rollout.request_permit import run_request_with_permit
 from relax.engine.rollout.sglang_rollout import GenerateState
 from relax.utils.data.processing_utils import encode_image_for_rollout_engine, get_encode_executor
 from relax.utils.http_utils import post
@@ -234,6 +235,15 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     finish_type = output["meta_info"]["finish_reason"]["type"]
     meta_info = output["meta_info"]
     return response_text, new_tokens, new_log_probs, finish_type, meta_info
+
+
+async def _run_inference_step_with_permit(state, *args, **kwargs):
+    result = await run_request_with_permit(
+        state.request_permit,
+        lambda: _run_inference_step(*args, **kwargs),
+        should_abort=lambda: getattr(state, "aborted", False),
+    )
+    return result.value
 
 
 async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
@@ -469,15 +479,27 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             inference_start_ts = time.time()
+            inference_result = await _run_inference_step_with_permit(
+                state,
+                url,
+                sample.tokens,
+                cur_sampling_params,
+                current_image_data,
+                state.tokenizer,
+                args=args,
+            )
+            if inference_result is None:
+                sample.status = Sample.Status.ABORTED
+                stop_reason = "request_abort"
+                turns_executed = turn_idx
+                break
             (
                 response_text,
                 new_response_tokens,
                 new_response_log_probs,
                 finish_type,
                 meta_info,
-            ) = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
-            )
+            ) = inference_result
             inference_end_ts = time.time()
             trace_recorder.record_inference_output(
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)

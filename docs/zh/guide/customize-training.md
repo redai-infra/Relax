@@ -150,7 +150,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        async with state.request_permit():
+            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
@@ -167,6 +168,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 ```
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
+
+仅在每次模型请求期间获取 `state.request_permit()`，进入环境或工具执行前必须释放。这样长多轮会话不会阻塞无关的短请求；请求正常返回、抛出异常或被取消时，上下文管理器都会释放 permit。
+
+升级后，自定义 generate 函数必须接入这个接口。未通过 `state.request_permit()` 发送请求的自定义实现不受 `--sglang-server-concurrency` 限制。内置 rollout 在等待 permit 后会再次检查 abort 状态，避免 rollout 已中止后又提交新请求。计时指标会把 permit 排队时间单独记录为 `request_permit_wait`，`generate` 继续只表示模型请求耗时。
+
+CPU 异步调度基准会让旧的会话级策略和新的请求级策略执行相同的模拟模型请求与环境耗时：
+
+```bash
+PYTHONPATH=. python scripts/benchmarks/benchmark_request_permit.py --warmups 1 --runs 9
+```
+
+该基准只验证调度行为和并发上限，不代表模型吞吐。
 
 ## 训练脚本与关键参数概览
 

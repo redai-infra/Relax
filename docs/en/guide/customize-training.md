@@ -151,7 +151,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        async with state.request_permit():
+            output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
@@ -168,6 +169,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 ```
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
+
+Acquire `state.request_permit()` only around each model request. Release it before running environment or tool code so a long multi-turn session does not block unrelated short requests. The context manager releases the permit when the request succeeds, raises, or is cancelled.
+
+Custom generate functions must adopt this interface after upgrading. A custom implementation that sends requests without `state.request_permit()` is not covered by `--sglang-server-concurrency`. The built-in rollout checks the abort state again after waiting for a permit, so it does not submit a new request after a rollout abort. Rollout timing reports permit queueing separately as `request_permit_wait`; `generate` continues to measure the model request itself.
+
+The CPU async scheduling benchmark uses the same synthetic model and environment durations for the former session-level policy and the request-level policy:
+
+```bash
+PYTHONPATH=. python scripts/benchmarks/benchmark_request_permit.py --warmups 1 --runs 9
+```
+
+This benchmark validates scheduling behavior and the concurrency bound. It does not measure model throughput.
 
 ## Training Script and Key Parameters
 

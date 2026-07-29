@@ -6,7 +6,7 @@ import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from time import monotonic
 from typing import Any
 
@@ -23,6 +23,7 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.request_permit import RequestPermitPool, run_request_with_permit
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -82,7 +83,7 @@ class GenerateState(metaclass=SingletonMeta):
                 except Exception as e:
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
 
-        self.semaphore = asyncio.Semaphore(
+        self.request_permits = RequestPermitPool(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
         self.sampling_params: dict[str, Any] = dict(
@@ -106,6 +107,10 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_rank = 0
 
         self.reset()
+
+    def request_permit(self) -> AbstractAsyncContextManager[None]:
+        """Return an async context manager for one model request."""
+        return self.request_permits.acquire()
 
     @contextmanager
     def dp_rank_context(self):
@@ -345,9 +350,21 @@ async def generate(
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
-    _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
-    _t_generate = monotonic() - _t_generate_start
+    request_execution = await run_request_with_permit(
+        state.request_permit,
+        lambda: post(url, payload, headers=headers),
+        should_abort=lambda: state.aborted and not evaluation,
+    )
+    if request_execution.aborted:
+        sample.status = Sample.Status.ABORTED
+        sample.metadata["_timing"] = {
+            "request_permit_wait": request_execution.permit_wait_seconds,
+            "generate": 0.0,
+        }
+        return sample
+    output = request_execution.value
+    assert output is not None
+    _t_generate = request_execution.request_seconds
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -436,7 +453,11 @@ async def generate(
     sample.update_from_meta_info(args, output["meta_info"])
     _t_post_generate = monotonic() - _t_post_generate_start
 
-    _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
+    _timing: dict[str, float] = {
+        "request_permit_wait": request_execution.permit_wait_seconds,
+        "generate": _t_generate,
+        "post_generate": _t_post_generate,
+    }
     if _t_image_processor is not None:
         _timing["image_processor"] = _t_image_processor
     if _t_mm_encode is not None:
@@ -466,24 +487,23 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
+    if state.aborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
-        with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    with state.dp_rank_context() as _:
+        # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
+        custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
 
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
+        if custom_func_path is not None:
+            custom_generate_func = load_function(custom_func_path)
+            # if signature has evaluation, pass evaluation
+            if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
             else:
-                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+                sample = await custom_generate_func(args, sample, sampling_params)
+        else:
+            sample = await generate(args, sample, sampling_params, evaluation=evaluation)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -535,7 +555,7 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     timing_data = _collect_timing_from_samples(all_samples)
     metrics: dict[str, float] = {}
 
-    for phase in ("image_processor", "mm_encode", "generate", "post_generate"):
+    for phase in ("image_processor", "mm_encode", "request_permit_wait", "generate", "post_generate"):
         values = timing_data.get(phase, [])
         if not values:
             continue
