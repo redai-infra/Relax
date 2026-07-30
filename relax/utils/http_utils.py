@@ -305,9 +305,44 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
     return await _post(_http_client, url, payload, max_retries, headers=headers)
 
 
-async def get(url):
-    response = await _http_client.get(url)
-    response.raise_for_status()
-    content = await response.aread()
-    output = json.loads(content)
+async def get(url, max_retries=MAX_RETRIES):
+    # Mirror `_post`'s retry policy: a bare GET without retries lets a transient
+    # connection drop (e.g. httpx.RemoteProtocolError "Server disconnected") on a
+    # control call such as the router's /list_workers propagate immediately. In the
+    # rollout abort path that raise fails the whole rollout step and deadlocks the
+    # colocate loop, so GET must be as resilient as POST.
+    retry_count = 0
+    while retry_count < max_retries:
+        response = None
+        try:
+            response = await _http_client.get(url)
+            response.raise_for_status()
+            content = await response.aread()
+            try:
+                output = json.loads(content)
+            except json.JSONDecodeError:
+                output = content.decode() if isinstance(content, bytes) else content
+        except Exception as e:
+            retry_count += 1
+
+            if isinstance(e, httpx.HTTPStatusError):
+                status_code = e.response.status_code
+                is_retryable_http_error = status_code >= 500 or status_code in {408, 409, 425, 429}
+                if not is_retryable_http_error:
+                    logger.info(
+                        f"Error: {e}, not retrying non-retryable HTTP status (url={url}, status_code={status_code})"
+                    )
+                    raise
+
+            logger.info(f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url})")
+            if retry_count >= max_retries:
+                logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
+                raise e
+            await asyncio.sleep(1)
+            continue
+        finally:
+            if response is not None:
+                await response.aclose()
+        break
+
     return output
