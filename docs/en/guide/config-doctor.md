@@ -19,7 +19,7 @@ python -m relax.entrypoints.doctor -- \
 The report contains four core sections:
 
 - `Final merged config`: the parsed and normalized training configuration.
-- `Role topology`: algorithm key, base roles, optional roles, per-role resource plan, and placement-group relation.
+- `Role topology`: algorithm key, candidate roles, required roles, planned roles, per-role resource plan, and placement-group relation.
 - `resource_summary`: GPU demand derived from colocate / fully-async / hybrid rules.
 - `Expected launch command`: the training entrypoint command that doctor previews.
 
@@ -46,6 +46,26 @@ python -m relax.entrypoints.doctor --doctor-skip-hf-validate -- <training args>
 ```
 
 This appends `--skip-hf-validate` to the training arguments and avoids fetching remote HF configs during parsing.
+
+## Validation Fallback and Targeted Diagnostics
+
+Doctor first runs the same complete argument parsing and validation as the training entrypoint. If validation fails, it parses again without validation to construct only the merged argument Namespace. This fallback does not fetch remote HF configuration, derive resource fields, run backend validation, or check the TransferQueue version. Mode conflicts and missing roles can therefore retain their targeted rule ids and fixes instead of collapsing into a generic `CONFIG_PARSE_ERROR`.
+
+If argparse cannot parse the arguments themselves, the fallback cannot construct a Namespace and the report retains `CONFIG_PARSE_ERROR`. Both paths only read configuration; neither calls `ray.init()` nor creates training services.
+
+## Topology and Resource Semantics
+
+`candidate_roles` are roles the algorithm registry may create, `required_roles` must have resources for the current configuration, and `roles` are the roles actually planned after applying `--resource`. Fully-async mode requires `reference` only when `--use-kl-loss` or a non-zero `--kl-coef` is set. It does not require `actor_fwd` when the effective configuration is true-on-policy.
+
+In synchronous colocate mode, actor, rollout, and an eligible critic share a placement group, so GPU demand is the maximum among the shared roles. Hybrid mode carries both fully-async and colocate execution flags, but actor and rollout use separate placement groups, so their GPU counts are added.
+
+## Dataset Path Checks
+
+`--prompt-data` accepts one file, a directory, a file list, or the `@[start:end]` slice syntax. Doctor resolves the generalized path before checking each physical file or directory. For example, `[a.jsonl,b.jsonl]@[0:100]` checks `a.jsonl` and `b.jsonl` separately instead of treating the full expression as a filename.
+
+## Sensitive Value Redaction
+
+Text and JSON reports redact sensitive values from `--agent-env`, API keys, tokens, passwords, credentials, private keys, and notification URLs. Redaction covers raw arguments, the expected command, the final merged configuration, parse errors, and diagnostic details. Sensitive values are rendered as `<redacted>`.
 
 ## Covered Error Classes
 

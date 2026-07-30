@@ -19,7 +19,7 @@ python -m relax.entrypoints.doctor -- \
 输出包含四类核心信息：
 
 - `Final merged config`：解析和归一化后的训练配置。
-- `Role topology`：算法、基础角色、可选角色、每个 role 的资源计划和 placement group 关系。
+- `Role topology`：算法、候选角色、必需角色、实际规划角色、每个 role 的资源计划和 placement group 关系。
 - `resource_summary`：按 colocate / fully-async / hybrid 规则推导出的 GPU 需求。
 - `Expected launch command`：doctor 预览的训练入口命令。
 
@@ -46,6 +46,26 @@ python -m relax.entrypoints.doctor --doctor-skip-hf-validate -- <training args>
 ```
 
 该选项会把 `--skip-hf-validate` 追加到训练参数中，避免解析阶段读取远端 HF config。
+
+## 校验回退与定向诊断
+
+doctor 首先执行与训练入口相同的完整参数解析和校验。完整校验失败时，它会再执行一次无校验解析，只构造合并后的参数 Namespace，不读取远端 HF 配置、不派生资源参数、不执行 backend 校验或 TransferQueue 版本检查。这样，模式冲突、缺失 role 等配置错误仍能由对应规则给出具体 rule id 和修复说明，而不是只返回通用的 `CONFIG_PARSE_ERROR`。
+
+如果参数本身无法被 argparse 解析，无校验解析也无法构造 Namespace，报告会保留 `CONFIG_PARSE_ERROR`。两种解析路径都只读取配置，不会调用 `ray.init()` 或创建任何训练服务。
+
+## 拓扑与资源语义
+
+`candidate_roles` 表示算法注册表可能创建的角色，`required_roles` 表示当前配置必须提供资源的角色，`roles` 表示结合 `--resource` 后实际进入预览的角色。Fully-async 模式仅在启用 `--use-kl-loss` 或设置非零 `--kl-coef` 时要求 `reference`；满足 true-on-policy 条件时不要求 `actor_fwd`。
+
+同步 colocate 模式下，actor、rollout 及符合条件的 critic 共享 placement group，GPU 需求取共享角色中的最大值。Hybrid 模式虽然同时具有 fully-async 和 colocate 执行标志，但 actor 与 rollout 使用独立 placement group，因此资源总量按两者 GPU 数量求和。
+
+## 数据路径检查
+
+`--prompt-data` 支持单文件、目录、文件列表和 `@[start:end]` 切片语法。doctor 会先解析广义路径，再逐个检查实际文件或目录，例如 `[a.jsonl,b.jsonl]@[0:100]` 会分别检查 `a.jsonl` 和 `b.jsonl`，不会把整个表达式当作文件名。
+
+## 敏感信息脱敏
+
+Text 和 JSON 报告会统一脱敏 `--agent-env`、API key、token、password、credential、private key 和通知 URL 等敏感值。脱敏覆盖原始参数、预计启动命令、最终合并配置、解析错误以及诊断详情，敏感值统一显示为 `<redacted>`。
 
 ## 已覆盖的错误类型
 
