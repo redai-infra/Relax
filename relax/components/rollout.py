@@ -436,7 +436,7 @@ class Rollout(Base):
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
                     await self.rollout_manager.generate.remote(rollout_id=local_step)
-                    if self.config.offload_rollout:
+                    if self.config.offload_rollout and not getattr(self.config, "colocate_weight_handoff", False):
                         await self.rollout_manager.offload.remote()
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"

@@ -194,3 +194,62 @@ def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
 
     with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
         arguments_module.slime_validate_args(args)
+
+
+def _colocate_handoff_args(**overrides):
+    values = dict(
+        colocate_weight_handoff=True,
+        colocate=True,
+        fully_async=False,
+        train_backend="megatron",
+        offload_train=True,
+        offload_rollout=True,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        context_parallel_size=1,
+        rollout_num_gpus_per_engine=1,
+        sglang_pp_size=1,
+        sglang_ep_size=1,
+        sglang_data_parallel_size=1,
+        rollout_external=False,
+        sglang_config=None,
+        bf16=True,
+        fp16=False,
+        use_distributed_optimizer=True,
+        enable_weights_backuper=True,
+        num_layers=36,
+        hidden_size=2560,
+        megatron_to_hf_mode="bridge",
+        sglang_speculative_algorithm=None,
+        sglang_quantization=None,
+        use_critic=False,
+        genrm_model_path=None,
+        use_opd=False,
+        opd_teacher_load=None,
+        keep_old_actor=False,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_colocate_weight_handoff_accepts_v1_layout(arguments_module):
+    arguments_module._validate_colocate_weight_handoff(_colocate_handoff_args())
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"tensor_model_parallel_size": 1}, "tensor parallel size 2"),
+        ({"rollout_num_gpus_per_engine": 2}, "one GPU per SGLang engine"),
+        ({"enable_weights_backuper": False}, "initialization-only actor CPU backup"),
+        ({"num_layers": 40}, "Qwen3-VL-4B"),
+    ],
+)
+def test_colocate_weight_handoff_rejects_unsupported_layout(arguments_module, override, message):
+    with pytest.raises(ValueError, match=message):
+        arguments_module._validate_colocate_weight_handoff(_colocate_handoff_args(**override))
+
+
+def test_colocate_weight_handoff_disabled_is_a_noop(arguments_module):
+    arguments_module._validate_colocate_weight_handoff(SimpleNamespace(colocate_weight_handoff=False))

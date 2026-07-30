@@ -791,10 +791,18 @@ index 1dde8bed80..729a5e6fe3 100644
          """Get weights by parameter name."""
          obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index 80081fc579..cec2c57f18 100644
+index 80081fc579..50b06d5a41 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -127,6 +127,7 @@ from sglang.srt.managers.io_struct import (
+@@ -118,6 +118,7 @@ from sglang.srt.managers.io_struct import (
+     DestroyWeightsUpdateGroupReqInput,
+     DumperControlReqInput,
+     EmbeddingReqInput,
++    ExportWeightsToTensorReqInput,
+     GenerateReqInput,
+     GetWeightsByNameReqInput,
+     InitWeightsSendGroupForRemoteInstanceReqInput,
+@@ -127,6 +128,7 @@ from sglang.srt.managers.io_struct import (
      OpenSessionReqInput,
      ParseFunctionCallReq,
      PauseGenerationReqInput,
@@ -802,7 +810,7 @@ index 80081fc579..cec2c57f18 100644
      ProfileReqInput,
      ReleaseMemoryOccupationReqInput,
      ResumeMemoryOccupationReqInput,
-@@ -611,10 +612,8 @@ async def model_info():
+@@ -611,10 +613,8 @@ async def model_info():
  @app.get("/weight_version")
  async def weight_version():
      """Get the current weight version."""
@@ -815,7 +823,7 @@ index 80081fc579..cec2c57f18 100644
  
  
  @app.get("/get_server_info")
-@@ -631,9 +630,19 @@ async def get_server_info():
+@@ -631,9 +631,19 @@ async def get_server_info():
  async def server_info():
      """Get the server information."""
      # Returns internal states per DP.
@@ -838,7 +846,35 @@ index 80081fc579..cec2c57f18 100644
  
      # server_args.model_config is not serializable but should be excluded by asdict.
      return {
-@@ -1222,6 +1231,23 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
+@@ -1186,6 +1196,27 @@ async def update_weights_from_tensor(
+     )
+ 
+ 
++@app.post("/export_weights_to_tensor")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def export_weights_to_tensor(
++    obj: ExportWeightsToTensorReqInput, request: Request
++):
++    """Export live model parameters as same-node CUDA IPC handles."""
++    result = await _global_state.tokenizer_manager.export_weights_to_tensor(
++        obj, request
++    )
++    content = {
++        "success": result.success,
++        "message": result.message,
++        "serialized_named_tensors": result.serialized_named_tensors,
++        "metadata": result.metadata,
++        "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
++    }
++    return ORJSONResponse(
++        content, status_code=200 if result.success else HTTPStatus.BAD_REQUEST
++    )
++
++
+ @app.post("/update_weights_from_distributed")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def update_weights_from_distributed(
+@@ -1222,6 +1253,23 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
          return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
  
  
@@ -953,7 +989,7 @@ index f3c2c295d2..b99f7fcbe3 100644
              if enable_dual_stream:
                  current_stream = torch.cuda.current_stream()
 diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
-index e9c9e7b..d07e8ed 100644
+index e9c9e7be8c..d07e8edfea 100644
 --- a/python/sglang/srt/layers/layernorm.py
 +++ b/python/sglang/srt/layers/layernorm.py
 @@ -561,7 +561,9 @@ class GemmaRMSNorm(MultiPlatformOp):
@@ -1150,7 +1186,7 @@ index 0ac18784c3..bbc94f7a49 100644
              is_k_full=self.is_k_full,
              routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 293335f646..51e56694ad 100644
+index 293335f646..d05103fee3 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -1407,6 +1407,8 @@ class PauseContinueBroadcast:
@@ -1213,7 +1249,28 @@ index 293335f646..51e56694ad 100644
      # Whether to call torch.cuda.empty_cache() during flush
      torch_empty_cache: bool = False
  
-@@ -1638,6 +1677,18 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
+@@ -1491,6 +1530,20 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
+     message: str
+ 
+ 
++@dataclass
++class ExportWeightsToTensorReqInput(BaseReq):
++    names: List[str]
++    load_format: str = "hf"
++
++
++@dataclass
++class ExportWeightsToTensorReqOutput(BaseReq):
++    success: bool
++    message: str
++    serialized_named_tensors: Optional[str] = None
++    metadata: Optional[List[Dict[str, Any]]] = None
++
++
+ @dataclass
+ class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
+     # The master address
+@@ -1638,6 +1691,18 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
      pass
  
  
@@ -1249,10 +1306,18 @@ index feecc54416..28b189cc59 100755
                  break
  
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 143054cd6e..40e05e2453 100644
+index 143054cd6e..35e8416aa2 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -124,6 +124,7 @@ from sglang.srt.managers.io_struct import (
+@@ -105,6 +105,7 @@ from sglang.srt.managers.io_struct import (
+     ExpertDistributionReq,
+     ExpertDistributionReqOutput,
+     ExpertDistributionReqType,
++    ExportWeightsToTensorReqInput,
+     FlushCacheReqInput,
+     FlushCacheReqOutput,
+     FreezeGCReq,
+@@ -124,6 +125,7 @@ from sglang.srt.managers.io_struct import (
      LoadLoRAAdapterReqOutput,
      OpenSessionReqInput,
      PauseGenerationReqInput,
@@ -1260,15 +1325,17 @@ index 143054cd6e..40e05e2453 100644
      ProfileReq,
      ReleaseMemoryOccupationReqInput,
      RemoveExternalCorpusReqInput,
-@@ -1452,6 +1453,7 @@ class Scheduler(
+@@ -1451,7 +1453,9 @@ class Scheduler(
+                     self.update_weights_from_distributed,
                  ),
                  (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
++                (ExportWeightsToTensorReqInput, self.export_weights_to_tensor),
                  (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
 +                (PostProcessWeightsReqInput, self.post_process_weights),
                  (GetWeightsByNameReqInput, self.get_weights_by_name),
                  (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                  (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
-@@ -3649,9 +3651,16 @@ class Scheduler(
+@@ -3649,9 +3653,16 @@ class Scheduler(
                  recv_req.abort_all or req.rid.startswith(recv_req.rid)
              ):
                  # Abort method 3: set `to_finish`
@@ -1313,10 +1380,10 @@ index c02ed7997d..61733c4127 100644
                      if self.profile_in_progress:
                          # force trace flush
 diff --git a/python/sglang/srt/managers/scheduler_update_weights_mixin.py b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
-index f2daf644de..534d1b2f01 100644
+index f2daf644de..bb2fe882e0 100644
 --- a/python/sglang/srt/managers/scheduler_update_weights_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
-@@ -12,6 +12,7 @@ from sglang.srt.constants import (
+@@ -12,15 +12,20 @@ from sglang.srt.constants import (
      GPU_MEMORY_TYPE_KV_CACHE,
      GPU_MEMORY_TYPE_WEIGHTS,
  )
@@ -1324,7 +1391,11 @@ index f2daf644de..534d1b2f01 100644
  from sglang.srt.managers.io_struct import (
      CheckWeightsReqInput,
      CheckWeightsReqOutput,
-@@ -21,6 +22,8 @@ from sglang.srt.managers.io_struct import (
+     DestroyWeightsUpdateGroupReqInput,
+     DestroyWeightsUpdateGroupReqOutput,
++    ExportWeightsToTensorReqInput,
++    ExportWeightsToTensorReqOutput,
+     GetWeightsByNameReqInput,
      GetWeightsByNameReqOutput,
      InitWeightsUpdateGroupReqInput,
      InitWeightsUpdateGroupReqOutput,
@@ -1333,7 +1404,35 @@ index f2daf644de..534d1b2f01 100644
      ReleaseMemoryOccupationReqInput,
      ReleaseMemoryOccupationReqOutput,
      ResumeMemoryOccupationReqInput,
-@@ -120,6 +123,11 @@ class SchedulerUpdateWeightsMixin:
+@@ -105,6 +110,27 @@ class SchedulerUpdateWeightsMixin:
+         torch.distributed.barrier(group=self.tp_cpu_group)
+         return UpdateWeightsFromTensorReqOutput(success, message)
+ 
++    def export_weights_to_tensor(
++        self: Scheduler, recv_req: ExportWeightsToTensorReqInput
++    ):
++        if not self.is_fully_idle():
++            return ExportWeightsToTensorReqOutput(
++                success=False,
++                message="Weight export requires an idle scheduler",
++            )
++        if GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags:
++            return ExportWeightsToTensorReqOutput(
++                success=False,
++                message="Weight export requires resident model weights",
++            )
++        success, message, serialized, metadata = self.tp_worker.export_weights_to_tensor(recv_req)
++        return ExportWeightsToTensorReqOutput(
++            success=success,
++            message=message,
++            serialized_named_tensors=serialized,
++            metadata=metadata,
++        )
++
+     def update_weights_from_ipc(
+         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
+     ):
+@@ -120,6 +146,11 @@ class SchedulerUpdateWeightsMixin:
          torch.distributed.barrier(group=self.tp_cpu_group)
          return UpdateWeightsFromIPCReqOutput(success, message)
  
@@ -1345,7 +1444,7 @@ index f2daf644de..534d1b2f01 100644
      def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
          parameter = self.tp_worker.get_weights_by_name(recv_req)
          return GetWeightsByNameReqOutput(parameter)
-@@ -143,6 +151,15 @@ class SchedulerUpdateWeightsMixin:
+@@ -143,6 +174,15 @@ class SchedulerUpdateWeightsMixin:
              self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
              self.flush_cache()
  
@@ -1361,7 +1460,7 @@ index f2daf644de..534d1b2f01 100644
          if GPU_MEMORY_TYPE_WEIGHTS in tags:
              self.stashed_model_static_state = _export_static_state(
                  self.tp_worker.model_runner.model
-@@ -183,6 +200,15 @@ class SchedulerUpdateWeightsMixin:
+@@ -183,6 +223,15 @@ class SchedulerUpdateWeightsMixin:
          if GPU_MEMORY_TYPE_KV_CACHE in tags:
              self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
  
@@ -1378,10 +1477,19 @@ index f2daf644de..534d1b2f01 100644
  
      def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index 05382e073e..7eea220be6 100644
+index 05382e073e..1c702cb65b 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
-@@ -76,6 +76,8 @@ from sglang.srt.managers.io_struct import (
+@@ -35,6 +35,8 @@ from sglang.srt.managers.io_struct import (
+     ExpertDistributionReq,
+     ExpertDistributionReqOutput,
+     ExpertDistributionReqType,
++    ExportWeightsToTensorReqInput,
++    ExportWeightsToTensorReqOutput,
+     FlushCacheReqInput,
+     FlushCacheReqOutput,
+     GetInternalStateReq,
+@@ -76,6 +78,8 @@ from sglang.srt.managers.io_struct import (
      UpdateWeightsFromDistributedReqOutput,
      UpdateWeightsFromIPCReqInput,
      UpdateWeightsFromIPCReqOutput,
@@ -1390,15 +1498,38 @@ index 05382e073e..7eea220be6 100644
      UpdateWeightsFromTensorReqInput,
      UpdateWeightsFromTensorReqOutput,
  )
-@@ -102,6 +104,7 @@ _COMMUNICATOR_SPECS = [
+@@ -101,7 +105,9 @@ _COMMUNICATOR_SPECS = [
+     ),
      ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
      ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
++    ("export_weights_to_tensor", ExportWeightsToTensorReqOutput),
      ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
 +    ("post_process_weights", PostProcessWeightsReqOutput),
      ("get_weights_by_name", GetWeightsByNameReqOutput),
      ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
      ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
-@@ -531,6 +534,17 @@ class TokenizerControlMixin:
+@@ -496,6 +502,20 @@ class TokenizerControlMixin:
+ 
+         return success, message
+ 
++    async def export_weights_to_tensor(
++        self: TokenizerManager,
++        obj: ExportWeightsToTensorReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> ExportWeightsToTensorReqOutput:
++        self.auto_create_handle_loop()
++        if self.server_args.dp_size != 1:
++            raise ValueError("Weight export currently requires SGLang DP=1")
++        async with self.model_update_lock.writer_lock:
++            results = await self.export_weights_to_tensor_communicator(obj)
++        if len(results) != 1:
++            raise RuntimeError(f"Expected one weight export result, got {len(results)}")
++        return results[0]
++
+     async def update_weights_from_ipc(
+         self: TokenizerManager,
+         obj: UpdateWeightsFromIPCReqInput,
+@@ -531,6 +551,17 @@ class TokenizerControlMixin:
  
          return success, message
  
@@ -1490,10 +1621,16 @@ index 6375a1d8b7..3fc175e1af 100644
          if state.finished:
              # Get detailed cache breakdown if available
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index 60e105d939..6a37a8200c 100644
+index 60e105d939..1468e40792 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
-@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
+@@ -24,11 +24,13 @@ import torch
+ from sglang.srt.distributed import get_pp_group, get_world_group
+ from sglang.srt.managers.io_struct import (
+     DestroyWeightsUpdateGroupReqInput,
++    ExportWeightsToTensorReqInput,
+     GetWeightsByNameReqInput,
+     InitWeightsSendGroupForRemoteInstanceReqInput,
      InitWeightsUpdateGroupReqInput,
      LoadLoRAAdapterFromTensorsReqInput,
      LoadLoRAAdapterReqInput,
@@ -1501,7 +1638,7 @@ index 60e105d939..6a37a8200c 100644
      SendWeightsToRemoteInstanceReqInput,
      UnloadLoRAAdapterReqInput,
      UpdateWeightFromDiskReqInput,
-@@ -97,6 +98,7 @@ class BaseTpWorker(ABC):
+@@ -97,6 +99,7 @@ class BaseTpWorker(ABC):
          success, message = self.model_runner.update_weights_from_disk(
              recv_req.model_path,
              recv_req.load_format,
@@ -1509,7 +1646,7 @@ index 60e105d939..6a37a8200c 100644
              recapture_cuda_graph=recv_req.recapture_cuda_graph,
          )
          return success, message
-@@ -152,6 +154,7 @@ class BaseTpWorker(ABC):
+@@ -152,6 +155,7 @@ class BaseTpWorker(ABC):
              recv_req.shapes,
              recv_req.group_name,
              recv_req.load_format,
@@ -1517,7 +1654,18 @@ index 60e105d939..6a37a8200c 100644
          )
          return success, message
  
-@@ -171,6 +174,11 @@ class BaseTpWorker(ABC):
+@@ -166,11 +170,22 @@ class BaseTpWorker(ABC):
+         )
+         return success, message
+ 
++    def export_weights_to_tensor(self, recv_req: ExportWeightsToTensorReqInput):
++        return self.model_runner.export_weights_to_tensor(
++            names=recv_req.names,
++            load_format=recv_req.load_format,
++        )
++
+     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+         """Update weights from IPC for checkpoint-engine integration."""
          success, message = self.model_runner.update_weights_from_ipc(recv_req)
          return success, message
  
@@ -1688,7 +1836,7 @@ index 5f8a256f66..5eff30ef96 100644
          return DecLockRefResult(delta=delta)
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index eff3a5615a..5b1eec9953 100644
+index eff3a5615a..fcae7e19e4 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -20,7 +20,9 @@ import datetime
@@ -1944,7 +2092,56 @@ index eff3a5615a..5b1eec9953 100644
      def update_weights_from_tensor(
          self,
          named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
-@@ -3346,11 +3526,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2098,6 +2278,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             raise NotImplementedError(f"Unknown load_format={load_format}")
+         return True, "Success"
+ 
++    def export_weights_to_tensor(self, names: List[str], load_format: str = "hf"):
++        """Serialize a partial group of model weights for same-node CUDA IPC."""
++        if load_format != "hf":
++            return False, f"Unsupported export format: {load_format}", None, None
++        if self.tp_size != 1:
++            return False, "Weight export currently requires SGLang TP=1", None, None
++        exporter = getattr(self.model, "export_weights_to_hf_views", None)
++        if exporter is None:
++            return False, f"{type(self.model).__name__} does not support HF-view export", None, None
++
++        try:
++            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
++
++            monkey_patch_torch_reductions()
++            source_views = exporter(names)
++            # TMS uses CUDA VMM for releasable model weights, while PyTorch's
++            # standard IPC reducer only supports ordinary CUDA allocations.
++            # Model loading has already left the tagged TMS region here, so a
++            # normal clone uses PyTorch's default CUDA pool.  The caller sends
++            # bounded Bridge-task groups, keeping this D2D staging short-lived
++            # and avoiding both full-model staging and host traffic.
++            named_tensors = [
++                (name, tensor.contiguous().clone())
++                for name, tensor in source_views
++            ]
++            if [name for name, _ in named_tensors] != names:
++                raise RuntimeError("Exporter returned weights in an unexpected order")
++            metadata = [
++                {
++                    "name": name,
++                    "shape": list(tensor.shape),
++                    "dtype": str(tensor.dtype).removeprefix("torch."),
++                    "numel": tensor.numel(),
++                }
++                for name, tensor in named_tensors
++            ]
++            serialized = MultiprocessingSerializer.serialize(named_tensors, output_str=True)
++            return True, "Success", serialized, metadata
++        except Exception as exc:
++            logger.exception("Failed to export model weights as CUDA IPC views")
++            return False, str(exc), None, None
++
+     def _update_weights_from_flattened_bucket(
+         self,
+         flattened_tensor_bucket_dict,
+@@ -3346,11 +3568,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
  
          no_copy_to_cpu = not self.server_args.disable_overlap_schedule
@@ -1964,7 +2161,7 @@ index eff3a5615a..5b1eec9953 100644
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -3358,7 +3545,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3358,7 +3587,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -1973,7 +2170,7 @@ index eff3a5615a..5b1eec9953 100644
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -3641,6 +3828,161 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3641,6 +3870,161 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              )
          return output
  
@@ -2413,7 +2610,7 @@ index 832ee74dd0..69b296fcb3 100644
      def get_model_config_for_expert_location(cls, config: KimiK25Config):
          text_config = config.text_config
 diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
-index 1b6c185bcb..58ad9c7803 100644
+index 1b6c185bcb..fb5895f44c 100644
 --- a/python/sglang/srt/models/qwen3_vl.py
 +++ b/python/sglang/srt/models/qwen3_vl.py
 @@ -1024,14 +1024,19 @@ class Qwen3LLMModel(Qwen3Model):
@@ -2440,6 +2637,77 @@ index 1b6c185bcb..58ad9c7803 100644
              hidden_states, residual = layer(
                  positions,
                  hidden_states,
+@@ -1307,6 +1312,70 @@ class Qwen3VLForConditionalGeneration(nn.Module):
+         self.capture_aux_hidden_states = True
+         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+ 
++    def export_weights_to_hf_views(
++        self, names: List[str]
++    ) -> List[Tuple[str, torch.Tensor]]:
++        """Return HF-semantic read-only views of the live TP=1 parameters."""
++        if get_tensor_model_parallel_world_size() != 1:
++            raise ValueError("Qwen3-VL HF-view export currently requires SGLang TP=1")
++        if self.quant_config is not None:
++            raise ValueError("Qwen3-VL HF-view export does not support quantized weights")
++
++        params = dict(self.named_parameters(remove_duplicate=False))
++        modules = dict(self.named_modules())
++        exported = []
++        for hf_name in names:
++            internal_name = hf_name
++            if internal_name.startswith("model.language_model."):
++                internal_name = internal_name.replace("model.language_model.", "model.", 1)
++            elif internal_name.startswith("model.visual."):
++                internal_name = internal_name.replace("model.visual.", "visual.", 1)
++                internal_name = internal_name.replace("attn.qkv.", "attn.qkv_proj.")
++
++            shard_name = None
++            for candidate in ("q", "k", "v"):
++                token = f".{candidate}_proj"
++                if token in internal_name:
++                    internal_name = internal_name.replace(token, ".qkv_proj", 1)
++                    shard_name = candidate
++                    break
++
++            gate_up_shard = None
++            if ".gate_proj" in internal_name:
++                internal_name = internal_name.replace(".gate_proj", ".gate_up_proj", 1)
++                gate_up_shard = 0
++            elif ".up_proj" in internal_name:
++                internal_name = internal_name.replace(".up_proj", ".gate_up_proj", 1)
++                gate_up_shard = 1
++
++            if internal_name not in params:
++                raise KeyError(f"Cannot export HF weight {hf_name!r}; internal parameter {internal_name!r} is absent")
++
++            param = params[internal_name].detach()
++            module_name = internal_name.rsplit(".", 1)[0]
++            module = modules.get(module_name)
++            output_dim = int(getattr(params[internal_name], "output_dim", 0) or 0)
++
++            if shard_name is not None:
++                if module is None:
++                    raise KeyError(f"Missing QKV module {module_name!r} for {hf_name!r}")
++                sizes = {
++                    "q": int(module.q_proj_shard_size),
++                    "k": int(module.kv_proj_shard_size),
++                    "v": int(module.kv_proj_shard_size),
++                }
++                offsets = {"q": 0, "k": sizes["q"], "v": sizes["q"] + sizes["k"]}
++                param = param.narrow(output_dim, offsets[shard_name], sizes[shard_name])
++            elif gate_up_shard is not None:
++                if module is None or not hasattr(module, "output_sizes"):
++                    raise KeyError(f"Missing fused MLP module {module_name!r} for {hf_name!r}")
++                sizes = [int(size) for size in module.output_sizes]
++                offset = sum(sizes[:gate_up_shard])
++                param = param.narrow(output_dim, offset, sizes[gate_up_shard])
++
++            exported.append((hf_name, param))
++        return exported
++
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
 diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
 index 5b886a8791..bde20421ed 100644
 --- a/python/sglang/srt/multimodal/processors/base_processor.py
@@ -2935,3 +3203,112 @@ index 55566973af..46c1771af8 100644
          assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
          assert (
              expect_should_compare == actual_should_compare
+diff --git a/test/registered/unit/models/test_qwen3_vl_weight_export.py b/test/registered/unit/models/test_qwen3_vl_weight_export.py
+new file mode 100644
+index 0000000000..8f67f91e8b
+--- /dev/null
++++ b/test/registered/unit/models/test_qwen3_vl_weight_export.py
+@@ -0,0 +1,103 @@
++"""Unit coverage for Qwen3-VL live HF-view weight export."""
++
++from sglang.test.ci.ci_register import register_cpu_ci
++
++
++register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
++
++import unittest
++from unittest.mock import patch
++
++import torch
++from torch import nn
++
++from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
++
++
++class _PackedLinear(nn.Module):
++    def __init__(self, rows, columns, *, output_sizes=None, q_size=None, kv_size=None):
++        super().__init__()
++        self.weight = nn.Parameter(torch.arange(rows * columns, dtype=torch.float32).reshape(rows, columns))
++        self.weight.output_dim = 0
++        if output_sizes is not None:
++            self.output_sizes = output_sizes
++        if q_size is not None:
++            self.q_proj_shard_size = q_size
++            self.kv_proj_shard_size = kv_size
++
++
++class _FakeQwen3VL(nn.Module):
++    export_weights_to_hf_views = Qwen3VLForConditionalGeneration.export_weights_to_hf_views
++
++    def __init__(self):
++        super().__init__()
++        self.quant_config = None
++
++        self.model = nn.Module()
++        self.model.layers = nn.ModuleList([nn.Module()])
++        layer = self.model.layers[0]
++        layer.self_attn = nn.Module()
++        layer.self_attn.qkv_proj = _PackedLinear(8, 2, q_size=4, kv_size=2)
++        layer.mlp = nn.Module()
++        layer.mlp.gate_up_proj = _PackedLinear(6, 2, output_sizes=[3, 3])
++
++        self.visual = nn.Module()
++        self.visual.blocks = nn.ModuleList([nn.Module()])
++        self.visual.blocks[0].attn = nn.Module()
++        self.visual.blocks[0].attn.qkv_proj = _PackedLinear(9, 2)
++
++        self.model.embed_tokens = nn.Embedding(5, 2)
++        self.lm_head = self.model.embed_tokens
++
++
++class TestQwen3VLWeightExport(unittest.TestCase):
++    def setUp(self):
++        self.model = _FakeQwen3VL()
++
++    def _export(self, names):
++        with patch("sglang.srt.models.qwen3_vl.get_tensor_model_parallel_world_size", return_value=1):
++            return dict(self.model.export_weights_to_hf_views(names))
++
++    def assertSharesStorage(self, exported, source):
++        self.assertEqual(exported.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
++
++    def test_text_qkv_and_gate_up_are_views(self):
++        names = [
++            "model.language_model.layers.0.self_attn.q_proj.weight",
++            "model.language_model.layers.0.self_attn.k_proj.weight",
++            "model.language_model.layers.0.self_attn.v_proj.weight",
++            "model.language_model.layers.0.mlp.gate_proj.weight",
++            "model.language_model.layers.0.mlp.up_proj.weight",
++        ]
++        exported = self._export(names)
++        qkv = self.model.model.layers[0].self_attn.qkv_proj.weight
++        gate_up = self.model.model.layers[0].mlp.gate_up_proj.weight
++
++        torch.testing.assert_close(exported[names[0]], qkv[:4])
++        torch.testing.assert_close(exported[names[1]], qkv[4:6])
++        torch.testing.assert_close(exported[names[2]], qkv[6:8])
++        torch.testing.assert_close(exported[names[3]], gate_up[:3])
++        torch.testing.assert_close(exported[names[4]], gate_up[3:])
++        for name in names[:3]:
++            self.assertSharesStorage(exported[name], qkv)
++        for name in names[3:]:
++            self.assertSharesStorage(exported[name], gate_up)
++
++    def test_vision_qkv_keeps_fused_layout(self):
++        name = "model.visual.blocks.0.attn.qkv.weight"
++        exported = self._export([name])[name]
++        source = self.model.visual.blocks[0].attn.qkv_proj.weight
++
++        torch.testing.assert_close(exported, source)
++        self.assertSharesStorage(exported, source)
++
++    def test_tied_embedding_exports_shared_storage(self):
++        names = ["model.language_model.embed_tokens.weight", "lm_head.weight"]
++        exported = self._export(names)
++
++        self.assertSharesStorage(exported[names[0]], self.model.model.embed_tokens.weight)
++        self.assertSharesStorage(exported[names[1]], self.model.model.embed_tokens.weight)
++
++
++if __name__ == "__main__":
++    unittest.main()

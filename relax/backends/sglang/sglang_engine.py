@@ -758,9 +758,18 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response.json()["weight_version"]
 
-    def release_memory_occupation(self):
+    def export_weights_to_tensor(self, names: list[str], load_format: str = "hf"):
+        return self._make_request(
+            "export_weights_to_tensor",
+            {"names": names, "load_format": load_format},
+        )
+
+    def release_memory_occupation(self, tags: list[str] = None):
         self.flush_cache()
-        return self._make_request("release_memory_occupation")
+        return self._make_request(
+            "release_memory_occupation",
+            {"tags": tags},
+        )
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""

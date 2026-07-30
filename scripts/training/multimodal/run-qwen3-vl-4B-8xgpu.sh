@@ -2,7 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-VL-4B 8xGPU colocate training script.
+# Qwen3-VL-4B colocate training script (8 GPUs by default).
 #
 # Usage:
 #   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu.sh
@@ -20,11 +20,20 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 
+TASK_GPUS="${TASK_GPUS:-${NUM_GPUS:-8}}"
+
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/openr1mm}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-64}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-512}"
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
+ROLLOUT_MAX_PROMPT_LEN="${ROLLOUT_MAX_PROMPT_LEN:-2048}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-20480}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-40960}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct/
@@ -47,11 +56,11 @@ ROLLOUT_ARGS=(
    --balance-data
    --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 64
-   --n-samples-per-prompt 8
-   --global-batch-size 512
-   --rollout-max-response-len 8192
-   --rollout-max-prompt-len 2048
+   --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
+   --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT}
+   --global-batch-size ${GLOBAL_BATCH_SIZE}
+   --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN}
+   --rollout-max-prompt-len ${ROLLOUT_MAX_PROMPT_LEN}
    --rollout-temperature 1.0
 )
 
@@ -70,8 +79,8 @@ PERF_ARGS=(
    # --qkv-format bshd
    # --micro-batch-size 1 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
-   --log-probs-max-tokens-per-gpu 40960
+   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
+   --log-probs-max-tokens-per-gpu ${LOG_PROBS_MAX_TOKENS_PER_GPU}
 
    --no-rope-fusion
    --calculate-per-token-loss
@@ -102,6 +111,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
+   --num-gpus-per-node "${TASK_GPUS}"
 )
 
 WANDB_ARGS=(
@@ -109,7 +119,7 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen3-vl-4b-GRPO-gpu8-${now}
+   --tb-experiment-name qwen3-vl-4b-GRPO-gpu${TASK_GPUS}-${now}
 )
 
 MISC_ARGS=(
@@ -123,12 +133,17 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+HANDOFF_ARGS=()
+if [ "${ENABLE_COLOCATE_WEIGHT_HANDOFF:-0}" = "1" ]; then
+   HANDOFF_ARGS+=(--colocate-weight-handoff)
+fi
+
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+   --resource "{\"actor\": [1, ${TASK_GPUS}], \"rollout\": [1, ${TASK_GPUS}]}"\
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
@@ -141,4 +156,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-vl-4b-GRPO-gpu8-${now}.log
+   "${HANDOFF_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee "log/qwen3-vl-4b-GRPO-gpu${TASK_GPUS}-${now}.log"

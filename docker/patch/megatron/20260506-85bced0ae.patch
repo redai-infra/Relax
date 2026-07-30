@@ -443,7 +443,7 @@ index 19de0ed52..d957e0f1e 100644
                      output_layer=self.output_layer,
                      output_weight=output_weight,
 diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
-index 4430a8c84..084389b27 100644
+index 4430a8c84a..f270a19615 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
 @@ -706,6 +706,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
@@ -464,6 +464,25 @@ index 4430a8c84..084389b27 100644
                              assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
                                  tensors[key].shape,
                                  gbuf_local_start,
+@@ -2823,6 +2827,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+         if self._state_offloader is not None:
+             self._state_offloader.offload()
+ 
++    def enable_state_offload(self):
++        """Lazily enable the existing asynchronous state offloader.
++
++        RL runtimes use this when optimizer state only needs to leave the GPU
++        at phase boundaries.  It intentionally does not change
++        ``config.offload_optimizer_states`` or the per-training-step policy.
++        """
++        if self._state_offloader is None:
++            self._state_offloader = OptimizerStateOffloader(self)
++        if self.optimizer.state:
++            self._state_offloader.mark_optimizer_states_initialized()
++
+     def reload_offloaded_states(self):
+         """Start async reload of offloaded states."""
+         if self._state_offloader is not None:
 diff --git a/megatron/core/parallel_state.py b/megatron/core/parallel_state.py
 index 863b5d55d..6c81e6e5f 100644
 --- a/megatron/core/parallel_state.py
@@ -912,17 +931,19 @@ index 62f6e4426..c25969b3b 100644
      )
      group.add_argument(
 diff --git a/megatron/training/training.py b/megatron/training/training.py
-index a0817e834..7cd094dc5 100644
+index a0817e834a..2befd84303 100644
 --- a/megatron/training/training.py
 +++ b/megatron/training/training.py
-@@ -222,7 +222,9 @@ from megatron.training.utils import (
+@@ -222,7 +222,11 @@ from megatron.training.utils import (
  try:
      from torch_memory_saver import torch_memory_saver
  
 -    torch_memory_saver.hook_mode = "torch"
-+    # NOTE(wuhuan): keep the default hook mode; forcing "torch" triggers
-+    # 'torch.AcceleratorError: CUDA error: invalid argument' on weight updates.
-+    # torch_memory_saver.hook_mode = "torch"
++    # A preloaded TMS allocator is required for pauseable CUDA graphs in
++    # colocated inference. Fall back to the torch hook only for standalone
++    # launches that did not preload that allocator.
++    if "torch_memory_saver" not in os.getenv("LD_PRELOAD", ""):
++        torch_memory_saver.hook_mode = "torch"
      HAVE_TORCH_MEMORY_SAVER = True
  except ImportError:
      HAVE_TORCH_MEMORY_SAVER = False
