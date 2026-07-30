@@ -4,9 +4,13 @@ from argparse import Namespace
 
 import pytest
 import torch
-from megatron.core.transformer.enums import AttnBackend
 
-from relax.backends.megatron import model
+
+pytest.importorskip("megatron.core")
+
+from megatron.core.transformer.enums import AttnBackend  # noqa: E402
+
+from relax.backends.megatron import model  # noqa: E402
 
 
 @pytest.mark.parametrize(

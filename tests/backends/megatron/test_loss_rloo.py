@@ -2,9 +2,13 @@
 
 from argparse import Namespace
 
+import pytest
 import torch
 
-from relax.backends.megatron import loss
+
+pytest.importorskip("megatron.core")
+
+from relax.backends.megatron import loss  # noqa: E402
 
 
 def test_compute_rloo_advantages_applies_sequence_kl_before_leave_one_out(monkeypatch):

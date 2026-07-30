@@ -5,7 +5,10 @@ from argparse import Namespace
 import pytest
 import torch
 
-from relax.backends.megatron import data
+
+pytest.importorskip("megatron.core")
+
+from relax.backends.megatron import data  # noqa: E402
 
 
 def test_log_rollout_data_keeps_rloo_sequence_metrics_cp_invariant(monkeypatch):
