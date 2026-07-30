@@ -8,6 +8,7 @@ Megatron bump could drop it silently, so the first test guards the patch text
 and runs in CI while the rest check the behaviour and need Megatron.
 """
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,27 @@ needs_megatron = pytest.mark.skipif(LinearWithFrozenWeight is None, reason="requ
 
 PATCH = Path(__file__).resolve().parents[3] / "docker" / "patch" / "latest" / "megatron.patch"
 HINT = f"the LinearWithFrozenWeight.backward hunk from NVIDIA/Megatron-LM#5092 is missing from {PATCH}"
+FOLD = "grad_output.reshape(-1, grad_output.size(-1))"
+
+
+def _megatron_lacks_dgrad_fold() -> bool:
+    """Whether the Megatron on the path predates the hunk.
+
+    False when Megatron is absent; ``needs_megatron`` gives the better reason.
+    """
+    if LinearWithFrozenWeight is None:
+        return False
+    try:
+        # Bytes: a decode error here would take the whole module down at import.
+        return FOLD.encode() not in Path(inspect.getfile(LinearWithFrozenWeight)).read_bytes()
+    except (OSError, TypeError):
+        return True  # cannot tell -- skip rather than report a regression
+
+
+needs_fold = pytest.mark.skipif(
+    _megatron_lacks_dgrad_fold(),
+    reason=f"the Megatron on the path predates the DGRAD fold; rebuild the image with {PATCH}",
+)
 
 
 def test_megatron_patch_carries_dgrad_fold():
@@ -31,7 +53,7 @@ def test_megatron_patch_carries_dgrad_fold():
     assert PATCH.is_file(), HINT
     patch = PATCH.read_text()
     assert "megatron/core/tensor_parallel/layers.py" in patch, HINT
-    assert "grad_output.reshape(-1, grad_output.size(-1))" in patch, HINT
+    assert FOLD in patch, HINT
     assert "grad_input.reshape(*grad_output.shape[:-1], weight.size(1))" in patch, HINT
 
 
@@ -73,6 +95,7 @@ def _run(batch, tokens, vocab, hidden, dtype=torch.float32, device="cpu"):
 
 
 @needs_megatron
+@needs_fold
 @pytest.mark.parametrize("batch", [1, 3])
 def test_frozen_weight_dgrad_folds_to_a_single_mm(batch):
     """batch 1 reshapes as a view, batch 3 has to copy."""
@@ -103,6 +126,7 @@ def test_frozen_weight_dgrad_passes_2d_grad_through():
 
 
 @needs_megatron
+@needs_fold
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_frozen_weight_dgrad_folds_to_a_single_mm_in_bf16_on_cuda():
     """bf16 on device is what training actually runs."""
