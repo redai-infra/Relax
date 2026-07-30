@@ -433,6 +433,8 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
+| `--rm-type-fallback` | str | None | 未知/缺失 Reward 类型的回退策略：`zero` 记 0 分并告警，注册名则路由到该 Reward；None 保持报错行为 |
+| `--rm-type-infer` | flag | False | 无显式类型时按注册的 label matcher 推断 Reward 类型；与显式类型冲突时告警并以显式类型优先 |
 | `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |

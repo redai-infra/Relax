@@ -11,14 +11,8 @@ from relax.utils.misc import load_function
 from relax.utils.types import Sample
 
 from .dapo_genrm import async_compute_score_genrm
-from .deepscaler import get_deepscaler_rule_based_reward
-from .f1 import f1_score
-from .gpqa import compute_gpqa_reward
-from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_utils import extract_answer as extract_boxed_answer
-from .math_utils import grade_answer_verl
-from .multiple_choice import get_multiple_choice_reward
-from .openr1mm import get_openr1mm_rule_based_reward
+from .registry import get_reward_spec, list_reward_types, register_reward, resolve_rm_type
 
 
 logger = get_logger(__name__)
@@ -59,40 +53,19 @@ class RewardWorker:
     """
 
     def compute(self, rm_type: str, response: str, label, metadata: dict | None = None):
-        """Dispatch to the appropriate synchronous reward function.
+        """Dispatch to the registered synchronous reward function.
 
         Returns the same value the original function would return.
         """
-        if rm_type == "deepscaler":
-            return get_deepscaler_rule_based_reward(response, label)
-        elif rm_type == "geo3k":
-            from .geo3k import get_geo3k_reward
-
-            return get_geo3k_reward(response, label)
-        elif rm_type == "openr1mm":
-            return get_openr1mm_rule_based_reward(response, label)
-        elif rm_type == "multiple_choice":
-            return get_multiple_choice_reward(response, label)
-        elif rm_type == "dapo":
-            return compute_score_dapo(response, label)
-        elif rm_type == "math":
-            return 1 if grade_answer_verl(response, label) else 0
-        elif rm_type == "mopd":
-            from .mopd import get_mopd_reward
-
-            return get_mopd_reward(response, label, metadata)
-        elif rm_type == "f1":
-            return f1_score(response, label)[0]
-        elif rm_type == "gpqa":
-            return compute_gpqa_reward(response, label, metadata=metadata)
-        elif rm_type == "ifbench":
-            from .ifbench import compute_ifbench_reward
-
-            return compute_ifbench_reward(response, label, metadata=metadata)
-        elif rm_type == "random":
-            return random.randint(0, 1)
-        else:
-            raise NotImplementedError(f"RewardWorker: unknown rm_type={rm_type!r}")
+        spec = get_reward_spec(rm_type)
+        if spec is None or spec.mode != "sync":
+            raise NotImplementedError(
+                f"RewardWorker: unknown rm_type={rm_type!r}. Available: {list_reward_types('sync')}"
+            )
+        fn = spec.resolve()
+        if spec.pass_metadata:
+            return fn(response, label, metadata=metadata)
+        return fn(response, label)
 
 
 # ---------------------------------------------------------------------------
@@ -149,33 +122,6 @@ class RewardExecutor:
 
     # -- public API -----------------------------------------------------------
 
-    # Async rm_types run in the event loop (not dispatched to worker pool).
-    _ASYNC_RM_DISPATCH = {
-        "remote_rm": lambda args, sample: remote_rm(args, sample),
-        "dapo-genrm": lambda args, sample: async_compute_score_genrm(args, sample),
-        # `dummy` returns 0 without any computation. Use it when the real
-        # reward is produced elsewhere (e.g., --custom-reward-post-process-path
-        # does batched GenRM scoring after all rollout finishes).
-        "dummy": lambda args, sample: _dummy_reward(args),
-    }
-
-    # CPU-bound / thread-unsafe rm_types dispatched to the Ray worker pool.
-    _SYNC_RM_TYPES = frozenset(
-        {
-            "deepscaler",
-            "geo3k",
-            "openr1mm",
-            "multiple_choice",
-            "dapo",
-            "math",
-            "mopd",
-            "f1",
-            "gpqa",
-            "ifbench",
-            "random",
-        }
-    )
-
     async def execute(self, args, sample: Sample, **kwargs):
         """Execute a single reward computation with concurrency control.
 
@@ -193,20 +139,33 @@ class RewardExecutor:
                 return await rm_function(args, sample, **kwargs)
 
             metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-            rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
+            route = resolve_rm_type(
+                metadata_rm_type=metadata.get("rm_type"),
+                args_rm_type=args.rm_type,
+                label=sample.label,
+                infer=getattr(args, "rm_type_infer", False),
+                fallback=getattr(args, "rm_type_fallback", None),
+                sample_index=getattr(sample, "index", None),
+            )
+            if route.zero_reward:
+                # Fallback "zero": no dispatch. Reuse the dummy reward so the
+                # 0.0 is reward-key aware and cannot mix dict/scalar shapes.
+                return await _dummy_reward(args)
+
+            rm_type = route.rm_type
             response = sample.response
             label = sample.label
-            if rm_type.startswith("boxed_"):
+            if route.boxed:
                 response = extract_boxed_answer(response) or ""
-                rm_type = rm_type[len("boxed_") :]
 
             # --- async rm types: run in event loop -----------------------
-            async_handler = self._ASYNC_RM_DISPATCH.get(rm_type)
-            if async_handler is not None:
-                return await async_handler(args, sample)
+            spec = get_reward_spec(rm_type) if rm_type else None
+            if spec is not None and spec.mode == "async":
+                return await spec.resolve()(args, sample)
 
             # --- sync rm types: dispatch to worker pool ------------------
-            # Default to sync path for any non-empty rm_type not in async dispatch
+            # Default to sync path for any non-empty rm_type not registered
+            # as async; unknown types keep failing inside the worker.
             if rm_type:
                 self._ensure_workers()
                 worker = self._next_worker()
@@ -252,6 +211,15 @@ async def remote_rm(args, sample: Sample, max_retries: int = 10):
             backoff = min(2**attempt, 30) + random.random()
             logger.info(f"remote_rm: {type(e).__name__}, retrying in {backoff:.1f}s ({attempt + 1}/{max_retries})")
             await asyncio.sleep(backoff)
+
+
+# Async rm_types run in the event loop (not dispatched to the worker pool).
+register_reward("remote_rm", remote_rm, mode="async")
+register_reward("dapo-genrm", async_compute_score_genrm, mode="async")
+# `dummy` returns 0 without any computation. Use it when the real reward is
+# produced elsewhere (e.g., --custom-reward-post-process-path does batched
+# GenRM scoring after all rollout finishes).
+register_reward("dummy", lambda args, sample: _dummy_reward(args), mode="async")
 
 
 async def async_rm(args, sample: Sample, **kwargs):

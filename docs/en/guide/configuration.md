@@ -433,6 +433,8 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--rm-type` | str | None | Built-in reward model type |
+| `--rm-type-fallback` | str | None | Fallback for unknown/missing reward types: `zero` scores 0.0 with a warning, a registered type name routes there. None keeps the error behavior |
+| `--rm-type-infer` | flag | False | Infer the reward type from the sample label via registered matchers when no explicit type is set; conflicts warn and the explicit type wins |
 | `--custom-rm-path` | str | None | Custom reward function path. Function signature: `def custom_rm(args, sample) -> float` |
 | `--reward-key` | str | None | Key to extract reward value when reward function returns dict |
 | `--eval-reward-key` | str | None | Reward key for evaluation. When None, equals `--reward-key` |
