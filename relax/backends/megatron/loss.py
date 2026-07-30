@@ -1061,10 +1061,13 @@ def policy_loss_function(
         # of the batch carries no signal at all.
         with torch.no_grad():
             abs_adv = sum_of_sample_mean(advantages.abs())
-            # A zero advantage means the whole group scored identically, so the
-            # group contributes no gradient. Tracking this catches a reward that
-            # has saturated (all-correct or all-wrong groups) long before the
-            # reward curve flattens.
+            # Fraction of tokens whose advantage is exactly zero, and which
+            # therefore contribute no gradient. The dominant cause is a group that
+            # scored identically throughout -- all-correct or all-wrong -- so this
+            # tracks reward saturation long before the reward curve flattens. Note
+            # it is a per-token count, not a per-group one: for k >= 3 a single
+            # sample can sit exactly at the group mean (rewards 1, 0.5, 0 gives
+            # advantages 0.75, 0, -0.75) and is counted here too.
             no_signal = sum_of_sample_mean((advantages == 0).to(advantages.dtype))
         reported_loss["rloo_advantage_abs"] = abs_adv.clone().detach()
         reported_loss["rloo_no_signal_fraction"] = no_signal.clone().detach()

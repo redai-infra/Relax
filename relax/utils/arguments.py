@@ -2789,6 +2789,13 @@ def slime_validate_args(args):
                 "--disable-rewards-normalization would degrade it to REINFORCE without a baseline. "
                 "Remove that flag, or pick a different --advantage-estimator."
             )
+            assert not args.normalize_advantages, (
+                "--normalize-advantages re-whitens advantages across the data-parallel group "
+                "(distributed_masked_whiten in loss.py), which re-introduces exactly the "
+                "standard-deviation normalization RLOO omits -- and does so after the DP split, so "
+                "the resulting advantage depends on how the batch was partitioned. Remove the flag "
+                "to keep RLOO's estimator intact."
+            )
 
         if args.fully_async:
             assert not args.normalize_advantages, (
