@@ -16,7 +16,6 @@ import sglang_router
 from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from urllib3.exceptions import NewConnectionError
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
@@ -38,6 +37,10 @@ _GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
 _GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
 _SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
 _MIN_HTTP_TIMEOUT_S = 1.0
+# Consecutive connection failures that mean "the server process is gone" rather
+# than "the server is briefly busy". Bail out instead of retrying until the
+# drain deadline: a dead engine will never answer.
+_MAX_CONSECUTIVE_CONNECT_ERRORS = 3
 
 
 def get_base_gpu_id(args, rank):
@@ -643,11 +646,12 @@ class SGLangEngine(RayActor):
         except Exception as e:  # noqa: BLE001 — best-effort, keep offloading
             logger.info(f"abort_requests failed (continuing to flush): {e}")
 
-    def flush_cache(self, timeout_s: float = 120.0):
+    def flush_cache(self, timeout_s: float = 120.0, max_connect_errors: int = _MAX_CONSECUTIVE_CONNECT_ERRORS):
         """Flush the cache of the server."""
         if self.node_rank != 0:
             return
         deadline = time.monotonic() + timeout_s
+        connect_errors = 0
         # flush cache will not return status_code 200 when there are pending requests
         while True:
             try:
@@ -658,9 +662,21 @@ class SGLangEngine(RayActor):
                 if response.status_code == 200:
                     break
                 # 400 = running/waiting requests present; wait and retry below.
-            except NewConnectionError as e:
-                raise e
+                connect_errors = 0
+            except requests.exceptions.ConnectionError as e:
+                connect_errors += 1
+                logger.warning(
+                    f"Cannot reach {self.server_host}:{self.server_port}/flush_cache "
+                    f"({connect_errors}/{max_connect_errors}): {e}"
+                )
+                if connect_errors >= max_connect_errors:
+                    raise ConnectionError(
+                        f"Engine {self.server_host}:{self.server_port} unreachable while "
+                        f"flushing cache ({connect_errors} consecutive connection errors) "
+                        f"— the server process is most likely dead."
+                    ) from e
             except Exception as e:
+                connect_errors = 0
                 logger.info(f"Error flushing cache: {e}")
             if time.monotonic() >= deadline:
                 raise TimeoutError("Timeout while flushing cache.")
@@ -1005,6 +1021,7 @@ class GenRMEngine(SGLangEngine):
         if self.node_rank == 0:
             deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
             self._pause_generation_for_offload(deadline)
+            connect_errors = 0
             while True:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Timeout while draining GenRM before release.")
@@ -1016,9 +1033,24 @@ class GenRMEngine(SGLangEngine):
                     )
                     if resp.status_code == 200:
                         break
-                except NewConnectionError:
-                    raise
+                    connect_errors = 0
+                except requests.exceptions.ConnectionError as e:
+                    # requests wraps urllib3's NewConnectionError, so catching the
+                    # latter here would never fire and a dead engine would be
+                    # retried until the drain deadline.
+                    connect_errors += 1
+                    logger.warning(
+                        f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
+                        f"draining GenRM ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
+                    )
+                    if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
+                        raise ConnectionError(
+                            f"GenRM engine {self.server_host}:{self.server_port} unreachable while "
+                            f"draining before release ({connect_errors} consecutive connection "
+                            f"errors) — the server process is most likely dead."
+                        ) from e
                 except Exception as e:  # noqa: BLE001
+                    connect_errors = 0
                     logger.info(f"Error flushing GenRM cache: {e}")
                 time.sleep(1)
         return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
