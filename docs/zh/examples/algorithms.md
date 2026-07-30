@@ -241,6 +241,15 @@ RLOO 的 advantage 量级小于默认 GRPO，因为二值 reward 下组内标准
 
 Adam 对梯度的常数缩放基本不敏感，所以这**基本不构成**重调 `--lr` 的理由。但它对 `--clip-grad` 有影响 —— 裁剪会破坏这种不变性：在 Megatron 默认的 `--clip-grad 1.0` 下，同一组实验里 GRPO 有 **68% 的 step 被裁剪，RLOO 只有 2%**。切换算法时应重新审视 `--clip-grad`，而不是 `--lr`。
 
+#### 如何读报告出来的 loss
+
+`train/pg_loss` 有两点与裁剪类估计器不同，都是预期行为而非异常：
+
+- **它经常是负数。** PPO-Clip 取两个取负项的最大值，天然偏正。RLOO 报的是 `-A · log π`，而 `log π < 0`，所以等于 `A · |log π|`；均值为负只是说明正 advantage 的 token 其 `|log π|` 更小，即模型对得分高的回复本来就更有信心。Qwen3-0.6B / GSM8K 实测：同一批数据下 RLOO 为 `-0.026`，GRPO 为 `+0.045`。
+- **它下无界。** 对 `A < 0` 的 token，最小化 `-A · log π` 会把 `log π` 推向 `-∞`，而且没有任何东西约束它 —— 因为没有信任域。这正是裁剪被引入所要消除的性质，属于无裁剪 REINFORCE 固有，而非本实现特有。60 步的实测中表现稳定（`grad_norm` 0.45、entropy 0.49、未发散），但**判断稳定性应看 `train/entropy_loss` 与 `train/grad_norm`，而不是 `pg_loss`**；两者中任一出现漂移时应启用 `--clip-grad`。
+
+与此相关，`rloo_no_signal_fraction` 值得从第一步就盯。同一组实验中它全程均值 **0.48，并在 60 个 rollout 内升到 0.65**，个别 step 达到 1.0：约一半的 token 落在全同分的组里，因而不贡献梯度。这就是 reward 饱和，而且远在 reward 曲线走平之前就能看到。
+
 #### 损失是 REINFORCE，不是 PPO-Clip
 
 RLOO 的目标函数是针对 leave-one-out baseline 的原始 REINFORCE，没有信任域：

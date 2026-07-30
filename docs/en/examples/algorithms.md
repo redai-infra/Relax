@@ -241,6 +241,15 @@ RLOO's advantages are smaller in magnitude than default GRPO's, because the grou
 
 Adam is largely invariant to a constant gradient rescale, so this is mostly *not* a reason to retune `--lr`. It does matter for `--clip-grad`, which breaks that invariance: at Megatron's default `--clip-grad 1.0`, the same run clipped **68% of steps under GRPO but only 2% under RLOO**. Revisit `--clip-grad` rather than `--lr` when switching.
 
+#### Reading the reported loss
+
+Two things about `train/pg_loss` differ from the clipped estimators and are expected rather than symptoms:
+
+- **It is routinely negative.** PPO-Clip takes a maximum of two negated terms, which biases it positive. RLOO reports `-A · log π`, and since `log π < 0` this equals `A · |log π|`; a negative mean simply says that positive-advantage tokens carry smaller `|log π|`, i.e. the model is already more confident on the responses that scored well. Measured on Qwen3-0.6B / GSM8K: `-0.026` for RLOO against `+0.045` for GRPO on the same data.
+- **It is unbounded below.** For a token with `A < 0`, minimising `-A · log π` pushes `log π` toward `-∞`; nothing caps it, because there is no trust region. This is the property clipping was introduced to remove, and it is intrinsic to unclipped REINFORCE rather than specific to this implementation. In a 60-step run it stayed well behaved (`grad_norm` 0.45, entropy 0.49, no divergence), but **watch `train/entropy_loss` and `train/grad_norm` rather than `pg_loss` for stability**, and reach for `--clip-grad` if either drifts.
+
+Relatedly, `rloo_no_signal_fraction` is worth watching from the first step. On the same run it averaged **0.48 and rose to 0.65** over 60 rollouts, reaching 1.0 on individual steps: roughly half the tokens sat in groups that scored identically and therefore contributed no gradient. That is reward saturation, visible long before the reward curve flattens.
+
 #### The loss is REINFORCE, not PPO-Clip
 
 RLOO's objective is plain REINFORCE against the leave-one-out baseline, with no trust region:
