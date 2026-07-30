@@ -17,7 +17,7 @@ import asyncio
 import logging
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -72,6 +72,7 @@ class DeviceDirectBackend(CommBackend):
         coordinator_url=None,
         lock: Any = None,
         timeout_seconds: int = 300,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ) -> None:
         """Initialize DeviceDirectBackend.
 
@@ -85,6 +86,11 @@ class DeviceDirectBackend(CommBackend):
             coordinator_url: URL of the coordinator service
             lock: Remote lock for coordinating weight updates
             timeout_seconds: Operation timeout (default 300)
+            weights_getter: Optional override for the weight source used by
+                ``update_weights_for_rollout``. Defaults to reading the live
+                model directly via ``named_params_and_buffers``; callers that
+                need to push a decoupled snapshot (e.g. hybrid mode's
+                TensorBackuper tag) pass this instead.
         """
         super().__init__(backend_type, role_info)
         self.args = args
@@ -96,6 +102,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
+        self._weights_getter = weights_getter
         self.device = next(model[0].parameters()).device if model else device_utils.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
@@ -125,6 +132,36 @@ class DeviceDirectBackend(CommBackend):
             from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
             self._bridge_converter = BridgeConverter(args=args, model=model, quantization_config=quantization_config)
+
+    def _named_params_and_buffers(self):
+        """Weight source for ``update_weights_for_rollout``.
+
+        Defaults to reading the live model directly; ``weights_getter``
+        overrides this with a decoupled snapshot (e.g. hybrid mode's
+        TensorBackuper tag) when the caller cannot safely read live params at
+        push time. That snapshot lives on host memory, but all_gather_param and
+        the NCCL/GLOO broadcast below require device tensors, so coerce here
+        (mirrors UpdateWeightFromTensor's equivalent H2D copy for its CUDA-IPC
+        push). ``tensor.to(device)`` returns a brand-new Tensor object, which
+        drops the tensor_model_parallel/partition_dim/etc. attributes
+        TensorBackuper attached to the CPU snapshot — copy them onto the device
+        copy too, same as Megatron's own copy_tensor_model_parallel_attributes
+        does after any such reallocation.
+        """
+        if self._weights_getter is not None:
+            from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+            result = []
+            for name, tensor in self._weights_getter().items():
+                if tensor.device != self.device:
+                    moved = tensor.to(self.device)
+                    copy_tensor_model_parallel_attributes(moved, tensor)
+                    if hasattr(tensor, "parallel_mode"):
+                        moved.parallel_mode = tensor.parallel_mode
+                    tensor = moved
+                result.append((name, tensor))
+            return result
+        return named_params_and_buffers(self.args, self.model)
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -535,7 +572,7 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in self._named_params_and_buffers():
             if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
@@ -560,7 +597,7 @@ class DeviceDirectBackend(CommBackend):
 
         buffer_size = 0
         named_tensors = []
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in self._named_params_and_buffers():
             if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(

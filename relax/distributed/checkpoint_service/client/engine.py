@@ -13,9 +13,11 @@ Provides:
 
 import asyncio
 import time
+from collections.abc import Callable, Mapping
 from typing import Any, Dict, Optional, Sequence
 
 import httpx
+import torch
 
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
 from relax.distributed.checkpoint_service.config import BackendType, DCSConfig, RoleInfo
@@ -59,6 +61,7 @@ class CheckpointEngineClient:
         model_name: Optional[str] = None,
         quantization_config: Optional[Dict[str, int | str | list[str]]] = None,
         lock: Any = None,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ):
         """Initialize checkpoint engine client.
 
@@ -77,6 +80,10 @@ class CheckpointEngineClient:
             model_name (Optional[str]): Model name (e.g., "qwen3-4B"). Default: None
             quantization_config (Optional[Dict]): Quantization configuration. Default: None
             lock :
+            weights_getter: Optional override for the weight source used when
+                pushing to rollout. Defaults to reading the live model
+                directly; callers that must push a decoupled snapshot (e.g.
+                hybrid mode's TensorBackuper tag) pass this instead.
         """
         self.coordinator_url = coordinator_url.rstrip("/")
         self.config = config or DCSConfig()
@@ -97,6 +104,7 @@ class CheckpointEngineClient:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.lock = lock
+        self.weights_getter = weights_getter
 
         # State
         self._registered = False
@@ -250,6 +258,7 @@ class CheckpointEngineClient:
                 quantization_config=self.quantization_config,
                 coordinator_url=self.coordinator_url,
                 lock=lock,
+                weights_getter=self.weights_getter,
             )
 
     async def init_process_groups_for_actor_fwd_ref(self, rollout_id: int) -> None:

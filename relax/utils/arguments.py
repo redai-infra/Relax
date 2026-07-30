@@ -86,6 +86,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-async-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Hybrid mode only: push the actor->rollout DCS weight sync in a background "
+                    "thread, joined at the top of the next iteration's push instead of blocking "
+                    "immediately. Opt-in and off by default: measured as no faster than the "
+                    "synchronous push on 2xH20 (the DCS push's H2D copy + TP all-gather + NCCL "
+                    "broadcast still run on the actor's own GPU and contend with the next step's "
+                    "compute either way), see exps/hybrid_async_perf_h20/README.md. Ignored when "
+                    "--disable-weights-backuper or --keep-old-actor is set."
+                ),
+            )
+            parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
                 default=device_utils.get_dist_backend(),
@@ -1031,6 +1045,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Whether to process the audio in the video or not.",
             )
+            parser.add_argument(
+                "--dedup-multimodal-preprocess",
+                action="store_true",
+                default=False,
+                help=(
+                    "Rollout-side optimization: when every sample in a prompt group shares the "
+                    "same multimodal_inputs object, run the image processor once per group "
+                    "instead of once per sample (n_samples_per_prompt calls otherwise), caching "
+                    "the result on each sample as _pre_encoded_image. Off by default; validated "
+                    "correct (20/20 rollout_ids, non-degenerate reward/loss) but without a "
+                    "quantified before/after timing comparison yet."
+                ),
+            )
+            parser.add_argument(
+                "--pin-multimodal-h2d-copy",
+                action="store_true",
+                default=False,
+                help=(
+                    "Pin multimodal_train_inputs CPU tensors in get_batch() so the H2D copy in "
+                    "move_tensors_to_device (called once per microbatch in forward_step) can go "
+                    "non_blocking instead of a synchronous pageable-memory copy of pixel tensors. "
+                    "Off by default; validated correct but without a quantified before/after "
+                    "timing comparison yet."
+                ),
+            )
             # Multimodal data processing parameters
             parser.add_argument(
                 "--image-max-token-num",
@@ -1098,7 +1137,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--mm-processor-pool-size",
                 type=int,
-                default=0,
+                default=1024,
                 help=(
                     "Size of the multimodal processor pool. "
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
