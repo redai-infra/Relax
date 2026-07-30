@@ -33,7 +33,6 @@ from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.timer import timer
 
-from .arguments import _resolve_optimizer_precision_args
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
@@ -227,7 +226,6 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
 
 def _build_optimizer_config_kwargs(args: Namespace) -> dict[str, object]:
     """Build optimizer kwargs from normalized runtime arguments."""
-    _resolve_optimizer_precision_args(args)
     kwargs = {}
     for field in dataclasses.fields(OptimizerConfig):
         if hasattr(args, field.name):

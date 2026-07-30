@@ -264,10 +264,12 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | enabled | disabled | Enable or disable TransformerEngine's precision-aware optimizer |
 | `--store-param-remainders` / `--no-store-param-remainders` | disabled | enabled | Control parameter-remainder storage in the distributed optimizer |
 
-Relax preserves its historical FP16 values when one or more of these options are omitted and emits one warning listing
-the applied fallbacks. Pass all four options explicitly to silence the warning. These dynamic-scale settings are
-inactive when a static `--loss-scale` is used. In FP16 mode, both dynamic-scale values must be finite and greater than
-zero, and `--min-loss-scale` must not exceed `--initial-loss-scale`.
+With dynamic FP16 loss scaling (`--loss-scale` omitted), Relax preserves its historical values for omitted options and
+emits one warning listing the applied fallbacks. With a static `--loss-scale`, `--initial-loss-scale` and
+`--min-loss-scale` are inactive, so Relax does not fill, validate, or warn about them; the two boolean optimizer options
+still use their FP16 compatibility fallbacks when omitted. Pass the active options explicitly to silence the warning.
+In dynamic mode, both scale values must be finite and greater than zero, and `--min-loss-scale` must not exceed
+`--initial-loss-scale`. Non-FP16 defaults come directly from Megatron's `OptimizerConfig`.
 
 The Qwen3-4B FP16 recipe configures all four values explicitly. Extra arguments passed to the shell script are appended
 to the training command, so a later value can override the recipe without editing it:
