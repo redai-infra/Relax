@@ -56,6 +56,43 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+def test_parse_only_mode_returns_namespace_before_validation(arguments_module, monkeypatch):
+    captured = {}
+
+    def fake_megatron_parse_args(extra_args_provider, skip_hf_validate=False, derive_cluster_args=True):
+        captured["skip_hf_validate"] = skip_hf_validate
+        captured["derive_cluster_args"] = derive_cluster_args
+        parser = argparse.ArgumentParser()
+        extra_args_provider(parser)
+        return parser.parse_args()
+
+    megatron_arguments = ModuleType("relax.backends.megatron.arguments")
+    megatron_arguments.megatron_parse_args = fake_megatron_parse_args
+    megatron_arguments.validate_args = lambda args: args
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.arguments", megatron_arguments)
+    monkeypatch.setattr(arguments_module, "sglang_parse_args", lambda: None)
+    monkeypatch.setattr(arguments_module, "teacher_sglang_parse_args", lambda: None)
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "relax-doctor",
+            "--resource",
+            '{"actor": [1, 4], "rollout": [1, 4]}',
+            "--fully-async",
+            "--colocate",
+        ],
+    )
+
+    args = arguments_module.parse_args(validate=False)
+
+    assert args.fully_async is True
+    assert args.colocate is True
+    assert args.resource == {"actor": [1, 4], "rollout": [1, 4]}
+    assert captured == {"skip_hf_validate": True, "derive_cluster_args": False}
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
