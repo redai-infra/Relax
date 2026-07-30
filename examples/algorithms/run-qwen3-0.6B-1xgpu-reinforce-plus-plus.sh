@@ -13,7 +13,7 @@
 # Optional:
 #   EVAL_DATA=/path/to/gsm8k/main/test-00000-of-00001.parquet
 #   ADVANTAGE_ESTIMATOR=reinforce_plus_plus[_baseline] | grpo
-#   NUM_ROLLOUT=50 SEED=42
+#   NUM_ROLLOUT=50 SEED=42 USE_HEALTH_CHECK=1
 
 set -euo pipefail
 
@@ -42,6 +42,7 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-1024}"
 REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-4}"
 REWARD_MAX_CONCURRENCY="${REWARD_MAX_CONCURRENCY:-16}"
+USE_HEALTH_CHECK="${USE_HEALTH_CHECK:-1}"
 KL_COEF="${KL_COEF:-0.01}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.01}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/task29-reinforce-plus-plus}"
@@ -174,15 +175,23 @@ if [[ -z "${RUNTIME_ENV_JSON:-}" ]]; then
     RUNTIME_ENV_JSON='{}'
 fi
 
+CONTROLLER_ARGS=(
+    --resource '{"actor": [1, 1], "rollout": [1, 1]}'
+    --max-staleness 0
+    --num-data-storage-units 1
+    --colocate
+)
+case "${USE_HEALTH_CHECK}" in
+    1|true) CONTROLLER_ARGS+=(--use-health-check) ;;
+    0|false) ;;
+    *) echo "USE_HEALTH_CHECK must be one of: 1, 0, true, false" >&2; exit 2 ;;
+esac
+
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train \
-    --resource '{"actor": [1, 1], "rollout": [1, 1]}' \
-    --max-staleness 0 \
-    --num-data-storage-units 1 \
-    --colocate \
-    --use-health-check \
+    "${CONTROLLER_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
