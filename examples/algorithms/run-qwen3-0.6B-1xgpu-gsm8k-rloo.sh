@@ -61,7 +61,13 @@ fi
 NUM_ROLLOUT="${NUM_ROLLOUT:=100}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:=4}"
 N_SAMPLES="${N_SAMPLES:=8}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=16}"
+# ROLLOUT_BATCH_SIZE * N_SAMPLES == GLOBAL_BATCH_SIZE, i.e. exactly ONE optimizer
+# step per rollout. This is a correctness requirement for RLOO, not a tuning
+# choice: RLOO is unclipped REINFORCE with no importance-ratio term, so a second
+# step within the same rollout trains at updated weights against log-probs
+# sampled from the old ones, with nothing correcting the mismatch. PPO-Clip
+# tolerates this via the ratio; RLOO does not.
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=32}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-0.6B

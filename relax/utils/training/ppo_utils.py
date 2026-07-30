@@ -353,9 +353,11 @@ def compute_rloo_loss(
     correction. Gradients flow ONLY through ``log_probs``.
 
     Note on off-policy drift: with no ratio correction, RLOO assumes the sampling
-    policy equals the training policy. That holds under one optimizer step per
-    rollout; with several inner epochs the estimator is off-policy and the paper's
-    guarantees no longer apply. The recipe therefore keeps one step per rollout.
+    policy equals the training policy. That holds only when a rollout yields a
+    single optimizer step, i.e. ``rollout_batch_size * n_samples_per_prompt ==
+    global_batch_size``. With more than one step the later steps train at updated
+    weights against log-probabilities sampled from the old ones and nothing
+    corrects the gap -- PPO-Clip absorbs this through the ratio, RLOO cannot.
 
     Args:
         log_probs: Current-policy log-probabilities (the only gradient source).

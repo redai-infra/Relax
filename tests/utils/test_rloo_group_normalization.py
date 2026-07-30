@@ -152,3 +152,56 @@ def test_grpo_behaviour_on_non_finite_rewards_is_unchanged(bad):
     assert not all(v == v for v in normalized) or any(abs(v) == float("inf") for v in normalized), (
         "GRPO should still propagate the non-finite value rather than raise"
     )
+
+
+def test_advantages_do_not_depend_on_how_samples_are_grouped_into_dp_ranks():
+    """DP splitting cannot change RLOO's advantages, by construction.
+
+    Acceptance criterion 3 covers DP as well as CP. For RLOO the DP half is
+    structural rather than something the loss path has to get right:
+    ``post_process_rewards`` runs inside ``convert_samples_to_train_data`` on the
+    rollout side, *before* the batch enters the TransferQueue and is handed to
+    data-parallel ranks. So the per-sample advantage is fixed before any DP split
+    exists, and no partitioning can alter it.
+
+    This pins that property directly: normalizing the whole batch at once must
+    give exactly what normalizing each would-be DP shard separately gives, as long
+    as groups stay intact -- which the group-size assertion already enforces.
+    """
+    k = 4
+    # Two prompt groups that would land on two different DP ranks.
+    group_a = _samples([1.0, 0.0, 0.0, 1.0], group_index=0)
+    group_b = _samples([1.0, 1.0, 0.0, 0.0], group_index=1)
+    for i, sample in enumerate(group_a + group_b):
+        sample.index = i
+
+    _, whole_batch = _post_process(_args("rloo", k), group_a + group_b)
+    _, shard_0 = _post_process(_args("rloo", k), group_a)
+    _, shard_1 = _post_process(_args("rloo", k), group_b)
+
+    assert torch.allclose(torch.tensor(whole_batch), torch.tensor(shard_0 + shard_1), atol=1e-12), (
+        f"whole batch gave {whole_batch}, per-shard gave {shard_0 + shard_1}"
+    )
+
+
+def test_group_order_within_the_batch_does_not_change_advantages():
+    """Reordering groups -- as a different DP assignment would -- changes
+    nothing.
+
+    Guards against an implementation that accidentally normalized across group
+    boundaries: that would make the result depend on batch composition, and hence
+    on how many DP ranks the batch was spread over.
+    """
+    k = 4
+    forward = _samples([1.0, 0.0, 0.0, 1.0], group_index=0) + _samples([1.0, 1.0, 0.0, 0.0], group_index=1)
+    for i, sample in enumerate(forward):
+        sample.index = i
+    _, straight = _post_process(_args("rloo", k), forward)
+
+    reversed_batch = _samples([1.0, 1.0, 0.0, 0.0], group_index=1) + _samples([1.0, 0.0, 0.0, 1.0], group_index=0)
+    for i, sample in enumerate(reversed_batch):
+        sample.index = i
+    _, swapped = _post_process(_args("rloo", k), reversed_batch)
+
+    assert torch.allclose(torch.tensor(straight[:k]), torch.tensor(swapped[k:]), atol=1e-12)
+    assert torch.allclose(torch.tensor(straight[k:]), torch.tensor(swapped[:k]), atol=1e-12)
