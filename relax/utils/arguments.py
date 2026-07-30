@@ -1572,6 +1572,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "p3o",
                 ],
                 default="grpo",
                 help=(
@@ -2577,6 +2578,58 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _validate_p3o_args(args) -> None:
+    """Reject P3O configurations whose ESS scope or replay would be wrong.
+
+    These are hard errors, not warnings. Every condition below silently changes
+    the objective (not just performance), and the failure mode is a plausible
+    loss curve that does not implement P3O.
+    """
+    assert args.use_rollout_logprobs, (
+        "P3O requires the rollout sampling distribution as its behavior policy. "
+        "Add --use-rollout-logprobs; without it there is no importance ratio to correct."
+    )
+    assert args.calculate_per_token_loss, (
+        "P3O requires --calculate-per-token-loss. Per-sample-mean normalization "
+        "reintroduces a per-micro-batch denominator, so the loss would depend on "
+        "how the optimizer step is split into micro-batches."
+    )
+    assert not args.use_tis, (
+        "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
+        "rollout/training mismatch, and stacking them double-corrects the ratio."
+    )
+    assert not getattr(args, "true_on_policy_mode", False), (
+        "P3O is an off-policy correction and has no role in --true-on-policy-mode, "
+        "where the behavior policy is the current policy by construction."
+    )
+    assert not getattr(args, "use_critic", False), (
+        "P3O does not use a critic; it is a score-function estimator over group-relative "
+        "advantages. Drop --use-critic."
+    )
+
+    # The ESS pre-pass replays the same micro-batch window under no_grad. Ops that
+    # mutate state on a forward would make the two passes disagree.
+    if getattr(args, "fp8", None) is not None:
+        raise ValueError(
+            "P3O's ESS pre-pass runs a second forward over the same window, which would "
+            "advance FP8 amax history and make the training forward non-reproducible. "
+            "Disable FP8 or run P3O without the two-pass ESS scope."
+        )
+    dropout = max(getattr(args, "attention_dropout", 0.0) or 0.0, getattr(args, "hidden_dropout", 0.0) or 0.0)
+    if dropout > 0.0:
+        raise ValueError(
+            f"P3O requires deterministic replay of the optimizer-step window, but dropout is "
+            f"enabled (max rate {dropout}). Set --attention-dropout 0.0 and --hidden-dropout 0.0."
+        )
+
+    if getattr(args, "fully_async", False):
+        raise ValueError(
+            "P3O's optimizer-step ESS scope requires the whole micro-batch window to be "
+            "available before the training pass. Fully-async mode streams micro-batches, so "
+            "the window is not knowable in advance."
+        )
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -2769,6 +2822,9 @@ def slime_validate_args(args):
                 "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
                 "require advantage normalization. Please add `--normalize-advantages` to your command."
             )
+
+        if args.advantage_estimator == "p3o":
+            _validate_p3o_args(args)
 
         if args.fully_async:
             assert not args.normalize_advantages, (

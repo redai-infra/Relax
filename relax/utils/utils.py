@@ -181,7 +181,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
     if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
         # group norm
@@ -202,7 +202,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                 )
             group_rewards = rewards[positions]
             group_rewards = group_rewards - group_rewards.mean()
-            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
+            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o"] and args.grpo_std_normalization:
                 group_rewards = group_rewards / (group_rewards.std() + 1e-6)
             normalized_rewards[positions] = group_rewards
 
@@ -429,7 +429,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         original_num_rows = len(data)
         if (
             args.custom_reward_post_process_path is None
-            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o", "reinforce_plus_plus_baseline"]
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

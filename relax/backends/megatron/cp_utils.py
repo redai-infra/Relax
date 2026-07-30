@@ -225,6 +225,55 @@ def get_cp_local_num_tokens(
     return total
 
 
+def get_cp_local_valid_mask(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Build the CP-local boolean mask of loss-contributing response tokens.
+
+    Returns a single 1-D mask over this rank's concatenated response tokens,
+    aligned with the layout that ``get_sum_of_sample_mean`` reduces over. Callers
+    that must compute a statistic and a loss over *identical* token sets (P3O's
+    ESS pre-pass and its loss) share this helper instead of re-deriving the
+    zig-zag slicing, which is where the two can silently drift apart.
+
+    For ``cp_size == 1`` this is just the concatenation of ``loss_masks``.
+    """
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if cp_size == 1:
+        return torch.cat([loss_mask.bool() for loss_mask in loss_masks], dim=0)
+
+    chunks: list[torch.Tensor] = []
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
+        prompt_length = total_length - response_length
+        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+            total_length,
+            response_length,
+            qkv_format,
+            max_seq_len,
+            padded_total_length,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
+        )
+        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
+        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
+        chunks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0).bool())
+
+    if not chunks:
+        return torch.zeros(0, dtype=torch.bool, device=loss_masks[0].device if loss_masks else "cpu")
+    return torch.cat(chunks, dim=0)
+
+
 def all_gather_with_cp(
     tensor: torch.Tensor,
     total_length: int,

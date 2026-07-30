@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import contextlib
 import dataclasses
 import gc
 import math
@@ -1107,16 +1108,35 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
+
+    # P3O: freeze one adaptive cap for the whole optimizer step before any
+    # gradient is produced, so gradient accumulation cannot change the objective.
+    p3o_context_manager = contextlib.nullcontext()
+    if getattr(args, "advantage_estimator", None) == "p3o":
+        from relax.backends.megatron.p3o_step import (
+            compute_p3o_step_context,
+            p3o_step_context_published,
+        )
+
+        p3o_step_context = compute_p3o_step_context(
+            args=args,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+        )
+        p3o_context_manager = p3o_step_context_published(args, p3o_step_context)
+
+    with p3o_context_manager:
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
