@@ -15,6 +15,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
 from relax.utils.types import Sample
 
 
@@ -182,7 +183,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
     if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
         and args.rewards_normalization
     ):
         # group norm
@@ -202,9 +203,12 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                     f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
                 )
             group_rewards = rewards[positions]
-            group_rewards = group_rewards - group_rewards.mean()
-            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
-                group_rewards = group_rewards / (group_rewards.std() + 1e-6)
+            if args.advantage_estimator == "rloo":
+                group_rewards = compute_rloo_leave_one_out_rewards(group_rewards)
+            else:
+                group_rewards = group_rewards - group_rewards.mean()
+                if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
+                    group_rewards = group_rewards / (group_rewards.std() + 1e-6)
             normalized_rewards[positions] = group_rewards
 
         return raw_rewards, normalized_rewards.tolist()
@@ -437,7 +441,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         original_num_rows = len(data)
         if (
             args.custom_reward_post_process_path is None
-            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
+            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

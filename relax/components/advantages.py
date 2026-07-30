@@ -172,7 +172,7 @@ class Advantages(Base):
                 for i in range(len(log_probs))
             ]
 
-        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
+        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
             rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
             returns = get_grpo_returns(rewards, kl)
             advantages = list(returns)  # make a copy
