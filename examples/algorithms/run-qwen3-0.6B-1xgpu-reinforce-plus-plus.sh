@@ -40,6 +40,8 @@ ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-1024}"
+REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-4}"
+REWARD_MAX_CONCURRENCY="${REWARD_MAX_CONCURRENCY:-16}"
 KL_COEF="${KL_COEF:-0.01}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.01}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/task29-reinforce-plus-plus}"
@@ -110,6 +112,8 @@ ROLLOUT_ARGS=(
     --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
     --rollout-temperature 1.0
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
+    --reward-num-workers "${REWARD_NUM_WORKERS}"
+    --reward-max-concurrency "${REWARD_MAX_CONCURRENCY}"
     --balance-data
     --use-fault-tolerance
 )
