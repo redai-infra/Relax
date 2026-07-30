@@ -12,9 +12,9 @@ ENV NVIDIA_PYTORCH_VERSION=25.06 \
     PYSFX=3 \
     L4T=0 \
     PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
-    TZ=Asia/Shanghai\
+    TZ=Asia/Shanghai \
     LANG=en_US.UTF-8 \
-    LC_ALL=en_US.UTF-8\
+    LC_ALL=en_US.UTF-8 \
     OPENCV_VERSION=4.7.0 \
     DEBIAN_FRONTEND=noninteractive
 
@@ -114,7 +114,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
 
 # sgl-router: override the official wheel (pulled by requirements.txt above) with
 # slime's r3-capable fork. The official sglang-router drops the routed_experts
@@ -122,7 +122,7 @@ RUN pip install --ignore-installed PyJWT && \
 # --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
 # `support r3` passthrough patch. Must run AFTER the requirements install so it
 # wins.
-RUN pip install --no-cache-dir --force-reinstall \
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
         https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
     python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
 

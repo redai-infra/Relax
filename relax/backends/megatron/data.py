@@ -20,7 +20,7 @@ from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
-from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step
+from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
@@ -997,19 +997,6 @@ def log_rollout_data(
 
     if args.log_multi_turn:
         log_multi_turn_data(rollout_id, args, rollout_data)
-    if args.log_passrate:
-        # On the fully-async dynamic-batch (streaming) path the sampler balances
-        # GRPO groups across DP ranks PER SAMPLE (groups are intentionally split),
-        # so this DP rank's ``rollout_data`` holds an arbitrary, non-group-aligned
-        # subset (count not a multiple of n_samples_per_prompt).  Train-time
-        # per-DP pass@k is therefore neither computable nor meaningful here —
-        # reshaping into [num_groups, group_size] would mix unrelated prompts (or
-        # assert on the ragged count).  Skip it on this path; eval pass@k (with
-        # complete groups, rollout side) is unaffected.
-        if getattr(args, "use_dynamic_batch_size", False) and getattr(args, "fully_async", False):
-            pass
-        else:
-            log_passrate(rollout_id, args, rollout_data, ignore_num_groups=True)
 
     if args.log_correct_samples:
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
@@ -1130,29 +1117,6 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
                 log_dict["multi_turn_metric/round_number_max"] = np.max(round_number_array)
                 log_dict["multi_turn_metric/round_number_min"] = np.min(round_number_array)
         gather_log_data("multi_turn", args, rollout_id, log_dict)
-
-
-def log_passrate(
-    rollout_id: int, args: Namespace, rollout_data: RolloutBatch, ignore_num_groups: bool = False
-) -> None:
-    """Compute pass@k metrics from `raw_reward` groups and log the results.
-
-    `raw_reward` is reshaped to `[group_number, group_size]`, then pass@k is
-    estimated per problem and averaged.
-    """
-    if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
-        log_dict = {}
-        for key, val in rollout_data.items():
-            if key != "raw_reward":
-                continue
-
-            log_dict |= compute_pass_rate(
-                flat_rewards=val,
-                group_size=args.n_samples_per_prompt,
-                num_groups=None if ignore_num_groups else args.rollout_batch_size,
-            )
-
-        gather_log_data("passrate", args, rollout_id, log_dict)
 
 
 def log_perf_data_fwd(args, rollout_id):

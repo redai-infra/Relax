@@ -299,7 +299,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `on_policy_distillation`, `sapo` | 优势估计器。注意：OPD 现在独立于优势估计器，使用 `--opd-kl-coef > 0` 在任何估计器上启用 OPD |
+| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `ppo`, `sapo`, `cispo` | 优势估计器。OPD 独立于该选项，使用 `--use-opd` 及对应 KL/loss 系数启用 |
 | `--normalize-advantages` | flag | False | - | 是否归一化优势 |
 | `--disable-grpo-std-normalization` | flag | - | - | 禁用 GRPO 标准差归一化（来自 [Dr.GRPO](https://arxiv.org/pdf/2503.20783)） |
 | `--disable-rewards-normalization` | flag | - | - | 禁用 reward 归一化 |
@@ -317,13 +317,24 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 | `--value-clip` | float | 0.2 | - | 值函数裁剪范围 |
 | `--entropy-coef` | float | 0.0 | - | 熵损失系数 |
 
+### PPO 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--gamma` | float | 1.0 | PPO GAE 折扣因子 |
+| `--lambd` | float | 1.0 | PPO GAE lambda |
+| `--value-clip` | float | 0.2 | PPO Critic value loss 裁剪范围 |
+| `--use-rollout-logprobs` | flag | False | 使用 Rollout logprobs 作为 PPO 旧策略 logprobs；当前提供的 colocate 拓扑必须启用 |
+
+PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `critic` 与 `advantages`。资源拓扑、checkpoint 一致性和 KL 约束详见 [PPO 训练](./ppo-training.md)。
+
 ### KL 散度相关
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--kl-coef` | float | 0.0 | KL 惩罚系数，用于 reward shaping（在优势计算之前应用到 reward 信号）。不能与 `--kl-loss-coef` 同时非零 |
-| `--use-kl-loss` | flag | False | 是否使用 GRPO 中的 KL 损失 |
-| `--kl-loss-coef` | float | 0.0 | KL 惩罚系数，添加到最终 PPO 损失中。不能与 `--kl-coef` 同时非零 |
+| `--kl-coef` | float | 0.0 | KL 惩罚系数，用于 reward shaping。同步 PPO 会将非零值重置为 `0.0`。不能与 `--kl-loss-coef` 同时非零 |
+| `--use-kl-loss` | flag | False | 为 GRPO-like 算法启用 loss-level KL；同步 PPO 会自动禁用该选项 |
+| `--kl-loss-coef` | float | 0.0 | KL 惩罚系数，添加到最终策略损失中。不能与 `--kl-coef` 同时非零 |
 | `--kl-loss-type` | str | k1 | `k1`, `k2`, `k3`, `low_var_kl` | KL 损失类型 |
 | `--use-unbiased-kl` | flag | False | 启用无偏 KL 估计 |
 | `--ref-update-interval` | int | None | 参考模型更新间隔（Rollout 步数）。None 表示不更新参考模型 |
@@ -341,6 +352,8 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 |------|------|--------|------|
 | `--num-critic-only-steps` | int | 0 | 仅训练 Critic 的步数 |
 | `--critic-train-only` | flag | False | 仅训练 Critic 模型 |
+| `--critic-load` | str | None | Critic 加载的 checkpoint。None 时等于 `--load` |
+| `--critic-save` | str | None | Critic checkpoint 输出目录 |
 | `--critic-lr` | float | None | Critic 学习率。None 时等于 `--lr` |
 | `--critic-lr-warmup-iters` | int | 0 | Critic 模型线性预热的迭代数 |
 
@@ -447,7 +460,11 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
-| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
+| `--rm-type-fallback` | str | None | 未知/缺失 Reward 类型的回退策略：`zero` 记 0 分并告警，注册名则路由到该 Reward；None 保持报错行为 |
+| `--rm-type-infer` | flag | False | 无显式类型时按注册的 label matcher 推断 Reward 类型；与显式类型冲突时告警并以显式类型优先 |
+| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。单样本函数接收一个样本；batch/group 函数接收完整样本列表，并为每个样本返回一个结果。会绕过格式感知路由 |
+| `--reward-max-concurrency` | int | 64 | 每个调用方进程内同时执行的 Reward 调用数上限。一次自定义 batch/group 调用计为一个调用 |
+| `--reward-num-workers` | int | 16 | 用于执行同步 Reward 的 Ray Actor 数量。异步自定义 Reward 不使用这些 worker |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |
 | `--group-rm` | flag | False | 是否对整个 group 做 Reward 计算 |

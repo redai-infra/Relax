@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import threading
 from argparse import Namespace
 from typing import Any, Dict
@@ -43,6 +44,15 @@ class Advantages(Base):
         self.step = 0
 
     async def run(self) -> None:
+        # Offload the blocking worker loop to a thread so it never blocks the
+        # Serve replica's asyncio event loop. The loop below drives blocking
+        # transfer-queue waits (run_(...).result()) and synchronous advantage
+        # compute; running them inline blocks the event loop for the full tq
+        # wait (20s+ under data imbalance), starving Serve's event-loop health
+        # probe and triggering a false-positive "event loop unresponsive" kill.
+        await asyncio.to_thread(self._run_blocking)
+
+    def _run_blocking(self) -> None:
         step = self.step
         self.data_system_client.reset_consumption(
             partition_id=f"train_{self.step}",

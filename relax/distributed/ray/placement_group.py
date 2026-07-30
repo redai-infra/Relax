@@ -70,12 +70,13 @@ def sort_key(x):
     return (node_ip_parts, int(gpu_id))
 
 
-def allocate_train_group(args, num_gpus, pg, runtime_env=None):
+def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
     return RayTrainGroup(
         args=args,
         num_gpus=num_gpus,
         pg=pg,
         num_gpus_per_actor=0.4,
+        role=role,
         runtime_env=runtime_env,
     )
 

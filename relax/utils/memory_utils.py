@@ -6,10 +6,23 @@ import torch
 import torch.distributed as dist
 
 from relax.utils import device as device_utils
+from relax.utils.log_style import format_role_tag
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+# Per-process role tag ("actor", "critic", "genrm", ...) prepended to
+# print_memory output so colocate PPO logs are readable at a glance.
+# Set once by TrainRayActor.init(); each Ray actor is its own process,
+# so there's no cross-role contamination.
+_ROLE: str | None = None
+
+
+def set_role(role: str | None) -> None:
+    global _ROLE
+    _ROLE = role
 
 
 def clear_memory(clear_host_memory: bool = False):
@@ -46,7 +59,9 @@ def print_memory(msg, clear_before_print: bool = False):
 
     memory_info = available_memory()
     # Need to print for all ranks, b/c different rank can have different behaviors
+    role_tag = f"{format_role_tag(_ROLE)} " if _ROLE else ""
     logger.info(
-        f"[Rank {dist.get_rank()}] Memory-Usage {msg}{' (cleared before print)' if clear_before_print else ''}: {memory_info}"
+        f"{role_tag}[Rank {dist.get_rank()}] Memory-Usage {msg}"
+        f"{' (cleared before print)' if clear_before_print else ''}: {memory_info}"
     )
     return memory_info
