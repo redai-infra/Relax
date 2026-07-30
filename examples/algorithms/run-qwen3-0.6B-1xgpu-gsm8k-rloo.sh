@@ -87,6 +87,9 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len 2048
    --rollout-temperature 1
 
+   # Scaling to more data-parallel ranks: the mini rollout batch must divide
+   # dp_size, so DP=8 needs --micro-batch-size 8 and --global-batch-size 64.
+   # Measured on 8xH100; DP<=4 works with the defaults below.
    --global-batch-size ${GLOBAL_BATCH_SIZE}
    --balance-data
    --use-fault-tolerance
