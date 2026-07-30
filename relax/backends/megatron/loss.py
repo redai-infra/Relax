@@ -1069,17 +1069,26 @@ def policy_loss_function(
             # sample can sit exactly at the group mean (rewards 1, 0.5, 0 gives
             # advantages 0.75, 0, -0.75) and is counted here too.
             no_signal = sum_of_sample_mean((advantages == 0).to(advantages.dtype))
-            # Responses with no valid token contribute no gradient whatever their
-            # advantage. Tracked separately from no_signal_fraction: that one says
-            # the reward was uninformative, this one that the rollout returned
-            # nothing to learn from.
-            masks = batch["loss_masks"]
-            empty_fraction = sum(1 for m in masks if float(m.sum()) == 0) / max(len(masks), 1)
+            # The baseline itself, which the task names alongside advantage and
+            # loss. It is never materialised -- the group-norm step emits only the
+            # advantage -- but for RLOO it follows from the raw reward:
+            #     A_i = R_i - b_i  =>  b_i = R_i - A_i
+            # `raw_reward` is a per-sample scalar, so broadcast it over that
+            # sample's response tokens and subtract. Emitting it per token keeps it
+            # on exactly the same normalization path as pg_loss, which matters
+            # because every entry in reported_loss is an unnormalized sum that
+            # model.py divides by the global token/sample count.
+            raw_reward = batch["raw_reward"]
+            raw = torch.cat(
+                [
+                    torch.full((length,), float(r), dtype=advantages.dtype, device=advantages.device)
+                    for length, r in zip(response_lengths, raw_reward, strict=False)
+                ]
+            )
+            baseline = sum_of_sample_mean(raw - advantages)
         reported_loss["rloo_advantage_abs"] = abs_adv.clone().detach()
         reported_loss["rloo_no_signal_fraction"] = no_signal.clone().detach()
-        reported_loss["rloo_empty_response_fraction"] = torch.tensor(
-            empty_fraction, dtype=torch.float32, device=advantages.device
-        )
+        reported_loss["rloo_baseline"] = baseline.clone().detach()
 
     reported_loss.update(opd_reported_loss)
 
