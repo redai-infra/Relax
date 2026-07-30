@@ -82,6 +82,8 @@ def _launch_server_with_patches(server_args: ServerArgs):
 
     - main process: OPD pre-expanded multimodal patch
       (``RELAX_OPD_PREEXPANDED_PATCH=1``).
+    - main process: DeepEyes Qwen-VL pre-tokenized input_ids patch
+      (``RELAX_DEEPEYES_QWEN_VL_PATCH=1``).
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
       installs ``_patched_run_scheduler_process``, which applies the
       routing-replay patch unconditionally.
@@ -92,6 +94,11 @@ def _launch_server_with_patches(server_args: ServerArgs):
         from relax.utils.opd.opd_sglang_patch import apply_opd_preexpanded_patch
 
         apply_opd_preexpanded_patch()
+
+    if os.environ.get("RELAX_DEEPEYES_QWEN_VL_PATCH", "0") == "1":
+        from relax.backends.sglang.patches.qwen_vl_patch import apply_deepeyes_qwen_vl_patch
+
+        apply_deepeyes_qwen_vl_patch()
 
     if os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1":
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
@@ -137,13 +144,16 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     # ``_patched_run_scheduler_process``); any combination is valid:
     #   - RELAX_OPTIMIZE_ROUTING_REPLAY : async D→H routing-replay patch (runtime)
     #   - RELAX_OPD_PREEXPANDED_PATCH   : OPD pre-expanded multimodal patch (runtime)
+    #   - RELAX_DEEPEYES_QWEN_VL_PATCH  : DeepEyes Qwen-VL pre-tokenized input_ids patch (runtime)
     #   - RELAX_OPD_PER_POS_TOKEN_IDS   : OPD per-position token_ids logprob;
     optimize = os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1"
     opd_patch = os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1"
+    deepeyes_patch = os.environ.get("RELAX_DEEPEYES_QWEN_VL_PATCH", "0") == "1"
     per_pos = os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1"
     logger.info(
         "Launching SGLang server with independently-gated patches: "
-        f"routing_replay={optimize}, opd_preexpanded={opd_patch}, per_pos_token_ids={per_pos}"
+        f"routing_replay={optimize}, opd_preexpanded={opd_patch}, "
+        f"deepeyes_qwen_vl={deepeyes_patch}, per_pos_token_ids={per_pos}"
     )
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args,))
@@ -434,6 +444,13 @@ class SGLangEngine(RayActor):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
             os.environ["RELAX_OPTIMIZE_ROUTING_REPLAY"] = "1"
+
+        # Translate the CLI flag into the env var read by
+        # ``_launch_server_with_patches`` in the spawned SGLang subprocess
+        # (same pattern as ``optimize_routing_replay``). Default off: stock
+        # SGLang Qwen-VL behavior is unchanged.
+        if getattr(self.args, "deepeyes_qwen_vl_patch", False):
+            os.environ["RELAX_DEEPEYES_QWEN_VL_PATCH"] = "1"
 
         if os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1":
             os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"

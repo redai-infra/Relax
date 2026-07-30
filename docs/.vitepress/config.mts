@@ -269,7 +269,8 @@ export default defineConfig({
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
-                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' }
+                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' },
+                { text: 'SGLang Runtime Patches', link: '/en/guide/sglang-patches' }
               ]
             },
             {
@@ -378,7 +379,8 @@ export default defineConfig({
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
-                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' }
+                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
+                { text: 'SGLang 运行时补丁', link: '/zh/guide/sglang-patches' }
               ]
             },
             {

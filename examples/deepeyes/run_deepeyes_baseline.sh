@@ -21,6 +21,14 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 
+# DeepEyes sends pre-tokenized input_ids that SGLang's stock Qwen-VL processor
+# mishandles; --deepeyes-qwen-vl-patch applies the runtime monkey-patch at
+# SGLang engine start-up (replaces the old ``cp qwen_vl.py /sgl-workspace/...``
+# overlay). Default off (stock SGLang behavior). Set DEEPEYES_PATCH=1 to enable
+# the patch — needed for correct DeepEyes multi-turn rollout (pre-tokenized
+# input_ids). See relax/backends/sglang/patches/qwen_vl_patch.py.
+DEEPEYES_PATCH="${DEEPEYES_PATCH:-0}"
+
 ###############################################################################
 #                                    DIRS                                     #
 ###############################################################################
@@ -149,6 +157,11 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
     --sglang-mem-fraction-static 0.8
 )
+
+# Apply the DeepEyes Qwen-VL processor patch unless DEEPEYES_PATCH=0.
+if [ "${DEEPEYES_PATCH}" = "1" ]; then
+    SGLANG_ARGS+=(--deepeyes-qwen-vl-patch)
+fi
 
 ###############################################################################
 #                               LOGGING CONFIG                                #
