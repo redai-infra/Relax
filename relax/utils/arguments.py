@@ -2486,8 +2486,14 @@ def _pre_parse_mode():
     return temp_args
 
 
-def parse_args(add_custom_arguments=None):
-    # Users may call `parse_args` very early, thus we ensure logger is configured here
+def parse_args(add_custom_arguments=None, *, validate=True):
+    """Parse Relax training arguments.
+
+    ``validate=False`` is reserved for static tooling that needs the merged
+    parser namespace after normal validation has failed. It skips HF access,
+    resource-derived mutations, backend validation, and version checks.
+    Training entrypoints keep the default validated behavior.
+    """
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2510,7 +2516,8 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
+        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate or not validate,
+        derive_cluster_args=validate,
     )
 
     # Merge pre-parsed args into the main namespace
@@ -2525,6 +2532,9 @@ def parse_args(add_custom_arguments=None):
     if teacher_sglang_ns is not None:
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
+
+    if not validate:
+        return args
 
     slime_validate_args(args)
 

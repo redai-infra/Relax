@@ -36,6 +36,10 @@ def run_doctor(
     for rule in get_rules():
         diagnostics.extend(rule.check(context))
 
+    targeted_errors = any(item.severity == "error" and item.rule_id != "CONFIG_PARSE_ERROR" for item in diagnostics)
+    if targeted_errors:
+        diagnostics = [item for item in diagnostics if item.rule_id != "CONFIG_PARSE_ERROR"]
+
     if strict_warnings:
         diagnostics = [
             DiagnosticResult(

@@ -96,7 +96,7 @@ def test_entrypoint_returns_zero_for_valid_config(monkeypatch, capsys):
 
 
 def test_entrypoint_returns_nonzero_for_parse_error(monkeypatch, capsys):
-    def fake_parse_training_args(_argv):
+    def fake_parse_training_args(_argv, *, validate=True):
         raise ValueError("bad config")
 
     monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
@@ -108,14 +108,39 @@ def test_entrypoint_returns_nonzero_for_parse_error(monkeypatch, capsys):
     assert "CONFIG_PARSE_ERROR" in output
 
 
+def test_entrypoint_falls_back_to_targeted_rules_after_validation_error(monkeypatch, capsys):
+    calls = []
+
+    def fake_parse_training_args(_argv, *, validate=True):
+        calls.append(validate)
+        if validate:
+            raise ValueError("--fully-async and --colocate cannot be combined directly")
+        args = _args()
+        args.fully_async = True
+        args.colocate = True
+        return args
+
+    monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
+
+    code = doctor.main(["--format", "json", "--", "--fully-async", "--colocate"])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert calls == [True, False]
+    assert '"rule_id": "CONFIG_MODE_CONFLICT"' in output
+    assert "CONFIG_PARSE_ERROR" not in output
+
+
 def test_doctor_skip_hf_validate_is_forwarded(monkeypatch):
     captured = {}
 
-    def fake_parse_training_args(argv):
+    def fake_parse_training_args(argv, *, validate=True):
         captured["argv"] = argv
+        captured["validate"] = validate
         return _args()
 
     monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
 
     assert doctor.main(["--doctor-skip-hf-validate", "--", "--num-rollout", "1"]) == 0
     assert captured["argv"] == ["--num-rollout", "1", "--skip-hf-validate"]
+    assert captured["validate"] is True

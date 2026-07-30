@@ -47,6 +47,10 @@ def main(argv: list[str] | None = None) -> int:
         parse_error = f"argparse exited with code {exc.code}"
     except Exception as exc:  # noqa: BLE001 - all config failures should become diagnostics
         parse_error = f"{type(exc).__name__}: {exc}"
+        try:
+            args = parse_training_args(training_argv, validate=False)
+        except Exception as fallback_exc:  # noqa: BLE001 - preserve the original validation failure
+            parse_error = f"{parse_error}; fallback parse failed: {type(fallback_exc).__name__}: {fallback_exc}"
 
     report = run_doctor(
         argv=training_argv,
@@ -59,13 +63,13 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if report.ok else 1
 
 
-def parse_training_args(training_argv: list[str]) -> Any:
+def parse_training_args(training_argv: list[str], *, validate: bool = True) -> Any:
     # Imported lazily so `python -m relax.entrypoints.doctor --help` does not
     # require Megatron/SGLang/Ray dependencies.
     from relax.utils.arguments import parse_args
 
     with _temporary_argv(["relax-doctor", *training_argv]):
-        return parse_args()
+        return parse_args(validate=validate)
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:

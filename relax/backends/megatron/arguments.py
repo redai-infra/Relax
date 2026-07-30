@@ -349,7 +349,7 @@ def _derive_cluster_args_from_resource(args):
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 
 
-def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
+def megatron_parse_args(extra_args_provider, skip_hf_validate=False, derive_cluster_args=True):
     """Parse megatron args, validate HF config, and set defaults."""
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
 
@@ -359,7 +359,8 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
 
     # Derive legacy cluster args from --resource when available, so users
     # don't have to specify both --resource and --actor-num-nodes / etc.
-    _derive_cluster_args_from_resource(args)
+    if derive_cluster_args:
+        _derive_cluster_args_from_resource(args)
 
     args.rank = 0
     if args.critic_train_only:
