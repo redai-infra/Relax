@@ -14,9 +14,8 @@ import pybase64
 import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
-from relax.engine.rollout.sglang_rollout import GenerateState
+from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, RolloutRequestAborted, request_model_aware
 from relax.utils.data.processing_utils import _ENCODE_EXECUTOR, encode_image_for_rollout_engine
-from relax.utils.http_utils import post
 from relax.utils.types import Sample
 
 
@@ -213,7 +212,16 @@ async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params
     return current_image_data, response_tokens, context_budget, generation_budget, multimodal_train_inputs_buffer
 
 
-async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, args=None):
+async def _run_inference_step(
+    url: str,
+    tokens: list[int],
+    sampling_params: dict,
+    image_data,
+    tokenizer,
+    args=None,
+    *,
+    request_model: RequestModel,
+):
     payload = {
         "input_ids": tokens,
         "sampling_params": sampling_params,
@@ -224,7 +232,7 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     if image_data:
         payload["image_data"] = image_data
 
-    output = await post(url, payload)
+    output = await request_model(url, payload)
     response_text = output["text"]
     if "output_token_logprobs" in output["meta_info"]:
         new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -391,7 +399,14 @@ class _RolloutTraceRecorder:
         }
 
 
-async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
+@request_model_aware
+async def generate(
+    args: Any,
+    sample: Sample,
+    sampling_params,
+    *,
+    request_model: RequestModel,
+) -> Sample:
     """Custom multi-turn rollout that interacts with a pluggable
     environment."""
 
@@ -469,12 +484,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             inference_start_ts = time.time()
-            # Per-request concurrency control: acquire a permit only around the
-            # model (SGLang) request and release it immediately after, so the
-            # slot is freed during environment / tool execution below. This keeps
-            # concurrency at "single model request" granularity rather than
-            # holding it for the whole multi-turn session.
-            async with state.model_request_permit():
+            try:
                 (
                     response_text,
                     new_response_tokens,
@@ -482,8 +492,19 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                     finish_type,
                     meta_info,
                 ) = await _run_inference_step(
-                    url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
+                    url,
+                    sample.tokens,
+                    cur_sampling_params,
+                    current_image_data,
+                    state.tokenizer,
+                    args=args,
+                    request_model=request_model,
                 )
+            except RolloutRequestAborted:
+                sample.status = Sample.Status.ABORTED
+                stop_reason = "abort_before_inference"
+                turns_executed = turn_idx
+                break
             inference_end_ts = time.time()
             trace_recorder.record_inference_output(
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)

@@ -8,7 +8,7 @@ from argparse import Namespace
 from collections.abc import Callable
 from contextlib import asynccontextmanager, contextmanager
 from time import monotonic
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import pybase64
@@ -45,9 +45,36 @@ from relax.utils.types import Sample
 from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_batch_to_data_system
 
 
-__all__ = ["generate_rollout"]
+__all__ = ["generate_rollout", "RequestModel", "RolloutRequestAborted", "request_model_aware"]
 
 logger = get_logger(__name__)
+
+_REQUEST_MODEL_AWARE_ATTR = "_relax_request_model_aware"
+
+
+class RolloutRequestAborted(RuntimeError):
+    """Raised when an aborted rollout attempts to start a model request."""
+
+
+class RequestModel(Protocol):
+    """A framework-controlled logical model request."""
+
+    async def __call__(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any: ...
+
+
+def request_model_aware(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Opt a custom generate function into injected per-request scheduling."""
+    request_model_param = inspect.signature(func).parameters.get("request_model")
+    if request_model_param is None or request_model_param.kind != inspect.Parameter.KEYWORD_ONLY:
+        raise TypeError("@request_model_aware requires a keyword-only 'request_model' parameter")
+    setattr(func, _REQUEST_MODEL_AWARE_ATTR, True)
+    return func
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -119,14 +146,6 @@ class GenerateState(metaclass=SingletonMeta):
         """Acquire one concurrency permit for a *single* model (SGLang) request
         and release it on exit.
 
-        This is the fine-grained unit of concurrency control shared by the
-        default single-turn ``generate()`` and by custom multi-turn rollouts.
-        Custom multi-turn rollouts should wrap ONLY the model request (not the
-        environment / tool execution) so the permit is freed while the
-        environment runs, letting other requests proceed. This shifts
-        concurrency control from "session-level" to "single model
-        request-level".
-
         Release is guaranteed on success, exception, and cancellation via the
         ``finally`` block, so the permit is never leaked.
         """
@@ -135,6 +154,19 @@ class GenerateState(metaclass=SingletonMeta):
             yield
         finally:
             self.semaphore.release()
+
+    async def request_model(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        """Send one model request with admission and post-acquire abort checks."""
+        async with self.model_request_permit():
+            if self.aborted:
+                raise RolloutRequestAborted("Rollout aborted; refusing model request")
+            return await post(url, payload, headers=headers)
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -476,38 +508,45 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
+    if state.aborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
+
+    # Resolve which function to call. Per-sample custom paths (for example from
+    # eval dataset config) take precedence over the global custom path.
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
-
     if custom_func_path is not None:
-        # Custom (possibly multi-turn) generate. Concurrency is controlled at the
-        # granularity of a single model request *inside* the function, via
-        # state.model_request_permit(). We must NOT hold a session-level permit
-        # here: it would keep the slot occupied during environment / tool
-        # execution (the very thing this optimization avoids) and would deadlock a
-        # nested per-request acquire when the concurrency limit is 1
-        # (asyncio.Semaphore is not reentrant).
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
-
-        custom_generate_func = load_function(custom_func_path)
-        with state.dp_rank_context() as _:
-            # if signature has evaluation, pass evaluation
-            if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-            else:
-                sample = await custom_generate_func(args, sample, sampling_params)
+        generate_func = load_function(custom_func_path)
+        generate_kwargs = (
+            {"evaluation": evaluation} if "evaluation" in inspect.signature(generate_func).parameters else {}
+        )
     else:
-        # Default single-turn generate: one session == one model request, so the
-        # session-level permit already IS the per-request permit.
-        async with state.model_request_permit():
-            if state.aborted:
-                sample.status = Sample.Status.ABORTED
-                return sample
+        generate_func = generate
+        generate_kwargs = {"evaluation": evaluation}
 
-            with state.dp_rank_context() as _:
-                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+    request_aware = bool(getattr(generate_func, _REQUEST_MODEL_AWARE_ATTR, False))
+    if request_aware:
+        generate_kwargs["request_model"] = state.request_model
+
+    async def invoke_generate() -> Sample | list[Sample]:
+        with state.dp_rank_context() as _:
+            return await generate_func(args, sample, sampling_params, **generate_kwargs)
+
+    try:
+        if request_aware:
+            # The injected request_model owns request-level admission.
+            sample = await invoke_generate()
+        else:
+            # Default generation and legacy custom generators retain the
+            # framework permit. Legacy multi-turn remains session-level.
+            async with state.model_request_permit():
+                if state.aborted:
+                    sample.status = Sample.Status.ABORTED
+                    return sample
+                sample = await invoke_generate()
+    except RolloutRequestAborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:

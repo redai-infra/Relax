@@ -138,20 +138,39 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 
 The function must populate these `sample` fields before returning: `tokens` (full prompt+response token IDs), `response` (decoded string), `response_length`, `loss_mask` (per-token: `1`=trainable, `0`=skip), `rollout_log_probs`, and `status` (`Sample.Status.COMPLETED` / `TRUNCATED` etc.).
 
+### Concurrency Control for Multi-Turn Rollouts
+
+For backward compatibility, an undecorated custom generate function keeps the legacy session-level concurrency limit. To opt into request-level concurrency, decorate the function with `@request_model_aware`, accept the required keyword-only `request_model` capability, and use it for **every individual model request**:
+
+```python
+@request_model_aware
+async def generate(args, sample, sampling_params, *, request_model: RequestModel):
+    ...
+    output = await request_model(url, payload) # permit + post-acquire abort check + HTTP
+    observation, done, info = env.step(...) # environment / tool work does not
+```
+
+The decorator is an explicit contract: once applied, the framework injects `request_model` and no longer wraps the whole custom function in a session-level permit. The injected capability acquires a permit, rechecks `state.aborted`, and only then sends the HTTP request. Without the decorator, the framework safely retains the old session-level cap, so existing custom generators cannot accidentally bypass `--sglang-server-concurrency`. Do not bypass the injected capability by calling `post()` directly.
+
+With request-level opt-in, the limit means "maximum concurrent **model requests**", not "maximum concurrent **sessions**"; more sessions may remain in flight while some are running environment steps.
+
 **Example** — simplified from [`examples/deepeyes/rollout.py`](../examples/deepeyes.md) (multi-turn tool-use rollout):
 
 ```python
-from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
+from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, request_model_aware
 
-async def generate(args, sample: Sample, sampling_params) -> Sample:
+@request_model_aware
+async def generate(args, sample: Sample, sampling_params, *, request_model: RequestModel) -> Sample:
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     env = build_env(sample=sample, args=args); env.reset()
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        output = await request_model(
+            url,
+            {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True},
+        )
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
