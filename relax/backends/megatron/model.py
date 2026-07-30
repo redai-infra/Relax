@@ -185,7 +185,8 @@ def _main_loss_has_tokens(batch: dict) -> bool:
 
 
 def _get_rloo_native_cp_attention_mask(args: Namespace, batch: dict) -> torch.Tensor | None:
-    """Build the zig-zag query rows required by Megatron's native CP attention."""
+    """Build the zig-zag query rows required by Megatron's native CP
+    attention."""
     cp_size = mpu.get_context_parallel_world_size()
     if (
         args.advantage_estimator != "rloo"

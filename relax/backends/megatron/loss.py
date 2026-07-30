@@ -516,7 +516,8 @@ def _gather_rloo_inputs_across_dp(
     shaped_rewards: torch.Tensor,
     group_indices: list[int | None],
 ) -> tuple[torch.Tensor, torch.Tensor, slice]:
-    """Gather sequence rewards and group IDs over DP, preserving rank-local order."""
+    """Gather sequence rewards and group IDs over DP, preserving rank-local
+    order."""
     for position, group_index in enumerate(group_indices):
         if group_index is None:
             raise ValueError(f"Sample.group_index is required for RLOO (missing at sample position {position}).")
