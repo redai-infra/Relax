@@ -107,6 +107,96 @@ def test_doctor_passes_for_minimal_colocate_config():
     assert report.topology["data_system"]["sampler"] == "GRPOGroupNSampler"
 
 
+def test_hybrid_resource_preview_uses_dedicated_actor_and_rollout_gpus():
+    args = _namespace(
+        {
+            "resource": {"actor": [1, 8], "rollout": [1, 8]},
+            "hybrid": True,
+            "fully_async": True,
+            "colocate": True,
+        }
+    )
+
+    report = run_doctor(argv=[], args=args)
+
+    assert report.ok
+    assert report.topology["colocate"] is True
+    assert report.topology["shares_actor_rollout_pg"] is False
+    assert report.topology["resource_summary"]["shared_gpu"] == 0
+    assert report.topology["resource_summary"]["total_required_gpus"] == 16
+    assert {item["placement_group"] for item in report.topology["role_plan"]} == {"dedicated"}
+
+
+def test_fully_async_without_kl_does_not_require_reference():
+    args = _namespace(
+        {
+            "resource": {
+                "actor": [1, 4],
+                "rollout": [1, 4],
+                "advantages": [1, 0],
+                "actor_fwd": [1, 2],
+            },
+            "fully_async": True,
+            "colocate": False,
+            "global_batch_size": 16,
+        }
+    )
+
+    report = run_doctor(argv=[], args=args)
+
+    assert report.ok
+    assert "reference" not in report.topology["required_roles"]
+    assert "reference" not in report.topology["missing_resource_roles"]
+    assert "reference" not in report.topology["roles"]
+
+
+def test_fully_async_with_kl_requires_reference():
+    args = _namespace(
+        {
+            "resource": {
+                "actor": [1, 4],
+                "rollout": [1, 4],
+                "advantages": [1, 0],
+                "actor_fwd": [1, 2],
+            },
+            "fully_async": True,
+            "colocate": False,
+            "global_batch_size": 16,
+            "use_kl_loss": True,
+        }
+    )
+
+    report = run_doctor(argv=[], args=args)
+
+    assert not report.ok
+    assert "reference" in report.topology["required_roles"]
+    assert "reference" in report.topology["missing_resource_roles"]
+    assert "CONFIG_REQUIRED_ROLES" in _rule_ids(report)
+
+
+def test_fully_async_keeps_explicit_optional_reference_in_plan():
+    args = _namespace(
+        {
+            "resource": {
+                "actor": [1, 4],
+                "rollout": [1, 4],
+                "advantages": [1, 0],
+                "actor_fwd": [1, 2],
+                "reference": [1, 2],
+            },
+            "fully_async": True,
+            "colocate": False,
+            "global_batch_size": 16,
+        }
+    )
+
+    report = run_doctor(argv=[], args=args)
+
+    assert report.ok
+    assert "reference" not in report.topology["required_roles"]
+    assert "reference" in report.topology["roles"]
+
+
 @pytest.mark.parametrize("case", json.loads(FIXTURES.read_text()))
 def test_error_case_library_maps_to_rule(case):
     report = run_doctor(argv=[], args=_namespace(case["config"]))

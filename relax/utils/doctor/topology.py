@@ -37,7 +37,7 @@ def resolve_algo_key(args: Any) -> str:
     return str(getattr(args, "advantage_estimator", "grpo"))
 
 
-def expected_base_roles(args: Any) -> list[str]:
+def candidate_base_roles(args: Any) -> list[str]:
     if getattr(args, "debug_rollout_only", False):
         return ["rollout"]
     if getattr(args, "debug_train_only", False):
@@ -49,7 +49,7 @@ def expected_base_roles(args: Any) -> list[str]:
     if algo_key == _PPO_ALGO:
         if getattr(args, "fully_async", False):
             roles = ["actor", "critic", "rollout", "advantages", "reference"]
-            if not getattr(args, "true_on_policy_mode", False):
+            if not _is_effective_true_on_policy(args):
                 roles.append("actor_fwd")
             return roles
         return ["actor", "critic", "rollout"]
@@ -58,10 +58,31 @@ def expected_base_roles(args: Any) -> list[str]:
         return ["actor", "rollout"]
     if getattr(args, "fully_async", False):
         roles = ["actor", "rollout", "advantages", "reference"]
-        if not getattr(args, "true_on_policy_mode", False):
+        if not _is_effective_true_on_policy(args):
             roles.append("actor_fwd")
         return roles
     return ["actor", "rollout"]
+
+
+def required_base_roles(args: Any) -> list[str]:
+    candidates = candidate_base_roles(args)
+    if getattr(args, "debug_rollout_only", False) or getattr(args, "debug_train_only", False):
+        return candidates
+    if getattr(args, "loss_type", None) == _SFT_ALGO:
+        return candidates
+    if resolve_algo_key(args) == _PPO_ALGO:
+        return ["actor", "critic", "rollout"]
+    if getattr(args, "hybrid", False):
+        return ["actor", "rollout"]
+    if not getattr(args, "fully_async", False):
+        return ["actor", "rollout"]
+
+    roles = ["actor", "rollout", "advantages"]
+    if _needs_reference(args):
+        roles.append("reference")
+    if not _is_effective_true_on_policy(args):
+        roles.append("actor_fwd")
+    return roles
 
 
 def optional_roles(args: Any) -> list[str]:
@@ -87,11 +108,14 @@ def build_topology_plan(args: Any | None) -> dict[str, Any]:
 
     resource = _resource(args)
     algo_key = resolve_algo_key(args)
-    base_roles = expected_base_roles(args)
+    candidates = candidate_base_roles(args)
+    required_roles = required_base_roles(args)
     extras = optional_roles(args)
-    roles = _unique(base_roles + extras)
+    required_roles = _unique(required_roles + extras)
+    roles = _unique([role for role in candidates if role in resource or role in required_roles] + extras)
     role_names = set(roles)
     colocate = bool(getattr(args, "colocate", False) and {"actor", "rollout"}.issubset(role_names))
+    shares_actor_rollout_pg = colocate and not (getattr(args, "fully_async", False) or getattr(args, "hybrid", False))
     pg_roles = actor_rollout_pg_roles(args)
 
     role_entries = []
@@ -100,8 +124,9 @@ def build_topology_plan(args: Any | None) -> dict[str, Any]:
     for role in roles:
         spec = resource.get(role)
         if spec is None:
-            missing_roles.append(role)
-            role_entries.append({"role": role, "status": "missing_resource"})
+            if role in required_roles:
+                missing_roles.append(role)
+                role_entries.append({"role": role, "status": "missing_resource"})
             continue
         parsed = _parse_resource_spec(spec)
         if parsed is None:
@@ -115,14 +140,16 @@ def build_topology_plan(args: Any | None) -> dict[str, Any]:
                 "status": "planned",
                 "num_serves": num_serves,
                 "num_gpus": num_gpus,
-                "placement_group": _placement_group_for_role(role, colocate, pg_roles, args),
+                "placement_group": _placement_group_for_role(role, shares_actor_rollout_pg, pg_roles),
             }
         )
 
-    resource_summary = _resource_summary(role_entries, colocate, pg_roles)
+    resource_summary = _resource_summary(role_entries, shares_actor_rollout_pg, pg_roles)
     data_system = _data_system_plan(args)
     startup = {
-        "service_creation": "parallel" if getattr(args, "fully_async", False) else "serial",
+        "service_creation": (
+            "parallel" if getattr(args, "fully_async", False) or getattr(args, "hybrid", False) else "serial"
+        ),
         "will_start_ray": False,
         "will_start_sglang": False,
         "will_start_training_workers": False,
@@ -130,7 +157,8 @@ def build_topology_plan(args: Any | None) -> dict[str, Any]:
     return {
         "algo_key": algo_key,
         "known_algorithms": KNOWN_ALGOS,
-        "base_roles": base_roles,
+        "candidate_roles": candidates,
+        "required_roles": required_roles,
         "optional_roles": extras,
         "roles": roles,
         "role_plan": role_entries,
@@ -138,6 +166,7 @@ def build_topology_plan(args: Any | None) -> dict[str, Any]:
         "invalid_resource_roles": invalid_resources,
         "colocate": colocate,
         "hybrid": bool(getattr(args, "hybrid", False)),
+        "shares_actor_rollout_pg": shares_actor_rollout_pg,
         "actor_rollout_pg_roles": pg_roles,
         "resource_summary": resource_summary,
         "data_system": data_system,
@@ -161,17 +190,19 @@ def _parse_resource_spec(spec: Any) -> tuple[int, int] | None:
     return num_serves, num_gpus
 
 
-def _placement_group_for_role(role: str, colocate: bool, pg_roles: list[str], args: Any) -> str:
-    if colocate and not getattr(args, "hybrid", False) and role in pg_roles:
+def _placement_group_for_role(role: str, shares_actor_rollout_pg: bool, pg_roles: list[str]) -> str:
+    if shares_actor_rollout_pg and role in pg_roles:
         return "actor_rollout_shared"
     if role in {"advantages", "sft"}:
         return "none"
     return "dedicated"
 
 
-def _resource_summary(role_entries: list[dict[str, Any]], colocate: bool, pg_roles: list[str]) -> dict[str, Any]:
+def _resource_summary(
+    role_entries: list[dict[str, Any]], shares_actor_rollout_pg: bool, pg_roles: list[str]
+) -> dict[str, Any]:
     planned = [entry for entry in role_entries if entry.get("status") == "planned"]
-    if colocate:
+    if shares_actor_rollout_pg:
         shared_gpu = max((entry["num_gpus"] for entry in planned if entry["role"] in pg_roles), default=0)
         independent_gpu = sum(entry["num_gpus"] for entry in planned if entry["role"] not in pg_roles)
         total_required = shared_gpu + independent_gpu
@@ -185,6 +216,25 @@ def _resource_summary(role_entries: list[dict[str, Any]], colocate: bool, pg_rol
         "total_required_gpus": total_required,
         "role_gpus": {entry["role"]: entry["num_gpus"] for entry in planned},
     }
+
+
+def _needs_reference(args: Any) -> bool:
+    return bool(getattr(args, "use_kl_loss", False) or getattr(args, "kl_coef", 0) != 0)
+
+
+def _is_effective_true_on_policy(args: Any) -> bool:
+    if getattr(args, "true_on_policy_mode", False):
+        return True
+    if not getattr(args, "fully_async", False):
+        return False
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    global_batch_size = getattr(args, "global_batch_size", None)
+    n_samples_per_prompt = getattr(args, "n_samples_per_prompt", 1)
+    return (
+        rollout_batch_size is not None
+        and global_batch_size is not None
+        and rollout_batch_size * n_samples_per_prompt == global_batch_size
+    )
 
 
 def _data_system_plan(args: Any) -> dict[str, Any]:
