@@ -7,6 +7,12 @@ from typing import Any
 
 from relax.utils.doctor.models import DiagnosticResult, DoctorContext, DoctorReport
 from relax.utils.doctor.rules import get_rules
+from relax.utils.doctor.sanitizer import (
+    sanitize_argv,
+    sanitize_config,
+    sanitize_details,
+    sanitize_text,
+)
 from relax.utils.doctor.topology import build_topology_plan, serialize_config
 
 
@@ -21,15 +27,18 @@ def run_doctor(
     parse_error: str | None = None,
     strict_warnings: bool = False,
 ) -> DoctorReport:
-    config = serialize_config(args)
+    safe_argv, argv_secrets = sanitize_argv(argv)
+    config, config_secrets = sanitize_config(serialize_config(args))
+    secret_values = argv_secrets | config_secrets
+    safe_parse_error = sanitize_text(parse_error, secret_values)
     topology = build_topology_plan(args)
     context = DoctorContext(
-        argv=argv,
+        argv=safe_argv,
         args=args,
-        parse_error=parse_error,
+        parse_error=safe_parse_error,
         config=config,
         topology=topology,
-        command=build_expected_command(argv),
+        command=build_expected_command(safe_argv),
     )
 
     diagnostics: list[DiagnosticResult] = []
@@ -39,6 +48,17 @@ def run_doctor(
     targeted_errors = any(item.severity == "error" and item.rule_id != "CONFIG_PARSE_ERROR" for item in diagnostics)
     if targeted_errors:
         diagnostics = [item for item in diagnostics if item.rule_id != "CONFIG_PARSE_ERROR"]
+
+    diagnostics = [
+        DiagnosticResult(
+            rule_id=item.rule_id,
+            severity=item.severity,
+            message=sanitize_text(item.message, secret_values) or "",
+            fix=sanitize_text(item.fix, secret_values) or "",
+            details=sanitize_details(item.details, secret_values),
+        )
+        for item in diagnostics
+    ]
 
     if strict_warnings:
         diagnostics = [
@@ -55,7 +75,7 @@ def run_doctor(
     ok = not any(item.severity == "error" for item in diagnostics)
     return DoctorReport(
         ok=ok,
-        argv=argv,
+        argv=safe_argv,
         command=context.command,
         diagnostics=diagnostics,
         config=config,

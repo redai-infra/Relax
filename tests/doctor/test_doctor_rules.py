@@ -263,3 +263,63 @@ def test_text_and_json_reports_include_required_sections():
     assert json_report["command"] == ["python", "-m", "relax.entrypoints.train", "--num-rollout", "1"]
     assert "topology" in json_report
     assert "config" in json_report
+
+
+def test_report_redacts_agent_env_and_sensitive_options():
+    api_value = "api-value"
+    region_value = "region-value"
+    sglang_value = "server-value"
+    args = _namespace(
+        {
+            "agent_env": [f"OPENAI_API_KEY={api_value}", f"REGION={region_value}"],
+            "sglang_api_key": sglang_value,
+            "reward_key": "score",
+        }
+    )
+    report = run_doctor(
+        argv=[
+            "--agent-env",
+            f"OPENAI_API_KEY={api_value}",
+            f"REGION={region_value}",
+            "--sglang-api-key",
+            sglang_value,
+            "--reward-key",
+            "score",
+        ],
+        args=args,
+    )
+
+    text_report = render_text(report)
+    json_report = render_json(report)
+
+    for sensitive_value in (api_value, region_value, sglang_value):
+        assert sensitive_value not in text_report
+        assert sensitive_value not in json_report
+    assert report.config["agent_env"] == ["OPENAI_API_KEY=<redacted>", "REGION=<redacted>"]
+    assert report.config["sglang_api_key"] == "<redacted>"
+    assert report.config["reward_key"] == "score"
+    assert report.argv == [
+        "--agent-env",
+        "OPENAI_API_KEY=<redacted>",
+        "REGION=<redacted>",
+        "--sglang-api-key",
+        "<redacted>",
+        "--reward-key",
+        "score",
+    ]
+    assert report.command[-2:] == ["--reward-key", "score"]
+
+
+def test_parse_error_redacts_secret_from_raw_argv():
+    secret = "malformed-agent-secret"
+
+    report = run_doctor(
+        argv=["--agent-env", f"TOKEN={secret}", "--bad-flag"],
+        args=None,
+        parse_error=f"invalid agent env TOKEN={secret}",
+    )
+    output = render_json(report)
+
+    assert not report.ok
+    assert secret not in output
+    assert "TOKEN=<redacted>" in output
