@@ -6,9 +6,9 @@ import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from time import monotonic
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import pybase64
@@ -45,9 +45,36 @@ from relax.utils.types import Sample
 from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_batch_to_data_system
 
 
-__all__ = ["generate_rollout"]
+__all__ = ["generate_rollout", "RequestModel", "RolloutRequestAborted", "request_model_aware"]
 
 logger = get_logger(__name__)
+
+_REQUEST_MODEL_AWARE_ATTR = "_relax_request_model_aware"
+
+
+class RolloutRequestAborted(RuntimeError):
+    """Raised when an aborted rollout attempts to start a model request."""
+
+
+class RequestModel(Protocol):
+    """A framework-controlled logical model request."""
+
+    async def __call__(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any: ...
+
+
+def request_model_aware(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Opt a custom generate function into injected per-request scheduling."""
+    request_model_param = inspect.signature(func).parameters.get("request_model")
+    if request_model_param is None or request_model_param.kind != inspect.Parameter.KEYWORD_ONLY:
+        raise TypeError("@request_model_aware requires a keyword-only 'request_model' parameter")
+    setattr(func, _REQUEST_MODEL_AWARE_ATTR, True)
+    return func
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -118,6 +145,34 @@ class GenerateState(metaclass=SingletonMeta):
         finally:
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
+
+    @asynccontextmanager
+    async def model_request_permit(self):
+        """Acquire one concurrency permit for a *single* model (SGLang) request
+        and release it on exit.
+
+        Release is guaranteed on success, exception, and cancellation via the
+        ``finally`` block, so the permit is never leaked.
+        """
+        await self.semaphore.acquire()
+        try:
+            yield
+        finally:
+            self.semaphore.release()
+
+    async def request_model(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        """Send one model request with admission and post-acquire abort
+        checks."""
+        async with self.model_request_permit():
+            if self.aborted:
+                raise RolloutRequestAborted("Rollout aborted; refusing model request")
+            return await post(url, payload, headers=headers)
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -466,24 +521,45 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
+    if state.aborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
+    # Resolve which function to call. Per-sample custom paths (for example from
+    # eval dataset config) take precedence over the global custom path.
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    if custom_func_path is not None:
+        generate_func = load_function(custom_func_path)
+        generate_kwargs = (
+            {"evaluation": evaluation} if "evaluation" in inspect.signature(generate_func).parameters else {}
+        )
+    else:
+        generate_func = generate
+        generate_kwargs = {"evaluation": evaluation}
+
+    request_aware = bool(getattr(generate_func, _REQUEST_MODEL_AWARE_ATTR, False))
+    if request_aware:
+        generate_kwargs["request_model"] = state.request_model
+
+    async def invoke_generate() -> Sample | list[Sample]:
         with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+            return await generate_func(args, sample, sampling_params, **generate_kwargs)
 
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
-            else:
-                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+    try:
+        if request_aware:
+            # The injected request_model owns request-level admission.
+            sample = await invoke_generate()
+        else:
+            # Default generation and legacy custom generators retain the
+            # framework permit. Legacy multi-turn remains session-level.
+            async with state.model_request_permit():
+                if state.aborted:
+                    sample.status = Sample.Status.ABORTED
+                    return sample
+                sample = await invoke_generate()
+    except RolloutRequestAborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:

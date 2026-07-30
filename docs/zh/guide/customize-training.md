@@ -154,20 +154,39 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 
 函数返回前必须填充以下 `sample` 字段：`tokens`（完整 prompt+response token ID）、`response`（解码后字符串）、`response_length`、`loss_mask`（逐 token：`1`=参与训练，`0`=跳过）、`rollout_log_probs` 以及 `status`（`Sample.Status.COMPLETED` / `TRUNCATED` 等）。
 
+### 并发控制（多轮场景务必遵守）
+
+为保持向后兼容，未加装饰器的自定义 generate 函数仍使用旧的**会话级**并发限制。若要启用请求级并发，请添加 `@request_model_aware`，接收必需的 keyword-only `request_model`，并用它发起**每一次模型请求**：
+
+```python
+@request_model_aware
+async def generate(args, sample, sampling_params, *, request_model: RequestModel):
+    ...
+    output = await request_model(url, payload) # permit + 获取后的 abort 复查 + HTTP
+    observation, done, info = env.step(...) # environment / 工具执行在额度之外
+```
+
+装饰器代表一份显式契约：添加后，框架会注入 `request_model`，并不再用会话级额度包住整个自定义函数。注入的请求能力会获取 permit、复查 `state.aborted`，然后才发送 HTTP。这样 environment 执行期间会释放额度，让其他请求得以推进。未添加装饰器时，框架保留旧的会话级限制，已有自定义函数不会意外绕过 `--sglang-server-concurrency`。不要绕过 `request_model` 直接调用 `post()`。
+
+启用请求级并发后，并发上限的语义是"最大并发**模型请求**数"，而非"最大并发**会话**数"——在途会话数可以超过该上限。
+
 **示例** — 简化自 [`examples/deepeyes/rollout.py`](../examples/deepeyes.md)（多轮工具调用 rollout）：
 
 ```python
-from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
+from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, request_model_aware
 
-async def generate(args, sample: Sample, sampling_params) -> Sample:
+@request_model_aware
+async def generate(args, sample: Sample, sampling_params, *, request_model: RequestModel) -> Sample:
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     env = build_env(sample=sample, args=args); env.reset()
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        output = await request_model(
+            url,
+            {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True},
+        )
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
