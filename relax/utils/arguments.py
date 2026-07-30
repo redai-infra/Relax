@@ -2719,28 +2719,6 @@ def slime_validate_args(args):
             )
             args.lora_merge_mode = True
 
-    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
-    # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
-    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
-    # response_length=1 for every sample and training silently degenerates.
-    if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-    ):
-        raise ValueError(
-            "SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
-            "--sglang-speculative-algorithm in this build: spec_v2 EAGLE worker "
-            "does not populate output_token_logprobs, which collapses rollout "
-            "response_length to 1 and silently breaks training. "
-            "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
-            "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
-            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
-            "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
-            "spec_v2."
-        )
-
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
