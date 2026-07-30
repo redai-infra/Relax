@@ -2040,6 +2040,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default=None,
+                help=(
+                    "Fallback for samples whose reward type is unknown or missing. "
+                    "None (default) keeps the current behavior of raising. 'zero' scores "
+                    "the sample 0.0 (reward-key aware) with a warning. Any registered "
+                    "reward type name routes degraded samples to that reward instead."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-infer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Infer the reward type from the sample label via registered label "
+                    "matchers when neither sample metadata nor --rm-type provides one. "
+                    "Also enables conflict detection (warn; the explicit type wins)."
+                ),
+            )
+            parser.add_argument(
                 "--reward-key",
                 type=str,
                 default=None,
@@ -2835,6 +2856,17 @@ def slime_validate_args(args):
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
+
+    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    if rm_type_fallback is not None and rm_type_fallback != "zero":
+        # Lazy import: only pay for the rewards package when the flag is set.
+        from relax.engine.rewards.registry import list_reward_types
+
+        if rm_type_fallback not in list_reward_types():
+            raise ValueError(
+                f"--rm-type-fallback {rm_type_fallback!r} is not a registered reward type. "
+                f"Use 'zero' or one of: {list_reward_types()}"
+            )
 
     if hasattr(args, "rollout_result_dir"):
         if args.rollout_result_dir is None and getattr(args, "save", None):

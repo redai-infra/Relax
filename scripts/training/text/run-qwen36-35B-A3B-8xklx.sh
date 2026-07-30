@@ -2,31 +2,43 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU colocate training script.
+# Qwen3.6-35B-A3B 8xXPU fully sync training script for DAPO math dataset.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen3-4B-8xklx.sh
+# bash scripts/training/text/run-qwen36-35B-A3B-8xklx.sh
 
 set -ex
 set -o pipefail
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
+export HOST_IP=127.0.0.1
 
 export WORKDIR="${WORKDIR:-/workspace}"
 export MODEL_DIR="${MODEL_DIR:-/workspace}"
 export DATA_DIR="${DATA_DIR:-/workspace}"
-export PROJECT_NAME=Relax-Qwen3-4B-P800
+export PROJECT_NAME=Relax-Qwen3.6-35B-A3B
 export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
+
 export MEGATRON=${WORKDIR}/Megatron-LM
 
+export XMLIR_USE_HYDRA_LINEAR=1
+export XMLIR_ENABLE_FAST_FC=1
+export XTE_DISABLE_MOE_DW_FUSION=0
+export USE_CAST_FC_FUSION=1
+
+export RELAX_SKIP_TORCH_MEMORY_SAVER=1
+export XMLIR_MEMCPY_RETRY_SYNC=true
 export CUDA_ENABLE_P2P_NO_UVA=0
 export CUDA_FAKE_UVA_ENABLE=1
 export CUDA_ERROR_LEVEL=0
-
 export XPU_SUPPORT_IPC_EVENT=1
-export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4"}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-"eth0"}
+export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-"eth0"}
+export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7"}
 
+export RAY_DEDUP_LOGS=0
+export RAY_DEDUP_LOGS_AGG_WINDOW_S=0
 
 unset http_proxy
 unset https_proxy
@@ -36,21 +48,27 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-klx.sh"
 fi
-source "${SCRIPT_DIR}/../../models/qwen3-4B.sh"
-NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+source "${SCRIPT_DIR}/../../models/qwen36-35B-A3B.sh"
 
+PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
+NUM_ROLLOUT="${NUM_ROLLOUT:=400}"
 
 CKPT_ARGS=(
-   --hf-checkpoint ${MODEL_DIR}/Qwen3-4B
-   --ref-load ${MODEL_DIR}/Qwen3-4B
+   --hf-checkpoint ${MODEL_DIR}/Qwen3.6-35B-A3B/
+   --ref-load ${MODEL_DIR}/Qwen3.6-35B-A3B/
    --megatron-to-hf-mode bridge
-   --load ${EXP_DIR}/Qwen3-4B_mcore_8xgpu/
-   --save ${EXP_DIR}/Qwen3-4B_mcore_8xgpu/
-   --save-interval 100
+   --warm-hf-checkpoint-page-cache
+
+   # --load ${EXP_DIR}/save/Qwen3.6-35B-A3B_mcore_8xgpu/
+   # --save ${EXP_DIR}/save/Qwen3.6-35B-A3B_mcore_8xgpu/
+   # --save-interval 100
+   # --max-actor-ckpt-to-keep 1
 )
 
-PROMPT_SET="${PROMPT_SET:-/workdir/dapo-math-17k/dapo-math-17k.jsonl}"
-EVAL_DATA="${EVAL_DATA:-/workdir/aime-2024/aime-2024.jsonl}"
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
@@ -58,47 +76,49 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-
    --rm-type dapo
    --reward-key score
-
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 1
-
    --global-batch-size 128
-   --balance-data
    --use-fault-tolerance
+   --balance-data
 )
 
 EVAL_ARGS=(
-   --skip-eval-before-train
    --log-passrate
+   --skip-eval-before-train
    --eval-interval 20
-   --eval-prompt-data aime ${EVAL_DATA}
+   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
-   --eval-max-response-len 16384
+   --eval-max-response-len 8192
    --eval-top-p 0.7
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --decoder-first-pipeline-num-layers 24
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 2
    --context-parallel-size 1
-   --expert-model-parallel-size 1
+   --calculate-per-token-loss
+   --expert-model-parallel-size 4
    --expert-tensor-parallel-size 1
 
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --calculate-per-token-loss
-   #--micro-batch-size 16 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 4096
+   --moe-flex-dispatcher-backend deepep
+   --moe-token-dispatcher-type flex
+   --moe-grouped-gemm true
+   # --moe-permute-fusion true
+   # --optimizer-offload-fraction 0.5
 )
 
 GRPO_ARGS=(
@@ -109,7 +129,6 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-
    --use-tis
 )
 
@@ -120,26 +139,41 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+
+   --optimizer-cpu-offload
+   --overlap-cpu-optimizer-d2h-h2d
+   --use-precision-aware-optimizer
+
+   # NOTE(wuhuan): to avoid algorithm performance degradation
+   --no-rope-fusion
+   --moe-router-load-balancing-type "none"
+   --moe-aux-loss-coeff 0.0
 )
 
+# 昆仑 XPU 专用 SGLang 参数 + 35B 推理 TP=2
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.8
+   --rollout-num-gpus-per-engine 4
+   --sglang-mem-fraction-static 0.7
    --sglang-disable-custom-all-reduce
    --sglang-page-size 64
    --sglang-attention-backend kunlun
    --sglang-disable-radix-cache
-   --sglang-max-running-requests 32
-   --sglang-disable-cuda-graph
+   --sglang-max-running-requests 256
+   # --sglang-disable-cuda-graph
+   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --sglang-router-policy round_robin
 )
 
 WANDB_ARGS=(
+   # --use-clearml
+   # --use-metrics-service
+   # --tb-project-name  ${PROJECT_NAME}
+   # --tb-experiment-name relax-qwen35-35B-A3B-p800x8-sync-${now}
+   --tb-experiment-name qwen3.6-35B-p800x8-fl-cp1-${now}
    --use-wandb
-   --tb-experiment-name relax-qwen3-4B-p800-${now}
    --wandb-project ${PROJECT_NAME}
-   --wandb-group relax-qwen3-4B-p800-${now}
+   --wandb-group p800x8-fl-4ktp1pp2ep4-${now}
    --wandb-key ${WANDB_API_KEY}
-   # --wandb-mode ${WANDB_MODE:-offline}
    --disable-wandb-random-suffix
    --no-use-metrics-service
 )
@@ -153,7 +187,18 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
+   # --debug-rollout-only
+   # --save-debug-rollout-data /workdir/debug_rollout/{rollout_id}.pt
+   # --debug-train-only
+   # --load-debug-rollout-data /workdir/debug_rollout/{rollout_id}.pt
 )
+
+# PARTIAL_ROLLOUT_ARGS=(
+#     --partial-rollout
+#     --over-sampling-batch-size 48
+#     --mask-offpolicy-in-partial-rollout
+#     --partial-rollout-max-aborted-count 3
+# )
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -170,6 +215,8 @@ RUNTIME_ENV_JSON="{
     \"NCCL_IB_HCA\": \"mlx5\",
     \"NCCL_IB_GID_INDEX\": \"3\",
     \"CUDA_DEVICE_ORDER\": \"OAM_ID\",
+    \"CUDA_ENABLE_P2P_NO_UVA\": \"0\",
+    \"CUDA_FAKE_UVA_ENABLE\": \"1\",
     \"CUDART_DUMMY_REGISTER\": \"1\",
     \"XPU_FORCE_USERMODE_LAUNCH\": \"1\",
     \"XMLIR_DIST_SINGLETON_STREAM\": \"true\",
@@ -177,20 +224,24 @@ RUNTIME_ENV_JSON="{
     \"XPU_VISIBLE_DEVICES\": \"0,1,2,3,4,5,6,7\",
     \"XMLIR_FA_GEMM_TYPE\": \"float\",
     \"XBLAS_FC_HBM_VERSION\": \"40\",
+    \"XMLIR_USE_HYDRA_LINEAR\": \"${XMLIR_USE_HYDRA_LINEAR}\",
+    \"XTE_DISABLE_MOE_DW_FUSION\": \"${XTE_DISABLE_MOE_DW_FUSION}\",
+    \"XMLIR_ENABLE_FAST_FC\": \"${XMLIR_ENABLE_FAST_FC}\",
+    \"USE_CAST_FC_FUSION\": \"${USE_CAST_FC_FUSION}\",
     \"XMLIR_PARALLEL_SAVE_MEMORY\": \"false\",
     \"XMLIR_DISABLE_CUDA_ALLOCATOR\": \"false\",
     \"XMLIR_XDNN_PYTORCH_CHECK_ENABLE_FALLBACK_BOOL\": \"0\",
     \"XMLIR_ENABLE_FALLBACK_TO_CPU_BOOL\": \"False\",
     \"XMLIR_DUMP_FALLBACK_OP_LIST_BOOL\": \"true\",
     \"XMLIR_DIST_ASYNC_ISEND_IRECV\": \"false\",
-    \"XMLIR_BATCH_PARALLEL\": \"false\",
+    \"XMLIR_BATCH_PARALLEL\": \"0\",
     \"XPU_FORCE_SHARED_DEVICE_CONTEXT\": \"1\",
     \"BKCL_RDMA_PROXY_DISABLE\": \"1\",
     \"BKCL_USE_AR\": \"1\",
     \"BKCL_RING_OPT\": \"1\",
     \"BKCL_FLAT_RING\": \"1\",
     \"BKCL_CCIX_RING\": \"1\",
-    \"BKCL_TREE_THRESHOLD\": \"1\",
+    \"BKCL_TREE_THRESHOLD\": \"1048576\",
     \"BKCL_CCIX_BUFFER_GM\": \"1\",
     \"BKCL_FORCE_L3_RDMA\": \"0\",
     \"BKCL_RING_BUFFER_GM\": \"1\",
@@ -223,7 +274,6 @@ RUNTIME_ENV_JSON="{
     \"SGLANG_IS_FLASHINFER_AVAILABLE\": \"false\",
     \"USE_MOE_FC_V3\": \"1\",
     \"XMLIR_DIST_SINGLETON_STREAM\": \"1\",
-    \"XMLIR_USE_HYDRA_LINEAR\": \"0\",
     \"SGL_CPU_QUANTIZATION\": \"0\",
     \"XSGL_ENABLE_MEM_SAVER\": \"0\",
     \"XPU_ENABLE_CTX_LAZY_INIT\": \"1\",
@@ -235,7 +285,6 @@ RUNTIME_ENV_JSON="{
     \"FORCE_DISABLE_FLA\": \"1\",
     \"DUMP_CONVERTED_WEIGHTS_DIR\": \"\",
     \"DISABLE_CAST_CACHE\": \"1\",
-    \"FORCE_NN_LINEAR\": \"1\",
     \"USE_FUSED_GATED_DELTA_RULE\": \"1\",
     \"XSGL_TRANSPOSE_SSM_STATE\": \"1\",
     \"XSGL_TRANSPOSE_CONV_STATE\": \"1\",
@@ -243,38 +292,40 @@ RUNTIME_ENV_JSON="{
     \"XSGL_MOE_UNSTABLE_TOPK\": \"1\",
     \"XPU_FLASH_ATTENTION_DECODER_USE_BALANCE\": \"1\",
     \"XMLIR_FORCE_USE_XPU_GRAPH\": \"1\",
+    \"FLASH_TMS_OPT_STATES_INIT\": \"none\",
+    \"FLASH_TMS_CHUNK_SIZE_MB\": \"256\",
+    \"FLASH_TMS_USE_SEPARATE_STREAM\": \"1\",
+    \"SLIME_LAYER_SNAPSHOT\": \"0\",
     \"RAY_OVERRIDE_JOB_RUNTIME_ENV\":\"1\",
     \"RELAX_SKIP_TORCH_MEMORY_SAVER\": \"1\",
-    \"XMLIR_MEMCPY_RETRY_SYNC\": \"true\",
-    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\":\"1\",
+    \"XMLIR_MEMCPY_RETRY_SYNC\": \"${XMLIR_MEMCPY_RETRY_SYNC}\",
     \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"XMLIR_MATMUL_FAST_MODE\": \"1\",
-    \"XMLIR_ENABLE_FAST_FC\": \"1\",
-    \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"XSGL_INT8_LM_HEAD\": \"0\",
+    \"GLOO_SOCKET_IFNAME\": \"${GLOO_SOCKET_IFNAME}\",
+    \"TP_SOCKET_IFNAME\": \"${TP_SOCKET_IFNAME}\",
     \"NVTE_DEBUG\": \"1\",
     \"NVTE_DEBUG_LEVEL\": \"1\",
+    \"XMLIR_ENABLE_H2D_SSE_COPY\": \"1\",
     \"HEALTH_GENERATE_TOPK\": \"-1\"
-  }
+   }
 }"
 
 mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
+   --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
    --max-staleness 0 \
    --num-data-storage-units 1 \
+   --use-health-check \
    --colocate \
-    --use-health-check \
-    "${MODEL_ARGS[@]}" \
-    "${CKPT_ARGS[@]}" \
-    "${ROLLOUT_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${GRPO_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${PERF_ARGS[@]}" \
-    "${EVAL_ARGS[@]}" \
-    "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-GRPO-gpu8-${now}.log
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen36-35B-A3B-GRPO-xpu8-sync-${now}.log
