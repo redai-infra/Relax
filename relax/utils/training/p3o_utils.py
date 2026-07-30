@@ -56,7 +56,7 @@ class P3OSufficientStats:
     valid_token_count: torch.Tensor
 
     def as_vector(self) -> torch.Tensor:
-        """Stack the statistics into a ``[3]`` float64 tensor for all-reduce."""
+        """Stack the statistics into a ``[3]`` float64 tensor for reduction."""
         return torch.stack([self.sum_ratio, self.sum_ratio_sq, self.valid_token_count])
 
     @classmethod

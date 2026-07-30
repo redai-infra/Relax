@@ -25,7 +25,7 @@ ARGUMENTS_PATH = Path(__file__).resolve().parents[2] / "relax" / "utils" / "argu
 
 
 def _load_validator():
-    """Extract ``_validate_p3o_args`` from arguments.py without importing it."""
+    """Extract ``_validate_p3o_args`` without importing arguments.py."""
     tree = ast.parse(ARGUMENTS_PATH.read_text(encoding="utf-8"))
     func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_validate_p3o_args")
     module = types.ModuleType("_p3o_args")

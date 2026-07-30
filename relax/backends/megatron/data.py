@@ -705,10 +705,10 @@ class DataIterator:
     def snapshot_position(self) -> int:
         """Return the current offset so it can be restored later.
 
-        ``reset()`` rewinds to the start of the whole rollout, which is wrong for
-        replaying a single optimizer window that begins mid-rollout. P3O's ESS
-        pre-pass consumes the window once and must hand the iterator back exactly
-        where it found it.
+        ``reset()`` rewinds to the start of the whole rollout, which is wrong
+        for replaying a single optimizer window that begins mid-rollout. P3O's
+        ESS pre-pass consumes the window once and must hand the iterator back
+        exactly where it found it.
         """
         return self.offset
 

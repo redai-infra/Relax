@@ -768,8 +768,9 @@ def get_p3o_step_context(args: Namespace) -> P3OStepContext:
 
     The context is published by the Megatron backend's ESS pre-pass
     (``model.py::compute_p3o_step_context``) before the training
-    forward/backward schedule starts, and is deliberately not passed through the
-    micro-batch dict: every micro-batch of the step must see the exact same cap.
+    forward/backward schedule starts, and is deliberately not passed through
+    the micro-batch dict: every micro-batch of the step must see the exact same
+    cap.
     """
     step_context = getattr(args, "_p3o_step_context", None)
     if step_context is None:

@@ -48,7 +48,7 @@ P3O_STEP_CONTEXT_ATTR = "_p3o_step_context"
 
 
 def _local_stats_from_batch(args: Namespace, batch: dict, log_probs: list[torch.Tensor]) -> P3OSufficientStats:
-    """Accumulate one micro-batch's ESS contribution from computed log-probs."""
+    """Accumulate one micro-batch's ESS contribution from its log-probs."""
     if batch.get("__is_dummy__", False):
         # Dummy micro-batches exist only to align num_microbatches across DP
         # ranks; they must contribute nothing to S1 / S2 / N.

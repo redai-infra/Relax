@@ -2,11 +2,11 @@
 
 """Element-wise parity tests for the P3O primitives.
 
-The golden values come from running the reference implementation
-(FeynRL ``algs/P3O/p3o.py``) over one *optimizer* step's tokens concatenated
-into a single logical batch. Relax computes ESS over the optimizer step rather
-than per micro-batch, so the reference's per-micro-batch loop is not the oracle
-for the statistical scope -- only for the element-wise formulas.
+The golden values come from running the reference implementation (FeynRL
+``algs/P3O/p3o.py``) over one *optimizer* step's tokens concatenated into a
+single logical batch. Relax computes ESS over the optimizer step rather than
+per micro-batch, so the reference's per-micro-batch loop is not the oracle for
+the statistical scope -- only for the element-wise formulas.
 """
 
 import math
@@ -170,7 +170,7 @@ def test_p3o_utils_on_policy_degenerates_to_vanilla_policy_gradient():
 
 
 def test_p3o_utils_uniform_ratio_offset_leaves_ess_near_one():
-    """ESS measures concentration, so a constant logprob shift is not mismatch."""
+    """ESS measures concentration, so a constant shift is not mismatch."""
     behavior_log_probs = torch.zeros(2, 4, dtype=torch.float32)
     log_probs = behavior_log_probs + 0.75
     valid_mask = torch.ones(2, 4, dtype=torch.bool)
@@ -200,7 +200,7 @@ def test_p3o_utils_single_valid_token_gives_full_ess():
 
 
 def test_p3o_utils_masked_positions_tolerate_non_finite_values():
-    """NaN/Inf parked in prompt or padding slots must not leak into the stats."""
+    """NaN/Inf in prompt or padding slots must not leak into the stats."""
     log_probs, behavior_log_probs, advantages, valid_mask = _golden_batch()
     log_probs, behavior_log_probs = log_probs.clone(), behavior_log_probs.clone()
     advantages = advantages.clone()
