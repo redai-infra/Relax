@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
+from relax.agentic.pipeline.reward import RewardDomain
 from relax.agentic.pipeline.runtime import (
     BackendGenerateResult,
     RuntimeGroup,
@@ -58,6 +59,50 @@ def _runtime_args(**overrides):
     if base["over_sampling_batch_size"] is None:
         base["over_sampling_batch_size"] = base["rollout_batch_size"]
     return SimpleNamespace(**base)
+
+
+async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) -> None:
+    calls: list[Sample] = []
+
+    async def fake_async_rm(args, sample):
+        del args
+        calls.append(sample)
+        return 1.0
+
+    monkeypatch.setattr("relax.engine.rewards.async_rm", fake_async_rm)
+    reward_domain = RewardDomain(
+        args=_runtime_args(reward_max_concurrency=1),
+        group_filter=None,
+        max_submissions_per_step=None,
+    )
+    sample = Sample(index=0, group_index=0, session_id="sample-0", metadata={})
+
+    rewarded_sample = await reward_domain._run_sample_reward(sample)
+
+    assert calls == [sample]
+    assert rewarded_sample.reward == 1.0
+
+
+async def test_reward_domain_delegates_group_reward_to_executor(monkeypatch) -> None:
+    calls: list[list[Sample]] = []
+
+    async def fake_batched_async_rm(args, samples):
+        del args
+        calls.append(samples)
+        return [float(sample.index) for sample in samples]
+
+    monkeypatch.setattr("relax.engine.rewards.batched_async_rm", fake_batched_async_rm)
+    reward_domain = RewardDomain(
+        args=_runtime_args(group_rm=True, reward_max_concurrency=1),
+        group_filter=None,
+        max_submissions_per_step=None,
+    )
+    group = [Sample(index=index, group_index=0, session_id=f"sample-{index}", metadata={}) for index in range(3)]
+
+    rewarded_group = await reward_domain._run_group_reward(group)
+
+    assert calls == [group]
+    assert [sample.reward for sample in rewarded_group] == [0.0, 1.0, 2.0]
 
 
 class _FakeTokenizer:

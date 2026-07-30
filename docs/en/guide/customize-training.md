@@ -116,13 +116,32 @@ python scripts/tools/process_avqa.py \
 
 ## Custom Reward Methods
 
-You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
+Define either a single-sample reward,
+`reward_func(args, sample: Sample, **kwargs) -> int | float | dict`, or a batched/group reward,
+`reward_func(args, samples: list[Sample], **kwargs) -> list[int | float | dict]`, in your own `.py` file. Then add
+its import path to the launch script. See [DeepEyes](../examples/deepeyes.md) for an example.
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # Custom reward_func may return a dict; if so, specify which key corresponds to the actual reward score
 --reward-key score
 ```
+
+Synchronous functions run in process-isolated Ray `RewardWorker` actors. Functions declared with `async def` are
+awaited in the caller process and do not use the worker pool. `--reward-num-workers` sets the synchronous worker
+count, while `--reward-max-concurrency` limits concurrent reward calls in each caller process.
+
+A batched/group custom reward is called once with the complete sample list, and that call counts as one concurrent
+call. Custom functions are loaded lazily and cached until `custom_rm` is explicitly reloaded.
+
+Inputs and return values of synchronous custom rewards must be serializable by Ray.
+
+> **Warning: Set timeouts for external I/O**
+>
+> Cancelling the caller or its Ray task is best-effort. It does **not** guarantee termination of a Python function
+> that is already running in a `RewardWorker`. Every potentially blocking external I/O operation, such as an HTTP,
+> RPC, or database call, must set an explicit timeout. Otherwise, the worker may remain occupied until the function
+> returns, and later reward calls assigned to that worker must wait.
 
 ### Format-aware reward routing
 
