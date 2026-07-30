@@ -166,7 +166,9 @@ MISC_ARGS=(
 )
 
 mkdir -p "${OUTPUT_DIR}" "${OUTPUT_DIR}/logs"
-RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-{}}"
+if [[ -z "${RUNTIME_ENV_JSON:-}" ]]; then
+    RUNTIME_ENV_JSON='{}'
+fi
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
