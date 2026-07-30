@@ -12,6 +12,12 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 _PIN_MEMORY = device_utils.use_pinned_host_memory()
 
+# Megatron attaches these as plain Python attributes on live nn.Parameter
+# objects (not part of the tensor's storage), so torch.empty_like() alone
+# drops them. Consumers that TP-gather from a backed-up snapshot instead of
+# the live model (e.g. DCS's all_gather_param) need them preserved.
+_MEGATRON_TP_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
+
 
 class TensorBackuper(ABC):
     @staticmethod
@@ -59,10 +65,25 @@ class _TensorBackuperNormal(TensorBackuper):
 
     @torch.no_grad()
     def backup(self, tag: str) -> None:
+        from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
+
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                snapshot = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                for attr in _MEGATRON_TP_ATTRS:
+                    if hasattr(param, attr):
+                        setattr(snapshot, attr, getattr(param, attr))
+                # Some params (e.g. this model's word_embeddings under bridge
+                # mode) aren't explicitly marked at model-construction time and
+                # only get backfilled with Megatron's own "not parallel"
+                # defaults later (see set_defaults_if_not_set_tensor_model_parallel_attributes
+                # callers) — apply the same backfill here so downstream
+                # TP-gather (e.g. DCS's all_gather_param) can rely on the
+                # attributes always being present, same contract Megatron
+                # itself guarantees for the live model.
+                set_defaults_if_not_set_tensor_model_parallel_attributes(snapshot)
+                backup_dict[name] = snapshot
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_utils.synchronize()
 

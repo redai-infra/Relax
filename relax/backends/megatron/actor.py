@@ -14,8 +14,9 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
-import transfer_queue as tq
 from megatron.core import mpu
+
+import transfer_queue as tq
 
 
 try:
@@ -211,8 +212,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
-        # internally via _switch_model and pushes weights to rollout via
-        # UpdateWeightFromTensor instead of DCS.
+        # internally via _switch_model, and pushes weights to rollout via DCS
+        # (relax.distributed.checkpoint_service), reading from the "actor" CPU
+        # snapshot tag instead of the live model directly.
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
@@ -241,78 +243,82 @@ class MegatronTrainRayActor(TrainRayActor):
                 if args.update_weights_interval == 1:
                     self.weights_backuper.backup("rollout_actor")
 
-            update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-            # Push-side repack is decided by the HF config: an FP8 release auto-routes
-            # through quantize_params_fp8, a compressed-tensors release through
-            # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
-            # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
-            # controls the training-side forward STE in the megatron patch — it is
-            # independent of push routing (matches slime/backends/megatron_utils/actor.py).
-            # K2.6 INT4 release ships an ignore list that omits vision_tower /
-            # mm_projector — without augment_compressed_tensors_ignore the bridge
-            # would try to INT4-pack those BF16 tensors and SGLang would reject
-            # them with "weight_packed not found in params_dict".
-            from relax.utils.quant_cast import augment_compressed_tensors_ignore
+            if self.args.hybrid:
+                # Mutable indirection so the background push (see
+                # _hybrid_async_weight_sync below) can point the DCS client at an
+                # isolated double-buffered snapshot without racing the "actor" tag
+                # that train_hybrid's per-step backup("actor") keeps overwriting.
+                # A no-op reassignment (tag stays "actor") when the async path is
+                # off, so this is always safe to set.
+                self._hybrid_send_tag_active = "actor"
+                # Push actor->rollout weights via DCS instead of the CUDA-IPC
+                # UpdateWeightFromTensor path (see docs/en/guide/hybrid-training.md).
+                self.checkpoint_engine_client = self._create_checkpoint_engine_client(
+                    role, weights_getter=lambda: self.weights_backuper.get(self._hybrid_send_tag_active)
+                )
 
-            push_quant_config = augment_compressed_tensors_ignore(
-                getattr(self.hf_config, "quantization_config", None),
-                args.hf_checkpoint,
-            )
-            self.weight_updater = update_weight_cls(
-                self.args,
-                self.model,
-                weights_getter=lambda: self.weights_backuper.get("actor"),
-                model_name=type(self.hf_config).__name__.lower()
-                if self.args.model_name is None
-                else self.args.model_name,
-                quantization_config=push_quant_config,
-            )
-        else:
-            is_pp_src_rank = (
-                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-                and mpu.get_tensor_model_parallel_rank() == 0
-            )
-            if is_pp_src_rank:
-                master_address = ray._private.services.get_node_ip_address()
-                with socket.socket() as sock:
-                    sock.bind(("", 0))
-                    master_port = sock.getsockname()[1]
+                # Opt-in: overlap the actor->rollout weight push with the next
+                # training iteration instead of blocking train_hybrid on it,
+                # gated behind --hybrid-async-weight-sync (default off). Measured
+                # as no faster than the synchronous push on 2xH20 (see
+                # exps/hybrid_async_perf_h20/README.md) — the DCS push's H2D copy
+                # + TP all-gather + NCCL broadcast still run on the actor's own
+                # GPU and contend with the next step's compute either way. Kept
+                # as an opt-in switch rather than removed, since larger-scale /
+                # slower-interconnect setups may see a different tradeoff.
+                # Safe only because the push reads a CPU-pinned TensorBackuper
+                # snapshot decoupled from the live GPU params the next step
+                # mutates. Disabled when there is no real CPU backup
+                # (--disable-weights-backuper, whose _TensorBackuperNoop doesn't
+                # support extra tags/copy()) or when --keep-old-actor is set,
+                # since that bookkeeping mutates the same CPU tags that
+                # _switch_model("old_actor") reads on the very next iteration's
+                # main thread — overlapping those would race.
+                self._hybrid_async_weight_sync = (
+                    self.args.hybrid_async_weight_sync
+                    and self.args.enable_weights_backuper
+                    and not self.args.keep_old_actor
+                )
+                if self._hybrid_async_weight_sync:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    self._hybrid_sync_executor = ThreadPoolExecutor(max_workers=1)
+                    self._pending_hybrid_sync_future = None
+                    self._hybrid_send_tag_counter = 0
+                    # TensorBackuper.copy() only overwrites keys that already exist
+                    # in the destination tag, so both double-buffer slots must be
+                    # pre-populated once before train_hybrid's per-step copy() calls.
+                    self.weights_backuper.backup("hybrid_send_0")
+                    self.weights_backuper.backup("hybrid_send_1")
             else:
-                master_address = None
-                master_port = None
-            metadata = {
-                "tp_size": mpu.get_tensor_model_parallel_world_size(),
-                "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
-                "pp_size": mpu.get_pipeline_model_parallel_world_size(),
-                "ep_size": mpu.get_expert_model_parallel_world_size(),
-                "cp_size": mpu.get_context_parallel_world_size(),
-                "pp_rank": mpu.get_pipeline_model_parallel_rank(),
-                "is_pp_src_rank": is_pp_src_rank,
-                "master_address": master_address,
-                "master_port": master_port,
-            }
-            from relax.utils.quant_cast import augment_compressed_tensors_ignore
+                update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+                # Push-side repack is decided by the HF config: an FP8 release auto-routes
+                # through quantize_params_fp8, a compressed-tensors release through
+                # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
+                # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
+                # controls the training-side forward STE in the megatron patch — it is
+                # independent of push routing (matches slime/backends/megatron_utils/actor.py).
+                # K2.6 INT4 release ships an ignore list that omits vision_tower /
+                # mm_projector — without augment_compressed_tensors_ignore the bridge
+                # would try to INT4-pack those BF16 tensors and SGLang would reject
+                # them with "weight_packed not found in params_dict".
+                from relax.utils.quant_cast import augment_compressed_tensors_ignore
 
-            push_quant_config = augment_compressed_tensors_ignore(
-                getattr(self.hf_config, "quantization_config", None),
-                args.hf_checkpoint,
-            )
-            self.checkpoint_engine_client = run(
-                create_client(
-                    args=self.args,
-                    coordinator_url=self.args.coordinator_url,
-                    role=role,
-                    rank=dist.get_rank(),
-                    model=self.model,
+                push_quant_config = augment_compressed_tensors_ignore(
+                    getattr(self.hf_config, "quantization_config", None),
+                    args.hf_checkpoint,
+                )
+                self.weight_updater = update_weight_cls(
+                    self.args,
+                    self.model,
+                    weights_getter=lambda: self.weights_backuper.get("actor"),
                     model_name=type(self.hf_config).__name__.lower()
                     if self.args.model_name is None
                     else self.args.model_name,
                     quantization_config=push_quant_config,
-                    backend_type=self.args.checkpoint_engine_backend,
-                    metadata=metadata,
-                    lock=self.lock,
                 )
-            )
+        else:
+            self.checkpoint_engine_client = self._create_checkpoint_engine_client(role)
         # empty cache after initialization
         clear_memory()
 
@@ -386,6 +392,63 @@ class MegatronTrainRayActor(TrainRayActor):
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _next_hybrid_send_tag(self) -> str:
+        self._hybrid_send_tag_counter += 1
+        return f"hybrid_send_{self._hybrid_send_tag_counter % 2}"
+
+    def _join_pending_hybrid_weight_sync(self) -> None:
+        future = self._pending_hybrid_sync_future
+        if future is not None:
+            self._pending_hybrid_sync_future = None
+            future.result()
+
+    def _create_checkpoint_engine_client(self, role, weights_getter=None):
+        is_pp_src_rank = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        if is_pp_src_rank:
+            master_address = ray._private.services.get_node_ip_address()
+            with socket.socket() as sock:
+                sock.bind(("", 0))
+                master_port = sock.getsockname()[1]
+        else:
+            master_address = None
+            master_port = None
+        metadata = {
+            "tp_size": mpu.get_tensor_model_parallel_world_size(),
+            "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+            "pp_size": mpu.get_pipeline_model_parallel_world_size(),
+            "ep_size": mpu.get_expert_model_parallel_world_size(),
+            "cp_size": mpu.get_context_parallel_world_size(),
+            "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+            "is_pp_src_rank": is_pp_src_rank,
+            "master_address": master_address,
+            "master_port": master_port,
+        }
+        from relax.utils.quant_cast import augment_compressed_tensors_ignore
+
+        push_quant_config = augment_compressed_tensors_ignore(
+            getattr(self.hf_config, "quantization_config", None),
+            self.args.hf_checkpoint,
+        )
+        return run(
+            create_client(
+                args=self.args,
+                coordinator_url=self.args.coordinator_url,
+                role=role,
+                rank=dist.get_rank(),
+                model=self.model,
+                model_name=type(self.hf_config).__name__.lower()
+                if self.args.model_name is None
+                else self.args.model_name,
+                quantization_config=push_quant_config,
+                backend_type=self.args.checkpoint_engine_backend,
+                metadata=metadata,
+                lock=self.lock,
+                weights_getter=weights_getter,
+            )
+        )
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -1128,10 +1191,14 @@ class MegatronTrainRayActor(TrainRayActor):
         fully-async's streaming data pipeline. Actor and rollout run on separate GPUs,
         but actor/ref/actor_fwd share the same GPUs via role switching.
 
-        Data is processed in sub-batches (controlled by num_iters_per_train_update) to
-        reduce peak GPU memory during forward passes, matching fully-async behavior.
-        Advantages are computed after all sub-batches are collected to ensure correct
-        global normalization across the full batch and DP group.
+        Data is processed in sub-batches (controlled by --num-steps-per-rollout via
+        build_rollout_minibatch_plan) to reduce peak GPU memory during forward passes,
+        matching fully-async behavior. Advantages are computed after all sub-batches
+        are collected to ensure correct global normalization across the full batch
+        and DP group. The merged batch is then re-chunked into
+        num_iters_per_train_update pieces and trained as that many separate
+        optimizer steps, pipelining optimizer updates independently of how the
+        forward phase was sub-batched.
         """
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
@@ -1140,7 +1207,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
-        rollout_mini_local_sample_counts: list[int] = []
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1159,7 +1225,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
-                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
             batch_index = 0
             # Surface stuck-loop conditions: when the partition can never reach the
@@ -1216,7 +1281,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 self._hybrid_forward_subbatch(sub_batch)
                 collected_batches.append(sub_batch)
-                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
 
         if len(collected_batches) != plan.num_rollout_minis:
             raise RuntimeError(
@@ -1238,7 +1302,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data[key].extend(value)
                 else:
                     rollout_data[key].append(value)
-        rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
@@ -1249,7 +1312,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
-            # ── Phase 3: Train on the full merged batch ──
+            # ── Phase 3: re-chunk the merged batch into num_iters_per_train_update
+            # pieces and train each as its own optimizer step. This is independent of
+            # how many sub-batches phase 1 used to fetch/forward data (that count
+            # comes from --num-steps-per-rollout via build_rollout_minibatch_plan);
+            # here we split the fully merged batch to pipeline optimizer updates
+            # with TransferQueue consumption and bound training-side peak memory.
+            num_iters = self.args.num_iters_per_train_update
+            num_local_samples = len(rollout_data["total_lengths"])
+            if num_local_samples % num_iters != 0:
+                raise RuntimeError(
+                    f"train_hybrid({rollout_id}): num_local_samples ({num_local_samples}) must be "
+                    f"divisible by num_iters_per_train_update ({num_iters})."
+                )
+            rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [
+                num_local_samples // num_iters for _ in range(num_iters)
+            ]
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -1324,28 +1402,57 @@ class MegatronTrainRayActor(TrainRayActor):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
             return
 
+        if self._hybrid_async_weight_sync:
+            # Join the PREVIOUS iteration's push here (not the one we're about
+            # to fire) so the NCCL broadcast overlaps with this iteration's own
+            # data pull + forward/backward instead of blocking on it.
+            self._join_pending_hybrid_weight_sync()
+
         # Mirror train_async's pause/resume coordination so the rollout service
         # has a chance to finish its in-flight step (and refill any partition
         # gaps it owes) before we swap weights. Without this gate the rollout
         # can race ahead while train_hybrid is still mid-consume on a
         # partially-filled partition, deadlocking against the staleness bound.
-        # Returned flags are for update_weights_fully_async only — hybrid uses
-        # the sync update_weights path so we just discard them.
         self._wait_for_previous_eval()
         self._check_services_health()
 
-        # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
-        self.update_weights()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-        dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id, end_update_weight=True)
+        if self._hybrid_async_weight_sync:
+            send_tag = self._next_hybrid_send_tag()
+            # Isolated snapshot for this push, decoupled from the "actor" tag so
+            # the next iteration's backup("actor") can't race a still-in-flight
+            # broadcast reading this buffer.
+            self.weights_backuper.copy(src_tag="actor", dst_tag=send_tag)
 
-        # On the final training step the rollout component has already exited
-        # its main loop, so the eval just triggered above will not be awaited
-        # anywhere. Block until it finishes; otherwise the controller's atexit
-        # shutdown races with eval and tears down the SGLang engines mid-flight.
-        if is_train_done:
-            self._wait_for_previous_eval()
+            def _push_and_notify(rid=rollout_id, tag=send_tag):
+                self._hybrid_send_tag_active = tag
+                run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+                tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rid))
+                dist.barrier(group=get_gloo_group())
+                self._run_step_evaluation(rid, end_update_weight=True)
+
+            self._pending_hybrid_sync_future = self._hybrid_sync_executor.submit(_push_and_notify)
+
+            if is_train_done:
+                # No next iteration to overlap with. Join now so the
+                # controller's atexit shutdown doesn't race the in-flight
+                # push/eval against SGLang engine teardown.
+                self._join_pending_hybrid_weight_sync()
+                self._wait_for_previous_eval()
+        else:
+            # Push weights to rollout via DCS, reading the "actor" CPU snapshot
+            # tag (see _create_checkpoint_engine_client).
+            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+            dist.barrier(group=get_gloo_group())
+            self._run_step_evaluation(rollout_id, end_update_weight=True)
+
+            # On the final training step the rollout component has already
+            # exited its main loop, so the eval just triggered above will not
+            # be awaited anywhere. Block until it finishes; otherwise the
+            # controller's atexit shutdown races with eval and tears down the
+            # SGLang engines mid-flight.
+            if is_train_done:
+                self._wait_for_previous_eval()
 
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:

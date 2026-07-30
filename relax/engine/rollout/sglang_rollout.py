@@ -270,9 +270,17 @@ async def generate(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
     if state.processor and _has_media:
-        processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
-            state, args, sample.prompt, sample.multimodal_inputs
-        )
+        pre_encoded = getattr(sample, "_pre_encoded_image", None)
+        if pre_encoded is not None:
+            processor_prompt_ids, sample.multimodal_train_inputs = pre_encoded
+            _t_image_processor = getattr(sample, "_pre_encoded_image_elapsed", 0.0)
+            del sample._pre_encoded_image
+            if hasattr(sample, "_pre_encoded_image_elapsed"):
+                del sample._pre_encoded_image_elapsed
+        else:
+            processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
+                state, args, sample.prompt, sample.multimodal_inputs
+            )
     else:
         processor_prompt_ids = tokenizer_prompt_ids
 
@@ -558,9 +566,22 @@ async def generate_and_rm_group(
     first_mm = getattr(group[0], "multimodal_inputs", None)
     if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
         encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
+
+        pre_train_inputs = None
+        if (
+            getattr(args, "dedup_multimodal_preprocess", False)
+            and state.processor
+            and any(first_mm.get(k) for k in ("images", "videos", "audio"))
+        ):
+            pre_prompt_ids, mm_train_inputs, t_img = await _run_image_processor(state, args, group[0].prompt, first_mm)
+            pre_train_inputs = (pre_prompt_ids, mm_train_inputs)
+
         for sample in group:
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
+            if pre_train_inputs is not None:
+                sample._pre_encoded_image = pre_train_inputs
+                sample._pre_encoded_image_elapsed = t_img
 
     tasks = []
     for idx, sample in enumerate(group):
