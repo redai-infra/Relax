@@ -26,11 +26,13 @@ from relax.utils.training.ppo_utils import (
     compute_log_probs,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_rloo_loss,
     compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    get_rloo_baseline,
 )
 from relax.utils.types import RolloutBatch
 
@@ -516,7 +518,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
+    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "rloo", "ppo", "reinforce_plus_plus",
     and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
@@ -566,7 +568,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
@@ -908,6 +910,10 @@ def policy_loss_function(
         pg_loss, pg_clipfrac = compute_sapo_loss(
             ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg
         )
+    elif args.advantage_estimator == "rloo":
+        # RLOO is unclipped REINFORCE against a leave-one-out baseline; it must not
+        # go through PPO-Clip. See compute_rloo_loss for why.
+        pg_loss, pg_clipfrac = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
     elif args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(
             log_probs=log_probs,
@@ -1047,6 +1053,37 @@ def policy_loss_function(
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if args.advantage_estimator == "rloo":
+        # RLOO-specific monitoring. The task asks for the estimator's own metrics,
+        # and the generic advantage mean is not informative here: leave-one-out
+        # advantages sum to zero per group, so their mean is ~0 by construction.
+        # What matters is the *magnitude* (does the signal survive?) and how much
+        # of the batch carries no signal at all.
+        with torch.no_grad():
+            abs_adv = sum_of_sample_mean(advantages.abs())
+            # Fraction of tokens whose advantage is exactly zero, and which
+            # therefore contribute no gradient. The dominant cause is a group that
+            # scored identically throughout -- all-correct or all-wrong -- so this
+            # tracks reward saturation long before the reward curve flattens. Note
+            # it is a per-token count, not a per-group one: for k >= 3 a single
+            # sample can sit exactly at the group mean (rewards 1, 0.5, 0 gives
+            # advantages 0.75, 0, -0.75) and is counted here too.
+            no_signal = sum_of_sample_mean((advantages == 0).to(advantages.dtype))
+            # The baseline itself, which the task names alongside advantage and
+            # loss. It is never materialised -- the group-norm step emits only the
+            # advantage -- but for RLOO it follows from the raw reward:
+            #     A_i = R_i - b_i  =>  b_i = R_i - A_i
+            # `raw_reward` is a per-sample scalar, so broadcast it over that
+            # sample's response tokens and subtract. Emitting it per token keeps it
+            # on exactly the same normalization path as pg_loss, which matters
+            # because every entry in reported_loss is an unnormalized sum that
+            # model.py divides by the global token/sample count.
+            adv_list = batch["advantages"] if isinstance(batch["advantages"], list) else [advantages]
+            baseline = sum_of_sample_mean(get_rloo_baseline(batch["raw_reward"], adv_list))
+        reported_loss["rloo_advantage_abs"] = abs_adv.clone().detach()
+        reported_loss["rloo_no_signal_fraction"] = no_signal.clone().detach()
+        reported_loss["rloo_baseline"] = baseline.clone().detach()
 
     reported_loss.update(opd_reported_loss)
 

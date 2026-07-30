@@ -4,7 +4,7 @@
 
 ## 概述
 
-Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、CISPO、GSPO 与 SAPO 共享同一套服务拓扑，可以通过替换算法参数块（`*_ARGS`）切换；PPO 还需要 Critic 与 Advantages 服务，应使用专用启动脚本。
+Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、CISPO、GSPO、SAPO 与 RLOO 共享同一套服务拓扑，可以通过替换算法参数块（`*_ARGS`）切换；PPO 还需要 Critic 与 Advantages 服务，应使用专用启动脚本。
 
 ## 支持的算法
 
@@ -15,6 +15,7 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 | **CISPO** | `--advantage-estimator cispo` | 保留梯度方向、需要更高精度 |
 | **GSPO**  | `--advantage-estimator gspo`  | 序列级约束、稳定训练       |
 | **SAPO**  | `--advantage-estimator sapo`  | 平滑优化、soft 信任域      |
+| **RLOO**  | `--advantage-estimator rloo`  | 无偏 baseline、小组规模    |
 
 ## 选择建议
 
@@ -50,11 +51,19 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - 梯度流更平滑，避免梯度突变
 - 适合对稳定性要求高的场景
 
+### RLOO（无偏 baseline）
+
+- baseline 取组内**其他** k-1 个样本的均值，与被评估样本统计独立，因此无偏
+- 不除以组内标准差，各组之间不会因离散度不同而被重新加权
+- 与 `--disable-grpo-std-normalization` 的关系：两者逐元素只差一个恒定的 `k/(k-1)`（组大小固定，故为全局常数）。RLOO 就是该估计量配上使 leave-one-out 无偏的那个常数，而非另一种加权方式
+- 适合小组规模（k=4~8），此时 GRPO 的 O(1/k) baseline 偏差最明显
+- 单卡示例：`examples/algorithms/run-qwen3-0.6B-1xgpu-gsm8k-rloo.sh`
+
 ## 快速开始
 
 ### 基础操作：修改算法参数
 
-GRPO-like 脚本采用统一的参数块设计。要在 GRPO、CISPO、GSPO 与 SAPO 之间切换，只需修改相应 `*_ARGS` 数组：
+GRPO-like 脚本采用统一的参数块设计。要在 GRPO、CISPO、GSPO、SAPO 与 RLOO 之间切换，只需修改相应 `*_ARGS` 数组：
 
 ```bash
 # 例如：在任意训练脚本中，将 GRPO_ARGS 替换为 CISPO_ARGS
@@ -123,13 +132,13 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ### 通用参数
 
-| 参数                    | 默认值               | 说明                                                                                                    |
-| ----------------------- | -------------------- | ------------------------------------------------------------------------------------------------------- |
-| `--advantage-estimator` | `grpo`               | 算法类型：`grpo`, `cispo`, `gspo`, `sapo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
-| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                             |
-| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                        |
-| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                    |
-| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                              |
+| 参数                    | 默认值               | 说明                                                                                                            |
+| ----------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `--advantage-estimator` | `grpo`               | 算法类型：`grpo`, `cispo`, `gspo`, `sapo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
+| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                                     |
+| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                                |
+| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                            |
+| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                                      |
 
 ### CISPO 专用参数
 
@@ -194,7 +203,23 @@ GSPO_ARGS=(
 
 **为什么**：GSPO 使用序列级 KL，序列内 token 约束一致，减少长序列训练的振荡。
 
-### 3. 异步 vs 同步模式选择
+### 3. RLOO：保持 reward normalization 开启
+
+```bash
+RLOO_ARGS=(
+   --advantage-estimator rloo
+   --eps-clip 0.2
+)
+```
+
+**为什么**：
+
+- leave-one-out baseline 由 reward normalization 这一步构造，`--disable-rewards-normalization` 会跳过它，使 RLOO 退化为原始 REINFORCE
+- `--disable-grpo-std-normalization` 对 RLOO 无效；std 分支只针对 GRPO 家族，无需额外关闭
+- `--n-samples-per-prompt` 必须 ≥ 2，组内只有 1 个样本时没有 baseline，advantage 记为 0
+- RLOO 的 advantage 量级小于默认 GRPO。Adam 对常数缩放基本不敏感，因此不必因此改 `--lr`；但要重新审视 `--clip-grad` —— 实测在默认 `--clip-grad 1.0` 下，GRPO 有 68% 的 step 触发裁剪，RLOO 只有 2%
+
+### 4. 异步 vs 同步模式选择
 
 - **Fully Async**（`--fully-async`）：
 
@@ -212,6 +237,7 @@ GSPO_ARGS=(
 examples/algorithms/
 ├── README.md                              (本文件)
 ├── run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh    (CISPO 多模态示例)
+├── run-qwen3-0.6B-1xgpu-gsm8k-rloo.sh             (RLOO 单卡示例)
 ├── ... (其他算法脚本)
 ```
 
@@ -225,6 +251,7 @@ examples/algorithms/
 - **CISPO**：需要精细学习信号时更好，但需要 KL 约束
 - **GSPO**：长序列任务，训练更稳定
 - **PPO**：如果已有 Critic 资源，性能可能更好
+- **RLOO**：小组规模下 baseline 无偏，可作为诊断 advantage 估计器问题的参照
 
 ### Q: CISPO 的梯度波动很大，正常吗？
 
@@ -244,3 +271,4 @@ examples/algorithms/
 - [CISPO - MiniMax-M1](https://arxiv.org/abs/2506.13585)
 - [PPO - Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)
 - [REINFORCE++ - Simple Efficient Alignment](https://arxiv.org/abs/2501.03262)
+- [RLOO - Back to Basics: Revisiting REINFORCE-Style Optimization](https://arxiv.org/abs/2402.14740)

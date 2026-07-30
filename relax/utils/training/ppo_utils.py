@@ -332,6 +332,93 @@ def compute_cispo_loss(
     return pg_loss, clipfrac
 
 
+def get_rloo_baseline(
+    raw_rewards: list[float] | torch.Tensor,
+    advantages: list[torch.Tensor],
+) -> torch.Tensor:
+    """Recover RLOO's leave-one-out baseline as a per-token tensor.
+
+    The baseline is never materialised -- the group-normalization step emits only
+    the advantage -- but it follows from the definition::
+
+        A_i = R_i - b_i   =>   b_i = R_i - A_i
+
+    so broadcasting each sample's scalar raw reward over that sample's advantage
+    tensor and subtracting recovers it.
+
+    The layout is taken from ``advantages`` rather than from ``response_lengths``,
+    and that is the whole point of this function: under CP>1 the advantages are
+    the rank-local shard while ``response_lengths`` stays full-length, so building
+    the broadcast from lengths produces a tensor of the wrong size (measured on
+    8xH100: 1536 against an advantage shard of 740). Following ``get_grpo_returns``
+    and using ``ones_like`` on each advantage keeps static CP, dynamic CP and CP=1
+    correct without branching.
+
+    Args:
+        raw_rewards: One scalar per sample, in the same order as ``advantages``.
+        advantages: Per-sample advantage tensors, already in whatever layout the
+            caller's reduction expects.
+
+    Returns:
+        The concatenated per-token baseline ``R_i - A_i``, same shape as
+        ``torch.cat(advantages)``.
+
+    Raises:
+        ValueError: If the two inputs disagree in length, which would otherwise
+            truncate silently and yield a baseline shorter than the advantages.
+    """
+    if len(raw_rewards) != len(advantages):
+        raise ValueError(
+            f"raw_rewards has {len(raw_rewards)} entries but advantages has {len(advantages)}; "
+            f"they must be one-to-one per sample."
+        )
+    per_sample = [torch.ones_like(a) * r - a for a, r in zip(advantages, raw_rewards, strict=True)]
+    return torch.cat(per_sample)
+
+
+def compute_rloo_loss(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes the RLOO policy-gradient loss: unclipped REINFORCE.
+
+    RLOO's objective is plain REINFORCE against a leave-one-out baseline, with no
+    trust region at all (https://arxiv.org/abs/2402.14740):
+
+        L_i = -stop_grad(A_i) * log pi_theta(y_i)
+
+    This is deliberately *not* PPO-Clip. Reusing the clipped objective would make
+    the estimator "GRPO with a leave-one-out baseline" rather than RLOO as
+    published, and the clipping would additionally bias an estimator whose whole
+    point is being unbiased.
+
+    Relationship to the neighbouring losses: this is ``compute_cispo_loss`` with
+    the importance-ratio coefficient fixed at 1, i.e. no clipping and no ratio
+    correction. Gradients flow ONLY through ``log_probs``.
+
+    Note on off-policy drift: with no ratio correction, RLOO assumes the sampling
+    policy equals the training policy. That holds only when a rollout yields a
+    single optimizer step, i.e. ``rollout_batch_size * n_samples_per_prompt ==
+    global_batch_size``. With more than one step the later steps train at updated
+    weights against log-probabilities sampled from the old ones and nothing
+    corrects the gap -- PPO-Clip absorbs this through the ratio, RLOO cannot.
+
+    Args:
+        log_probs: Current-policy log-probabilities (the only gradient source).
+            Shape: ``[total_tokens]``.
+        advantages: Advantage values, shape matches ``log_probs``.
+
+    Returns:
+        pg_loss: Element-wise loss (negative objective). NO reduction applied --
+            the caller's reduction decides whether this ends up sequence-mean or
+            token-weighted.
+        clipfrac: All zeros, since nothing is clipped. Returned only to keep the
+            call signature uniform with the other estimators' losses.
+    """
+    pg_loss = -(advantages.detach() * log_probs)
+    return pg_loss, torch.zeros_like(pg_loss)
+
+
 @torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
@@ -415,6 +502,66 @@ def get_grpo_returns(
     for i in range(len(rewards)):
         returns.append(torch.ones_like(kl[i]) * rewards[i])
     return returns
+
+
+def get_rloo_advantages(rewards: torch.Tensor) -> torch.Tensor:
+    """RLOO advantages: leave-one-out baseline, no std scaling.
+
+    Each sample is scored against the mean of the *other* ``k - 1`` samples, which
+    keeps the baseline independent of the sample it evaluates and therefore
+    unbiased (https://arxiv.org/abs/2402.14740)::
+
+        A_i = R_i - mean(R_j for j != i)
+
+    Args:
+        rewards: Raw (un-centered) rewards of a single group, shape ``[k]``.
+
+    Returns:
+        Advantages with the same shape as ``rewards``. Floating-point dtypes are
+        preserved; integer rewards are promoted by the division rather than
+        truncated. A group of one has no leave-one-out baseline, so its
+        advantage is zero.
+
+    Raises:
+        ValueError: If ``rewards`` is not 1-D. The baseline is a whole-group
+            reduction, so a 2-D input would silently be treated as one large
+            group and return wrong numbers rather than failing.
+    """
+    if rewards.dim() != 1:
+        raise ValueError(f"rewards must be 1-D (one group), got shape {tuple(rewards.shape)}.")
+    k = rewards.numel()
+    if k < 2:
+        return torch.zeros_like(rewards)
+    return (rewards * k - rewards.sum()) / (k - 1)
+
+
+def scale_centered_rewards_for_rloo(centered_rewards: torch.Tensor) -> torch.Tensor:
+    """Turn group-centered rewards into RLOO advantages.
+
+    ``A_i = R_i - mean(R_j for j != i)`` is algebraically ``k / (k - 1)`` times the
+    group-centered reward, so callers that already subtracted the group mean only
+    need this rescale instead of recomputing the baseline. Kept separate from
+    :func:`get_rloo_advantages` so both forms can be cross-checked in tests.
+
+    Args:
+        centered_rewards: Rewards of a single group after subtracting the group
+            mean, shape ``[k]``.
+
+    Returns:
+        Advantages with the same shape and dtype -- scaling by a Python float does
+        not upcast a float32 input. A group of one is zeroed, matching
+        :func:`get_rloo_advantages`.
+
+    Raises:
+        ValueError: If ``centered_rewards`` is not 1-D, for the same reason as
+            :func:`get_rloo_advantages`.
+    """
+    if centered_rewards.dim() != 1:
+        raise ValueError(f"centered_rewards must be 1-D (one group), got shape {tuple(centered_rewards.shape)}.")
+    k = centered_rewards.numel()
+    if k < 2:
+        return torch.zeros_like(centered_rewards)
+    return centered_rewards * (k / (k - 1))
 
 
 def get_reinforce_plus_plus_returns(

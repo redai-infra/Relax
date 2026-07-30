@@ -109,6 +109,15 @@ ALGOS = {
         ROLES.reference: ActorFwd,
         ROLES.actor_fwd: ActorFwd,
     },
+    # RLOO shares GRPO's role topology: it only swaps the group baseline, so the
+    # same rollout / actor / advantages / reference services apply.
+    "rloo": {
+        ROLES.rollout: Rollout,
+        ROLES.actor: Actor,
+        ROLES.advantages: Advantages,
+        ROLES.reference: ActorFwd,
+        ROLES.actor_fwd: ActorFwd,
+    },
     "sft": {
         ROLES.sft: SFT,
         ROLES.actor: Actor,
