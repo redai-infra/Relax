@@ -167,7 +167,8 @@ class GenerateState(metaclass=SingletonMeta):
         *,
         headers: dict[str, str] | None = None,
     ) -> Any:
-        """Send one model request with admission and post-acquire abort checks."""
+        """Send one model request with admission and post-acquire abort
+        checks."""
         async with self.model_request_permit():
             if self.aborted:
                 raise RolloutRequestAborted("Rollout aborted; refusing model request")

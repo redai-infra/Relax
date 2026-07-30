@@ -10,14 +10,37 @@ model weights are required.
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
+import sys
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-import relax.engine.rollout.sglang_rollout as sglang_rollout
-from relax.engine.rollout.sglang_rollout import GenerateState, request_model_aware
 from relax.utils.types import Sample
+
+
+# The GitHub CPU test environment intentionally omits SGLang. Importing
+# sglang_rollout normally pulls in relax.distributed.ray.rollout, whose runtime
+# engine imports sglang.srt. Stub only that unrelated logging dependency while
+# loading the module under test, then restore sys.modules immediately.
+_DISTRIBUTED_ROLLOUT_MODULE = "relax.distributed.ray.rollout"
+_installed_rollout_stub = _DISTRIBUTED_ROLLOUT_MODULE not in sys.modules and importlib.util.find_spec("sglang") is None
+if _installed_rollout_stub:
+    _rollout_stub = ModuleType(_DISTRIBUTED_ROLLOUT_MODULE)
+    _rollout_stub._log_rollout_data = Mock()
+    sys.modules[_DISTRIBUTED_ROLLOUT_MODULE] = _rollout_stub
+
+try:
+    sglang_rollout = importlib.import_module("relax.engine.rollout.sglang_rollout")
+finally:
+    if _installed_rollout_stub:
+        sys.modules.pop(_DISTRIBUTED_ROLLOUT_MODULE, None)
+
+GenerateState = sglang_rollout.GenerateState
+request_model_aware = sglang_rollout.request_model_aware
 
 
 class _PermitState:

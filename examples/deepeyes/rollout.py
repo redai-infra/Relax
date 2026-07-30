@@ -15,10 +15,7 @@ import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
 from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, RolloutRequestAborted, request_model_aware
-from relax.utils.data.processing_utils import _ENCODE_EXECUTOR, encode_image_for_rollout_engine
-from relax.engine.rollout.sglang_rollout import GenerateState
 from relax.utils.data.processing_utils import encode_image_for_rollout_engine, get_encode_executor
-from relax.utils.http_utils import post
 from relax.utils.types import Sample
 
 
