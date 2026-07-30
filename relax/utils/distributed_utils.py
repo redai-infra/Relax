@@ -156,3 +156,47 @@ def distributed_masked_whiten(
         whitened_values += global_mean
 
     return whitened_values
+
+
+def distributed_masked_normalize(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    process_group: dist.ProcessGroup | None = None,
+    variance_floor: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize valid values with global population moments.
+
+    This is the REINFORCE++ normalization contract: statistics are computed
+    over every mask-nonzero element across the supplied process group, the
+    population variance uses ``ddof=0``, and the output is explicitly zero
+    outside the mask.
+
+    Returns:
+        A tuple of ``(normalized, mean, variance, count)``. The three moment
+        tensors contain global values and are identical on every rank.
+    """
+    if values.shape != mask.shape:
+        raise ValueError(f"values and mask must have the same shape, got {values.shape} and {mask.shape}.")
+    if variance_floor <= 0:
+        raise ValueError(f"variance_floor must be positive, got {variance_floor}.")
+
+    working_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
+    working_values = values.to(dtype=working_dtype)
+    working_mask = mask.to(device=values.device, dtype=working_dtype)
+
+    mean_stats = torch.stack(((working_values * working_mask).sum(), working_mask.sum()))
+    dist.all_reduce(mean_stats, group=process_group)
+    global_sum, global_count = mean_stats.unbind()
+
+    if global_count.item() == 0:
+        raise ValueError("The global mask sum across all participating ranks is zero.")
+
+    global_mean = global_sum / global_count
+    centered = (working_values - global_mean) * working_mask
+    centered_sum_sq = centered.square().sum()
+    dist.all_reduce(centered_sum_sq, group=process_group)
+    global_variance = (centered_sum_sq / global_count).clamp_min(0.0)
+    inverse_std = torch.rsqrt(global_variance.clamp_min(variance_floor))
+    normalized = (working_values - global_mean) * inverse_std * working_mask
+
+    return normalized, global_mean, global_variance, global_count

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
-from relax.utils.distributed_utils import distributed_masked_whiten
+from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -611,7 +611,6 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             rewards=rewards,
             kl=kl,
             loss_masks=loss_masks,
-            kl_coef=args.kl_coef,
         )
         returns = advantages
 
@@ -676,18 +675,40 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
             all_masks = torch.cat(mask_chunks)
 
-        if all_masks.numel() > 0:
-            assert all_advs.size() == all_masks.size(), (
-                f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-            )
+        assert all_advs.size() == all_masks.size(), (
+            f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
+        )
+        is_reinforce_plus_plus = args.advantage_estimator in {
+            "reinforce_plus_plus",
+            "reinforce_plus_plus_baseline",
+        }
+        if is_reinforce_plus_plus or all_masks.numel() > 0:
             dp_group = mpu.get_data_parallel_group()
 
-            whitened_advs_flat = distributed_masked_whiten(
-                all_advs,
-                all_masks,
-                process_group=dp_group,
-                shift_mean=True,
-            )
+            if is_reinforce_plus_plus:
+                whitened_advs_flat, raw_mean, raw_variance, valid_count = distributed_masked_normalize(
+                    all_advs,
+                    all_masks,
+                    process_group=dp_group,
+                )
+                variance_floor = torch.tensor(1e-8, device=raw_variance.device, dtype=raw_variance.dtype)
+                normalized_variance = raw_variance / torch.maximum(raw_variance, variance_floor)
+                num_samples = len(advantages)
+                rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean.item()] * num_samples
+                rollout_data["reinforce_pp_advantage_raw_std"] = [raw_variance.sqrt().item()] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_mean"] = [0.0] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_std"] = [
+                    normalized_variance.sqrt().item()
+                ] * num_samples
+                rollout_data["reinforce_pp_valid_token_count"] = [valid_count.item()] * num_samples
+                rollout_data["reinforce_pp_zero_variance"] = [float(raw_variance.item() == 0.0)] * num_samples
+            else:
+                whitened_advs_flat = distributed_masked_whiten(
+                    all_advs,
+                    all_masks,
+                    process_group=dp_group,
+                    shift_mean=True,
+                )
             chunk_lengths = [chunk.size(0) for chunk in advantages]
             advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
