@@ -157,18 +157,30 @@ The function must populate these `sample` fields before returning: `tokens` (ful
 
 **Example** — simplified from [`examples/deepeyes/rollout.py`](../examples/deepeyes.md) (multi-turn tool-use rollout):
 
-```python
-from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
+Prefer `@request_model_aware` and use the framework-injected `request_model` for every model call. Only one logical SGLang request occupies a model-request slot; environment / tool execution does not block other short requests.
 
-async def generate(args, sample: Sample, sampling_params) -> Sample:
+```python
+from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, request_model_aware
+
+@request_model_aware
+async def generate(
+    args,
+    sample: Sample,
+    sampling_params,
+    *,
+    request_model: RequestModel,
+) -> Sample:
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     env = build_env(sample=sample, args=args); env.reset()
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        # Each turn takes a model-request slot independently; env steps stay outside the slot.
+        output = await request_model(
+            url,
+            {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True},
+        )
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
@@ -183,6 +195,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.status = Sample.Status.COMPLETED
     return sample
 ```
+
+::: tip Migration notes
+- **request-aware (recommended)**: use both `@request_model_aware` and a required keyword-only `request_model` parameter. Marker/signature mismatches raise `TypeError` before execution (no silent fallback).
+- **legacy**: unmarked custom generate keeps session-level gating (full multi-turn including env still holds one slot) with the original call signature.
+- Do not bypass `request_model` by calling `post()` directly; bypassed requests are outside the framework concurrency guarantee.
+:::
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
 

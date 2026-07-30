@@ -156,18 +156,30 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 
 **示例** — 简化自 [`examples/deepeyes/rollout.py`](../examples/deepeyes.md)（多轮工具调用 rollout）：
 
-```python
-from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
+推荐使用 `@request_model_aware`，并在每一轮模型调用处使用框架注入的 `request_model`。这样只有单次逻辑 SGLang 请求占用模型请求槽位，环境 / 工具执行不会阻塞其他短请求。
 
-async def generate(args, sample: Sample, sampling_params) -> Sample:
+```python
+from relax.engine.rollout.sglang_rollout import GenerateState, RequestModel, request_model_aware
+
+@request_model_aware
+async def generate(
+    args,
+    sample: Sample,
+    sampling_params,
+    *,
+    request_model: RequestModel,
+) -> Sample:
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     env = build_env(sample=sample, args=args); env.reset()
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        # 每轮独立占用模型请求槽位；环境步骤在槽位之外
+        output = await request_model(
+            url,
+            {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True},
+        )
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
@@ -182,6 +194,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.status = Sample.Status.COMPLETED
     return sample
 ```
+
+::: tip 迁移说明
+- **request-aware（推荐）**：同时满足 `@request_model_aware` 与必需的 keyword-only 参数 `request_model`。marker 与签名不一致时会在执行前抛出 `TypeError`，不会静默回退。
+- **legacy**：未标记的 custom generate 保持原会话级限流（完整多轮含环境阶段仍占一个槽位），调用签名不变。
+- 不要绕过 `request_model` 直接调用 `post()`；绕过的请求不在框架并发保证范围内。
+:::
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
 

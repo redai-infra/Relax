@@ -5,10 +5,10 @@ import copy
 import inspect
 import uuid
 from argparse import Namespace
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from time import monotonic
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import pybase64
@@ -18,7 +18,6 @@ import torch
 from packaging.version import parse
 from tqdm import tqdm
 
-from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
@@ -45,9 +44,128 @@ from relax.utils.types import Sample
 from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_batch_to_data_system
 
 
-__all__ = ["generate_rollout"]
+__all__ = [
+    "generate_rollout",
+    "GenerateState",
+    "ModelRequestScheduler",
+    "RequestModel",
+    "RolloutRequestAborted",
+    "request_model_aware",
+]
 
 logger = get_logger(__name__)
+
+_REQUEST_MODEL_AWARE_ATTR = "__relax_request_model_aware__"
+
+
+# Raised when a model request is refused because training rollout was aborted.
+class RolloutRequestAborted(RuntimeError):
+    pass
+
+
+# Capability for sending one logical SGLang model request under admission control.
+class RequestModel(Protocol):
+    async def __call__(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any: ...
+
+
+# Mark a custom generate function as request-aware (per-request model slot).
+def request_model_aware(fn: Callable) -> Callable:
+    setattr(fn, _REQUEST_MODEL_AWARE_ATTR, True)
+    return fn
+
+
+def _is_request_model_aware(fn: Callable) -> bool:
+    unwrapped = inspect.unwrap(fn)
+    return bool(getattr(fn, _REQUEST_MODEL_AWARE_ATTR, False) or getattr(unwrapped, _REQUEST_MODEL_AWARE_ATTR, False))
+
+
+# Fail fast when @request_model_aware is present but request_model is not a required KW-only param.
+def _validate_request_model_signature(fn: Callable) -> None:
+    sig = inspect.signature(inspect.unwrap(fn))
+    param = sig.parameters.get("request_model")
+    if param is None:
+        raise TypeError(
+            f"{getattr(fn, '__qualname__', fn)} is marked @request_model_aware but missing "
+            "required keyword-only parameter 'request_model'"
+        )
+    if param.kind != inspect.Parameter.KEYWORD_ONLY:
+        raise TypeError(
+            f"{getattr(fn, '__qualname__', fn)}: 'request_model' must be a keyword-only parameter, "
+            f"got kind={param.kind!s}"
+        )
+    if param.default is not inspect.Parameter.empty:
+        raise TypeError(
+            f"{getattr(fn, '__qualname__', fn)}: 'request_model' must have no default value "
+            "(required keyword-only parameter)"
+        )
+
+
+def _model_request_capacity(args: Namespace) -> int:
+    concurrency = args.sglang_server_concurrency
+    rollout_num_gpus = args.rollout_num_gpus
+    rollout_num_gpus_per_engine = args.rollout_num_gpus_per_engine
+    if concurrency <= 0:
+        raise ValueError(f"sglang_server_concurrency must be positive, got {concurrency}")
+    if rollout_num_gpus <= 0:
+        raise ValueError(f"rollout_num_gpus must be positive, got {rollout_num_gpus}")
+    if rollout_num_gpus_per_engine <= 0:
+        raise ValueError(f"rollout_num_gpus_per_engine must be positive, got {rollout_num_gpus_per_engine}")
+
+    capacity = concurrency * rollout_num_gpus // rollout_num_gpus_per_engine
+    if capacity <= 0:
+        raise ValueError(
+            "model request capacity must be positive, got "
+            f"{capacity} from sglang_server_concurrency={concurrency}, "
+            f"rollout_num_gpus={rollout_num_gpus}, "
+            f"rollout_num_gpus_per_engine={rollout_num_gpus_per_engine}"
+        )
+    return capacity
+
+
+# Admit logical SGLang model requests with a shared BoundedSemaphore.
+# A slot covers one logical post() call (including internal retries/backoff).
+# Custom code receives only a bound request_model callable, never this object.
+class ModelRequestScheduler:
+    def __init__(self, state: "GenerateState", capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError(f"model request capacity must be positive, got {capacity}")
+        self._state = state
+        self._semaphore = asyncio.BoundedSemaphore(capacity)
+        self.capacity = capacity
+
+    async def _run_with_slot(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        async with self._semaphore:
+            if self._state.aborted:
+                raise RolloutRequestAborted("Rollout aborted; refusing model request")
+            return await operation()
+
+    async def request(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        async def send_request() -> Any:
+            return await post(url, payload, headers=headers)
+
+        return await self._run_with_slot(send_request)
+
+    # Hold one slot for an entire legacy custom generate session.
+    async def run_legacy(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        return await self._run_with_slot(operation)
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -82,9 +200,7 @@ class GenerateState(metaclass=SingletonMeta):
                 except Exception as e:
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-        )
+        self.model_request_scheduler = ModelRequestScheduler(self, _model_request_capacity(args))
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -250,13 +366,22 @@ async def _encode_multimodal_inputs(multimodal_inputs: dict) -> tuple[dict[str, 
 
 
 async def generate(
-    args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    *,
+    request_model: RequestModel | None = None,
 ) -> Sample:
-    """Generate using traditional SGLang router with token-based workflow."""
+    # Generate using traditional SGLang router with token-based workflow.
+    # request_model admits one logical SGLang HTTP call; multimodal encode /
+    # response post-process stay outside the model-request slot.
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
+    if request_model is None:
+        request_model = state.model_request_scheduler.request
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     assert sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED, (
@@ -346,7 +471,7 @@ async def generate(
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
+    output = await request_model(url, payload, headers=headers)
     _t_generate = monotonic() - _t_generate_start
 
     _t_post_generate_start = monotonic()
@@ -465,25 +590,45 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
+    # Do not start new model requests after the rollout has been aborted.
+    if state.aborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
-        with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    request_model = state.model_request_scheduler.request
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
 
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
+    try:
+        if custom_func_path is not None:
+            custom_generate_func = load_function(custom_func_path)
+            if _is_request_model_aware(custom_generate_func):
+                _validate_request_model_signature(custom_generate_func)
+                call_kwargs: dict[str, Any] = {"request_model": request_model}
                 if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
+                    call_kwargs["evaluation"] = evaluation
+                with state.dp_rank_context() as _:
+                    sample = await custom_generate_func(args, sample, sampling_params, **call_kwargs)
             else:
-                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+                # Legacy custom: keep full-session gating (including env/tool phases).
+                async def _legacy_custom() -> Sample | list[Sample]:
+                    with state.dp_rank_context() as _:
+                        if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                            return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                        return await custom_generate_func(args, sample, sampling_params)
+
+                sample = await state.model_request_scheduler.run_legacy(_legacy_custom)
+        else:
+            with state.dp_rank_context() as _:
+                sample = await generate(
+                    args,
+                    sample,
+                    sampling_params,
+                    evaluation=evaluation,
+                    request_model=request_model,
+                )
+    except RolloutRequestAborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -1045,6 +1190,8 @@ async def generate_rollout_async(
             rollout_metrics["rollout/staleness/max"] = np.max(staleness_gaps).item()
             rollout_metrics["rollout/staleness/min"] = np.min(staleness_gaps).item()
             rollout_metrics["rollout/global_batch_size"] = len(data) * args.n_samples_per_prompt
+        from relax.distributed.ray.rollout import _log_rollout_data
+
         _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")
