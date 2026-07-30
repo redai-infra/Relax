@@ -197,6 +197,38 @@ def test_fully_async_keeps_explicit_optional_reference_in_plan():
     assert "reference" in report.topology["roles"]
 
 
+def test_generalized_prompt_data_paths_are_checked_individually(tmp_path):
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text("{}\n")
+    second.write_text("{}\n")
+    args = _namespace({"prompt_data": f"[{first},{second}]@[0:100]"})
+
+    report = run_doctor(argv=[], args=args)
+
+    assert report.ok
+    assert "CONFIG_PATHS" not in _rule_ids(report)
+
+
+def test_generalized_prompt_data_reports_only_missing_physical_path(tmp_path):
+    existing = tmp_path / "existing.jsonl"
+    missing = tmp_path / "missing.jsonl"
+    existing.write_text("{}\n")
+    path_spec = f"[{existing},{missing}]@[1:5]"
+    args = _namespace({"prompt_data": path_spec})
+
+    report = run_doctor(argv=[], args=args)
+
+    path_diagnostics = [item for item in report.diagnostics if item.rule_id == "CONFIG_PATHS"]
+    assert not report.ok
+    assert len(path_diagnostics) == 1
+    assert path_diagnostics[0].details == {
+        "field": "prompt_data",
+        "path": str(missing),
+        "path_spec": path_spec,
+    }
+
+
 @pytest.mark.parametrize("case", json.loads(FIXTURES.read_text()))
 def test_error_case_library_maps_to_rule(case):
     report = run_doctor(argv=[], args=_namespace(case["config"]))

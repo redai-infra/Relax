@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +13,7 @@ from relax.utils.doctor.models import DiagnosticResult, DoctorContext
 
 
 RuleFn = Callable[[DoctorContext], list[DiagnosticResult]]
+_GENERALIZED_PATH_RE = re.compile(r"^(?P<path>.*)@\[-?\d*:-?\d*\]$")
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,25 @@ def _has_path(value: Any) -> bool:
 def _looks_like_dotted_import(value: str) -> bool:
     parts = value.split(".")
     return len(parts) > 1 and all(part.isidentifier() for part in parts)
+
+
+def _dataset_paths(value: Any) -> list[str]:
+    values = value if isinstance(value, (list, tuple)) else [value]
+    paths = []
+    for item in values:
+        text = str(item).strip()
+        if match := _GENERALIZED_PATH_RE.match(text):
+            text = match.group("path").strip()
+        if (text.startswith("[") and text.endswith("]")) or (text.startswith("(") and text.endswith(")")):
+            try:
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                parsed = [part.strip().strip("\"'") for part in text[1:-1].split(",") if part.strip()]
+            if isinstance(parsed, (list, tuple)):
+                paths.extend(str(path).strip() for path in parsed)
+                continue
+        paths.append(text)
+    return paths
 
 
 @diagnostic_rule("CONFIG_PARSE_ERROR", "Training arguments can be parsed")
@@ -567,7 +589,6 @@ def check_paths(ctx: DoctorContext) -> list[DiagnosticResult]:
     filesystem_fields = [
         "custom_config_path",
         "eval_config",
-        "prompt_data",
     ]
     import_or_path_fields = [
         "data_source_path",
@@ -590,6 +611,19 @@ def check_paths(ctx: DoctorContext) -> list[DiagnosticResult]:
                     details={"field": field, "path": value},
                 )
             )
+    prompt_data = getattr(args, "prompt_data", None)
+    if prompt_data:
+        for path in _dataset_paths(prompt_data):
+            expanded_path = os.path.expanduser(path)
+            if not os.path.exists(expanded_path):
+                diagnostics.append(
+                    _result(
+                        "CONFIG_PATHS",
+                        f"prompt_data contains a missing path: {path!r}.",
+                        "Fix the path or mount the required dataset file or directory.",
+                        details={"field": "prompt_data", "path": path, "path_spec": prompt_data},
+                    )
+                )
     for field in import_or_path_fields:
         value = getattr(args, field, None)
         if not _has_path(value):
