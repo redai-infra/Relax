@@ -614,6 +614,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-invalid-multimodal-strategy",
+                type=str,
+                default="error",
+                choices=["error", "skip"],
+                help=(
+                    "How to handle SFT samples where a rendered image/video/audio marker cannot resolve to "
+                    "exactly one inline or top-level media source, or duplicate sources are supplied. "
+                    "`error` (default) fails before model forward; `skip` emits a WARNING and refills the batch."
+                ),
+            )
+            parser.add_argument(
                 "--sft-tq-timeout-minutes",
                 type=int,
                 default=None,

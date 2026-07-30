@@ -56,6 +56,23 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], "error"),
+        (["--sft-invalid-multimodal-strategy", "skip"], "skip"),
+    ],
+)
+def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args(argv)
+
+    assert args.sft_invalid_multimodal_strategy == expected
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
