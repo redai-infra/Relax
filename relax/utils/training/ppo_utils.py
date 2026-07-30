@@ -332,6 +332,50 @@ def compute_cispo_loss(
     return pg_loss, clipfrac
 
 
+def get_rloo_baseline(
+    raw_rewards: list[float] | torch.Tensor,
+    advantages: list[torch.Tensor],
+) -> torch.Tensor:
+    """Recover RLOO's leave-one-out baseline as a per-token tensor.
+
+    The baseline is never materialised -- the group-normalization step emits only
+    the advantage -- but it follows from the definition::
+
+        A_i = R_i - b_i   =>   b_i = R_i - A_i
+
+    so broadcasting each sample's scalar raw reward over that sample's advantage
+    tensor and subtracting recovers it.
+
+    The layout is taken from ``advantages`` rather than from ``response_lengths``,
+    and that is the whole point of this function: under CP>1 the advantages are
+    the rank-local shard while ``response_lengths`` stays full-length, so building
+    the broadcast from lengths produces a tensor of the wrong size (measured on
+    8xH100: 1536 against an advantage shard of 740). Following ``get_grpo_returns``
+    and using ``ones_like`` on each advantage keeps static CP, dynamic CP and CP=1
+    correct without branching.
+
+    Args:
+        raw_rewards: One scalar per sample, in the same order as ``advantages``.
+        advantages: Per-sample advantage tensors, already in whatever layout the
+            caller's reduction expects.
+
+    Returns:
+        The concatenated per-token baseline ``R_i - A_i``, same shape as
+        ``torch.cat(advantages)``.
+
+    Raises:
+        ValueError: If the two inputs disagree in length, which would otherwise
+            truncate silently and yield a baseline shorter than the advantages.
+    """
+    if len(raw_rewards) != len(advantages):
+        raise ValueError(
+            f"raw_rewards has {len(raw_rewards)} entries but advantages has {len(advantages)}; "
+            f"they must be one-to-one per sample."
+        )
+    per_sample = [torch.ones_like(a) * r - a for a, r in zip(advantages, raw_rewards, strict=True)]
+    return torch.cat(per_sample)
+
+
 def compute_rloo_loss(
     log_probs: torch.Tensor,
     advantages: torch.Tensor,

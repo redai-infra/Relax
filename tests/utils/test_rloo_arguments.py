@@ -2,10 +2,11 @@
 
 """Tests for the RLOO startup guards in relax.utils.arguments.
 
-Each guard exists because the failure it prevents is silent or late: a flag that
-quietly changes the estimator, or a configuration that only reveals itself as
-all-zero advantages several minutes into a run. They are asserted here against
-the validation function directly, so no GPU or Megatron initialization is needed.
+Each guard exists because the failure it prevents is silent or late: a flag
+that quietly changes the estimator, or a configuration that only reveals itself
+as all-zero advantages several minutes into a run. They are asserted here
+against the validation function directly, so no GPU or Megatron initialization
+is needed.
 """
 
 from argparse import Namespace
@@ -43,30 +44,34 @@ def test_valid_configuration_passes():
 
 @pytest.mark.parametrize("mode", ["fully_async", "hybrid"])
 def test_async_modes_are_rejected(mode):
-    """Asynchronous RLOO is out of scope, so it fails at parse time rather than running unvalidated."""
+    """Asynchronous RLOO is out of scope, so it fails at parse time rather than
+    running unvalidated."""
     with pytest.raises(AssertionError, match="synchronous-only"):
         _check(_args(**{mode: True}))
 
 
 @pytest.mark.parametrize("k", [0, 1])
 def test_group_of_fewer_than_two_is_rejected(k):
-    """A group of one has no leave-one-out baseline and would train on all-zero advantages."""
+    """A group of one has no leave-one-out baseline and would train on all-zero
+    advantages."""
     with pytest.raises(AssertionError, match="at least 2 samples"):
         _check(_args(n_samples_per_prompt=k))
 
 
 def test_disabling_reward_normalization_is_rejected():
-    """That flag skips the step that builds the baseline, degrading RLOO to baseline-free REINFORCE."""
+    """That flag skips the step that builds the baseline, degrading RLOO to
+    baseline-free REINFORCE."""
     with pytest.raises(AssertionError, match="reward normalization"):
         _check(_args(rewards_normalization=False))
 
 
 def test_normalize_advantages_is_rejected():
-    """It re-whitens across the DP group, re-introducing the std scaling RLOO omits.
+    """It re-whitens across the DP group, re-introducing the std scaling RLOO
+    omits.
 
-    This is also the precondition for the DP-invariance argument: advantages are
-    fixed on the rollout side before any DP split, but only if nothing
-    re-normalizes them afterwards.
+    This is also the precondition for the DP-invariance argument: advantages
+    are fixed on the rollout side before any DP split, but only if nothing re-
+    normalizes them afterwards.
     """
     with pytest.raises(AssertionError, match="DP group"):
         _check(_args(normalize_advantages=True))

@@ -32,6 +32,7 @@ from relax.utils.training.ppo_utils import (
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    get_rloo_baseline,
 )
 from relax.utils.types import RolloutBatch
 
@@ -1078,14 +1079,8 @@ def policy_loss_function(
             # on exactly the same normalization path as pg_loss, which matters
             # because every entry in reported_loss is an unnormalized sum that
             # model.py divides by the global token/sample count.
-            raw_reward = batch["raw_reward"]
-            raw = torch.cat(
-                [
-                    torch.full((length,), float(r), dtype=advantages.dtype, device=advantages.device)
-                    for length, r in zip(response_lengths, raw_reward, strict=False)
-                ]
-            )
-            baseline = sum_of_sample_mean(raw - advantages)
+            adv_list = batch["advantages"] if isinstance(batch["advantages"], list) else [advantages]
+            baseline = sum_of_sample_mean(get_rloo_baseline(batch["raw_reward"], adv_list))
         reported_loss["rloo_advantage_abs"] = abs_adv.clone().detach()
         reported_loss["rloo_no_signal_fraction"] = no_signal.clone().detach()
         reported_loss["rloo_baseline"] = baseline.clone().detach()

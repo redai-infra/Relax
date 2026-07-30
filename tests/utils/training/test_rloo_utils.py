@@ -22,6 +22,7 @@ from relax.utils.training.ppo_utils import (
     compute_policy_loss,
     compute_rloo_loss,
     get_rloo_advantages,
+    get_rloo_baseline,
     scale_centered_rewards_for_rloo,
 )
 
@@ -293,3 +294,62 @@ def test_empty_response_contributes_no_loss_but_still_feeds_the_baseline():
     assert not torch.allclose(advantages[:3], without_it), (
         "the empty sample's reward must still participate in the other baselines"
     )
+
+
+def test_baseline_is_raw_reward_minus_advantage_element_wise():
+    """b_i = R_i - A_i, broadcast over each sample's tokens."""
+    advantages = [torch.tensor([0.75, 0.75], dtype=torch.float64), torch.tensor([-0.25], dtype=torch.float64)]
+    raw_rewards = [1.0, 0.0]
+
+    baseline = get_rloo_baseline(raw_rewards, advantages)
+
+    expected = torch.tensor([1.0 - 0.75, 1.0 - 0.75, 0.0 - (-0.25)], dtype=torch.float64)
+    assert torch.allclose(baseline, expected, atol=1e-12), f"expected {expected.tolist()}, got {baseline.tolist()}"
+
+
+def test_baseline_layout_follows_the_advantages_not_the_response_lengths():
+    """The regression this function exists to prevent.
+
+    Under CP>1 the advantages handed to the loss are the rank-local shard while
+    ``response_lengths`` stays full-length. An earlier implementation built the
+    broadcast from the lengths and produced a tensor of the wrong size --
+    measured on 8xH100, 1536 against an advantage shard of 740 -- which is a
+    shape error at best and a silently wrong baseline at worst. Shape must
+    track the advantages.
+    """
+    full_response_length = 8
+    shard = full_response_length // 2  # what a CP=2 rank actually holds
+    advantages = [torch.full((shard,), 0.5, dtype=torch.float64) for _ in range(3)]
+
+    baseline = get_rloo_baseline([1.0, 1.0, 0.0], advantages)
+
+    assert baseline.numel() == 3 * shard, (
+        f"baseline must match the advantage shard ({3 * shard} elements), got {baseline.numel()}"
+    )
+    assert baseline.numel() != 3 * full_response_length, "must not be sized from the full response length"
+
+
+def test_baseline_preserves_dtype_and_device_of_the_advantages():
+    """ones_like inherits both, so no explicit dtype/device plumbing is
+    needed."""
+    for dtype in (torch.float32, torch.float64):
+        advantages = [torch.zeros(4, dtype=dtype)]
+        out = get_rloo_baseline([1.0], advantages)
+        assert out.dtype == dtype and out.shape == advantages[0].shape
+
+
+def test_baseline_rejects_a_length_mismatch_instead_of_truncating():
+    """A short reward list would otherwise zip-truncate into a too-short
+    baseline."""
+    advantages = [torch.zeros(2, dtype=torch.float64) for _ in range(3)]
+    with pytest.raises(ValueError, match="one-to-one per sample"):
+        get_rloo_baseline([1.0, 0.0], advantages)
+
+
+def test_baseline_accepts_a_reward_tensor_as_well_as_a_list():
+    """raw_reward may arrive as a tensor after the transfer queue; both must
+    work."""
+    advantages = [torch.zeros(2, dtype=torch.float64), torch.zeros(2, dtype=torch.float64)]
+    from_list = get_rloo_baseline([1.0, 0.5], advantages)
+    from_tensor = get_rloo_baseline(torch.tensor([1.0, 0.5], dtype=torch.float64), advantages)
+    assert torch.allclose(from_list, from_tensor, atol=1e-12)
