@@ -31,6 +31,48 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
+# Minimum required TransferQueue version and the command to upgrade to it.
+_MIN_TQ_VERSION = "0.1.10.dev0"
+_TQ_UPGRADE_CMD = (
+    'pip install "transferqueue @ git+https://github.com/redai-infra/'
+    'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
+)
+
+
+def check_transfer_queue_version() -> None:
+    """Fail fast if the installed TransferQueue is older than the required
+    version.
+
+    Only fully-async mode needs the newer TransferQueue, so this is called from
+    ``parse_args`` only when ``--fully-async`` is set.
+    """
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as pkg_version
+
+    from packaging.version import parse as parse_version
+
+    try:
+        installed = pkg_version("transferqueue")
+    except PackageNotFoundError as e:
+        raise ImportError(
+            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        ) from e
+
+    if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
+        raise RuntimeError(
+            f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
+            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        )
+
+
+def _positive_int(value: str) -> int:
+    """argparse type that rejects non-positive integers at parse time."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -1107,6 +1149,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--encode-max-workers",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Worker threads for the shared media-encoding thread pool (image/video/audio "
+                    "encoding offloaded from the asyncio event loop). Positive integer. If unset, "
+                    "falls back to $RELAX_ENCODE_MAX_WORKERS, then to min(32, usable CPU count)."
+                ),
+            )
+            parser.add_argument(
                 "--custom-prompt-path",
                 type=str,
                 default=None,
@@ -1279,6 +1331,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SGLang reasoning parser for agentic rollout.",
             )
             parser.add_argument(
+                "--agentic-custom-advantage-path",
+                type=str,
+                default=None,
+                help="Custom group-level advantage function for explicit agentic exports.",
+            )
+            parser.add_argument(
                 "--agentic-prepare-pool-size",
                 type=int,
                 default=None,
@@ -1371,6 +1429,56 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
+            )
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="LoRA rank for parameter-efficient fine-tuning (0=disabled).",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=32,
+                help="LoRA alpha scaling factor for learning rate adjustment.",
+            )
+            parser.add_argument(
+                "--lora-target-modules",
+                type=str,
+                nargs="+",
+                default=["linear_qkv", "linear_proj"],
+                help=(
+                    "Target modules for LoRA (Megatron-style names, e.g. linear_qkv, "
+                    "linear_proj, linear_fc1, linear_fc2). Expanded to HF-style names "
+                    "automatically when exporting the adapter."
+                ),
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="Dropout probability for LoRA layers.",
+            )
+            parser.add_argument(
+                "--lora-merge-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Merge LoRA adapters into base weights before weight synchronization. "
+                    "Simplifies rollout but slower rollout inference."
+                ),
+            )
+            parser.add_argument(
+                "--lora-adapter-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable LoRA adapter mode: sync the base model once, then each step push only "
+                    "the trained LoRA adapter to the rollout engine via SGLang's runtime LoRA API "
+                    "(rollouts select it via lora_path). Saves per-step full-weight-sync bandwidth. "
+                    "Requires --enable-lora (auto-set by the engine) and sglang_dp_size == 1. "
+                    "Supported in colocate and fully-async modes. Mutually exclusive with --lora-merge-mode."
+                ),
             )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
@@ -1932,6 +2040,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default=None,
+                help=(
+                    "Fallback for samples whose reward type is unknown or missing. "
+                    "None (default) keeps the current behavior of raising. 'zero' scores "
+                    "the sample 0.0 (reward-key aware) with a warning. Any registered "
+                    "reward type name routes degraded samples to that reward instead."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-infer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Infer the reward type from the sample label via registered label "
+                    "matchers when neither sample metadata nor --rm-type provides one. "
+                    "Also enables conflict detection (warn; the explicit type wins)."
+                ),
+            )
+            parser.add_argument(
                 "--reward-key",
                 type=str,
                 default=None,
@@ -2344,6 +2473,11 @@ def parse_args(add_custom_arguments=None):
     if not args.debug_train_only:
         sglang_validate_args(args)
 
+    # Only fully-async mode relies on the newer TransferQueue (e.g.
+    # StreamingTokenBudgetSampler), so gate the version requirement on it.
+    if getattr(args, "fully_async", False):
+        check_transfer_queue_version()
+
     return args
 
 
@@ -2443,12 +2577,34 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _normalize_sync_ppo_kl_args(args) -> bool:
+    """Disable KL options that have no ref-logprob producer in sync PPO."""
+    is_sync_ppo = (
+        getattr(args, "use_critic", False)
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "hybrid", False)
+    )
+    if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
+        return False
+
+    args.use_kl_loss = False
+    args.kl_coef = 0.0
+    return True
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
+    if is_sft and getattr(args, "dynamic_context_parallel", False) and args.eval_interval is not None:
+        raise ValueError(
+            "--dynamic-context-parallel cannot be used with SFT eval (--eval-interval) yet: "
+            "this combination can hang and has not been fixed. "
+            "Disable --eval-interval or --dynamic-context-parallel."
+        )
+
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
         # `--disable-compute-advantages-and-returns` and friends.
@@ -2480,6 +2636,23 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    if getattr(args, "lora_rank", 0) > 0:
+        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+            raise ValueError(
+                "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
+            )
+        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+            raise ValueError(
+                "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
+                "support dp_size > 1)."
+            )
+        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+            logger.info(
+                "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
+                args.lora_rank,
+            )
+            args.lora_merge_mode = True
 
     # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
     # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
@@ -2684,6 +2857,17 @@ def slime_validate_args(args):
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
 
+    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    if rm_type_fallback is not None and rm_type_fallback != "zero":
+        # Lazy import: only pay for the rewards package when the flag is set.
+        from relax.engine.rewards.registry import list_reward_types
+
+        if rm_type_fallback not in list_reward_types():
+            raise ValueError(
+                f"--rm-type-fallback {rm_type_fallback!r} is not a registered reward type. "
+                f"Use 'zero' or one of: {list_reward_types()}"
+            )
+
     if hasattr(args, "rollout_result_dir"):
         if args.rollout_result_dir is None and getattr(args, "save", None):
             args.rollout_result_dir = f"{args.save}/rollout_result"
@@ -2737,6 +2921,23 @@ def slime_validate_args(args):
             args.balance_data = True
 
     args.use_critic = args.advantage_estimator == "ppo"
+    # Synchronous PPO has no producer for
+    # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
+    # gated on `advantage_estimator != "ppo"`, and the sync role set does not
+    # deploy a separate reference service. Either KL option would make
+    # advantages / actor request a field that never arrives and hang in
+    # TQ.get_meta, so disable both for the currently supported sync topology.
+    if _normalize_sync_ppo_kl_args(args):
+        logger.warning(
+            "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
+            "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
+            "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
+            "Drop these KL options from the launch script to silence this warning."
+        )
+    elif args.use_critic and args.use_kl_loss:
+        # Preserve the existing behavior outside the synchronous topology.
+        logger.warning("PPO does not support --use-kl-loss. Auto-disabling --use-kl-loss.")
+        args.use_kl_loss = False
     if args.critic_num_gpus_per_node is None:
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     if args.critic_num_nodes is None:
@@ -2996,13 +3197,6 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
-
-    if args.advantage_estimator == "ppo":
-        raise ValueError(
-            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
-            "Please use one of the following advantage estimators instead: "
-            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
-        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."
