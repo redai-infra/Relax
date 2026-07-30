@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.ppo_utils import compute_rloo_baselines_and_advantages
 from relax.utils.types import Sample
 
 
@@ -109,6 +110,9 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         "sample_indices": [sample.index for sample in samples],
     }
 
+    if args.advantage_estimator == "rloo":
+        train_data["group_indices"] = [sample.group_index for sample in samples]
+
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
@@ -178,6 +182,14 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return custom_reward_post_process_func(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if args.advantage_estimator == "rloo":
+        rewards = torch.tensor(raw_rewards, dtype=torch.float32)
+        compute_rloo_baselines_and_advantages(
+            rewards,
+            [sample.group_index for sample in samples],
+            args.n_samples_per_prompt,
+        )
+        return raw_rewards, raw_rewards
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
     if (

@@ -21,6 +21,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import get_model_config, unwrap_model
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
@@ -181,6 +182,43 @@ def _main_loss_has_tokens(batch: dict) -> bool:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.all_reduce(num_tokens, group=mpu.get_data_parallel_group(with_context_parallel=True))
     return bool(num_tokens.item() > 0)
+
+
+def _get_rloo_native_cp_attention_mask(args: Namespace, batch: dict) -> torch.Tensor | None:
+    """Build the zig-zag query rows required by Megatron's native CP attention."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if (
+        args.advantage_estimator != "rloo"
+        or cp_size == 1
+        or args.qkv_format != "bshd"
+        or args.attention_backend != AttnBackend.local
+    ):
+        return None
+
+    tokens = batch["tokens"]
+    local_sequence_length = tokens.shape[1]
+    if local_sequence_length % 2 != 0:
+        raise ValueError(
+            f"RLOO native context parallelism requires an even local sequence length, got {local_sequence_length}."
+        )
+
+    chunk_size = local_sequence_length // 2
+    global_sequence_length = local_sequence_length * cp_size
+    cp_rank = mpu.get_context_parallel_rank()
+    first = slice(cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
+    second_chunk = 2 * cp_size - cp_rank - 1
+    second = slice(second_chunk * chunk_size, (second_chunk + 1) * chunk_size)
+    full_mask = torch.triu(
+        torch.ones(
+            (global_sequence_length, global_sequence_length),
+            dtype=torch.bool,
+            device=tokens.device,
+        ),
+        diagonal=1,
+    )
+    return torch.cat([full_mask[first], full_mask[second]], dim=0).reshape(
+        1, 1, local_sequence_length, global_sequence_length
+    )
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -759,7 +797,7 @@ def forward_only(
             forward_packed_seq_params = batch["vlm_packed_seq_params"]
             forward_loss_mask = None
         else:
-            forward_attention_mask = None
+            forward_attention_mask = _get_rloo_native_cp_attention_mask(args, batch)
             forward_loss_mask = batch["full_loss_masks"]
 
         # Dynamic CP: the VL bridge (Qwen3VLModel.forward) reads pg_collection.cp
@@ -983,6 +1021,7 @@ def train_one_step(
                     "advantages",
                     "returns",
                     "rollout_log_probs",
+                    "rloo_advantage",
                     "max_seq_lens",
                     *_opd_keys,
                 ],
@@ -1024,7 +1063,7 @@ def train_one_step(
             forward_kwargs = {
                 "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
                 "position_ids": None,
-                "attention_mask": None,
+                "attention_mask": _get_rloo_native_cp_attention_mask(args, batch),
                 "labels": None,
                 "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
@@ -1253,6 +1292,9 @@ def train(
     config = get_model_config(model[0])
     config.grad_scale_func = optimizer.scale_loss
     config.timers = None
+    if args.advantage_estimator == "rloo":
+        # Bridge requires the CLI flag for CP, but RLOO gradients normalize by sequences.
+        config.calculate_per_token_loss = False
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
