@@ -21,40 +21,48 @@ actor / advantages / reference / actor_fwd，**无 critic**），由 `--advantag
 在 advantage 组件与 `policy_loss_function` 中分发。GRPO 族算法（GRPO / GSPO / SAPO / CISPO /
 REINFORCE++ / REINFORCE++-baseline）共享同一拓扑，拓扑定义集中为 `_GRPO_TOPOLOGY` 单一常量。
 
-| 配置值 | 含义 | 必需参数 |
-|---|---|---|
-| `reinforce_plus_plus` | Monte-Carlo 折扣回报，无 group baseline | `--normalize-advantages` |
-| `reinforce_plus_plus_baseline` | group-mean baseline 版本 | `--normalize-advantages` |
+| 配置值 | 含义 | 必需参数 | KL 口径（论文约定） |
+|---|---|---|---|
+| `reinforce_plus_plus` | Monte-Carlo 折扣回报，无 group baseline | `--normalize-advantages` | `--kl-coef β` 逐 token k1-style 惩罚折入回报（§3.1） |
+| `reinforce_plus_plus_baseline` | group-mean baseline 版本 | `--normalize-advantages` | `--use-kl-loss --kl-loss-type k2 --kl-loss-coef λ` 独立 k2 KL loss（§3.2）；`--kl-coef` 必须为 0 |
 
-`arguments.py` 强制两个变体开启 `--normalize-advantages`，否则报错。两个变体命名可清晰区分；
-切换算法需真正修改 `--advantage-estimator`，而非复制 GRPO recipe 改名。
+`arguments.py` 强制两个变体开启 `--normalize-advantages`，否则报错；并强制
+`reinforce_plus_plus_baseline` 的 `--kl-coef == 0`（其 KL 正则来自独立的 k2 KL loss，折入
+advantage 的惩罚项在该变体中不存在，设置 `--kl-coef` 会被静默忽略，故直接拒绝）。两个变体
+命名可清晰区分；切换算法需真正修改 `--advantage-estimator`，而非复制 GRPO recipe 改名。
 
 ## 3. 公式
 
 设第 $i$ 条样本响应长度 $R_i$、逐 token KL 为 $k_i \in \mathbb{R}^{R_i}$、响应 mask
-$m_i \in \{0,1\}^{R_i}$、标量奖励 $r_i$、KL 系数 $\beta$（`kl_coef`）、折扣 $\gamma$。
-记响应最后一个有效 token 下标为 $t^*_i = \max\{t : m_i[t]=1\}$。
+$m_i \in \{0,1\}^{R_i}$、标量奖励 $r_i$、KL 系数 $\beta$（`kl_coef`）、折扣 $\gamma$、
+独立 KL loss 系数 $\lambda$（`kl_loss_coef`）。记响应最后一个有效 token 下标为
+$t^*_i = \max\{t : m_i[t]=1\}$。
 
 ### 3.1 REINFORCE++（`get_reinforce_plus_plus_returns`）
 
-逐 token 奖励（KL 惩罚 + 终端奖励）：
+对应论文 §3.1 的 REINFORCE++（k=1）：逐 token 奖励（k1-style KL 惩罚 + 终端奖励）：
 
 $$
 \tilde r_i[t] = -\beta \cdot k_i[t] \cdot m_i[t], \quad
 \tilde r_i[t^*_i] \mathrel{+}= r_i
 $$
 
-折扣回报（反向累加）：
+其中逐 token KL 使用 **k1-style 估计器**（论文 "k1-style penalty"：
+$k_i[t] = \log \pi_{\theta_{\text{old}}}(o_t \mid \cdot) - \log \pi_{\text{ref}}(o_t \mid \cdot)$，
+即 Relax `compute_approx_kl` 的 `k1`，由 `--kl-loss-type k1` 选择）。折扣回报（反向累加）：
 
 $$
 G_i[t] = \tilde r_i[t] + \gamma \cdot G_i[t+1], \quad G_i[R_i] = 0
 $$
 
-advantage = return：$A_i = G_i$。**不做 group baseline**（使用原始 $r_i$）。
+advantage = return：$A_i = G_i$。**不做 group baseline**（使用原始 $r_i$）。$\beta$ 由
+`--kl-coef` 给出（recipe 默认 0.001）；论文取 $\gamma = 1$（即 $G_t = \sum_{i \geq t} \tilde r_i$），
+Relax 的 `--gamma` 默认值即 1.0，可配置。
 
 ### 3.2 REINFORCE++-baseline（`get_reinforce_plus_plus_baseline_advantages`）
 
-group baseline 在上游 `post_process_rewards`（`relax/utils/utils.py`）中预先减去：
+对应论文 §3.2 的 "REINFORCE++ /w baseline"（组采样变体，k > 1）。group baseline 在上游
+`post_process_rewards`（`relax/utils/utils.py`）中预先减去：
 
 $$
 \bar r_i = r_i - \mathrm{mean}_{j \in \text{group}(i)} r_j
@@ -62,11 +70,18 @@ $$
 
 与 GRPO / GSPO / SAPO / CISPO 不同，baseline 变体**只做 group-mean 减法，不做 std 归一化**
 （`post_process_rewards` 中 std 除法分支仅对 `grpo/gspo/sapo/cispo` 生效）。随后 advantage
-函数把 $(\bar r_i - \beta k_i)$ 广播到每个 token：
+函数把 $\bar r_i$ 广播到每个 token——**KL 惩罚不折入 advantage**（论文 §3.2：该变体采用
+独立 KL loss 项做正则）：
 
 $$
-A_i[t] = \bar r_i - \beta \cdot k_i[t], \quad \text{return} = A_i
+A_i[t] = \bar r_i, \quad \text{return} = A_i
 $$
+
+KL 正则由 `policy_loss_function` 中的**独立 k2 KL loss** 提供（论文 Eq. 8：
+$\mathcal{L} = \mathcal{L}_{\text{PPO}}(A^{\text{norm}}) + \lambda \cdot \mathbb{E}\left[
+\frac{1}{2} \left(\log \frac{\pi_\theta}{\pi_{\text{ref}}}\right)^2 \right]$，
+即 Relax `compute_approx_kl` 的 `k2`），由 `--use-kl-loss --kl-loss-type k2 --kl-loss-coef λ`
+启用。`arguments.py` 强制该变体 `--kl-coef == 0`（KL 不进 advantage）。
 
 ### 3.3 优势归一化（两变体共用，`--normalize-advantages`）
 
@@ -86,7 +101,7 @@ $$
 |---|---|---|---|
 | return 计算 | 逐 token 折扣 MC 回报 $G_t$ | 无折扣，广播标量 advantage | 广播标量 advantage |
 | group baseline | 否 | 是（group-mean，**无 std**） | 是（group-mean，**有 std**） |
-| KL 计入位置 | 逐 token 计入 reward | 逐 token 计入 advantage | 不计入 advantage（走单独 KL loss） |
+| KL 计入位置 | 逐 token k1-style 计入 reward（`--kl-coef`） | **不计入 advantage**（独立 k2 KL loss，`--use-kl-loss --kl-loss-type k2`） | 不计入 advantage（走单独 KL loss） |
 | advantage 归一化 | masked whiten over DP | masked whiten over DP | 可选 std 归一化（group 内） |
 | mask 作用域 | response token；padding 不注入奖励、不参与统计 | 同左 | 同左 |
 | loss reduction | per-token（`sum_of_sample_mean`，`--calculate-per-token-loss`） | 同左 | 同左 |
@@ -107,12 +122,14 @@ $$
 | GSPO | 同 GRPO 优势 | 是 | 是 | **sequence-level KL** | `compute_policy_loss` + seq KL |
 | SAPO | GRPO 优势 | 是 | 是 | soft sigmoid 非对称 τ | `compute_sapo_loss` |
 | CISPO | GRPO 优势 | 是 | 是 | 梯度只过 `log_probs` | `compute_cispo_loss` |
-| **REINFORCE++** | MC 折扣回报 $G_t$ | **否** | advantage whiten | 逐 token KL 计入 reward | `compute_policy_loss` |
-| **REINFORCE++-baseline** | $(\bar r - \beta k)$ 广播 | **是（无 std）** | advantage whiten | 逐 token KL 计入 advantage | `compute_policy_loss` |
+| **REINFORCE++** | MC 折扣回报 $G_t$ | **否** | advantage whiten | 逐 token k1-style KL 计入 reward（`--kl-coef`） | `compute_policy_loss` |
+| **REINFORCE++-baseline** | $\bar r$ 广播 | **是（无 std）** | advantage whiten | **独立 k2 KL loss**（`--use-kl-loss --kl-loss-type k2`） | `compute_policy_loss` + k2 KL loss |
 
 核心区别：
 - REINFORCE++ 用**逐 token 折扣 MC 回报**取代 GRPO 的「标量优势广播」；
-- KL 惩罚**直接进入 reward / advantage**（逐 token），而非 GRPO 的独立 KL loss；
+- REINFORCE++ 的 KL 惩罚**逐 token 直接进入 reward**（k1-style，`--kl-coef`），
+  baseline 变体的 KL 正则则是**独立 k2 KL loss**（论文 §3.2，Eq. 8），均与 GRPO 的
+  `low_var_kl` 单独 KL loss 估计器不同；
 - baseline 变体的 group baseline **不做 std 归一化**（与 GRPO 的关键差异）；
 - loss 复用 PPO clipped surrogate（`compute_policy_loss` 的 `else` 分支）。
 
@@ -157,11 +174,24 @@ fully-async 模式下对所有算法（含 REINFORCE++）均不生效。这是�
 - `examples/algorithms/run-qwen3-0.6B-1xgpu-reinforce-pp-baseline.sh`
 
 基于单卡 GRPO quickstart，切换 `--advantage-estimator reinforce_plus_plus[_baseline]`
-并加 `--normalize-advantages`。
+并加 `--normalize-advantages`。KL 口径遵循论文（非零系数，随 recipe 生效）：
+
+- REINFORCE++：`--kl-coef 0.001 --kl-loss-type k1`（k1-style 惩罚折入折扣回报，§3.1）；
+- REINFORCE++-baseline：`--use-kl-loss --kl-loss-coef 0.001 --kl-loss-type k2`
+  （独立 k2 KL loss，`--kl-coef` 保持默认 0，§3.2）。
+
+GRPO 对比组使用 `contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh`
+（quickstart 原样，`--kl-loss-coef 0.00`），保证与仓库既有 GRPO 口径一致。
 
 ## 9. 验证方法
 
 同模型（Qwen3-0.6B）、数据（GSM8K）、预算、硬件（单卡，sync colocate）下分别运行
 GRPO / REINFORCE++ / REINFORCE++-baseline，对比 reward、loss、KL、吞吐（samples/s、step time）、
 GPU 利用率、峰值显存，不少于 3 个稳定窗口。稳定性护栏：无 NaN / Inf、无丢样本、有效 batch /
-序列长度不下降。
+序列长度不下降。**KL 必须在非零系数下验证**：REINFORCE++ 用 `--kl-coef 0.001`（k1 折入回报）、
+REINFORCE++-baseline 用 `--kl-loss-coef 0.001`（k2 独立 loss），recipe 内已固定，训练对比
+不得以 `kl-coef=0` / `kl-loss-coef=0.00` 替代（否则退化为无 KL 的纯 MC / 纯 group-mean
+口径，与本文档 §3 公式不符）。**KL 必须在非零系数下验证**：REINFORCE++ 用 `--kl-coef 0.001`（k1 折入回报）、
+REINFORCE++-baseline 用 `--kl-loss-coef 0.001`（k2 独立 loss），recipe 内已固定，训练对比
+不得以 `kl-coef=0` / `kl-loss-coef=0.00` 替代（否则退化为无 KL 的纯 MC / 纯 group-mean
+口径，与本文档 §3 公式不符）。

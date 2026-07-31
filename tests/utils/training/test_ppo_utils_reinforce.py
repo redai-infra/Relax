@@ -88,21 +88,19 @@ def reference_reinforce_plus_plus_returns(
 def reference_reinforce_plus_plus_baseline_advantages(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
-    kl_coef: float,
 ) -> list[torch.Tensor]:
     """Plain-torch reference for
     ``get_reinforce_plus_plus_baseline_advantages``.
 
-    ``advantage = (reward - group_baseline) - kl_coef * kl`` broadcast to every
-    token. The group baseline is assumed already subtracted from ``rewards``
-    (done upstream in ``relax.utils.utils.post_process_rewards``); this reference
-    therefore mirrors the advantage function exactly: broadcast the scalar reward
-    and subtract the per-token KL penalty.
+    ``advantage = (reward - group_baseline)`` broadcast to every token, with no
+    per-token KL penalty (paper arXiv:2501.03262 §3.2: the baseline variant
+    applies a separate k2 KL loss instead of folding KL into the advantage).
+    The group baseline is assumed already subtracted from ``rewards`` (done
+    upstream in ``relax.utils.utils.post_process_rewards``); this reference
+    therefore mirrors the advantage function exactly: broadcast the scalar
+    reward to the per-token shape.
     """
-    return [
-        torch.ones_like(kl_tensor) * reward_val - kl_coef * kl_tensor
-        for kl_tensor, reward_val in zip(kl, rewards, strict=False)
-    ]
+    return [torch.ones_like(kl_tensor) * reward_val for kl_tensor, reward_val in zip(kl, rewards, strict=False)]
 
 
 def reference_policy_loss(
@@ -345,8 +343,8 @@ class TestReinforcePlusPlusBaselineAdvantages:
         kl = [torch.randn(6), torch.randn(4), torch.randn(9)]
         masks = [torch.ones(6), torch.ones(4), torch.ones(9)]
 
-        actual = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks, kl_coef=0.03)
-        expected = reference_reinforce_plus_plus_baseline_advantages(rewards, kl, 0.03)
+        actual = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks)
+        expected = reference_reinforce_plus_plus_baseline_advantages(rewards, kl)
 
         assert len(actual) == len(expected)
         for a, e in zip(actual, expected, strict=False):
@@ -363,19 +361,27 @@ class TestReinforcePlusPlusBaselineAdvantages:
         kl = [torch.randn(7)]
         masks = [torch.ones(7)]
 
-        adv = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks, kl_coef=0.0)[0]
+        adv = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks)[0]
         assert torch.allclose(adv, torch.full((7,), 2.0), atol=1e-6)
 
-    def test_kl_coef_zero(self, monkeypatch):
+    def test_kl_not_folded_into_advantage(self, monkeypatch):
+        """The baseline variant's advantage ignores per-token KL values.
+
+        Paper convention (arXiv:2501.03262 §3.2): the advantage is the
+        broadcast (reward - group baseline) only. Per-token KL must NOT change
+        it (KL is a separate k2 loss applied in policy_loss_function, not
+        here).
+        """
         pytest.importorskip("torch")
         install_fake_megatron(monkeypatch)
         from relax.utils.training.ppo_utils import get_reinforce_plus_plus_baseline_advantages
 
         rewards = torch.tensor([0.5, -0.5])
+        # deliberately non-trivial KL values — they must be ignored
         kl = [torch.randn(5), torch.randn(3)]
         masks = [torch.ones(5), torch.ones(3)]
 
-        adv = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks, kl_coef=0.0)
+        adv = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks)
         for a, r in zip(adv, rewards, strict=False):
             assert torch.allclose(a, torch.full_like(a, r.item()), atol=1e-6)
 
@@ -387,8 +393,8 @@ class TestReinforcePlusPlusBaselineAdvantages:
         rewards = torch.tensor([1.0])
         kl = [torch.randn(4)]
         masks = [torch.ones(4)]
-        actual = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks, kl_coef=0.2)
-        expected = reference_reinforce_plus_plus_baseline_advantages(rewards, kl, 0.2)
+        actual = get_reinforce_plus_plus_baseline_advantages(rewards, kl, masks)
+        expected = reference_reinforce_plus_plus_baseline_advantages(rewards, kl)
         assert torch.allclose(actual[0], expected[0], atol=1e-6)
 
 

@@ -502,24 +502,26 @@ def get_reinforce_plus_plus_baseline_advantages(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
-    kl_coef: float,
 ) -> list[torch.Tensor]:
     """Calculates the unwhitened advantages for the REINFORCE++-baseline
     algorithm.
 
-    Broadcasting the scalar ``(reward - group_baseline) - kl_coef * kl`` to each
-    token, i.e. the per-token KL penalty is subtracted from the broadcast
-    scalar advantage and there is **no discounting** (contrast
-    ``get_reinforce_plus_plus_returns``, which uses a discounted Monte-Carlo
-    return).
+    Broadcasting the scalar ``(reward - group_baseline)`` to each token, with
+    **no per-token KL penalty and no discounting**. Following the paper
+    (arXiv:2501.03262, §3.2 "REINFORCE++ /w baseline"), the baseline variant
+    subtracts only the group-mean baseline and applies a **separate k2 KL loss**
+    term in ``policy_loss_function`` (``--use-kl-loss --kl-loss-type k2``),
+    instead of folding the KL penalty into the advantage like the plain
+    REINFORCE++ variant (which uses a discounted Monte-Carlo return and is
+    documented in ``get_reinforce_plus_plus_returns``).
 
-    Baseline convention (see ``docs/algorithms/reinforce_plus_plus.md``): the group
-    baseline is **not** subtracted here. It is subtracted upstream in
+    Baseline convention (see ``docs/algorithms/reinforce_plus_plus.md``): the
+    group baseline is **not** subtracted here. It is subtracted upstream in
     ``relax.utils.utils.post_process_rewards`` (group-mean, no std division —
     unlike GRPO/GSPO/SAPO/CISPO which additionally divide by group std). The
     ``rewards`` passed in therefore already carry ``(r - group_mean)``. The
-    optional ``--normalize-advantages`` whitening is applied later in the sync
-    path ``relax/backends/megatron/loss.py:compute_advantages_and_returns``.
+    ``--normalize-advantages`` whitening is applied later in the sync path
+    ``relax/backends/megatron/loss.py:compute_advantages_and_returns``.
 
     Args:
         rewards (Tensor): A tensor of scalar rewards, where the group-wise
@@ -531,15 +533,13 @@ def get_reinforce_plus_plus_baseline_advantages(
                                  ``get_reinforce_plus_plus_returns``; not used
                                  here because the per-token mask is enforced
                                  downstream in loss reduction.
-        kl_coef (float): Coefficient for the KL penalty.
 
     Returns:
         list[Tensor]: A list of tensors containing the unwhitened advantages.
     """
     # Broadcast to get unwhitened advantages
     unwhitened_advantages = [
-        torch.ones_like(kl_tensor) * reward_val - kl_coef * kl_tensor
-        for kl_tensor, reward_val in zip(kl, rewards, strict=False)
+        torch.ones_like(kl_tensor) * reward_val for kl_tensor, reward_val in zip(kl, rewards, strict=False)
     ]
 
     return unwhitened_advantages

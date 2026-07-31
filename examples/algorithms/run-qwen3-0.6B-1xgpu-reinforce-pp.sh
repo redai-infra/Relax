@@ -7,7 +7,7 @@
 # Colocate mode: actor and rollout time-share the same GPU.
 #
 # train_iters = NUM_ROLLOUT × ROLLOUT_BATCH_SIZE × N_SAMPLES / GLOBAL_BATCH_SIZE
-#             = 100 × 4 × 4 / 16 = 100 steps
+#             = 100 × 4 × 8 / 16 = 200 steps
 #
 # Dataset: openai/gsm8k (~7.5K problems)
 #   Requires JSONL conversion before use; see beginner-task.md for the conversion script.
@@ -26,8 +26,10 @@
 #   train/grad_norm      — gradient norm (stable, not exploding)
 #   eval/aime-2024-pass@1 — AIME-2024 passrate every 10 steps
 #   NOTE: REINFORCE++ uses a discounted Monte-Carlo return with no group
-#         baseline; advantages are whitened (--normalize-advantages) and hover
-#         near 0, while rollout/raw_reward reflects accuracy.
+#         baseline and a per-token k1-style KL penalty (--kl-coef 0.001)
+#         folded into the return (paper §3.1); advantages are whitened
+#         (--normalize-advantages) and hover near 0, while rollout/raw_reward
+#         reflects accuracy. Watch train/ppo_kl for the KL magnitude.
 
 set -ex
 set -o pipefail
@@ -94,9 +96,10 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
     --advantage-estimator reinforce_plus_plus --normalize-advantages
-    --use-kl-loss
-    --kl-loss-coef 0.00
-    --kl-loss-type low_var_kl
+    # Paper convention (arXiv:2501.03262 §3.1): per-token k1-style KL penalty
+    # folded into the discounted return via --kl-coef (here 0.001).
+    --kl-coef 0.001
+    --kl-loss-type k1
     --entropy-coef 0.00
     --eps-clip 0.2
 

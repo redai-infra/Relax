@@ -7,7 +7,7 @@
 # Colocate mode: actor and rollout time-share the same GPU.
 #
 # train_iters = NUM_ROLLOUT × ROLLOUT_BATCH_SIZE × N_SAMPLES / GLOBAL_BATCH_SIZE
-#             = 100 × 4 × 4 / 16 = 100 steps
+#             = 100 × 4 × 8 / 16 = 200 steps
 #
 # Dataset: openai/gsm8k (~7.5K problems)
 #   Requires JSONL conversion before use; see beginner-task.md for the conversion script.
@@ -25,9 +25,12 @@
 #   train/pg_loss        — policy gradient loss (non-zero and decreasing)
 #   train/grad_norm      — gradient norm (stable, not exploding)
 #   eval/aime-2024-pass@1 — AIME-2024 passrate every 10 steps
-#   NOTE: REINFORCE++-baseline subtracts a group-mean baseline (no std) and
-#         whitens advantages (--normalize-advantages), so rollout/advantages
-#         hover near 0; rollout/raw_reward reflects accuracy.
+#   NOTE: REINFORCE++-baseline subtracts a group-mean baseline (no std),
+#         whitens advantages (--normalize-advantages), and regularizes with a
+#         separate k2 KL loss (--use-kl-loss --kl-loss-type k2 --kl-loss-coef
+#         0.001, paper §3.2), so rollout/advantages hover near 0 while
+#         rollout/raw_reward reflects accuracy. Watch train/kl_loss for the
+#         KL loss term.
 
 set -ex
 set -o pipefail
@@ -94,9 +97,13 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
     --advantage-estimator reinforce_plus_plus_baseline --normalize-advantages
+    # Paper convention (arXiv:2501.03262 §3.2): group-mean baseline + global
+    # advantage normalization + a SEPARATE k2 KL loss term (--use-kl-loss
+    # --kl-loss-type k2 --kl-loss-coef). The KL penalty is NOT folded into the
+    # advantage; --kl-coef must stay 0 (validated in arguments.py).
     --use-kl-loss
-    --kl-loss-coef 0.00
-    --kl-loss-type low_var_kl
+    --kl-loss-coef 0.001
+    --kl-loss-type k2
     --entropy-coef 0.00
     --eps-clip 0.2
 

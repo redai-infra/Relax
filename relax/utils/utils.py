@@ -188,7 +188,9 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         # docs/algorithms/reinforce_plus_plus.md): GRPO/GSPO/SAPO/CISPO also
         # divide by group std below, whereas reinforce_plus_plus_baseline only
         # subtracts the group mean (no std) — its advantage function then
-        # broadcasts (reward - group_mean) - kl_coef * kl per token.
+        # broadcasts (reward - group_mean) per token, with no KL penalty folded
+        # in (the KL regularization is a separate k2 loss, see
+        # get_reinforce_plus_plus_baseline_advantages).
         # reinforce_plus_plus (non-baseline) is intentionally NOT here: it uses
         # raw rewards with a discounted Monte-Carlo return and no group baseline.
         # group norm

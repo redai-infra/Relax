@@ -146,13 +146,11 @@ class TestReinforcePlusPlusBaselineCPLocality:
         torch.manual_seed(0)
         kl_full = torch.randn(8, dtype=torch.float32)
         rewards = torch.tensor([0.7])
-        kl_coef = 0.03
 
         full_adv = get_reinforce_plus_plus_baseline_advantages(
             rewards,
             [kl_full],
             [torch.ones(8)],
-            kl_coef=kl_coef,
         )[0]
 
         mid = kl_full.size(0) // 2
@@ -160,13 +158,11 @@ class TestReinforcePlusPlusBaselineCPLocality:
             rewards,
             [kl_full[:mid]],
             [torch.ones(mid)],
-            kl_coef=kl_coef,
         )[0]
         rank1_local = get_reinforce_plus_plus_baseline_advantages(
             rewards,
             [kl_full[mid:]],
             [torch.ones(8 - mid)],
-            kl_coef=kl_coef,
         )[0]
 
         reconstructed = torch.cat([rank0_local, rank1_local])
