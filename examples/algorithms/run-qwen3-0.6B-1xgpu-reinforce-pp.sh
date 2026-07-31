@@ -29,7 +29,9 @@
 #         baseline and a per-token k1-style KL penalty (--kl-coef 0.001)
 #         folded into the return (paper §3.1); advantages are whitened
 #         (--normalize-advantages) and hover near 0, while rollout/raw_reward
-#         reflects accuracy. Watch train/ppo_kl for the KL magnitude.
+#         reflects accuracy. train/ppo_kl is the old-vs-current policy drift
+#         (not the folded penalty); the folded k1 penalty shows up as
+#         rollout/returns - rollout/raw_reward ≈ -β·Σk1.
 
 set -ex
 set -o pipefail

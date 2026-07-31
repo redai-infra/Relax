@@ -149,13 +149,14 @@ $$
 `--normalize-advantages` 的 masked whiten 在 DP 组上聚合全局统计量。因统计量为全 token
 求和，**DP 切分不改变每个 token 的归一化结果**。
 
-### 6.3 已知限制：异步路径无 advantage whiten
+### 6.3 已知限制：fully-async 模式不支持本族变体
 
 advantage whiten（`distributed_masked_whiten`）只在同步路径
 `loss.py:compute_advantages_and_returns` 中执行；异步路径
-`relax/components/advantages.py:Advantages` 未做 whiten。即 `--normalize-advantages` 在
-fully-async 模式下对所有算法（含 REINFORCE++）均不生效。这是全算法共有的既有行为。
-推荐使用 sync colocate 模式以使 advantage 归一化生效。
+`relax/components/advantages.py:Advantages` 未做 whiten，且 `arguments.py` 对
+fully-async 模式强制 `assert not --normalize-advantages`。由于两个变体都必须开启
+`--normalize-advantages`（§2），**fully-async 下它们会被参数校验直接拒绝**（而非"归一化不生效"），
+这是全算法共有的既有行为。推荐使用 sync colocate 模式。
 
 ## 7. 测试
 
@@ -190,9 +191,6 @@ GRPO 对比组使用 community 的 GRPO quickstart（与本地
 GRPO / REINFORCE++ / REINFORCE++-baseline，对比 reward、loss、KL、吞吐（samples/s、step time）、
 GPU 利用率、峰值显存，不少于 3 个稳定窗口。稳定性护栏：无 NaN / Inf、无丢样本、有效 batch /
 序列长度不下降。**KL 必须在非零系数下验证**：REINFORCE++ 用 `--kl-coef 0.001`（k1 折入回报）、
-REINFORCE++-baseline 用 `--kl-loss-coef 0.001`（k2 独立 loss），recipe 内已固定，训练对比
-不得以 `kl-coef=0` / `kl-loss-coef=0.00` 替代（否则退化为无 KL 的纯 MC / 纯 group-mean
-口径，与本文档 §3 公式不符）。**KL 必须在非零系数下验证**：REINFORCE++ 用 `--kl-coef 0.001`（k1 折入回报）、
 REINFORCE++-baseline 用 `--kl-loss-coef 0.001`（k2 独立 loss），recipe 内已固定，训练对比
 不得以 `kl-coef=0` / `kl-loss-coef=0.00` 替代（否则退化为无 KL 的纯 MC / 纯 group-mean
 口径，与本文档 §3 公式不符）。
