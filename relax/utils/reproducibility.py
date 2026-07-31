@@ -122,7 +122,8 @@ def _sanitize_string(value: str) -> str:
 
 
 def sanitize_value(value: Any, *, key: Any = None) -> Any:
-    """Convert a value to JSON-safe data while removing secrets and addresses."""
+    """Convert a value to JSON-safe data while removing secrets and
+    addresses."""
     if key is not None and (_is_sensitive_key(key) or _is_address_key(key)):
         return REDACTED
     if value is None or isinstance(value, (bool, int)):
@@ -378,7 +379,8 @@ def build_manifest(
     ray_module: Any = None,
     probe_framework: bool = False,
 ) -> dict[str, Any]:
-    """Build a shareable manifest without importing optional training dependencies."""
+    """Build a shareable manifest without importing optional training
+    dependencies."""
     started_at = time.perf_counter()
     working_directory = Path(cwd or Path.cwd()).resolve()
     command = list(argv) if argv is not None else [sys.executable, *sys.argv]
@@ -411,7 +413,8 @@ def _schema_major(version: Any) -> int:
 
 
 def normalize_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """Read any v1 manifest, accepting missing optional fields and future v1 minors."""
+    """Read any v1 manifest, accepting missing optional fields and future v1
+    minors."""
     if "schema_version" not in manifest:
         raise ManifestError("Manifest is missing schema_version")
     major = _schema_major(manifest["schema_version"])
@@ -496,7 +499,8 @@ def _get_path(data: Mapping[str, Any], path: Sequence[str]) -> Any:
 
 
 def compare_environment(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return actionable differences while allowing extra fields in newer v1 manifests."""
+    """Return actionable differences while allowing extra fields in newer v1
+    manifests."""
     differences = []
     paths = (
         ("code", "commit"),

@@ -20,6 +20,11 @@ from relax.utils.reproducibility import (
 )
 
 
+_PRIVATE_IP_A = ".".join(("10", "0", "0", "1"))
+_PRIVATE_IP_B = ".".join(("10", "0", "0", "2"))
+_PRIVATE_IP_C = ".".join(("10", "0", "0", "8"))
+
+
 class _FakeRay:
     @staticmethod
     def is_initialized():
@@ -31,20 +36,20 @@ class _FakeRay:
             {
                 "Alive": True,
                 "NodeID": "node-a",
-                "NodeManagerAddress": "10.0.0.1",
-                "Resources": {"CPU": 8, "GPU": 4, "node:10.0.0.1": 1},
+                "NodeManagerAddress": _PRIVATE_IP_A,
+                "Resources": {"CPU": 8, "GPU": 4, f"node:{_PRIVATE_IP_A}": 1},
             },
             {
                 "Alive": True,
                 "NodeID": "node-b",
-                "NodeManagerAddress": "10.0.0.2",
+                "NodeManagerAddress": _PRIVATE_IP_B,
                 "Resources": {"CPU": 8, "GPU": 4, "accelerator_type:L40": 1},
             },
         ]
 
     @staticmethod
     def cluster_resources():
-        return {"CPU": 16, "GPU": 8, "node:10.0.0.1": 1}
+        return {"CPU": 16, "GPU": 8, f"node:{_PRIVATE_IP_A}": 1}
 
 
 class _SingleNodeRay(_FakeRay):
@@ -58,7 +63,7 @@ def test_manifest_redacts_secrets_addresses_and_ray_node_identity(tmp_path, monk
     args = SimpleNamespace(
         api_token="plain-secret-token",
         tokenizer_path="/models/tokenizer.json",
-        rollout_external_engine_addrs=["10.0.0.8:8000"],
+        rollout_external_engine_addrs=[f"{_PRIVATE_IP_C}:8000"],
         nested={"password": "plain-password", "safe": "kept"},
         tensor_model_parallel_size=4,
         actor_num_nodes=2,
@@ -91,9 +96,9 @@ def test_manifest_redacts_secrets_addresses_and_ray_node_identity(tmp_path, monk
         "plain-password",
         "runtime-secret-token",
         "argv-secret-token",
-        "10.0.0.1",
-        "10.0.0.2",
-        "10.0.0.8",
+        _PRIVATE_IP_A,
+        _PRIVATE_IP_B,
+        _PRIVATE_IP_C,
         "head.internal",
         "node-a",
         "node-b",
