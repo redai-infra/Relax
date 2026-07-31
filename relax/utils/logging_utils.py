@@ -234,8 +234,16 @@ def get_logger(name: str, prefix: str = "") -> LazyConfiguredLogger:
     logger = logging.getLogger(name)
     logging.setLoggerClass(logging.Logger)  # Reset to default for other loggers
 
-    if not isinstance(logger, LazyConfiguredLogger):
-        # If logger already exists and is not our class, create a new instance
-        logger = LazyConfiguredLogger(name)
+    if not isinstance(logger, LazyConfiguredLogger) and type(logger) is logging.Logger:
+        # Upgrade the manager-registered instance in place instead of building a
+        # detached `LazyConfiguredLogger(name)`: a Logger constructed directly
+        # (not via getLogger) has parent=None and no handlers, so every record
+        # it emits falls through to logging.lastResort (WARNING+) and INFO
+        # output silently disappears. The name can pre-exist as a plain Logger
+        # because Ray/cloudpickle reconstructs @ray.remote class namespaces by
+        # value and unpickles their module-global loggers via getLogger(name)
+        # with the default logger class (see _LOCAL_ROLLOUT_MANAGER note in
+        # relax/distributed/ray/rollout.py).
+        logger.__class__ = LazyConfiguredLogger
 
     return logger
