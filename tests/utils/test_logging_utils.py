@@ -80,8 +80,8 @@ def test_upgraded_logger_emits_info_records():
     """End-to-end guard on the actual failure mode: dropped INFO records.
 
     ``LazyConfiguredLogger`` installs its own handler on first use, so the
-    record is asserted at the logger's own handlers rather than at the root.
-    A detached logger has no handlers at all and would drop the record to
+    record is asserted at the logger's own handlers rather than at the root. A
+    detached logger has no handlers at all and would drop the record to
     ``logging.lastResort``, which only passes WARNING and above.
     """
     name = "relax_test.logging_utils.emit"
@@ -111,6 +111,37 @@ def test_upgraded_logger_emits_info_records():
 
         assert "rloo-metrics-visible" in records
     finally:
+        _unregister(name)
+
+
+def test_get_logger_leaves_global_logger_class_untouched():
+    """get_logger must not mutate process-global logging state.
+
+    The previous implementation flipped ``logging.setLoggerClass`` around its
+    ``getLogger`` call, which raced with concurrent ``getLogger`` calls on
+    other threads and reset third-party default logger classes to
+    ``logging.Logger``.
+    """
+
+    class _ThirdPartyLogger(logging.Logger):
+        pass
+
+    name = "relax_test.logging_utils.global_class"
+    _unregister(name)
+    previous_class = logging.getLoggerClass()
+    try:
+        logging.setLoggerClass(_ThirdPartyLogger)
+
+        logger = get_logger(name)
+
+        # The third-party default class must survive get_logger.
+        assert logging.getLoggerClass() is _ThirdPartyLogger
+        # A name created under a third-party default class is respected
+        # (registered and attached), consistent with the subclass test below.
+        assert logging.getLogger(name) is logger
+        assert type(logger) is _ThirdPartyLogger
+    finally:
+        logging.setLoggerClass(previous_class)
         _unregister(name)
 
 
