@@ -1,12 +1,23 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Metric-contract tests for the Megatron P3O loss branch."""
+"""Metric-contract tests for the Megatron P3O loss branch.
+
+``relax.backends.megatron.loss`` imports ``megatron.core`` at module scope, and
+CI installs no megatron. The branch under test only consumes token terms, so the
+megatron surface is stubbed for the import and restored afterwards -- keeping
+these assertions running in CI instead of silently skipping.
+"""
 
 from argparse import Namespace
 
 import torch
 
-from relax.backends.megatron import loss as loss_module
+from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
+
+
+with stubbed_megatron_modules():
+    from relax.backends.megatron import loss as loss_module
+
 from relax.utils.training.p3o_utils import P3OStepContext
 
 

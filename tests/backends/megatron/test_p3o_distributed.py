@@ -12,8 +12,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from relax.backends.megatron import p3o_step
-from relax.backends.megatron.p3o_step import synchronize_p3o_stats
+from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
+
+
+with stubbed_megatron_modules():
+    from relax.backends.megatron import p3o_step
+    from relax.backends.megatron.p3o_step import synchronize_p3o_stats
+
 from relax.utils.training.p3o_utils import (
     P3OSufficientStats,
     compute_p3o_sufficient_stats,

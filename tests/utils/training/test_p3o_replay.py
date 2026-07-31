@@ -8,6 +8,9 @@ produces a plausible-looking loss curve. The distributed matrix (DP/CP/TP/PP) an
 the end-to-end training run require multi-GPU and are covered separately.
 """
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 
@@ -106,7 +109,24 @@ def test_p3o_rng_state_restored_after_prepass():
 
 
 def test_p3o_rng_and_megatron_tracker_restored_after_error(monkeypatch):
-    from megatron.core.tensor_parallel import random as megatron_random
+    # preserved_rng_state() imports the tracker lazily from megatron. CI installs no
+    # megatron, so supply just the one module that import needs; a real install is
+    # used as-is, keeping the GPU path identical.
+    megatron_random = sys.modules.get("megatron.core.tensor_parallel.random")
+    if megatron_random is None:
+        for name in (
+            "megatron",
+            "megatron.core",
+            "megatron.core.tensor_parallel",
+            "megatron.core.tensor_parallel.random",
+        ):
+            module = ModuleType(name)
+            module.__path__ = []
+            monkeypatch.setitem(sys.modules, name, module)
+        megatron_random = sys.modules["megatron.core.tensor_parallel.random"]
+        # Seed the symbol so the monkeypatch below patches rather than invents it,
+        # matching how a real megatron module would look at import time.
+        megatron_random.get_cuda_rng_tracker = lambda: None
 
     class _FakeTracker:
         def __init__(self):

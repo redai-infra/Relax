@@ -2,11 +2,23 @@
 
 """P3O advantage-path parity with GRPO."""
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
-from relax.components.advantages import Advantages
+
+# `relax.components.advantages` imports `megatron.core` at module level. CI installs no
+# megatron, so the import runs under the shared stub; the advantage path under test is
+# pure PyTorch and touches no megatron symbol at call time.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backends" / "megatron"))
+
+from _megatron_stub import stubbed_megatron_modules  # noqa: E402
+
+
+with stubbed_megatron_modules():
+    from relax.components.advantages import Advantages  # noqa: E402
 
 
 def _compute(estimator: str):

@@ -10,7 +10,17 @@ from types import SimpleNamespace
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
 
-from examples.algorithms.p3o import rollout  # noqa: E402
+# ``examples.algorithms.p3o.rollout`` imports ``relax.engine.rollout.sglang_rollout``,
+# which transitively reaches ``megatron.core`` via the checkpoint-service backend.
+# CI installs no megatron, so the import is done under the shared stub to keep this
+# module collectable; the tested wrapper itself is pure dict/await logic.
+sys.path.insert(0, str(REPO_ROOT / "tests" / "backends" / "megatron"))
+
+from _megatron_stub import stubbed_megatron_modules  # noqa: E402
+
+
+with stubbed_megatron_modules():
+    from examples.algorithms.p3o import rollout  # noqa: E402
 
 
 def test_behavior_sampling_params_overrides_training_copy_only():

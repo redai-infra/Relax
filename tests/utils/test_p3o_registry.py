@@ -3,12 +3,24 @@
 """Registration and rollout reward-path tests for P3O."""
 
 import argparse
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-from relax.core.registry import ALGOS
-from relax.utils.arguments import get_slime_extra_args_provider
-from relax.utils.types import Sample
-from relax.utils.utils import post_process_rewards
+
+# `relax.core.registry` eagerly imports `relax.components.advantages`, which imports
+# `megatron.core` at module level. CI installs no megatron, so the import runs under
+# the shared stub; the registry mapping and reward path under test are pure Python.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backends" / "megatron"))
+
+from _megatron_stub import stubbed_megatron_modules  # noqa: E402
+
+
+with stubbed_megatron_modules():
+    from relax.core.registry import ALGOS  # noqa: E402
+    from relax.utils.arguments import get_slime_extra_args_provider  # noqa: E402
+    from relax.utils.types import Sample  # noqa: E402
+    from relax.utils.utils import post_process_rewards  # noqa: E402
 
 
 def test_p3o_registry_parser_accepts_estimator():
