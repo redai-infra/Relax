@@ -68,7 +68,7 @@ RUN pip install pyyaml && \
 RUN cd /root && rm -rf /root/pytorch && \
     pip install triton-ascend==3.2.0 && \
     pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
 
     # Clone Megatron-LM, MindSpeed, MindSpeed-Bridge, Megatron-Bridge and install
 RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \

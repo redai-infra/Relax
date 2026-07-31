@@ -674,7 +674,10 @@ def get_data_from_transfer_queue(
                 )  # type: ignore
 
             if batch_meta.size == 0:
-                rollout_data = [None, None]
+                # Keep the (empty) meta so its extra_info (e.g. dummy_round) rides
+                # the broadcast to every consumer rank — the consumer decides
+                # real vs dummy vs end from what it fetched, no extra RPC.
+                rollout_data = [None, batch_meta]
             else:
                 rollout_data = [tq_client.get_data(batch_meta), batch_meta]
         else:
@@ -782,7 +785,7 @@ def get_data_from_transfer_queue(
     rollout_data, batch_meta, mm_spec = rollout_data[0], rollout_data[1], rollout_data[2]
 
     if rollout_data is None:
-        return None, None
+        return None, batch_meta
 
     # --- Stream multimodal tensors via NCCL (zero-copy, CPU-resident result) ---
     mm_inputs = None
@@ -906,6 +909,7 @@ def post_process_rollout_data(args, rollout_data):
         "rollout_log_probs",
         "advantages",
         "returns",
+        "values",
         *iter_opd_cp_float_fields(),
     ]:
         if key not in rollout_data:
@@ -985,13 +989,20 @@ class StreamingTQIterator:
         dp_rank: Data-parallel rank of this worker.
         dp_size: Data-parallel world size.
         task_name: TQ task name (default ``"actor_train"``).
-        max_samples: Optional local sample limit for one rollout-mini window.
-        rollout_mini_index: Rollout-mini window id, passed to the TQ sampler.
+        window_quota: Global per-window sample count (``mini_global_samples``),
+            forwarded to the TQ sampler. The sampler stops dispatching this
+            rollout-mini window once ``window_quota`` samples have been handed
+            out across ALL DPs; per-DP counts stay uneven (token-budget driven)
+            and the dummy-pad aligns cross-DP micro-batch counts. Termination is
+            the per-window drained signal (``all_consumed_fn``), NOT a per-DP
+            count target. ``None`` (fwd/logprob path) → no window cap.
+        rollout_mini_index: Rollout-mini window id, passed to the TQ sampler
+            (keys the sampler's per-window dispatch counter).
         start_batch_index: First batch index for this iterator; used to keep
             sampler cache keys distinct across rollout-mini windows.
-        overflow_buffer: Shared FIFO of already-fetched samples that crossed a
-            rollout-mini boundary. Used by consecutive rollout-mini iterators.
         max_empty_sleep: Maximum sleep duration (seconds) between empty-poll retries.
+        max_stream_stall_s: Wall-clock timeout for consecutive empty polls while
+            the rollout is not yet drained. Exceeding it raises (deadlock guard).
     """
 
     def __init__(
@@ -1006,14 +1017,17 @@ class StreamingTQIterator:
         dp_rank: int,
         dp_size: int,
         task_name: str = "actor_train",
-        max_samples: Optional[int] = None,
+        window_quota: Optional[int] = None,
         rollout_mini_index: int = 0,
         start_batch_index: int = 0,
-        overflow_buffer: Optional[List[Tuple[Dict[str, Any], Any]]] = None,
         max_empty_sleep: float = 2.0,
+        max_stream_stall_s: float = 3600.0,
+        per_round_dummy: bool = False,
     ) -> None:
-        if max_samples is not None and max_samples <= 0:
-            raise ValueError(f"max_samples must be positive when set, got {max_samples}")
+        if window_quota is not None and window_quota <= 0:
+            raise ValueError(f"window_quota must be positive when set, got {window_quota}")
+        if max_stream_stall_s <= 0:
+            raise ValueError(f"max_stream_stall_s must be positive, got {max_stream_stall_s}")
         self.args = args
         self.tq_client = tq_client
         self.data_fields = data_fields
@@ -1021,14 +1035,30 @@ class StreamingTQIterator:
         self.token_budget = token_budget
         self.loss_scale = loss_scale
         self.all_consumed_fn = all_consumed_fn
+        # per_round_dummy: train path only. When True, on an empty fetch the
+        # iterator reads the DUMMY-round flag from the fetched meta's extra_info
+        # (sampler-driven per-round alignment) and emits a zero-grad dummy micro-
+        # batch so all DPs run equal micro-batch counts (MoE EP all-to-all matches
+        # by call order). The forward-only path keeps this False and uses the
+        # legacy end-phase dummy-pad (a dummy there would corrupt put-back data).
+        self.per_round_dummy = per_round_dummy
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.task_name = task_name
-        self.max_samples = max_samples
+        # Global per-window sample quota (mini_global_samples), forwarded to the
+        # TQ sampler so it stops dispatching this window once the quota is met
+        # across all DPs.  The consumer no longer enforces a per-DP count target;
+        # termination is the per-window drained signal (all_consumed_fn).
+        self.window_quota = window_quota
         self.rollout_mini_index = rollout_mini_index
         self._sample_count: int = 0
-        self._overflow_buffer = overflow_buffer if overflow_buffer is not None else []
         self.max_empty_sleep = max_empty_sleep
+        # Wall-clock guard: if the stream produces no data for this long while
+        # the rollout is NOT yet drained, raise instead of polling forever.
+        # A genuine deadlock (e.g. a sample the sampler never dispatched to any
+        # bucket, so all_consumed can never flip true) then surfaces as a fast,
+        # diagnosable error rather than a silent hang that ends in an OOM kill.
+        self.max_stream_stall_s = max_stream_stall_s
 
         self._batch_index: int = start_batch_index
         self._mb_count: int = 0
@@ -1064,13 +1094,8 @@ class StreamingTQIterator:
 
             self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-tq-prefetch")
 
-    def _remaining_samples(self) -> Optional[int]:
-        if self.max_samples is None:
-            return None
-        return max(self.max_samples - self._sample_count, 0)
-
     def _sampling_config(self, batch_index: int) -> Dict[str, Any]:
-        config = {
+        return {
             "dp_rank": self.dp_rank,
             "dp_size": self.dp_size,
             "task_name": self.task_name,
@@ -1078,17 +1103,11 @@ class StreamingTQIterator:
             "partition_id": f"train_{self.rollout_id}",
             "allow_underfill": True,
             "rollout_mini_index": self.rollout_mini_index,
+            # Global per-window cap for the sampler (mini_global_samples). The
+            # sampler stops dispatching this window once the quota is met across
+            # all DPs; None on the fwd/logprob path → no cap.
+            "window_quota": self.window_quota,
         }
-        remaining_samples = self._remaining_samples()
-        if remaining_samples is not None:
-            config.update(
-                {
-                    "max_samples": self.max_samples,
-                    "consumed_samples": self._sample_count,
-                    "remaining_samples": remaining_samples,
-                }
-            )
-        return config
 
     @staticmethod
     def _num_samples(data: Dict[str, Any]) -> int:
@@ -1098,34 +1117,6 @@ class StreamingTQIterator:
                 return len(value)
         return 0
 
-    @staticmethod
-    def _split_sample_value(value: Any, split_at: int, n_samples: int) -> Tuple[Any, Any]:
-        if isinstance(value, torch.Tensor) and value.dim() > 0 and value.size(0) == n_samples:
-            return value[:split_at], value[split_at:]
-        if isinstance(value, list) and len(value) == n_samples:
-            return value[:split_at], value[split_at:]
-        if isinstance(value, tuple) and len(value) == n_samples:
-            return value[:split_at], value[split_at:]
-        return value, value
-
-    def _split_batch_at_sample(
-        self,
-        data: Dict[str, Any],
-        meta: Any,
-        split_at: int,
-        n_samples: int,
-    ) -> Tuple[Tuple[Dict[str, Any], Any], Tuple[Dict[str, Any], Any]]:
-        if split_at <= 0 or split_at >= n_samples:
-            raise ValueError(f"split_at must be in (0, {n_samples}), got {split_at}")
-
-        current: Dict[str, Any] = {}
-        overflow: Dict[str, Any] = {}
-        for key, value in data.items():
-            current_value, overflow_value = self._split_sample_value(value, split_at, n_samples)
-            current[key] = current_value
-            overflow[key] = overflow_value
-        return (current, meta), (overflow, meta)
-
     def _warm_next_batch_index(self, next_index: int) -> None:
         """Fire-and-forget controller cache warm-up for ``next_index``.
 
@@ -1133,9 +1124,6 @@ class StreamingTQIterator:
         sampling_config / partition / batch_index) so the controller sampler
         prepares & caches all dp slices.  Meta-only: result is discarded.
         """
-        remaining_samples = self._remaining_samples()
-        if remaining_samples is not None and remaining_samples <= 0:
-            return
         if self._prefetch_executor is None or next_index <= self._prefetched_index:
             return
         self._prefetched_index = next_index
@@ -1181,13 +1169,45 @@ class StreamingTQIterator:
 
     def _make_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
         """Build a dummy micro-batch from the last real one, tagged so the loss
-        contributes zero gradient (used to pad short DP ranks to the per-DP
-        max)."""
+        contributes zero gradient (keeps all DP ranks at the same micro-batch
+        count)."""
+        if self._last_batch is None:
+            # A dp asked to emit a dummy before ever seeing a real batch = it got
+            # ZERO samples this window. With the fair per-window quota
+            # (mini_global_samples % dp_size == 0) every dp normally gets >= 1
+            # real sample, so this is pathological — fail loudly rather than
+            # fabricate a shape-less batch.
+            raise RuntimeError(
+                f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
+                f"dp={self.dp_rank} must emit a dummy micro-batch but received zero real samples "
+                "this window (no template to build a dummy from)."
+            )
         data, meta = self._last_batch
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
         return dummy, meta
+
+    def _emit_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
+        """Emit one zero-grad dummy micro-batch for a DUMMY round (this dp is
+        short this round but another dp still has a real slice).
+
+        Advances batch_index + mb_count for lockstep with other DPs; does NOT
+        count toward sample_count or the log buffer (it carries no real data).
+        """
+        dummy = self._make_dummy_batch()
+        self._batch_index += 1
+        self._mb_count += 1
+        if self._mb_count % 20 == 0:
+            logger.info(
+                "[StreamingTQIterator] rollout=%s mini=%d dp=%d dummy round mb=%d batch_index=%d",
+                self.rollout_id,
+                self.rollout_mini_index,
+                self.dp_rank,
+                self._mb_count,
+                self._batch_index,
+            )
+        return dummy
 
     def _finish_real_batches(self, reason: str) -> Tuple[Dict[str, Any], Any]:
         # Real data exhausted. Align mb count across DP ranks: MAX-reduce the
@@ -1205,7 +1225,7 @@ class StreamingTQIterator:
             k_real,
             k_global,
             self._sample_count,
-            f"/{self.max_samples}" if self.max_samples is not None else "",
+            f"/{self.window_quota}" if self.window_quota is not None else "",
             max(0, k_global - k_real),
             total_wait,
             reason,
@@ -1225,7 +1245,6 @@ class StreamingTQIterator:
         data: Dict[str, Any],
         meta: Any,
         tq_wait: float,
-        from_overflow: bool,
     ) -> Tuple[Dict[str, Any], Any]:
         n_samples = self._num_samples(data)
         if n_samples <= 0:
@@ -1234,19 +1253,8 @@ class StreamingTQIterator:
                 "received a non-empty batch with zero sample-aligned fields"
             )
 
-        remaining_samples = self._remaining_samples()
-        if remaining_samples is not None and n_samples > remaining_samples:
-            (data, meta), overflow = self._split_batch_at_sample(data, meta, remaining_samples, n_samples)
-            self._overflow_buffer.insert(0, overflow)
-            logger.info(
-                "[StreamingTQIterator] rollout=%s mini=%d split overfilled mb: used=%d overflow=%d",
-                self.rollout_id,
-                self.rollout_mini_index,
-                remaining_samples,
-                n_samples - remaining_samples,
-            )
-            n_samples = remaining_samples
-
+        # The sampler enforces the per-window global quota, so a fetched mb never
+        # straddles a window boundary — no consumer-side split/spill needed.
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
         self._buffer.append((data, meta))
@@ -1262,8 +1270,7 @@ class StreamingTQIterator:
         # values, which get_batch does not mutate) so the dummy always
         # rebuilds from the pristine raw fields.
         self._last_batch = (dict(data), meta)
-        if not from_overflow:
-            self._batch_index += 1
+        self._batch_index += 1
         self._mb_count += 1
 
         adv_info = ""
@@ -1274,6 +1281,16 @@ class StreamingTQIterator:
                 adv_info = (
                     f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
                 )
+        # ``samples`` reports GLOBAL window progress (sum across all dps) vs the
+        # window quota, so it monotonically approaches ``window_quota`` (e.g.
+        # 256).  The controller piggybacks this global count on the fetched
+        # meta's extra_info (``window_dispatched``) — no cross-DP all_reduce.
+        # Falls back to this dp's local count when the global count is absent
+        # (legacy/non-streaming fetches).
+        extra = getattr(meta, "extra_info", None) or {}
+        window_progress = extra.get("window_dispatched")
+        if window_progress is None:
+            window_progress = self._sample_count
         logger.info(
             "[StreamingTQIterator] rollout=%s mini=%d dp=%d/%d mb=%d source=%s tq_wait=%.3fs "
             "n_samples=%d samples=%d%s loss_scale=%.6f%s",
@@ -1282,18 +1299,17 @@ class StreamingTQIterator:
             self.dp_rank,
             self.dp_size,
             self._mb_count,
-            "overflow" if from_overflow else "tq",
+            "tq",
             tq_wait,
             n_samples,
-            self._sample_count,
-            f"/{self.max_samples}" if self.max_samples is not None else "",
+            window_progress,
+            f"/{self.window_quota}" if self.window_quota is not None else "",
             self.loss_scale,
             adv_info,
         )
-        if not from_overflow:
-            # Warm the controller cache for the next mb while the trainer
-            # computes this one (tail prefetch; meta-only).
-            self._warm_next_batch_index(self._batch_index)
+        # Warm the controller cache for the next mb while the trainer
+        # computes this one (tail prefetch; meta-only).
+        self._warm_next_batch_index(self._batch_index)
         return data, meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
@@ -1318,13 +1334,6 @@ class StreamingTQIterator:
         empty_streak = 0
 
         while True:
-            if self.max_samples is not None and self._sample_count >= self.max_samples:
-                return self._finish_real_batches("rollout mini sample limit reached")
-
-            if self._overflow_buffer:
-                data, meta = self._overflow_buffer.pop(0)
-                return self._emit_data_batch(data, meta, tq_wait=0.0, from_overflow=True)
-
             sampling_config = self._sampling_config(self._batch_index)
             data, meta = get_data_from_transfer_queue(
                 args=self.args,
@@ -1343,20 +1352,31 @@ class StreamingTQIterator:
             if data is not None:
                 tq_wait = time.monotonic() - t0
                 self._tq_wait_times.append(tq_wait)
-                return self._emit_data_batch(data, meta, tq_wait=tq_wait, from_overflow=False)
+                return self._emit_data_batch(data, meta, tq_wait=tq_wait)
 
-            # Data not yet available — check if the rollout is fully consumed.
-            if self.all_consumed_fn():
-                if self.max_samples is not None and self._sample_count < self.max_samples:
+            # Data not yet available for this (dp, batch_index).
+            if self.per_round_dummy:
+                # Train path: the consumer decides from WHAT IT FETCHED — the
+                # sampler carries a DUMMY-round flag in the (empty) meta's
+                # extra_info. DUMMY → this dp is short this round but another dp
+                # still got a real slice; emit a zero-grad dummy and advance so all
+                # dps run the SAME number of micro-batches (MoE EP all-to-all
+                # matches by call order). drained → StopIteration. No extra RPC,
+                # no cross-DP all_reduce.
+                extra = getattr(meta, "extra_info", None) or {}
+                if extra.get("dummy_round"):
+                    return self._emit_dummy_batch()
+                if extra.get("stream_end"):
                     self._shutdown_prefetch()
-                    raise RuntimeError(
-                        f"Transfer queue stream drained before rollout {self.rollout_id} mini "
-                        f"{self.rollout_mini_index} reached its local sample target: "
-                        f"{self._sample_count}/{self.max_samples}"
-                    )
-                return self._finish_real_batches("transfer queue stream drained")
+                    raise StopIteration
+            else:
+                # Forward-only / legacy path: end-phase dummy-pad via all_reduce
+                # (a per-round dummy here would corrupt put-back log-probs).
+                if self.all_consumed_fn():
+                    return self._finish_real_batches("transfer queue window drained (underfill ok)")
 
             empty_streak += 1
+            elapsed = time.monotonic() - t0
             if empty_streak % 20 == 0:
                 logger.info(
                     "[StreamingTQIterator] rollout=%s dp=%d polling: empty_streak=%d "
@@ -1366,7 +1386,20 @@ class StreamingTQIterator:
                     empty_streak,
                     self._batch_index,
                     self._mb_count,
-                    time.monotonic() - t0,
+                    elapsed,
+                )
+            # Deadlock guard: no data for max_stream_stall_s while not drained
+            # means the stream can never complete (e.g. a produced sample that
+            # the sampler never dispatched to any bucket, so all_consumed stays
+            # False forever).  Fail fast and diagnosably instead of hanging.
+            if elapsed >= self.max_stream_stall_s:
+                self._shutdown_prefetch()
+                raise RuntimeError(
+                    f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
+                    f"dp={self.dp_rank} stalled {elapsed:.0f}s (>{self.max_stream_stall_s:.0f}s) with no "
+                    f"data and rollout not drained: samples={self._sample_count} "
+                    f"batch_index={self._batch_index} empty_streak={empty_streak}. Likely a sample was "
+                    "never dispatched to a DP bucket by the sampler, or the drained predicate is stuck."
                 )
             sleep_s = min(0.05 * empty_streak, self.max_empty_sleep)
             time.sleep(sleep_s)

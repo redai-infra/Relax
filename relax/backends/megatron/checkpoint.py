@@ -5,14 +5,18 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 
+import torch
+
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args
 
 from relax.utils import megatron_bridge_utils
+from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.ppo_utils import use_critic_lm_head_for_hf_load
 
 
 try:
@@ -224,10 +228,11 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     if getattr(args, "warm_hf_checkpoint_page_cache", False):
         warm_hf_checkpoint_page_cache(source_path)
 
-    with megatron_bridge_utils.patch_megatron_model(ddp_model):
-        bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
-        with _patch_scatter_dtype_cast():
-            bridge.load_hf_weights(ddp_model)
+    with use_critic_lm_head_for_hf_load(ddp_model):
+        with megatron_bridge_utils.patch_megatron_model(ddp_model):
+            bridge = AutoBridge.from_hf_pretrained(source_path, trust_remote_code=True)
+            with _patch_scatter_dtype_cast():
+                bridge.load_hf_weights(ddp_model)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)
     if (args.fp16 or args.bf16) and optimizer is not None:
@@ -244,3 +249,95 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
 def _is_dir_nonempty(path):
     with os.scandir(path) as it:
         return any(it)
+
+
+def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> None:
+    """Save the LoRA adapter as a standard HF-PEFT directory under
+    ``checkpoint_dir``.
+
+    This is a portable *export* artifact (HF ``adapter_model.safetensors`` +
+    ``adapter_config.json``) for external / inference use — e.g. loading with
+    ``peft.PeftModel.from_pretrained``. It is NOT the resume source: LoRA params are
+    ordinary model parameters, so the native Megatron torch_dist checkpoint already
+    persists and restores them on resume.
+
+    Every rank exports its owned (TP-gathered) adapter params via Megatron-Bridge, the
+    shards are gathered to global rank 0, and rank 0 writes one consolidated adapter.
+
+    Collective: the export + ``gather_object`` MUST run in lockstep on every rank, so
+    nothing before the gather is gated behind a rank check.
+
+    Args:
+        model: The training model (sequence of VPP chunks) with LoRA.
+        checkpoint_dir: Directory where ``lora_adapter/`` will be written.
+        args: Training arguments.
+        bridge: Optional pre-built ``AutoBridge`` (reused by ``save_hf_model``); built
+            from ``args.hf_checkpoint`` when not supplied.
+    """
+
+    import torch.distributed as dist
+
+    from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, write_hf_peft_adapter
+
+    if bridge is None:
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+
+    # Export this rank's owned adapter params (TP already gathered by the bridge);
+    # cpu=True so the tensors can travel over the gloo gather below.
+    with megatron_bridge_utils.patch_megatron_model(model):
+        local_adapter = {
+            item.param_name: item.weight.detach().cpu() for item in bridge.export_adapter_weights(model, cpu=True)
+        }
+
+    gloo = get_gloo_group()
+    is_dst = dist.get_rank() == 0
+    gathered = [None] * dist.get_world_size(group=gloo) if is_dst else None
+    dist.gather_object(local_adapter, object_gather_list=gathered, dst=0, group=gloo)
+    if not is_dst:
+        return
+
+    merged: dict[str, torch.Tensor] = {}
+    for shard in gathered:
+        if shard:
+            merged.update(shard)
+    if not merged:
+        logger.warning("LoRA enabled but no adapter parameters were gathered; skipping LoRA save")
+        return
+
+    adapter_dir = Path(checkpoint_dir) / "lora_adapter"
+    # args.lora_target_modules holds canonical Megatron names; the on-disk HF-PEFT
+    # adapter_config.json must carry HF-style names so standard PEFT loaders can match
+    # them against the HF module tree.
+    write_hf_peft_adapter(
+        merged,
+        adapter_dir,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        target_modules=convert_megatron_to_hf_target_modules(args.lora_target_modules),
+        lora_dropout=args.lora_dropout,
+    )
+
+    # Sidecar metadata for resume-time mode-mismatch diagnostics. Kept separate from
+    # adapter_config.json so it can never confuse load_peft_adapter.
+    import json
+
+    metadata = {
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_target_modules": list(args.lora_target_modules),
+        "lora_dropout": args.lora_dropout,
+        "lora_merge_mode": args.lora_merge_mode,
+        "lora_adapter_mode": getattr(args, "lora_adapter_mode", False),
+    }
+    with open(adapter_dir / "relax_lora_meta.json", "w") as f:
+        json.dump(metadata, f)
+
+    if metadata["lora_adapter_mode"]:
+        mode_str = "adapter"
+    elif metadata["lora_merge_mode"]:
+        mode_str = "merge"
+    else:
+        mode_str = "standard"
+    logger.info(f"Saved LoRA adapter to {adapter_dir} ({len(merged)} tensors, mode={mode_str})")

@@ -3,11 +3,97 @@
 # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
+import contextlib
 from argparse import Namespace
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def validate_ppo_config(config: Namespace) -> None:
+    if getattr(config, "advantage_estimator", None) != "ppo":
+        return
+
+    resource = getattr(config, "resource", None) or {}
+    if "critic" not in resource:
+        raise ValueError("--advantage-estimator ppo requires a 'critic' entry in --resource.")
+
+    if getattr(config, "fully_async", False) or getattr(config, "hybrid", False):
+        raise ValueError("PPO does not currently support --fully-async or --hybrid.")
+
+    is_sync_colocate = getattr(config, "colocate", False) and not getattr(config, "fully_async", False)
+    if is_sync_colocate and getattr(config, "max_staleness", 0) != 0:
+        raise ValueError("Synchronous colocate PPO requires --max-staleness 0.")
+
+    _validate_actor_critic_resume_consistency(config)
+
+
+def _validate_actor_critic_resume_consistency(config: Namespace) -> None:
+    """Keep actor and critic checkpoints in lockstep.
+
+    If both sides are cold-started or both resume from the same iteration, we
+    do nothing. If only one side has a tracker (typical when actor's ckpt was
+    wiped after a crash but critic's stale ckpt lingered), fall back to cold-
+    start on both by routing the surviving side at a path without a tracker —
+    Megatron then re-inits from ``--hf-checkpoint``. Only raise when both sides
+    have trackers at different iterations, which is a genuine inconsistency the
+    user must resolve.
+    """
+    actor_load = getattr(config, "load", None)
+    critic_load = getattr(config, "critic_load", None) or actor_load
+    actor_iter = _read_latest_iter(actor_load)
+    critic_iter = _read_latest_iter(critic_load)
+
+    if actor_iter == critic_iter:
+        return
+
+    if actor_iter is None and critic_iter is not None and actor_load is not None:
+        logger.warning(
+            f"PPO resume: actor has no tracker at {actor_load!r} while critic has "
+            f"iter={critic_iter} at {critic_load!r}. Cold-starting both from "
+            f"--hf-checkpoint to keep them in sync; the stale critic ckpt is left "
+            f"on disk — delete it manually if you want cleanup."
+        )
+        config.critic_load = actor_load
+        return
+
+    if critic_iter is None and actor_iter is not None and critic_load is not None:
+        logger.warning(
+            f"PPO resume: critic has no tracker at {critic_load!r} while actor has "
+            f"iter={actor_iter} at {actor_load!r}. Cold-starting both from "
+            f"--hf-checkpoint to keep them in sync; the stale actor ckpt is left "
+            f"on disk — delete it manually if you want cleanup."
+        )
+        config.load = critic_load
+        return
+
+    raise ValueError(
+        "PPO resume requires actor and critic checkpoints to be in the same state, "
+        f"but got actor iter={actor_iter} at --load={actor_load!r} and "
+        f"critic iter={critic_iter} at --critic-load={critic_load!r}. "
+        "Either provide both Megatron checkpoints at the same iteration, or remove both "
+        "so training cold-starts from --hf-checkpoint for actor and critic."
+    )
+
+
+def _read_latest_iter(load_path: str | None) -> int | None:
+    """Return the iteration recorded in a Megatron checkpoint tracker."""
+    if not load_path:
+        return None
+    tracker = Path(load_path) / "latest_checkpointed_iteration.txt"
+    if not tracker.is_file():
+        return None
+    try:
+        return int(tracker.read_text().strip())
+    except (ValueError, OSError):
+        return None
 
 
 @torch.compile(dynamic=True)
@@ -503,6 +589,7 @@ def get_advantages_and_returns_batch(
     gamma,
     lambd,
     chunked: bool = True,
+    padded_total_lengths=None,
 ):
     """Batched GAE with CP support.
 
@@ -533,15 +620,14 @@ def get_advantages_and_returns_batch(
             full_values_list = []
             full_rewards_list = []
 
-            for total_len, resp_len, v, r in zip(
-                total_lengths, response_lengths, values_list, rewards_list, strict=False
+            for idx, (total_len, resp_len, v, r) in enumerate(
+                zip(total_lengths, response_lengths, values_list, rewards_list, strict=False)
             ):
-                full_v = all_gather_with_cp(v, total_len, resp_len)
-                full_r = all_gather_with_cp(r, total_len, resp_len)
+                ptl = padded_total_lengths[idx] if padded_total_lengths is not None else None
+                full_v = all_gather_with_cp(v, total_len, resp_len, padded_total_length=ptl)
+                full_r = all_gather_with_cp(r, total_len, resp_len, padded_total_length=ptl)
                 full_values_list.append(full_v)
                 full_rewards_list.append(full_r)
-
-            # full_values_list[i].shape = [total_len_i]
         else:
             full_values_list = values_list
             full_rewards_list = rewards_list
@@ -578,18 +664,27 @@ def get_advantages_and_returns_batch(
         if cp_size > 1:
             from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
 
-            for total_len, resp_len, adv_row, ret_row in zip(
-                total_lengths,
-                response_lengths,
-                full_advantages,
-                full_returns,
-                strict=False,
+            for idx, (total_len, resp_len, adv_row, ret_row) in enumerate(
+                zip(
+                    total_lengths,
+                    response_lengths,
+                    full_advantages,
+                    full_returns,
+                    strict=False,
+                )
             ):
-                adv_full = adv_row  # shape = [resp_len_i padded to max_len]
-                ret_full = ret_row
-
-                adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len)
-                ret_sliced = slice_log_prob_with_cp(ret_full[:resp_len], total_len, resp_len)
+                adv_sliced = slice_log_prob_with_cp(
+                    adv_row[:resp_len],
+                    total_len,
+                    resp_len,
+                    padded_total_length=padded_total_lengths[idx] if padded_total_lengths is not None else None,
+                )
+                ret_sliced = slice_log_prob_with_cp(
+                    ret_row[:resp_len],
+                    total_len,
+                    resp_len,
+                    padded_total_length=padded_total_lengths[idx] if padded_total_lengths is not None else None,
+                )
 
                 advantages_list.append(adv_sliced)
                 returns_list.append(ret_sliced)
@@ -801,3 +896,316 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
             entropy = logits.new_zeros((0,))
 
     return log_prob, entropy
+
+
+# ============================================================================
+# PPO critic value head plumbing (Megatron backend)
+#
+# All helpers below manipulate a scalar value head that replaces the vocab-
+# sized LM head on the critic model. They must be co-located because Bridge /
+# DDP / optimizer construction order matters (see design doc
+# docs/superpowers/specs/2026-07-22-critic-value-head-registration-design.md).
+#
+# Megatron imports are lazy so this module stays importable in FSDP-only
+# / non-Megatron setups (``ppo_utils`` is loaded by cross-backend callers).
+# ============================================================================
+
+
+_RELAX_HF_OUTPUT_LAYER_ATTR = "_relax_hf_output_layer"
+
+_CRITIC_VH_INIT_STATS_ATTR = "_critic_value_head_init_stats"
+_CRITIC_VH_VERIFIED_ATTR = "_critic_value_head_verified"
+_CRITIC_VH_CHECK_COUNT_ATTR = "_critic_value_head_check_count"
+_CRITIC_VH_WARN_AFTER_STEPS = 5
+
+
+class LinearForLastLayer(torch.nn.Linear):
+    """Scalar value head that swaps in for Megatron's
+    ``GPTModel.output_layer``.
+
+    Sequence-parallel-aware: if ``config.sequence_parallel`` is set, the
+    forward gathers the SP output so downstream slicing sees the full
+    sequence dimension.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config,  # megatron.core.transformer.TransformerConfig — forward ref to avoid top-level megatron dep
+        bias: bool = True,
+    ) -> None:
+        super().__init__(in_features=input_size, out_features=output_size, bias=bias)
+        self.sequence_parallel = config.sequence_parallel
+        if self.sequence_parallel:
+            self.weight.sequence_parallel = True
+            if bias:
+                self.bias.sequence_parallel = True
+
+        self.weight.data.normal_(mean=0.0, std=0.02)
+        if bias:
+            self.bias.data.zero_()
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        runtime_gather_output: bool | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        logits = super().forward(input_)
+        logits = logits.float()
+        if self.sequence_parallel:
+            from megatron.core import tensor_parallel
+
+            logits = tensor_parallel.gather_from_sequence_parallel_region(logits, tensor_parallel_output_grad=False)
+        return logits, None
+
+
+def _find_output_layer_owner(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Walk DDP / Float16Module / bridge-VL wrappers to the module that owns
+    ``output_layer``.
+
+    Handles the common Bridge convention where VL/Omni models nest the inner
+    GPTModel under ``.language_model``. Returns None on non-last PP stages
+    (where ``output_layer`` is ``nn.Identity``).
+    """
+    current = model
+    for _ in range(6):
+        for candidate in (current, getattr(current, "language_model", None)):
+            if candidate is None:
+                continue
+            output_layer = getattr(candidate, "output_layer", None)
+            if output_layer is not None and not isinstance(output_layer, torch.nn.Identity):
+                return candidate
+        current = getattr(current, "module", None)
+        if current is None:
+            break
+    return None
+
+
+def install_critic_value_head_in_provider(
+    model: torch.nn.Module,
+    role: str,
+    post_process: bool,
+    *,
+    stash_lm_head: bool = False,
+) -> None:
+    """Swap ``model.output_layer`` for a ``LinearForLastLayer(hidden, 1)``.
+
+    Called from ``get_model_provider_func`` after the underlying provider
+    (Bridge / custom / default) builds a ``GPTModel``. Running before
+    ``get_model(..., wrap_with_ddp=True)`` and ``get_megatron_optimizer(...)``
+    is what lets DDP and the optimizer own the value head from the start;
+    doing this after wrap orphans the new params.
+
+    ``stash_lm_head=True`` (Bridge path only) preserves the original LM head
+    as an unregistered attribute so ``use_critic_lm_head_for_hf_load`` can
+    restore it during HF weight conversion.
+    """
+    if role != "critic" or not post_process:
+        return
+
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+
+    output_layer = owner.output_layer
+    if isinstance(output_layer, LinearForLastLayer) and output_layer.out_features == 1:
+        return
+
+    if stash_lm_head:
+        object.__setattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR, output_layer)
+    owner.output_layer = LinearForLastLayer(
+        input_size=owner.config.hidden_size,
+        output_size=1,
+        config=owner.config,
+    )
+
+
+@contextlib.contextmanager
+def use_critic_lm_head_for_hf_load(model):
+    """Temporarily restore the stashed LM head for HF Bridge weight loading.
+
+    Bridge can only convert HF weights against a vocab-sized ``output_layer``;
+    the scalar value head is put back in ``finally`` (asserting the exact same
+    object survives) so DDP / optimizer references remain valid.
+    """
+    restored_heads = []
+    try:
+        for model_chunk in model:
+            owner = _find_output_layer_owner(model_chunk)
+            if owner is None or not hasattr(owner, _RELAX_HF_OUTPUT_LAYER_ATTR):
+                continue
+
+            value_head = owner.output_layer
+            value_param_ids = tuple(id(param) for param in value_head.parameters())
+            lm_head = getattr(owner, _RELAX_HF_OUTPUT_LAYER_ATTR)
+            restored_heads.append((owner, value_head, value_param_ids))
+
+            value_param = next(value_head.parameters(), None)
+            if value_param is not None:
+                lm_head.to(device=value_param.device, dtype=value_param.dtype)
+            owner.output_layer = lm_head
+        yield
+    finally:
+        for owner, value_head, value_param_ids in reversed(restored_heads):
+            owner.output_layer = value_head
+            object.__delattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR)
+            assert owner.output_layer is value_head, "critic value head object changed during HF checkpoint loading"
+            assert tuple(id(param) for param in value_head.parameters()) == value_param_ids, (
+                "critic value head parameters changed during HF checkpoint loading"
+            )
+
+
+def release_critic_lm_heads(model) -> None:
+    """Drop the stashed LM-head reference after checkpoint load finishes."""
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is not None and hasattr(owner, _RELAX_HF_OUTPUT_LAYER_ATTR):
+            object.__delattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR)
+
+
+def _ddp_owns_param(model_chunk: torch.nn.Module, param: torch.nn.Parameter) -> bool:
+    if getattr(param, "main_grad", None) is not None:
+        return True
+    for module in (model_chunk, getattr(model_chunk, "module", None)):
+        if module is None:
+            continue
+        for attr in ("param_to_buffer", "param_to_bucket", "param_to_bucket_group"):
+            mapping = getattr(module, attr, None)
+            if mapping is not None and param in mapping:
+                return True
+    return False
+
+
+def validate_critic_value_head_registration(model, optimizer) -> tuple[int, ...]:
+    """Fail-fast structural checks for the critic value head.
+
+    We verify shape and DDP ownership. DDP ownership is the load-bearing
+    contract: once ``main_grad`` is allocated for a param, Megatron guarantees
+    that exactly one DP rank's optimizer shard owns it and will update it
+    during ``optimizer.step()``. We deliberately do NOT assert per-rank
+    optimizer ownership because ``DistributedOptimizer`` shards params across
+    DP ranks — only the shard-owning rank will have ``.main_param`` set or the
+    param id present in its ``opt_group_ranges``.
+    """
+    del optimizer  # kept in signature for future use; ownership is DDP-only
+    value_head_param_ids = []
+
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        value_head = owner.output_layer
+        assert isinstance(value_head, LinearForLastLayer), (
+            f"critic output layer must be LinearForLastLayer, got {type(value_head).__name__}"
+        )
+        assert tuple(value_head.weight.shape) == (1, owner.config.hidden_size), (
+            "critic value head weight must have shape "
+            f"(1, {owner.config.hidden_size}), got {tuple(value_head.weight.shape)}"
+        )
+
+        registered_param_ids = {id(param) for param in model_chunk.parameters()}
+        for name, param in value_head.named_parameters(recurse=False):
+            param_name = f"output_layer.{name}"
+            assert id(param) in registered_param_ids, (
+                f"critic value head parameter {param_name} is not registered in the live model"
+            )
+            assert _ddp_owns_param(model_chunk, param), f"DDP does not own critic value head parameter {param_name}"
+            value_head_param_ids.append(id(param))
+
+    return tuple(value_head_param_ids)
+
+
+def snapshot_critic_value_head_state(model) -> dict:
+    """One-scalar-per-param snapshot of value head weights, keyed by
+    chunk+name.
+
+    Uses ``.item()`` so this is a GPU→CPU sync — call once at initialization,
+    never in the hot path. Returns an empty dict when this rank has no post-
+    process value head (e.g., non-last PP stage).
+    """
+    stats: dict[str, float] = {}
+    for chunk_idx, model_chunk in enumerate(model):
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        for name, param in owner.output_layer.named_parameters(recurse=False):
+            stats[f"chunk{chunk_idx}.output_layer.{name}"] = param.detach().float().abs().sum().item()
+    return stats
+
+
+def has_critic_value_head_moved(model, init_stats: dict) -> bool | None:
+    """Return True if any value head param differs from its init snapshot.
+
+    Returns ``None`` when this rank has no value head to check (empty
+    ``init_stats``) so callers can skip logging for non-post-process ranks.
+    Uses ``.item()``; caller should gate invocation to avoid per-step syncs.
+    """
+    if not init_stats:
+        return None
+    for chunk_idx, model_chunk in enumerate(model):
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        for name, param in owner.output_layer.named_parameters(recurse=False):
+            key = f"chunk{chunk_idx}.output_layer.{name}"
+            init_val = init_stats.get(key)
+            if init_val is None:
+                continue
+            current = param.detach().float().abs().sum().item()
+            if current != init_val:
+                return True
+    return False
+
+
+def install_critic_value_head_runtime_check(model) -> None:
+    """Arm the resident value-head-movement check on ``model[0]``.
+
+    Records a scalar snapshot of the value head weights and initializes the
+    per-run state that ``maybe_verify_critic_value_head_movement`` consumes.
+    Safe to call for non-post-process PP ranks — the snapshot is empty and the
+    check will short-circuit as ``verified``.
+    """
+    init_stats = snapshot_critic_value_head_state(model)
+    setattr(model[0], _CRITIC_VH_INIT_STATS_ATTR, init_stats)
+    setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, not init_stats)
+    setattr(model[0], _CRITIC_VH_CHECK_COUNT_ATTR, 0)
+
+
+def maybe_verify_critic_value_head_movement(model, optimizer, update_successful: bool) -> None:
+    """Resident check that the critic value head is actually being updated.
+
+    Costs one ``.item()`` per value head param per call; short-circuits after
+    first observed movement so long-run overhead is zero. Emits a
+    ``logger.warning`` (never asserts) after ``_CRITIC_VH_WARN_AFTER_STEPS``
+    eligible steps still show no movement. Skips silently on ineligible steps
+    (warmup ``lr==0``, grad-overflow ``update_successful=False``, actor role,
+    non-post-process PP rank) so it never false-alarms.
+    """
+    if getattr(model[0], "role", "actor") != "critic":
+        return
+    if getattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True):
+        return
+    if not update_successful:
+        return
+    if not any(pg.get("lr", 0.0) > 0 for pg in optimizer.param_groups):
+        return
+
+    init_stats = getattr(model[0], _CRITIC_VH_INIT_STATS_ATTR)
+    moved = has_critic_value_head_moved(model, init_stats)
+    if moved is True:
+        setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True)
+        return
+    if moved is False:
+        count = getattr(model[0], _CRITIC_VH_CHECK_COUNT_ATTR) + 1
+        setattr(model[0], _CRITIC_VH_CHECK_COUNT_ATTR, count)
+        if count >= _CRITIC_VH_WARN_AFTER_STEPS:
+            logger.warning(
+                "Critic value head weights unchanged after %d successful optimizer "
+                "steps with lr>0 — suspect the head is not registered in DDP/optimizer. "
+                "Verify get_model_provider_func installs the head before setup_model_and_optimizer.",
+                count,
+            )
+            setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True)

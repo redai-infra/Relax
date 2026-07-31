@@ -46,7 +46,7 @@ ______________________________________________________________________
 - 🔁 **Hybrid Mode** — Separate Actor/Rollout placement groups with TransferQueue streaming, while ref / actor_fwd / advantages run in-process on the actor — pairs `--balance-data` with sub-batched forward to minimize GPU waste
 - 🤖 **Agentic RL** — Multi-turn interaction, loss masking, flexible termination, and VLM multimodal context carry-over for closed-loop "execute → observe → decide" training
 - 🔀 **Elastic Rollout Scaling** — Dynamically grow/shrink inference engines mid-training via HTTP REST API, with same-cluster (`ray_native`) and cross-cluster (`external`) federation modes
-- 🧠 **Rich Algorithm Suite** — GRPO, GSPO, SAPO, and On-Policy Distillation out of the box, with pluggable rewards and built-in **GenRM** (LLM-as-judge) mode
+- 🧠 **Rich Algorithm Suite** — PPO, GRPO, GSPO, SAPO, CISPO, and On-Policy Distillation out of the box, with pluggable rewards and built-in **GenRM** (LLM-as-judge) mode
 - 🚀 **Megatron + SGLang Backends** — Megatron-LM (TP/PP/CP/EP) for MoE and deep models, SGLang for high-throughput inference, DCS for NCCL-broadcast weight sync
 - 📦 **Production-Ready Ops** — HealthManager auto-recovery, centralized Metrics Service (WandB / TensorBoard / ClearML), and Apprise real-time notifications
 
@@ -93,9 +93,10 @@ ______________________________________________________________________
 
 | Algorithm                  | Type                | Description                                       |
 | :------------------------- | :------------------ | :------------------------------------------------ |
+| **PPO**                    | Actor-Critic        | Proximal Policy Optimization                      |
 | **GRPO**                   | Policy Optimization | Group Relative Policy Optimization                |
-| **GSPO**                   | Policy Optimization | Group Sample Policy Optimization                  |
-| **SAPO**                   | Policy Optimization | Sample-Aware Policy Optimization                  |
+| **GSPO**                   | Policy Optimization | Group-wise Sequence-level Policy Optimization     |
+| **SAPO**                   | Policy Optimization | Soft Adaptive Policy Optimization                 |
 | **CISPO**                  | Policy Optimization | Clipped Importance-ratio Soft Policy Optimization |
 | **On-Policy Distillation** | Knowledge Transfer  | Teacher-student KL penalty distillation           |
 

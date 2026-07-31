@@ -210,6 +210,28 @@ if __name__ == "__main__":
         if source is not None and original_save_generator is not None:
             source.save_generator = original_save_generator
 
+    # Work around a Megatron-Bridge bug: with strict=False, export_ckpt writes each
+    # incomplete shard without the tensors the checkpoint lacked (e.g. MTP), yet still
+    # lists those keys in model.safetensors.index.json, producing "ghost" entries that
+    # point at shards which do not contain them. Reconcile the index against the shards
+    # and supplement missing MTP weights from the reference model so the export stays
+    # loadable/deployable (e.g. for EAGLE speculative decoding). The FP8 path uses a
+    # separate streaming writer with its own index and is left untouched here.
+    if not args.fp8:
+        from relax.utils.hf_export import reconcile_hf_export_index
+
+        reconcile_summary = reconcile_hf_export_index(
+            args.output_dir,
+            reference_hf_dir=args.origin_hf_dir,
+            supplement_mtp=allow_missing_mtp_keys,
+        )
+        if reconcile_summary["ghosts"]:
+            print(
+                f"[convert] reconciled index: {len(reconcile_summary['ghosts'])} ghost key(s), "
+                f"{len(reconcile_summary['supplemented'])} MTP supplemented, "
+                f"{len(reconcile_summary['dropped'])} dropped"
+            )
+
     # Make the output dir consumable by older transformers 4.x releases.
     import json
     import shutil
