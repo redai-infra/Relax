@@ -274,9 +274,6 @@ def dict_to_tensordict(
     result = {}
 
     for key, value in data.items():
-        if key == "multimodal_train_inputs" and isinstance(value, TensorDict):
-            result[key] = value
-            continue
         if not isinstance(value, list):
             raise TypeError(f"Value for key '{key}' must be a list, got {type(value)}")
         if key == "rollout_routed_experts":

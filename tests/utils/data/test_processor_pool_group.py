@@ -18,10 +18,6 @@ def _sample(prompt, multimodal_inputs):
     return SimpleNamespace(prompt=prompt, multimodal_inputs=multimodal_inputs)
 
 
-def _packed_rows(packed):
-    return [dict(row.items()) for row in packed.unbind(0)]
-
-
 def _torch():
     return pytest.importorskip("torch")
 
@@ -75,16 +71,15 @@ def test_group_multimodal_transfer_keeps_one_payload_and_reconstructs_aliases():
 
     packed, source_count, ref_count = pack_group_multimodal_train_inputs(samples, group_size=8)
 
-    assert type(packed).__name__ == "TensorDict"
+    assert isinstance(packed, list)
     assert source_count == 1
     assert ref_count == 7
-    rows = _packed_rows(packed)
-    assert rows[0][MM_GROUP_ID_KEY] == 9
-    assert rows[0][MM_GROUP_OWNER_KEY]
-    assert rows[0]["pixel_values"].numel() == tensor.numel()
-    assert all(row["pixel_values"].numel() == 0 for row in rows[1:])
+    assert packed[0][MM_GROUP_ID_KEY] == 9
+    assert packed[0][MM_GROUP_OWNER_KEY]
+    assert packed[0]["pixel_values"] is tensor
+    assert all(row == {MM_GROUP_ID_KEY: 9, MM_GROUP_OWNER_KEY: False} for row in packed[1:])
 
-    unpacked = unpack_group_multimodal_train_inputs(list(reversed(rows)), group_size=8)
+    unpacked = unpack_group_multimodal_train_inputs(list(reversed(packed)), group_size=8)
 
     assert len(unpacked) == 8
     assert len({item["pixel_values"].untyped_storage().data_ptr() for item in unpacked}) == 1
@@ -159,7 +154,7 @@ def test_group_multimodal_transfer_supports_interleaved_complete_groups():
     ]
 
     packed, source_count, ref_count = pack_group_multimodal_train_inputs(samples, group_size=4)
-    unpacked = unpack_group_multimodal_train_inputs(_packed_rows(packed), group_size=4)
+    unpacked = unpack_group_multimodal_train_inputs(packed, group_size=4)
 
     assert source_count == 2
     assert ref_count == 6
@@ -192,3 +187,49 @@ def test_group_multimodal_transfer_rejects_reserved_marker_collision():
 
     with pytest.raises(ValueError, match="collides with Relax group transfer marker keys"):
         pack_group_multimodal_train_inputs(samples, group_size=8)
+
+
+def test_group_multimodal_transfer_supports_transfer_queue_position_selection():
+    torch = _torch()
+    tensordict = pytest.importorskip("tensordict")
+    manager_module = pytest.importorskip("transfer_queue.storage.managers.simple_storage_manager")
+    serial_utils = pytest.importorskip("transfer_queue.utils.serial_utils")
+    tensor = torch.arange(100_000, dtype=torch.uint8)
+    samples = [SimpleNamespace(group_index=9, multimodal_train_inputs={"pixel_values": tensor}) for _ in range(8)]
+    packed, source_count, ref_count = pack_group_multimodal_train_inputs(samples, group_size=8)
+    rollout_data = tensordict.TensorDict({"multimodal_train_inputs": packed}, batch_size=[8])
+    field = rollout_data["multimodal_train_inputs"]
+
+    selected_by_position = {}
+    for positions in ([0, 2, 5], [1, 3, 7], [4, 6]):
+        selected = manager_module.AsyncSimpleStorageManager._select_by_positions(field, positions)
+        selected_by_position.update(zip(positions, selected, strict=True))
+    merged = [selected_by_position[position] for position in range(8)]
+    unpacked = unpack_group_multimodal_train_inputs(merged, group_size=8)
+
+    assert source_count == 1
+    assert ref_count == 7
+    assert len({item["pixel_values"].untyped_storage().data_ptr() for item in unpacked}) == 1
+
+    packed_frames = serial_utils.encode(
+        {
+            "multimodal_train_inputs": manager_module.AsyncSimpleStorageManager._select_by_positions(
+                field,
+                list(range(8)),
+            )
+        }
+    )
+    dense_field = tensordict.TensorDict(
+        {"multimodal_train_inputs": [{"pixel_values": tensor} for _ in range(8)]},
+        batch_size=[8],
+    )["multimodal_train_inputs"]
+    dense_frames = serial_utils.encode(
+        {
+            "multimodal_train_inputs": manager_module.AsyncSimpleStorageManager._select_by_positions(
+                dense_field,
+                list(range(8)),
+            )
+        }
+    )
+
+    assert sum(len(frame) for frame in packed_frames) * 4 < sum(len(frame) for frame in dense_frames)

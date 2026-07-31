@@ -109,8 +109,9 @@ def validate_group_multimodal_transport_ref(item: dict[str, Any]) -> None:
 def pack_group_multimodal_train_inputs(
     samples: Sequence[Any],
     group_size: int,
-) -> tuple[Any, int, int]:
-    """Build a batch-shaped payload with one non-empty tensor per group."""
+) -> tuple[list[dict[str, Any] | None], int, int]:
+    """Store one tensor payload per complete prompt group and lightweight refs
+    for the remaining samples."""
     if group_size <= 1:
         raise ValueError(f"group_size must be greater than 1, got {group_size}")
 
@@ -145,42 +146,13 @@ def pack_group_multimodal_train_inputs(
             return original, 0, 0
         source_positions[group_index] = positions[0]
 
-    first = original[0]
-    if not isinstance(first, dict) or not first:
-        return original, 0, 0
-    if any(not isinstance(item, dict) or item.keys() != first.keys() for item in original):
-        return original, 0, 0
-
-    import torch
-    from tensordict import TensorDict
-
-    fields: dict[str, torch.Tensor] = {}
-    for key in first:
-        values = [item[key] for item in original]
-        if any(
-            not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.ndim == 0 for value in values
-        ):
-            return original, 0, 0
-        trailing_shape = values[0].shape[1:]
-        if any(value.shape[1:] != trailing_shape for value in values[1:]):
-            return original, 0, 0
-
-        compact_values = []
-        for position, (sample, value) in enumerate(zip(samples, values, strict=True)):
-            is_owner = source_positions[sample.group_index] == position
-            compact_values.append(value if is_owner else value.new_empty((0, *value.shape[1:])))
-        try:
-            fields[key] = torch.nested.as_nested_tensor(compact_values, layout=torch.jagged)
-        except (RuntimeError, TypeError, ValueError):
-            return original, 0, 0
-
-    fields[MM_GROUP_ID_KEY] = torch.tensor([sample.group_index for sample in samples], dtype=torch.long)
-    fields[MM_GROUP_OWNER_KEY] = torch.tensor(
-        [source_positions[sample.group_index] == position for position, sample in enumerate(samples)],
-        dtype=torch.bool,
-    )
-    packed = TensorDict(fields, batch_size=[len(samples)])
-
+    packed: list[dict[str, Any]] = []
+    for position, sample in enumerate(samples):
+        is_owner = source_positions[sample.group_index] == position
+        item = _copy_multimodal_train_inputs(original[position]) if is_owner else {}
+        item[MM_GROUP_ID_KEY] = sample.group_index
+        item[MM_GROUP_OWNER_KEY] = is_owner
+        packed.append(item)
     source_count = len(source_positions)
     return packed, source_count, len(samples) - source_count
 
