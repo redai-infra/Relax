@@ -11,6 +11,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.utils.data.group_processor import pack_group_multimodal_train_inputs
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -151,7 +152,23 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
     if args.multimodal_keys is not None:
-        train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+        multimodal_train_inputs = [sample.multimodal_train_inputs for sample in samples]
+        if (
+            getattr(args, "hybrid", False)
+            and getattr(args, "mm_processor_group_dedup", False)
+            and not getattr(args, "debug_train_only", False)
+        ):
+            multimodal_train_inputs, source_count, ref_count = pack_group_multimodal_train_inputs(
+                samples,
+                args.n_samples_per_prompt,
+            )
+            logger.info(
+                "Packed multimodal transfer payloads: sources=%d, refs=%d, logical_samples=%d",
+                source_count,
+                ref_count,
+                len(multimodal_train_inputs),
+            )
+        train_data["multimodal_train_inputs"] = multimodal_train_inputs
 
     if args.use_opd:
         from relax.engine.rollout.on_policy_distillation import produce_opd_transfer_data
