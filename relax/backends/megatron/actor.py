@@ -14,9 +14,8 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
-from megatron.core import mpu
-
 import transfer_queue as tq
+from megatron.core import mpu
 
 
 try:

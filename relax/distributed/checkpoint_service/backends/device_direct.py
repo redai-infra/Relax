@@ -141,7 +141,7 @@ class DeviceDirectBackend(CommBackend):
             from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
 
             self._bridge_converter = BridgeConverter(args=args, model=model, quantization_config=quantization_config)
-            
+
         # LoRA weight-sync state. Mirrors the colocate UpdateWeightFromTensor fields so the
         # fully-async path supports both merge mode (fold adapter into base, reuse the NCCL
         # broadcast) and adapter mode (base synced once, adapter pushed to SGLang each step).
