@@ -23,11 +23,11 @@ FORMAL_SCRIPTS = {
 def _bash_executable() -> str:
     """Resolve a POSIX bash that can open the repository's own paths.
 
-    A bare ``bash`` argv[0] is not safe to rely on: Windows resolves executables from
-    ``System32`` before ``PATH``, and ``System32\\bash.exe`` is the WSL launcher, which
-    runs in a separate filesystem namespace and cannot open a ``D:\\...`` script path.
-    Prefer an explicit Git-for-Windows bash, and skip rather than fail when no usable
-    POSIX shell exists.
+    A bare ``bash`` argv[0] is not safe to rely on: Windows resolves
+    executables from ``System32`` before ``PATH``, and ``System32\\bash.exe``
+    is the WSL launcher, which runs in a separate filesystem namespace and
+    cannot open a ``D:\\...`` script path. Prefer an explicit Git-for-Windows
+    bash, and skip rather than fail when no usable POSIX shell exists.
     """
     for candidate in (
         shutil.which("bash", path=os.environ.get("GIT_BASH_DIR")),

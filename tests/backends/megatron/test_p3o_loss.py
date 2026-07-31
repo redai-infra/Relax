@@ -3,9 +3,9 @@
 """Metric-contract tests for the Megatron P3O loss branch.
 
 ``relax.backends.megatron.loss`` imports ``megatron.core`` at module scope, and
-CI installs no megatron. The branch under test only consumes token terms, so the
-megatron surface is stubbed for the import and restored afterwards -- keeping
-these assertions running in CI instead of silently skipping.
+CI installs no megatron. The branch under test only consumes token terms, so
+the megatron surface is stubbed for the import and restored afterwards --
+keeping these assertions running in CI instead of silently skipping.
 """
 
 from argparse import Namespace
