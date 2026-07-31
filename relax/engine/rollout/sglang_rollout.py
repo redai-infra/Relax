@@ -27,7 +27,11 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
-from relax.utils.data.group_processor import copy_group_processor_output, get_reusable_group_processor_input
+from relax.utils.data.group_processor import (
+    copy_group_processor_output,
+    get_reusable_group_processor_input,
+    validate_group_multimodal_transport_dp_size,
+)
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
@@ -78,6 +82,8 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
+        if getattr(args, "hybrid", False) and getattr(args, "mm_processor_group_dedup", False):
+            validate_group_multimodal_transport_dp_size(compute_dp_size(args))
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
@@ -92,17 +98,20 @@ class GenerateState(metaclass=SingletonMeta):
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
         self.processor_pool = None
+        processor_pool_size = getattr(args, "mm_processor_pool_size", 0)
         if self.processor is not None:
-            pool_size = getattr(args, "mm_processor_pool_size", 0)
-            if pool_size > 0:
+            if processor_pool_size > 0:
                 try:
                     self.processor_pool = ProcessorPool(
                         model_path=args.hf_checkpoint,
-                        pool_size=pool_size,
+                        pool_size=processor_pool_size,
                         trust_remote_code=True,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
+        # Multimodal preprocessing has its own bound and must not consume an
+        # SGLang inference permit while waiting in the processor executor.
+        self.group_processor_semaphore = asyncio.Semaphore(max(1, processor_pool_size))
 
         capacity = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         self.permit_manager = InferencePermitManager(capacity)
@@ -155,6 +164,12 @@ class GenerateState(metaclass=SingletonMeta):
         _ensure_not_holding_session_lock()
         return self.permit_manager.permit(abort_check=lambda: self.aborted)
 
+    def next_transfer_batch_sequence(self, rollout_id: int) -> int:
+        """Return a process-local dispatch sequence for one TQ partition."""
+        sequence = self.transfer_batch_sequences.get(rollout_id, 0)
+        self.transfer_batch_sequences[rollout_id] = sequence + 1
+        return sequence
+
     async def post_generate(self, url: str, payload: dict, headers: dict | None = None) -> dict:
         """Acquire a per-request permit, honor abort, then POST to the engine.
 
@@ -184,6 +199,10 @@ class GenerateState(metaclass=SingletonMeta):
         # 0 before the first step / when the previous step met its target. fully_async only.
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
+        # A fully-async partition may be filled across two rollout steps, so
+        # sequence state must survive reset() and remain unique per partition.
+        if not hasattr(self, "transfer_batch_sequences"):
+            self.transfer_batch_sequences: dict[int, int] = {}
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
@@ -689,9 +708,7 @@ async def generate_and_rm_group(
         and reusable_processor_input is not None
     ):
         prompt, multimodal_inputs = reusable_processor_input
-        # Preserve the existing request backpressure: group preprocessing occupies
-        # one inference slot instead of bypassing the global semaphore.
-        async with state.semaphore:
+        async with state.group_processor_semaphore:
             if state.aborted and not evaluation:
                 return group
             prompt_ids, train_inputs, processor_elapsed = await _run_image_processor(
@@ -740,10 +757,14 @@ async def generate_and_rm_group(
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
     finally:
-        if processor_cache_attached:
-            for sample in group:
+        for sample in group:
+            if processor_cache_attached:
                 if hasattr(sample, "_group_processor_output"):
                     del sample._group_processor_output
+            if hasattr(sample, "_pre_encoded_mm"):
+                del sample._pre_encoded_mm
+            if hasattr(sample, "_pre_encoded_mm_elapsed"):
+                del sample._pre_encoded_mm_elapsed
 
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm:
@@ -1019,6 +1040,7 @@ async def generate_rollout_async(
                         rollout_id - 1,
                         data_system_client,
                         is_last=prev_is_last,
+                        batch_sequence=state.next_transfer_batch_sequence(rollout_id - 1),
                     )
                 )
                 committed_prev += n
@@ -1040,6 +1062,7 @@ async def generate_rollout_async(
                             rollout_id - 1,
                             data_system_client,
                             is_last=prev_is_last,
+                            batch_sequence=state.next_transfer_batch_sequence(rollout_id - 1),
                         )
                     )
                     committed_prev += n_prev
@@ -1061,6 +1084,7 @@ async def generate_rollout_async(
                             rollout_id,
                             data_system_client,
                             is_last=curr_is_last,
+                            batch_sequence=state.next_transfer_batch_sequence(rollout_id),
                         )
                     )
                     committed_curr += n
@@ -1082,6 +1106,7 @@ async def generate_rollout_async(
                     rollout_id - 1,
                     data_system_client,
                     is_last=prev_is_last,
+                    batch_sequence=state.next_transfer_batch_sequence(rollout_id - 1),
                 )
             )
             committed_prev += n
@@ -1099,6 +1124,7 @@ async def generate_rollout_async(
                     rollout_id,
                     data_system_client,
                     is_last=curr_is_last,
+                    batch_sequence=state.next_transfer_batch_sequence(rollout_id),
                 )
             )
             committed_curr += n
@@ -1184,7 +1210,14 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                await transfer_batch_to_data_system(
+                    args,
+                    accepted,
+                    len(accepted),
+                    rollout_id,
+                    data_system_client,
+                    batch_sequence=state.next_transfer_batch_sequence(rollout_id),
+                )
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH

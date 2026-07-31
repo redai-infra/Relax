@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from relax.utils.data.group_processor import (
     get_reusable_group_processor_input,
     pack_group_multimodal_train_inputs,
     unpack_group_multimodal_train_inputs,
+    validate_group_multimodal_transport_dp_size,
 )
 
 
@@ -45,6 +47,31 @@ def test_group_processor_input_rejects_empty_media():
     assert get_reusable_group_processor_input([_sample("question", media)]) is None
 
 
+def test_group_multimodal_transport_requires_group_atomic_dp_layout():
+    validate_group_multimodal_transport_dp_size(1)
+
+    with pytest.raises(ValueError, match="requires actor data-parallel size 1"):
+        validate_group_multimodal_transport_dp_size(2)
+
+
+def test_shared_train_data_pack_entry_rejects_non_atomic_dp_layout():
+    from relax.utils.utils import convert_samples_to_train_data
+
+    args = SimpleNamespace(
+        context_parallel_size=2,
+        debug_train_only=False,
+        hybrid=True,
+        mm_processor_group_dedup=True,
+        multimodal_keys=["pixel_values"],
+        pipeline_model_parallel_size=1,
+        resource={"actor": [1, 8]},
+        tensor_model_parallel_size=2,
+    )
+
+    with pytest.raises(ValueError, match="requires actor data-parallel size 1"):
+        convert_samples_to_train_data(args, [])
+
+
 def test_group_processor_output_copies_containers_and_shares_tensor_storage():
     tensor = object()
     prompt_ids = [1, 2]
@@ -58,6 +85,36 @@ def test_group_processor_output_copies_containers_and_shares_tensor_storage():
     assert copied_train_inputs["image_grid_thw"] is not train_inputs["image_grid_thw"]
     assert copied_train_inputs["pixel_values"] is tensor
     assert copied_train_inputs["image_grid_thw"][0] is tensor
+
+
+def test_group_processor_output_survives_packed_transport_with_shared_tensor_storage():
+    torch = _torch()
+    pixel_values = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    image_grid_thw = torch.tensor([[1, 2, 3]], dtype=torch.int64)
+    processor_output = {
+        "pixel_values": pixel_values,
+        "image_grid_thw": image_grid_thw,
+    }
+    samples = []
+    for _ in range(8):
+        _prompt_ids, copied_output = copy_group_processor_output([1, 2, 3], processor_output)
+        samples.append(SimpleNamespace(group_index=17, multimodal_train_inputs=copied_output))
+
+    packed, source_count, ref_count = pack_group_multimodal_train_inputs(samples, group_size=8)
+    unpacked = unpack_group_multimodal_train_inputs(packed, group_size=8)
+    source_ptr = unpacked[0]["pixel_values"].untyped_storage().data_ptr()
+
+    del packed, samples, processor_output, pixel_values, image_grid_thw
+    gc.collect()
+
+    assert source_count == 1
+    assert ref_count == 7
+    assert all(item["pixel_values"].shape == (6, 4) for item in unpacked)
+    assert all(item["pixel_values"].dtype == torch.float32 for item in unpacked)
+    assert all(item["image_grid_thw"].dtype == torch.int64 for item in unpacked)
+    assert all(item["pixel_values"].untyped_storage().data_ptr() == source_ptr for item in unpacked)
+    assert torch.equal(unpacked[-1]["pixel_values"], torch.arange(24, dtype=torch.float32).reshape(6, 4))
+    assert torch.equal(unpacked[-1]["image_grid_thw"], torch.tensor([[1, 2, 3]], dtype=torch.int64))
 
 
 def test_group_multimodal_transfer_keeps_one_payload_and_reconstructs_aliases():

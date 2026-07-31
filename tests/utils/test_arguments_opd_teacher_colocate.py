@@ -62,10 +62,14 @@ def test_task21_optimization_flags_default_off_and_can_be_enabled(arguments_modu
     arguments_module.get_slime_extra_args_provider()(parser)
 
     defaults = parser.parse_args([])
-    enabled = parser.parse_args(["--hybrid-stream-forward", "--mm-processor-group-dedup"])
+    enabled = parser.parse_args(
+        ["--mm-processor-pool-size", "8", "--hybrid-stream-forward", "--mm-processor-group-dedup"]
+    )
 
+    assert defaults.mm_processor_pool_size == 0
     assert defaults.hybrid_stream_forward is False
     assert defaults.mm_processor_group_dedup is False
+    assert enabled.mm_processor_pool_size == 8
     assert enabled.hybrid_stream_forward is True
     assert enabled.mm_processor_group_dedup is True
 

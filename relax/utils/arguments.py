@@ -1214,7 +1214,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Run multimodal processor preprocessing once for samples in the same prompt group "
-                    "when they share the prompt and raw media object."
+                    "when they share the prompt and raw media object, and transport one source tensor payload "
+                    "plus lightweight group references in hybrid mode. The transport path currently requires "
+                    "actor data-parallel size 1."
                 ),
             )
             parser.add_argument(

@@ -1295,6 +1295,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
         model_switches = 0
+        timeline_host = socket.gethostname() if stream_forward else ""
+        timeline_pid = os.getpid() if stream_forward else 0
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1371,6 +1373,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     continue
                 last_progress = time.monotonic()
                 last_warn = last_progress
+                chunk_index = batch_index
                 batch_index += 1
 
                 # Forward passes on this chunk while rollout continues producing later chunks.
@@ -1380,11 +1383,48 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"batch_index={batch_index - 1}: expected {batch_size}, "
                         f"got {len(sub_batch['total_lengths'])}."
                     )
+                if stream_forward:
+                    logger.info(
+                        "Hybrid pipeline event=actor_fetch_end rollout_id=%d chunk=%d/%d samples=%d "
+                        "epoch_ns=%d monotonic_ns=%d host=%s pid=%d",
+                        rollout_id,
+                        chunk_index,
+                        expected_forward_chunks,
+                        len(sub_batch["total_lengths"]),
+                        time.time_ns(),
+                        time.monotonic_ns(),
+                        timeline_host,
+                        timeline_pid,
+                    )
                 forward_context = timer("hybrid_forward") if stream_forward else nullcontext()
+                if stream_forward:
+                    logger.info(
+                        "Hybrid pipeline event=actor_forward_start rollout_id=%d chunk=%d/%d "
+                        "epoch_ns=%d monotonic_ns=%d host=%s pid=%d",
+                        rollout_id,
+                        chunk_index,
+                        expected_forward_chunks,
+                        time.time_ns(),
+                        time.monotonic_ns(),
+                        timeline_host,
+                        timeline_pid,
+                    )
                 with forward_context:
                     model_switches += self._hybrid_forward_subbatch(
                         sub_batch,
                         skip_redundant_model_switch=stream_forward,
+                    )
+                if stream_forward:
+                    logger.info(
+                        "Hybrid pipeline event=actor_forward_end rollout_id=%d chunk=%d/%d "
+                        "epoch_ns=%d monotonic_ns=%d host=%s pid=%d",
+                        rollout_id,
+                        chunk_index,
+                        expected_forward_chunks,
+                        time.time_ns(),
+                        time.monotonic_ns(),
+                        timeline_host,
+                        timeline_pid,
                     )
                 collected_batches.append(sub_batch)
 

@@ -11,6 +11,15 @@ MM_GROUP_ID_KEY = "__relax_mm_group_id__"
 MM_GROUP_OWNER_KEY = "__relax_mm_group_owner__"
 
 
+def validate_group_multimodal_transport_dp_size(dp_size: int) -> None:
+    """Reject DP layouts whose sampler may split source/ref prompt groups."""
+    if dp_size != 1:
+        raise ValueError(
+            "--mm-processor-group-dedup in hybrid mode currently requires actor data-parallel size 1; "
+            f"got dp_size={dp_size}. TransferQueue group-atomic sampling is not yet guaranteed for DP > 1."
+        )
+
+
 def get_reusable_group_processor_input(samples: Sequence[Any]) -> tuple[Any, dict] | None:
     """Return shared prompt/media when a whole sample group is safe to
     preprocess once."""
