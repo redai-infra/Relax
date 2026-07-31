@@ -16,7 +16,13 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
-from relax.utils.data.group_processor import unpack_group_multimodal_train_inputs
+from relax.utils.data.group_processor import (
+    MM_GROUP_ID_KEY,
+    MM_GROUP_OWNER_KEY,
+    get_group_multimodal_transport_marker,
+    unpack_group_multimodal_train_inputs,
+    validate_group_multimodal_transport_ref,
+)
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import timer
 
@@ -504,7 +510,18 @@ def _encode_multimodal_inputs(mm_list):
             spec.append(None)
             continue
         entry: Dict[str, Any] = {}
+        marker = get_group_multimodal_transport_marker(sample)
+        if marker is not None:
+            group_index, is_owner = marker
+            entry[MM_GROUP_ID_KEY] = {"t": "raw", "value": group_index}
+            entry[MM_GROUP_OWNER_KEY] = {"t": "raw", "value": is_owner}
+            if not is_owner:
+                validate_group_multimodal_transport_ref(sample)
+                spec.append(entry)
+                continue
         for key, val in sample.items():
+            if key in {MM_GROUP_ID_KEY, MM_GROUP_OWNER_KEY}:
+                continue
             if isinstance(val, torch.Tensor):
                 entry[key] = {"t": "tensor", "dtype": val.dtype, "shape": tuple(val.shape)}
                 tensors.append(val)

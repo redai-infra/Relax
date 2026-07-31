@@ -7,8 +7,8 @@ from collections.abc import Sequence
 from typing import Any
 
 
-MM_GROUP_SOURCE_KEY = "__relax_mm_group_source__"
-MM_GROUP_REF_KEY = "__relax_mm_group_ref__"
+MM_GROUP_ID_KEY = "__relax_mm_group_id__"
+MM_GROUP_OWNER_KEY = "__relax_mm_group_owner__"
 
 
 def get_reusable_group_processor_input(samples: Sequence[Any]) -> tuple[Any, dict] | None:
@@ -58,48 +58,131 @@ def _shares_payload_storage(left: Any, right: Any) -> bool:
     return False
 
 
+def _as_cpu_scalar(value: Any, name: str) -> int | bool:
+    if isinstance(value, (int, bool)):
+        return value
+
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu" or value.numel() != 1:
+            raise ValueError(f"{name} must be a CPU scalar")
+        value = int(value) if value.dtype != torch.bool else bool(value)
+    if not isinstance(value, (int, bool)):
+        raise ValueError(f"{name} must be an integer or boolean scalar")
+    return value
+
+
+def get_group_multimodal_transport_marker(item: dict[str, Any]) -> tuple[int, bool] | None:
+    """Return the group id and owner flag carried by a packed row."""
+    has_group_id = MM_GROUP_ID_KEY in item
+    has_owner = MM_GROUP_OWNER_KEY in item
+    if has_group_id != has_owner:
+        raise ValueError("multimodal group transport marker is incomplete")
+    if not has_group_id:
+        return None
+
+    group_index = _as_cpu_scalar(item[MM_GROUP_ID_KEY], MM_GROUP_ID_KEY)
+    is_owner = _as_cpu_scalar(item[MM_GROUP_OWNER_KEY], MM_GROUP_OWNER_KEY)
+    return int(group_index), bool(is_owner)
+
+
+def _is_empty_transport_placeholder(value: Any) -> bool:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.numel() == 0
+    if isinstance(value, dict):
+        return all(_is_empty_transport_placeholder(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_is_empty_transport_placeholder(item) for item in value)
+    return False
+
+
+def validate_group_multimodal_transport_ref(item: dict[str, Any]) -> None:
+    """Reject ref rows that would silently discard a non-empty payload."""
+    payload = {key: value for key, value in item.items() if key not in {MM_GROUP_ID_KEY, MM_GROUP_OWNER_KEY}}
+    if payload and not all(_is_empty_transport_placeholder(value) for value in payload.values()):
+        raise ValueError("multimodal group ref contains a non-empty payload")
+
+
 def pack_group_multimodal_train_inputs(
     samples: Sequence[Any],
     group_size: int,
-) -> tuple[list[dict[str, Any] | None], int, int]:
-    """Store one tensor payload per complete prompt group and lightweight refs
-    for the remaining samples."""
+) -> tuple[Any, int, int]:
+    """Build a batch-shaped payload with one non-empty tensor per group."""
     if group_size <= 1:
         raise ValueError(f"group_size must be greater than 1, got {group_size}")
 
-    packed = [sample.multimodal_train_inputs for sample in samples]
+    original = [sample.multimodal_train_inputs for sample in samples]
+    if not samples or len(samples) % group_size != 0:
+        return original, 0, 0
+
     positions_by_group: dict[int, list[int]] = {}
     for position, sample in enumerate(samples):
         group_index = getattr(sample, "group_index", None)
-        if group_index is not None:
-            positions_by_group.setdefault(group_index, []).append(position)
+        if not isinstance(group_index, int):
+            return original, 0, 0
+        positions_by_group.setdefault(group_index, []).append(position)
 
-    source_count = 0
-    ref_count = 0
+    if len(positions_by_group) * group_size != len(samples):
+        return original, 0, 0
+
+    source_positions: dict[int, int] = {}
     for group_index, positions in positions_by_group.items():
         if len(positions) != group_size:
-            continue
-        source = packed[positions[0]]
+            return original, 0, 0
+        source = original[positions[0]]
         if not isinstance(source, dict):
-            continue
+            return original, 0, 0
         if any(
-            isinstance(packed[position], dict)
-            and (MM_GROUP_SOURCE_KEY in packed[position] or MM_GROUP_REF_KEY in packed[position])
+            isinstance(original[position], dict)
+            and (MM_GROUP_ID_KEY in original[position] or MM_GROUP_OWNER_KEY in original[position])
             for position in positions
         ):
             raise ValueError("multimodal processor output collides with Relax group transfer marker keys")
-        if any(not _shares_payload_storage(source, packed[position]) for position in positions[1:]):
-            continue
+        if any(not _shares_payload_storage(source, original[position]) for position in positions[1:]):
+            return original, 0, 0
+        source_positions[group_index] = positions[0]
 
-        source_payload = _copy_multimodal_train_inputs(source)
-        source_payload[MM_GROUP_SOURCE_KEY] = group_index
-        packed[positions[0]] = source_payload
-        for position in positions[1:]:
-            packed[position] = {MM_GROUP_REF_KEY: group_index}
-        source_count += 1
-        ref_count += len(positions) - 1
+    first = original[0]
+    if not isinstance(first, dict) or not first:
+        return original, 0, 0
+    if any(not isinstance(item, dict) or item.keys() != first.keys() for item in original):
+        return original, 0, 0
 
-    return packed, source_count, ref_count
+    import torch
+    from tensordict import TensorDict
+
+    fields: dict[str, torch.Tensor] = {}
+    for key in first:
+        values = [item[key] for item in original]
+        if any(
+            not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.ndim == 0 for value in values
+        ):
+            return original, 0, 0
+        trailing_shape = values[0].shape[1:]
+        if any(value.shape[1:] != trailing_shape for value in values[1:]):
+            return original, 0, 0
+
+        compact_values = []
+        for position, (sample, value) in enumerate(zip(samples, values, strict=True)):
+            is_owner = source_positions[sample.group_index] == position
+            compact_values.append(value if is_owner else value.new_empty((0, *value.shape[1:])))
+        try:
+            fields[key] = torch.nested.as_nested_tensor(compact_values, layout=torch.jagged)
+        except (RuntimeError, TypeError, ValueError):
+            return original, 0, 0
+
+    fields[MM_GROUP_ID_KEY] = torch.tensor([sample.group_index for sample in samples], dtype=torch.long)
+    fields[MM_GROUP_OWNER_KEY] = torch.tensor(
+        [source_positions[sample.group_index] == position for position, sample in enumerate(samples)],
+        dtype=torch.bool,
+    )
+    packed = TensorDict(fields, batch_size=[len(samples)])
+
+    source_count = len(source_positions)
+    return packed, source_count, len(samples) - source_count
 
 
 def unpack_group_multimodal_train_inputs(
@@ -120,22 +203,21 @@ def unpack_group_multimodal_train_inputs(
     for item in packed_inputs:
         if not isinstance(item, dict):
             continue
-        is_source = MM_GROUP_SOURCE_KEY in item
-        is_ref = MM_GROUP_REF_KEY in item
-        if is_source and is_ref:
-            raise ValueError("multimodal group source cannot also be a group ref")
-        if is_source:
-            group_index = item[MM_GROUP_SOURCE_KEY]
+        marker = get_group_multimodal_transport_marker(item)
+        if marker is not None:
+            group_index, is_owner = marker
+            marker_counts[group_index] = marker_counts.get(group_index, 0) + 1
+        else:
+            continue
+        if is_owner:
             if group_index in sources:
                 raise ValueError(f"duplicate multimodal group source for group {group_index}")
-            source = {key: value for key, value in item.items() if key != MM_GROUP_SOURCE_KEY}
+            source = {key: value for key, value in item.items() if key not in {MM_GROUP_ID_KEY, MM_GROUP_OWNER_KEY}}
             if not source:
                 raise ValueError(f"empty multimodal group source for group {group_index}")
             sources[group_index] = source
-            marker_counts[group_index] = marker_counts.get(group_index, 0) + 1
-        elif is_ref:
-            group_index = item[MM_GROUP_REF_KEY]
-            marker_counts[group_index] = marker_counts.get(group_index, 0) + 1
+        else:
+            validate_group_multimodal_transport_ref(item)
 
     for group_index, count in marker_counts.items():
         if count != group_size:
@@ -148,15 +230,12 @@ def unpack_group_multimodal_train_inputs(
         if not isinstance(item, dict):
             unpacked.append(item)
             continue
-        if MM_GROUP_REF_KEY in item:
-            if item.keys() != {MM_GROUP_REF_KEY}:
-                raise ValueError("multimodal group ref contains unexpected payload fields")
-            group_index = item[MM_GROUP_REF_KEY]
+        marker = get_group_multimodal_transport_marker(item)
+        if marker is not None:
+            group_index, _is_owner = marker
             if group_index not in sources:
                 raise ValueError(f"missing multimodal group source for group {group_index}")
             unpacked.append(_copy_multimodal_train_inputs(sources[group_index]))
-        elif MM_GROUP_SOURCE_KEY in item:
-            unpacked.append(_copy_multimodal_train_inputs(sources[item[MM_GROUP_SOURCE_KEY]]))
         else:
             unpacked.append(item)
     return unpacked
