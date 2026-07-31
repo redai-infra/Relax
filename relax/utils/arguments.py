@@ -177,6 +177,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-stream-forward",
+                action="store_true",
+                default=False,
+                help=(
+                    "In hybrid mode, fetch and forward each optimizer mini in "
+                    "--num-iters-per-train-update prompt-aligned chunks, then merge the chunks "
+                    "before advantage computation and a single optimizer update."
+                ),
+            )
+            parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
                 default=device_utils.get_dist_backend(),
@@ -1196,6 +1206,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
                     "When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers "
                     "for true parallelism without GIL contention."
+                ),
+            )
+            parser.add_argument(
+                "--mm-processor-group-dedup",
+                action="store_true",
+                default=False,
+                help=(
+                    "Run multimodal processor preprocessing once for samples in the same prompt group "
+                    "when they share the prompt and raw media object."
                 ),
             )
             parser.add_argument(
@@ -2686,6 +2705,14 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    if getattr(args, "hybrid_stream_forward", False):
+        if not args.hybrid:
+            raise ValueError("--hybrid-stream-forward requires --hybrid.")
+        if args.num_iters_per_train_update <= 1:
+            raise ValueError("--hybrid-stream-forward requires --num-iters-per-train-update greater than 1.")
+        if args.use_routing_replay or args.use_rollout_routing_replay:
+            raise ValueError("--hybrid-stream-forward does not yet support routing replay.")
 
     if getattr(args, "lora_rank", 0) > 0:
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):

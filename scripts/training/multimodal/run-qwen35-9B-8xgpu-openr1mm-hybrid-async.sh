@@ -29,6 +29,19 @@ EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+MM_PROCESSOR_POOL_SIZE="${MM_PROCESSOR_POOL_SIZE:-0}"
+MM_PROCESSOR_GROUP_DEDUP="${MM_PROCESSOR_GROUP_DEDUP:-0}"
+HYBRID_STREAM_FORWARD="${HYBRID_STREAM_FORWARD:-0}"
+
+TASK21_OPT_ARGS=(
+   --mm-processor-pool-size "${MM_PROCESSOR_POOL_SIZE}"
+)
+if [[ "${MM_PROCESSOR_GROUP_DEDUP}" == "1" ]]; then
+   TASK21_OPT_ARGS+=(--mm-processor-group-dedup)
+fi
+if [[ "${HYBRID_STREAM_FORWARD}" == "1" ]]; then
+   TASK21_OPT_ARGS+=(--hybrid-stream-forward)
+fi
 
 
 CKPT_ARGS=(
@@ -148,8 +161,9 @@ if [ ${MODE} = "hybrid-async" ]; then
    --max-staleness 2 \
         --num-data-storage-units 1 \
         --num-iters-per-train-update 2  \
-         --balance-data \
+        --balance-data \
         --hybrid \
+        "${TASK21_OPT_ARGS[@]}" \
         "${MODEL_ARGS[@]}" \
         "${CKPT_ARGS[@]}" \
         "${ROLLOUT_ARGS[@]}" \

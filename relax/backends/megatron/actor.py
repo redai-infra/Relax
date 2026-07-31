@@ -82,6 +82,7 @@ from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    build_hybrid_forward_chunk_plan,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     get_data_iterator,
@@ -1071,13 +1072,30 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
-    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
+    def _hybrid_forward_subbatch(
+        self,
+        sub_batch: RolloutBatch,
+        skip_redundant_model_switch: bool = False,
+    ) -> int:
         """Run the ref/teacher/actor forward passes for a single hybrid sub-
         batch in place.
 
         Shared by the streaming and debug_train_only paths so both compute
         identical log-probs before advantages are merged.
+
+        Returns the number of model restores performed.
         """
+        model_switches = 0
+
+        def activate_model(target_tag: str) -> None:
+            nonlocal model_switches
+            if skip_redundant_model_switch and self._active_model_tag == target_tag:
+                return
+            context = timer("hybrid_model_switch") if skip_redundant_model_switch else nullcontext()
+            with context:
+                self._switch_model(target_tag)
+            model_switches += 1
+
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
         # Separate iterator with larger token budget for ref/teacher log-probs (fallthrough mode).
         if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
@@ -1098,7 +1116,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if "ref" in self.weights_backuper.backup_tags:
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                self._switch_model("ref")
+                activate_model("ref")
                 sub_batch.update(
                     self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="ref_")
                 )
@@ -1107,13 +1125,13 @@ class MegatronTrainRayActor(TrainRayActor):
             if "teacher" in self.weights_backuper.backup_tags:
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                self._switch_model("teacher")
+                activate_model("teacher")
                 sub_batch.update(
                     self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="teacher_")
                 )
 
             # Actor forward
-            self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+            activate_model("old_actor" if self.args.keep_old_actor else "actor")
             if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                 if self.args.use_routing_replay:
                     if self.args.use_rollout_routing_replay:
@@ -1123,6 +1141,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
                 if self.args.use_rollout_routing_replay:
                     RoutingReplay.clear_all_forward()
+        return model_switches
 
     @staticmethod
     def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
@@ -1226,19 +1245,40 @@ class MegatronTrainRayActor(TrainRayActor):
         fully-async's streaming data pipeline. Actor and rollout run on separate GPUs,
         but actor/ref/actor_fwd share the same GPUs via role switching.
 
-        Data is processed in sub-batches (controlled by num_iters_per_train_update) to
-        reduce peak GPU memory during forward passes, matching fully-async behavior.
-        Advantages are computed after all sub-batches are collected to ensure correct
-        global normalization across the full batch and DP group.
+        With --hybrid-stream-forward, each optimizer mini is fetched and forwarded
+        in prompt-aligned chunks. Advantages and the optimizer boundary remain on
+        the original full mini.
         """
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
+        if plan.mini_local_sample_request is None:
+            raise RuntimeError("train_hybrid requires a fixed local rollout mini size")
+
+        stream_forward = getattr(self.args, "hybrid_stream_forward", False)
+        chunks_per_rollout_mini = 1
         batch_size = plan.mini_local_sample_request
+        if stream_forward:
+            unsupported_tags = {"ref", "teacher"}.intersection(self.weights_backuper.backup_tags)
+            if unsupported_tags:
+                raise ValueError(
+                    "--hybrid-stream-forward currently supports actor-only forward roles; "
+                    f"found model tags {sorted(unsupported_tags)}"
+                )
+            chunk_plan = build_hybrid_forward_chunk_plan(self.args, plan, dp_size)
+            chunks_per_rollout_mini = chunk_plan.chunks_per_rollout_mini
+            batch_size = chunk_plan.chunk_local_samples
+
+        expected_forward_chunks = plan.num_rollout_minis * chunks_per_rollout_mini
+        rollout_mini_local_sample_counts = [plan.mini_local_sample_request] * plan.num_rollout_minis
+        logger.info(
+            f"train_hybrid({rollout_id}) optimizer_minis={plan.num_rollout_minis}, "
+            f"forward_chunks_per_mini={chunks_per_rollout_mini}, local_chunk_size={batch_size}"
+        )
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
-        rollout_mini_local_sample_counts: list[int] = []
+        model_switches = 0
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1249,15 +1289,19 @@ class MegatronTrainRayActor(TrainRayActor):
             full_batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
             debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, debug_data)
-            for sub_batch in self._split_rollout_batch(debug_data, plan.num_rollout_minis):
+            for sub_batch in self._split_rollout_batch(debug_data, expected_forward_chunks):
                 if len(sub_batch["total_lengths"]) != batch_size:
                     raise RuntimeError(
-                        f"debug rollout mini batch local size mismatch for train_hybrid({rollout_id}): "
+                        f"debug forward chunk local size mismatch for train_hybrid({rollout_id}): "
                         f"expected {batch_size}, got {len(sub_batch['total_lengths'])}."
                     )
-                self._hybrid_forward_subbatch(sub_batch)
+                forward_context = timer("hybrid_forward") if stream_forward else nullcontext()
+                with forward_context:
+                    model_switches += self._hybrid_forward_subbatch(
+                        sub_batch,
+                        skip_redundant_model_switch=stream_forward,
+                    )
                 collected_batches.append(sub_batch)
-                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
             batch_index = 0
             # Surface stuck-loop conditions: when the partition can never reach the
@@ -1268,7 +1312,7 @@ class MegatronTrainRayActor(TrainRayActor):
             loop_start = time.monotonic()
             last_progress = loop_start
             last_warn = loop_start
-            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id):
+            while batch_index < expected_forward_chunks:
                 data_fields = [
                     "tokens",
                     "total_lengths",
@@ -1283,10 +1327,21 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
-                with timer("train_get_data"):
-                    sub_batch, batch_meta = self._get_data_from_transfer_queue(
-                        "train", rollout_id, data_fields, batch_size, batch_index
-                    )
+                fetch_context = timer("hybrid_fetch_wait") if stream_forward else nullcontext()
+                with fetch_context:
+                    with timer("train_get_data"):
+                        sub_batch, _batch_meta = self._get_data_from_transfer_queue(
+                            "train", rollout_id, data_fields, batch_size, batch_index
+                        )
+                    if sub_batch is None:
+                        if self.all_consumed("train", rollout_id):
+                            raise RuntimeError(
+                                f"train_hybrid({rollout_id}) partition drained after {batch_index}/"
+                                f"{expected_forward_chunks} forward chunks of local size {batch_size}."
+                            )
+                        # Throttle the spin so the controller is not hammered with metadata
+                        # polls while we wait for upstream data.
+                        time.sleep(0.1)
                 if sub_batch is None:
                     now = time.monotonic()
                     stalled = now - last_progress
@@ -1297,45 +1352,54 @@ class MegatronTrainRayActor(TrainRayActor):
                             f"all_consumed=False. Likely the rollout under-filled this partition."
                         )
                         last_warn = now
-                    # Throttle the spin so the controller is not hammered with metadata
-                    # polls while we wait for upstream data.
-                    time.sleep(0.1)
                     continue
                 last_progress = time.monotonic()
                 last_warn = last_progress
                 batch_index += 1
 
-                # Forward passes on this sub-batch (small memory footprint)
+                # Forward passes on this chunk while rollout continues producing later chunks.
                 if len(sub_batch["total_lengths"]) != batch_size:
                     raise RuntimeError(
-                        f"rollout mini batch local size mismatch for train_hybrid({rollout_id}), "
+                        f"forward chunk local size mismatch for train_hybrid({rollout_id}), "
                         f"batch_index={batch_index - 1}: expected {batch_size}, "
                         f"got {len(sub_batch['total_lengths'])}."
                     )
-                self._hybrid_forward_subbatch(sub_batch)
+                forward_context = timer("hybrid_forward") if stream_forward else nullcontext()
+                with forward_context:
+                    model_switches += self._hybrid_forward_subbatch(
+                        sub_batch,
+                        skip_redundant_model_switch=stream_forward,
+                    )
                 collected_batches.append(sub_batch)
-                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
 
-        if len(collected_batches) != plan.num_rollout_minis:
+        if len(collected_batches) != expected_forward_chunks:
             raise RuntimeError(
-                f"Expected {plan.num_rollout_minis} rollout mini batches for train_hybrid({rollout_id}), "
+                f"Expected {expected_forward_chunks} forward chunks for train_hybrid({rollout_id}), "
                 f"got {len(collected_batches)}."
             )
 
         if self._active_model_tag != "actor":
-            self._switch_model("actor")
+            switch_context = timer("hybrid_model_switch") if stream_forward else nullcontext()
+            with switch_context:
+                self._switch_model("actor")
+            model_switches += 1
+        if stream_forward:
+            logger.info(f"train_hybrid({rollout_id}) completed phase 1 with {model_switches} model switch(es)")
 
         # ── Phase 2: Merge sub-batches and compute advantages with correct global normalization ──
-        # Merge all sub-batch dicts: each value is a list, so we concatenate them.
-        rollout_data: RolloutBatch = {}
-        for sb in collected_batches:
-            for key, value in sb.items():
-                if key not in rollout_data:
-                    rollout_data[key] = []
-                if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
-                    rollout_data[key].extend(value)
-                else:
-                    rollout_data[key].append(value)
+        if stream_forward:
+            rollout_data = concat_rollout_batches(collected_batches)
+        else:
+            # Preserve the pre-existing flag-off merge semantics.
+            rollout_data: RolloutBatch = {}
+            for sub_batch in collected_batches:
+                for key, value in sub_batch.items():
+                    if key not in rollout_data:
+                        rollout_data[key] = []
+                    if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
+                        rollout_data[key].extend(value)
+                    else:
+                        rollout_data[key].append(value)
         rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
 
         with inverse_timer("train_wait"), timer("train"):

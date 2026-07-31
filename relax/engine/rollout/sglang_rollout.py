@@ -27,6 +27,7 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
+from relax.utils.data.group_processor import copy_group_processor_output, get_reusable_group_processor_input
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
@@ -311,6 +312,8 @@ async def generate(
     tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
     _t_image_processor: float | None = None
+    _image_processor_calls = 0.0
+    _image_processor_reuse_hits = 0.0
     # K2.x ships a multimodal AutoProcessor even for text-only fine-tunes; the
     # data loader always populates multimodal_inputs with empty-list placeholders
     # in that case, so check for actual media content before routing through the
@@ -320,9 +323,21 @@ async def generate(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
     if state.processor and _has_media:
-        processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
-            state, args, sample.prompt, sample.multimodal_inputs
-        )
+        group_processor_output = getattr(sample, "_group_processor_output", None)
+        if group_processor_output is not None:
+            del sample._group_processor_output
+            shared_prompt_ids, shared_train_inputs, _t_image_processor, is_processor_call = group_processor_output
+            processor_prompt_ids, sample.multimodal_train_inputs = copy_group_processor_output(
+                shared_prompt_ids,
+                shared_train_inputs,
+            )
+            _image_processor_calls = float(is_processor_call)
+            _image_processor_reuse_hits = float(not is_processor_call)
+        else:
+            processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
+                state, args, sample.prompt, sample.multimodal_inputs
+            )
+            _image_processor_calls = 1.0
     else:
         processor_prompt_ids = tokenizer_prompt_ids
 
@@ -484,6 +499,8 @@ async def generate(
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
     if _t_image_processor is not None:
         _timing["image_processor"] = _t_image_processor
+        _timing["image_processor_calls"] = _image_processor_calls
+        _timing["image_processor_reuse_hits"] = _image_processor_reuse_hits
     if _t_mm_encode is not None:
         _timing["mm_encode"] = _t_mm_encode
     sample.metadata["_timing"] = _timing
@@ -624,6 +641,17 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
             continue
         metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
         metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
+        if phase == "image_processor":
+            metrics[f"perf_detail/rollout/{phase}_time/total"] = sum(values)
+
+    processor_calls = sum(timing_data.get("image_processor_calls", []))
+    processor_reuse_hits = sum(timing_data.get("image_processor_reuse_hits", []))
+    if processor_calls or processor_reuse_hits:
+        metrics["perf_detail/rollout/image_processor_calls"] = processor_calls
+        metrics["perf_detail/rollout/image_processor_reuse_hits"] = processor_reuse_hits
+        metrics["perf_detail/rollout/image_processor_reuse_ratio"] = processor_reuse_hits / (
+            processor_calls + processor_reuse_hits
+        )
 
     if get_samples_times:
         metrics["perf_detail/rollout/get_samples_time/total"] = sum(get_samples_times)
@@ -635,6 +663,9 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
+    if not group:
+        return group
+
     state = GenerateState(args)
 
     # eval requests should not be affected by abort state; only skip for training rollout
@@ -646,28 +677,73 @@ async def generate_and_rm_group(
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
-    # Group-level multimodal encoding de-duplication: when samples in the same
-    # group share the same multimodal_inputs object (e.g. after shallow-copy in
-    # data_source), encode once and attach the result to every sample so that
-    # generate() picks up the pre-encoded data instead of re-encoding per sample.
-    first_mm = getattr(group[0], "multimodal_inputs", None)
-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
-        encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
-        for sample in group:
-            sample._pre_encoded_mm = encoded_mm
-            sample._pre_encoded_mm_elapsed = t_enc
+    processor_cache_attached = False
+    uses_builtin_generate = getattr(args, "custom_generate_function_path", None) is None and all(
+        sample.generate_function_path is None for sample in group
+    )
+    reusable_processor_input = get_reusable_group_processor_input(group)
+    if (
+        getattr(args, "mm_processor_group_dedup", False)
+        and state.processor is not None
+        and uses_builtin_generate
+        and reusable_processor_input is not None
+    ):
+        prompt, multimodal_inputs = reusable_processor_input
+        # Preserve the existing request backpressure: group preprocessing occupies
+        # one inference slot instead of bypassing the global semaphore.
+        async with state.semaphore:
+            if state.aborted and not evaluation:
+                return group
+            prompt_ids, train_inputs, processor_elapsed = await _run_image_processor(
+                state,
+                args,
+                prompt,
+                multimodal_inputs,
+            )
+        for index, sample in enumerate(group):
+            sample._group_processor_output = (
+                prompt_ids,
+                train_inputs,
+                processor_elapsed if index == 0 else 0.0,
+                index == 0,
+            )
+        processor_cache_attached = True
 
-    tasks = []
-    for idx, sample in enumerate(group):
-        current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+    tasks: list[asyncio.Task] = []
+    try:
+        # Group-level multimodal encoding de-duplication: when samples in the same
+        # group share the same multimodal_inputs object (e.g. after shallow-copy in
+        # data_source), encode once and attach the result to every sample so that
+        # generate() picks up the pre-encoded data instead of re-encoding per sample.
+        first_mm = getattr(group[0], "multimodal_inputs", None)
+        if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+            encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
+            for sample in group:
+                sample._pre_encoded_mm = encoded_mm
+                sample._pre_encoded_mm_elapsed = t_enc
 
-    group = await asyncio.gather(*tasks)
+        for idx, sample in enumerate(group):
+            current_sampling_params = sampling_params.copy()
+            if getattr(args, "sglang_enable_deterministic_inference", False):
+                seed = state.group_sampling_seeds[idx]
+                current_sampling_params["sampling_seed"] = seed
+            tasks.append(
+                asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+            )
+
+        try:
+            group = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+    finally:
+        if processor_cache_attached:
+            for sample in group:
+                if hasattr(sample, "_group_processor_output"):
+                    del sample._group_processor_output
 
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm:
