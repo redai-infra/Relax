@@ -15,7 +15,6 @@ Features:
 
 import asyncio
 import logging
-import os
 import socket
 import time
 from collections.abc import Sequence
@@ -41,6 +40,7 @@ from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     LORA_ADAPTER_NAME,
@@ -210,7 +210,9 @@ class DeviceDirectBackend(CommBackend):
 
     def _healthcheck_rollout_engines(self, timeout_seconds: int = 5) -> set[int]:
         # Allow raising the cold-start healthcheck timeout via env for slow starts.
-        timeout_seconds = int(os.environ.get("RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT", str(timeout_seconds)))
+        env_timeout = Envs.RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT
+        if env_timeout is not None:
+            timeout_seconds = env_timeout
         failed_ranks = set()
         futures_to_rank = {}
 

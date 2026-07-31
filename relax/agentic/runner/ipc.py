@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -171,7 +172,7 @@ def _sanitize_token(value: str) -> str:
 
 
 def _launcher_launch_concurrency() -> int:
-    raw_value = os.environ.get("RELAX_AGENTIC_LAUNCHER_CONCURRENCY")
+    raw_value = Envs.RELAX_AGENTIC_LAUNCHER_CONCURRENCY
     if raw_value is not None:
         concurrency = int(raw_value)
         if concurrency <= 0:
@@ -188,20 +189,20 @@ def _launcher_launch_semaphore() -> asyncio.BoundedSemaphore:
 
 
 def _launcher_job_token() -> str:
-    explicit_namespace = os.environ.get("RELAX_LAUNCHER_NAMESPACE")
+    explicit_namespace = Envs.RELAX_LAUNCHER_NAMESPACE
     if explicit_namespace:
         return _sanitize_token(explicit_namespace)
-    job_id = os.environ.get("RAY_JOB_ID")
+    job_id = Envs.RAY_JOB_ID
     if job_id:
         return _sanitize_token(job_id)
-    repo_root = os.environ.get("RELAX")
+    repo_root = Envs.RELAX
     if repo_root:
         return _sanitize_token(repo_root)
     return "standalone"
 
 
 def _launcher_user_token() -> str:
-    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    user = Envs.USER or Envs.LOGNAME
     if user:
         return _sanitize_token(user)
     return str(os.getuid())

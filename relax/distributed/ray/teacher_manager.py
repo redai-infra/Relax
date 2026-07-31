@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import os
 
 import ray
 from ray.util.placement_group import remove_placement_group
@@ -10,6 +9,7 @@ from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.service import create_placement_group
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_overrides
@@ -39,9 +39,9 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
         # OPD patches default off; enabled only when the corresponding env flag is
         # passed through from the driver. RELAX_OPD_PREEXPANDED_PATCH affects the
         # teacher engine only; RELAX_OPD_PER_POS_TOKEN_IDS affects teacher + student.
-        "RELAX_OPD_PREEXPANDED_PATCH": os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0"),
-        "RELAX_OPD_PER_POS_TOKEN_IDS": os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0"),
-        "RELAX_OPD_TOKEN_IDS_LOGPROB_K": os.environ.get("RELAX_OPD_TOKEN_IDS_LOGPROB_K", "0"),
+        "RELAX_OPD_PREEXPANDED_PATCH": str(int(Envs.RELAX_OPD_PREEXPANDED_PATCH)),
+        "RELAX_OPD_PER_POS_TOKEN_IDS": str(int(Envs.RELAX_OPD_PER_POS_TOKEN_IDS)),
+        "RELAX_OPD_TOKEN_IDS_LOGPROB_K": Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
         "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",

@@ -21,6 +21,7 @@ from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run
+from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
@@ -101,12 +102,12 @@ def _launch_server_with_patches(server_args: ServerArgs):
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
-    if os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1":
+    if Envs.RELAX_OPD_PREEXPANDED_PATCH:
         from relax.utils.opd.opd_sglang_patch import apply_opd_preexpanded_patch
 
         apply_opd_preexpanded_patch()
 
-    if os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1":
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -151,9 +152,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     #   - RELAX_OPTIMIZE_ROUTING_REPLAY : async D→H routing-replay patch (runtime)
     #   - RELAX_OPD_PREEXPANDED_PATCH   : OPD pre-expanded multimodal patch (runtime)
     #   - RELAX_OPD_PER_POS_TOKEN_IDS   : OPD per-position token_ids logprob;
-    optimize = os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1"
-    opd_patch = os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1"
-    per_pos = os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1"
+    optimize = Envs.RELAX_OPTIMIZE_ROUTING_REPLAY
+    opd_patch = Envs.RELAX_OPD_PREEXPANDED_PATCH
+    per_pos = Envs.RELAX_OPD_PER_POS_TOKEN_IDS
     logger.info(
         "Launching SGLang server with independently-gated patches: "
         f"routing_replay={optimize}, opd_preexpanded={opd_patch}, per_pos_token_ids={per_pos}"
@@ -448,14 +449,14 @@ class SGLangEngine(RayActor):
         if getattr(self.args, "optimize_routing_replay", False):
             os.environ["RELAX_OPTIMIZE_ROUTING_REPLAY"] = "1"
 
-        if os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1":
+        if Envs.RELAX_OPD_PER_POS_TOKEN_IDS:
             os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"
             top_k = getattr(self.args, "opd_log_prob_top_k", 0)
             if top_k:
                 os.environ["RELAX_OPD_TOKEN_IDS_LOGPROB_K"] = str(top_k)
             logger.info(
                 "Set RELAX_FORCE_LOGPROBS_BASE64=1, RELAX_OPD_TOKEN_IDS_LOGPROB_K=%s (topk enabled)",
-                os.environ.get("RELAX_OPD_TOKEN_IDS_LOGPROB_K", "0"),
+                Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
             )
 
         # Set SGLang external model/processor package env vars so the spawned

@@ -12,6 +12,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
@@ -2718,6 +2719,32 @@ def slime_validate_args(args):
                 args.lora_rank,
             )
             args.lora_merge_mode = True
+
+    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding on SGLang <= 0.5.9.
+    # There, spec_v2 routes requests through EAGLEWorkerV2.verify(), which does
+    # not populate output_token_logprobs — rollout sees response_length=1 for
+    # every sample and training silently degenerates. Fixed after 0.5.9, so
+    # newer builds may combine the two freely.
+    if getattr(args, "sglang_speculative_algorithm", None) and Envs.SGLANG_ENABLE_SPEC_V2.lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    ):
+        import sglang
+        from packaging.version import parse
+
+        if parse(sglang.__version__) <= parse("0.5.9"):
+            raise ValueError(
+                f"SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
+                f"--sglang-speculative-algorithm on sglang {sglang.__version__}: the spec_v2 "
+                f"EAGLE worker does not populate output_token_logprobs, which collapses "
+                f"rollout response_length to 1 and silently breaks training. Unset "
+                f"SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the spec_v1 EAGLE "
+                f"worker, or upgrade past 0.5.9. For Qwen3.5-MoE-style hybrid models, keep "
+                f"--sglang-mamba-scheduler-strategy extra_buffer — that flag alone satisfies "
+                f"SGLang's mamba radix-cache check and does NOT auto-enable spec_v2."
+            )
 
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)

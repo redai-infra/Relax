@@ -7,7 +7,6 @@ This module provides a Ray Serve deployment for Generative Reward Model
 """
 
 import asyncio
-import os
 from argparse import Namespace
 from itertools import cycle
 from typing import Any, List, Optional, Union
@@ -22,6 +21,7 @@ from ray.serve.schema import LoggingConfig
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_manager
 from relax.utils.data.processing_utils import load_tokenizer
+from relax.utils.env import Envs
 
 
 app = FastAPI()
@@ -30,12 +30,11 @@ app = FastAPI()
 # of 5 throttles judge dispatch and leaves the SGLang engines idle. The replica
 # is a pure-async CPU proxy (tokenize + forward), so a high cap lets one replica
 # saturate the engines. Override via env for tuning.
-GENRM_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("GENRM_SERVE_MAX_ONGOING_REQUESTS", "256"))
+GENRM_SERVE_MAX_ONGOING_REQUESTS = Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS
 
-# Serve→engine retry attempts for transient resets (ReadError / 5xx under bursty
-# colocate contention), absorbing them before they surface as a 500 to the
-# client. Set 1 to disable.
-GENRM_ENGINE_RETRY_ATTEMPTS = int(os.environ.get("GENRM_ENGINE_RETRY_ATTEMPTS", "3"))
+# NOTE: GENRM_SERVE_MAX_ONGOING_REQUESTS above must stay module-level — it feeds
+# the @serve.deployment decorator, which runs at import. The retry count has no
+# such constraint, so it is read at the call site to stay lazy.
 
 
 class Message(BaseModel):
@@ -227,7 +226,11 @@ class GenRM(Base):
         # Retry transient resets (transport-level or 5xx) with short backoff so
         # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
         # (terminal) and a cancellation (caller timeout) is never retried.
-        for _attempt in range(1, GENRM_ENGINE_RETRY_ATTEMPTS + 1):
+        # Serve→engine retry attempts for transient resets (ReadError / 5xx under
+        # bursty colocate contention), absorbing them before they surface as a 500
+        # to the client. Set 1 to disable.
+        retry_attempts = Envs.GENRM_ENGINE_RETRY_ATTEMPTS
+        for _attempt in range(1, retry_attempts + 1):
             try:
                 resp = await self._http_client.post(url, json=payload)
                 resp.raise_for_status()
@@ -236,7 +239,7 @@ class GenRM(Base):
                 raise
             except Exception as e:
                 status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
-                if (status == 0 or status >= 500) and _attempt < GENRM_ENGINE_RETRY_ATTEMPTS:
+                if (status == 0 or status >= 500) and _attempt < retry_attempts:
                     await asyncio.sleep(0.3 * _attempt)
                     continue
                 raise

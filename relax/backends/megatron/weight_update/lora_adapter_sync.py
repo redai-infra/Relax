@@ -22,6 +22,7 @@ import torch.distributed as dist
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     build_hf_peft_config_dict,
@@ -84,10 +85,9 @@ class LoraAdapterSync:
         IO, but it is valid only when every rollout engine can read that path
         (do NOT point it at node-local storage in fully-async).
         """
-        import os
         from pathlib import Path
 
-        base = os.environ.get("RELAX_LORA_LIVE_DIR") or self.args.save or "/tmp"  # noqa: S108 - fallback
+        base = Envs.RELAX_LORA_LIVE_DIR or self.args.save or "/tmp"  # noqa: S108 - fallback
         return str(Path(base) / "relax_lora_live" / "adapter")
 
     def config_dict(self) -> dict:

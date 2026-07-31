@@ -17,7 +17,6 @@ Deployment options:
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -29,6 +28,7 @@ from ray.serve.schema import LoggingConfig
 
 from relax.distributed.checkpoint_service.config import DCSConfig, RoleInfo, TopologyConfig
 from relax.distributed.checkpoint_service.coordinator.topology import TopologyManager
+from relax.utils.env import Envs
 from relax.utils.utils import get_serve_url
 
 
@@ -109,7 +109,7 @@ app = FastAPI(
 )
 
 
-DCS_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("DCS_SERVE_MAX_ONGOING_REQUESTS", "100"))
+DCS_SERVE_MAX_ONGOING_REQUESTS = Envs.DCS_SERVE_MAX_ONGOING_REQUESTS
 
 
 @serve.deployment(

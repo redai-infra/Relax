@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import os
 import time
 import uuid
 from argparse import Namespace
@@ -19,6 +18,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
 
@@ -313,7 +313,7 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
 
 
 # Ray Serve's default max_ongoing_requests (5) throttles concurrent load; env-tunable like the genrm knob.
-ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", "256"))
+ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS
 
 
 @serve.deployment(max_ongoing_requests=ROLLOUT_SERVE_MAX_ONGOING_REQUESTS)

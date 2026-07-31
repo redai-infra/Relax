@@ -29,6 +29,7 @@ from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
@@ -321,7 +322,7 @@ def setup_model_and_optimizer(
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
     # the actual model modules to remove stale (orphaned) entries.
-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+    if Envs.ENABLE_ROUTING_REPLAY:
         from relax.utils.training.routing_replay import RoutingReplay
 
         active_replays = []
@@ -1036,7 +1037,7 @@ def train_one_step(
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
@@ -1114,7 +1115,7 @@ def train_one_step(
             else:
                 output_tensor = model(**forward_kwargs)
 
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
         # Always dispatch via loss_function. lm_head_forward is None unless the

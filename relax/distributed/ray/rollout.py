@@ -25,9 +25,9 @@ from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
+from relax.utils.env import Envs
 from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
-    SLIME_HOST_IP_ENV,
     _wrap_ipv6,
     find_available_port,
     get,
@@ -3610,7 +3610,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     # single-node default 127.0.0.1) honor it for both bind and connect so the
     # two stay consistent.
     real_local_ip = _wrap_ipv6(get_host_info()[1])
-    env_overwrite_local_ip = os.getenv(SLIME_HOST_IP_ENV, None)
+    env_overwrite_local_ip = Envs.SLIME_HOST_IP
     if env_overwrite_local_ip:
         bind_ip = _wrap_ipv6(env_overwrite_local_ip)
         is_wildcard = env_overwrite_local_ip.strip("[]") in ("0.0.0.0", "::")

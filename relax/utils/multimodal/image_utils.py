@@ -12,14 +12,13 @@ import numpy as np
 import requests
 from PIL import Image
 
+from relax.utils.env import Envs
+
 from .config import MultimodalConfig, get_image_max_token_num, get_image_min_token_num, get_image_resize_scale_factor
 
 
 SPATIAL_MERGE_SIZE = 2
 
-_HTTP_IMAGE_ATTEMPTS = max(1, int(os.environ.get("ROLLOUT_IMAGE_FETCH_ATTEMPTS", "3")))
-_HTTP_IMAGE_TIMEOUT = float(os.environ.get("ROLLOUT_IMAGE_FETCH_TIMEOUT_S", "10"))
-_HTTP_IMAGE_BACKOFF = float(os.environ.get("ROLLOUT_IMAGE_FETCH_BACKOFF_S", "0.5"))
 
 ImageInput = Union[
     Image.Image,
@@ -148,10 +147,15 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
         return image_obj
 
     if image.startswith(("http://", "https://")):
+        # Read per call rather than at import: a Ray worker's runtime_env is
+        # applied to the process, and reading here keeps the knob tunable
+        # regardless of when this module first got imported.
+        attempts = max(1, Envs.ROLLOUT_IMAGE_FETCH_ATTEMPTS)
+        backoff = Envs.ROLLOUT_IMAGE_FETCH_BACKOFF_S
         last_exc: Optional[Exception] = None
-        for attempt in range(_HTTP_IMAGE_ATTEMPTS):
+        for attempt in range(attempts):
             try:
-                with requests.get(image, stream=True, timeout=_HTTP_IMAGE_TIMEOUT) as response:
+                with requests.get(image, stream=True, timeout=Envs.ROLLOUT_IMAGE_FETCH_TIMEOUT_S) as response:
                     response.raise_for_status()
                     with BytesIO(response.content) as bio:
                         image_obj = Image.open(bio)
@@ -159,8 +163,8 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
                 break
             except Exception as exc:  # transient network / HTTP — retry with backoff
                 last_exc = exc
-                if attempt + 1 < _HTTP_IMAGE_ATTEMPTS:
-                    time.sleep(_HTTP_IMAGE_BACKOFF * (attempt + 1))
+                if attempt + 1 < attempts:
+                    time.sleep(backoff * (attempt + 1))
         else:
             raise last_exc
     else:

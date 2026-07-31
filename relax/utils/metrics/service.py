@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from ray import serve
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.adapters.apprise import _AppriseAdapter
 from relax.utils.metrics.adapters.clearml import _ClearMLAdapter
@@ -91,7 +92,7 @@ def is_timeline_event(metric_value: Any) -> bool:
     return "ph" in metric_value[0] and "ts" in metric_value[0]
 
 
-METRICS_SERVE_MAX_ONGOING_REQUESTS = int(os.environ.get("METRICS_SERVE_MAX_ONGOING_REQUESTS", "200"))
+METRICS_SERVE_MAX_ONGOING_REQUESTS = Envs.METRICS_SERVE_MAX_ONGOING_REQUESTS
 
 
 @serve.deployment(max_ongoing_requests=METRICS_SERVE_MAX_ONGOING_REQUESTS)
@@ -160,7 +161,6 @@ class MetricsService:
         rank/group), MetricsService is a single Ray Serve replica that only
         needs basic project and run name configuration.
         """
-        import os
 
         if config.wandb_mode:
             os.environ["WANDB_MODE"] = config.wandb_mode

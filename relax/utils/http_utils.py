@@ -4,18 +4,17 @@ import asyncio
 import ipaddress
 import json
 import multiprocessing
-import os
 import random
 import socket
 
 import httpx
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
 
-SLIME_HOST_IP_ENV = "SLIME_HOST_IP"
 MAX_RETRIES = 6
 
 
@@ -47,7 +46,7 @@ def is_port_available(port):
 def get_host_info():
     hostname = socket.gethostname()
 
-    # if env_overwrite_local_ip := os.getenv(SLIME_HOST_IP_ENV, None):
+    # if env_overwrite_local_ip := Envs.SLIME_HOST_IP:
     #     return hostname, env_overwrite_local_ip
 
     def _is_loopback(ip):
@@ -88,7 +87,7 @@ def get_host_info():
 
         return None
 
-    prefer_ipv6 = os.getenv("SLIME_PREFER_IPV6", "0").lower() in ("1", "true", "yes", "on")
+    prefer_ipv6 = Envs.SLIME_PREFER_IPV6
     local_ip = None
     final_fallback = "127.0.0.1"
 
