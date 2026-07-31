@@ -3,8 +3,11 @@
 """Static comparability tests for the Task40 A100x4 launch scripts."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -17,16 +20,41 @@ FORMAL_SCRIPTS = {
 }
 
 
+def _bash_executable() -> str:
+    """Resolve a POSIX bash that can open the repository's own paths.
+
+    A bare ``bash`` argv[0] is not safe to rely on: Windows resolves executables from
+    ``System32`` before ``PATH``, and ``System32\\bash.exe`` is the WSL launcher, which
+    runs in a separate filesystem namespace and cannot open a ``D:\\...`` script path.
+    Prefer an explicit Git-for-Windows bash, and skip rather than fail when no usable
+    POSIX shell exists.
+    """
+    for candidate in (
+        shutil.which("bash", path=os.environ.get("GIT_BASH_DIR")),
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        "/bin/bash",
+        "/usr/bin/bash",
+    ):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    resolved = shutil.which("bash")
+    if resolved and os.name != "nt":
+        return resolved
+    pytest.skip("no POSIX bash available to dry-run the launch scripts")
+
+
 def _dry_run(script: Path, *extra_args: str) -> list[str]:
     env = os.environ.copy()
     env["TASK40_DRY_RUN"] = "1"
     result = subprocess.run(
-        ["bash", str(script), *extra_args],
+        [_bash_executable(), str(script), *extra_args],
         cwd=REPO_ROOT,
         env=env,
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return result.stdout.splitlines()
 
