@@ -89,6 +89,55 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
+def _add_fp16_optimizer_arguments(parser):
+    """Expose FP16 optimizer settings while preserving an unset sentinel."""
+    reset_arg(
+        parser,
+        "--initial-loss-scale",
+        type=float,
+        default=None,
+        help="Initial loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--min-loss-scale",
+        type=float,
+        default=None,
+        help="Minimum loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--use-precision-aware-optimizer",
+        action="store_true",
+        default=None,
+        help="Use TransformerEngine's precision-aware optimizer.",
+    )
+    if "--no-use-precision-aware-optimizer" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-use-precision-aware-optimizer",
+            action="store_false",
+            dest="use_precision_aware_optimizer",
+            default=None,
+            help="Disable TransformerEngine's precision-aware optimizer.",
+        )
+    reset_arg(
+        parser,
+        "--store-param-remainders",
+        action="store_true",
+        default=None,
+        help="Store parameter remainders in the distributed optimizer.",
+    )
+    if "--no-store-param-remainders" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-store-param-remainders",
+            action="store_false",
+            dest="store_param_remainders",
+            default=None,
+            help="Do not store parameter remainders in the distributed optimizer.",
+        )
+    return parser
+
+
 def get_slime_extra_args_provider(add_custom_arguments=None):
     def add_slime_arguments(parser):
         # Ray
@@ -575,6 +624,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
+            parser = _add_fp16_optimizer_arguments(parser)
             return parser
 
         # rollout
