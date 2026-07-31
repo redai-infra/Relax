@@ -37,6 +37,13 @@ ESS_DENOM_EPS = 1e-8
 # (FeynRL ``algs/RL/common.py::compute_kl_distance``).
 BEHAVIOR_KL_EXP_CLAMP = 10.0
 
+# Shared by the checked and unchecked sufficient-statistics paths so the message
+# a user sees does not depend on which one detected the non-finite ratio.
+NONFINITE_RATIO_MESSAGE = (
+    "P3O: non-finite importance ratio at a valid response token; refusing to "
+    "silently fall back to ESS=1. Check rollout log-probs and mask alignment."
+)
+
 
 @dataclass(frozen=True)
 class P3OSufficientStats:
@@ -172,28 +179,63 @@ def compute_p3o_sufficient_stats(
     Raises:
         ValueError: If a valid position produced a non-finite ratio.
     """
+    stats, invalid_flag = compute_p3o_sufficient_stats_unchecked(log_probs, behavior_log_probs, valid_mask)
+    # This is the sync-ing convenience wrapper: it materializes the flag to host
+    # memory so callers outside the micro-batch loop (tests, single-batch CPU
+    # use) still get an eager ValueError. Hot-path callers must use the
+    # unchecked variant and reduce the flag with the stats.
+    if bool(invalid_flag > 0):
+        raise ValueError(NONFINITE_RATIO_MESSAGE)
+    return stats
+
+
+def compute_p3o_sufficient_stats_unchecked(
+    log_probs: torch.Tensor,
+    behavior_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[P3OSufficientStats, torch.Tensor]:
+    """Sync-free variant: report non-finite ratios as a device-resident flag.
+
+    Identical arithmetic to :func:`compute_p3o_sufficient_stats`, but the
+    finiteness verdict is returned as a ``float64`` scalar tensor instead of
+    being tested on the host. This is what the ESS pre-pass calls: it runs once
+    per micro-batch, and a ``bool()`` there would stall the GPU pipeline
+    ``num_microbatches`` times per optimizer step. The flag rides along with
+    ``S1/S2/N`` through the step's single all-reduce, so the error still
+    surfaces on every rank -- just one collective later.
+
+    Args:
+        log_probs: Current-policy log-probs of the sampled tokens.
+        behavior_log_probs: Behavior-policy (rollout) log-probs.
+        valid_mask: Boolean mask selecting valid response tokens.
+
+    Returns:
+        ``(stats, invalid_flag)``. ``invalid_flag`` is ``1.0`` when any valid
+        position produced a non-finite ratio, else ``0.0``. When it is set, the
+        statistics are zeroed so a caller that defers the check cannot poison
+        ``S1/S2`` with ``inf``/``nan`` in the meantime.
+    """
     with torch.no_grad():
         mask_bool = valid_mask.bool()
         log_ratio = compute_p3o_log_ratio(log_probs.detach(), behavior_log_probs.detach(), mask_bool)
-        if not torch.isfinite(log_ratio[mask_bool]).all():
-            raise ValueError(
-                "P3O: non-finite importance ratio at a valid response token; refusing to "
-                "silently fall back to ESS=1. Check rollout log-probs and mask alignment."
-            )
 
         ratio = torch.exp(log_ratio.to(torch.float64))
         ratio = torch.where(mask_bool, ratio, torch.zeros_like(ratio))
 
-        if not torch.isfinite(ratio).all():
-            raise ValueError(
-                "P3O: non-finite importance ratio at a valid response token; refusing to "
-                "silently fall back to ESS=1. Check rollout log-probs and mask alignment."
-            )
+        # Both checks stay on device. log_ratio is already zeroed outside the
+        # mask, so a global isfinite() over it is equivalent to masking first.
+        invalid_flag = (~(torch.isfinite(log_ratio).all() & torch.isfinite(ratio).all())).to(torch.float64)
 
-        return P3OSufficientStats(
-            sum_ratio=ratio.sum(),
-            sum_ratio_sq=ratio.pow(2).sum(),
-            valid_token_count=mask_bool.sum().to(torch.float64),
+        # Zero the contribution when invalid, so deferring the host-side check
+        # cannot let inf/nan reach the reduced moments.
+        keep = 1.0 - invalid_flag
+        return (
+            P3OSufficientStats(
+                sum_ratio=ratio.sum() * keep,
+                sum_ratio_sq=ratio.pow(2).sum() * keep,
+                valid_token_count=mask_bool.sum().to(torch.float64) * keep,
+            ),
+            invalid_flag,
         )
 
 
@@ -268,7 +310,12 @@ def compute_p3o_behavior_kl_proxy(
 ) -> torch.Tensor:
     """Sampled-token k3 proxy for ``KL(pi_theta || pi_b)``.
 
-    ``K_i = l_i + exp(clip(-l_i, -10, 10)) - 1`` with ``l_i`` the log ratio.
+    ``K_i = l_i + exp(clip(-l_i, -C, C)) - 1`` with ``l_i`` the log ratio and
+    ``C = BEHAVIOR_KL_EXP_CLAMP`` (currently 10). When ``|l_i| > C`` the
+    exponent saturates: for ``l_i > C`` the exp term floors at ``exp(-C)`` so
+    the gradient of the kl term w.r.t. ``log_probs`` approaches 1 (only the
+    ``l_i`` addend contributes); for ``l_i < -C`` it caps at ``exp(C)``
+    preventing numerical overflow.
     Gradient flows through ``log_probs``, which is what makes this an adaptive
     trust region rather than a diagnostic.
 

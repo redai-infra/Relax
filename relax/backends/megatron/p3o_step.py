@@ -34,7 +34,7 @@ from relax.utils.training.p3o_replay import preserved_iterator_positions, preser
 from relax.utils.training.p3o_utils import (
     P3OStepContext,
     P3OSufficientStats,
-    compute_p3o_sufficient_stats,
+    compute_p3o_sufficient_stats_unchecked,
     finalize_p3o_step_context,
 )
 
@@ -51,12 +51,25 @@ P3O_NONFINITE_RATIO_ERROR = (
 )
 
 
-def _local_stats_from_batch(args: Namespace, batch: dict, log_probs: list[torch.Tensor]) -> P3OSufficientStats:
-    """Accumulate one micro-batch's ESS contribution from its log-probs."""
+def _local_stats_from_batch(
+    args: Namespace, batch: dict, log_probs: list[torch.Tensor]
+) -> tuple[P3OSufficientStats, torch.Tensor]:
+    """Accumulate one micro-batch's ESS contribution from its log-probs.
+
+    Returns:
+        ``(stats, invalid_flag)``, where ``invalid_flag`` is a device-resident
+        ``float64`` scalar set to ``1.0`` if this micro-batch produced a
+        non-finite ratio. It is reduced with ``S1/S2/N`` rather than checked
+        here, so the pre-pass adds no GPU-CPU sync per micro-batch.
+    """
     if batch.get("__is_dummy__", False):
         # Dummy micro-batches exist only to align num_microbatches across DP
         # ranks; they must contribute nothing to S1 / S2 / N.
-        return P3OSufficientStats.zeros(device=log_probs[0].device if log_probs else "cpu")
+        device = log_probs[0].device if log_probs else "cpu"
+        return (
+            P3OSufficientStats.zeros(device=device),
+            torch.zeros((), dtype=torch.float64, device=device),
+        )
 
     total_lengths = batch["total_lengths"]
     response_lengths = batch["response_lengths"]
@@ -74,7 +87,7 @@ def _local_stats_from_batch(args: Namespace, batch: dict, log_probs: list[torch.
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
-    return compute_p3o_sufficient_stats(current, behavior, valid_mask)
+    return compute_p3o_sufficient_stats_unchecked(current, behavior, valid_mask)
 
 
 def synchronize_p3o_stats(
@@ -102,7 +115,7 @@ def synchronize_p3o_stats(
                 group_src=pp_size - 1,
             )
 
-    if bool(vector[3] > 0):
+    if vector[3].item() > 0:
         raise ValueError(P3O_NONFINITE_RATIO_ERROR)
     return P3OSufficientStats.from_vector(vector[:3])
 
@@ -160,14 +173,62 @@ def compute_p3o_step_context(
             or getattr(args, "uses_unsplit_forward", False),
         )
 
-        output_tensor = model_chunk(
-            input_ids=batch["tokens"],
-            position_ids=None,
-            attention_mask=None,
-            labels=None,
-            packed_seq_params=batch["packed_seq_params"],
-            loss_mask=batch["full_loss_masks"],
+        # The forward inputs must be selected exactly as the training pass in
+        # model.py::train_one_step does, or the two passes read different token
+        # layouts and the frozen cap would be computed from logits the gradient
+        # pass never sees. The VL bridge (Qwen3VLModel.forward) does its own
+        # CP+SP splitting, so it takes unsplit tokens and no caller-side
+        # packed_seq_params.
+        mm_kwargs = batch.get("multimodal_train_inputs") or {}
+        needs_unsplit = (
+            getattr(args, "is_vl_model", False)
+            or batch.get("multimodal_train_inputs") is not None
+            or getattr(args, "uses_unsplit_forward", False)
         )
+
+        if needs_unsplit and "unsplit_tokens" in batch:
+            forward_input_ids = batch["unsplit_tokens"]
+            forward_packed_seq_params = None
+        else:
+            forward_input_ids = batch["tokens"]
+            forward_packed_seq_params = batch["packed_seq_params"]
+
+        # thd bridge+CP: the bridge needs the per-sample attention mask and the
+        # matching thd packed_seq_params; loss_mask is None there because
+        # labels=None means the model runs no internal loss.
+        if needs_unsplit and "vlm_packed_seq_params" in batch:
+            forward_attention_mask = batch["unsplit_attention_mask"]
+            forward_packed_seq_params = batch["vlm_packed_seq_params"]
+            forward_loss_mask = None
+        else:
+            forward_attention_mask = None
+            forward_loss_mask = batch["full_loss_masks"]
+
+        # Dynamic CP: the VL bridge reads pg_collection.cp directly, so point it
+        # at this micro-batch's sub-group for the forward and restore after.
+        orig_cp_group = None
+        inner = None
+        dynamic_cp_size = batch.get("dynamic_cp_size")
+        if dynamic_cp_size is not None and needs_unsplit:
+            inner = model_chunk
+            while hasattr(inner, "module"):
+                inner = inner.module
+            orig_cp_group = inner.pg_collection.cp
+            inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+
+        try:
+            output_tensor = model_chunk(
+                input_ids=forward_input_ids,
+                position_ids=None,
+                attention_mask=forward_attention_mask,
+                labels=None,
+                packed_seq_params=forward_packed_seq_params,
+                loss_mask=forward_loss_mask,
+                **mm_kwargs,
+            )
+        finally:
+            if orig_cp_group is not None:
+                inner.pg_collection.cp = orig_cp_group
 
         def collect(logits: torch.Tensor):
             # Only the pipeline last stage sees real logits; earlier stages just
@@ -185,13 +246,12 @@ def compute_p3o_step_context(
                     dynamic_cp_size=batch.get("dynamic_cp_size", None),
                     dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
                 )
-                try:
-                    micro_stats = _local_stats_from_batch(args, batch, computed["log_probs"])
-                except ValueError as error:
-                    if "non-finite importance ratio at a valid response token" not in str(error):
-                        raise
-                    invalid_count_acc[0] = invalid_count_acc[0] + 1.0
-                    micro_stats = P3OSufficientStats.zeros(device=invalid_count_acc[0].device)
+                # _local_stats_from_batch returns a device-resident invalid_flag
+                # instead of raising, so the non-finite detection rides the
+                # existing allreduce rather than adding a per-micro-batch
+                # GPU-CPU sync via bool() or .item().
+                micro_stats, invalid_flag = _local_stats_from_batch(args, batch, computed["log_probs"])
+                invalid_count_acc[0] = invalid_count_acc[0] + invalid_flag
                 stats_acc[0] = stats_acc[0] + micro_stats
             zero = torch.zeros((), device=logits.device, dtype=torch.float32)
             return zero, 1, {"keys": [], "values": zero.reshape(1)}

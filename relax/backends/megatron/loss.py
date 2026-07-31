@@ -828,9 +828,12 @@ def p3o_loss_function(
     else:
         advantages = batch["advantages"]
 
-    assert "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None, (
-        "P3O requires actual rollout log-probs as the behavior policy; run with --use-rollout-logprobs."
-    )
+    # Raise, not assert: under `python -O` a stripped check would fall through to
+    # a KeyError deep in the loss, or worse, a silently wrong behavior policy.
+    if batch.get("rollout_log_probs") is None:
+        raise ValueError(
+            "P3O requires actual rollout log-probs as the behavior policy; run with --use-rollout-logprobs."
+        )
 
     total_lengths = batch["total_lengths"]
     response_lengths = batch["response_lengths"]

@@ -270,7 +270,12 @@ def get_cp_local_valid_mask(
         chunks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0).bool())
 
     if not chunks:
-        return torch.zeros(0, dtype=torch.bool, device=loss_masks[0].device if loss_masks else "cpu")
+        if not loss_masks:
+            raise ValueError(
+                "P3O cp_utils: both loss_masks and computed chunks are empty; "
+                "cannot determine device for the returned tensor."
+            )
+        return torch.zeros(0, dtype=torch.bool, device=loss_masks[0].device)
     return torch.cat(chunks, dim=0)
 
 

@@ -2635,23 +2635,31 @@ def _validate_p3o_args(args) -> None:
     the objective (not just performance), and the failure mode is a plausible
     loss curve that does not implement P3O.
     """
-    assert args.use_rollout_logprobs, (
-        "P3O requires the rollout sampling distribution as its behavior policy. "
-        "Add --use-rollout-logprobs; without it there is no importance ratio to correct."
-    )
-    assert args.calculate_per_token_loss, (
-        "P3O requires --calculate-per-token-loss. Per-sample-mean normalization "
-        "reintroduces a per-micro-batch denominator, so the loss would depend on "
-        "how the optimizer step is split into micro-batches."
-    )
-    assert not args.use_tis, (
-        "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
-        "rollout/training mismatch, and stacking them double-corrects the ratio."
-    )
-    assert not getattr(args, "use_critic", False), (
-        "P3O does not use a critic; it is a score-function estimator over group-relative "
-        "advantages. Drop --use-critic."
-    )
+    # These are raises rather than asserts on purpose: `python -O` strips
+    # asserts, and every condition here silently changes the objective rather
+    # than crashing, so a stripped check would let a non-P3O run masquerade as
+    # one for its entire duration.
+    if not args.use_rollout_logprobs:
+        raise ValueError(
+            "P3O requires the rollout sampling distribution as its behavior policy. "
+            "Add --use-rollout-logprobs; without it there is no importance ratio to correct."
+        )
+    if not args.calculate_per_token_loss:
+        raise ValueError(
+            "P3O requires --calculate-per-token-loss. Per-sample-mean normalization "
+            "reintroduces a per-micro-batch denominator, so the loss would depend on "
+            "how the optimizer step is split into micro-batches."
+        )
+    if args.use_tis:
+        raise ValueError(
+            "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
+            "rollout/training mismatch, and stacking them double-corrects the ratio."
+        )
+    if getattr(args, "use_critic", False):
+        raise ValueError(
+            "P3O does not use a critic; it is a score-function estimator over group-relative "
+            "advantages. Drop --use-critic."
+        )
 
     incompatible_flags = {
         "get_mismatch_metrics": "--get-mismatch-metrics",

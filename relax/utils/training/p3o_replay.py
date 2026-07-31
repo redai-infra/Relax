@@ -83,6 +83,14 @@ def preserved_iterator_positions(data_iterator: Sequence[Any] | Any):
     positions = {key: iterator.snapshot_position() for key, iterator in unique.items()}
     try:
         yield
+        # WARNING: callers must not advance or otherwise mutate any of the
+        # tracked iterators *outside* this context manager while the with-block
+        # is open.  External advancement between snapshot and restore will
+        # silently corrupt the replay: restore_position rewinds to the saved
+        # offset, causing the train pass to re-consume tokens that were already
+        # consumed by the external caller rather than the tokens this pre-pass
+        # saw.  Only the pre-pass (the model forward) should drive the iterators
+        # while this context is live.
     finally:
         for key, iterator in unique.items():
             iterator.restore_position(positions[key])
