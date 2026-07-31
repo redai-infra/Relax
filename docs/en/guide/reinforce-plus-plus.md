@@ -220,3 +220,7 @@ compared with the independently concatenated global population.
 See
 `examples/algorithms/run-qwen3-0.6B-1xgpu-reinforce-plus-plus.sh` for the
 parameterized Qwen3-0.6B recipe.
+
+The equal-budget Qwen3-0.6B stability experiment, numerical evidence, curves,
+and comparison with GRPO are documented in the
+[training and numerical validation report](./reinforce-plus-plus-training-report.md).

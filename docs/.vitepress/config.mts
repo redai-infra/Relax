@@ -246,6 +246,7 @@ export default defineConfig({
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
