@@ -46,6 +46,7 @@ traces
 output
 outputs
 tensorboard_log
+relax_runs
 
 .history
 *.log

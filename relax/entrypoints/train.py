@@ -20,6 +20,7 @@ try_import_telemetry_hook()
 from relax.core.controller import Controller  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.reproducibility import write_experiment_manifest  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
@@ -98,6 +99,8 @@ def main(args):
             )
         except RuntimeError:
             pass
+
+    write_experiment_manifest(args, runtime_env, ray_module=ray)
 
     # init_tracking must run after serve.start() (metrics adapter probes Ray
     # Serve for the /metrics endpoint) and before Controller() (wandb primary
