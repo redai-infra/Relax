@@ -1,8 +1,8 @@
 # Algorithm Reference
 
-Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers all integrated algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
+Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-All algorithms share the same training scripts — simply replace the `GRPO_ARGS` block in the script with the corresponding algorithm's arguments.
+GRPO, CISPO, GSPO, and SAPO share the same service topology, so their argument blocks can be swapped in existing scripts. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
 ---
 
@@ -39,6 +39,49 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## PPO
+
+PPO (Proximal Policy Optimization) is an actor-critic algorithm. Relax trains a separate Critic to predict token-level values, computes GAE advantages and returns, applies PPO-Clip to the Actor, and applies clipped value loss to the Critic.
+
+Reference: [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347).
+
+### How It Works
+
+The temporal-difference residual and GAE recursion are:
+
+$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$$
+
+$$\hat{A}_t = \delta_t + \gamma\lambda\hat{A}_{t+1}, \qquad \hat{R}_t = \hat{A}_t + V(s_t)$$
+
+The Actor then uses the same clipped policy objective shown for GRPO, but with Critic-derived token-level advantages. The Critic minimizes the maximum of clipped and unclipped squared value errors.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--advantage-estimator ppo` | — | Enable PPO and the Critic service graph |
+| `--gamma` | `1.0` | GAE discount factor |
+| `--lambd` | `1.0` | GAE lambda |
+| `--eps-clip` | `0.2` | Actor clipping margin |
+| `--value-clip` | `0.2` | Critic value clipping range |
+| `--num-critic-only-steps` | `0` | Initial Critic-only warmup steps |
+| `--critic-lr` | same as `--lr` | Critic learning rate |
+
+### Quick Start
+
+PPO cannot be enabled by changing only the algorithm argument because its service graph requires `critic` and `advantages` resources. Fully-async PPO is not currently supported; use the dedicated synchronous colocate recipe:
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+EXP_DIR=/path/to/experiments \
+bash scripts/training/text/run-qwen35-9B-8xgpu-ppo.sh
+```
+
+See [PPO Training](../guide/ppo-training.md) for the resource topology, checkpoint rules, and KL constraints.
 
 ---
 
@@ -163,6 +206,7 @@ SAPO_ARGS=(
 
 | Algorithm | Advantage Computation | Policy Loss | KL Constraint |
 |-----------|----------------------|-------------|---------------|
+| **PPO** | Critic values + GAE | PPO-Clip (hard clip) | Disabled in the current synchronous topology |
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
@@ -170,6 +214,7 @@ SAPO_ARGS=(
 
 ## Next Steps
 
-- [Quick Start](./quick-start.md)
+- [PPO Training](../guide/ppo-training.md)
+- [Quick Start](../guide/quick-start.md)
 - [On-Policy Distillation](./on-policy-distillation.md)
 - [Generative Reward Model](./generative-reward-model.md)

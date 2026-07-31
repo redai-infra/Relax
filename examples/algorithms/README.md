@@ -4,18 +4,27 @@
 
 ## 概述
 
-Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。所有算法共享同一套训练脚本架构，用户只需替换脚本中的算法参数块（`*_ARGS`）即可快速切换算法。
+Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、CISPO、GSPO 与 SAPO 共享同一套服务拓扑，可以通过替换算法参数块（`*_ARGS`）切换；PPO 还需要 Critic 与 Advantages 服务，应使用专用启动脚本。
 
 ## 支持的算法
 
 | 算法      | 启用参数                      | 推荐场景                   |
 | --------- | ----------------------------- | -------------------------- |
+| **PPO**   | `--advantage-estimator ppo`   | Actor-Critic、token 级 GAE |
 | **GRPO**  | `--advantage-estimator grpo`  | 默认、大多数场景           |
 | **CISPO** | `--advantage-estimator cispo` | 保留梯度方向、需要更高精度 |
 | **GSPO**  | `--advantage-estimator gspo`  | 序列级约束、稳定训练       |
 | **SAPO**  | `--advantage-estimator sapo`  | 平滑优化、soft 信任域      |
 
 ## 选择建议
+
+### PPO（Actor-Critic）
+
+- 使用独立 Critic 预测 token 级 value，并通过 GAE 计算 advantage 与 return
+- Actor 使用 PPO-Clip，Critic 使用裁剪 value loss
+- 必须在 `--resource` 中配置 `critic` 与 `advantages`，不能只替换 `GRPO_ARGS`
+- 暂不支持 fully-async PPO
+- 8 卡 colocate 入门配置：`scripts/training/text/run-qwen35-9B-8xgpu-ppo.sh`
 
 ### GRPO（推荐首选）
 
@@ -45,7 +54,7 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 
 ### 基础操作：修改算法参数
 
-所有脚本均采用统一的参数块设计。要切换算法，只需修改相应 `*_ARGS` 数组：
+GRPO-like 脚本采用统一的参数块设计。要在 GRPO、CISPO、GSPO 与 SAPO 之间切换，只需修改相应 `*_ARGS` 数组：
 
 ```bash
 # 例如：在任意训练脚本中，将 GRPO_ARGS 替换为 CISPO_ARGS
@@ -83,7 +92,6 @@ export DATA_DIR=/path/to/multimodal-open-r1-8k-verified
 export EXP_DIR=/path/to/experiments
 
 # 2) 运行 CISPO 异步训练（Fully Async 模式）
-cd /fengxiaoshi/Relax
 bash examples/algorithms/run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh async
 
 # 或运行同步训练（Colocate 模式）
@@ -121,7 +129,7 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 | `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                             |
 | `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                        |
 | `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                    |
-| `--kl-coef`             | `0.0`                | KL 惩罚系数（PPO、REINFORCE++ 等用）                                                                    |
+| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                              |
 
 ### CISPO 专用参数
 
@@ -138,6 +146,19 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 | ---------------- | ------ | ------------------------------------------------ |
 | `--sapo-tau-pos` | `1.0`  | Positive advantage 的温度参数                    |
 | `--sapo-tau-neg` | `1.05` | Negative advantage 的温度参数（更高 = 更强抑制） |
+
+### PPO 专用参数
+
+| 参数                       | 默认值         | 说明                        |
+| -------------------------- | -------------- | --------------------------- |
+| `--gamma`                  | `1.0`          | GAE 折扣因子                |
+| `--lambd`                  | `1.0`          | GAE lambda                  |
+| `--value-clip`             | `0.2`          | Critic value loss 裁剪范围  |
+| `--num-critic-only-steps`  | `0`            | 初始 Critic-only 预热步数   |
+| `--critic-lr`              | 与 `--lr` 相同 | Critic 学习率               |
+| `--critic-lr-warmup-iters` | `0`            | Critic 学习率线性预热迭代数 |
+
+PPO 还要求在 `--resource` 中提供 `critic` 与 `advantages`。当前 colocate 示例使用 `--use-rollout-logprobs`，并保持 `--kl-coef 0.0`。完整说明参见[双语 PPO 训练文档](../../docs/zh/guide/ppo-training.md)。
 
 ## 最佳实践
 

@@ -1,12 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import contextvars
 import copy
 import inspect
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from time import monotonic
 from typing import Any
 
@@ -23,13 +24,14 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
-    _ENCODE_EXECUTOR,
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
     async_encode_video_tensor_for_rollout_engine,
+    configure_encode_executor,
     load_processor,
     load_tokenizer,
 )
@@ -50,6 +52,25 @@ __all__ = ["generate_rollout"]
 logger = get_logger(__name__)
 
 
+# Misuse guard for the per-request permit contract. Set while the session-level
+# lock (GenerateState.semaphore) is held so that a legacy custom function that
+# wrongly calls inference_permit()/post_generate() fails loudly instead of
+# deadlocking on the same non-reentrant semaphore. A ContextVar is task-local
+# and propagates down the await chain (including create_task children).
+_holding_session_lock: contextvars.ContextVar[bool] = contextvars.ContextVar("holding_session_lock", default=False)
+
+
+def _ensure_not_holding_session_lock() -> None:
+    if _holding_session_lock.get():
+        raise RuntimeError(
+            "inference_permit()/post_generate() was called while the session-level lock is held. "
+            "A custom generate function must declare `manages_inference_permit = True` to use "
+            "per-request permits; without it the function runs under the session lock (the same "
+            "non-reentrant semaphore) and acquiring a permit would deadlock. "
+            "See docs/{zh,en}/guide/customize-training.md."
+        )
+
+
 class GenerateState(metaclass=SingletonMeta):
     """The global state for the generation process."""
 
@@ -61,6 +82,11 @@ class GenerateState(metaclass=SingletonMeta):
 
         # OPD manager (singleton — one OpdManager per GenerateState)
         self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+
+        # Media-encoding thread pool for this rollout worker process, sized by
+        # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
+        # affinity-aware default). Held on state so consumers use it explicitly.
+        self.encode_executor = configure_encode_executor(getattr(args, "encode_max_workers", None))
 
         # Process pool for running HuggingFace processor without GIL contention.
         # Controlled by --mm-processor-pool-size (0 = disabled).
@@ -77,9 +103,12 @@ class GenerateState(metaclass=SingletonMeta):
                 except Exception as e:
                     logger.warning(f"Failed to create ProcessorPool, falling back to ThreadPoolExecutor: {e}")
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-        )
+        capacity = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self.permit_manager = InferencePermitManager(capacity)
+        # Backward-compatible alias: same underlying semaphore, so the session-level
+        # lock path behaves exactly as before. Custom multi-turn rollouts should use
+        # inference_permit()/post_generate() instead (see docs customize-training).
+        self.semaphore = self.permit_manager.semaphore
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -113,6 +142,27 @@ class GenerateState(metaclass=SingletonMeta):
         finally:
             self.dp_counts[dp_rank] -= 1
             assert self.dp_counts[dp_rank] >= 0
+
+    def inference_permit(self) -> AbstractAsyncContextManager[None]:
+        """Per-request permit for custom multi-turn rollouts.
+
+        Acquire one permit per model request and release it right after; do not
+        hold it during env/tool execution. Only for custom generate functions
+        that declare ``manages_inference_permit = True`` -- see
+        docs/{zh,en}/guide/customize-training.md.
+        """
+        _ensure_not_holding_session_lock()
+        return self.permit_manager.permit(abort_check=lambda: self.aborted)
+
+    async def post_generate(self, url: str, payload: dict, headers: dict | None = None) -> dict:
+        """Acquire a per-request permit, honor abort, then POST to the engine.
+
+        Recommended entry point for custom multi-turn rollouts: it scopes the
+        permit to exactly one in-flight request. Raises ``GenerationAborted``
+        if rollout abort has been signalled by the time the permit is acquired.
+        """
+        async with self.inference_permit():
+            return await post(url, payload, headers=headers)
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
@@ -206,7 +256,7 @@ async def _run_image_processor(
             prompt_ids = expand_kimi_k25_placeholders(state.processor, prompt_ids, train_inputs)
             return prompt_ids, train_inputs
 
-        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(_ENCODE_EXECUTOR, _run_processor)
+        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(state.encode_executor, _run_processor)
 
     return processor_prompt_ids, mm_train_inputs, monotonic() - t_start
 
@@ -305,6 +355,13 @@ async def generate(
 
     if state.opd_manager and not evaluation:
         state.opd_manager.before_rollout(payload)
+    # LoRA adapter mode: route generation through the trained adapter registered on the engine
+    # (see UpdateWeightFromTensor._push_lora_adapter). Without lora_path the engine serves the
+    # base model only and rollouts would not reflect the trained policy.
+    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+        from relax.utils.megatron_peft_utils import LORA_ADAPTER_NAME
+
+        payload["lora_path"] = LORA_ADAPTER_NAME
 
     _t_mm_encode: float | None = None
     if _has_media:
@@ -442,6 +499,60 @@ async def generate(
     return sample
 
 
+async def _dispatch_generate(
+    state: "GenerateState",
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+) -> Sample | list[Sample]:
+    """Resolve the generate function and run it under the correct permit scope.
+
+    Touches only ``state.aborted`` / ``state.dp_rank_context`` / ``state.semaphore``
+    so it can be unit-tested with a lightweight stub state (no GenerateState).
+
+    - Default (built-in ``generate`` or a custom function without the opt-in flag):
+      hold the session-level lock for the whole call, exactly as before.
+    - Opt-in (custom function with ``manages_inference_permit = True``): do NOT
+      hold the session lock; the function acquires a per-request permit per turn
+      via ``state.post_generate``/``state.inference_permit``.
+
+    ``GenerationAborted`` must never escape this function: ``generate_and_rm_group``
+    runs the per-sample tasks through ``asyncio.gather`` *without*
+    ``return_exceptions=True``, and no existing abort path raises -- so a leaked
+    exception would crash the whole rollout step. It is contained here and mapped
+    to an ABORTED sample (mirroring the legacy in-lock abort check).
+    """
+    custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
+    custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
+    manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
+
+    async def _run() -> Sample | list[Sample]:
+        if state.aborted:
+            sample.status = Sample.Status.ABORTED
+            return sample
+        with state.dp_rank_context() as _:
+            if custom_generate_func is not None:
+                # if signature has evaluation, pass evaluation
+                if "evaluation" in inspect.signature(custom_generate_func).parameters:
+                    return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                return await custom_generate_func(args, sample, sampling_params)
+            return await generate(args, sample, sampling_params, evaluation=evaluation)
+
+    try:
+        if manages_permit:
+            return await _run()
+        async with state.semaphore:
+            token = _holding_session_lock.set(True)
+            try:
+                return await _run()
+            finally:
+                _holding_session_lock.reset(token)
+    except GenerationAborted:
+        sample.status = Sample.Status.ABORTED
+        return sample
+
+
 async def generate_and_rm(
     args: Namespace,
     sample: Sample | list[Sample],
@@ -461,25 +572,9 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
-        if state.aborted:
-            sample.status = Sample.Status.ABORTED
-            return sample
-
-        with state.dp_rank_context() as _:
-            # Check sample.generate_function_path for per-sample custom_generate_function_path (e.g., from eval dataset config)
-            custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
-
-            if custom_func_path is not None:
-                custom_generate_func = load_function(custom_func_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
-            else:
-                sample = await generate(args, sample, sampling_params, evaluation=evaluation)
+    # Resolve the generate function and run it under the right permit scope
+    # (session-level lock by default; per-request permits for opt-in functions).
+    sample = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -1043,7 +1138,7 @@ async def generate_rollout_async(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = dict(timing_metrics)
-        if args.partial_rollout:
+        if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
             )
@@ -1249,7 +1344,11 @@ def generate_rollout(
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
-    if not args.fully_async:
+    # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
+    # prefetched generation is almost always aborted by the next step's pause_generation and its
+    # truncated samples would pollute the next rollout. Other modes keep the optimization.
+    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    if not args.fully_async and not _lora_adapter_mode:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
