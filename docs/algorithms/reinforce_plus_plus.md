@@ -180,8 +180,9 @@ fully-async 模式下对所有算法（含 REINFORCE++）均不生效。这是�
 - REINFORCE++-baseline：`--use-kl-loss --kl-loss-coef 0.001 --kl-loss-type k2`
   （独立 k2 KL loss，`--kl-coef` 保持默认 0，§3.2）。
 
-GRPO 对比组使用 `contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh`
-（quickstart 原样，`--kl-loss-coef 0.00`），保证与仓库既有 GRPO 口径一致。
+GRPO 对比组使用 community 的 GRPO quickstart（与本地
+`contributor-program/2026-cohort-1/run-qwen3-0.6B-1xgpu-grpo.sh` 逐字节一致，见
+`redai-infra/community` 仓库；`--kl-loss-coef 0.00`），保证与既有 GRPO 口径一致。
 
 ## 9. 验证方法
 
