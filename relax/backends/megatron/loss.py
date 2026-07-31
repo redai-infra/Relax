@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -881,12 +883,14 @@ def p3o_loss_function(
     loss = score_loss + adaptive_kl_loss - args.entropy_coef * entropy_loss
 
     reference_kl_loss = None
+    reference_kl_metric = loss.detach().new_zeros(())
     if args.use_kl_loss:
         # Optional frozen-reference regularization. Orthogonal to the adaptive
         # behavior KL above and reported under its own key.
         ref_log_probs = torch.cat(batch["ref_log_probs"], dim=0)
         reference_kl = compute_approx_kl(log_probs, ref_log_probs, kl_loss_type=args.kl_loss_type)
         reference_kl_loss = sum_of_sample_mean(reference_kl)
+        reference_kl_metric = reference_kl_loss.clone().detach()
         loss = loss + args.kl_loss_coef * reference_kl_loss
 
     if log_probs.numel() == 0:
@@ -906,6 +910,7 @@ def p3o_loss_function(
         "p3o/score_loss": score_loss.clone().detach(),
         "p3o/behavior_kl_proxy": behavior_kl_proxy.clone().detach(),
         "p3o/adaptive_kl_loss": adaptive_kl_loss.clone().detach(),
+        "p3o/reference_kl": reference_kl_metric,
         "p3o/entropy": entropy_loss.clone().detach(),
         "p3o/cap_fraction": cap_fraction.clone().detach(),
         "p3o/total_loss": loss.clone().detach(),
@@ -917,7 +922,6 @@ def p3o_loss_function(
     }
 
     if reference_kl_loss is not None:
-        reported_loss["p3o/reference_kl"] = reference_kl_loss.clone().detach()
         reported_loss["kl_loss"] = reference_kl_loss.clone().detach()
 
     return loss, reported_loss

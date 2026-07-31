@@ -45,6 +45,10 @@ from .data import DataIterator, get_batch
 logger = get_logger(__name__)
 
 P3O_STEP_CONTEXT_ATTR = "_p3o_step_context"
+P3O_NONFINITE_RATIO_ERROR = (
+    "P3O: non-finite importance ratio at a valid response token on at least one rank; "
+    "refusing to silently fall back to ESS=1. Check rollout log-probs and mask alignment."
+)
 
 
 def _local_stats_from_batch(args: Namespace, batch: dict, log_probs: list[torch.Tensor]) -> P3OSufficientStats:
@@ -73,18 +77,34 @@ def _local_stats_from_batch(args: Namespace, batch: dict, log_probs: list[torch.
     return compute_p3o_sufficient_stats(current, behavior, valid_mask)
 
 
-def reduce_p3o_stats(stats: P3OSufficientStats) -> P3OSufficientStats:
-    """Sum sufficient statistics across the DP x CP group.
+def synchronize_p3o_stats(
+    stats: P3OSufficientStats,
+    invalid_count: torch.Tensor,
+) -> P3OSufficientStats:
+    """Reduce last-stage stats over DP x CP, then publish them over PP.
 
-    Only DP and CP are reduced. TP and PP ranks hold *replicas* of the selected
-    tokens' log-probs, so including them would multiply N (and S1, S2) by the
-    TP/PP degree and silently rescale the cap.
+    Pipeline-last is the only stage with logits. It first sums ``S1/S2/N`` and
+    the invalid-ratio flag over DP x CP. The already-global vector is then
+    broadcast, never summed, over PP so every stage finalizes the same context.
+    TP replicas use independent but equivalent groups.
     """
-    vector = stats.as_vector()
+    vector = torch.cat((stats.as_vector(), invalid_count.reshape(1).to(dtype=torch.float64)))
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        group = mpu.get_data_parallel_group(with_context_parallel=True)
-        torch.distributed.all_reduce(vector, op=torch.distributed.ReduceOp.SUM, group=group)
-    return P3OSufficientStats.from_vector(vector)
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            group = mpu.get_data_parallel_group(with_context_parallel=True)
+            torch.distributed.all_reduce(vector, op=torch.distributed.ReduceOp.SUM, group=group)
+
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            torch.distributed.broadcast(
+                vector,
+                group=mpu.get_pipeline_model_parallel_group(),
+                group_src=pp_size - 1,
+            )
+
+    if bool(vector[3] > 0):
+        raise ValueError(P3O_NONFINITE_RATIO_ERROR)
+    return P3OSufficientStats.from_vector(vector[:3])
 
 
 def compute_p3o_step_context(
@@ -112,6 +132,7 @@ def compute_p3o_step_context(
     stats_acc: list[P3OSufficientStats] = [
         P3OSufficientStats.zeros(device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
     ]
+    invalid_count_acc = [stats_acc[0].valid_token_count.clone()]
 
     def forward_step(iterator: DataIterator, model_chunk: torch.nn.Module):
         batch = get_batch(
@@ -164,7 +185,14 @@ def compute_p3o_step_context(
                     dynamic_cp_size=batch.get("dynamic_cp_size", None),
                     dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
                 )
-                stats_acc[0] = stats_acc[0] + _local_stats_from_batch(args, batch, computed["log_probs"])
+                try:
+                    micro_stats = _local_stats_from_batch(args, batch, computed["log_probs"])
+                except ValueError as error:
+                    if "non-finite importance ratio at a valid response token" not in str(error):
+                        raise
+                    invalid_count_acc[0] = invalid_count_acc[0] + 1.0
+                    micro_stats = P3OSufficientStats.zeros(device=invalid_count_acc[0].device)
+                stats_acc[0] = stats_acc[0] + micro_stats
             zero = torch.zeros((), device=logits.device, dtype=torch.float32)
             return zero, 1, {"keys": [], "values": zero.reshape(1)}
 
@@ -184,8 +212,9 @@ def compute_p3o_step_context(
             forward_only=True,
         )
 
-    # Accumulate every local micro-batch first, then reduce exactly once.
-    reduced = reduce_p3o_stats(stats_acc[0])
+    # Accumulate every local micro-batch first, reduce exactly once over DP x CP
+    # on pipeline-last, then broadcast that fixed vector over PP.
+    reduced = synchronize_p3o_stats(stats_acc[0], invalid_count_acc[0])
     step_context = finalize_p3o_step_context(reduced)
 
     if step_context.clamp_events:

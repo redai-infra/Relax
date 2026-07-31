@@ -49,6 +49,13 @@ def _p3o_args(**overrides) -> Namespace:
         attention_dropout=0.0,
         hidden_dropout=0.0,
         fully_async=False,
+        get_mismatch_metrics=False,
+        use_opsm=False,
+        custom_pg_loss_reducer_function_path=None,
+        enable_mtp_training=False,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+        overlap_moe_expert_parallel_comm=False,
     )
     config.update(overrides)
     return Namespace(**config)
@@ -58,20 +65,66 @@ def test_p3o_arguments_accepts_a_valid_configuration():
     validate_p3o_args(_p3o_args())
 
 
+def test_p3o_arguments_accepts_true_on_policy_scheduling():
+    validate_p3o_args(_p3o_args(true_on_policy_mode=True))
+
+
 @pytest.mark.parametrize(
     ("reason", "overrides"),
     [
         ("behavior policy would be undefined", dict(use_rollout_logprobs=False)),
         ("per-sample-mean reintroduces a micro-batch denominator", dict(calculate_per_token_loss=False)),
         ("TIS double-corrects the same mismatch", dict(use_tis=True)),
-        ("on-policy mode has no ratio to correct", dict(true_on_policy_mode=True)),
         ("P3O is critic-free", dict(use_critic=True)),
         ("FP8 amax history breaks replay", dict(fp8="hybrid")),
         ("attention dropout breaks replay", dict(attention_dropout=0.1)),
         ("hidden dropout breaks replay", dict(hidden_dropout=0.1)),
         ("async streaming hides the window", dict(fully_async=True)),
+        ("mismatch metrics add an unverified extra forward", dict(get_mismatch_metrics=True)),
+        ("OPSM changes the policy-gradient mask", dict(use_opsm=True)),
+        (
+            "custom reducer may change token-sum normalization",
+            dict(custom_pg_loss_reducer_function_path="pkg.reducer"),
+        ),
+        ("MTP changes forward state between replay passes", dict(enable_mtp_training=True)),
+        ("training routing replay changes the replayed forward", dict(use_routing_replay=True)),
+        ("rollout routing replay changes the replayed forward", dict(use_rollout_routing_replay=True)),
+        ("combined 1F1B bypasses the standard forward", dict(overlap_moe_expert_parallel_comm=True)),
     ],
 )
 def test_p3o_arguments_rejects_configs_that_change_the_objective(reason, overrides):
     with pytest.raises((AssertionError, ValueError)):
         validate_p3o_args(_p3o_args(**overrides))
+
+
+def test_p3o_arguments_validate_after_effective_value_overrides():
+    tree = ast.parse(ARGUMENTS_PATH.read_text(encoding="utf-8"))
+    validator = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "slime_validate_args"
+    )
+    calls = [
+        node
+        for node in ast.walk(validator)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_validate_p3o_args"
+    ]
+    assert len(calls) == 1
+
+    custom_config_if = next(
+        node
+        for node in ast.walk(validator)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Attribute) and child.attr == "custom_config_path" for child in ast.walk(node.test)
+        )
+    )
+    rollout_routing_if = next(
+        node
+        for node in ast.walk(validator)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Attribute) and child.attr == "use_rollout_routing_replay"
+            for child in ast.walk(node.test)
+        )
+    )
+    assert calls[0].lineno > custom_config_if.end_lineno
+    assert calls[0].lineno > rollout_routing_if.end_lineno

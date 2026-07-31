@@ -88,6 +88,13 @@ ALGOS = {
         ROLES.reference: ActorFwd,
         ROLES.actor_fwd: ActorFwd,
     },
+    "p3o": {
+        ROLES.rollout: Rollout,
+        ROLES.actor: Actor,
+        ROLES.advantages: Advantages,
+        ROLES.reference: ActorFwd,
+        ROLES.actor_fwd: ActorFwd,
+    },
     "gspo": {
         ROLES.rollout: Rollout,
         ROLES.actor: Actor,

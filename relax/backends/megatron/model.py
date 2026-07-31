@@ -134,6 +134,23 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
             output_layer.forward = original_forward
 
 
+@contextmanager
+def _preserved_dynamic_cp_group(args: Namespace, model: Sequence[torch.nn.Module]) -> Iterator[None]:
+    """Restore the static context-parallel group after dynamic-CP forwards."""
+    if not getattr(args, "dynamic_context_parallel", False):
+        yield
+        return
+
+    inner = model[0]
+    while hasattr(inner, "module"):
+        inner = inner.module
+    original_cp_group = inner.pg_collection.cp
+    try:
+        yield
+    finally:
+        inner.pg_collection.cp = original_cp_group
+
+
 def _should_use_sft_chunked(args: Namespace) -> bool:
     """Gate for the SFT chunked-logits path.
 
@@ -1076,15 +1093,6 @@ def train_one_step(
         # and lm_head_forward are set.
         return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
 
-    # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
-    # save the original static CP group here and restore after forward+backward.
-    _dcp_orig_cp_group = None
-    if getattr(args, "dynamic_context_parallel", False):
-        inner = model[0]
-        while hasattr(inner, "module"):
-            inner = inner.module
-        _dcp_orig_cp_group = inner.pg_collection.cp
-
     # Forward pass.
     use_streaming = (
         getattr(args, "use_dynamic_batch_size", False)
@@ -1109,37 +1117,37 @@ def train_one_step(
     else:
         forward_backward_func = get_forward_backward_func()
 
-    # P3O: freeze one adaptive cap for the whole optimizer step before any
-    # gradient is produced, so gradient accumulation cannot change the objective.
-    p3o_context_manager = contextlib.nullcontext()
-    if getattr(args, "advantage_estimator", None) == "p3o":
-        from relax.backends.megatron.p3o_step import (
-            compute_p3o_step_context,
-            p3o_step_context_published,
-        )
+    # Dynamic CP mutates the model's CP process group inside each forward.
+    # Protect both P3O passes so failures cannot leak a per-micro-batch group.
+    with _preserved_dynamic_cp_group(args, model):
+        # P3O: freeze one adaptive cap for the whole optimizer step before any
+        # gradient is produced, so gradient accumulation cannot change the objective.
+        p3o_context_manager = contextlib.nullcontext()
+        if getattr(args, "advantage_estimator", None) == "p3o":
+            from relax.backends.megatron.p3o_step import (
+                compute_p3o_step_context,
+                p3o_step_context_published,
+            )
 
-        p3o_step_context = compute_p3o_step_context(
-            args=args,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-        )
-        p3o_context_manager = p3o_step_context_published(args, p3o_step_context)
+            p3o_step_context = compute_p3o_step_context(
+                args=args,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+            )
+            p3o_context_manager = p3o_step_context_published(args, p3o_step_context)
 
-    with p3o_context_manager:
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-        )
-
-    if _dcp_orig_cp_group is not None:
-        inner.pg_collection.cp = _dcp_orig_cp_group
+        with p3o_context_manager:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+            )
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step

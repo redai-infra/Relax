@@ -217,13 +217,35 @@ def test_p3o_utils_masked_positions_tolerate_non_finite_values():
     assert float(_mean_loss(terms, valid_mask)) == pytest.approx(GOLDEN_LOSS_MEAN, **TOL)
 
 
-def test_p3o_utils_non_finite_valid_token_raises():
-    behavior_log_probs = torch.zeros(1, 2, dtype=torch.float32)
-    log_probs = torch.tensor([[float("nan"), 0.0]], dtype=torch.float32)
+@pytest.mark.parametrize(
+    ("log_prob", "behavior_log_prob"),
+    [
+        (float("nan"), 0.0),
+        (float("inf"), 0.0),
+        (float("-inf"), 0.0),
+        (0.0, float("inf")),
+        (0.0, float("-inf")),
+    ],
+)
+def test_p3o_utils_non_finite_valid_token_raises(log_prob, behavior_log_prob):
+    behavior_log_probs = torch.tensor([[behavior_log_prob, 0.0]], dtype=torch.float32)
+    log_probs = torch.tensor([[log_prob, 0.0]], dtype=torch.float32)
     valid_mask = torch.ones(1, 2, dtype=torch.bool)
 
     with pytest.raises(ValueError, match="non-finite importance ratio"):
         compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask)
+
+
+def test_p3o_utils_all_masked_poison_produces_fp64_zero_stats():
+    log_probs = torch.tensor([[float("nan"), float("inf")]], dtype=torch.float32)
+    behavior_log_probs = torch.tensor([[float("-inf"), float("nan")]], dtype=torch.float32)
+    valid_mask = torch.zeros(1, 2, dtype=torch.bool)
+
+    stats = compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask)
+
+    for value in (stats.sum_ratio, stats.sum_ratio_sq, stats.valid_token_count):
+        assert value.dtype == torch.float64
+        assert torch.equal(value, torch.zeros((), dtype=torch.float64))
 
 
 def test_p3o_utils_empty_global_batch_raises():
@@ -281,11 +303,40 @@ def test_p3o_utils_advantage_and_cap_are_stop_gradient():
     assert not ctx.normalized_ess.requires_grad
 
 
+def test_p3o_utils_entire_adaptive_coefficient_is_stop_gradient():
+    log_probs = torch.tensor([math.log(2.0)], dtype=torch.float32, requires_grad=True)
+    behavior_log_probs = torch.zeros(1, dtype=torch.float32)
+    advantages = torch.tensor([2.0], dtype=torch.float32)
+    valid_mask = torch.ones(1, dtype=torch.bool)
+    adaptive_cap = torch.tensor(0.75, dtype=torch.float64, requires_grad=True)
+    ctx = finalize_p3o_step_context(
+        P3OSufficientStats(
+            sum_ratio=torch.tensor(1.0, dtype=torch.float64),
+            sum_ratio_sq=torch.tensor(1.0, dtype=torch.float64),
+            valid_token_count=torch.tensor(1.0, dtype=torch.float64),
+        )
+    )
+    ctx = type(ctx)(
+        normalized_ess=ctx.normalized_ess,
+        adaptive_cap=adaptive_cap,
+        valid_token_count=ctx.valid_token_count,
+        ratio_mean=ctx.ratio_mean,
+        ratio_std=ctx.ratio_std,
+    )
+
+    terms = compute_p3o_token_terms(log_probs, behavior_log_probs, advantages, valid_mask, ctx)
+    terms.score_loss.sum().backward()
+
+    torch.testing.assert_close(log_probs.grad, torch.tensor([-1.5]))
+    assert adaptive_cap.grad is None
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 def test_p3o_utils_stats_stable_across_input_dtypes(dtype):
     log_probs, behavior_log_probs, _, valid_mask = _golden_batch()
     stats = compute_p3o_sufficient_stats(log_probs.to(dtype), behavior_log_probs.to(dtype), valid_mask)
     ess = float(finalize_p3o_step_context(stats).normalized_ess)
 
+    assert stats.as_vector().dtype == torch.float64
     tol = 5e-3 if dtype is torch.bfloat16 else 1e-6
     assert ess == pytest.approx(GOLDEN_ESS, rel=tol, abs=tol)

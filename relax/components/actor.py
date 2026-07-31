@@ -215,8 +215,7 @@ class Actor(Base):
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
             self._logger.exception(error_msg)
             self.healthy.report_error.remote("actor", error_msg)
-            if not getattr(self.config, "use_health_check", False):
-                raise
+            raise
 
     def _wait_for_rollout_data(self) -> bool:
         """Wait for rollout data to be ready in async colocate mode.

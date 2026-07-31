@@ -105,6 +105,39 @@ def test_p3o_rng_state_restored_after_prepass():
     torch.testing.assert_close(actual, expected)
 
 
+def test_p3o_rng_and_megatron_tracker_restored_after_error(monkeypatch):
+    from megatron.core.tensor_parallel import random as megatron_random
+
+    class _FakeTracker:
+        def __init__(self):
+            self.states = {"model-parallel-rng": torch.tensor([7], dtype=torch.uint8)}
+
+        def get_states(self):
+            return {name: state.clone() for name, state in self.states.items()}
+
+        def set_states(self, states):
+            self.states = {name: state.clone() for name, state in states.items()}
+
+    tracker = _FakeTracker()
+    monkeypatch.setattr(megatron_random, "get_cuda_rng_tracker", lambda: tracker)
+
+    torch.manual_seed(2026)
+    expected = torch.randn(4)
+    torch.manual_seed(2026)
+
+    with pytest.raises(RuntimeError, match="stats pass failed"):
+        with preserved_rng_state():
+            torch.randn(8)
+            tracker.states["model-parallel-rng"] = torch.tensor([99], dtype=torch.uint8)
+            raise RuntimeError("stats pass failed")
+
+    torch.testing.assert_close(torch.randn(4), expected)
+    torch.testing.assert_close(
+        tracker.states["model-parallel-rng"],
+        torch.tensor([7], dtype=torch.uint8),
+    )
+
+
 def test_p3o_stats_accumulate_then_reduce_equals_single_shot():
     """Sum-then-reduce must equal computing over the concatenated token set."""
     shards = [

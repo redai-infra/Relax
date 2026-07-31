@@ -4,7 +4,7 @@ import re
 
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_dapo_utils import normalize_final_answer
-from .math_utils import grade_answer_verl
+from .math_utils import extract_boxed_answer, grade_answer_verl
 from .openr1mm import get_openr1mm_rule_based_reward
 
 
@@ -38,10 +38,11 @@ def _is_correct_gsm8k(solution_str: str, gt: str) -> tuple[bool, str]:
     Comparison uses exact string match, then numeric fallback, then
     unit-suffix fallback ("852 BC" → 852, "100 miles" → 100).
     """
+    boxed_answer = extract_boxed_answer(solution_str) if "\\boxed" in solution_str else None
     match = _MINERVA_PATTERN.findall(solution_str)
     if not match:
         match = _GSM8K_PATTERN.findall(solution_str)
-    extracted = match[-1].strip() if match else "[INVALID]"
+    extracted = boxed_answer or (match[-1].strip() if match else "[INVALID]")
     pred = normalize_final_answer(extracted)
 
     gt_norm = normalize_final_answer(gt)
@@ -78,6 +79,9 @@ def _compute_gsm8k_score(response: str, label) -> float:
       - Handles decimal ground-truth labels and unit-suffix predictions
     """
     gt = str(label.get("ground_truth") or label.get("answer", "") if isinstance(label, dict) else label)
+    gt_matches = _GSM8K_PATTERN.findall(gt)
+    if gt_matches:
+        gt = gt_matches[-1]
 
     response = _strip_eos(response)
 

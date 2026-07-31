@@ -175,6 +175,12 @@ def compute_p3o_sufficient_stats(
     with torch.no_grad():
         mask_bool = valid_mask.bool()
         log_ratio = compute_p3o_log_ratio(log_probs.detach(), behavior_log_probs.detach(), mask_bool)
+        if not torch.isfinite(log_ratio[mask_bool]).all():
+            raise ValueError(
+                "P3O: non-finite importance ratio at a valid response token; refusing to "
+                "silently fall back to ESS=1. Check rollout log-probs and mask alignment."
+            )
+
         ratio = torch.exp(log_ratio.to(torch.float64))
         ratio = torch.where(mask_bool, ratio, torch.zeros_like(ratio))
 

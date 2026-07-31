@@ -2598,14 +2598,24 @@ def _validate_p3o_args(args) -> None:
         "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
         "rollout/training mismatch, and stacking them double-corrects the ratio."
     )
-    assert not getattr(args, "true_on_policy_mode", False), (
-        "P3O is an off-policy correction and has no role in --true-on-policy-mode, "
-        "where the behavior policy is the current policy by construction."
-    )
     assert not getattr(args, "use_critic", False), (
         "P3O does not use a critic; it is a score-function estimator over group-relative "
         "advantages. Drop --use-critic."
     )
+
+    incompatible_flags = {
+        "get_mismatch_metrics": "--get-mismatch-metrics",
+        "use_opsm": "--use-opsm",
+        "enable_mtp_training": "--enable-mtp-training",
+        "use_routing_replay": "--use-routing-replay",
+        "use_rollout_routing_replay": "--use-rollout-routing-replay",
+        "overlap_moe_expert_parallel_comm": "--overlap-moe-expert-parallel-comm",
+    }
+    for attr, flag in incompatible_flags.items():
+        if getattr(args, attr, False):
+            raise ValueError(f"P3O does not support {flag} in the replayed two-pass optimizer step.")
+    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        raise ValueError("P3O requires token-sum normalization and does not support a custom PG-loss reducer.")
 
     # The ESS pre-pass replays the same micro-batch window under no_grad. Ops that
     # mutate state on a forward would make the two passes disagree.
@@ -2822,9 +2832,6 @@ def slime_validate_args(args):
                 "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
                 "require advantage normalization. Please add `--normalize-advantages` to your command."
             )
-
-        if args.advantage_estimator == "p3o":
-            _validate_p3o_args(args)
 
         if args.fully_async:
             assert not args.normalize_advantages, (
@@ -3262,3 +3269,10 @@ def slime_validate_args(args):
     if args.genrm_model_path:
         args.genrm_engine_config = args.genrm_engine_config or {}
         args.genrm_sampling_config = args.genrm_sampling_config or {}
+
+    # Validate the final effective values. Several execution flags are derived
+    # above (hybrid and routing replay), and custom YAML is applied near the end;
+    # validating earlier would let those paths silently bypass P3O's replay
+    # contract.
+    if args.advantage_estimator == "p3o":
+        _validate_p3o_args(args)
