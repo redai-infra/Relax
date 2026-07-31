@@ -199,6 +199,30 @@ def test_concat_rollout_batches_preserves_order_and_scalar_metadata(monkeypatch)
     assert merged["weight_version"] == 7
 
 
+def test_hybrid_actor_logprob_schedule_uses_forward_budget_without_routing_replay(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    training_schedule = ([object()], [4])
+    logprob_schedule = ([object()], [2])
+
+    selected = data_module.select_hybrid_actor_logprob_schedule(
+        Namespace(use_routing_replay=False), training_schedule, logprob_schedule
+    )
+
+    assert selected is logprob_schedule
+
+
+def test_hybrid_actor_logprob_schedule_preserves_training_partition_for_routing_replay(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    training_schedule = ([object()], [4])
+    logprob_schedule = ([object()], [2])
+
+    selected = data_module.select_hybrid_actor_logprob_schedule(
+        Namespace(use_routing_replay=True), training_schedule, logprob_schedule
+    )
+
+    assert selected is training_schedule
+
+
 def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkeypatch):
     data_module = _load_data_module(monkeypatch)
     monkeypatch.setattr(

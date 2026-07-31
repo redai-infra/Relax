@@ -32,6 +32,7 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 MM_PROCESSOR_POOL_SIZE="${MM_PROCESSOR_POOL_SIZE:-0}"
 MM_PROCESSOR_GROUP_DEDUP="${MM_PROCESSOR_GROUP_DEDUP:-0}"
 HYBRID_STREAM_FORWARD="${HYBRID_STREAM_FORWARD:-0}"
+LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-12288}"
 
 TASK21_OPT_ARGS=(
    --mm-processor-pool-size "${MM_PROCESSOR_POOL_SIZE}"
@@ -98,6 +99,7 @@ PERF_ARGS=(
    # --qkv-format bshd
    --use-dynamic-batch-size
    --max-tokens-per-gpu 12288
+   --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU}"
    --no-rope-fusion
 )
 

@@ -164,15 +164,24 @@ export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
 
 # ── NVLink detection ────────────────────────────────────────────────────────
-if nvidia-smi 2>&1 > /dev/null; then
-    NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+# Keep hardware detection as the default, but allow a run-scoped override for
+# clusters where the requested NCCL NVLS mode is configured outside topology
+# discovery.  The override is intentionally opt-in and does not change normal
+# launcher behavior.
+if [ -n "${RELAX_NCCL_NVLS_ENABLE:-}" ]; then
+    HAS_NVLINK="${RELAX_NCCL_NVLS_ENABLE}"
+    NVLINK_COUNT="override"
 else
-    NVLINK_COUNT=0
-fi
-if [ "$NVLINK_COUNT" -gt 0 ]; then
-    export HAS_NVLINK=1
-else
-    export HAS_NVLINK=0
+    if nvidia-smi 2>&1 > /dev/null; then
+        NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+    else
+        NVLINK_COUNT=0
+    fi
+    if [ "$NVLINK_COUNT" -gt 0 ]; then
+        HAS_NVLINK=1
+    else
+        HAS_NVLINK=0
+    fi
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
@@ -186,6 +195,13 @@ NVSHMEM_LIB_PATH="${NVSHMEM_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/nv
 # torch lib path is required for fake_int4_quant_cuda.so to find libc10.so / libtorch.so
 TORCH_LIB_PATH="${TORCH_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/torch/lib}"
 CURRENT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NVSHMEM_LIB_PATH}:${TORCH_LIB_PATH}"
+
+# Propagate the allocator setting only when a run explicitly opts in.  Keeping
+# this empty by default preserves the existing launcher behavior.
+RUNTIME_ALLOC_CONF_ENV=""
+if [ -n "${RELAX_PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
+    RUNTIME_ALLOC_CONF_ENV="\"PYTORCH_CUDA_ALLOC_CONF\": \"${RELAX_PYTORCH_CUDA_ALLOC_CONF}\",";
+fi
 
 # Cap OMP/MKL/OpenBLAS threads (default 24) to avoid CPU oversubscription when colocating multiple Ray actors per node.
 export RUNTIME_ENV_JSON="{
@@ -209,6 +225,7 @@ export RUNTIME_ENV_JSON="{
    \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
    \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-1}\",
    \"NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK\": \"${NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK:-1}\",
+   ${RUNTIME_ALLOC_CONF_ENV}
    \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
 }
 }"

@@ -89,6 +89,7 @@ from .data import (
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
+    select_hybrid_actor_logprob_schedule,
 )
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
@@ -1107,6 +1108,19 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
+        actor_logprob_iterator, actor_logprob_microbatches = select_hybrid_actor_logprob_schedule(
+            self.args,
+            (data_iterator, num_microbatches),
+            (data_iterator_logprobs, num_microbatches_logprobs),
+        )
+        if self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu and not self.args.use_routing_replay:
+            logger.info(
+                "Hybrid actor log-prob schedule: token_budget=%s (training=%s), microbatches=%s (training=%s)",
+                self.args.log_probs_max_tokens_per_gpu,
+                self.args.max_tokens_per_gpu,
+                actor_logprob_microbatches,
+                num_microbatches,
+            )
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, sub_batch)
@@ -1138,7 +1152,9 @@ class MegatronTrainRayActor(TrainRayActor):
                         os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                     else:
                         os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
+                sub_batch.update(
+                    self.compute_log_prob(actor_logprob_iterator, actor_logprob_microbatches, store_prefix="")
+                )
                 if self.args.use_rollout_routing_replay:
                     RoutingReplay.clear_all_forward()
         return model_switches

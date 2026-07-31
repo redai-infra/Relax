@@ -753,6 +753,22 @@ class DataIterator:
         return self
 
 
+def select_hybrid_actor_logprob_schedule(
+    args: Namespace,
+    training_schedule: tuple[list[DataIterator], list[int]],
+    logprob_schedule: tuple[list[DataIterator], list[int]],
+) -> tuple[list[DataIterator], list[int]]:
+    """Select the inline old-actor forward schedule for Hybrid mode.
+
+    Routing replay records expert choices per training micro-batch, so its
+    actor forward must retain the training partition. Without routing replay,
+    forward-only log-probs can safely use their explicit, larger token budget.
+    """
+    if args.use_routing_replay:
+        return training_schedule
+    return logprob_schedule
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
