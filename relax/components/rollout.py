@@ -588,10 +588,20 @@ class Rollout(Base):
         can_update = await self._async_check_production_for_update_weight(step)
         if can_update:
             self._weight_update_ready.clear()
-            self.status = "paused"
-            await self.rollout_manager.health_monitoring_pause.remote()
-            await self.rollout_manager.set_weight_updating.remote(True)
-            self._weight_update_ready.set()
+            try:
+                self.status = "paused"
+                await self.rollout_manager.health_monitoring_pause.remote()
+                await self.rollout_manager.set_weight_updating.remote(True)
+            finally:
+                # Always release the handshake gate: even if the remote calls
+                # above raise (e.g. RayActorError from a dead engine),
+                # end_update_weight must not block forever. The 500 still
+                # propagates to the actor, which already has graceful
+                # degradation (actor_fwd_only). _weight_update_ready only orders
+                # the can_do <-> end_update_weight handshake; it does not gate
+                # the real weight transfer, so setting it on the failure path
+                # cannot make an engine use wrong weights.
+                self._weight_update_ready.set()
             return 1
         return 0
 

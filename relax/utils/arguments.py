@@ -969,6 +969,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
             )
             parser.add_argument(
+                "--rollout-http-timeout",
+                type=float,
+                default=120.0,
+                help="Timeout in seconds for actor HTTP probes to rollout and actor_fwd services.",
+            )
+            parser.add_argument(
                 "--rollout-health-check-first-wait",
                 type=float,
                 default=0,
