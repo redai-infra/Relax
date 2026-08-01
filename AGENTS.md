@@ -86,6 +86,16 @@ pytest tests/                        # 测试
 - 仅创建本地 commit，不 push
 - 测试命名：`test_<module>_<behavior>()`，GPU 测试用 `@pytest.mark.skipif` 优雅跳过
 
+## Git Identity
+
+- 所有新 commit 的 author 和 committer 必须统一为
+  `DreamEnding <63937131+DreamEnding@users.noreply.github.com>`。
+- commit 前必须检查仓库局部的 `user.name`、`user.email` 和 `user.useConfigOnly`；若会回退到
+  `zhanghua`、`dieter-zhang`、其他账号或其他邮箱，立即停止。
+- push 到 DreamEnding fork 前必须验证当前 GitHub 认证账号是 `DreamEnding`；远端仓库属于 DreamEnding
+  并不能证明实际 pusher 身份正确。
+- 只有用户明确授权时才允许 push、改写已有 commit 身份或 force-push。
+
 ## Distributed Code Rules
 
 作用域：`relax/backends/**`、`relax/distributed/ray/**`、`relax/distributed/checkpoint_service/**`
