@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from relax.utils.training.p3o_utils import (
+    P3OStepContext,
     P3OSufficientStats,
     compute_p3o_behavior_kl_proxy,
     compute_p3o_sufficient_stats,
@@ -329,6 +330,33 @@ def test_p3o_utils_entire_adaptive_coefficient_is_stop_gradient():
 
     torch.testing.assert_close(log_probs.grad, torch.tensor([-1.5]))
     assert adaptive_cap.grad is None
+
+
+def test_p3o_utils_token_terms_keep_adaptive_cap_on_device(monkeypatch):
+    """The per-micro-batch loss must not convert the GPU cap to a scalar."""
+    adaptive_cap = torch.tensor(0.75, dtype=torch.float64)
+    context = P3OStepContext(
+        normalized_ess=adaptive_cap,
+        adaptive_cap=adaptive_cap,
+        valid_token_count=torch.tensor(1.0, dtype=torch.float64),
+        ratio_mean=torch.tensor(2.0, dtype=torch.float64),
+        ratio_std=torch.tensor(0.0, dtype=torch.float64),
+    )
+    log_probs = torch.tensor([math.log(2.0)], dtype=torch.float32, requires_grad=True)
+
+    def fail_on_scalar_conversion(tensor):
+        raise AssertionError(f"unexpected Tensor.__float__ for {tensor}")
+
+    monkeypatch.setattr(torch.Tensor, "__float__", fail_on_scalar_conversion)
+    terms = compute_p3o_token_terms(
+        log_probs=log_probs,
+        behavior_log_probs=torch.zeros_like(log_probs),
+        advantages=torch.ones_like(log_probs),
+        valid_mask=torch.ones_like(log_probs, dtype=torch.bool),
+        step_context=context,
+    )
+
+    torch.testing.assert_close(terms.score_loss, -adaptive_cap.float() * log_probs.detach())
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])

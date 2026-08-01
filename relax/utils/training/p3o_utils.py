@@ -375,7 +375,9 @@ def compute_p3o_token_terms(
         ratio = torch.where(mask_bool, ratio, torch.zeros_like(ratio))
         # Full stop-gradient on min(ratio, cap): the coefficient must not
         # contribute a gradient path of its own.
-        coefficient = torch.clamp(ratio, min=0.0, max=float(cap))
+        # Keep the cap on device. Converting it with ``float(cap)`` would add a
+        # GPU-to-CPU synchronization in every training micro-batch.
+        coefficient = torch.minimum(ratio, cap)
         cap_hits = (mask_bool & (ratio > cap)).to(dtype=torch.float32)
 
     score_loss = -(coefficient * log_probs.float() * advantages.detach().float())
