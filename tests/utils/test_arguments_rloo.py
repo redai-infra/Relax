@@ -9,8 +9,15 @@ from types import SimpleNamespace
 
 import pytest
 
-import relax.utils.arguments as arguments_mod
-from tests.utils.test_arguments_opd_teacher_colocate import _opd_args
+from tests.utils.test_arguments_opd_teacher_colocate import (
+    _opd_args,
+)
+from tests.utils.test_arguments_opd_teacher_colocate import (
+    arguments_module as _arguments_module_fixture,
+)
+
+
+arguments_module = _arguments_module_fixture
 
 
 def _rloo_args(**overrides) -> SimpleNamespace:
@@ -37,35 +44,36 @@ def _rloo_args(**overrides) -> SimpleNamespace:
     return args
 
 
-def _validate(**overrides) -> SimpleNamespace:
+def _validate(arguments_module, **overrides) -> SimpleNamespace:
     args = _rloo_args(**overrides)
-    arguments_mod.slime_validate_args(args)
+    arguments_module.slime_validate_args(args)
     return args
 
 
-def test_rloo_valid_config_passes():
-    args = _validate()
+def test_rloo_valid_config_passes(arguments_module):
+    args = _validate(arguments_module)
     assert args.rollout_batch_size == 16
     assert args.global_batch_size == 128
 
 
-def test_rloo_derives_rollout_batch_size_before_validation():
-    args = _validate(rollout_batch_size=None, global_batch_size=128)
+def test_rloo_derives_rollout_batch_size_before_validation(arguments_module):
+    args = _validate(arguments_module, rollout_batch_size=None, global_batch_size=128)
     assert args.rollout_batch_size == 16
 
 
-def test_rloo_derives_batch_before_rejecting_fully_async():
+def test_rloo_derives_batch_before_rejecting_fully_async(arguments_module):
     with pytest.raises(ValueError, match="synchronous"):
-        _validate(rollout_batch_size=None, global_batch_size=128, fully_async=True)
+        _validate(arguments_module, rollout_batch_size=None, global_batch_size=128, fully_async=True)
 
 
-def test_batch_derivation_requires_exact_divisibility():
+def test_batch_derivation_requires_exact_divisibility(arguments_module):
     with pytest.raises(ValueError, match="must be divisible"):
-        _validate(rollout_batch_size=None, global_batch_size=127)
+        _validate(arguments_module, rollout_batch_size=None, global_batch_size=127)
 
 
-def test_fully_async_non_rloo_can_derive_rollout_batch_size():
+def test_fully_async_non_rloo_can_derive_rollout_batch_size(arguments_module):
     args = _validate(
+        arguments_module,
         advantage_estimator="grpo",
         rollout_batch_size=None,
         global_batch_size=128,
@@ -75,45 +83,46 @@ def test_fully_async_non_rloo_can_derive_rollout_batch_size():
     assert args.true_on_policy_mode is True
 
 
-def test_rloo_requires_n_samples_ge_2():
+def test_rloo_requires_n_samples_ge_2(arguments_module):
     with pytest.raises(ValueError, match="n-samples-per-prompt >= 2"):
-        _validate(n_samples_per_prompt=1, rollout_batch_size=16, global_batch_size=16)
+        _validate(arguments_module, n_samples_per_prompt=1, rollout_batch_size=16, global_batch_size=16)
 
 
 @pytest.mark.parametrize("mode", ["fully_async", "hybrid"])
-def test_rloo_rejects_async_modes(mode):
+def test_rloo_rejects_async_modes(arguments_module, mode):
     with pytest.raises(ValueError, match="synchronous"):
-        _validate(**{mode: True})
+        _validate(arguments_module, **{mode: True})
 
 
-def test_rloo_requires_rewards_normalization():
+def test_rloo_requires_rewards_normalization(arguments_module):
     with pytest.raises(ValueError, match="rewards normalization"):
-        _validate(rewards_normalization=False)
+        _validate(arguments_module, rewards_normalization=False)
 
 
-def test_rloo_rejects_normalize_advantages():
+def test_rloo_rejects_normalize_advantages(arguments_module):
     with pytest.raises(ValueError, match="normalize-advantages"):
-        _validate(normalize_advantages=True)
+        _validate(arguments_module, normalize_advantages=True)
 
 
-def test_rloo_requires_matching_global_batch_size():
+def test_rloo_requires_matching_global_batch_size(arguments_module):
     with pytest.raises(ValueError, match="one optimizer update per rollout"):
-        _validate(global_batch_size=64)
+        _validate(arguments_module, global_batch_size=64)
 
 
-def test_rloo_rejects_multiple_steps_per_rollout():
+def test_rloo_rejects_multiple_steps_per_rollout(arguments_module):
     with pytest.raises(ValueError, match="num-steps-per-rollout 1"):
-        _validate(num_steps_per_rollout=2, global_batch_size=64)
+        _validate(arguments_module, num_steps_per_rollout=2, global_batch_size=64)
 
 
 @pytest.mark.parametrize("mode", ["partial_rollout", "use_dynamic_global_batch_size"])
-def test_rloo_rejects_dynamic_batch_modes(mode):
+def test_rloo_rejects_dynamic_batch_modes(arguments_module, mode):
     with pytest.raises(ValueError, match="effective batch size to drift"):
-        _validate(**{mode: True})
+        _validate(arguments_module, **{mode: True})
 
 
-def test_non_rloo_path_does_not_apply_rloo_guards():
+def test_non_rloo_path_does_not_apply_rloo_guards(arguments_module):
     args = _validate(
+        arguments_module,
         advantage_estimator="grpo",
         n_samples_per_prompt=1,
         rollout_batch_size=16,
@@ -126,14 +135,14 @@ def test_non_rloo_path_does_not_apply_rloo_guards():
     assert args.advantage_estimator == "grpo"
 
 
-def test_advantage_estimator_choices_include_rloo(monkeypatch):
+def test_advantage_estimator_choices_include_rloo(arguments_module, monkeypatch):
     monkeypatch.setattr(
-        arguments_mod,
+        arguments_module,
         "RouterArgs",
         SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser),
     )
     parser = argparse.ArgumentParser()
-    arguments_mod.get_slime_extra_args_provider()(parser)
+    arguments_module.get_slime_extra_args_provider()(parser)
 
     action = next(action for action in parser._actions if action.dest == "advantage_estimator")
     assert "rloo" in action.choices
