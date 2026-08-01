@@ -18,6 +18,10 @@ FORMAL_SCRIPTS = {
     "p3o_temperature_1p2": SCRIPT_DIR / "run_p3o_temperature_1p2_a100x4.sh",
     "grpo_temperature_1p2": SCRIPT_DIR / "run_grpo_temperature_1p2_a100x4.sh",
 }
+STALENESS_SCRIPTS = {
+    "p3o_staleness_2_mismatch": SCRIPT_DIR / "run_p3o_staleness_mismatch_a100x4.sh",
+    "grpo_staleness_2_mismatch": SCRIPT_DIR / "run_grpo_staleness_mismatch_a100x4.sh",
+}
 
 
 def _bash_executable() -> str:
@@ -43,9 +47,11 @@ def _bash_executable() -> str:
     pytest.skip("no POSIX bash available to dry-run the launch scripts")
 
 
-def _dry_run(script: Path, *extra_args: str) -> list[str]:
+def _dry_run(script: Path, *extra_args: str, env_overrides: dict[str, str] | None = None) -> list[str]:
     env = os.environ.copy()
     env["TASK40_DRY_RUN"] = "1"
+    if env_overrides is not None:
+        env.update(env_overrides)
     result = subprocess.run(
         [_bash_executable(), str(script), *extra_args],
         cwd=REPO_ROOT,
@@ -130,6 +136,25 @@ def test_p3o_configs_are_comparable_except_algorithm_and_behavior():
     for name in ("p3o_on_policy", "p3o_temperature_1p2"):
         assert "--eps-clip" not in resolved[name]
         assert "--eps-clip-high" not in resolved[name]
+
+
+def test_p3o_staleness_configs_are_matched_and_parameterized():
+    resolved = {name: _dry_run(script) for name, script in STALENESS_SCRIPTS.items()}
+
+    p3o_args = resolved["p3o_staleness_2_mismatch"]
+    grpo_args = resolved["grpo_staleness_2_mismatch"]
+    assert _option_value(p3o_args, "--max-staleness") == "2"
+    assert _option_value(grpo_args, "--max-staleness") == "2"
+    assert _option_value(p3o_args, "--tb-experiment-name") == "p3o_staleness_2_mismatch-seed-42"
+    assert _option_value(grpo_args, "--tb-experiment-name") == "grpo_staleness_2_mismatch-seed-42"
+    assert _comparable_args(p3o_args) == _comparable_args(grpo_args)
+
+    overridden = _dry_run(
+        STALENESS_SCRIPTS["p3o_staleness_2_mismatch"],
+        env_overrides={"TASK40_MAX_STALENESS": "3"},
+    )
+    assert _option_value(overridden, "--max-staleness") == "3"
+    assert _option_value(overridden, "--tb-experiment-name") == "p3o_staleness_3_mismatch-seed-42"
 
 
 def test_p3o_smoke_uses_one_small_optimizer_step():

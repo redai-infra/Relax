@@ -10,6 +10,7 @@ source "${TASK40_REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
 
 TASK40_ALGORITHM="${TASK40_ALGORITHM:?set TASK40_ALGORITHM to p3o or grpo}"
 TASK40_BEHAVIOR_MISMATCH="${TASK40_BEHAVIOR_MISMATCH:-0}"
+TASK40_MAX_STALENESS="${TASK40_MAX_STALENESS:-0}"
 TASK40_MODE="${TASK40_MODE:-formal}"
 TASK40_SEED="${TASK40_SEED:-42}"
 TASK40_MODEL_DIR="${TASK40_MODEL_DIR:-/workspace/Qwen3-0.6B}"
@@ -51,7 +52,11 @@ fi
 
 TASK40_CONFIG_NAME="${TASK40_ALGORITHM}_$(
     if [[ "${TASK40_BEHAVIOR_MISMATCH}" == "1" ]]; then
-        echo "temperature_1p2"
+        if [[ "${TASK40_MAX_STALENESS}" != "0" ]]; then
+            echo "staleness_${TASK40_MAX_STALENESS}_mismatch"
+        else
+            echo "temperature_1p2"
+        fi
     else
         echo "on_policy"
     fi
@@ -153,7 +158,7 @@ task40_build_args() {
 
     TASK40_TRAIN_ARGS=(
         --resource '{"actor":[1,4],"rollout":[1,4]}'
-        --max-staleness 0
+        --max-staleness "${TASK40_MAX_STALENESS}"
         --num-iters-per-train-update 1
         --num-data-storage-units 1
         --colocate
@@ -198,6 +203,7 @@ task40_run() {
         echo "config=${TASK40_CONFIG_NAME}"
         echo "mode=${TASK40_MODE}"
         echo "seed=${TASK40_SEED}"
+        echo "max_staleness=${TASK40_MAX_STALENESS}"
         echo "ray_job_id=${TASK40_JOB_ID}"
         echo "repo=${TASK40_REPO_ROOT}"
         echo "model=${TASK40_MODEL_DIR}"
