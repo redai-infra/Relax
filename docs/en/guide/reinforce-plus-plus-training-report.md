@@ -9,6 +9,8 @@ a claim that one algorithm is statistically superior.
 ## Scope and evidence boundary
 
 - Proposal: [Task 29 issue #192](https://github.com/redai-infra/Relax/issues/192)
+- Sanitized reproducibility evidence:
+  [logs, expanded commands, metrics and manifest](https://github.com/zheself/Relax/releases/tag/task29-reinforcepp-evidence-c72caf1)
 - Experiment source commit: `5f7cd574372288391bb1c41ca0677422cd31e725`
 - Experiment upstream base: `b095ba68ce95c7d98762cf128eab630878f394e6`
 - Post-experiment rebase base: `0bc99af8dd39de8fd99c588a98b3f3a463bc818c`
@@ -21,10 +23,15 @@ The GPU results below remain attributed to the exact experiment commit. The
 branch was later rebased onto the newer upstream base and the CPU numerical
 and regression tests were rerun. No post-rebase GPU result is claimed.
 
-The report does not include checkpoints, data, credentials, cluster paths, or
-complete raw logs. The local evidence bundle retains the raw TensorBoard event
-files, training/evaluation logs, GPU samples, expanded commands, evaluation
-JSONL files, and a SHA256 manifest.
+The Git tree does not include checkpoints, data, credentials, cluster paths,
+or complete raw logs. The public sanitized evidence release contains the nine
+accepted training logs, nine accepted evaluation logs and summaries, all 18
+expanded commands, GPU samples, report CSV/SVG files, and an internal SHA256
+manifest. Its compressed archive SHA256 is
+`0b52d8e8e6a85ff534e16569dd48c9dbef336402a2c80b6aa96b8bf2ffd7834f`.
+The private local evidence bundle additionally retains raw TensorBoard event
+files, evaluation JSONL files, and checkpoints; none is required to reproduce
+the published tables from the released CSV files.
 
 Machine-readable, path-free evidence used by the figures and tables is
 published with the documentation:
@@ -218,6 +225,34 @@ three run-level values.
 | GRPO | 0.5417 ± 0.0273 | -0.000000 ± 0.000000 | 0.006024 ± 0.000380 | 1.1674 ± 0.0396 |
 | REINFORCE++ | 0.5469 ± 0.0188 | -0.111379 ± 0.015769 | N/A (k1 reward shaping) | 1.7015 ± 0.0244 |
 | REINFORCE++-baseline | 0.5344 ± 0.0143 | -0.021490 ± 0.010483 | 0.006048 ± 0.002002 | 1.5847 ± 0.0499 |
+
+`train/ppo_kl` is the response-reduced old-policy/current-policy log-prob
+difference used by the PPO importance ratio. It is zero in all 450 published
+rows for this frozen workload with one Actor update per rollout batch, but
+that is not a
+reference-policy KL measurement and does not imply that reference
+regularization was disabled. REINFORCE++ instead folds its k1 reference term
+into the return, while GRPO and REINFORCE++-baseline report an independent k2
+term as `train/kl_loss`.
+
+For a direct k1 activation check, the following table subtracts each
+same-step TensorBoard `rollout/raw_reward` scalar from `rollout/returns`, then
+averages those differences within the indicated interval. All three
+REINFORCE++ commands used `--kl-coef 0.01 --kl-loss-type k1`. The consistently
+negative, nonzero differences after policy movement show that reference KL
+shaping reached the production return rather than remaining a recipe-only
+setting.
+
+| Seed / job | All-50 mean difference | Last-10 mean difference | Final-step difference |
+|---|---:|---:|---:|
+| 42 / 937653 | -0.007241 | -0.017225 | -0.019743 |
+| 1234 / 937680 | -0.007396 | -0.018403 | -0.020091 |
+| 2026 / 937689 | -0.006929 | -0.017273 | -0.014912 |
+
+The baseline's separately optimized k2 loss is independently visible in the
+stability table (`0.006048 ± 0.002002` over steps 40--49). The released
+expanded commands and raw logs allow both checks to be recomputed without
+access to the cluster.
 
 ![Training reward curves](/reinforce-plus-plus/training_reward_curve.svg)
 

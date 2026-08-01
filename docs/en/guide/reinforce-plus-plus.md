@@ -238,8 +238,21 @@ The rollout metrics include:
 - zero-variance indicator;
 - ordinary reward, return and advantage summaries.
 
-Training metrics continue to report policy loss, PPO KL, clip fraction and the
-independent k2 loss when enabled.
+The three KL-related observables have deliberately different meanings:
+
+- `train/ppo_kl` is the response-reduced old-policy/current-policy log-prob
+  difference used to form the PPO importance ratio. It measures policy-update
+  drift; it is not a reference-policy KL and does not show whether k1 or k2
+  regularization is active.
+- For REINFORCE++, reference-policy k1 shaping is already folded into
+  `rollout/returns`. Comparing the same-step `rollout/returns` and
+  `rollout/raw_reward` summaries exposes its empirical effect; there is no
+  independent `train/kl_loss` for this variant.
+- For REINFORCE++-baseline, `train/kl_loss` is the separately reduced k2
+  reference-policy penalty. It is absent from the advantage and is added to
+  the total loss with `--kl-loss-coef`.
+
+Training metrics also continue to report policy loss and clip fraction.
 
 ## Testing
 
