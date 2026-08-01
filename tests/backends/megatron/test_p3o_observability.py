@@ -10,14 +10,6 @@ class TestP3OObservability:
 
     def test_snapshot_step_initialization(self):
         """Verify _rollout_policy_snapshot_step is initialized to 0."""
-        from argparse import Namespace
-
-        # Mock minimal args needed for initialization
-        args = Namespace(
-            update_weights_interval=11,
-            num_rollout=11,
-        )
-
         # Simulate the initialization logic
         snapshot_step = 0
         assert snapshot_step == 0, "Initial snapshot step should be 0"
@@ -63,8 +55,6 @@ class TestP3OObservability:
 
     def test_lag_boundaries(self):
         """Test lag values at interval boundaries."""
-        interval = 11
-
         # Just after refresh (rollout_id=10 completed, step 11)
         snapshot_step = 11
         current_step = 11

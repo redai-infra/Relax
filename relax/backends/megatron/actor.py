@@ -1650,9 +1650,11 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def get_rollout_policy_snapshot_step(self) -> int:
-        """Return the step at which the current rollout policy snapshot was created.
+        """Return the step at which the current rollout policy snapshot was
+        created.
 
-        Returns 0 for on-policy (interval=1) or when snapshot tracking is unavailable.
+        Returns 0 for on-policy (interval=1) or when snapshot tracking is
+        unavailable.
         """
         return getattr(self, "_rollout_policy_snapshot_step", 0)
 
