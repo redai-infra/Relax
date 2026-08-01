@@ -278,6 +278,8 @@ class MegatronTrainRayActor(TrainRayActor):
             self._active_model_tag: str | None = "actor"
             self.weights_backuper.backup("actor")
             self._rollout_weights_tag = rollout_weights_tag(update_weights_interval)
+            # Track the step at which rollout policy snapshot was created (for observability)
+            self._rollout_policy_snapshot_step = 0
             if use_rollout_policy_snapshot:
                 self.weights_backuper.backup(ROLLOUT_POLICY_TAG)
 
@@ -895,6 +897,8 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            # Store rollout policy snapshot step for observability in training metrics
+            self.args.rollout_policy_snapshot_step = self.get_rollout_policy_snapshot_step()
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -1626,10 +1630,14 @@ class MegatronTrainRayActor(TrainRayActor):
             interval,
             self.args.num_rollout,
         ):
+            # Store the step at which we refreshed the snapshot
+            self._rollout_policy_snapshot_step = rollout_id + 1
             logger.info(
-                "Refreshed rollout policy snapshot after rollout_id=%s (update_weights_interval=%s)",
+                "Refreshed rollout policy snapshot after rollout_id=%s (update_weights_interval=%s); "
+                "snapshot now at step=%s",
                 rollout_id,
                 interval,
+                self._rollout_policy_snapshot_step,
             )
         else:
             next_rollout_lag = (rollout_id + 1) % interval
@@ -1640,6 +1648,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 next_rollout_lag,
                 interval,
             )
+
+    def get_rollout_policy_snapshot_step(self) -> int:
+        """Return the step at which the current rollout policy snapshot was created.
+
+        Returns 0 for on-policy (interval=1) or when snapshot tracking is unavailable.
+        """
+        return getattr(self, "_rollout_policy_snapshot_step", 0)
 
     @timer
     def update_weights(self, rollout_id: int | None = None) -> None:

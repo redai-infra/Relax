@@ -1436,6 +1436,16 @@ def train(
                 log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
                     num_per_epoch * num_steps_per_rollout
                 )
+
+            # P3O observability: track rollout policy lag
+            if getattr(args, "advantage_estimator", None) == "p3o" and args.update_weights_interval > 1:
+                snapshot_step = getattr(args, "rollout_policy_snapshot_step", 0)
+                current_step = accumulated_step_id + 1  # +1 because this step just completed
+                lag_steps = current_step - snapshot_step
+                log_dict["train/actor_optimizer_step"] = current_step
+                log_dict["train/rollout_policy_snapshot_step"] = snapshot_step
+                log_dict["train/p3o/rollout_policy_lag_steps"] = lag_steps
+
             tracking_utils.log(args, log_dict, step_key="train/step")
             tracking_utils.flush_metrics(args, accumulated_step_id)
 
