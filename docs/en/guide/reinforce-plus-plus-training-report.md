@@ -35,6 +35,9 @@ published with the documentation:
 - [per-run evaluation summaries](/reinforce-plus-plus/evaluation_summary_by_run.csv)
   and [three-seed aggregates](/reinforce-plus-plus/evaluation_summary_by_algorithm.csv);
 - [paired reward differences](/reinforce-plus-plus/evaluation_paired_reward_differences.csv).
+- [accepted job and evidence index](/reinforce-plus-plus/evidence_index.csv),
+  including Slurm state, elapsed time, source commit, accepted step/response
+  counts, and SHA256 identifiers for the retained primary artifacts.
 
 ## Algorithm contract
 
@@ -122,6 +125,25 @@ directory, output directory, and port set per Slurm job. It set
 `PYTHONNOUSERSITE=1` and bind-mounted the host checkout into the immutable
 container.
 
+The site-specific Slurm expansion for every formal training was:
+
+```bash
+sbatch \
+  --partition=ShangHAI --account=hexm-shanghai \
+  --gres=gpu:NVIDIAA40:1 --cpus-per-task=16 --mem=64G \
+  --time=06:00:00 \
+  --export=ALL,TASK29_ALGORITHM=<algorithm>,TASK29_SEED=<seed>,TASK29_NUM_ROLLOUT=50,TASK29_ROLLOUT_BATCH_SIZE=4,TASK29_N_SAMPLES_PER_PROMPT=8,TASK29_GLOBAL_BATCH_SIZE=32,TASK29_MAX_RESPONSE_LEN=1024,TASK29_MAX_TOKENS_PER_GPU=4096,TASK29_SGLANG_MEM_FRACTION=0.40,TASK29_REWARD_NUM_WORKERS=4,TASK29_REWARD_MAX_CONCURRENCY=16,TASK29_USE_HEALTH_CHECK=1,TASK29_USE_EVAL=0 \
+  <job-isolated-wrapper.sbatch>
+```
+
+The wrapper verified the source commit, model/data/image inputs, runtime module
+paths and visible A40 before invoking the portable recipe above. It gave each
+job distinct Ray, Serve, cache, temporary and output roots. Site paths and the
+wrapper itself are not a portable project API; the complete algorithm
+invocation is the recipe command above. The path-free evidence index records
+every accepted training and evaluation job, while the SHA256-verified local
+bundle retains the expanded commands and raw logs for audit.
+
 ## Numerical and regression validation
 
 The independent float64 test references do not call the production return,
@@ -132,7 +154,8 @@ response-reduced loss element by element at `atol=rtol=1e-6`.
 Coverage includes:
 
 - response lengths `[1, 3, 5]`, right padding, and an internal mask hole;
-- large finite sentinels outside the mask and exact mask-zero outputs;
+- finite, `NaN`, and `Inf` sentinels outside the mask and exact mask-zero
+  outputs;
 - all-zero reward, nonzero KL, zero variance, and a single valid token;
 - baseline `k=1` rejection;
 - upper/lower PPO clipping and positive/negative advantages;
@@ -165,6 +188,16 @@ container process cannot import the image's root-owned Megatron checkout. It
 is not a Task 29 test. A `git range-diff` marks all five Task 29 commits as
 patch-identical before and after the rebase, so the upstream FP16 change was
 added without altering the trained Task 29 implementation.
+
+A final pre-review audit hardened boolean masking against non-finite padding,
+made a fully masked local response participate safely in global DP statistics,
+and added a production-dispatch integration test. The updated focused host
+suite reported `62 passed, 2 skipped`; the broader `tests/utils + tests/core`
+regression reported `209 passed, 12 skipped, 3 warnings`. The two focused
+skips remain upstream modules that require a full Megatron installation. These
+post-experiment changes affect only masked/degenerate inputs and monitoring
+scalar synchronization; the GPU results remain attributed to the frozen
+experiment commit above.
 
 At the experiment commit, the pinned container passed 43 Task 29 tests and 14
 metrics tests. All nine formal trainings produced 50 rollout records, 50 Actor

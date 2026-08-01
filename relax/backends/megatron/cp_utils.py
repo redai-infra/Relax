@@ -105,7 +105,8 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+                    torch.where(loss_mask_i != 0, x_i, torch.zeros_like(x_i)).sum()
+                    / torch.clamp_min(loss_mask_i.sum(), 1)
                     for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
                 ]
             )
@@ -113,7 +114,7 @@ def get_sum_of_sample_mean(
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum()
+                    torch.where(loss_mask_i != 0, x_i, torch.zeros_like(x_i)).sum()
                     for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
                 ]
             )
@@ -145,7 +146,8 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
+                    torch.where(chunked_loss_mask != 0, x_i, torch.zeros_like(x_i)).sum()
+                    / torch.clamp_min(loss_mask.sum(), 1)
                     for x_i, chunked_loss_mask, loss_mask in zip(
                         x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
                     )
@@ -155,7 +157,7 @@ def get_sum_of_sample_mean(
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum()
+                    torch.where(chunked_loss_mask != 0, x_i, torch.zeros_like(x_i)).sum()
                     for x_i, chunked_loss_mask in zip(
                         x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False
                     )

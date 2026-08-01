@@ -20,7 +20,7 @@ def _distributed_worker(rank: int, world_size: int, init_method: str) -> None:
     )
     try:
         if rank == 0:
-            values = torch.tensor([1.0, 10000.0, 3.0], dtype=torch.float64)
+            values = torch.tensor([1.0, float("nan"), 3.0], dtype=torch.float64)
             mask = torch.tensor([1.0, 0.0, 1.0], dtype=torch.float64)
             expected = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float64) / torch.sqrt(
                 torch.tensor(5.0, dtype=torch.float64)
@@ -42,7 +42,9 @@ def _distributed_worker(rank: int, world_size: int, init_method: str) -> None:
         # Rank 0 has no valid token in this second collective; it must still
         # participate and receive the moments produced by rank 1.
         values = (
-            torch.tensor([9999.0], dtype=torch.float64) if rank == 0 else torch.tensor([2.0, 4.0], dtype=torch.float64)
+            torch.tensor([float("inf")], dtype=torch.float64)
+            if rank == 0
+            else torch.tensor([2.0, 4.0], dtype=torch.float64)
         )
         mask = torch.zeros_like(values) if rank == 0 else torch.ones_like(values)
         normalized, mean, variance, count = distributed_masked_normalize(values, mask)

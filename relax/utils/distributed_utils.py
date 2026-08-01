@@ -182,9 +182,11 @@ def distributed_masked_normalize(
 
     working_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
     working_values = values.to(dtype=working_dtype)
-    working_mask = mask.to(device=values.device, dtype=working_dtype)
+    valid_mask = mask.to(device=values.device) != 0
+    working_mask = valid_mask.to(dtype=working_dtype)
+    masked_values = torch.where(valid_mask, working_values, torch.zeros_like(working_values))
 
-    mean_stats = torch.stack(((working_values * working_mask).sum(), working_mask.sum()))
+    mean_stats = torch.stack((masked_values.sum(), working_mask.sum()))
     dist.all_reduce(mean_stats, group=process_group)
     global_sum, global_count = mean_stats.unbind()
 
@@ -192,11 +194,15 @@ def distributed_masked_normalize(
         raise ValueError("The global mask sum across all participating ranks is zero.")
 
     global_mean = global_sum / global_count
-    centered = (working_values - global_mean) * working_mask
+    centered = torch.where(valid_mask, working_values - global_mean, torch.zeros_like(working_values))
     centered_sum_sq = centered.square().sum()
     dist.all_reduce(centered_sum_sq, group=process_group)
     global_variance = (centered_sum_sq / global_count).clamp_min(0.0)
     inverse_std = torch.rsqrt(global_variance.clamp_min(variance_floor))
-    normalized = (working_values - global_mean) * inverse_std * working_mask
+    normalized = torch.where(
+        valid_mask,
+        (working_values - global_mean) * inverse_std,
+        torch.zeros_like(working_values),
+    )
 
     return normalized, global_mean, global_variance, global_count

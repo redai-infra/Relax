@@ -477,11 +477,22 @@ def get_reinforce_plus_plus_returns(
                 f"KL and loss mask for response {i} must have the same shape, "
                 f"got {full_kl_response.shape} and {full_mask.shape}."
             )
-        if full_mask.sum().item() == 0:
-            raise ValueError(f"Sequence at index {i} is fully masked.")
-        masked_kl = full_kl_response * full_mask
+        valid_mask = full_mask != 0
+        if not torch.any(valid_mask):
+            returns_for_seq = torch.zeros_like(full_kl_response)
+            if cp_size > 1:
+                from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
+
+                returns_for_seq = slice_log_prob_with_cp(returns_for_seq, total_len, response_len)
+            final_returns_chunks.append(returns_for_seq)
+            continue
+
+        # Multiplication is insufficient here because NaN * 0 is still NaN.
+        # Select valid values before any return arithmetic so masked padding can
+        # never contaminate a valid token.
+        masked_kl = torch.where(valid_mask, full_kl_response, torch.zeros_like(full_kl_response))
         token_level_rewards = -kl_coef * masked_kl
-        last_idx = full_mask.nonzero(as_tuple=True)[0][-1]
+        last_idx = valid_mask.nonzero(as_tuple=True)[0][-1]
         token_level_rewards[last_idx] += rewards[i]
 
         returns_for_seq = torch.zeros_like(token_level_rewards)
@@ -490,7 +501,7 @@ def get_reinforce_plus_plus_returns(
             # G_t = r_t + gamma * G_{t+1}
             running_return = token_level_rewards[t] + gamma * running_return
             returns_for_seq[t] = running_return
-        returns_for_seq *= full_mask
+        returns_for_seq = torch.where(valid_mask, returns_for_seq, torch.zeros_like(returns_for_seq))
 
         # Step 4: Pick up the results corresponding to our local chunk's parts.
         if cp_size > 1:
@@ -537,7 +548,9 @@ def get_reinforce_plus_plus_baseline_advantages(
                 f"Token shape and loss mask for response {response_index} must match, "
                 f"got {kl_tensor.shape} and {loss_mask.shape}."
             )
-        unwhitened_advantages.append(torch.ones_like(kl_tensor) * reward_val * loss_mask)
+        valid_mask = loss_mask != 0
+        broadcast_reward = torch.ones_like(kl_tensor) * reward_val
+        unwhitened_advantages.append(torch.where(valid_mask, broadcast_reward, torch.zeros_like(kl_tensor)))
 
     return unwhitened_advantages
 

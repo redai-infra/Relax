@@ -694,14 +694,18 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 variance_floor = torch.tensor(1e-8, device=raw_variance.device, dtype=raw_variance.dtype)
                 normalized_variance = raw_variance / torch.maximum(raw_variance, variance_floor)
                 num_samples = len(advantages)
-                rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean.item()] * num_samples
-                rollout_data["reinforce_pp_advantage_raw_std"] = [raw_variance.sqrt().item()] * num_samples
-                rollout_data["reinforce_pp_advantage_normalized_mean"] = [0.0] * num_samples
-                rollout_data["reinforce_pp_advantage_normalized_std"] = [
-                    normalized_variance.sqrt().item()
-                ] * num_samples
-                rollout_data["reinforce_pp_valid_token_count"] = [valid_count.item()] * num_samples
-                rollout_data["reinforce_pp_zero_variance"] = [float(raw_variance.item() == 0.0)] * num_samples
+                raw_mean = raw_mean.detach()
+                raw_std = raw_variance.sqrt().detach()
+                normalized_mean = torch.zeros_like(raw_mean)
+                normalized_std = normalized_variance.sqrt().detach()
+                valid_count = valid_count.detach()
+                zero_variance = (raw_variance == 0).to(dtype=raw_variance.dtype).detach()
+                rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean] * num_samples
+                rollout_data["reinforce_pp_advantage_raw_std"] = [raw_std] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_mean"] = [normalized_mean] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_std"] = [normalized_std] * num_samples
+                rollout_data["reinforce_pp_valid_token_count"] = [valid_count] * num_samples
+                rollout_data["reinforce_pp_zero_variance"] = [zero_variance] * num_samples
             else:
                 whitened_advs_flat = distributed_masked_whiten(
                     all_advs,

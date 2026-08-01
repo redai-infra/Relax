@@ -53,6 +53,8 @@ def _args(estimator: str, **overrides) -> SimpleNamespace:
         n_samples_per_prompt=8,
         rewards_normalization=True,
         use_unbiased_kl=False,
+        custom_reward_post_process_path=None,
+        agentic_custom_advantage_path=None,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -97,6 +99,8 @@ def test_reinforce_plus_plus_kl_contract(arguments_module, overrides, message):
     ("overrides", "message"),
     [
         ({"n_samples_per_prompt": 1}, "n-samples-per-prompt > 1"),
+        ({"custom_reward_post_process_path": "custom.py:process"}, "custom-reward-post-process-path"),
+        ({"agentic_custom_advantage_path": "custom.py:advantage"}, "agentic-custom-advantage-path"),
         ({"rewards_normalization": False}, "group-mean centering"),
         ({"kl_coef": 0.01, "kl_loss_coef": 0.0}, "does not put token KL"),
         ({"use_kl_loss": False, "kl_loss_coef": 0.0}, "independent k2"),

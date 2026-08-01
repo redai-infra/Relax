@@ -14,16 +14,24 @@ normalization convention in OpenRLHF commit
 
 ## Version and naming note
 
-The paper changed between v1 and v9. In addition, v9's main method and Appendix
-B.2 do not describe exactly the same token placement:
+The paper changed between v1 and v9, and even v9's main method and Appendix B.2
+do not describe exactly the same token placement. The following table makes the
+version and implementation boundary explicit.
 
-- the main method defines a token KL-to-go return and global normalization;
-- Appendix B.2 describes zero advantage before the final token and sample-level
-  reward normalization.
+| Source | Return / baseline | Normalization and KL | Status in this implementation |
+|---|---|---|---|
+| paper v1 | token k1 KL-to-go advantage plus PPO clipping | describes reward normalization/clipping and batch z-score advantage normalization, but has no separately named group-baseline-plus-k2 variant | historical REINFORCE++ only; not the baseline definition |
+| paper v9 main equations | token KL-to-go return; inclusive group-mean baseline variant | global normalization of advantage tokens | normative paper definition |
+| paper v9 Appendix B.2 | zero advantage before the final token | sample-level reward normalization | documented conflict; not selected |
+| OpenRLHF `bc71bb1` | inclusive group mean and global valid-token population normalization | its pinned baseline training script enables token KL shaping **and** a separate k2 loss | normalization reference only; its combined-KL baseline is intentionally not copied |
+| Relax before this feature | partial helper names and return code | no registered pair, frozen validation, dedicated population moments, recipe, or complete numerical contract | compatibility baseline |
 
-Relax selects the v9 main-equation interpretation. The implementation is
-therefore described as **v9 main-equation and OpenRLHF aligned**, rather than as
-an implementation of every sentence in the appendix.
+Relax selects the v9 main-equation interpretation. “OpenRLHF aligned” in this
+document refers specifically to its executable inclusive-baseline and masked
+population-normalization convention. The Relax baseline deliberately keeps KL
+out of the advantage and applies only the independent k2 loss, as frozen in the
+Task 29 Proposal; it is therefore not an exact reproduction of the pinned
+OpenRLHF training script.
 
 ## Notation and mask contract
 
@@ -36,7 +44,9 @@ For response (i) and response position (t):
 
 Prompt tokens, padding and response tokens with `mask=0` do not contribute to
 reward shaping, return, normalization or loss. Production return and advantage
-tensors are explicitly zero outside the mask.
+tensors are explicitly zero outside the mask. Selection is boolean rather than
+multiplicative, so even `NaN` or `Inf` in a masked storage position cannot
+contaminate a valid-token result.
 
 ## REINFORCE++
 
@@ -108,7 +118,9 @@ $$
 
 The baseline variant requires more than one sample per prompt. The group mean
 includes each sample itself, so `n_samples_per_prompt=1` would collapse every
-raw advantage to zero and is rejected.
+raw advantage to zero and is rejected. Custom reward post-processing and
+agentic custom-advantage hooks are also rejected for this estimator because
+they would bypass the frozen inclusive group-mean semantics.
 
 ## Global masked normalization
 
@@ -144,6 +156,8 @@ Expected edge behavior:
 - an all-zero baseline reward group produces finite zeros;
 - an all-zero reward with nonzero KL can produce finite KL-shaped
   REINFORCE++ returns;
+- a fully masked local response contributes a zero tensor and still reaches
+  the data-parallel collective;
 - a globally empty mask raises `ValueError` on every participating rank.
 
 Because the baseline scalar is broadcast to each valid token, longer responses
@@ -166,15 +180,37 @@ The baseline k2 loss uses the same response-mean reduction. The initial
 implementation rejects `--calculate-per-token-loss` for these variants because
 it changes the objective to a global token mean.
 
-## Comparison
+## Formula-level comparison
 
-| Algorithm | Advantage | Ratio/loss | Reference regularization |
+Let
+
+$$
+\rho_{i,t}=\exp(\log\pi_\theta(a_{i,t})-\log\pi_{old}(a_{i,t})),
+$$
+
+and let `clip-PPO` denote the token objective shown above. Relax's existing
+group-relative algorithms first compute
+
+$$
+A_i^{grp}=R_i-\bar R_g,
+$$
+
+and, when `--grpo-std-normalization` is enabled, divide by
+`torch.std({R_j:j in g}) + 1e-6`. That existing `torch.std` call uses Bessel's
+sample correction (`ddof=1`), unlike the new global population variance.
+
+| Algorithm | Raw advantage and statistical axes | Ratio / policy objective | Reference regularization |
 |---|---|---|---|
-| REINFORCE++ | token KL-to-go return, then global valid-token normalization | token PPO clip | k1 inside token reward |
-| REINFORCE++-baseline | inclusive group-mean baseline, then global valid-token normalization | token PPO clip | separate k2 loss |
-| GRPO | group mean and group standard deviation | token PPO clip | existing configurable Relax KL |
-| GSPO | GRPO group advantage | response-level ratio expanded to tokens | existing configurable Relax KL |
-| SAPO | GRPO group advantage | sigmoid-shaped token ratio | existing configurable Relax KL |
+| REINFORCE++ | token KL-to-go $G_{i,t}$; normalize over every valid token and DP rank with `ddof=0` | token $\rho_{i,t}$ and clip-PPO; response mean | k1 inside token reward |
+| REINFORCE++-baseline | $R_i-\bar R_g$ broadcast to valid tokens, without group-std division; then the same global token/DP normalization | token $\rho_{i,t}$ and clip-PPO; response mean | separate k2 loss with response mean |
+| GRPO | $A_i^{grp}$ with optional same-prompt sample-std scaling; broadcast within the response | token $\rho_{i,t}$ and clip-PPO | existing configurable Relax KL |
+| GSPO | the same group advantage as GRPO | sequence ratio $\rho_i=\exp[L_i^{-1}\sum_t m_{i,t}(\log\pi_\theta-\log\pi_{old})]$ expanded to its tokens, then clip-PPO | existing configurable Relax KL |
+| SAPO | the same group advantage as GRPO | token ratio with $f_\tau(\rho)=4\,\sigma[\tau(\rho-1)]/\tau$; loss $-f_\tau(\rho)A$, using separate positive/negative $\tau$ values | existing configurable Relax KL |
+
+For all five paths, masks select contributing response tokens and the existing
+Relax reducer computes a mean within each response followed by a mean across
+responses. The new variants reject the alternative global-token reduction so
+that this denominator cannot change silently.
 
 This feature does not change GRPO, GSPO or SAPO defaults.
 
@@ -209,9 +245,13 @@ independent k2 loss when enabled.
 
 The numerical tests use an independent float64 reference that does not invoke
 the production return, advantage, normalization or loss functions. Coverage
-includes variable response lengths, padding, internal mask holes, large values
-outside the mask, zero rewards, zero variance, a single valid token, PPO
-clipping and response-reduced policy/k2 losses.
+includes variable response lengths, padding, internal mask holes, finite and
+non-finite sentinels outside the mask, zero rewards, zero variance, a single
+valid token, a fully masked local rank, PPO clipping and response-reduced
+policy/k2 losses. A Megatron-backend integration test also calls the production
+`compute_advantages_and_returns` dispatcher. On a host without Megatron it
+injects only the minimal `mpu` interface needed by that function, so the real
+Relax dispatch and normalization code still execute rather than being mocked.
 
 Distributed normalization is tested with two real Gloo processes and a real
 `all_reduce`, including a case where one rank has no valid token. Its output is

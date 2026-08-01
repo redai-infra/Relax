@@ -2683,6 +2683,16 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
 
     if getattr(args, "n_samples_per_prompt", 1) <= 1:
         raise ValueError("reinforce_plus_plus_baseline requires --n-samples-per-prompt > 1.")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--custom-reward-post-process-path is not supported."
+        )
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--agentic-custom-advantage-path is not supported."
+        )
     if not getattr(args, "rewards_normalization", True):
         raise ValueError(
             "reinforce_plus_plus_baseline requires group-mean centering; "

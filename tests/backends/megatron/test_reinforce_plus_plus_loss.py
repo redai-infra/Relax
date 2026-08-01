@@ -65,3 +65,15 @@ def test_masked_tokens_cannot_change_reduced_loss(monkeypatch):
     changed = torch.tensor([1.0, 20000.0, 3.0, 4.0, -50000.0])
 
     torch.testing.assert_close(reducer(base), reducer(changed), atol=0, rtol=0)
+
+
+def test_nonfinite_masked_tokens_cannot_change_reduced_loss(monkeypatch):
+    monkeypatch.setattr(cp_utils, "mpu", SimpleNamespace(get_context_parallel_world_size=lambda: 1))
+    masks = [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 1.0, 0.0])]
+    values = torch.tensor([1.0, float("nan"), 3.0, 4.0, float("inf")])
+
+    response_mean = cp_utils.get_sum_of_sample_mean([2, 3], [2, 3], masks)
+    token_sum = cp_utils.get_sum_of_sample_mean([2, 3], [2, 3], masks, calculate_per_token_loss=True)
+
+    torch.testing.assert_close(response_mean(values), torch.tensor(4.5), atol=0, rtol=0)
+    torch.testing.assert_close(token_sum(values), torch.tensor(8.0), atol=0, rtol=0)
