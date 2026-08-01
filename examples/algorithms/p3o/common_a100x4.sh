@@ -11,6 +11,7 @@ source "${TASK40_REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
 TASK40_ALGORITHM="${TASK40_ALGORITHM:?set TASK40_ALGORITHM to p3o or grpo}"
 TASK40_BEHAVIOR_MISMATCH="${TASK40_BEHAVIOR_MISMATCH:-0}"
 TASK40_MAX_STALENESS="${TASK40_MAX_STALENESS:-0}"
+TASK40_UPDATE_WEIGHTS_INTERVAL="${TASK40_UPDATE_WEIGHTS_INTERVAL:-1}"
 TASK40_MODE="${TASK40_MODE:-formal}"
 TASK40_SEED="${TASK40_SEED:-42}"
 TASK40_MODEL_DIR="${TASK40_MODEL_DIR:-/workspace/Qwen3-0.6B}"
@@ -30,6 +31,10 @@ if [[ "${TASK40_BEHAVIOR_MISMATCH}" != "0" && "${TASK40_BEHAVIOR_MISMATCH}" != "
 fi
 if [[ "${TASK40_MODE}" != "formal" && "${TASK40_MODE}" != "smoke" ]]; then
     echo "TASK40_MODE must be formal or smoke" >&2
+    exit 2
+fi
+if [[ ! "${TASK40_UPDATE_WEIGHTS_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TASK40_UPDATE_WEIGHTS_INTERVAL must be a positive integer" >&2
     exit 2
 fi
 
@@ -52,7 +57,9 @@ fi
 
 TASK40_CONFIG_NAME="${TASK40_ALGORITHM}_$(
     if [[ "${TASK40_BEHAVIOR_MISMATCH}" == "1" ]]; then
-        if [[ "${TASK40_MAX_STALENESS}" != "0" ]]; then
+        if [[ "${TASK40_UPDATE_WEIGHTS_INTERVAL}" != "1" ]]; then
+            echo "fixed_lag_$((TASK40_UPDATE_WEIGHTS_INTERVAL - 1))_mismatch"
+        elif [[ "${TASK40_MAX_STALENESS}" != "0" ]]; then
             echo "staleness_${TASK40_MAX_STALENESS}_mismatch"
         else
             echo "temperature_1p2"
@@ -159,6 +166,7 @@ task40_build_args() {
     TASK40_TRAIN_ARGS=(
         --resource '{"actor":[1,4],"rollout":[1,4]}'
         --max-staleness "${TASK40_MAX_STALENESS}"
+        --update-weights-interval "${TASK40_UPDATE_WEIGHTS_INTERVAL}"
         --num-iters-per-train-update 1
         --num-data-storage-units 1
         --colocate
@@ -204,6 +212,7 @@ task40_run() {
         echo "mode=${TASK40_MODE}"
         echo "seed=${TASK40_SEED}"
         echo "max_staleness=${TASK40_MAX_STALENESS}"
+        echo "update_weights_interval=${TASK40_UPDATE_WEIGHTS_INTERVAL}"
         echo "ray_job_id=${TASK40_JOB_ID}"
         echo "repo=${TASK40_REPO_ROOT}"
         echo "model=${TASK40_MODEL_DIR}"

@@ -18,9 +18,9 @@ FORMAL_SCRIPTS = {
     "p3o_temperature_1p2": SCRIPT_DIR / "run_p3o_temperature_1p2_a100x4.sh",
     "grpo_temperature_1p2": SCRIPT_DIR / "run_grpo_temperature_1p2_a100x4.sh",
 }
-STALENESS_SCRIPTS = {
-    "p3o_staleness_2_mismatch": SCRIPT_DIR / "run_p3o_staleness_mismatch_a100x4.sh",
-    "grpo_staleness_2_mismatch": SCRIPT_DIR / "run_grpo_staleness_mismatch_a100x4.sh",
+FIXED_LAG_SCRIPTS = {
+    "p3o_fixed_lag_2_mismatch": SCRIPT_DIR / "run_p3o_fixed_lag_2_mismatch_a100x4.sh",
+    "grpo_fixed_lag_2_mismatch": SCRIPT_DIR / "run_grpo_fixed_lag_2_mismatch_a100x4.sh",
 }
 
 
@@ -138,23 +138,26 @@ def test_p3o_configs_are_comparable_except_algorithm_and_behavior():
         assert "--eps-clip-high" not in resolved[name]
 
 
-def test_p3o_staleness_configs_are_matched_and_parameterized():
-    resolved = {name: _dry_run(script) for name, script in STALENESS_SCRIPTS.items()}
+def test_p3o_fixed_lag_configs_are_matched_and_parameterized():
+    resolved = {name: _dry_run(script) for name, script in FIXED_LAG_SCRIPTS.items()}
 
-    p3o_args = resolved["p3o_staleness_2_mismatch"]
-    grpo_args = resolved["grpo_staleness_2_mismatch"]
-    assert _option_value(p3o_args, "--max-staleness") == "2"
-    assert _option_value(grpo_args, "--max-staleness") == "2"
-    assert _option_value(p3o_args, "--tb-experiment-name") == "p3o_staleness_2_mismatch-seed-42"
-    assert _option_value(grpo_args, "--tb-experiment-name") == "grpo_staleness_2_mismatch-seed-42"
+    p3o_args = resolved["p3o_fixed_lag_2_mismatch"]
+    grpo_args = resolved["grpo_fixed_lag_2_mismatch"]
+    assert _option_value(p3o_args, "--max-staleness") == "0"
+    assert _option_value(grpo_args, "--max-staleness") == "0"
+    assert _option_value(p3o_args, "--update-weights-interval") == "3"
+    assert _option_value(grpo_args, "--update-weights-interval") == "3"
+    assert _option_value(p3o_args, "--tb-experiment-name") == "p3o_fixed_lag_2_mismatch-seed-42"
+    assert _option_value(grpo_args, "--tb-experiment-name") == "grpo_fixed_lag_2_mismatch-seed-42"
     assert _comparable_args(p3o_args) == _comparable_args(grpo_args)
 
     overridden = _dry_run(
-        STALENESS_SCRIPTS["p3o_staleness_2_mismatch"],
-        env_overrides={"TASK40_MAX_STALENESS": "3"},
+        FIXED_LAG_SCRIPTS["p3o_fixed_lag_2_mismatch"],
+        env_overrides={"TASK40_UPDATE_WEIGHTS_INTERVAL": "4"},
     )
-    assert _option_value(overridden, "--max-staleness") == "3"
-    assert _option_value(overridden, "--tb-experiment-name") == "p3o_staleness_3_mismatch-seed-42"
+    assert _option_value(overridden, "--max-staleness") == "0"
+    assert _option_value(overridden, "--update-weights-interval") == "4"
+    assert _option_value(overridden, "--tb-experiment-name") == "p3o_fixed_lag_3_mismatch-seed-42"
 
 
 def test_p3o_smoke_uses_one_small_optimizer_step():
