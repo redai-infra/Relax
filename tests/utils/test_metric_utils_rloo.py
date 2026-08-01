@@ -103,6 +103,8 @@ def test_non_rloo_estimator_omits_rloo_diagnostics():
 
 
 def test_eval_logger_disables_training_rloo_diagnostics(monkeypatch):
+    pytest.importorskip("megatron.core")
+
     import relax.distributed.ray.rollout as rollout_module
 
     calls = []
