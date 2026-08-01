@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT))
@@ -30,6 +32,21 @@ def test_behavior_sampling_params_overrides_training_copy_only():
 
     assert updated == {"temperature": 1.2, "top_p": 1.0, "max_new_tokens": 64}
     assert original == {"temperature": 1.0, "top_p": 0.9, "max_new_tokens": 64}
+
+
+def test_behavior_sampling_params_accepts_runtime_temperature(monkeypatch):
+    monkeypatch.setenv("TASK40_BEHAVIOR_TEMPERATURE", "2.0")
+
+    updated = rollout.behavior_sampling_params({"temperature": 1.0}, evaluation=False)
+
+    assert updated["temperature"] == 2.0
+
+
+def test_behavior_sampling_params_rejects_invalid_runtime_temperature(monkeypatch):
+    monkeypatch.setenv("TASK40_BEHAVIOR_TEMPERATURE", "nan")
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        rollout.behavior_sampling_params({"temperature": 1.0}, evaluation=False)
 
 
 def test_behavior_sampling_params_preserves_evaluation():

@@ -10,6 +10,7 @@ source "${TASK40_REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
 
 TASK40_ALGORITHM="${TASK40_ALGORITHM:?set TASK40_ALGORITHM to p3o or grpo}"
 TASK40_BEHAVIOR_MISMATCH="${TASK40_BEHAVIOR_MISMATCH:-0}"
+TASK40_BEHAVIOR_TEMPERATURE="${TASK40_BEHAVIOR_TEMPERATURE:-1.2}"
 TASK40_MAX_STALENESS="${TASK40_MAX_STALENESS:-0}"
 TASK40_UPDATE_WEIGHTS_INTERVAL="${TASK40_UPDATE_WEIGHTS_INTERVAL:-1}"
 TASK40_MODE="${TASK40_MODE:-formal}"
@@ -27,6 +28,10 @@ if [[ "${TASK40_ALGORITHM}" != "p3o" && "${TASK40_ALGORITHM}" != "grpo" ]]; then
 fi
 if [[ "${TASK40_BEHAVIOR_MISMATCH}" != "0" && "${TASK40_BEHAVIOR_MISMATCH}" != "1" ]]; then
     echo "TASK40_BEHAVIOR_MISMATCH must be 0 or 1" >&2
+    exit 2
+fi
+if [[ ! "${TASK40_BEHAVIOR_TEMPERATURE}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${TASK40_BEHAVIOR_TEMPERATURE}" == "0" ]]; then
+    echo "TASK40_BEHAVIOR_TEMPERATURE must be a positive decimal number" >&2
     exit 2
 fi
 if [[ "${TASK40_MODE}" != "formal" && "${TASK40_MODE}" != "smoke" ]]; then
@@ -58,7 +63,11 @@ fi
 TASK40_CONFIG_NAME="${TASK40_ALGORITHM}_$(
     if [[ "${TASK40_BEHAVIOR_MISMATCH}" == "1" ]]; then
         if [[ "${TASK40_UPDATE_WEIGHTS_INTERVAL}" != "1" ]]; then
-            echo "fixed_lag_$((TASK40_UPDATE_WEIGHTS_INTERVAL - 1))_mismatch"
+            if [[ "${TASK40_BEHAVIOR_TEMPERATURE}" == "1.2" ]]; then
+                echo "fixed_lag_$((TASK40_UPDATE_WEIGHTS_INTERVAL - 1))_mismatch"
+            else
+                echo "fixed_lag_$((TASK40_UPDATE_WEIGHTS_INTERVAL - 1))_temperature_${TASK40_BEHAVIOR_TEMPERATURE//./p}_mismatch"
+            fi
         elif [[ "${TASK40_MAX_STALENESS}" != "0" ]]; then
             echo "staleness_${TASK40_MAX_STALENESS}_mismatch"
         else
@@ -213,6 +222,7 @@ task40_run() {
         echo "seed=${TASK40_SEED}"
         echo "max_staleness=${TASK40_MAX_STALENESS}"
         echo "update_weights_interval=${TASK40_UPDATE_WEIGHTS_INTERVAL}"
+        echo "behavior_temperature=${TASK40_BEHAVIOR_TEMPERATURE}"
         echo "ray_job_id=${TASK40_JOB_ID}"
         echo "repo=${TASK40_REPO_ROOT}"
         echo "model=${TASK40_MODEL_DIR}"
@@ -225,6 +235,7 @@ task40_run() {
     TASK40_RUNTIME_ENV_JSON="$(
         TASK40_RUNTIME_PYTHONPATH="${TASK40_REPO_ROOT}:${TASK40_MEGATRON_DIR}" \
         TASK40_TENSORBOARD_DIR="${TASK40_RUN_DIR}/tensorboard" \
+        TASK40_RUNTIME_BEHAVIOR_TEMPERATURE="${TASK40_BEHAVIOR_TEMPERATURE}" \
         python3 - <<'PY'
 import json
 import os
@@ -236,6 +247,7 @@ print(
                 "PYTHONUNBUFFERED": "1",
                 "PYTHONPATH": os.environ["TASK40_RUNTIME_PYTHONPATH"],
                 "TENSORBOARD_DIR": os.environ["TASK40_TENSORBOARD_DIR"],
+                "TASK40_BEHAVIOR_TEMPERATURE": os.environ["TASK40_RUNTIME_BEHAVIOR_TEMPERATURE"],
                 "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
                 "HTTP_PROXY": "",
                 "HTTPS_PROXY": "",

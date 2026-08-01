@@ -159,6 +159,14 @@ def test_p3o_fixed_lag_configs_are_matched_and_parameterized():
     assert _option_value(overridden, "--update-weights-interval") == "4"
     assert _option_value(overridden, "--tb-experiment-name") == "p3o_fixed_lag_3_mismatch-seed-42"
 
+    adjusted_temperature = _dry_run(
+        FIXED_LAG_SCRIPTS["p3o_fixed_lag_2_mismatch"],
+        env_overrides={"TASK40_UPDATE_WEIGHTS_INTERVAL": "11", "TASK40_BEHAVIOR_TEMPERATURE": "2.0"},
+    )
+    assert _option_value(adjusted_temperature, "--tb-experiment-name") == (
+        "p3o_fixed_lag_10_temperature_2p0_mismatch-seed-42"
+    )
+
 
 def test_p3o_smoke_uses_one_small_optimizer_step():
     args = _dry_run(SCRIPT_DIR / "run_p3o_smoke.sh", "p3o_temperature_1p2")
@@ -176,6 +184,7 @@ def test_p3o_runtime_env_allows_ray_job_driver_merge():
     common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
 
     assert '"RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"' in common_script
+    assert '"TASK40_BEHAVIOR_TEMPERATURE": os.environ["TASK40_RUNTIME_BEHAVIOR_TEMPERATURE"]' in common_script
 
 
 def test_p3o_runtime_env_bypasses_proxy_for_colocated_services():
