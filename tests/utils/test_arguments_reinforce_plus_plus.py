@@ -90,9 +90,7 @@ def test_common_contract_rejections(arguments_module, estimator, overrides, mess
 )
 def test_reinforce_plus_plus_kl_contract(arguments_module, overrides, message):
     with pytest.raises(ValueError, match=message):
-        arguments_module._validate_reinforce_plus_plus_args(
-            _args("reinforce_plus_plus", **overrides), is_sft=False
-        )
+        arguments_module._validate_reinforce_plus_plus_args(_args("reinforce_plus_plus", **overrides), is_sft=False)
 
 
 @pytest.mark.parametrize(

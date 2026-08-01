@@ -107,13 +107,9 @@ def test_returns_reject_fully_masked_response():
 
 def test_returns_validate_response_batch_lengths_and_shapes():
     with pytest.raises(ValueError, match="same number of responses"):
-        get_reinforce_plus_plus_returns(
-            torch.tensor([0.0, 1.0]), [torch.ones(1)], [torch.ones(1)], [1], [1], 0.1, 1.0
-        )
+        get_reinforce_plus_plus_returns(torch.tensor([0.0, 1.0]), [torch.ones(1)], [torch.ones(1)], [1], [1], 0.1, 1.0)
     with pytest.raises(ValueError, match="must have the same shape"):
-        get_reinforce_plus_plus_returns(
-            torch.tensor([0.0]), [torch.ones(2)], [torch.ones(1)], [1], [1], 0.1, 1.0
-        )
+        get_reinforce_plus_plus_returns(torch.tensor([0.0]), [torch.ones(2)], [torch.ones(1)], [1], [1], 0.1, 1.0)
 
 
 def test_baseline_advantages_are_masked_and_do_not_depend_on_token_kl():
@@ -139,13 +135,9 @@ def test_baseline_advantages_are_masked_and_do_not_depend_on_token_kl():
 
 def test_baseline_advantages_validate_batch_lengths():
     with pytest.raises(ValueError, match="same number of responses"):
-        get_reinforce_plus_plus_baseline_advantages(
-            torch.tensor([1.0, -1.0]), [torch.ones(2)], [torch.ones(2)]
-        )
+        get_reinforce_plus_plus_baseline_advantages(torch.tensor([1.0, -1.0]), [torch.ones(2)], [torch.ones(2)])
     with pytest.raises(ValueError, match="must match"):
-        get_reinforce_plus_plus_baseline_advantages(
-            torch.tensor([1.0]), [torch.ones(2)], [torch.ones(1)]
-        )
+        get_reinforce_plus_plus_baseline_advantages(torch.tensor([1.0]), [torch.ones(2)], [torch.ones(1)])
 
 
 def test_token_policy_and_k2_losses_match_independent_formulas():
@@ -162,9 +154,7 @@ def test_token_policy_and_k2_losses_match_independent_formulas():
         -ratio * advantages,
         -torch.clamp(ratio, 0.8, 1.2) * advantages,
     )
-    expected_clipfrac = (
-        -torch.clamp(ratio, 0.8, 1.2) * advantages > -ratio * advantages
-    ).to(dtype=torch.float32)
+    expected_clipfrac = (-torch.clamp(ratio, 0.8, 1.2) * advantages > -ratio * advantages).to(dtype=torch.float32)
     expected_k2 = 0.5 * (current_log_probs.float() - ref_log_probs.float()).square()
     actual_k2 = compute_approx_kl(current_log_probs, ref_log_probs, "k2")
 

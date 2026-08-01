@@ -2689,13 +2689,10 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
             "--disable-rewards-normalization is not supported."
         )
     if kl_coef != 0:
-        raise ValueError(
-            "reinforce_plus_plus_baseline does not put token KL in the advantage; set --kl-coef 0."
-        )
+        raise ValueError("reinforce_plus_plus_baseline does not put token KL in the advantage; set --kl-coef 0.")
     if not use_kl_loss or kl_loss_coef <= 0:
         raise ValueError(
-            "reinforce_plus_plus_baseline requires an independent k2 penalty via "
-            "--use-kl-loss and --kl-loss-coef > 0."
+            "reinforce_plus_plus_baseline requires an independent k2 penalty via --use-kl-loss and --kl-loss-coef > 0."
         )
     if kl_loss_type != "k2":
         raise ValueError("reinforce_plus_plus_baseline requires --kl-loss-type k2.")

@@ -526,16 +526,12 @@ def get_reinforce_plus_plus_baseline_advantages(
         list[Tensor]: A list of tensors containing the unwhitened advantages.
     """
     if not (len(rewards) == len(kl) == len(loss_masks)):
-        raise ValueError(
-            "rewards, token shapes, and loss_masks must contain the same number of responses."
-        )
+        raise ValueError("rewards, token shapes, and loss_masks must contain the same number of responses.")
 
     # Token KL is intentionally not part of this advantage. The baseline
     # variant applies reference regularization as a separate k2 loss.
     unwhitened_advantages = []
-    for response_index, (kl_tensor, reward_val, loss_mask) in enumerate(
-        zip(kl, rewards, loss_masks, strict=True)
-    ):
+    for response_index, (kl_tensor, reward_val, loss_mask) in enumerate(zip(kl, rewards, loss_masks, strict=True)):
         if kl_tensor.shape != loss_mask.shape:
             raise ValueError(
                 f"Token shape and loss mask for response {response_index} must match, "

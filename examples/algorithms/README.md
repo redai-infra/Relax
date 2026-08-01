@@ -8,15 +8,15 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 
 ## 支持的算法
 
-| 算法      | 启用参数                      | 推荐场景                   |
-| --------- | ----------------------------- | -------------------------- |
-| **PPO**   | `--advantage-estimator ppo`   | Actor-Critic、token 级 GAE |
-| **GRPO**  | `--advantage-estimator grpo`  | 默认、大多数场景           |
-| **REINFORCE++** | `--advantage-estimator reinforce_plus_plus` | token KL-to-go 与全局归一化 |
+| 算法                     | 启用参数                                             | 推荐场景                    |
+| ------------------------ | ---------------------------------------------------- | --------------------------- |
+| **PPO**                  | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE  |
+| **GRPO**                 | `--advantage-estimator grpo`                         | 默认、大多数场景            |
+| **REINFORCE++**          | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化 |
 | **REINFORCE++-baseline** | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL |
-| **CISPO** | `--advantage-estimator cispo` | 保留梯度方向、需要更高精度 |
-| **GSPO**  | `--advantage-estimator gspo`  | 序列级约束、稳定训练       |
-| **SAPO**  | `--advantage-estimator sapo`  | 平滑优化、soft 信任域      |
+| **CISPO**                | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度  |
+| **GSPO**                 | `--advantage-estimator gspo`                         | 序列级约束、稳定训练        |
+| **SAPO**                 | `--advantage-estimator sapo`                         | 平滑优化、soft 信任域       |
 
 ## 选择建议
 
