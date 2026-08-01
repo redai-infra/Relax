@@ -1,16 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RLOO CP reduction invariance test using real torch.distributed gloo.
-
-Verifies that the loss reduction (sum_of_sample_mean and sum_of_token) is
-CP-invariant: the all-reduced result of per-rank partial reductions equals
-the CP=1 (full-sequence) result, and each response token is partitioned
-exactly once across CP ranks. No GPU required — runs on CPU via gloo.
-"""
+"""RLOO invariance through the production context-parallel reducer."""
 
 from __future__ import annotations
 
-import os
+from datetime import timedelta
 
 import pytest
 
@@ -18,121 +12,113 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
-def _free_port() -> int:
-    import socket
+def _response_slices(total_length: int, response_length: int, rank: int, world_size: int) -> list[slice]:
+    """Derive the two shifted-token CP response slices independently."""
+    prompt_length = total_length - response_length
+    chunk_size = (total_length + 2 * world_size - 1) // (2 * world_size)
+    chunk_ids = (rank, 2 * world_size - rank - 1)
+    slices = []
+    for chunk_id in chunk_ids:
+        chunk_start = chunk_id * chunk_size
+        chunk_end = (chunk_id + 1) * chunk_size
+        logit_start = max(chunk_start, prompt_length - 1)
+        logit_end = min(chunk_end, total_length - 1)
+        if logit_start < logit_end:
+            slices.append(slice(logit_start + 1 - prompt_length, logit_end + 1 - prompt_length))
+    return slices
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
-
-def _rloo_cp_worker(rank, world_size, port, calculate_per_token_loss):
+def _rloo_cp_worker(rank, world_size, init_file, calculate_per_token_loss):
     import torch.distributed as dist
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    from relax.backends.megatron.cp_utils import get_sum_of_sample_mean
+    from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
     try:
-        cp_size = world_size
         torch.manual_seed(0)
-
-        # 3 samples with different response lengths, each divisible by 2*cp
-        # so contiguous splitting produces exact chunks.
-        chunk = 4
-        base = 2 * cp_size * chunk
-        resp_lens = [base * (i + 1) for i in range(3)]
-        rewards = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64)
-
-        # LOO advantages (same on every rank)
-        from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
-
+        base_length = 2 * world_size * 4
+        response_lengths = [base_length, base_length * 2, base_length * 3]
+        prompt_lengths = [2 * world_size * (sample_index + 1) for sample_index in range(3)]
+        total_lengths = [
+            prompt_length + response_length
+            for prompt_length, response_length in zip(prompt_lengths, response_lengths, strict=True)
+        ]
+        rewards = torch.tensor([0.0, 1.0, 3.0], dtype=torch.float64)
         advantages = compute_rloo_leave_one_out_rewards(rewards)
-
-        # Full log_probs (same seed → same on every rank)
-        full_log_probs = [torch.randn(L, dtype=torch.float64) for L in resp_lens]
-        full_loss_masks = [torch.ones(L, dtype=torch.float64) for L in resp_lens]
-
-        # --- CP=1 reference (computed on every rank for comparison) ---
-        full_pg = []
-        for i, L in enumerate(resp_lens):
-            adv_broadcast = advantages[i].expand(L)
-            pg = -(adv_broadcast * full_log_probs[i])
-            full_pg.append(pg)
+        full_log_probs = [torch.randn(length, dtype=torch.float64) for length in response_lengths]
+        full_masks = [
+            ((torch.arange(length) + sample_index) % 3 != 0).to(torch.float64)
+            for sample_index, length in enumerate(response_lengths)
+        ]
+        full_losses = [
+            -(advantage * log_probs) for advantage, log_probs in zip(advantages, full_log_probs, strict=True)
+        ]
 
         if calculate_per_token_loss:
-            ref = sum((pg * m).sum() for pg, m in zip(full_pg, full_loss_masks, strict=True))
+            reference = sum((loss * mask).sum() for loss, mask in zip(full_losses, full_masks, strict=True))
         else:
-            ref = sum(
-                (pg * m).sum() / torch.clamp_min(m.sum(), 1)
-                for pg, m in zip(full_pg, full_loss_masks, strict=True)
+            reference = sum(
+                (loss * mask).sum() / torch.clamp_min(mask.sum(), 1)
+                for loss, mask in zip(full_losses, full_masks, strict=True)
             )
 
-        # --- CP=world_size: each rank holds a contiguous chunk of each sample ---
-        local_pg_chunks = []
-        local_mask_chunks = []
-        local_full_masks = []  # full mask (for denominator)
-        chunk_lengths = []
-        for i, L in enumerate(resp_lens):
-            tokens = full_log_probs[i]
-            mask = full_loss_masks[i]
-            # Contiguous split: rank r gets tokens [r*L/cp : (r+1)*L/cp]
-            chunk_len = L // cp_size
-            start = rank * chunk_len
-            end = start + chunk_len
-            local_chunk = tokens[start:end]
-            local_mask = mask[start:end]
-            local_pg = -(advantages[i].expand(chunk_len) * local_chunk)
-            local_pg_chunks.append(local_pg)
-            local_mask_chunks.append(local_mask)
-            local_full_masks.append(mask)  # full mask for denominator
-            chunk_lengths.append(chunk_len)
+        local_losses = []
+        local_ownership = []
+        for total_length, response_length, full_loss in zip(total_lengths, response_lengths, full_losses, strict=True):
+            response_slices = _response_slices(total_length, response_length, rank, world_size)
+            local_losses.append(torch.cat([full_loss[response_slice] for response_slice in response_slices]))
+            ownership = torch.zeros(response_length, dtype=torch.int64)
+            for response_slice in response_slices:
+                ownership[response_slice] += 1
+            local_ownership.append(ownership)
 
-        # Local partial reduction (mirrors get_sum_of_sample_mean / sum_of_token)
-        if calculate_per_token_loss:
-            local_sum = sum(
-                (pg * m).sum()
-                for pg, m in zip(local_pg_chunks, local_mask_chunks, strict=True)
-            )
-        else:
-            local_sum = sum(
-                (pg * local_mask).sum() / torch.clamp_min(full_mask.sum(), 1)
-                for pg, local_mask, full_mask in zip(
-                    local_pg_chunks, local_mask_chunks, local_full_masks, strict=True
-                )
-            )
-
-        # All-reduce across CP ranks
-        reduced = local_sum.clone()
+        local_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            full_masks,
+            calculate_per_token_loss=calculate_per_token_loss,
+            dynamic_cp_size=world_size,
+            dynamic_cp_rank=rank,
+        )
+        reduced = local_reducer(torch.cat(local_losses))
         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
 
-        # Verify: reduced == CP=1 reference
-        assert torch.allclose(reduced, ref, atol=1e-10), (
-            f"CP={cp_size} rank={rank} per_token={calculate_per_token_loss}: "
-            f"reduced={reduced.item()} != ref={ref.item()}"
+        assert torch.allclose(reduced, reference, atol=1e-10), (
+            f"CP={world_size} rank={rank} per_token={calculate_per_token_loss}: "
+            f"reduced={reduced.item()} != reference={reference.item()}"
         )
 
-        # Verify partition: each token appears exactly once across ranks.
-        # Gather all chunk lengths and verify they sum to the full length.
-        chunk_lens_tensor = torch.tensor([sum(chunk_lengths)], dtype=torch.int64)
-        dist.all_reduce(chunk_lens_tensor, op=dist.ReduceOp.SUM)
-        total_tokens = sum(resp_lens)
-        assert chunk_lens_tensor.item() == total_tokens, (
-            f"CP={cp_size}: partitioned tokens {chunk_lens_tensor.item()} != total {total_tokens}"
-        )
-
+        for ownership in local_ownership:
+            dist.all_reduce(ownership, op=dist.ReduceOp.SUM)
+            assert torch.equal(ownership, torch.ones_like(ownership))
     finally:
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="torch.distributed with Gloo is required",
+)
 @pytest.mark.parametrize("world_size", [2, 4])
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-def test_rloo_cp_partial_reductions_sum_to_unsplit(world_size, calculate_per_token_loss):
+def test_rloo_cp_production_reducer_matches_unsplit(
+    tmp_path,
+    world_size,
+    calculate_per_token_loss,
+):
     import torch.multiprocessing as mp
 
-    port = _free_port()
+    init_file = tmp_path / f"gloo-{world_size}-{int(calculate_per_token_loss)}"
     mp.spawn(
         _rloo_cp_worker,
-        args=(world_size, port, calculate_per_token_loss),
+        args=(world_size, str(init_file), calculate_per_token_loss),
         nprocs=world_size,
         join=True,
     )

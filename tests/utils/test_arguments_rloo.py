@@ -1,143 +1,139 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Unit tests for RLOO argument validation (six startup guards).
-
-These tests verify the choices and the six guards without running the full
-argument parser (which requires megatron). We construct a ``SimpleNamespace``
-mimicking the parsed args and call the validation logic directly.
-"""
+"""Tests for RLOO validation through the production argument path."""
 
 from __future__ import annotations
 
-import sys
-from types import ModuleType, SimpleNamespace
+import argparse
+from types import SimpleNamespace
 
 import pytest
 
-
-torch = pytest.importorskip("torch")
-
-
-def _install_fake_megatron(monkeypatch):
-    megatron = ModuleType("megatron")
-    core = ModuleType("megatron.core")
-    mpu = ModuleType("megatron.core.mpu")
-    mpu.get_context_parallel_world_size = lambda: 1
-    mpu.get_context_parallel_rank = lambda: 0
-    mpu.is_pipeline_last_stage = lambda: True
-    core.mpu = mpu
-    monkeypatch.setitem(sys.modules, "megatron", megatron)
-    monkeypatch.setitem(sys.modules, "megatron.core", core)
-    monkeypatch.setitem(sys.modules, "megatron.core.mpu", mpu)
+import relax.utils.arguments as arguments_mod
+from tests.utils.test_arguments_opd_teacher_colocate import _opd_args
 
 
-def _rloo_args(**kwargs):
-    """Return a SimpleNamespace with valid RLOO defaults; override via kwargs."""
-    defaults = dict(
-        advantage_estimator="rloo",
-        n_samples_per_prompt=8,
-        rollout_batch_size=16,
-        global_batch_size=128,  # 16 * 8 == 128 ✓
-        fully_async=False,
-        hybrid=False,
-        rewards_normalization=True,
-        normalize_advantages=False,
-        partial_rollout=False,
-        use_dynamic_global_batch_size=False,
-    )
-    defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
+def _rloo_args(**overrides) -> SimpleNamespace:
+    """Return a complete ``slime_validate_args`` input with valid RLOO
+    defaults."""
+    args = _opd_args()
+    defaults = {
+        "advantage_estimator": "rloo",
+        "n_samples_per_prompt": 8,
+        "rollout_batch_size": 16,
+        "global_batch_size": 128,
+        "num_steps_per_rollout": None,
+        "fully_async": False,
+        "hybrid": False,
+        "rewards_normalization": True,
+        "normalize_advantages": False,
+        "partial_rollout": False,
+        "use_dynamic_global_batch_size": False,
+        "grpo_std_normalization": False,
+    }
+    defaults.update(overrides)
+    for name, value in defaults.items():
+        setattr(args, name, value)
+    return args
 
 
-def _run_rloo_guards(args):
-    """Replicate the RLOO guard block from arguments.py.
-
-    The real guard lives inside ``process_args`` which requires the full
-    megatron parser. We extract the same logic so the test runs without
-    megatron. If the guard logic changes in arguments.py, update this mirror.
-    """
-    if args.advantage_estimator != "rloo":
-        return
-    if args.n_samples_per_prompt < 2:
-        raise ValueError("n_samples_per_prompt < 2")
-    if args.fully_async or getattr(args, "hybrid", False):
-        raise ValueError("fully_async")
-    if not args.rewards_normalization:
-        raise ValueError("rewards_normalization")
-    if args.normalize_advantages:
-        raise ValueError("normalize_advantages")
-    if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
-        raise ValueError("equality")
-    if args.partial_rollout or args.use_dynamic_global_batch_size:
-        raise ValueError("partial_rollout")
+def _validate(**overrides) -> SimpleNamespace:
+    args = _rloo_args(**overrides)
+    arguments_mod.slime_validate_args(args)
+    return args
 
 
 def test_rloo_valid_config_passes():
-    args = _rloo_args()
-    _run_rloo_guards(args)  # should not raise
+    args = _validate()
+    assert args.rollout_batch_size == 16
+    assert args.global_batch_size == 128
+
+
+def test_rloo_derives_rollout_batch_size_before_validation():
+    args = _validate(rollout_batch_size=None, global_batch_size=128)
+    assert args.rollout_batch_size == 16
+
+
+def test_rloo_derives_batch_before_rejecting_fully_async():
+    with pytest.raises(ValueError, match="synchronous"):
+        _validate(rollout_batch_size=None, global_batch_size=128, fully_async=True)
+
+
+def test_batch_derivation_requires_exact_divisibility():
+    with pytest.raises(ValueError, match="must be divisible"):
+        _validate(rollout_batch_size=None, global_batch_size=127)
+
+
+def test_fully_async_non_rloo_can_derive_rollout_batch_size():
+    args = _validate(
+        advantage_estimator="grpo",
+        rollout_batch_size=None,
+        global_batch_size=128,
+        fully_async=True,
+    )
+    assert args.rollout_batch_size == 16
+    assert args.true_on_policy_mode is True
 
 
 def test_rloo_requires_n_samples_ge_2():
-    args = _rloo_args(n_samples_per_prompt=1, global_batch_size=16)
-    with pytest.raises(ValueError, match="n_samples_per_prompt"):
-        _run_rloo_guards(args)
+    with pytest.raises(ValueError, match="n-samples-per-prompt >= 2"):
+        _validate(n_samples_per_prompt=1, rollout_batch_size=16, global_batch_size=16)
 
 
-def test_rloo_rejects_fully_async():
-    args = _rloo_args(fully_async=True)
-    with pytest.raises(ValueError, match="fully_async"):
-        _run_rloo_guards(args)
-
-
-def test_rloo_rejects_hybrid_async():
-    args = _rloo_args(hybrid=True)
-    with pytest.raises(ValueError, match="fully_async"):
-        _run_rloo_guards(args)
+@pytest.mark.parametrize("mode", ["fully_async", "hybrid"])
+def test_rloo_rejects_async_modes(mode):
+    with pytest.raises(ValueError, match="synchronous"):
+        _validate(**{mode: True})
 
 
 def test_rloo_requires_rewards_normalization():
-    args = _rloo_args(rewards_normalization=False)
-    with pytest.raises(ValueError, match="rewards_normalization"):
-        _run_rloo_guards(args)
+    with pytest.raises(ValueError, match="rewards normalization"):
+        _validate(rewards_normalization=False)
 
 
 def test_rloo_rejects_normalize_advantages():
-    args = _rloo_args(normalize_advantages=True)
-    with pytest.raises(ValueError, match="normalize_advantages"):
-        _run_rloo_guards(args)
+    with pytest.raises(ValueError, match="normalize-advantages"):
+        _validate(normalize_advantages=True)
 
 
-def test_rloo_requires_one_optimizer_step_per_rollout():
-    args = _rloo_args(rollout_batch_size=16, n_samples_per_prompt=8, global_batch_size=64)
-    # 16 * 8 = 128 != 64 → two optimizer steps per rollout
-    with pytest.raises(ValueError, match="equality"):
-        _run_rloo_guards(args)
+def test_rloo_requires_matching_global_batch_size():
+    with pytest.raises(ValueError, match="one optimizer update per rollout"):
+        _validate(global_batch_size=64)
 
 
-def test_rloo_rejects_partial_rollout():
-    args = _rloo_args(partial_rollout=True)
-    with pytest.raises(ValueError, match="partial_rollout"):
-        _run_rloo_guards(args)
+def test_rloo_rejects_multiple_steps_per_rollout():
+    with pytest.raises(ValueError, match="num-steps-per-rollout 1"):
+        _validate(num_steps_per_rollout=2, global_batch_size=64)
 
 
-def test_rloo_rejects_dynamic_global_batch_size():
-    args = _rloo_args(use_dynamic_global_batch_size=True)
-    with pytest.raises(ValueError, match="partial_rollout"):
-        _run_rloo_guards(args)
+@pytest.mark.parametrize("mode", ["partial_rollout", "use_dynamic_global_batch_size"])
+def test_rloo_rejects_dynamic_batch_modes(mode):
+    with pytest.raises(ValueError, match="effective batch size to drift"):
+        _validate(**{mode: True})
 
 
-def test_grpo_default_path_unchanged():
-    """Default grpo config must not trigger any rloo guard."""
-    args = _rloo_args(advantage_estimator="grpo")
-    _run_rloo_guards(args)  # should not raise (rloo guards skipped)
+def test_non_rloo_path_does_not_apply_rloo_guards():
+    args = _validate(
+        advantage_estimator="grpo",
+        n_samples_per_prompt=1,
+        rollout_batch_size=16,
+        global_batch_size=16,
+        rewards_normalization=False,
+        normalize_advantages=True,
+        partial_rollout=True,
+        use_dynamic_global_batch_size=True,
+    )
+    assert args.advantage_estimator == "grpo"
 
 
 def test_advantage_estimator_choices_include_rloo(monkeypatch):
-    """Verify the argparse choices list includes 'rloo'."""
-    # Read the source to check the choices without running the parser
-    import inspect
+    monkeypatch.setattr(
+        arguments_mod,
+        "RouterArgs",
+        SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser),
+    )
+    parser = argparse.ArgumentParser()
+    arguments_mod.get_slime_extra_args_provider()(parser)
 
-    import relax.utils.arguments as arguments_mod
-
-    source = inspect.getsource(arguments_mod)
-    assert '"rloo"' in source, "rloo not found in arguments.py source"
+    action = next(action for action in parser._actions if action.dest == "advantage_estimator")
+    assert "rloo" in action.choices

@@ -204,6 +204,16 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                 )
             group_rewards = rewards[positions]
             if args.advantage_estimator == "rloo":
+                finite_mask = torch.isfinite(group_rewards)
+                if not finite_mask.all():
+                    invalid_group_positions = (~finite_mask).nonzero(as_tuple=False).flatten().tolist()
+                    invalid_sample_positions = [positions[position] for position in invalid_group_positions]
+                    invalid_values = group_rewards[~finite_mask].tolist()
+                    raise ValueError(
+                        f"RLOO group_index={group_index} contains non-finite reward(s) at "
+                        f"group position(s) {invalid_group_positions}, sample position(s) "
+                        f"{invalid_sample_positions}: {invalid_values}."
+                    )
                 group_rewards = compute_rloo_leave_one_out_rewards(group_rewards)
             else:
                 group_rewards = group_rewards - group_rewards.mean()

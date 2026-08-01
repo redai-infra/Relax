@@ -187,14 +187,21 @@ def test_post_process_rewards_rloo_nonfinite_reward_raises(monkeypatch):
     from relax.utils.utils import post_process_rewards
 
     samples = [
-        _make_sample(reward=1.0, group_index=0),
-        _make_sample(reward=float("nan"), group_index=0),
-        _make_sample(reward=0.0, group_index=0),
-        _make_sample(reward=1.0, group_index=0),
+        *[_make_sample(reward=1.0, group_index=0) for _ in range(4)],
+        _make_sample(reward=1.0, group_index=42),
+        _make_sample(reward=float("nan"), group_index=42),
+        _make_sample(reward=0.0, group_index=42),
+        _make_sample(reward=1.0, group_index=42),
     ]
     args = _fake_args(n_samples_per_prompt=4)
-    with pytest.raises(ValueError, match="non-finite"):
+    with pytest.raises(ValueError) as exc_info:
         post_process_rewards(args, samples)
+
+    message = str(exc_info.value)
+    assert "non-finite" in message
+    assert "group_index=42" in message
+    assert "group position(s) [1]" in message
+    assert "sample position(s) [5]" in message
 
 
 def test_post_process_rewards_grpo_unchanged_by_rloo_addition(monkeypatch):
@@ -323,7 +330,9 @@ def test_rloo_cp_slice_invariance():
     advantages = compute_rloo_leave_one_out_rewards(rewards)
 
     # Full broadcast
-    full_tokens = torch.cat([torch.full((L,), advantages[i].item(), dtype=torch.float64) for i, L in enumerate(resp_lens)])
+    full_tokens = torch.cat(
+        [torch.full((L,), advantages[i].item(), dtype=torch.float64) for i, L in enumerate(resp_lens)]
+    )
 
     # Simulate CP: split each response into two chunks (zig-zag not needed for
     # scalar broadcast — any partition works since the value is constant).

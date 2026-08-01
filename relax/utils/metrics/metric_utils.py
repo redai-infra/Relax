@@ -111,24 +111,26 @@ def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]
 
 
 def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, float]:
-    """Compute RLOO-specific diagnostics from raw rollout samples.
+    """Compute RLOO-specific diagnostics from training rollout samples.
 
-    These metrics are computed on the rollout side where both raw rewards and
-    group structure are available. The leave-one-out baseline is recomputed
-    here from raw rewards (mirroring ``compute_rloo_leave_one_out_rewards``)
-    so the diagnostics are self-contained.
+    These keys are returned with an ``rloo/`` prefix. The training rollout
+    logger adds the outer ``rollout/`` prefix before publishing them.
 
-    Metrics:
-        rloo/baseline_mean: mean of per-group LOO baseline means.
-        rloo/adv_abs_mean: mean of per-group |advantage| means (signal strength;
-            the plain mean of RLOO advantages is always 0 and carries no info).
-        rloo/no_signal_frac: token-level fraction of tokens whose sample has
-            zero advantage (group rewards all equal, or the sample lands on the
-            group mean). Zero-advantage tokens contribute no gradient.
-        rloo/empty_response_frac: fraction of samples with empty responses.
-        rloo/zero_adv_group_frac: fraction of groups where all advantages are 0.
+    ``no_signal_frac`` uses effective loss-token counts, because masked response
+    tokens cannot contribute gradients. ``empty_response_frac`` intentionally
+    uses the literal response length and therefore remains distinct from a
+    sample whose response exists but is fully masked.
     """
     if getattr(args, "advantage_estimator", None) != "rloo":
+        return {}
+    if (
+        getattr(args, "custom_reward_post_process_path", None) is not None
+        or getattr(args, "agentic_custom_advantage_path", None) is not None
+    ):
+        # These hooks can replace the advantages consumed by training. Raw
+        # rewards are insufficient to reconstruct that custom signal here, so
+        # suppress the standard RLOO diagnostics instead of publishing values
+        # that may disagree with the optimizer input.
         return {}
 
     from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
@@ -136,49 +138,56 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     group_size = args.n_samples_per_prompt
     groups: dict[int, list[tuple[Sample, float]]] = {}
     for sample in samples:
-        gi = sample.group_index
-        if gi is None:
+        group_index = sample.group_index
+        if group_index is None:
             continue
-        groups.setdefault(gi, []).append((sample, sample.get_reward_value(args)))
+        groups.setdefault(group_index, []).append((sample, sample.get_reward_value(args)))
 
-    all_baseline_means: list[float] = []
-    all_adv_abs_means: list[float] = []
+    baseline_means: list[float] = []
+    advantage_abs_means: list[float] = []
     zero_adv_groups = 0
-    total_groups = 0
+    complete_groups = 0
+    dropped_groups = 0
     zero_adv_tokens = 0
-    total_response_tokens = 0
-    empty_count = 0
+    effective_response_tokens = 0
 
     for items in groups.values():
         if len(items) != group_size:
+            dropped_groups += 1
             continue
-        total_groups += 1
-        rewards = torch.tensor([r for _, r in items], dtype=torch.float32)
-        adv = compute_rloo_leave_one_out_rewards(rewards)
-        baselines = rewards - adv
-        all_baseline_means.append(baselines.mean().item())
-        all_adv_abs_means.append(adv.abs().mean().item())
-        if bool(adv.abs().max().item() < 1e-12):
+        complete_groups += 1
+        rewards = torch.tensor([reward for _, reward in items], dtype=torch.float32)
+        advantages = compute_rloo_leave_one_out_rewards(rewards)
+        baselines = rewards - advantages
+        baseline_means.append(baselines.mean().item())
+        advantage_abs_means.append(advantages.abs().mean().item())
+        if bool(advantages.abs().max().item() < 1e-12):
             zero_adv_groups += 1
-        for (sample, _), a in zip(items, adv.tolist(), strict=False):
-            resp_len = getattr(sample, "response_length", 0) or 0
-            total_response_tokens += resp_len
-            if resp_len == 0:
-                empty_count += 1
-            if abs(a) < 1e-12:
-                zero_adv_tokens += resp_len
+        for (sample, _), advantage in zip(items, advantages.tolist(), strict=True):
+            effective_length = sample.effective_response_length or 0
+            effective_response_tokens += effective_length
+            if abs(advantage) < 1e-12:
+                zero_adv_tokens += effective_length
 
     total_samples = len(samples)
+    observed_groups = complete_groups + dropped_groups
+    empty_responses = sum((sample.response_length or 0) == 0 for sample in samples)
     return {
-        "rloo/baseline_mean": sum(all_baseline_means) / len(all_baseline_means) if all_baseline_means else 0.0,
-        "rloo/adv_abs_mean": sum(all_adv_abs_means) / len(all_adv_abs_means) if all_adv_abs_means else 0.0,
-        "rloo/no_signal_frac": zero_adv_tokens / total_response_tokens if total_response_tokens > 0 else 0.0,
-        "rloo/empty_response_frac": empty_count / total_samples if total_samples > 0 else 0.0,
-        "rloo/zero_adv_group_frac": zero_adv_groups / total_groups if total_groups > 0 else 0.0,
+        "rloo/baseline_mean": sum(baseline_means) / len(baseline_means) if baseline_means else 0.0,
+        "rloo/adv_abs_mean": sum(advantage_abs_means) / len(advantage_abs_means) if advantage_abs_means else 0.0,
+        "rloo/no_signal_frac": (zero_adv_tokens / effective_response_tokens if effective_response_tokens > 0 else 0.0),
+        "rloo/empty_response_frac": empty_responses / total_samples if total_samples > 0 else 0.0,
+        "rloo/zero_adv_group_frac": zero_adv_groups / complete_groups if complete_groups > 0 else 0.0,
+        "rloo/dropped_group_frac": dropped_groups / observed_groups if observed_groups > 0 else 0.0,
     }
 
 
-def compute_rollout_explicit_reward_metrics(args, samples: list[Sample]) -> dict[str, float]:
+def compute_rollout_explicit_reward_metrics(
+    args,
+    samples: list[Sample],
+    *,
+    include_rloo_diagnostics: bool = True,
+) -> dict[str, float]:
     reward_metric_values: dict[str, list[float]] = {}
     primary_reward_key = getattr(args, "reward_key", None)
     for sample in samples:
@@ -204,7 +213,8 @@ def compute_rollout_explicit_reward_metrics(args, samples: list[Sample]) -> dict
                 "passrate/",
             )
 
-    log_dict |= _compute_rloo_group_diagnostics(args, samples)
+    if include_rloo_diagnostics:
+        log_dict |= _compute_rloo_group_diagnostics(args, samples)
 
     return log_dict
 

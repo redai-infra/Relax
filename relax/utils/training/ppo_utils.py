@@ -491,10 +491,7 @@ def compute_rloo_leave_one_out_rewards(group_rewards: torch.Tensor) -> torch.Ten
             f"makes the leave-one-out baseline undefined: division by G-1=0)."
         )
     if not torch.isfinite(group_rewards).all():
-        raise ValueError(
-            f"RLOO group contains non-finite reward(s): {group_rewards}. "
-            f"All rewards must be finite."
-        )
+        raise ValueError(f"RLOO group contains non-finite reward(s): {group_rewards}. All rewards must be finite.")
     mean_reward = group_rewards.mean()
     scale = group_size / (group_size - 1)
     return scale * (group_rewards - mean_reward)
