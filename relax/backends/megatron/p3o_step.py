@@ -147,7 +147,12 @@ def compute_p3o_step_context(
     ]
     invalid_count_acc = [stats_acc[0].valid_token_count.clone()]
 
-    def forward_step(iterator: DataIterator, model_chunk: torch.nn.Module):
+    def forward_step(
+        iterator: DataIterator,
+        model_chunk: torch.nn.Module,
+        return_schedule_plan: bool = False,
+    ):
+        assert not return_schedule_plan, "P3O ESS pre-pass never returns a schedule plan"
         batch = get_batch(
             iterator,
             [

@@ -1209,3 +1209,24 @@ def maybe_verify_critic_value_head_movement(model, optimizer, update_successful:
                 count,
             )
             setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True)
+
+
+# ---------------------------------------------------------------------------
+# P3O helpers – narrow re-exports from p3o_utils
+#
+# Task40 requires this file to expose P3O entry points. Per the module-boundary
+# spec (task40_solution_spec.md), all formulas live in p3o_utils.py; this
+# section only re-exports the public API so callers may import from the
+# ppo_utils namespace without knowing the internal layout.
+# ---------------------------------------------------------------------------
+from relax.utils.training.p3o_utils import (  # noqa: E402, F401
+    P3OStepContext,
+    P3OSufficientStats,
+    P3OTokenTerms,
+    compute_p3o_behavior_kl_proxy,
+    compute_p3o_log_ratio,
+    compute_p3o_sufficient_stats,
+    compute_p3o_sufficient_stats_unchecked,
+    compute_p3o_token_terms,
+    finalize_p3o_step_context,
+)

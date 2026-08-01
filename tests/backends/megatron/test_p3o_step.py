@@ -4,13 +4,16 @@
 
 from __future__ import annotations
 
+import sys
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
 from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 
-with stubbed_megatron_modules():
+with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
     from relax.backends.megatron import p3o_step
     from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 
@@ -74,3 +77,246 @@ def test_p3o_step_raises_only_after_global_invalid_flag_is_visible(monkeypatch):
 
     with pytest.raises(ValueError, match="non-finite importance ratio"):
         synchronize_p3o_stats(_stats((1.0, 1.0, 1.0)), torch.zeros((), dtype=torch.float64))
+
+
+def test_compute_p3o_step_context_plain_text_forward_kwargs(monkeypatch):
+    """ESS pre-pass forward_step must use tokens+packed_seq_params for plain text."""
+    from argparse import Namespace
+
+    captured = {}
+
+    def fake_model(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(1, 1, 768)
+
+    def fake_get_batch(iterator, keys, *_args, **_kwargs):
+        return {
+            "tokens": torch.zeros(4, dtype=torch.long),
+            "packed_seq_params": "packed_sentinel",
+            "total_lengths": [4],
+            "response_lengths": [2],
+            "loss_masks": [torch.ones(4)],
+            "rollout_log_probs": [torch.zeros(4)],
+            "full_loss_masks": torch.ones(4),
+            "unconcat_tokens": [torch.zeros(4, dtype=torch.long)],
+        }
+
+    def fake_forward_backward(forward_step_func, data_iterator, model, **_kwargs):
+        # Call forward_step once to trigger kwarg capture (avoid calling collect callback)
+        forward_step_func(data_iterator[0], model[0])
+        return None
+
+    # Prevent the lazy `from .loss import get_log_probs_and_entropy` from executing
+    # by ensuring the forward_backward func never calls the collect callback
+    monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
+    monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "finalize_p3o_step_context", lambda s: p3o_step.P3OStepContext(
+        normalized_ess=torch.tensor(0.66), adaptive_cap=torch.tensor(0.66),
+        valid_token_count=torch.tensor(4.0), ratio_mean=torch.tensor(1.875),
+        ratio_std=torch.tensor(0.5), clamp_events=0
+    ))
+    monkeypatch.setattr(torch, "no_grad", lambda: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_iterator_positions", lambda _: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_rng_state", lambda: __import__("contextlib").nullcontext())
+
+    args = Namespace(
+        data_pad_size_multiplier=1, qkv_format="thd", allgather_cp=False,
+        seq_length=512, micro_batch_size=1, decoder_seq_length=None,
+    )
+    # loss.py is a lazy import inside compute_p3o_step_context (line 140 of p3o_step.py).
+    # It fires after the stubbed_megatron_modules context has already exited, so we must
+    # inject a mock for loss before the function is called.
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
+    p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
+
+    assert captured["input_ids"] is not None
+    assert str(captured["input_ids"].dtype) == "torch.int64"
+    assert captured["packed_seq_params"] == "packed_sentinel"
+    assert captured["loss_mask"] is not None
+
+
+def test_compute_p3o_step_context_vl_unsplit_forward_kwargs(monkeypatch):
+    """ESS pre-pass forward_step must use unsplit_tokens for VL models."""
+    from argparse import Namespace
+
+    captured = {}
+
+    def fake_model(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(1, 1, 768)
+
+    def fake_get_batch(iterator, keys, *_args, **_kwargs):
+        return {
+            "tokens": torch.zeros(4, dtype=torch.long),
+            "unsplit_tokens": torch.zeros(8, dtype=torch.long),  # VL path
+            "packed_seq_params": "packed_sentinel",
+            "total_lengths": [4],
+            "response_lengths": [2],
+            "loss_masks": [torch.ones(4)],
+            "rollout_log_probs": [torch.zeros(4)],
+            "full_loss_masks": torch.ones(4),
+            "unconcat_tokens": [torch.zeros(4, dtype=torch.long)],
+        }
+
+    def fake_forward_backward(forward_step_func, data_iterator, model, **_kwargs):
+        output_tensor, _ = forward_step_func(data_iterator[0], model[0])
+        return None
+
+    monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
+    monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "finalize_p3o_step_context", lambda s: p3o_step.P3OStepContext(
+        normalized_ess=torch.tensor(0.66), adaptive_cap=torch.tensor(0.66),
+        valid_token_count=torch.tensor(4.0), ratio_mean=torch.tensor(1.875),
+        ratio_std=torch.tensor(0.5), clamp_events=0
+    ))
+    monkeypatch.setattr(torch, "no_grad", lambda: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_iterator_positions", lambda _: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_rng_state", lambda: __import__("contextlib").nullcontext())
+
+    args = Namespace(
+        data_pad_size_multiplier=1, qkv_format="thd", allgather_cp=False,
+        is_vl_model=True,
+        seq_length=512, micro_batch_size=1, decoder_seq_length=None,
+    )
+    # cp_utils.maybe_padded_total_lengths queries mpu for the CP world size; this
+    # test is single-process, so report CP=1 instead of a bare MagicMock.
+    monkeypatch.setattr(p3o_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
+    p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
+
+    # VL path: should use unsplit_tokens, packed_seq_params=None
+    assert captured["input_ids"].shape == (8,), "VL path must use unsplit_tokens"
+    assert captured["packed_seq_params"] is None, "VL path sets packed_seq_params=None"
+    assert captured["loss_mask"] is not None
+
+
+def test_compute_p3o_step_context_vl_thd_bridge_forward_kwargs(monkeypatch):
+    """ESS pre-pass forward_step must use thd bridge path (vlm_packed_seq_params, loss_mask=None)."""
+    from argparse import Namespace
+
+    captured = {}
+
+    def fake_model(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(1, 1, 768)
+
+    def fake_get_batch(iterator, keys, *_args, **_kwargs):
+        return {
+            "tokens": torch.zeros(4, dtype=torch.long),
+            "unsplit_tokens": torch.zeros(8, dtype=torch.long),
+            "unsplit_attention_mask": torch.ones(8),
+            "vlm_packed_seq_params": "vlm_packed_sentinel",  # thd bridge marker
+            "packed_seq_params": "packed_sentinel",
+            "total_lengths": [4],
+            "response_lengths": [2],
+            "loss_masks": [torch.ones(4)],
+            "rollout_log_probs": [torch.zeros(4)],
+            "full_loss_masks": torch.ones(4),
+            "unconcat_tokens": [torch.zeros(4, dtype=torch.long)],
+        }
+
+    def fake_forward_backward(forward_step_func, data_iterator, model, **_kwargs):
+        output_tensor, _ = forward_step_func(data_iterator[0], model[0])
+        return None
+
+    monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
+    monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "finalize_p3o_step_context", lambda s: p3o_step.P3OStepContext(
+        normalized_ess=torch.tensor(0.66), adaptive_cap=torch.tensor(0.66),
+        valid_token_count=torch.tensor(4.0), ratio_mean=torch.tensor(1.875),
+        ratio_std=torch.tensor(0.5), clamp_events=0
+    ))
+    monkeypatch.setattr(torch, "no_grad", lambda: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_iterator_positions", lambda _: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_rng_state", lambda: __import__("contextlib").nullcontext())
+
+    args = Namespace(
+        data_pad_size_multiplier=1, qkv_format="thd", allgather_cp=False,
+        is_vl_model=True,
+        seq_length=512, micro_batch_size=1, decoder_seq_length=None,
+    )
+    monkeypatch.setattr(p3o_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
+    p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
+
+    # thd bridge path: unsplit_tokens, vlm_packed_seq_params, unsplit_attention_mask, loss_mask=None
+    assert captured["input_ids"].shape == (8,), "thd bridge must use unsplit_tokens"
+    assert captured["packed_seq_params"] == "vlm_packed_sentinel", "thd bridge uses vlm_packed_seq_params"
+    assert captured["attention_mask"] is not None, "thd bridge requires attention_mask"
+    assert captured["loss_mask"] is None, "thd bridge sets loss_mask=None"
+
+
+def test_compute_p3o_step_context_dynamic_cp_group_switching(monkeypatch):
+    """ESS pre-pass forward_step must switch pg_collection.cp for dynamic CP."""
+    from argparse import Namespace
+
+    captured_pg = []
+    orig_cp_group = object()
+    dynamic_cp_group = object()
+
+    class FakePGCollection:
+        def __init__(self):
+            self.cp = orig_cp_group
+
+    class FakeInner:
+        def __init__(self):
+            self.pg_collection = FakePGCollection()
+
+    class FakeModel:
+        def __init__(self):
+            self.module = FakeInner()
+
+        def __call__(self, **kwargs):
+            captured_pg.append(self.module.pg_collection.cp)
+            return torch.zeros(1, 1, 768)
+
+    fake_model = FakeModel()
+
+    def fake_get_batch(iterator, keys, *_args, **_kwargs):
+        return {
+            "tokens": torch.zeros(4, dtype=torch.long),
+            "unsplit_tokens": torch.zeros(8, dtype=torch.long),
+            "packed_seq_params": "packed_sentinel",
+            "dynamic_cp_size": 2,  # trigger dynamic CP path
+            "total_lengths": [4],
+            "response_lengths": [2],
+            "loss_masks": [torch.ones(4)],
+            "rollout_log_probs": [torch.zeros(4)],
+            "full_loss_masks": torch.ones(4),
+            "unconcat_tokens": [torch.zeros(4, dtype=torch.long)],
+        }
+
+    def fake_forward_backward(forward_step_func, data_iterator, model, **_kwargs):
+        output_tensor, _ = forward_step_func(data_iterator[0], model[0])
+        return None
+
+    monkeypatch.setattr(p3o_step.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: dynamic_cp_group)
+    monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
+    monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "finalize_p3o_step_context", lambda s: p3o_step.P3OStepContext(
+        normalized_ess=torch.tensor(0.66), adaptive_cap=torch.tensor(0.66),
+        valid_token_count=torch.tensor(4.0), ratio_mean=torch.tensor(1.875),
+        ratio_std=torch.tensor(0.5), clamp_events=0
+    ))
+    monkeypatch.setattr(torch, "no_grad", lambda: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_iterator_positions", lambda _: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(p3o_step, "preserved_rng_state", lambda: __import__("contextlib").nullcontext())
+
+    args = Namespace(
+        data_pad_size_multiplier=1, qkv_format="thd", allgather_cp=False,
+        is_vl_model=True,
+        seq_length=512, micro_batch_size=1, decoder_seq_length=None,
+    )
+    monkeypatch.setattr(p3o_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
+    p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
+
+    # The forward should have been called with dynamic_cp_group active
+    assert len(captured_pg) == 1, "forward_step should call model_chunk once"
+    assert captured_pg[0] is dynamic_cp_group, "pg_collection.cp must switch to dynamic group during forward"
+    # After forward, it should be restored (verify via the finally block's side effect)
+    assert fake_model.module.pg_collection.cp is orig_cp_group, "pg_collection.cp must be restored after forward"
