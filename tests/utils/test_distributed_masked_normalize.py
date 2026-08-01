@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import sys
 from datetime import timedelta
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from relax.utils.distributed_utils import distributed_masked_normalize
+from relax.utils.training.ppo_utils import get_reinforce_plus_plus_returns
 
 
 def _distributed_worker(rank: int, world_size: int, init_method: str) -> None:
@@ -80,6 +83,42 @@ def _distributed_worker(rank: int, world_size: int, init_method: str) -> None:
         torch.testing.assert_close(variance, torch.tensor(0.0, dtype=torch.float64), atol=0, rtol=0)
         torch.testing.assert_close(count, torch.tensor(1.0, dtype=torch.float64), atol=0, rtol=0)
         torch.testing.assert_close(normalized, torch.zeros_like(normalized), atol=0, rtol=0)
+
+        # A rank with no valid response tokens must reach the same collective
+        # as ranks with valid tokens. Otherwise the valid rank hangs in all_reduce.
+        megatron = ModuleType("megatron")
+        megatron_core = ModuleType("megatron.core")
+        megatron_core.mpu = SimpleNamespace(get_context_parallel_world_size=lambda: 1)
+        megatron.core = megatron_core
+        sys.modules["megatron"] = megatron
+        sys.modules["megatron.core"] = megatron_core
+
+        local_mask = torch.zeros(2, dtype=torch.float64) if rank == 0 else torch.ones(2, dtype=torch.float64)
+        local_kl = (
+            torch.tensor([float("inf"), float("nan")], dtype=torch.float64)
+            if rank == 0
+            else torch.tensor([0.2, -0.1], dtype=torch.float64)
+        )
+        local_returns = get_reinforce_plus_plus_returns(
+            rewards=torch.tensor([10.0 if rank == 0 else 1.0], dtype=torch.float64),
+            kl=[local_kl],
+            loss_masks=[local_mask],
+            response_lengths=[2],
+            total_lengths=[2],
+            kl_coef=0.1,
+            gamma=1.0,
+        )[0]
+        normalized, mean, variance, count = distributed_masked_normalize(local_returns, local_mask)
+
+        if rank == 0:
+            torch.testing.assert_close(local_returns, torch.zeros_like(local_returns), atol=0, rtol=0)
+            torch.testing.assert_close(normalized, torch.zeros_like(normalized), atol=0, rtol=0)
+        else:
+            torch.testing.assert_close(local_returns, torch.tensor([0.99, 1.01], dtype=torch.float64))
+            torch.testing.assert_close(normalized, torch.tensor([-1.0, 1.0], dtype=torch.float64))
+        torch.testing.assert_close(mean, torch.tensor(1.0, dtype=torch.float64), atol=1e-12, rtol=0)
+        torch.testing.assert_close(variance, torch.tensor(1e-4, dtype=torch.float64), atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(count, torch.tensor(2.0, dtype=torch.float64), atol=0, rtol=0)
 
         with pytest.raises(ValueError, match="global mask sum"):
             distributed_masked_normalize(torch.tensor([float(rank)]), torch.zeros(1))
