@@ -18,7 +18,7 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 ARTIFACT_ROOT = Path(
-    os.environ.get("TASK22_ARTIFACT_ROOT", REPO_ROOT / "benchmark_artifacts" / "task22-hybrid-async-text-v2")
+    os.environ.get("TASK22_ARTIFACT_ROOT", REPO_ROOT / "benchmark_artifacts" / "task22-hybrid-async-text-v3")
 )
 OUTPUT_ROOT = Path(
     os.environ.get("TASK22_OUTPUT_ROOT", REPO_ROOT / "benchmarks" / "results" / "task22-hybrid-async-text")
@@ -29,8 +29,9 @@ STABLE_FIRST_STEP = 5
 STABLE_LAST_STEP = 15
 GLOBAL_BATCH_SIZE = 32
 UPDATE_WEIGHT_BUFFER_SIZE = 512 * 1024**2
-TRAIN_TOKEN_BUDGETS = {"baseline": 8192, "zero_kl": 8192, "optimized": 12288}
-LOG_PROB_TOKEN_BUDGETS = {"baseline": 8192, "zero_kl": 8192, "optimized": 24576}
+TRAIN_TOKEN_BUDGETS = {variant: 8192 for variant in VARIANTS}
+LOG_PROB_TOKEN_BUDGETS = {variant: 8192 for variant in VARIANTS}
+UPDATE_WEIGHTS_INTERVALS = {"baseline": 1, "zero_kl": 1, "optimized": 2}
 WORKLOAD_KEYS = (
     "git_commit",
     "python",
@@ -59,7 +60,6 @@ WORKLOAD_KEYS = (
     "global_batch_size",
     "max_response_len",
     "max_staleness",
-    "update_weights_interval",
     "kl_loss_coef",
     "use_tis",
 )
@@ -273,6 +273,7 @@ def summarize_run(variant: str, run_id: int) -> tuple[dict[str, Any], list[dict[
         "gpu_driver": manifest["gpu_driver"],
         "seed": int(manifest["seed"]),
         "update_weight_buffer_size": int(manifest["update_weight_buffer_size"]),
+        "update_weights_interval": int(manifest["update_weights_interval"]),
         "max_tokens_per_gpu": int(manifest["max_tokens_per_gpu"]),
         "log_probs_max_tokens_per_gpu": int(manifest["log_probs_max_tokens_per_gpu"]),
         "total_steps": len(perf),
@@ -362,12 +363,12 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     zero_kl_step = aggregate(summaries, "zero_kl", "e2e_step_time_s")
     optimized_step = aggregate(summaries, "optimized", "e2e_step_time_s")
     zero_kl_throughput_gain = (zero_kl_tps / baseline_tps - 1.0) * 100.0
-    token_budget_throughput_gain = (optimized_tps / zero_kl_tps - 1.0) * 100.0
+    interval_throughput_gain = (optimized_tps / zero_kl_tps - 1.0) * 100.0
     total_throughput_gain = (optimized_tps / baseline_tps - 1.0) * 100.0
     zero_kl_latency_change = (zero_kl_step / baseline_step - 1.0) * 100.0
-    token_budget_latency_change = (optimized_step / zero_kl_step - 1.0) * 100.0
+    interval_latency_change = (optimized_step / zero_kl_step - 1.0) * 100.0
     total_latency_change = (optimized_step / baseline_step - 1.0) * 100.0
-    acceptance = "PASS" if token_budget_throughput_gain >= 5.0 else "NOT MET"
+    acceptance = "PASS" if interval_throughput_gain >= 5.0 else "NOT MET"
     commit = summaries[0]["git_commit"]
     dataset_sha = summaries[0]["dataset_sha256"]
     model_sha = summaries[0]["model_sha256"]
@@ -379,26 +380,26 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
         "",
         f"Three paired trials on commit `{commit}` show that pruning the zero-coefficient KL reference path "
         f"changes response throughput by {zero_kl_throughput_gain:+.2f}% and E2E latency by "
-        f"{zero_kl_latency_change:+.2f}%. Applying the 12288/24576 train/log-prob token budgets then "
-        f"changes throughput by another {token_budget_throughput_gain:+.2f}% and latency by "
-        f"{token_budget_latency_change:+.2f}%. The combined change is {total_throughput_gain:+.2f}% throughput "
+        f"{zero_kl_latency_change:+.2f}%. Publishing rollout weights every two actor updates then "
+        f"changes throughput by another {interval_throughput_gain:+.2f}% and latency by "
+        f"{interval_latency_change:+.2f}%. The combined change is {total_throughput_gain:+.2f}% throughput "
         f"and {total_latency_change:+.2f}% latency versus baseline.",
         f"Acceptance: **{acceptance}** against the frozen target of at least +5% response throughput for "
         "`optimized` versus `zero_kl`.",
         "",
-        "| variant | train/log-prob budget | microbatches | framework/E2E step (s) | response tok/s | samples/s | GPU util | actor peak MiB | rollout peak MiB |",
+        "| variant | update interval | framework/E2E step (s) | response tok/s | samples/s | weight publish/step (s) | TIS | actor peak MiB | rollout peak MiB |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for variant in VARIANTS:
         variant_rows = [row for row in summaries if row["variant"] == variant]
         lines.append(
-            f"| {variant} | {TRAIN_TOKEN_BUDGETS[variant]}/{LOG_PROB_TOKEN_BUDGETS[variant]} | "
-            f"{aggregate(summaries, variant, 'dynamic_microbatches_mean'):.2f} | "
+            f"| {variant} | {UPDATE_WEIGHTS_INTERVALS[variant]} | "
             f"{aggregate(summaries, variant, 'framework_step_time_s'):.3f}/"
             f"{aggregate(summaries, variant, 'e2e_step_time_s'):.3f} | "
             f"{aggregate(summaries, variant, 'response_tokens_per_s'):.1f} | "
             f"{aggregate(summaries, variant, 'samples_per_s'):.3f} | "
-            f"{aggregate(summaries, variant, 'gpu_util_pct'):.1f}% | "
+            f"{aggregate(summaries, variant, 'preceding_update_weights_s'):.3f} | "
+            f"{aggregate(summaries, variant, 'tis'):.6f} | "
             f"{max(float(row['actor_peak_memory_mib']) for row in variant_rows):.0f} | "
             f"{max(float(row['rollout_peak_memory_mib']) for row in variant_rows):.0f} |"
         )
@@ -424,7 +425,7 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "",
             "## Paired changes",
             "",
-            "| run | zero-KL throughput | token-budget throughput | total throughput | total latency | seed |",
+            "| run | zero-KL throughput | interval-two throughput | total throughput | total latency | seed |",
             "| ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -433,11 +434,11 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
         zero_kl = next(row for row in summaries if row["variant"] == "zero_kl" and row["run_id"] == run_id)
         optimized = next(row for row in summaries if row["variant"] == "optimized" and row["run_id"] == run_id)
         zero_kl_gain = zero_kl["response_tokens_per_s"] / baseline["response_tokens_per_s"] - 1.0
-        token_budget_gain = optimized["response_tokens_per_s"] / zero_kl["response_tokens_per_s"] - 1.0
+        interval_gain = optimized["response_tokens_per_s"] / zero_kl["response_tokens_per_s"] - 1.0
         total_gain = optimized["response_tokens_per_s"] / baseline["response_tokens_per_s"] - 1.0
         run_latency_change = optimized["e2e_step_time_s"] / baseline["e2e_step_time_s"] - 1.0
         lines.append(
-            f"| {run_id} | {zero_kl_gain * 100:+.2f}% | {token_budget_gain * 100:+.2f}% | "
+            f"| {run_id} | {zero_kl_gain * 100:+.2f}% | {interval_gain * 100:+.2f}% | "
             f"{total_gain * 100:+.2f}% | {run_latency_change * 100:+.2f}% | {baseline['seed']} |"
         )
     lines.extend(
@@ -457,7 +458,8 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             f"subset of {environment['dataset_subset_size']} prompts, SHA256 `{dataset_sha}`; "
             "no hand-written large dataset.",
             "- Each component run: 20 steps, 8 prompts/step, 4 samples/prompt, effective batch 32, response cap 512.",
-            "- Async policy: Hybrid, max staleness 2, TIS enabled, weight update interval 1.",
+            "- Async policy: Hybrid, max staleness 2 and TIS enabled. Baseline/zero-KL publish every step; optimized publishes every two steps.",
+            "- Dynamic-batch budgets: 8192 training tokens and 8192 log-prob tokens per GPU for every variant.",
             "- Performance window: logged steps 5-15 inclusive (11 observations). Primary throughput uses high-resolution framework `perf/step_time`; the E2E interval from actor completion N-1 to N is secondary because those completion logs have only one-second timestamp resolution.",
             "- GPU window: actor completion 4 through completion 15. Utilization and peak memory use only this window; utilization includes idle-zero samples.",
             "- Trial order uses a three-way rotation to reduce warm-cache and order bias.",
@@ -466,9 +468,16 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "",
             "`baseline` deliberately preserves the original misconfiguration: `--use-kl-loss --kl-loss-coef 0.00` plus `--ref-load`. `zero_kl` removes the unused reference path while retaining the 8192-token dynamic-batch budget. Because the KL term is multiplied by exactly zero, this removes compute but does not change the scalar objective.",
             "",
-            "`optimized` builds on `zero_kl` and uses a 12288-token training budget plus a 24576-token forward-only log-prob budget. The role-specific budgets target two backward microbatches and one forward microbatch instead of three each, reducing scheduling and kernel-launch overhead without changing samples, generated-token caps, global batch, optimizer updates, staleness, or weight-publication frequency.",
+            "`optimized` builds on `zero_kl` and sets `--update-weights-interval 2`. Hybrid skips the rollout pause, weight transfer, and resume endpoint on odd completed steps, while still publishing at interval boundaries and the final step. A configured evaluation also forces publication before evaluation.",
+            "",
+            "This method intentionally trades one additional actor update of rollout-policy freshness for lower publication overhead. `--max-staleness 2` bounds the existing asynchronous pipeline, while TIS, loss, reward, and clipping metrics are correctness guardrails rather than evidence of long-horizon convergence equivalence.",
             "",
             "All variants keep the weight-update buffer fixed at 512 MiB; the previously tested 1 GiB buffer is intentionally excluded from this experiment.",
+            "",
+            "## Rejected directions",
+            "",
+            "- Increasing the weight-update buffer from 512 MiB to 1 GiB improved throughput by only +1.12% across three trials.",
+            "- Increasing train/log-prob budgets to 12288/24576 reduced throughput by -1.52% versus `zero_kl`: log-prob forward became faster, but actor training regressed enough to outweigh it.",
             "",
             "## Correctness guardrails",
             "",
@@ -485,7 +494,7 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 bash benchmarks/task22_hybrid_async_text/run_paired_trials.sh",
             "```",
             "",
-            "Run `TASK22_VARIANT=zero_kl MAX_TOKENS_PER_GPU=8192` to disable only the token-budget optimization, or `TASK22_VARIANT=baseline` to roll back both changes. Raw logs, manifests, submitted commands, and one-second GPU samples are under `benchmark_artifacts/task22-hybrid-async-text-v2/`.",
+            "Run `TASK22_VARIANT=zero_kl UPDATE_WEIGHTS_INTERVAL=1` to disable only interval-two publication, or `TASK22_VARIANT=baseline` to roll back both changes. Raw logs, manifests, submitted commands, and one-second GPU samples are under `benchmark_artifacts/task22-hybrid-async-text-v3/`.",
             "",
             "Generated files: `summary.csv`, `step_metrics.csv`, and `throughput_curves.svg`.",
         ]
@@ -523,6 +532,8 @@ def main() -> None:
         raise RuntimeError("Reference-forward execution does not match the three-stage design")
     if any(row["update_weight_buffer_size"] != UPDATE_WEIGHT_BUFFER_SIZE for row in summaries):
         raise RuntimeError("Weight-update buffer size must stay fixed at 512 MiB")
+    if any(row["update_weights_interval"] != UPDATE_WEIGHTS_INTERVALS[row["variant"]] for row in summaries):
+        raise RuntimeError("Weight-update intervals do not match the three-stage design")
     if any(row["max_tokens_per_gpu"] != TRAIN_TOKEN_BUDGETS[row["variant"]] for row in summaries):
         raise RuntimeError("Training token budgets do not match the three-stage design")
     if any(row["log_probs_max_tokens_per_gpu"] != LOG_PROB_TOKEN_BUDGETS[row["variant"]] for row in summaries):

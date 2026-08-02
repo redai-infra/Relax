@@ -105,6 +105,31 @@ logger = logging.getLogger(__name__)
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
 
 
+def _should_publish_hybrid_weights(
+    rollout_id: int,
+    update_weights_interval: int,
+    num_rollout: int,
+    *,
+    evaluation_configured: bool = False,
+    eval_interval: int | None = None,
+    num_rollout_per_epoch: int | None = None,
+) -> bool:
+    if update_weights_interval <= 0:
+        raise ValueError(f"update_weights_interval must be positive, got {update_weights_interval}")
+
+    step = rollout_id + 1
+    if step == num_rollout or step % update_weights_interval == 0:
+        return True
+    if not evaluation_configured:
+        return False
+
+    # The rollout service also evaluates at epoch boundaries. When its epoch
+    # length is unavailable in this worker, publish conservatively every step.
+    if num_rollout_per_epoch is None:
+        return True
+    return (eval_interval is not None and step % eval_interval == 0) or step % num_rollout_per_epoch == 0
+
+
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
     if not counts or any((not isinstance(c, int)) or c <= 0 for c in counts):
         raise ValueError(f"rollout mini counts must be positive integers, got {counts}")
@@ -1422,21 +1447,24 @@ class MegatronTrainRayActor(TrainRayActor):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
             return
 
-        # Mirror train_async's pause/resume coordination so the rollout service
-        # has a chance to finish its in-flight step (and refill any partition
-        # gaps it owes) before we swap weights. Without this gate the rollout
-        # can race ahead while train_hybrid is still mid-consume on a
-        # partially-filled partition, deadlocking against the staleness bound.
-        # Returned flags are for update_weights_fully_async only — hybrid uses
-        # the sync update_weights path so we just discard them.
-        self._wait_for_previous_eval()
-        self._check_services_health()
+        should_publish_weights = _should_publish_hybrid_weights(
+            rollout_id,
+            self.args.update_weights_interval,
+            self.args.num_rollout,
+            evaluation_configured=self.args.eval_interval is not None and self.args.eval_prompt_data is not None,
+            eval_interval=self.args.eval_interval,
+            num_rollout_per_epoch=getattr(self.args, "num_rollout_per_epoch", None),
+        )
+        if should_publish_weights:
+            # Pause rollout only when a matching update/end_update_weight pair
+            # will run. Skipped publications must leave rollout progressing.
+            self._wait_for_previous_eval()
+            self._check_services_health()
+            self.update_weights()
 
-        # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
-        self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id, end_update_weight=True)
+        self._run_step_evaluation(rollout_id, end_update_weight=should_publish_weights)
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited

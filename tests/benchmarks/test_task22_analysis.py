@@ -16,6 +16,12 @@ def test_performance_window_is_logged_steps_5_through_15() -> None:
     assert list(range(analysis.STABLE_FIRST_STEP, analysis.STABLE_LAST_STEP + 1)) == list(range(5, 16))
 
 
+def test_three_stage_design_changes_only_reference_and_publication_interval() -> None:
+    assert analysis.TRAIN_TOKEN_BUDGETS == {variant: 8192 for variant in analysis.VARIANTS}
+    assert analysis.LOG_PROB_TOKEN_BUDGETS == {variant: 8192 for variant in analysis.VARIANTS}
+    assert analysis.UPDATE_WEIGHTS_INTERVALS == {"baseline": 1, "zero_kl": 1, "optimized": 2}
+
+
 def test_parse_metric_dict_accepts_known_infinity() -> None:
     record = analysis.parse_metric_dict("{'perf/step_time': 2.5, 'perf/device_peak_tflops': inf}")
 

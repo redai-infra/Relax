@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # Two-GPU Hybrid-async Task 22 recipe. Variants isolate zero-KL reference
-# pruning from a larger dynamic-batch token budget.
+# pruning from interval-two weight publication.
 
 set -Eeuo pipefail
 
@@ -88,18 +88,21 @@ case "${TASK22_VARIANT}" in
         UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-536870912}"
         MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
         LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-8192}"
+        UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
         ENABLE_ZERO_KL_REFERENCE=1
         ;;
     zero_kl)
         UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-536870912}"
         MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
         LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-8192}"
+        UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
         ENABLE_ZERO_KL_REFERENCE=0
         ;;
     optimized)
         UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-536870912}"
-        MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-12288}"
-        LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-24576}"
+        MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
+        LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-8192}"
+        UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-2}"
         ENABLE_ZERO_KL_REFERENCE=0
         ;;
     *)
@@ -122,6 +125,10 @@ if ! [[ "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "${LOG_PROBS_MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
     echo "LOG_PROBS_MAX_TOKENS_PER_GPU must be a positive integer, got ${LOG_PROBS_MAX_TOKENS_PER_GPU}" >&2
+    exit 2
+fi
+if ! [[ "${UPDATE_WEIGHTS_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "UPDATE_WEIGHTS_INTERVAL must be a positive integer, got ${UPDATE_WEIGHTS_INTERVAL}" >&2
     exit 2
 fi
 if [[ "${CUDA_VISIBLE_DEVICES:-}" != *,* ]] || [[ "${CUDA_VISIBLE_DEVICES}" == *,*,* ]]; then
@@ -171,6 +178,7 @@ TRAIN_CMD=(
     python3 -m relax.entrypoints.train
     --resource '{"actor": [1, 1], "rollout": [1, 1]}'
     --max-staleness 2
+    --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}"
     --update-weight-buffer-size "${UPDATE_WEIGHT_BUFFER_SIZE}"
     --num-data-storage-units 1
     --num-iters-per-train-update 1

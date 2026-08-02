@@ -2,7 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Run three paired Task 22 trials. Each trial contains baseline, zero-KL, and
-# optimized token-budget component runs with the same seed and workload.
+# interval-two weight-publication runs with the same seed and workload.
 
 set -Eeuo pipefail
 
@@ -22,7 +22,7 @@ unset RUNTIME_ENV_JSON
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 export MODEL_PATH="${MODEL_PATH:-${HOME}/model/Qwen3-0.6B}"
 TOTAL_TRIALS="${TOTAL_TRIALS:-3}"
-ARTIFACT_ROOT="${TASK22_ARTIFACT_ROOT:-${REPO_ROOT}/benchmark_artifacts/task22-hybrid-async-text-v2}"
+ARTIFACT_ROOT="${TASK22_ARTIFACT_ROOT:-${REPO_ROOT}/benchmark_artifacts/task22-hybrid-async-text-v3}"
 export PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/benchmarks/data/task22_gsm8k_main16.jsonl}"
 export TASK22_DATASET_REPO_ID="${TASK22_DATASET_REPO_ID:-AI-ModelScope/gsm8k}"
 export TASK22_DATASET_SPLIT="${TASK22_DATASET_SPLIT:-main}"
@@ -89,12 +89,12 @@ run_component() {
     local log_probs_max_tokens_per_gpu="8192"
     local reference_forward="disabled"
     local use_kl_loss="disabled"
+    local update_weights_interval="1"
     if [[ "${variant}" == "baseline" ]]; then
         reference_forward="enabled"
         use_kl_loss="enabled"
     elif [[ "${variant}" == "optimized" ]]; then
-        max_tokens_per_gpu="12288"
-        log_probs_max_tokens_per_gpu="24576"
+        update_weights_interval="2"
     fi
     mkdir -p "${run_dir}"
 
@@ -147,7 +147,7 @@ run_component() {
         echo "max_tokens_per_gpu=${max_tokens_per_gpu}"
         echo "log_probs_max_tokens_per_gpu=${log_probs_max_tokens_per_gpu}"
         echo "max_staleness=2"
-        echo "update_weights_interval=1"
+        echo "update_weights_interval=${update_weights_interval}"
         echo "update_weight_buffer_size=${UPDATE_WEIGHT_BUFFER_SIZE}"
         echo "reference_forward=${reference_forward}"
         echo "use_kl_loss=${use_kl_loss}"
@@ -159,6 +159,7 @@ run_component() {
     if ! TASK22_VARIANT="${variant}" UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE}" \
         MAX_TOKENS_PER_GPU="${max_tokens_per_gpu}" \
         LOG_PROBS_MAX_TOKENS_PER_GPU="${log_probs_max_tokens_per_gpu}" \
+        UPDATE_WEIGHTS_INTERVAL="${update_weights_interval}" \
         RUN_ID="${run_id}" TASK22_JOB_ID="${job_id}" \
         bash "${RECIPE}" >"${run_dir}/submit.log" 2>&1; then
         kill "${monitor_pid}" 2>/dev/null || true
