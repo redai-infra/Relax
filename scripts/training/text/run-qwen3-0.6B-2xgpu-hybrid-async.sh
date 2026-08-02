@@ -17,6 +17,52 @@ source "${WORKSPACE_ROOT}/relax.env"
 source "${WORKSPACE_ROOT}/.venv/bin/activate"
 source "${REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
 
+build_runtime_env_json() {
+    python - <<'PY'
+import json
+import os
+
+runtime_env = {
+    "worker_process_setup_hook": "relax.utils.logging_utils.install_asyncio_noise_filter",
+    "env_vars": {
+        "PYTHONUNBUFFERED": os.environ.get("PYTHONUNBUFFERED", "1"),
+        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        "CUDA_DEVICE_MAX_CONNECTIONS": os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1"),
+        "CUDA_HOME": os.environ.get("CUDA_HOME", ""),
+        "CUDACXX": os.environ.get("CUDACXX", ""),
+        "CUDNN_HOME": os.environ.get("CUDNN_HOME", ""),
+        "NCCL_HOME": os.environ.get("NCCL_HOME", ""),
+        "CPATH": os.environ.get("CPATH", ""),
+        "LIBRARY_PATH": os.environ.get("LIBRARY_PATH", ""),
+        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+        "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "24"),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "24"),
+        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "24"),
+        "NCCL_NVLS_ENABLE": os.environ.get("NCCL_NVLS_ENABLE", "0"),
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": os.environ.get(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "32"
+        ),
+        "NVSHMEM_DISABLE_NCCL": os.environ.get("NVSHMEM_DISABLE_NCCL", "1"),
+        "SGLANG_HEALTH_CHECK_TIMEOUT": os.environ.get("SGLANG_HEALTH_CHECK_TIMEOUT", "180"),
+        "NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME": os.environ.get("NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME", ""),
+        "NVTE_USE_CUTLASS_GROUPED_GEMM": os.environ.get("NVTE_USE_CUTLASS_GROUPED_GEMM", "1"),
+        "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK": os.environ.get(
+            "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK", "1"
+        ),
+        "NVTE_CUDA_ARCHS": os.environ.get("NVTE_CUDA_ARCHS", "120;120-real"),
+        "INDEXER_ROPE_NEOX_STYLE": os.environ.get("INDEXER_ROPE_NEOX_STYLE", "0"),
+        "PYTHONNOUSERSITE": os.environ.get("PYTHONNOUSERSITE", "1"),
+        "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "false"),
+        "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": os.environ.get(
+            "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python"
+        ),
+    },
+}
+print(json.dumps(runtime_env))
+PY
+}
+
 MODEL_PATH="${MODEL_PATH:-${HOME}/model/Qwen3-0.6B}"
 PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/benchmarks/data/task22_gsm8k_main16.jsonl}"
 TASK22_DATA_PREP_SCRIPT="${TASK22_DATA_PREP_SCRIPT:-${REPO_ROOT}/benchmarks/task22_hybrid_async_text/prepare_task22_dataset.py}"
@@ -34,7 +80,9 @@ MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 TASK22_JOB_ID="${TASK22_JOB_ID:-task22-${TASK22_VARIANT}-run-${RUN_ID}}"
-RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-{}}"
+if [[ -z "${RUNTIME_ENV_JSON:-}" || "${RUNTIME_ENV_JSON}" == "{}" ]]; then
+    RUNTIME_ENV_JSON="$(build_runtime_env_json)"
+fi
 
 case "${TASK22_VARIANT}" in
     baseline)

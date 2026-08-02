@@ -14,8 +14,10 @@ DATASET_PREP="${SCRIPT_DIR}/prepare_task22_dataset.py"
 
 export RELAX_ROOT="${REPO_ROOT}"
 export RELAX="${REPO_ROOT}"
+export MEGATRON="${WORKSPACE_ROOT}/.relax-deps/Megatron-LM"
 source "${WORKSPACE_ROOT}/relax.env"
 source "${WORKSPACE_ROOT}/.venv/bin/activate"
+unset RUNTIME_ENV_JSON
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 export MODEL_PATH="${MODEL_PATH:-${HOME}/model/Qwen3-0.6B}"
