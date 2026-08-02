@@ -46,6 +46,7 @@ traces
 output
 outputs
 tensorboard_log
+benchmark_artifacts/
 
 .history
 *.log
