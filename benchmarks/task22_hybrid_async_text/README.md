@@ -37,19 +37,19 @@ MODEL_PATH=/path/to/Qwen3-0.6B CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 \
 ```
 
 Raw logs, manifests, submitted commands, and one-second GPU samples are first written to ignored
-`benchmark_artifacts/task22-hybrid-async-text-v3/`. An ignored local directory is not itself reviewable evidence.
-Before opening the PR, create the redacted evidence bundle and SHA-256 indexes in the tracked results directory:
+`benchmark_artifacts/task22-hybrid-async-text-v3/`. Before opening the PR, create the redacted evidence bundle and
+SHA-256 indexes in the ignored PR-attachment directory:
 
 ```bash
 python benchmarks/task22_hybrid_async_text/package_evidence.py \
   --artifact-root benchmark_artifacts/task22-hybrid-async-text-v3 \
-  --output-dir benchmarks/results/task22-hybrid-async-text
+  --output-dir benchmark_artifacts/task22-pr-attachments/task22-hybrid-async-text
 python benchmarks/task22_hybrid_async_text/analyze.py
 ```
 
-The analyzer writes the Chinese report, CSV tables, and SVG curve to
-`benchmarks/results/task22-hybrid-async-text/`. The report must not claim that raw evidence is deliverable until
-`raw-evidence.tar.gz`, `raw-evidence-index.csv`, and `raw-evidence.sha256` are present or a durable external URL and
-checksum are recorded.
+The analyzer writes the Chinese report, CSV tables, and SVG throughput, step-time, and weight-publication curves to
+`benchmark_artifacts/task22-pr-attachments/task22-hybrid-async-text/` by default. Do not commit this output directory.
+Upload the deliverables to the Draft PR, then record the durable attachment URLs and SHA-256 values in both the PR and
+Issue. `TASK22_OUTPUT_ROOT` can override the analyzer output location for compatibility with other artifact stores.
 
 The dataset helper downloads `AI-ModelScope/gsm8k` with `ms download --repo-type dataset`, then slices the first 16 rows from `main/train` into `benchmarks/data/task22_gsm8k_main16.jsonl` for training.

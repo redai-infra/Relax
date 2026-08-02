@@ -16,6 +16,12 @@ def test_performance_window_is_logged_steps_5_through_15() -> None:
     assert list(range(analysis.STABLE_FIRST_STEP, analysis.STABLE_LAST_STEP + 1)) == list(range(5, 16))
 
 
+def test_default_output_uses_ignored_attachment_directory() -> None:
+    assert analysis.OUTPUT_ROOT == (
+        analysis.REPO_ROOT / "benchmark_artifacts" / "task22-pr-attachments" / "task22-hybrid-async-text"
+    )
+
+
 def test_three_stage_design_changes_only_reference_and_publication_interval() -> None:
     assert analysis.TRAIN_TOKEN_BUDGETS == {variant: 8192 for variant in analysis.VARIANTS}
     assert analysis.LOG_PROB_TOKEN_BUDGETS == {variant: 8192 for variant in analysis.VARIANTS}
@@ -109,3 +115,43 @@ def test_weight_publication_count_includes_initial_and_training_updates(tmp_path
     log.write_text("before update_weights\nunrelated\nbefore update_weights\n")
 
     assert analysis.weight_publication_count(log) == 2
+
+
+def test_svg_chart_includes_labeled_axes_and_run_step_ticks(tmp_path: Path) -> None:
+    rows = [
+        {
+            "variant": variant,
+            "run_id": run_id,
+            "step": step,
+            "response_tokens_per_s": 4000 + run_id * 100 + step + variant_index * 250,
+            "framework_step_time_s": 4.5 - variant_index * 0.5 + step / 100,
+        }
+        for variant_index, variant in enumerate(analysis.VARIANTS)
+        for run_id in analysis.RUN_IDS
+        for step in range(analysis.STABLE_FIRST_STEP, analysis.STABLE_LAST_STEP + 1)
+    ]
+    output = tmp_path / "throughput.svg"
+
+    analysis.svg_chart(rows, output)
+
+    chart = output.read_text()
+    assert "响应吞吐（tokens/s）" in chart
+    assert "配对运行 / 训练 step" in chart
+    assert "R1/S5" in chart
+    assert "R2/S10" in chart
+    assert "R3/S15" in chart
+
+    step_time_output = tmp_path / "step_time.svg"
+    analysis.stable_window_svg_chart(
+        rows,
+        step_time_output,
+        metric_key="framework_step_time_s",
+        title="Task 22 稳定窗口 framework step 耗时",
+        y_axis_label="framework step 耗时（s）",
+        y_interval=0.5,
+        y_decimals=1,
+    )
+
+    step_time_chart = step_time_output.read_text()
+    assert "framework step 耗时（s）" in step_time_chart
+    assert ">3.5<" in step_time_chart

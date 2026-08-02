@@ -22,7 +22,10 @@ ARTIFACT_ROOT = Path(
     os.environ.get("TASK22_ARTIFACT_ROOT", REPO_ROOT / "benchmark_artifacts" / "task22-hybrid-async-text-v3")
 )
 OUTPUT_ROOT = Path(
-    os.environ.get("TASK22_OUTPUT_ROOT", REPO_ROOT / "benchmarks" / "results" / "task22-hybrid-async-text")
+    os.environ.get(
+        "TASK22_OUTPUT_ROOT",
+        REPO_ROOT / "benchmark_artifacts" / "task22-pr-attachments" / "task22-hybrid-async-text",
+    )
 )
 VARIANTS = ("baseline", "zero_kl", "optimized")
 RUN_IDS = (1, 2, 3)
@@ -324,38 +327,102 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def svg_chart(rows: list[dict[str, Any]], path: Path) -> None:
-    width, height = 960, 420
-    margin = 55
-    values = [float(row["response_tokens_per_s"]) for row in rows]
-    y_min, y_max = min(values) * 0.97, max(values) * 1.03
+def stable_window_svg_chart(
+    rows: list[dict[str, Any]],
+    path: Path,
+    *,
+    metric_key: str,
+    title: str,
+    y_axis_label: str,
+    y_interval: float,
+    y_decimals: int,
+) -> None:
+    width, height = 960, 460
+    plot_left, plot_right = 88, 930
+    plot_top, plot_bottom = 70, 375
+    values = [float(row[metric_key]) for row in rows]
+    y_min = math.floor(min(values) / y_interval) * y_interval
+    y_max = math.ceil(max(values) / y_interval) * y_interval
+    if y_min == y_max:
+        y_max += y_interval
     colors = {"baseline": "#4b5563", "zero_kl": "#2563eb", "optimized": "#0f766e"}
     elements = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-labelledby="chart-title">',
+        f'<title id="chart-title">{title}</title>',
         '<rect width="100%" height="100%" fill="white"/>',
-        '<text x="480" y="28" text-anchor="middle" font-family="sans-serif" font-size="18">Task 22 稳定窗口响应吞吐</text>',
+        f'<text x="480" y="28" text-anchor="middle" font-family="sans-serif" font-size="18">{title}</text>',
     ]
+    tick_count = int(round((y_max - y_min) / y_interval))
+    for tick_index in range(tick_count + 1):
+        tick_value = y_min + tick_index * y_interval
+        y = plot_bottom - (tick_value - y_min) * (plot_bottom - plot_top) / (y_max - y_min)
+        elements.extend(
+            [
+                f'<line x1="{plot_left}" y1="{y:.1f}" x2="{plot_right}" y2="{y:.1f}" stroke="#e5e7eb" stroke-width="1"/>',
+                f'<text x="{plot_left - 10}" y="{y + 4:.1f}" text-anchor="end" font-family="sans-serif" font-size="11">{tick_value:.{y_decimals}f}</text>',
+            ]
+        )
+
+    reference_rows = [row for row in rows if row["variant"] == VARIANTS[0]]
+    denominator = max(len(reference_rows) - 1, 1)
+    for index, row in enumerate(reference_rows):
+        if int(row["step"]) not in (STABLE_FIRST_STEP, 10, STABLE_LAST_STEP):
+            continue
+        x = plot_left + index * (plot_right - plot_left) / denominator
+        elements.extend(
+            [
+                f'<line x1="{x:.1f}" y1="{plot_bottom}" x2="{x:.1f}" y2="{plot_bottom + 5}" stroke="#111827"/>',
+                f'<text x="{x:.1f}" y="{plot_bottom + 20}" text-anchor="middle" font-family="sans-serif" font-size="10">R{row["run_id"]}/S{row["step"]}</text>',
+            ]
+        )
+    stable_steps_per_run = STABLE_LAST_STEP - STABLE_FIRST_STEP + 1
+    for boundary in range(1, len(RUN_IDS)):
+        boundary_index = boundary * stable_steps_per_run - 0.5
+        x = plot_left + boundary_index * (plot_right - plot_left) / denominator
+        elements.append(
+            f'<line x1="{x:.1f}" y1="{plot_top}" x2="{x:.1f}" y2="{plot_bottom}" stroke="#9ca3af" stroke-width="1" stroke-dasharray="4 4"/>'
+        )
+
+    elements.extend(
+        [
+            f'<line x1="{plot_left}" y1="{plot_top}" x2="{plot_left}" y2="{plot_bottom}" stroke="#111827" stroke-width="1.5"/>',
+            f'<line x1="{plot_left}" y1="{plot_bottom}" x2="{plot_right}" y2="{plot_bottom}" stroke="#111827" stroke-width="1.5"/>',
+            f'<text x="{(plot_left + plot_right) / 2:.1f}" y="438" text-anchor="middle" font-family="sans-serif" font-size="12">配对运行 / 训练 step</text>',
+            f'<text x="20" y="{(plot_top + plot_bottom) / 2:.1f}" text-anchor="middle" font-family="sans-serif" font-size="12" transform="rotate(-90 20 {(plot_top + plot_bottom) / 2:.1f})">{y_axis_label}</text>',
+        ]
+    )
     for variant in VARIANTS:
         points = []
         variant_rows = [row for row in rows if row["variant"] == variant]
         for index, row in enumerate(variant_rows):
-            x = margin + index * (width - 2 * margin) / max(len(variant_rows) - 1, 1)
-            value = float(row["response_tokens_per_s"])
-            y = height - margin - (value - y_min) * (height - 2 * margin) / (y_max - y_min)
+            x = plot_left + index * (plot_right - plot_left) / max(len(variant_rows) - 1, 1)
+            value = float(row[metric_key])
+            y = plot_bottom - (value - y_min) * (plot_bottom - plot_top) / (y_max - y_min)
             points.append(f"{x:.1f},{y:.1f}")
         elements.append(
             f'<polyline points="{" ".join(points)}" fill="none" stroke="{colors[variant]}" stroke-width="2"/>'
         )
     elements.extend(
         [
-            f'<text x="{margin}" y="{height - 15}" font-family="sans-serif" font-size="12">3 组配对实验的 step 5-15</text>',
-            '<rect x="760" y="45" width="12" height="12" fill="#4b5563"/><text x="780" y="56" font-family="sans-serif" font-size="12">baseline</text>',
-            '<rect x="760" y="65" width="12" height="12" fill="#2563eb"/><text x="780" y="76" font-family="sans-serif" font-size="12">zero_kl</text>',
-            '<rect x="760" y="85" width="12" height="12" fill="#0f766e"/><text x="780" y="96" font-family="sans-serif" font-size="12">optimized</text>',
+            '<line x1="590" y1="50" x2="612" y2="50" stroke="#4b5563" stroke-width="2"/><text x="620" y="54" font-family="sans-serif" font-size="12">baseline</text>',
+            '<line x1="700" y1="50" x2="722" y2="50" stroke="#2563eb" stroke-width="2"/><text x="730" y="54" font-family="sans-serif" font-size="12">zero_kl</text>',
+            '<line x1="800" y1="50" x2="822" y2="50" stroke="#0f766e" stroke-width="2"/><text x="830" y="54" font-family="sans-serif" font-size="12">optimized</text>',
             "</svg>",
         ]
     )
     path.write_text("\n".join(elements) + "\n")
+
+
+def svg_chart(rows: list[dict[str, Any]], path: Path) -> None:
+    stable_window_svg_chart(
+        rows,
+        path,
+        metric_key="response_tokens_per_s",
+        title="Task 22 稳定窗口响应吞吐",
+        y_axis_label="响应吞吐（tokens/s）",
+        y_interval=500,
+        y_decimals=0,
+    )
 
 
 def aggregate(rows: list[dict[str, Any]], variant: str, key: str) -> float:
@@ -501,9 +568,13 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     lines.extend(
         [
             "",
-            "## 吞吐曲线",
+            "## 性能曲线",
             "",
             "![三组配对实验稳定窗口响应吞吐](throughput_curves.svg)",
+            "",
+            "![三组配对实验稳定窗口 framework step 耗时](step_time_curves.svg)",
+            "",
+            "![三组配对实验稳定窗口前序权重发布耗时](weight_update_curves.svg)",
             "",
             "## 固定工作量与方法",
             "",
@@ -572,9 +643,10 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "设置 `TASK22_VARIANT=zero_kl UPDATE_WEIGHTS_INTERVAL=1` 可只关闭 interval-two 发布；"
             "设置 `TASK22_VARIANT=baseline` 可回退两个改动。",
             "",
-            "生成文件：`summary.csv`、`step_metrics.csv` 和 `throughput_curves.svg`。",
-            "当前已提交文件的校验值见 [committed-evidence.sha256](committed-evidence.sha256)；"
-            "该清单不能替代下述原始日志证据包。",
+            "生成文件：`summary.csv`、`step_metrics.csv`、`throughput_curves.svg`、"
+            "`step_time_curves.svg` 和 `weight_update_curves.svg`。",
+            "这些结果文件位于被忽略的附件目录，不应提交到仓库。上传 Draft PR 后，需在 PR 和 Issue "
+            "中记录附件 URL 与 SHA-256。",
             "",
             "## 原始证据交付",
             "",
@@ -589,7 +661,7 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "```bash",
             "python benchmarks/task22_hybrid_async_text/package_evidence.py \\",
             "  --artifact-root benchmark_artifacts/task22-hybrid-async-text-v3 \\",
-            "  --output-dir benchmarks/results/task22-hybrid-async-text",
+            "  --output-dir benchmark_artifacts/task22-pr-attachments/task22-hybrid-async-text",
             "python benchmarks/task22_hybrid_async_text/analyze.py",
             "```",
             "",
@@ -651,6 +723,24 @@ def main() -> None:
     write_csv(OUTPUT_ROOT / "summary.csv", summaries)
     write_csv(OUTPUT_ROOT / "step_metrics.csv", steps)
     svg_chart(steps, OUTPUT_ROOT / "throughput_curves.svg")
+    stable_window_svg_chart(
+        steps,
+        OUTPUT_ROOT / "step_time_curves.svg",
+        metric_key="framework_step_time_s",
+        title="Task 22 稳定窗口 framework step 耗时",
+        y_axis_label="framework step 耗时（s）",
+        y_interval=0.5,
+        y_decimals=1,
+    )
+    stable_window_svg_chart(
+        steps,
+        OUTPUT_ROOT / "weight_update_curves.svg",
+        metric_key="preceding_update_weights_s",
+        title="Task 22 稳定窗口前序权重发布耗时",
+        y_axis_label="前序权重发布耗时（s）",
+        y_interval=0.1,
+        y_decimals=1,
+    )
     write_report(summaries, OUTPUT_ROOT / "report.md")
     print(f"Wrote Task 22 report to {OUTPUT_ROOT / 'report.md'}")
 
