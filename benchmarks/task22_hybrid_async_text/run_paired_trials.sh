@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." >/dev/null 2>&1 && pwd)"
 WORKSPACE_ROOT="$(cd -- "${REPO_ROOT}/.." >/dev/null 2>&1 && pwd)"
 RECIPE="${REPO_ROOT}/scripts/training/text/run-qwen3-0.6B-2xgpu-hybrid-async.sh"
+DATASET_PREP="${SCRIPT_DIR}/prepare_task22_dataset.py"
 
 export RELAX_ROOT="${REPO_ROOT}"
 export RELAX="${REPO_ROOT}"
@@ -18,14 +19,19 @@ source "${WORKSPACE_ROOT}/.venv/bin/activate"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 export MODEL_PATH="${MODEL_PATH:-${HOME}/model/Qwen3-0.6B}"
+TOTAL_TRIALS="${TOTAL_TRIALS:-3}"
+ARTIFACT_ROOT="${TASK22_ARTIFACT_ROOT:-${REPO_ROOT}/benchmark_artifacts/task22-hybrid-async-text}"
+export PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/benchmarks/data/task22_gsm8k_main16.jsonl}"
+export TASK22_DATASET_REPO_ID="${TASK22_DATASET_REPO_ID:-AI-ModelScope/gsm8k}"
+export TASK22_DATASET_SPLIT="${TASK22_DATASET_SPLIT:-main}"
+export TASK22_DATASET_SUBSET_SIZE="${TASK22_DATASET_SUBSET_SIZE:-16}"
+export TASK22_DATASET_DOWNLOAD_DIR="${TASK22_DATASET_DOWNLOAD_DIR:-${ARTIFACT_ROOT}/modelscope-cache}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
 export RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 export ROLLOUT_BATCH_SIZE=8
 export N_SAMPLES_PER_PROMPT=4
 export MAX_RESPONSE_LEN=512
 export MAX_TOKENS_PER_GPU=8192
-TOTAL_TRIALS="${TOTAL_TRIALS:-3}"
-ARTIFACT_ROOT="${TASK22_ARTIFACT_ROOT:-${REPO_ROOT}/benchmark_artifacts/task22-hybrid-async-text}"
 BASELINE_BUFFER_SIZE=536870912
 OPTIMIZED_BUFFER_SIZE=1073741824
 
@@ -42,6 +48,12 @@ if ! ray status >/dev/null 2>&1; then
     echo "No reachable Ray cluster. Start a two-GPU cluster from the workspace .venv first." >&2
     exit 1
 fi
+python "${DATASET_PREP}" \
+    --repo-id "${TASK22_DATASET_REPO_ID}" \
+    --split "${TASK22_DATASET_SPLIT}" \
+    --limit "${TASK22_DATASET_SUBSET_SIZE}" \
+    --download-dir "${TASK22_DATASET_DOWNLOAD_DIR}" \
+    --output "${PROMPT_DATA}"
 
 job_status() {
     python - "$RAY_DASHBOARD_ADDRESS" "$1" <<'PY'
@@ -110,7 +122,10 @@ run_component() {
         echo "cpu_logical_count=$(nproc --all)"
         echo "memory_total_kib=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
         echo "model_path=${MODEL_PATH}"
-        echo "dataset_sha256=$(sha256sum "${REPO_ROOT}/benchmarks/data/task22_tiny_math.jsonl" | awk '{print $1}')"
+        echo "dataset_sha256=$(sha256sum "${PROMPT_DATA}" | awk '{print $1}')"
+        echo "dataset_repo_id=${TASK22_DATASET_REPO_ID}"
+        echo "dataset_split=${TASK22_DATASET_SPLIT}"
+        echo "dataset_subset_size=${TASK22_DATASET_SUBSET_SIZE}"
         echo "model_sha256=$(sha256sum "${MODEL_PATH}/model.safetensors" | awk '{print $1}')"
         echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
         echo "actor_gpu=${ACTOR_GPU}"

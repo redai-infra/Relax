@@ -10,7 +10,7 @@ Both variants retain the same reference forward, zero-coefficient KL path, weigh
 | --- | --- |
 | Model | `~/model/Qwen3-0.6B` |
 | GPUs | 2, split as actor 1 + rollout 1 |
-| Data | 16 local arithmetic records |
+| Data | 16-row ModelScope GSM8K slice (`AI-ModelScope/gsm8k`, `main/train`) |
 | Repetitions | 3 paired trials |
 | Steps | 10 per component run, hard-capped at 20 |
 | Batch | 8 prompts x 4 samples = 32 |
@@ -31,3 +31,5 @@ CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 \
 ```
 
 Raw logs, manifests, submitted commands, and one-second GPU samples are written to ignored `benchmark_artifacts/`. The analyzer writes the reviewable report, CSV tables, and SVG curve to `benchmarks/results/task22-hybrid-async-text/`.
+
+The dataset helper downloads `AI-ModelScope/gsm8k` with `ms download --repo-type dataset`, then slices the first 16 rows from `main/train` into `benchmarks/data/task22_gsm8k_main16.jsonl` for training.

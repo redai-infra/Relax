@@ -44,8 +44,13 @@ WORKLOAD_KEYS = (
     "memory_total_kib",
     "model_path",
     "dataset_sha256",
+    "dataset_repo_id",
+    "dataset_split",
+    "dataset_subset_size",
     "model_sha256",
     "cuda_visible_devices",
+    "actor_gpu",
+    "rollout_gpu",
     "num_rollout",
     "rollout_batch_size",
     "n_samples_per_prompt",
@@ -417,7 +422,10 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             f"driver {environment['gpu_driver']}; Ray {environment['ray']}; SGLang {environment['sglang']}; "
             f"Transformers {environment['transformers']}.",
             "- Model: `/home/zhengbaowei/model/Qwen3-0.6B`, " + f"model SHA256 `{model_sha}`.",
-            "- Data: 16 checked-in arithmetic prompts, " + f"SHA256 `{dataset_sha}`; no external large dataset.",
+            "- Data: "
+            f"ModelScope `{environment['dataset_repo_id']}` {environment['dataset_split']} "
+            f"subset of {environment['dataset_subset_size']} prompts, SHA256 `{dataset_sha}`; "
+            "no hand-written large dataset.",
             "- Each component run: 10 steps, 8 prompts/step, 4 samples/prompt, effective batch 32, response cap 512.",
             "- Async policy: Hybrid, max staleness 2, TIS enabled, weight update interval 1.",
             "- Stable observations: completed steps 2-9, where step N latency is the interval from actor completion N-1 to N. This includes post-train coordination and weight publication omitted by framework `perf/step_time`.",
