@@ -562,6 +562,25 @@ index 465e83f28..707162f47 100644
  
          tensor_recv_prev = None
          tensor_recv_next = None
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -358,7 +358,14 @@
+     def backward(ctx, grad_output):
+         """Backward with frozen weight."""
+         (weight,) = ctx.saved_tensors
+-        grad_input = grad_output.matmul(weight)
++        if grad_output.dim() > 2:
++            # Work around PyTorch matmul not folding some size-1 leading dims to mm.
++            # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
++            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
++            grad_input = grad_output_2d.matmul(weight)
++            grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
++        else:
++            grad_input = grad_output.matmul(weight)
+ 
+         if ctx.allreduce_dgrad:
+             # All-reduce. Note: here async and sync are effectively the same.
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
 index d316d23de..9bb6d2bd6 100644
 --- a/megatron/core/transformer/moe/moe_utils.py

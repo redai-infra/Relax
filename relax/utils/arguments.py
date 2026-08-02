@@ -67,6 +67,14 @@ def check_transfer_queue_version() -> None:
         )
 
 
+def _positive_int(value: str) -> int:
+    """argparse type that rejects non-positive integers at parse time."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset selected metadata on an existing Megatron argument.
 
@@ -84,6 +92,55 @@ def reset_arg(parser, name, **kwargs):
             break
     else:
         parser.add_argument(name, **kwargs)
+
+
+def _add_fp16_optimizer_arguments(parser):
+    """Expose FP16 optimizer settings while preserving an unset sentinel."""
+    reset_arg(
+        parser,
+        "--initial-loss-scale",
+        type=float,
+        default=None,
+        help="Initial loss scale. When omitted in FP16 mode, Relax uses 32768.0.",
+    )
+    reset_arg(
+        parser,
+        "--min-loss-scale",
+        type=float,
+        default=None,
+        help="Minimum loss scale. When omitted in FP16 mode, Relax uses 1.0.",
+    )
+    reset_arg(
+        parser,
+        "--use-precision-aware-optimizer",
+        action="store_true",
+        default=None,
+        help="Use the precision-aware optimizer. When omitted in FP16 mode, Relax enables it.",
+    )
+    if "--no-use-precision-aware-optimizer" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-use-precision-aware-optimizer",
+            action="store_false",
+            dest="use_precision_aware_optimizer",
+            default=None,
+            help="Disable TransformerEngine's precision-aware optimizer.",
+        )
+    reset_arg(
+        parser,
+        "--store-param-remainders",
+        action="store_true",
+        default=None,
+        help="Store parameter remainders. When omitted in FP16 mode, Relax disables it.",
+    )
+    if "--no-store-param-remainders" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-store-param-remainders",
+            action="store_false",
+            dest="store_param_remainders",
+            default=None,
+            help="Do not store parameter remainders in the distributed optimizer.",
+        )
+    return parser
 
 
 def get_slime_extra_args_provider(add_custom_arguments=None):
@@ -607,6 +664,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
+            parser = _add_fp16_optimizer_arguments(parser)
             return parser
 
         # rollout
@@ -1178,6 +1236,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
                     "When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers "
                     "for true parallelism without GIL contention."
+                ),
+            )
+            parser.add_argument(
+                "--encode-max-workers",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Worker threads for the shared media-encoding thread pool (image/video/audio "
+                    "encoding offloaded from the asyncio event loop). Positive integer. If unset, "
+                    "falls back to $RELAX_ENCODE_MAX_WORKERS, then to min(32, usable CPU count)."
                 ),
             )
             parser.add_argument(
@@ -2062,6 +2130,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Type of the reward model",
             )
             parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default=None,
+                help=(
+                    "Fallback for samples whose reward type is unknown or missing. "
+                    "None (default) keeps the current behavior of raising. 'zero' scores "
+                    "the sample 0.0 (reward-key aware) with a warning. Any registered "
+                    "reward type name routes degraded samples to that reward instead."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-infer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Infer the reward type from the sample label via registered label "
+                    "matchers when neither sample metadata nor --rm-type provides one. "
+                    "Also enables conflict detection (warn; the explicit type wins)."
+                ),
+            )
+            parser.add_argument(
                 "--reward-key",
                 type=str,
                 default=None,
@@ -2896,6 +2985,17 @@ def slime_validate_args(args):
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
+
+    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    if rm_type_fallback is not None and rm_type_fallback != "zero":
+        # Lazy import: only pay for the rewards package when the flag is set.
+        from relax.engine.rewards.registry import list_reward_types
+
+        if rm_type_fallback not in list_reward_types():
+            raise ValueError(
+                f"--rm-type-fallback {rm_type_fallback!r} is not a registered reward type. "
+                f"Use 'zero' or one of: {list_reward_types()}"
+            )
 
     if hasattr(args, "rollout_result_dir"):
         if args.rollout_result_dir is None and getattr(args, "save", None):

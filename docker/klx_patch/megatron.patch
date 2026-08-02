@@ -408,6 +408,19 @@ index 465e83f28..707162f47 100644
          )
          ops.append(recv_next_op)
      if len(ops) > 0:
+diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
+index 07f33deca..dc2e17519 100644
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -8,7 +8,7 @@ from typing import Optional
+ from megatron.core.utils import internal_api
+ 
+ try:
+-    from deep_ep import Buffer
++    from deep_ep import BufferV2 as Buffer
+     from deep_ep.utils import EventHandle, EventOverlap
+ 
+     HAVE_DEEP_EP = True
 diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
 index d316d23de..9bb6d2bd6 100644
 --- a/megatron/core/transformer/moe/moe_utils.py
