@@ -17,7 +17,9 @@ VARIANTS = ("baseline", "zero_kl", "optimized")
 RUN_IDS = (1, 2, 3)
 REQUIRED_FILES = ("manifest.txt", "submit.log", "train.log", "gpu.csv")
 HOME_PATH = re.compile(r"(?<![A-Za-z0-9_])(?:/public)?/home/[^/\s'\";,]+")
-PRIVATE_IPV4 = re.compile(r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})\b")
+PRIVATE_IPV4 = re.compile(
+    r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})\b"
+)
 EMAIL_ADDRESS = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY)[A-Z0-9_]*)=([^\s]+)"

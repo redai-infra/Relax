@@ -390,9 +390,7 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     environment = manifest_values(ARTIFACT_ROOT / "baseline" / "run-1" / "manifest.txt")
     tis_values = [float(row["tis"]) for row in summaries]
     max_tis_clipfrac = max(float(row["tis_clipfrac"]) for row in summaries)
-    baseline_actor_peak = max(
-        float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "baseline"
-    )
+    baseline_actor_peak = max(float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "baseline")
     optimized_actor_peak = max(
         float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "optimized"
     )
