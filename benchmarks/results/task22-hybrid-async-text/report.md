@@ -4,29 +4,29 @@
 
 Three paired trials on commit `2b1c7955e2ff84ea6ef6240b9575e6329f260ab5` show a response-throughput change of +1.12% and an end-to-end step-latency change of -1.05% after increasing the weight-update buffer from 512 MiB to 1 GiB.
 
-| variant | E2E step (s) | response tok/s | samples/s | weight update (s) | GPU util | actor GPU | rollout GPU | peak MiB |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| baseline | 3.958 | 4135.7 | 8.086 | 0.692 | 49.7% | 73.5% | 25.8% | 80639 |
-| optimized | 3.917 | 4182.1 | 8.172 | 0.684 | 50.4% | 73.5% | 27.3% | 80747 |
+| variant   | E2E step (s) | response tok/s | samples/s | weight update (s) | GPU util | actor GPU | rollout GPU | peak MiB |
+| --------- | -----------: | -------------: | --------: | ----------------: | -------: | --------: | ----------: | -------: |
+| baseline  |        3.958 |         4135.7 |     8.086 |             0.692 |    49.7% |     73.5% |       25.8% |    80639 |
+| optimized |        3.917 |         4182.1 |     8.172 |             0.684 |    50.4% |     73.5% |       27.3% |    80747 |
 
 ## Per-run evidence
 
-| variant | run | steps | E2E p50/p95 (s) | response tok/s | reward | loss | TIS | samples | errors |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| baseline | 1 | 10 | 4.000/5.000 | 4091.6 | -1.0000 | 0 | 1.000127 | 320 | 0 |
-| baseline | 2 | 10 | 4.000/4.000 | 4090.3 | -1.0000 | 0 | 1.000058 | 320 | 0 |
-| baseline | 3 | 10 | 4.000/4.000 | 4225.2 | -1.0000 | 0 | 0.999926 | 320 | 0 |
-| optimized | 1 | 10 | 4.000/4.000 | 4225.9 | -0.9938 | -6.49178e-06 | 1.000003 | 320 | 0 |
-| optimized | 2 | 10 | 4.000/5.000 | 4093.0 | -1.0000 | 0 | 0.999912 | 320 | 0 |
-| optimized | 3 | 10 | 4.000/4.000 | 4227.5 | -1.0000 | 0 | 0.999960 | 320 | 0 |
+| variant   | run | steps | E2E p50/p95 (s) | response tok/s |  reward |         loss |      TIS | samples | errors |
+| --------- | --: | ----: | --------------: | -------------: | ------: | -----------: | -------: | ------: | -----: |
+| baseline  |   1 |    10 |     4.000/5.000 |         4091.6 | -1.0000 |            0 | 1.000127 |     320 |      0 |
+| baseline  |   2 |    10 |     4.000/4.000 |         4090.3 | -1.0000 |            0 | 1.000058 |     320 |      0 |
+| baseline  |   3 |    10 |     4.000/4.000 |         4225.2 | -1.0000 |            0 | 0.999926 |     320 |      0 |
+| optimized |   1 |    10 |     4.000/4.000 |         4225.9 | -0.9938 | -6.49178e-06 | 1.000003 |     320 |      0 |
+| optimized |   2 |    10 |     4.000/5.000 |         4093.0 | -1.0000 |            0 | 0.999912 |     320 |      0 |
+| optimized |   3 |    10 |     4.000/4.000 |         4227.5 | -1.0000 |            0 | 0.999960 |     320 |      0 |
 
 ## Paired changes
 
-| run | response throughput | E2E step latency | seed |
-| ---: | ---: | ---: | ---: |
-| 1 | +3.28% | -3.12% | 20260802 |
-| 2 | +0.07% | +0.00% | 20260803 |
-| 3 | +0.05% | +0.00% | 20260804 |
+| run | response throughput | E2E step latency |     seed |
+| --: | ------------------: | ---------------: | -------: |
+|   1 |              +3.28% |           -3.12% | 20260802 |
+|   2 |              +0.07% |           +0.00% | 20260803 |
+|   3 |              +0.05% |           +0.00% | 20260804 |
 
 ## Fixed workload and method
 

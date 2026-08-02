@@ -2,8 +2,8 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Two-GPU Hybrid-async Task 22 recipe. Baseline and optimized variants run
-# identical training work and differ only in weight-update chunk size.
+# Two-GPU Hybrid-async Task 22 recipe. Variants isolate zero-KL reference
+# pruning from a larger dynamic-batch token budget.
 
 set -Eeuo pipefail
 
@@ -70,14 +70,13 @@ TASK22_DATASET_REPO_ID="${TASK22_DATASET_REPO_ID:-AI-ModelScope/gsm8k}"
 TASK22_DATASET_SPLIT="${TASK22_DATASET_SPLIT:-main}"
 TASK22_DATASET_SUBSET_SIZE="${TASK22_DATASET_SUBSET_SIZE:-16}"
 TASK22_VARIANT="${TASK22_VARIANT:-baseline}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-20}"
 RUN_ID="${RUN_ID:-1}"
 SEED="${SEED:-$((20260801 + RUN_ID))}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://127.0.0.1:8265}"
 TASK22_JOB_ID="${TASK22_JOB_ID:-task22-${TASK22_VARIANT}-run-${RUN_ID}}"
 if [[ -z "${RUNTIME_ENV_JSON:-}" || "${RUNTIME_ENV_JSON}" == "{}" ]]; then
@@ -87,12 +86,24 @@ fi
 case "${TASK22_VARIANT}" in
     baseline)
         UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-536870912}"
+        MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
+        LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-8192}"
+        ENABLE_ZERO_KL_REFERENCE=1
+        ;;
+    zero_kl)
+        UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-536870912}"
+        MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
+        LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-8192}"
+        ENABLE_ZERO_KL_REFERENCE=0
         ;;
     optimized)
-        UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-1073741824}"
+        UPDATE_WEIGHT_BUFFER_SIZE="${UPDATE_WEIGHT_BUFFER_SIZE:-536870912}"
+        MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-12288}"
+        LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-24576}"
+        ENABLE_ZERO_KL_REFERENCE=0
         ;;
     *)
-        echo "TASK22_VARIANT must be baseline or optimized, got ${TASK22_VARIANT}" >&2
+        echo "TASK22_VARIANT must be baseline, zero_kl, or optimized, got ${TASK22_VARIANT}" >&2
         exit 2
         ;;
 esac
@@ -103,6 +114,14 @@ if ! [[ "${UPDATE_WEIGHT_BUFFER_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "${NUM_ROLLOUT}" =~ ^[1-9][0-9]*$ ]] || ((NUM_ROLLOUT > 20)); then
     echo "NUM_ROLLOUT must be an integer in [1, 20], got ${NUM_ROLLOUT}" >&2
+    exit 2
+fi
+if ! [[ "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_TOKENS_PER_GPU must be a positive integer, got ${MAX_TOKENS_PER_GPU}" >&2
+    exit 2
+fi
+if ! [[ "${LOG_PROBS_MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "LOG_PROBS_MAX_TOKENS_PER_GPU must be a positive integer, got ${LOG_PROBS_MAX_TOKENS_PER_GPU}" >&2
     exit 2
 fi
 if [[ "${CUDA_VISIBLE_DEVICES:-}" != *,* ]] || [[ "${CUDA_VISIBLE_DEVICES}" == *,*,* ]]; then
@@ -129,20 +148,24 @@ fi
 
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_PATH}"
-    --ref-load "${MODEL_PATH}"
     --megatron-to-hf-mode bridge
     --warm-hf-checkpoint-page-cache
 )
+if ((ENABLE_ZERO_KL_REFERENCE)); then
+    CKPT_ARGS+=(--ref-load "${MODEL_PATH}")
+fi
 GRPO_ARGS=(
     --advantage-estimator grpo
     --entropy-coef 0.00
     --eps-clip 0.2
     --eps-clip-high 0.28
     --use-tis
-    --use-kl-loss
     --kl-loss-coef 0.00
     --kl-loss-type low_var_kl
 )
+if ((ENABLE_ZERO_KL_REFERENCE)); then
+    GRPO_ARGS+=(--use-kl-loss)
+fi
 
 TRAIN_CMD=(
     python3 -m relax.entrypoints.train
@@ -178,6 +201,7 @@ TRAIN_CMD=(
     --expert-tensor-parallel-size 1
     --use-dynamic-batch-size
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+    --log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU}"
     "${GRPO_ARGS[@]}"
     --optimizer adam
     --lr 1e-6

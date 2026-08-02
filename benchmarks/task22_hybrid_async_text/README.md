@@ -1,23 +1,28 @@
 # Task 22: Hybrid-async text performance
 
-This benchmark adapts the repository's Hybrid-async text recipe to Qwen3-0.6B and exactly two GPUs. It runs three paired trials; every trial executes the baseline and optimized recipe with the same seed and effective workload.
+This benchmark adapts the repository's Hybrid-async text recipe to Qwen3-0.6B and exactly two GPUs. It runs three paired trials; every trial executes three variants with the same seed and effective workload.
 
-Both variants retain the same reference forward, zero-coefficient KL path, weight-update frequency, and effective workload. The only A/B variable is `--update-weight-buffer-size`: the baseline uses the framework default of 512 MiB and the optimized recipe uses 1 GiB. The larger buffer reduces the number of weight-publication chunks for this 1.40 GiB checkpoint while retaining two chunks so conversion and transfer can still overlap. Selecting `TASK22_VARIANT=baseline` is the rollback.
+1. `baseline` preserves the original zero-KL reference forward and uses an 8192-token dynamic-batch budget.
+2. `zero_kl` removes `--use-kl-loss` and `--ref-load` while the KL coefficient is exactly zero. This is an objective-equivalent configuration fix, measured separately from the main optimization.
+3. `optimized` builds on `zero_kl` and uses role-specific budgets: `--max-tokens-per-gpu 12288` for training and `--log-probs-max-tokens-per-gpu 24576` for forward-only log-prob computation. These target two training microbatches and one log-prob microbatch instead of three of each.
+
+All variants keep the 512 MiB weight-update buffer, model, data, generated workload, global batch, optimizer updates, staleness, and publication frequency fixed. The main acceptance target is at least 5% higher response-token throughput for `optimized` versus `zero_kl`, with no runtime errors, unexpected NaN/Inf, missing samples, or TIS instability. `TASK22_VARIANT=zero_kl MAX_TOKENS_PER_GPU=8192` rolls back the token-budget change; `TASK22_VARIANT=baseline` rolls back both changes.
 
 ## Fixed configuration
 
-| Item | Value |
-| --- | --- |
-| Model | `~/model/Qwen3-0.6B` |
-| GPUs | 2, split as actor 1 + rollout 1 |
-| Data | 16-row ModelScope GSM8K slice (`AI-ModelScope/gsm8k`, `main/train`) |
-| Repetitions | 3 paired trials |
-| Steps | 10 per component run, hard-capped at 20 |
-| Batch | 8 prompts x 4 samples = 32 |
-| Response cap | 512 tokens |
-| Hybrid staleness | 2 |
-| Baseline buffer | 512 MiB |
-| Optimized buffer | 1 GiB |
+| Item                        | Value                                                               |
+| --------------------------- | ------------------------------------------------------------------- |
+| Model                       | `~/model/Qwen3-0.6B`                                                |
+| GPUs                        | 2, split as actor 1 + rollout 1                                     |
+| Data                        | 16-row ModelScope GSM8K slice (`AI-ModelScope/gsm8k`, `main/train`) |
+| Repetitions                 | 3 paired trials, with all 3 variants in every trial                 |
+| Steps                       | 20 per component run                                                |
+| Performance window          | Logged steps 5-15 inclusive                                         |
+| Batch                       | 8 prompts x 4 samples = 32                                          |
+| Response cap                | 512 tokens                                                          |
+| Hybrid staleness            | 2                                                                   |
+| Weight-update buffer        | 512 MiB for every variant                                           |
+| Train/log-prob token budget | 8192/8192 (`baseline`, `zero_kl`); 12288/24576 (`optimized`)        |
 
 ## Run
 
@@ -30,6 +35,6 @@ CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 \
   bash benchmarks/task22_hybrid_async_text/run_paired_trials.sh
 ```
 
-Raw logs, manifests, submitted commands, and one-second GPU samples are written to ignored `benchmark_artifacts/`. The analyzer writes the reviewable report, CSV tables, and SVG curve to `benchmarks/results/task22-hybrid-async-text/`.
+Raw logs, manifests, submitted commands, and one-second GPU samples are written to ignored `benchmark_artifacts/task22-hybrid-async-text-v2/`. The analyzer writes the reviewable report, CSV tables, and SVG curve to `benchmarks/results/task22-hybrid-async-text/`.
 
 The dataset helper downloads `AI-ModelScope/gsm8k` with `ms download --repo-type dataset`, then slices the first 16 rows from `main/train` into `benchmarks/data/task22_gsm8k_main16.jsonl` for training.

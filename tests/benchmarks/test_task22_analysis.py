@@ -12,6 +12,10 @@ analysis = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(analysis)
 
 
+def test_performance_window_is_logged_steps_5_through_15() -> None:
+    assert list(range(analysis.STABLE_FIRST_STEP, analysis.STABLE_LAST_STEP + 1)) == list(range(5, 16))
+
+
 def test_parse_metric_dict_accepts_known_infinity() -> None:
     record = analysis.parse_metric_dict("{'perf/step_time': 2.5, 'perf/device_peak_tflops': inf}")
 
@@ -77,5 +81,18 @@ def test_gpu_stats_filters_window_and_roles(tmp_path: Path) -> None:
         "gpu_util_pct": 70.0,
         "actor_gpu_util_pct": 90.0,
         "rollout_gpu_util_pct": 50.0,
+        "actor_peak_memory_mib": 800.0,
+        "rollout_peak_memory_mib": 650.0,
         "peak_memory_mib": 800.0,
     }
+
+
+def test_dynamic_microbatch_counts_parses_all_batches(tmp_path: Path) -> None:
+    log = tmp_path / "train.log"
+    log.write_text(
+        "After dynamic batching, num_microbatches: [3], micro_batch_indices: [[0], [1], [2]]\n"
+        "unrelated line\n"
+        "After dynamic batching, num_microbatches: [1], micro_batch_indices: [[0, 1, 2]]\n"
+    )
+
+    assert analysis.dynamic_microbatch_counts(log) == [3, 1]
