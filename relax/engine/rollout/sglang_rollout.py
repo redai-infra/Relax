@@ -25,6 +25,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.engine.rollout.sync_intent import resolve_partition_request_priority, sync_intent_policy_enabled
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -341,6 +342,9 @@ async def generate(
         "sampling_params": sampling_params,
         "return_logprob": not evaluation,
     }
+    request_priority = resolve_partition_request_priority(args, sample)
+    if request_priority is not None:
+        payload["priority"] = request_priority
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -497,6 +501,7 @@ async def _dispatch_generate(
     sample: Sample,
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    dispatch_started_event: asyncio.Event | None = None,
 ) -> Sample | list[Sample]:
     """Resolve the generate function and run it under the correct permit scope.
 
@@ -533,8 +538,12 @@ async def _dispatch_generate(
 
     try:
         if manages_permit:
+            if dispatch_started_event is not None:
+                dispatch_started_event.set()
             return await _run()
         async with state.semaphore:
+            if dispatch_started_event is not None:
+                dispatch_started_event.set()
             token = _holding_session_lock.set(True)
             try:
                 return await _run()
@@ -550,6 +559,7 @@ async def generate_and_rm(
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    dispatch_started_event: asyncio.Event | None = None,
 ) -> Sample | list[Sample]:
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
@@ -560,13 +570,22 @@ async def generate_and_rm(
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
+        if dispatch_started_event is not None:
+            dispatch_started_event.set()
         return sample
 
     state = GenerateState(args)
 
     # Resolve the generate function and run it under the right permit scope
     # (session-level lock by default; per-request permits for opt-in functions).
-    sample = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    sample = await _dispatch_generate(
+        state,
+        args,
+        sample,
+        sampling_params,
+        evaluation=evaluation,
+        dispatch_started_event=dispatch_started_event,
+    )
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -633,12 +652,18 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
 
 
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    submitted_event: asyncio.Event | None = None,
 ) -> list[Sample]:
     state = GenerateState(args)
 
     # eval requests should not be affected by abort state; only skip for training rollout
     if state.aborted and not evaluation:
+        if submitted_event is not None:
+            submitted_event.set()
         return group
 
     # Generate a unique session_id for each sample in the group
@@ -658,14 +683,28 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm_elapsed = t_enc
 
     tasks = []
+    dispatch_started_events = [asyncio.Event() for _ in group] if submitted_event is not None else None
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        task = asyncio.create_task(
+            generate_and_rm(
+                args,
+                sample,
+                current_sampling_params,
+                evaluation=evaluation,
+                dispatch_started_event=dispatch_started_events[idx] if dispatch_started_events else None,
+            )
         )
+        if dispatch_started_events is not None:
+            task.add_done_callback(lambda _task, event=dispatch_started_events[idx]: event.set())
+        tasks.append(task)
+
+    if dispatch_started_events is not None:
+        await asyncio.gather(*(event.wait() for event in dispatch_started_events))
+        submitted_event.set()
 
     group = await asyncio.gather(*tasks)
 
@@ -1320,7 +1359,14 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
+    if sync_intent_policy_enabled():
+        from relax.engine.rollout.sync_intent_rollout import generate_rollout_async_with_sync_intent
+
+        output, aborted_samples = run(
+            generate_rollout_async_with_sync_intent(args, rollout_id, data_buffer, data_system_client)
+        )
+    else:
+        output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a

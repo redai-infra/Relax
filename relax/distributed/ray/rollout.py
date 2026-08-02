@@ -876,6 +876,62 @@ class RolloutManager(ReloadableMixin):
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
 
+    def begin_sync_intent(self, sync_id: int, actor_rollout_id: int) -> dict:
+        from relax.engine.rollout.sync_intent import begin_sync_intent, sync_intent_policy_enabled
+
+        if not sync_intent_policy_enabled():
+            return {"enabled": False, "active": False}
+        snapshot = begin_sync_intent(sync_id, actor_rollout_id)
+        return {
+            "enabled": True,
+            "active": snapshot.active,
+            "sync_id": snapshot.sync_id,
+            "actor_rollout_id": snapshot.actor_rollout_id,
+        }
+
+    def end_sync_intent(self, sync_id: int) -> dict:
+        from relax.engine.rollout.sync_intent import end_sync_intent, sync_intent_policy_enabled
+
+        if not sync_intent_policy_enabled():
+            return {"enabled": False, "active": False}
+        snapshot = end_sync_intent(sync_id)
+        return {"enabled": True, "active": snapshot.active, "sync_id": snapshot.sync_id}
+
+    def update_sync_intent_phase(
+        self,
+        sync_id: int,
+        phase: str,
+        estimated_phase_seconds: float | None = None,
+    ) -> dict:
+        from relax.engine.rollout.sync_intent import sync_intent_policy_enabled, update_sync_intent_phase
+
+        if not sync_intent_policy_enabled():
+            return {"enabled": False, "active": False}
+        snapshot = update_sync_intent_phase(sync_id, phase, estimated_phase_seconds)
+        return {
+            "enabled": True,
+            "active": snapshot.active,
+            "sync_id": snapshot.sync_id,
+            "phase": snapshot.phase,
+            "estimated_phase_seconds": snapshot.estimated_phase_seconds,
+        }
+
+    def get_sync_intent(self) -> dict:
+        from relax.engine.rollout.sync_intent import get_sync_intent, sync_intent_policy_enabled
+
+        if not sync_intent_policy_enabled():
+            return {"enabled": False, "active": False}
+        snapshot = get_sync_intent()
+        return {
+            "enabled": True,
+            "active": snapshot.active,
+            "sync_id": snapshot.sync_id,
+            "actor_rollout_id": snapshot.actor_rollout_id,
+            "phase": snapshot.phase,
+            "estimated_phase_seconds": snapshot.estimated_phase_seconds,
+            "expired": snapshot.expired,
+        }
+
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is
         running)."""

@@ -18,6 +18,7 @@ e.g. on the CPU-only GitHub runner; it is covered by the internal nightly GPU ru
 import asyncio
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -31,6 +32,7 @@ try:
         _dispatch_generate,
         _ensure_not_holding_session_lock,
         _holding_session_lock,
+        generate_and_rm_group,
     )
 
     HAS_DEPS = True
@@ -62,6 +64,18 @@ class _StubSample:
     def __init__(self) -> None:
         self.status = Sample.Status.PENDING
         self.generate_function_path = None
+
+
+def _completed_sample() -> SimpleNamespace:
+    return SimpleNamespace(
+        status=Sample.Status.COMPLETED,
+        response="done",
+        response_length=1,
+        reward=1.0,
+        loss_mask=None,
+        session_id=None,
+        metadata={},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +285,43 @@ async def test_dispatch_optin_vs_legacy_lock_scope(monkeypatch) -> None:
     await _dispatch_generate(optin_state, _StubArgs("x"), _StubSample(), {})
     assert free_between_turns == [False, False]
     assert not optin_state.semaphore.locked()
+
+
+async def test_group_dispatch_barrier_releases_for_completed_partial_samples() -> None:
+    args = SimpleNamespace(
+        partial_rollout=True,
+        mask_offpolicy_in_partial_rollout=True,
+        group_rm=False,
+        sglang_enable_deterministic_inference=False,
+    )
+    state = SimpleNamespace(aborted=False, opd_manager=None)
+    submitted = asyncio.Event()
+    group = [_completed_sample(), _completed_sample()]
+
+    with patch("relax.engine.rollout.sglang_rollout.GenerateState", return_value=state):
+        result = await asyncio.wait_for(
+            generate_and_rm_group(args, group, {}, submitted_event=submitted),
+            timeout=1.0,
+        )
+
+    assert result == group
+    assert submitted.is_set()
+
+
+async def test_group_dispatch_barrier_releases_when_rollout_already_aborted() -> None:
+    args = SimpleNamespace()
+    state = SimpleNamespace(aborted=True)
+    submitted = asyncio.Event()
+    group = [_completed_sample()]
+
+    with patch("relax.engine.rollout.sglang_rollout.GenerateState", return_value=state):
+        result = await asyncio.wait_for(
+            generate_and_rm_group(args, group, {}, submitted_event=submitted),
+            timeout=1.0,
+        )
+
+    assert result == group
+    assert submitted.is_set()
 
 
 async def test_uncaught_abort_contained_in_dispatch(monkeypatch) -> None:

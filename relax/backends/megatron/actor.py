@@ -6,6 +6,7 @@ import random
 import socket
 import time
 from argparse import Namespace
+from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, List
@@ -186,6 +187,7 @@ class MegatronTrainRayActor(TrainRayActor):
             init_tracking(args, primary=False)
 
         self.prof = TrainProfiler(args)
+        self._sync_intent_actor_train_ewma_seconds: float | None = None
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -1232,6 +1234,9 @@ class MegatronTrainRayActor(TrainRayActor):
         global normalization across the full batch and DP group.
         """
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
+        sync_intent_enabled = self._sync_intent_policy_enabled()
+        if sync_intent_enabled:
+            self._begin_sync_intent(rollout_id)
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
         batch_size = plan.mini_local_sample_request
@@ -1351,6 +1356,13 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            if sync_intent_enabled:
+                self._update_sync_intent_phase(
+                    rollout_id,
+                    "actor_train",
+                    self._sync_intent_actor_train_ewma_seconds,
+                )
+                actor_train_started_at = time.monotonic()
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -1360,6 +1372,15 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                 )
+            if sync_intent_enabled:
+                actor_train_seconds = time.monotonic() - actor_train_started_at
+                if self._sync_intent_actor_train_ewma_seconds is None:
+                    self._sync_intent_actor_train_ewma_seconds = actor_train_seconds
+                else:
+                    self._sync_intent_actor_train_ewma_seconds = (
+                        0.7 * self._sync_intent_actor_train_ewma_seconds + 0.3 * actor_train_seconds
+                    )
+                self._update_sync_intent_phase(rollout_id, "quiesce")
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -1433,10 +1454,14 @@ class MegatronTrainRayActor(TrainRayActor):
         self._check_services_health()
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
+        if sync_intent_enabled:
+            self._update_sync_intent_phase(rollout_id, "weight_sync")
         self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)
+        if sync_intent_enabled:
+            self._verify_sync_intent_cleared(rollout_id)
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -1444,6 +1469,76 @@ class MegatronTrainRayActor(TrainRayActor):
         # shutdown races with eval and tears down the SGLang engines mid-flight.
         if is_train_done:
             self._wait_for_previous_eval()
+
+    @staticmethod
+    def _sync_intent_policy_enabled() -> bool:
+        return os.environ.get("RELAX_SYNC_INTENT_POLICY", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _run_sync_intent_request(self, rollout_id: int, request: Callable[[], None]) -> None:
+        if not self._sync_intent_policy_enabled():
+            return
+        error_message = ""
+        if dist.get_rank() == 0:
+            try:
+                request()
+            except Exception as error:
+                error_message = f"{type(error).__name__}: {error}"
+                logger.exception("Sync-intent control request failed for rollout_id=%s", rollout_id)
+        error_messages = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(error_messages, error_message, group=get_gloo_group())
+        failures = [message for message in error_messages if message]
+        if failures:
+            raise RuntimeError(f"Sync-intent control failed consistently across ranks: {failures}")
+
+    def _begin_sync_intent(self, rollout_id: int) -> None:
+        def request() -> None:
+            rollout_serve_url = get_serve_url("rollout")
+            response = requests.post(
+                f"{rollout_serve_url}/sync_intent",
+                params={"sync_id": rollout_id + 1, "actor_rollout_id": rollout_id},
+                timeout=10,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if result.get("enabled") is not True or result.get("active") is not True:
+                raise RuntimeError(f"sync intent was not activated: {result}")
+
+        self._run_sync_intent_request(rollout_id, request)
+
+    def _update_sync_intent_phase(
+        self,
+        rollout_id: int,
+        phase: str,
+        estimated_phase_seconds: float | None = None,
+    ) -> None:
+        def request() -> None:
+            rollout_serve_url = get_serve_url("rollout")
+            response = requests.post(
+                f"{rollout_serve_url}/sync_intent_phase",
+                params={
+                    "sync_id": rollout_id + 1,
+                    "phase": phase,
+                    "estimated_phase_seconds": estimated_phase_seconds,
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if result.get("enabled") is not True or result.get("active") is not True:
+                raise RuntimeError(f"sync intent phase was not updated: {result}")
+
+        self._run_sync_intent_request(rollout_id, request)
+
+    def _verify_sync_intent_cleared(self, rollout_id: int) -> None:
+        def request() -> None:
+            rollout_serve_url = get_serve_url("rollout")
+            response = requests.get(f"{rollout_serve_url}/sync_intent", timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("enabled") is not True or result.get("active") is not False:
+                raise RuntimeError(f"sync intent remained active after publication: {result}")
+
+        self._run_sync_intent_request(rollout_id, request)
 
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
