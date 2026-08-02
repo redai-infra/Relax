@@ -102,3 +102,10 @@ def test_dynamic_microbatch_counts_parses_all_batches(tmp_path: Path) -> None:
     )
 
     assert analysis.dynamic_microbatch_counts(log) == [3, 1]
+
+
+def test_weight_publication_count_includes_initial_and_training_updates(tmp_path: Path) -> None:
+    log = tmp_path / "train.log"
+    log.write_text("before update_weights\nunrelated\nbefore update_weights\n")
+
+    assert analysis.weight_publication_count(log) == 2

@@ -28,6 +28,7 @@ RUN_IDS = (1, 2, 3)
 STABLE_FIRST_STEP = 5
 STABLE_LAST_STEP = 15
 GLOBAL_BATCH_SIZE = 32
+TOTAL_STEPS = 20
 UPDATE_WEIGHT_BUFFER_SIZE = 512 * 1024**2
 TRAIN_TOKEN_BUDGETS = {variant: 8192 for variant in VARIANTS}
 LOG_PROB_TOKEN_BUDGETS = {variant: 8192 for variant in VARIANTS}
@@ -182,6 +183,10 @@ def dynamic_microbatch_counts(path: Path) -> list[int]:
     return [int(match.group(1)) for match in pattern.finditer(path.read_text(errors="replace"))]
 
 
+def weight_publication_count(path: Path) -> int:
+    return path.read_text(errors="replace").count("before update_weights")
+
+
 def summarize_run(variant: str, run_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     run_dir = ARTIFACT_ROOT / variant / f"run-{run_id}"
     log_path = run_dir / "train.log"
@@ -304,6 +309,7 @@ def summarize_run(variant: str, run_id: int) -> tuple[dict[str, Any], list[dict[
         "unexpected_nonfinite": unexpected_nonfinite,
         "runtime_errors": error_count,
         "has_reference_forward": all("perf/ref_log_probs_time" in record for record in perf.values()),
+        "weight_publications": weight_publication_count(log_path),
         "dynamic_microbatches_mean": mean(microbatch_counts),
         **gpu,
     }
@@ -373,6 +379,8 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     dataset_sha = summaries[0]["dataset_sha256"]
     model_sha = summaries[0]["model_sha256"]
     environment = manifest_values(ARTIFACT_ROOT / "baseline" / "run-1" / "manifest.txt")
+    tis_values = [float(row["tis"]) for row in summaries]
+    max_tis_clipfrac = max(float(row["tis_clipfrac"]) for row in summaries)
     lines = [
         "# Task 22 Hybrid-async text performance report",
         "",
@@ -472,6 +480,8 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "",
             "This method intentionally trades one additional actor update of rollout-policy freshness for lower publication overhead. `--max-staleness 2` bounds the existing asynchronous pipeline, while TIS, loss, reward, and clipping metrics are correctness guardrails rather than evidence of long-horizon convergence equivalence.",
             "",
+            f"The logs record {aggregate(summaries, 'zero_kl', 'weight_publications'):.0f} weight publications per zero-KL job and {aggregate(summaries, 'optimized', 'weight_publications'):.0f} per optimized job, including the common initialization publication.",
+            "",
             "All variants keep the weight-update buffer fixed at 512 MiB; the previously tested 1 GiB buffer is intentionally excluded from this experiment.",
             "",
             "## Rejected directions",
@@ -484,6 +494,9 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             f"All {len(summaries)} component jobs completed 20 steps. Unexpected non-finite metrics: "
             f"{sum(int(row['unexpected_nonfinite']) for row in summaries)}; runtime errors: "
             f"{sum(int(row['runtime_errors']) for row in summaries)}.",
+            f"Every job produced {TOTAL_STEPS * GLOBAL_BATCH_SIZE} samples. Per-run mean TIS ranges from "
+            f"{min(tis_values):.6f} to {max(tis_values):.6f}; maximum mean TIS clip fraction is "
+            f"{max_tis_clipfrac:.6f}.",
             "The existing unknown-device `perf/device_peak_tflops=inf` sentinel is counted separately and is not treated as a training anomaly.",
             "This short experiment establishes runtime equivalence guards, not long-horizon convergence equivalence.",
             "",
@@ -527,6 +540,10 @@ def main() -> None:
         raise RuntimeError("Formal runs must use a clean worktree")
     if any(row["runtime_errors"] or row["unexpected_nonfinite"] for row in summaries):
         raise RuntimeError("Runtime errors or unexpected non-finite metrics found")
+    if any(row["total_steps"] != TOTAL_STEPS for row in summaries):
+        raise RuntimeError(f"Every component run must contain exactly {TOTAL_STEPS} steps")
+    if any(row["total_samples"] != TOTAL_STEPS * GLOBAL_BATCH_SIZE for row in summaries):
+        raise RuntimeError("Component runs contain missing or extra samples")
     expected_reference = {"baseline": True, "zero_kl": False, "optimized": False}
     if any(row["has_reference_forward"] != expected_reference[row["variant"]] for row in summaries):
         raise RuntimeError("Reference-forward execution does not match the three-stage design")
@@ -534,6 +551,11 @@ def main() -> None:
         raise RuntimeError("Weight-update buffer size must stay fixed at 512 MiB")
     if any(row["update_weights_interval"] != UPDATE_WEIGHTS_INTERVALS[row["variant"]] for row in summaries):
         raise RuntimeError("Weight-update intervals do not match the three-stage design")
+    if any(
+        row["weight_publications"] != 1 + math.ceil(TOTAL_STEPS / UPDATE_WEIGHTS_INTERVALS[row["variant"]])
+        for row in summaries
+    ):
+        raise RuntimeError("Observed weight-publication counts do not match configured intervals")
     if any(row["max_tokens_per_gpu"] != TRAIN_TOKEN_BUDGETS[row["variant"]] for row in summaries):
         raise RuntimeError("Training token budgets do not match the three-stage design")
     if any(row["log_probs_max_tokens_per_gpu"] != LOG_PROB_TOKEN_BUDGETS[row["variant"]] for row in summaries):
