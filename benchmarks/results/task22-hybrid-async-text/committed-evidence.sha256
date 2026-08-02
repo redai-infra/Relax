@@ -7,4 +7,4 @@ f4a38d9a8b58fa9509eb3ec5f6924a2b033ab1c5e1c1291fd6c4b9d8aee39b98  ../../task22_h
 2869f7f629d5a15820979a64d69e6fafe616307a070c39e2626a2741cfe1578c  ../../task22_hybrid_async_text/package_evidence.py
 0123162edbb99be047aea575c1715191c19a3610a9288a6926f9ce260295fa3b  ../../../scripts/training/text/run-qwen3-0.6B-2xgpu-hybrid-async.sh
 226ff126dd37062dd57620ea68eb327393340d76aa7a5cb73a65cccc99e521ae  ../../../tests/benchmarks/test_task22_analysis.py
-01f0c631f6909341ff4f0794c847c05fc7f2da4a5f6e62038c047da5add25309  ../../../tests/benchmarks/test_task22_evidence_package.py
+2d9bbd5eb5bd5e03daca0230868e6b35ff04717978ded2b024d6a91bf3622432  ../../../tests/benchmarks/test_task22_evidence_package.py

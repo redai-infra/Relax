@@ -22,6 +22,7 @@ def test_package_evidence_rejects_incomplete_artifacts(tmp_path: Path) -> None:
 
 def test_package_evidence_requires_all_runs_and_redacts_private_values(tmp_path: Path) -> None:
     artifact_root = tmp_path / "artifacts"
+    private_ip = ".".join(("10", "15", "1", "9"))
     for variant in evidence.VARIANTS:
         for run_id in evidence.RUN_IDS:
             run_dir = artifact_root / variant / f"run-{run_id}"
@@ -31,7 +32,7 @@ def test_package_evidence_requires_all_runs_and_redacts_private_values(tmp_path:
                     "model=/home/example/model/Qwen3-0.6B\n"
                     "HF_TOKEN=secret-value\n"
                     "url=https://user:password@example.com/api\n"
-                    "ray_address=10.15.1.9:6379\n"
+                    f"ray_address={private_ip}:6379\n"
                     "author=person@example.com\n"
                 )
 
@@ -56,5 +57,5 @@ def test_package_evidence_requires_all_runs_and_redacts_private_values(tmp_path:
     assert "ray_address=<private-ip>:6379" in delivered
     assert "author=<redacted-email>" in delivered
     assert "/home/example" not in delivered
-    assert "10.15.1.9" not in delivered
+    assert private_ip not in delivered
     assert "secret-value" not in delivered
