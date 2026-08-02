@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420">
+<rect width="100%" height="100%" fill="white"/>
+<text x="480" y="28" text-anchor="middle" font-family="sans-serif" font-size="18">Task 22 stable response throughput</text>
+<polyline points="55.0,352.8 92.0,246.6 128.9,75.5 165.9,349.3 202.8,75.5 239.8,246.6 276.7,246.6 313.7,246.6 350.7,248.0 387.6,246.6 424.6,247.0 461.5,246.6 498.5,247.1 535.4,250.0 572.4,246.6 609.3,246.6 646.3,246.6 683.3,246.6 720.2,247.1 757.2,246.6 794.1,246.6 831.1,75.5 868.0,246.9 905.0,248.7" fill="none" stroke="#4b5563" stroke-width="2"/>
+<polyline points="55.0,248.5 92.0,246.6 128.9,246.6 165.9,246.6 202.8,246.6 239.8,246.6 276.7,246.6 313.7,75.9 350.7,350.3 387.6,75.5 424.6,246.6 461.5,246.6 498.5,247.6 535.4,246.6 572.4,246.6 609.3,247.3 646.3,246.6 683.3,246.6 720.2,246.6 757.2,246.6 794.1,246.6 831.1,246.6 868.0,246.6 905.0,76.4" fill="none" stroke="#0f766e" stroke-width="2"/>
+<text x="55" y="405" font-family="sans-serif" font-size="12">stable observations across 3 runs</text>
+<rect x="760" y="45" width="12" height="12" fill="#4b5563"/><text x="780" y="56" font-family="sans-serif" font-size="12">baseline</text>
+<rect x="760" y="65" width="12" height="12" fill="#0f766e"/><text x="780" y="76" font-family="sans-serif" font-size="12">optimized</text>
+</svg>
