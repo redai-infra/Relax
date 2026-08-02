@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import hashlib
 import math
 import os
 import re
@@ -332,7 +333,7 @@ def svg_chart(rows: list[dict[str, Any]], path: Path) -> None:
     elements = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
-        '<text x="480" y="28" text-anchor="middle" font-family="sans-serif" font-size="18">Task 22 stable response throughput</text>',
+        '<text x="480" y="28" text-anchor="middle" font-family="sans-serif" font-size="18">Task 22 稳定窗口响应吞吐</text>',
     ]
     for variant in VARIANTS:
         points = []
@@ -347,7 +348,7 @@ def svg_chart(rows: list[dict[str, Any]], path: Path) -> None:
         )
     elements.extend(
         [
-            f'<text x="{margin}" y="{height - 15}" font-family="sans-serif" font-size="12">steps 5-15 across 3 paired trials</text>',
+            f'<text x="{margin}" y="{height - 15}" font-family="sans-serif" font-size="12">3 组配对实验的 step 5-15</text>',
             '<rect x="760" y="45" width="12" height="12" fill="#4b5563"/><text x="780" y="56" font-family="sans-serif" font-size="12">baseline</text>',
             '<rect x="760" y="65" width="12" height="12" fill="#2563eb"/><text x="780" y="76" font-family="sans-serif" font-size="12">zero_kl</text>',
             '<rect x="760" y="85" width="12" height="12" fill="#0f766e"/><text x="780" y="96" font-family="sans-serif" font-size="12">optimized</text>',
@@ -359,6 +360,14 @@ def svg_chart(rows: list[dict[str, Any]], path: Path) -> None:
 
 def aggregate(rows: list[dict[str, Any]], variant: str, key: str) -> float:
     return mean([float(row[key]) for row in rows if row["variant"] == variant])
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
@@ -374,29 +383,52 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     zero_kl_latency_change = (zero_kl_step / baseline_step - 1.0) * 100.0
     interval_latency_change = (optimized_step / zero_kl_step - 1.0) * 100.0
     total_latency_change = (optimized_step / baseline_step - 1.0) * 100.0
-    acceptance = "PASS" if interval_throughput_gain >= 5.0 else "NOT MET"
+    acceptance = "通过" if interval_throughput_gain >= 5.0 else "未达到"
     commit = summaries[0]["git_commit"]
     dataset_sha = summaries[0]["dataset_sha256"]
     model_sha = summaries[0]["model_sha256"]
     environment = manifest_values(ARTIFACT_ROOT / "baseline" / "run-1" / "manifest.txt")
     tis_values = [float(row["tis"]) for row in summaries]
     max_tis_clipfrac = max(float(row["tis_clipfrac"]) for row in summaries)
+    baseline_actor_peak = max(
+        float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "baseline"
+    )
+    optimized_actor_peak = max(
+        float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "optimized"
+    )
+    actor_peak_delta = optimized_actor_peak - baseline_actor_peak
+    actor_peak_delta_pct = (optimized_actor_peak / baseline_actor_peak - 1.0) * 100.0
+    evidence_archive = path.parent / "raw-evidence.tar.gz"
+    evidence_index = path.parent / "raw-evidence-index.csv"
+    evidence_checksum = path.parent / "raw-evidence.sha256"
+    if evidence_archive.is_file() and evidence_index.is_file() and evidence_checksum.is_file():
+        evidence_lines = [
+            "- 脱敏原始证据包：[raw-evidence.tar.gz](raw-evidence.tar.gz)",
+            "- 文件级索引：[raw-evidence-index.csv](raw-evidence-index.csv)",
+            "- 压缩包校验：[raw-evidence.sha256](raw-evidence.sha256)",
+            f"- 当前压缩包 SHA-256：`{sha256_file(evidence_archive)}`。",
+        ]
+    else:
+        evidence_lines = [
+            "- **阻塞：当前 checkout 尚未包含脱敏原始证据包或长期可访问链接。**",
+            "- `benchmark_artifacts/` 被 `.gitignore` 排除，不能把本地目录位置当成交付证据。",
+            "- 在提交 PR 前，必须从原实验机生成并提交上述三个文件，或在此处填写长期可访问链接及 SHA-256。",
+        ]
     lines = [
-        "# Task 22 Hybrid-async text performance report",
+        "# Task 22 Hybrid-async 纯文本性能报告",
         "",
-        "## Result",
+        "## 结果",
         "",
-        f"Three paired trials on commit `{commit}` show that pruning the zero-coefficient KL reference path "
-        f"changes response throughput by {zero_kl_throughput_gain:+.2f}% and E2E latency by "
-        f"{zero_kl_latency_change:+.2f}%. Publishing rollout weights every two actor updates then "
-        f"changes throughput by another {interval_throughput_gain:+.2f}% and latency by "
-        f"{interval_latency_change:+.2f}%. The combined change is {total_throughput_gain:+.2f}% throughput "
-        f"and {total_latency_change:+.2f}% latency versus baseline.",
-        f"Acceptance: **{acceptance}** against the frozen target of at least +5% response throughput for "
-        "`optimized` versus `zero_kl`.",
+        f"在实验提交 `{commit}` 上完成三组配对实验。移除系数为零的 KL reference 路径后，"
+        f"响应吞吐变化 {zero_kl_throughput_gain:+.2f}%，端到端延迟变化 "
+        f"{zero_kl_latency_change:+.2f}%；随后每两次 Actor 更新发布一次 Rollout 权重，吞吐进一步变化 "
+        f"{interval_throughput_gain:+.2f}%，延迟进一步变化 {interval_latency_change:+.2f}%。"
+        f"相对 baseline，组合改动使吞吐变化 {total_throughput_gain:+.2f}%，延迟变化 "
+        f"{total_latency_change:+.2f}%。",
+        f"验收：**{acceptance}**。冻结目标为 `optimized` 相对 `zero_kl` 的响应吞吐至少提升 5%。",
         "",
-        "| variant | update interval | framework/E2E step (s) | response tok/s | samples/s | weight publish/step (s) | TIS | actor peak MiB | rollout peak MiB |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 变体 | 权重发布间隔 | framework/E2E step (s) | 响应 tok/s | samples/s | 发布耗时/step (s) | TIS | 整体 GPU 利用率 | Actor GPU 利用率 | Rollout GPU 利用率 | Actor 峰值 MiB | Rollout 峰值 MiB |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for variant in VARIANTS:
         variant_rows = [row for row in summaries if row["variant"] == variant]
@@ -408,15 +440,34 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             f"{aggregate(summaries, variant, 'samples_per_s'):.3f} | "
             f"{aggregate(summaries, variant, 'preceding_update_weights_s'):.3f} | "
             f"{aggregate(summaries, variant, 'tis'):.6f} | "
+            f"{aggregate(summaries, variant, 'gpu_util_pct'):.2f}% | "
+            f"{aggregate(summaries, variant, 'actor_gpu_util_pct'):.2f}% | "
+            f"{aggregate(summaries, variant, 'rollout_gpu_util_pct'):.2f}% | "
             f"{max(float(row['actor_peak_memory_mib']) for row in variant_rows):.0f} | "
             f"{max(float(row['rollout_peak_memory_mib']) for row in variant_rows):.0f} |"
         )
     lines.extend(
         [
             "",
-            "## Per-run evidence",
+            "GPU 利用率来自稳定窗口内的一秒采样，包含空闲的 0% 样本。`optimized` 的整体/Actor/Rollout "
+            f"平均利用率分别为 {aggregate(summaries, 'optimized', 'gpu_util_pct'):.2f}% / "
+            f"{aggregate(summaries, 'optimized', 'actor_gpu_util_pct'):.2f}% / "
+            f"{aggregate(summaries, 'optimized', 'rollout_gpu_util_pct'):.2f}%；`zero_kl` 分别为 "
+            f"{aggregate(summaries, 'zero_kl', 'gpu_util_pct'):.2f}% / "
+            f"{aggregate(summaries, 'zero_kl', 'actor_gpu_util_pct'):.2f}% / "
+            f"{aggregate(summaries, 'zero_kl', 'rollout_gpu_util_pct'):.2f}%。",
             "",
-            "| variant | run | steps | E2E p50/p95 (s) | response tok/s | reward | loss | TIS | samples | errors |",
+            f"Actor 峰值显存从 baseline 的 {baseline_actor_peak:.0f} MiB "
+            f"（{baseline_actor_peak / 1024:.2f} GiB）增至 optimized 的 {optimized_actor_peak:.0f} MiB "
+            f"（{optimized_actor_peak / 1024:.2f} GiB），增加 {actor_peak_delta:.0f} MiB "
+            f"（{actor_peak_delta_pct:.2f}%）；Rollout 峰值基本不变。当前采样只记录设备已用显存，"
+            "没有区分 PyTorch allocated/reserved 或张量生命周期，因此不能把增量归因于某个单独张量。"
+            "它与权重发布间隔改变后的流水重叠及缓存高水位同时出现，应作为性能收益的显存代价记录；"
+            "在取得 allocator/timeline 原始证据前不作更强因果结论。",
+            "",
+            "## 单次运行证据",
+            "",
+            "| 变体 | run | steps | E2E p50/p95 (s) | 响应 tok/s | reward | loss | TIS | samples | errors |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -431,9 +482,9 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     lines.extend(
         [
             "",
-            "## Paired changes",
+            "## 配对变化",
             "",
-            "| run | zero-KL throughput | interval-two throughput | total throughput | total latency | seed |",
+            "| run | zero-KL 吞吐变化 | interval-two 吞吐变化 | 总吞吐变化 | 总延迟变化 | seed |",
             "| ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -452,64 +503,101 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     lines.extend(
         [
             "",
-            "## Fixed workload and method",
+            "## 吞吐曲线",
             "",
-            "- Hardware: physical GPUs 2 and 3, both NVIDIA RTX PRO 6000 Blackwell; actor 1 GPU, rollout 1 GPU.",
-            f"- Host: {environment['cpu_logical_count']} logical CPUs ({environment['cpu_model']}), "
-            f"{int(environment['memory_total_kib']) / 1024**2:.1f} GiB RAM.",
-            f"- Runtime: {environment['python']}; Torch {environment['torch']} (CUDA {environment['torch_cuda']}); "
-            f"driver {environment['gpu_driver']}; Ray {environment['ray']}; SGLang {environment['sglang']}; "
-            f"Transformers {environment['transformers']}.",
-            "- Model: `/home/zhengbaowei/model/Qwen3-0.6B`, " + f"model SHA256 `{model_sha}`.",
-            "- Data: "
+            "![三组配对实验稳定窗口响应吞吐](throughput_curves.svg)",
+            "",
+            "## 固定工作量与方法",
+            "",
+            "- 硬件：物理 GPU 2 和 3，均为 NVIDIA RTX PRO 6000 Blackwell；Actor 1 卡、Rollout 1 卡。",
+            f"- 主机：{environment['cpu_logical_count']} 个逻辑 CPU（{environment['cpu_model']}），"
+            f"内存 {int(environment['memory_total_kib']) / 1024**2:.1f} GiB。",
+            f"- 运行时：{environment['python']}；Torch {environment['torch']}（CUDA "
+            f"{environment['torch_cuda']}）；driver {environment['gpu_driver']}；Ray {environment['ray']}；"
+            f"SGLang {environment['sglang']}；Transformers {environment['transformers']}。",
+            f"- 模型：Qwen3-0.6B；模型 SHA-256 `{model_sha}`。本地绝对路径不进入交付报告。",
+            "- 数据："
             f"ModelScope `{environment['dataset_repo_id']}` {environment['dataset_split']} "
-            f"subset of {environment['dataset_subset_size']} prompts, SHA256 `{dataset_sha}`; "
-            "no hand-written large dataset.",
-            "- Each component run: 20 steps, 8 prompts/step, 4 samples/prompt, effective batch 32, response cap 512.",
-            "- Async policy: Hybrid, max staleness 2 and TIS enabled. Baseline/zero-KL publish every step; optimized publishes every two steps.",
-            "- Dynamic-batch budgets: 8192 training tokens and 8192 log-prob tokens per GPU for every variant.",
-            "- Performance window: logged steps 5-15 inclusive (11 observations). Primary throughput uses high-resolution framework `perf/step_time`; the E2E interval from actor completion N-1 to N is secondary because those completion logs have only one-second timestamp resolution.",
-            "- GPU window: actor completion 4 through completion 15. Utilization and peak memory use only this window; utilization includes idle-zero samples.",
-            "- Trial order uses a three-way rotation to reduce warm-cache and order bias.",
+            f"中固定 {environment['dataset_subset_size']} 个 prompt，SHA-256 `{dataset_sha}`；没有手写大数据集。",
+            "- 每个组件运行 20 steps；每 step 8 prompts × 4 samples，有效 batch 32，response cap 512。",
+            "- 异步策略：Hybrid、max staleness 2、启用 TIS。baseline/zero_kl 每 step 发布；optimized 每两 step 发布。",
+            "- 动态 batch：所有变体每卡训练/log-prob token budget 均为 8192/8192。",
+            "- 性能窗口：记录的 step 5-15（共 11 个观测）。主要吞吐使用高精度 `perf/step_time`；"
+            "Actor completion N-1 到 N 的 E2E 间隔只有一秒时间戳精度，因此作为次要指标。",
+            "- GPU 窗口：Actor completion 4 至 15；利用率和峰值显存只使用该窗口，且包含空闲 0% 样本。",
+            "- 三组实验采用轮换顺序，降低 warm-cache 和运行顺序偏差。",
             "",
-            "## Optimization rationale",
+            "## 优化原理",
             "",
-            "`baseline` deliberately preserves the original misconfiguration: `--use-kl-loss --kl-loss-coef 0.00` plus `--ref-load`. `zero_kl` removes the unused reference path while retaining the 8192-token dynamic-batch budget. Because the KL term is multiplied by exactly zero, this removes compute but does not change the scalar objective.",
+            "`baseline` 保留原始配置：`--use-kl-loss --kl-loss-coef 0.00` 加 `--ref-load`。"
+            "`zero_kl` 移除未使用的 reference 路径，同时保留 8192-token 动态 batch 预算。"
+            "KL 项严格乘以零，因此该改动移除计算但不改变标量目标。",
             "",
-            "`optimized` builds on `zero_kl` and sets `--update-weights-interval 2`. Hybrid skips the rollout pause, weight transfer, and resume endpoint on odd completed steps, while still publishing at interval boundaries and the final step. A configured evaluation also forces publication before evaluation.",
+            "`optimized` 基于 `zero_kl` 设置 `--update-weights-interval 2`。Hybrid 在奇数完成 step 跳过 "
+            "Rollout pause、权重传输和 resume endpoint，同时仍在间隔边界、最后一步以及评测前强制发布。",
             "",
-            "This method intentionally trades one additional actor update of rollout-policy freshness for lower publication overhead. `--max-staleness 2` bounds the existing asynchronous pipeline, while TIS, loss, reward, and clipping metrics are correctness guardrails rather than evidence of long-horizon convergence equivalence.",
+            "该方法有意用额外一次 Actor update 的 Rollout policy freshness 换取更低的发布开销。"
+            "`--max-staleness 2` 约束现有异步流水；TIS、loss、reward 和 clipping 指标是正确性护栏，"
+            "不能证明长期收敛等价。",
             "",
-            f"The logs record {aggregate(summaries, 'zero_kl', 'weight_publications'):.0f} weight publications per zero-KL job and {aggregate(summaries, 'optimized', 'weight_publications'):.0f} per optimized job, including the common initialization publication.",
+            f"日志记录每个 zero_kl 作业平均发布 {aggregate(summaries, 'zero_kl', 'weight_publications'):.0f} "
+            f"次权重，每个 optimized 作业发布 {aggregate(summaries, 'optimized', 'weight_publications'):.0f} 次；"
+            "两者均包含一次共同的初始化发布。",
             "",
-            "All variants keep the weight-update buffer fixed at 512 MiB; the previously tested 1 GiB buffer is intentionally excluded from this experiment.",
+            "所有变体的 weight-update buffer 固定为 512 MiB；先前测试的 1 GiB buffer 不进入本实验。",
             "",
-            "## Rejected directions",
+            "## 未采用的方向",
             "",
-            "- Increasing the weight-update buffer from 512 MiB to 1 GiB improved throughput by only +1.12% across three trials.",
-            "- Increasing train/log-prob budgets to 12288/24576 reduced throughput by -1.52% versus `zero_kl`: log-prob forward became faster, but actor training regressed enough to outweigh it.",
+            "- weight-update buffer 从 512 MiB 增至 1 GiB，三组实验吞吐只提升 +1.12%。",
+            "- train/log-prob budget 增至 12288/24576 后，相对 `zero_kl` 吞吐下降 -1.52%；"
+            "log-prob forward 加快，但 Actor training 的回退抵消了收益。",
             "",
-            "## Correctness guardrails",
+            "## 正确性护栏",
             "",
-            f"All {len(summaries)} component jobs completed 20 steps. Unexpected non-finite metrics: "
-            f"{sum(int(row['unexpected_nonfinite']) for row in summaries)}; runtime errors: "
-            f"{sum(int(row['runtime_errors']) for row in summaries)}.",
-            f"Every job produced {TOTAL_STEPS * GLOBAL_BATCH_SIZE} samples. Per-run mean TIS ranges from "
-            f"{min(tis_values):.6f} to {max(tis_values):.6f}; maximum mean TIS clip fraction is "
-            f"{max_tis_clipfrac:.6f}.",
-            "The existing unknown-device `perf/device_peak_tflops=inf` sentinel is counted separately and is not treated as a training anomaly.",
-            "This short experiment establishes runtime equivalence guards, not long-horizon convergence equivalence.",
+            f"全部 {len(summaries)} 个组件作业均完成 20 steps；意外非有限指标为 "
+            f"{sum(int(row['unexpected_nonfinite']) for row in summaries)}，运行时错误为 "
+            f"{sum(int(row['runtime_errors']) for row in summaries)}。",
+            f"每个作业生成 {TOTAL_STEPS * GLOBAL_BATCH_SIZE} 个样本。单次运行平均 TIS 范围为 "
+            f"{min(tis_values):.6f}-{max(tis_values):.6f}，最大平均 TIS clip fraction 为 "
+            f"{max_tis_clipfrac:.6f}。",
+            "已有的未知设备 `perf/device_peak_tflops=inf` sentinel 单独计数，不视为训练异常。",
+            "该短实验只建立运行时等价护栏，不证明长期收敛等价。",
             "",
-            "## Reproduction and rollback",
+            "## 复现与回退",
             "",
             "```bash",
-            "cd /home/zhengbaowei/relax_ft/Relax",
-            "CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 bash benchmarks/task22_hybrid_async_text/run_paired_trials.sh",
+            "cd /path/to/Relax",
+            "MODEL_PATH=/path/to/Qwen3-0.6B CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 \\",
+            "  bash benchmarks/task22_hybrid_async_text/run_paired_trials.sh",
             "```",
             "",
-            "Run `TASK22_VARIANT=zero_kl UPDATE_WEIGHTS_INTERVAL=1` to disable only interval-two publication, or `TASK22_VARIANT=baseline` to roll back both changes. Raw logs, manifests, submitted commands, and one-second GPU samples are under `benchmark_artifacts/task22-hybrid-async-text-v3/`.",
+            "设置 `TASK22_VARIANT=zero_kl UPDATE_WEIGHTS_INTERVAL=1` 可只关闭 interval-two 发布；"
+            "设置 `TASK22_VARIANT=baseline` 可回退两个改动。",
             "",
-            "Generated files: `summary.csv`, `step_metrics.csv`, and `throughput_curves.svg`.",
+            "生成文件：`summary.csv`、`step_metrics.csv` 和 `throughput_curves.svg`。",
+            "当前已提交文件的校验值见 [committed-evidence.sha256](committed-evidence.sha256)；"
+            "该清单不能替代下述原始日志证据包。",
+            "",
+            "## 原始证据交付",
+            "",
+        ]
+    )
+    lines.extend(evidence_lines)
+    lines.extend(
+        [
+            "",
+            "拿到实验机上的 `benchmark_artifacts/task22-hybrid-async-text-v3/` 后，执行：",
+            "",
+            "```bash",
+            "python benchmarks/task22_hybrid_async_text/package_evidence.py \\",
+            "  --artifact-root benchmark_artifacts/task22-hybrid-async-text-v3 \\",
+            "  --output-dir benchmarks/results/task22-hybrid-async-text",
+            "python benchmarks/task22_hybrid_async_text/analyze.py",
+            "```",
+            "",
+            "打包器要求 3 个变体 × 3 次运行全部具备 `manifest.txt`、`submit.log`、`train.log` 和 "
+            "`gpu.csv`；它会脱敏 home path、私网 IP、邮箱、URL credentials 和 secret-like assignments，"
+            "并同时记录原文件与交付文件的 SHA-256。",
         ]
     )
     path.write_text("\n".join(lines) + "\n")

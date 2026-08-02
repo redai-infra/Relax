@@ -30,12 +30,26 @@ All variants keep the 512 MiB weight-update buffer, 8192/8192 train/log-prob tok
 The Ray head must expose only the two experiment GPUs. Activate the workspace environment and run:
 
 ```bash
-cd /home/zhengbaowei/relax_ft/Relax
+cd /path/to/Relax
 source ../.venv/bin/activate
-CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 \
+MODEL_PATH=/path/to/Qwen3-0.6B CUDA_VISIBLE_DEVICES=2,3 TOTAL_TRIALS=3 \
   bash benchmarks/task22_hybrid_async_text/run_paired_trials.sh
 ```
 
-Raw logs, manifests, submitted commands, and one-second GPU samples are written to ignored `benchmark_artifacts/task22-hybrid-async-text-v3/`. The analyzer writes the reviewable report, CSV tables, and SVG curve to `benchmarks/results/task22-hybrid-async-text/`.
+Raw logs, manifests, submitted commands, and one-second GPU samples are first written to ignored
+`benchmark_artifacts/task22-hybrid-async-text-v3/`. An ignored local directory is not itself reviewable evidence.
+Before opening the PR, create the redacted evidence bundle and SHA-256 indexes in the tracked results directory:
+
+```bash
+python benchmarks/task22_hybrid_async_text/package_evidence.py \
+  --artifact-root benchmark_artifacts/task22-hybrid-async-text-v3 \
+  --output-dir benchmarks/results/task22-hybrid-async-text
+python benchmarks/task22_hybrid_async_text/analyze.py
+```
+
+The analyzer writes the Chinese report, CSV tables, and SVG curve to
+`benchmarks/results/task22-hybrid-async-text/`. The report must not claim that raw evidence is deliverable until
+`raw-evidence.tar.gz`, `raw-evidence-index.csv`, and `raw-evidence.sha256` are present or a durable external URL and
+checksum are recorded.
 
 The dataset helper downloads `AI-ModelScope/gsm8k` with `ms download --repo-type dataset`, then slices the first 16 rows from `main/train` into `benchmarks/data/task22_gsm8k_main16.jsonl` for training.
