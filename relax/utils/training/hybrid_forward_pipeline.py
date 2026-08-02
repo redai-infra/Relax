@@ -15,7 +15,8 @@ def execute_hybrid_forward_mini(
     forward_chunk: Callable[[Any, int, list[int]], None],
     overlap_producer: bool = True,
 ) -> list[tuple[Any, list[int]]]:
-    """Restore once, then execute a matched chunk schedule with optional overlap."""
+    """Restore once, then execute a matched chunk schedule with optional
+    overlap."""
     if chunks_per_mini <= 0:
         raise ValueError(f"chunks_per_mini must be positive, got {chunks_per_mini}")
     if type(overlap_producer) is not bool:
@@ -43,10 +44,10 @@ def canonicalize_hybrid_microbatch_schedule(
 ) -> list[list[int]]:
     """Translate chunk-local forward schedules into merged-batch indexes.
 
-    The actor old-logprob forward chooses its dynamic microbatches independently
-    for each producer chunk. Training must replay those exact sample groups and
-    their order; otherwise batch-shape-dependent numerics create an artificial
-    PPO ratio even though the weights did not change.
+    The actor old-logprob forward chooses its dynamic microbatches
+    independently for each producer chunk. Training must replay those exact
+    sample groups and their order; otherwise batch-shape-dependent numerics
+    create an artificial PPO ratio even though the weights did not change.
     """
     canonical_indexes = list(canonical_global_indexes)
     if not canonical_indexes:
