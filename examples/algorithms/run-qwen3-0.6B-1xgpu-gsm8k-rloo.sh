@@ -72,6 +72,16 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=32}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:=1}"
 # Overridable for the multi-GPU CP validation; 1 keeps the single-GPU default.
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:=1}"
+# GPUs per role. Must be overridden together with CONTEXT_PARALLEL_SIZE > 1:
+# Megatron requires world_size to be divisible by tp*pp*cp, so a CP=2 run on the
+# single-GPU default fails in validate_args with
+#   "world size (1) is not divisible by total_model_size (2)".
+# For 8 GPUs in colocate mode use RESOURCE='{"actor": [1, 8], "rollout": [1, 8]}'.
+# Set explicitly rather than with ${VAR:=default}: the default contains braces,
+# which that expansion mis-parses, silently appending a stray "}" to an override.
+if [ -z "${RESOURCE:-}" ]; then
+    RESOURCE='{"actor": [1, 1], "rollout": [1, 1]}'
+fi
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-0.6B
@@ -190,7 +200,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 1], "rollout": [1, 1]}' \
+   --resource "${RESOURCE}" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
