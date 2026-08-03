@@ -56,6 +56,24 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+def test_task21_optimization_flags_default_off_and_can_be_enabled(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args([])
+    enabled = parser.parse_args(
+        ["--mm-processor-pool-size", "8", "--hybrid-stream-forward", "--mm-processor-group-dedup"]
+    )
+
+    assert defaults.mm_processor_pool_size == 0
+    assert defaults.hybrid_stream_forward is False
+    assert defaults.mm_processor_group_dedup is False
+    assert enabled.mm_processor_pool_size == 8
+    assert enabled.hybrid_stream_forward is True
+    assert enabled.mm_processor_group_dedup is True
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
@@ -193,4 +211,24 @@ def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
     args.eval_size = 0.1
 
     with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_hybrid_stream_forward_requires_hybrid(arguments_module):
+    args = _opd_args()
+    args.hybrid_stream_forward = True
+    args.num_iters_per_train_update = 2
+
+    with pytest.raises(ValueError, match="requires --hybrid"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_hybrid_stream_forward_rejects_routing_replay(arguments_module):
+    args = _opd_args()
+    args.hybrid = True
+    args.hybrid_stream_forward = True
+    args.num_iters_per_train_update = 2
+    args.use_routing_replay = True
+
+    with pytest.raises(ValueError, match="does not yet support routing replay"):
         arguments_module.slime_validate_args(args)

@@ -12,9 +12,19 @@ def _load_data_module(monkeypatch):
     core = types.ModuleType("megatron.core")
     mpu = types.ModuleType("megatron.core.mpu")
     packed_seq_params = types.ModuleType("megatron.core.packed_seq_params")
-    training = types.ModuleType("megatron.training")
+    megatron_training = types.ModuleType("megatron.training")
     global_vars = types.ModuleType("megatron.training.global_vars")
     tracking_utils = types.ModuleType("relax.utils.tracking_utils")
+    data_utils = types.ModuleType("relax.utils.data.data")
+    seqlen_balancing = types.ModuleType("relax.utils.data.seqlen_balancing")
+    metrics = types.ModuleType("relax.utils.metrics")
+    metric_utils = types.ModuleType("relax.utils.metrics.metric_utils")
+    timer = types.ModuleType("relax.utils.timer")
+    relax_training = types.ModuleType("relax.utils.training")
+    train_metric_utils = types.ModuleType("relax.utils.training.train_metric_utils")
+    flops_counter = types.ModuleType("relax.utils.training.flops_counter")
+    opd = types.ModuleType("relax.utils.opd")
+    opd_utils = types.ModuleType("relax.utils.opd.opd_utils")
 
     class _PackedSeqParams:
         pass
@@ -22,15 +32,32 @@ def _load_data_module(monkeypatch):
     core.mpu = mpu
     packed_seq_params.PackedSeqParams = _PackedSeqParams
     global_vars.get_args = lambda: None
+    data_utils.get_minimum_num_micro_batch_size = lambda samples, max_tokens: 1
+    seqlen_balancing.get_seqlen_balanced_partitions = lambda samples, num_parts, equal_size=False: []
+    metric_utils.compute_rollout_step = lambda args, rollout_id: rollout_id
+    timer.Timer = type("_Timer", (), {})
+    relax_training.train_metric_utils = train_metric_utils
+    flops_counter.FlopsCounter = object
+    opd_utils.OPD_ROLLOUT_LOG_SKIP_FIELDS = frozenset()
 
     modules = {
         "megatron": megatron,
         "megatron.core": core,
         "megatron.core.mpu": mpu,
         "megatron.core.packed_seq_params": packed_seq_params,
-        "megatron.training": training,
+        "megatron.training": megatron_training,
         "megatron.training.global_vars": global_vars,
         "relax.utils.tracking_utils": tracking_utils,
+        "relax.utils.data.data": data_utils,
+        "relax.utils.data.seqlen_balancing": seqlen_balancing,
+        "relax.utils.metrics": metrics,
+        "relax.utils.metrics.metric_utils": metric_utils,
+        "relax.utils.timer": timer,
+        "relax.utils.training": relax_training,
+        "relax.utils.training.train_metric_utils": train_metric_utils,
+        "relax.utils.training.flops_counter": flops_counter,
+        "relax.utils.opd": opd,
+        "relax.utils.opd.opd_utils": opd_utils,
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -94,6 +121,58 @@ def test_rollout_minibatch_plan_rejects_non_divisible_prompt_groups(monkeypatch)
         data_module.build_rollout_minibatch_plan(args, dp_size=2)
 
 
+def test_hybrid_forward_chunk_plan_keeps_optimizer_boundary(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=2,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=1)
+
+    chunk_plan = data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=1)
+
+    assert rollout_plan.num_rollout_minis == 1
+    assert rollout_plan.mini_local_sample_request == 256
+    assert chunk_plan.chunks_per_rollout_mini == 2
+    assert chunk_plan.chunk_global_samples == 128
+    assert chunk_plan.chunk_local_samples == 128
+
+
+def test_hybrid_forward_chunk_plan_scales_local_request_with_dp(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=2,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=2)
+
+    chunk_plan = data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=2)
+
+    assert rollout_plan.mini_local_sample_request == 128
+    assert chunk_plan.chunk_local_samples == 64
+
+
+def test_hybrid_forward_chunk_plan_rejects_split_prompt_groups(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=3,
+        n_samples_per_prompt=8,
+        global_batch_size=24,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=2,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=1)
+
+    with pytest.raises(ValueError, match="preserve complete prompt groups"):
+        data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=1)
+
+
 def test_concat_rollout_batches_preserves_order_and_scalar_metadata(monkeypatch):
     data_module = _load_data_module(monkeypatch)
 
@@ -118,6 +197,44 @@ def test_concat_rollout_batches_preserves_order_and_scalar_metadata(monkeypatch)
     assert merged["total_lengths"] == [1, 2, 3]
     assert torch.equal(merged["scores"], torch.tensor([[1], [2], [3]]))
     assert merged["weight_version"] == 7
+
+
+def test_hybrid_actor_logprob_schedule_uses_forward_budget_without_routing_replay(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    training_schedule = ([object()], [4])
+    logprob_schedule = ([object()], [2])
+
+    selected = data_module.select_hybrid_actor_logprob_schedule(
+        Namespace(use_routing_replay=False), training_schedule, logprob_schedule
+    )
+
+    assert selected is logprob_schedule
+
+
+def test_hybrid_actor_logprob_schedule_preserves_training_partition_for_routing_replay(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    training_schedule = ([object()], [4])
+    logprob_schedule = ([object()], [2])
+
+    selected = data_module.select_hybrid_actor_logprob_schedule(
+        Namespace(use_routing_replay=True), training_schedule, logprob_schedule
+    )
+
+    assert selected is training_schedule
+
+
+def test_hybrid_actor_logprob_schedule_preserves_training_partition_for_rollout_routing_replay(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    training_schedule = ([object()], [4])
+    logprob_schedule = ([object()], [2])
+
+    selected = data_module.select_hybrid_actor_logprob_schedule(
+        Namespace(use_routing_replay=True, use_rollout_routing_replay=True),
+        training_schedule,
+        logprob_schedule,
+    )
+
+    assert selected is training_schedule
 
 
 def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkeypatch):

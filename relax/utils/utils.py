@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -11,6 +12,10 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.utils.data.group_processor import (
+    pack_group_multimodal_train_inputs,
+    validate_group_multimodal_transport_dp_size,
+)
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -93,6 +98,17 @@ def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
 
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
+    if (
+        args.multimodal_keys is not None
+        and getattr(args, "hybrid", False)
+        and getattr(args, "mm_processor_group_dedup", False)
+        and not getattr(args, "debug_train_only", False)
+    ):
+        # This is the shared packing entry used by both standard and agentic
+        # rollout transfer paths. Keep the transport guard here even though
+        # GenerateState also validates early during standard SGLang startup.
+        validate_group_multimodal_transport_dp_size(compute_dp_size(args))
+
     raw_rewards, rewards = post_process_rewards(args, samples)
 
     assert len(raw_rewards) == len(samples)
@@ -151,7 +167,23 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
     if args.multimodal_keys is not None:
-        train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+        multimodal_train_inputs = [sample.multimodal_train_inputs for sample in samples]
+        if (
+            getattr(args, "hybrid", False)
+            and getattr(args, "mm_processor_group_dedup", False)
+            and not getattr(args, "debug_train_only", False)
+        ):
+            multimodal_train_inputs, source_count, ref_count = pack_group_multimodal_train_inputs(
+                samples,
+                args.n_samples_per_prompt,
+            )
+            logger.info(
+                "Packed multimodal transfer payloads: sources=%d, refs=%d, logical_samples=%d",
+                source_count,
+                ref_count,
+                len(multimodal_train_inputs),
+            )
+        train_data["multimodal_train_inputs"] = multimodal_train_inputs
 
     if args.use_opd:
         from relax.engine.rollout.on_policy_distillation import produce_opd_transfer_data
@@ -460,18 +492,21 @@ async def transfer_batch_to_data_system(
     rollout_id: int,
     data_system_client: Any,
     is_last: bool = False,
+    batch_sequence: int | None = None,
 ) -> None:
     """Helper function to transfer a batch of samples to the data system
     client.
 
     Args:
         batch_samples: List of sample groups
-        batch_count: Batch sequence number
+        batch_count: Number of prompt groups in this transfer
         rollout_id: Rollout identifier
         data_system_client: Client for async data transfer
         is_last: Mark this as the final batch of the partition train_{rollout_id}
             so the data system can detect streaming end-of-stream without a preset
             global batch size. See the is_last bookkeeping in generate_rollout.
+        batch_sequence: Zero-based dispatch sequence within train_{rollout_id},
+            used to correlate producer and actor pipeline events.
     """
     try:
         # Guard against empty batch_samples
@@ -500,9 +535,26 @@ async def transfer_batch_to_data_system(
         # fallback and defeating dynamic batching).
         total_lengths = rollout_batch.get("total_lengths", None)
         custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths] if total_lengths is not None else None
+        if getattr(args, "hybrid_stream_forward", False) and batch_sequence is None:
+            raise RuntimeError("hybrid stream transfer requires a per-partition batch_sequence")
         await data_system_client.async_put(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )
+
+        if getattr(args, "hybrid_stream_forward", False):
+            logger.info(
+                "Hybrid pipeline event=producer_batch_ready rollout_id=%d sequence=%d group_count=%d "
+                "samples=%d is_last=%s epoch_ns=%d monotonic_ns=%d host=%s pid=%d",
+                rollout_id,
+                batch_sequence,
+                batch_count,
+                rollout_batch.numel(),
+                is_last,
+                time.time_ns(),
+                time.monotonic_ns(),
+                socket.gethostname(),
+                os.getpid(),
+            )
 
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:

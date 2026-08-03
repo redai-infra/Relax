@@ -16,6 +16,13 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.data.group_processor import (
+    MM_GROUP_ID_KEY,
+    MM_GROUP_OWNER_KEY,
+    get_group_multimodal_transport_marker,
+    unpack_group_multimodal_train_inputs,
+    validate_group_multimodal_transport_ref,
+)
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import timer
 
@@ -503,7 +510,18 @@ def _encode_multimodal_inputs(mm_list):
             spec.append(None)
             continue
         entry: Dict[str, Any] = {}
+        marker = get_group_multimodal_transport_marker(sample)
+        if marker is not None:
+            group_index, is_owner = marker
+            entry[MM_GROUP_ID_KEY] = {"t": "raw", "value": group_index}
+            entry[MM_GROUP_OWNER_KEY] = {"t": "raw", "value": is_owner}
+            if not is_owner:
+                validate_group_multimodal_transport_ref(sample)
+                spec.append(entry)
+                continue
         for key, val in sample.items():
+            if key in {MM_GROUP_ID_KEY, MM_GROUP_OWNER_KEY}:
+                continue
             if isinstance(val, torch.Tensor):
                 entry[key] = {"t": "tensor", "dtype": val.dtype, "shape": tuple(val.shape)}
                 tensors.append(val)
@@ -608,6 +626,9 @@ def get_data_from_transfer_queue(
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
         If no data is available, both elements are None.
     """
+    group_transfer_dedup = getattr(args, "hybrid", False) and getattr(args, "mm_processor_group_dedup", False)
+    if group_transfer_dedup and token_budget is not None:
+        raise ValueError("hybrid multimodal group transfer dedup does not support token-budget sampling")
 
     # Compose request configuration and ask the queue for metadata.
     config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
@@ -792,6 +813,10 @@ def get_data_from_transfer_queue(
     if has_multimodal:
         with timer("tgd_bcast_mm"):
             mm_inputs = _broadcast_multimodal_inputs(mm_spec, mm_send_tensors, should_fetch, cuda_dev, broadcast_pp)
+            if mm_inputs is not None and group_transfer_dedup:
+                # Keep transport markers through TQ and NCCL so only each
+                # group's source tensors are sent; strip them before model use.
+                mm_inputs = unpack_group_multimodal_train_inputs(mm_inputs, args.n_samples_per_prompt)
 
     # --- Broadcast routed_experts tensors via efficient dist.broadcast ---
     # Skipped entirely in per_rank_fetch mode: each rank already received the
@@ -851,6 +876,12 @@ def get_data_from_transfer_queue(
                 raise TypeError(f"Unsupported rollout_data type for key '{k}': {type(v)}")
 
         rollout_data = new_rollout_data
+
+    if has_multimodal and per_rank_fetch and group_transfer_dedup and "multimodal_train_inputs" in rollout_data:
+        rollout_data["multimodal_train_inputs"] = unpack_group_multimodal_train_inputs(
+            rollout_data["multimodal_train_inputs"],
+            args.n_samples_per_prompt,
+        )
 
     # Re-attach routed_experts as a list of 2D tensors (per-sample) — only on
     # the bcast path, where the NestedTensor was extracted into ``routed_experts_values``

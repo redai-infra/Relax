@@ -52,6 +52,13 @@ class RolloutMiniBatchPlan:
     mini_local_sample_request: int | None
 
 
+@dataclass(frozen=True)
+class HybridForwardChunkPlan:
+    chunks_per_rollout_mini: int
+    chunk_global_samples: int
+    chunk_local_samples: int
+
+
 def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBatchPlan:
     """Build a prompt-group based mini plan for one rollout partition."""
     if dp_size <= 0:
@@ -116,6 +123,49 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
         fixed_n_samples_per_prompt=n_samples_per_prompt,
         mini_global_samples=mini_global_samples,
         mini_local_sample_request=mini_global_samples // dp_size,
+    )
+
+
+def build_hybrid_forward_chunk_plan(
+    args: Namespace,
+    rollout_plan: RolloutMiniBatchPlan,
+    dp_size: int,
+) -> HybridForwardChunkPlan:
+    """Split each optimizer mini into prompt-aligned forward-only chunks."""
+    chunks_per_rollout_mini = int(args.num_iters_per_train_update)
+    if chunks_per_rollout_mini <= 1:
+        raise ValueError(
+            "--hybrid-stream-forward requires --num-iters-per-train-update greater than 1, "
+            f"got {chunks_per_rollout_mini}"
+        )
+    if rollout_plan.mini_global_samples is None or rollout_plan.fixed_n_samples_per_prompt is None:
+        raise ValueError("hybrid forward chunking requires a fixed-n-samples rollout plan")
+    if rollout_plan.mini_global_samples % chunks_per_rollout_mini != 0:
+        raise ValueError(
+            "rollout mini global samples must be divisible by --num-iters-per-train-update, "
+            f"got mini_global_samples={rollout_plan.mini_global_samples}, "
+            f"num_iters_per_train_update={chunks_per_rollout_mini}"
+        )
+
+    chunk_global_samples = rollout_plan.mini_global_samples // chunks_per_rollout_mini
+    if chunk_global_samples % dp_size != 0:
+        raise ValueError(
+            "hybrid forward chunk global samples must be divisible by data parallel size, "
+            f"got chunk_global_samples={chunk_global_samples}, dp_size={dp_size}"
+        )
+
+    chunk_local_samples = chunk_global_samples // dp_size
+    if chunk_local_samples % rollout_plan.fixed_n_samples_per_prompt != 0:
+        raise ValueError(
+            "each per-rank hybrid forward chunk must preserve complete prompt groups, "
+            f"got chunk_local_samples={chunk_local_samples}, "
+            f"n_samples_per_prompt={rollout_plan.fixed_n_samples_per_prompt}"
+        )
+
+    return HybridForwardChunkPlan(
+        chunks_per_rollout_mini=chunks_per_rollout_mini,
+        chunk_global_samples=chunk_global_samples,
+        chunk_local_samples=chunk_local_samples,
     )
 
 
@@ -701,6 +751,22 @@ class DataIterator:
         """Reset internal offset to the start and return self."""
         self.offset = 0
         return self
+
+
+def select_hybrid_actor_logprob_schedule(
+    args: Namespace,
+    training_schedule: tuple[list[DataIterator], list[int]],
+    logprob_schedule: tuple[list[DataIterator], list[int]],
+) -> tuple[list[DataIterator], list[int]]:
+    """Select the inline old-actor forward schedule for Hybrid mode.
+
+    Routing replay records expert choices per training micro-batch, so its
+    actor forward must retain the training partition. Without routing replay,
+    forward-only log-probs can safely use their explicit, larger token budget.
+    """
+    if args.use_routing_replay:
+        return training_schedule
+    return logprob_schedule
 
 
 def get_data_iterator(
