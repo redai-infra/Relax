@@ -72,8 +72,8 @@ def test_normalize_advantages_is_rejected():
     """It re-whitens across the DP group, re-introducing the std scaling RLOO
     omits.
 
-    This is also the precondition for the DP-invariance argument: advantages are
-    fixed on the rollout side before any DP split, but only if nothing re-
+    This is also the precondition for the DP-invariance argument: advantages
+    are fixed on the rollout side before any DP split, but only if nothing re-
     normalizes them afterwards.
     """
     with pytest.raises(AssertionError, match="data-parallel group"):
@@ -94,31 +94,36 @@ def test_one_step_per_rollout_is_accepted():
 
 
 def test_batch_sizes_implying_more_than_one_step_are_rejected():
-    """The step count is implicit when --num-steps-per-rollout is unset:
+    """A batch shape that implies two steps is rejected even without the flag.
+
+    With `--num-steps-per-rollout` unset the step count is implicit:
     `rollout_batch_size * n_samples_per_prompt // global_batch_size`. A GRPO
     configuration that legitimately yields two steps must not silently become a
-    two-step RLOO run."""
+    two-step RLOO run.
+    """
     with pytest.raises(AssertionError, match="exactly one optimizer step per rollout"):
         validate_rloo_args(_args(rollout_batch_size=4, n_samples_per_prompt=8, global_batch_size=16))
 
 
 def test_batch_sizes_are_not_checked_before_they_are_derived():
-    """`rollout_batch_size` / `global_batch_size` may still be None on namespaces
-    the validator sees outside `slime_validate_args`; that must not raise."""
+    """`rollout_batch_size` / `global_batch_size` may still be None on
+    namespaces the validator sees outside `slime_validate_args`; that must not
+    raise."""
     validate_rloo_args(_args(rollout_batch_size=None, global_batch_size=None))
 
 
 @pytest.mark.parametrize("kl_coef", [1e-4, 0.1])
 def test_non_zero_kl_coef_is_rejected(kl_coef):
-    """`get_grpo_returns` uses only the shape of the reference KL, so a non-zero
-    coefficient would pay for the reference forward and change nothing."""
+    """`get_grpo_returns` uses only the shape of the reference KL, so a non-
+    zero coefficient would pay for the reference forward and change nothing."""
     with pytest.raises(AssertionError, match="has no effect under RLOO"):
         validate_rloo_args(_args(kl_coef=kl_coef))
 
 
 def test_kl_via_the_loss_term_is_allowed():
-    """`--use-kl-loss` is the supported route: `policy_loss_function` adds it as
-    a separate term, so it is not silently dropped the way `--kl-coef` is."""
+    """`--use-kl-loss` is the supported route: `policy_loss_function` adds it
+    as a separate term, so it is not silently dropped the way `--kl-coef`
+    is."""
     validate_rloo_args(_args(use_kl_loss=True, kl_loss_coef=0.001))
 
 
