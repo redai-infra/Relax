@@ -3,10 +3,176 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
+from math import floor
 from typing import Literal
 
 
 CrossVersionKVPauseMode = Literal["abort", "retract", "in_place"]
+
+
+@dataclass(frozen=True)
+class JointCarryAdmitPlan:
+    debt_remaining: int
+    debt_admit_groups: int
+    current_deficit: int
+    carry_work_equivalents: float
+    resident_cap: int
+    current_reserve: int
+    fresh_admit_groups: int
+    work_overcommit_equivalents: float
+    reason: str
+
+
+def plan_joint_carry_admission(
+    *,
+    phase: str | None,
+    debt_target: int,
+    debt_committed: int,
+    current_target: int,
+    current_committed: int,
+    resident_group_ids: Sequence[str],
+    carry_groups: Sequence[tuple[str, int]],
+    debt_eligible_group_ids: Sequence[str],
+    carry_current_group_ids: Sequence[str],
+    fresh_current_group_ids: Sequence[str],
+    rollout_batch_size: int,
+    max_response_length: int,
+    strict_retry_pending: bool = False,
+    final_backfill: bool = False,
+) -> JointCarryAdmitPlan:
+    """Plan debt and current admission from one shared resident/work budget."""
+    counts = (
+        debt_target,
+        debt_committed,
+        current_target,
+        current_committed,
+    )
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
+        raise ValueError("Joint carry-admit counts must be integers")
+    if min(counts) < 0:
+        raise ValueError("Joint carry-admit counts must be non-negative")
+    if (
+        isinstance(rollout_batch_size, bool)
+        or not isinstance(rollout_batch_size, int)
+        or isinstance(max_response_length, bool)
+        or not isinstance(max_response_length, int)
+    ):
+        raise ValueError("Joint carry-admit size limits must be integers")
+    if rollout_batch_size <= 0 or max_response_length <= 0:
+        raise ValueError("Joint carry-admit size limits must be positive")
+    if debt_committed > debt_target:
+        raise ValueError("debt_committed must not exceed debt_target")
+    id_sequences = (
+        resident_group_ids,
+        debt_eligible_group_ids,
+        carry_current_group_ids,
+        fresh_current_group_ids,
+    )
+    if any(any(not isinstance(group_id, str) or not group_id for group_id in ids) for ids in id_sequences):
+        raise ValueError("Joint carry-admit group IDs must be non-empty strings")
+    if any(len(set(ids)) != len(ids) for ids in id_sequences):
+        raise ValueError("Joint carry-admit group IDs must be unique within each set")
+
+    carry_ids: list[str] = []
+    normalized_remaining: list[int] = []
+    for group_id, value in carry_groups:
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("Joint carry-admit carry IDs must be non-empty strings")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("carry remaining-token estimates must be integers")
+        if value < 0 or value > max_response_length:
+            raise ValueError("carry remaining-token estimates must be within the response bound")
+        carry_ids.append(group_id)
+        normalized_remaining.append(value)
+    if len(set(carry_ids)) != len(carry_ids):
+        raise ValueError("Joint carry-admit carry IDs must be unique")
+
+    resident_set = set(resident_group_ids)
+    carry_set = set(carry_ids)
+    debt_set = set(debt_eligible_group_ids)
+    carry_current_set = set(carry_current_group_ids)
+    fresh_current_set = set(fresh_current_group_ids)
+    if not carry_set <= resident_set or not fresh_current_set <= resident_set:
+        raise ValueError("carry and fresh current groups must be resident")
+    if not debt_set <= carry_set or not carry_current_set <= carry_set:
+        raise ValueError("classified carry groups must be subsets of the carry set")
+    if debt_set & carry_current_set:
+        raise ValueError("debt-eligible and current carry groups must be disjoint")
+    if carry_set & fresh_current_set:
+        raise ValueError("carry and fresh current groups must be disjoint")
+
+    debt_eligible_inflight = len(debt_set)
+    carry_current_inflight = len(carry_current_set)
+    fresh_current_inflight = len(fresh_current_set)
+    resident_groups = len(resident_set)
+    useful_current_inflight = carry_current_inflight + fresh_current_inflight
+    if current_committed + useful_current_inflight > current_target:
+        raise ValueError("current committed and inflight work exceed current_target")
+
+    resident_cap = cross_version_kv_resident_cap(rollout_batch_size)
+    if resident_groups > resident_cap:
+        raise ValueError("resident_groups exceed the joint planner cap")
+
+    debt_remaining = debt_target - debt_committed
+    current_deficit = current_target - current_committed - useful_current_inflight
+    carry_work = sum(value / max_response_length for value in normalized_remaining)
+    free_slots = resident_cap - resident_groups
+    work_slots = floor(max(rollout_batch_size - carry_work - fresh_current_inflight, 0))
+
+    blocked_phase = phase in {"quiesce", "weight_sync"}
+    if blocked_phase:
+        debt_admit = 0
+        fresh_admit = 0
+        current_reserve = 0
+        reason = f"phase:{phase}"
+    else:
+        uncovered_debt = max(debt_remaining - debt_eligible_inflight, 0)
+        debt_admit = min(uncovered_debt, free_slots, work_slots)
+        free_after_debt = free_slots - debt_admit
+        work_after_debt = work_slots - debt_admit
+
+        current_reserve = 0
+        if (
+            not final_backfill
+            and not strict_retry_pending
+            and uncovered_debt == debt_admit
+            and useful_current_inflight == 0
+            and current_deficit > 0
+        ):
+            reserve_cap = max(1, rollout_batch_size // 4)
+            current_reserve = min(reserve_cap, current_deficit, free_after_debt)
+
+        if final_backfill:
+            fresh_admit = 0
+            reason = "final_backfill"
+        elif strict_retry_pending:
+            fresh_admit = 0
+            reason = "strict_retry"
+        elif uncovered_debt > debt_admit:
+            fresh_admit = 0
+            reason = "debt_first"
+        else:
+            fresh_admit = min(
+                current_deficit,
+                free_after_debt,
+                max(work_after_debt, current_reserve),
+            )
+            reason = "joint_budget"
+
+    planned_work = carry_work + fresh_current_inflight + debt_admit + fresh_admit
+    work_overcommit = max(0.0, planned_work - rollout_batch_size)
+    return JointCarryAdmitPlan(
+        debt_remaining=debt_remaining,
+        debt_admit_groups=debt_admit,
+        current_deficit=current_deficit,
+        carry_work_equivalents=carry_work,
+        resident_cap=resident_cap,
+        current_reserve=current_reserve,
+        fresh_admit_groups=fresh_admit,
+        work_overcommit_equivalents=work_overcommit,
+        reason=reason,
+    )
 
 
 def cross_version_kv_enabled(args: object) -> bool:
