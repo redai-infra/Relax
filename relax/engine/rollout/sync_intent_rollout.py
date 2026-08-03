@@ -29,6 +29,8 @@ from relax.engine.rollout.sync_intent import (
     mark_work_origin,
     plan_adaptive_window_fetch,
     plan_intent_guard_fetch,
+    sync_intent_abort_retry_interval_seconds,
+    sync_intent_abort_timeout_seconds,
     wait_for_sync_intent_end,
 )
 from relax.utils.logging_utils import get_logger
@@ -138,13 +140,20 @@ async def generate_rollout_async_with_sync_intent(
     prev_target = num_old_samples
     curr_target = 0 if is_final_backfill else args.rollout_batch_size
     loop = asyncio.get_running_loop()
+    completed_buffer_groups = await loop.run_in_executor(
+        None,
+        ray.get,
+        data_source.get_completed_buffer_group_count.remote(target_data_size),
+    )
+    completed_buffer_groups = int(completed_buffer_groups)
 
     if is_final_backfill:
         logger.info(f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}")
     else:
         logger.info(
             f"Starting rollout step {rollout_id}: target(commit)={target_data_size} "
-            f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples})"
+            f"(rollout_batch={args.rollout_batch_size} + old={num_old_samples}) "
+            f"completed_buffer={completed_buffer_groups}"
         )
 
     def target_reached() -> bool:
@@ -168,6 +177,7 @@ async def generate_rollout_async_with_sync_intent(
                 remaining_commit_groups=remaining_commit_groups,
                 hedge_groups=original_hedge_groups,
                 window_initialized=candidate_window_initialized,
+                completed_buffer_groups=completed_buffer_groups,
             )
             default_fetch_groups = max(default_fetch_groups, missing_debt_groups)
             if default_fetch_groups == 0:
@@ -364,7 +374,12 @@ async def generate_rollout_async_with_sync_intent(
     all_samples = [sample for group in data for sample in group]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
 
-    new_aborted, completed_protected = await abort(args, rollout_id)
+    new_aborted, completed_protected = await abort(
+        args,
+        rollout_id,
+        retry_interval_seconds=sync_intent_abort_retry_interval_seconds(),
+        timeout_seconds=sync_intent_abort_timeout_seconds(),
+    )
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
     if aborted_samples:

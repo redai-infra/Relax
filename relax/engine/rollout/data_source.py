@@ -349,6 +349,12 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
     def get_buffer_length(self):
         return len(self.buffer)
 
+    def get_completed_buffer_group_count(self, max_groups: int) -> int:
+        if max_groups < 0:
+            raise ValueError("max_groups must be non-negative")
+        terminal = (Sample.Status.COMPLETED, Sample.Status.TRUNCATED)
+        return sum(all(sample.status in terminal for sample in group) for group in self.buffer[:max_groups])
+
 
 def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -> list[list[Sample]]:
     num_to_pop = min(len(buffer), num_samples)

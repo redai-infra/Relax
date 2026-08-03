@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from relax.engine.rollout.sync_intent import (
+    CARRYOVER_RESUME_REQUEST_PRIORITY,
+    DEFAULT_ROLLOUT_REQUEST_PRIORITY,
+    OLD_DEBT_REQUEST_PRIORITY,
     SYNC_INTENT_POLICY_ENV,
     SYNC_INTENT_QUIESCE_FLOOR_ENV,
     SYNC_INTENT_QUIESCE_MULTIPLIER_ENV,
@@ -160,11 +163,59 @@ def test_adaptive_window_seeds_once_then_refills_commit_gap(monkeypatch: pytest.
     )
 
 
+@pytest.mark.parametrize(
+    ("completed_buffer_groups", "expected_fetch_groups"),
+    (
+        (0, 16),
+        (3, 13),
+        (8, 8),
+        (16, 8),
+    ),
+)
+def test_adaptive_window_consumes_carryover_before_fresh_hedge(
+    monkeypatch: pytest.MonkeyPatch,
+    completed_buffer_groups: int,
+    expected_fetch_groups: int,
+) -> None:
+    monkeypatch.setenv(SYNC_INTENT_WINDOW_GROUPS_ENV, "16")
+
+    assert (
+        plan_adaptive_window_fetch(
+            resident_groups=0,
+            baseline_fetch_groups=16,
+            remaining_commit_groups=8,
+            hedge_groups=8,
+            window_initialized=False,
+            completed_buffer_groups=completed_buffer_groups,
+        )
+        == expected_fetch_groups
+    )
+
+
 def test_old_debt_priority_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     args = SimpleNamespace(sglang_enable_priority_scheduling=True)
     groups = [[SimpleNamespace(metadata={})], [SimpleNamespace(metadata={})]]
     mark_work_origin(groups, old_debt_groups=1, fresh_origin="speculative_fresh")
 
     monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, "1")
-    assert resolve_partition_request_priority(args, groups[0][0]) == 1
-    assert resolve_partition_request_priority(args, groups[1][0]) == 0
+    assert resolve_partition_request_priority(args, groups[0][0]) == OLD_DEBT_REQUEST_PRIORITY
+    assert resolve_partition_request_priority(args, groups[1][0]) == DEFAULT_ROLLOUT_REQUEST_PRIORITY
+
+
+def test_request_priority_orders_old_debt_resume_then_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, "1")
+    args = SimpleNamespace(sglang_enable_priority_scheduling=True)
+    groups = [
+        [SimpleNamespace(metadata={}, status="aborted", abort_count=1)],
+        [SimpleNamespace(metadata={}, status="aborted", abort_count=1)],
+        [SimpleNamespace(metadata={}, status="pending", abort_count=0)],
+    ]
+
+    mark_work_origin(groups, old_debt_groups=1)
+
+    assert groups[0][0].metadata["work_origin"] == "old_debt"
+    assert groups[1][0].metadata["work_origin"] == "partial_resume"
+    assert groups[2][0].metadata["work_origin"] == "fresh"
+    assert resolve_partition_request_priority(args, groups[0][0]) == OLD_DEBT_REQUEST_PRIORITY
+    assert resolve_partition_request_priority(args, groups[1][0]) == CARRYOVER_RESUME_REQUEST_PRIORITY
+    assert resolve_partition_request_priority(args, groups[2][0]) == DEFAULT_ROLLOUT_REQUEST_PRIORITY

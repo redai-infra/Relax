@@ -15,6 +15,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from relax.engine.rollout.data_source import RolloutDataSourceWithBuffer
+from relax.utils.types import Sample
+
+
+def _sample_group(status: Sample.Status, n: int = 2) -> list[Sample]:
+    return [Sample(status=status) for _ in range(n)]
+
 
 class TestEagerDataset:
     """Tests for eager Dataset global-slice semantics."""
@@ -175,6 +182,23 @@ class TestDataSourceIntegration:
             for path in files:
                 if os.path.exists(path):
                     os.unlink(path)
+
+
+def test_completed_buffer_count_only_inspects_fifo_prefix() -> None:
+    source = RolloutDataSourceWithBuffer.__new__(RolloutDataSourceWithBuffer)
+    source.buffer = [
+        _sample_group(Sample.Status.ABORTED),
+        _sample_group(Sample.Status.COMPLETED),
+        _sample_group(Sample.Status.TRUNCATED),
+        _sample_group(Sample.Status.COMPLETED),
+    ]
+
+    assert source.get_completed_buffer_group_count(0) == 0
+    assert source.get_completed_buffer_group_count(2) == 1
+    assert source.get_completed_buffer_group_count(3) == 2
+    assert source.get_completed_buffer_group_count(100) == 3
+    with pytest.raises(ValueError, match="non-negative"):
+        source.get_completed_buffer_group_count(-1)
 
 
 if __name__ == "__main__":

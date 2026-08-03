@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 PYTHON_BIN="${TASK22_PYTHON:?Set TASK22_PYTHON to an absolute executable launcher}"
 AB_ARM="${TASK22_AB_ARM:?Set TASK22_AB_ARM to off or on}"
+RUN_MODE="${TASK22_RUN_MODE:-clean_ab}"
 LOCAL_RUN_DIR="${TASK22_LOCAL_RUN_DIR:?Set a fresh absolute local run directory}"
 PERSIST_DIR="${TASK22_PERSIST_DIR:?Set a fresh absolute persistent artifact directory}"
 EXPECTED_GIT_SHA="${TASK22_EXPECTED_GIT_SHA:?Set the exact clean-policy commit SHA}"
@@ -62,6 +63,8 @@ export RELAX_SYNC_INTENT_TTL_SECONDS=600
 export RELAX_SYNC_INTENT_WINDOW_GROUPS=16
 export RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER=1.25
 export RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS=2.0
+export RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS=0.5
+export RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS=15
 export FLASHINFER_CUDA_ARCH_LIST=12.0a
 
 mkdir -p "$LOCAL_RUN_DIR"
@@ -167,7 +170,19 @@ EXP_DIR="${EXP_DIR:?Set EXP_DIR}"
 MODEL_DIR="${MODEL_DIR:?Set MODEL_DIR}"
 DATA_DIR="${DATA_DIR:?Set DATA_DIR}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-20}"
-[[ "$NUM_ROLLOUT" == "20" ]] || { echo "clean A/B requires NUM_ROLLOUT=20" >&2; exit 2; }
+case "$RUN_MODE" in
+    clean_ab)
+        [[ "$NUM_ROLLOUT" == "20" ]] || { echo "clean A/B requires NUM_ROLLOUT=20" >&2; exit 2; }
+        ;;
+    v2_on_canary)
+        [[ "$AB_ARM" == "on" ]] || { echo "v2_on_canary requires TASK22_AB_ARM=on" >&2; exit 2; }
+        [[ "$NUM_ROLLOUT" == "13" ]] || { echo "v2_on_canary requires NUM_ROLLOUT=13" >&2; exit 2; }
+        ;;
+    *)
+        echo "TASK22_RUN_MODE must be clean_ab or v2_on_canary, got $RUN_MODE" >&2
+        exit 2
+        ;;
+esac
 
 if [[ -z "${RUNTIME_ENV_JSON:-}" ]]; then
     RUNTIME_ENV_JSON="{}"
@@ -190,6 +205,8 @@ for name in (
     "RELAX_SYNC_INTENT_WINDOW_GROUPS",
     "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER",
     "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS",
+    "RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS",
+    "RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS",
 ):
     env[name] = os.environ[name]
 print(json.dumps(runtime, sort_keys=True, separators=(",", ":")))
@@ -290,6 +307,7 @@ TRAIN_ARGS=(
 )
 
 export TASK22_AB_ARM="$AB_ARM"
+export TASK22_RUN_MODE="$RUN_MODE"
 export TASK22_GIT_SHA="$(git -C "$REPO" rev-parse HEAD)"
 export TASK22_TRAIN_ARGS_JSON
 TASK22_TRAIN_ARGS_JSON="$("$PYTHON_BIN" - "${TRAIN_ARGS[@]}" <<'PY'
@@ -330,6 +348,7 @@ source_paths = (
     repo / "relax/backends/megatron/actor.py",
     repo / "relax/components/rollout.py",
     repo / "relax/distributed/ray/rollout.py",
+    repo / "relax/engine/rollout/data_source.py",
     repo / "relax/engine/rollout/sglang_rollout.py",
     repo / "relax/engine/rollout/sync_intent.py",
     repo / "relax/engine/rollout/sync_intent_rollout.py",
@@ -379,6 +398,8 @@ comparison_payload = {
         "window_groups": os.environ["RELAX_SYNC_INTENT_WINDOW_GROUPS"],
         "quiesce_multiplier": os.environ["RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER"],
         "quiesce_floor_seconds": os.environ["RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS"],
+        "abort_retry_interval_seconds": os.environ["RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS"],
+        "abort_timeout_seconds": os.environ["RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS"],
     },
 }
 comparison_fingerprint = hashlib.sha256(
@@ -386,6 +407,7 @@ comparison_fingerprint = hashlib.sha256(
 ).hexdigest()
 payload = {
     "schema_version": 1,
+    "run_mode": os.environ["TASK22_RUN_MODE"],
     "arm": os.environ["TASK22_AB_ARM"],
     "policy_enabled": os.environ["RELAX_SYNC_INTENT_POLICY"] == "1",
     "comparison_fingerprint": comparison_fingerprint,

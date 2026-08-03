@@ -720,7 +720,20 @@ async def generate_and_rm_group(
     return group
 
 
-async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], list[list[Sample]]]:
+async def abort(
+    args: Namespace,
+    rollout_id: int,
+    *,
+    retry_interval_seconds: float | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[list[list[Sample]], list[list[Sample]]]:
+    if retry_interval_seconds is not None and retry_interval_seconds <= 0:
+        raise ValueError("retry_interval_seconds must be positive")
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if timeout_seconds is not None and retry_interval_seconds is None:
+        raise ValueError("timeout_seconds requires retry_interval_seconds")
+
     aborted_samples = []
     completed_protected_samples = []
 
@@ -764,20 +777,54 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
         urls = [worker["url"] for worker in response["workers"]]
 
-    logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, BaseException):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    abort_started_at = monotonic()
+    abort_attempt = 0
+
+    async def send_abort_all() -> None:
+        nonlocal abort_attempt
+        abort_attempt += 1
+        logger.info(
+            "Abort request for %s attempt=%s pending_groups=%s",
+            urls,
+            abort_attempt,
+            len(state.pendings),
+        )
+        abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+        abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+        for url, result in zip(urls, abort_results, strict=False):
+            if isinstance(result, BaseException):
+                logger.warning(f"Failed to abort worker at {url}: {result}")
+
+    await send_abort_all()
 
     # make sure all the pending tasks are finished
     count = 0
+    next_abort_at = monotonic() + retry_interval_seconds if retry_interval_seconds is not None else None
     while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        done = {task for task in state.pendings if task.done()}
+        if done:
+            state.pendings -= done
+        else:
+            wait_timeout = None
+            if next_abort_at is not None:
+                wait_timeout = max(next_abort_at - monotonic(), 0.0)
+            if timeout_seconds is not None:
+                remaining_timeout = timeout_seconds - (monotonic() - abort_started_at)
+                if remaining_timeout <= 0:
+                    raise RuntimeError(
+                        f"Abort drain timed out for rollout_id={rollout_id}: "
+                        f"pending_groups={len(state.pendings)} attempts={abort_attempt}"
+                    )
+                wait_timeout = min(wait_timeout, remaining_timeout) if wait_timeout is not None else remaining_timeout
+
+            done, state.pendings = await asyncio.wait(
+                state.pendings,
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
         if not args.partial_rollout:
-            continue
+            done = set()
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
@@ -790,8 +837,18 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             aborted_samples.append(group)
             count += len(group)
 
+        now = monotonic()
+        if state.pendings and next_abort_at is not None and now >= next_abort_at:
+            await send_abort_all()
+            next_abort_at = monotonic() + retry_interval_seconds
+
     if args.partial_rollout:
-        logger.info(f"Collected {count} partial samples into the data buffer")
+        logger.info(
+            "Collected %s partial samples into the data buffer abort_attempts=%s abort_drain_seconds=%.6f",
+            count,
+            abort_attempt,
+            monotonic() - abort_started_at,
+        )
 
     return aborted_samples, completed_protected_samples
 

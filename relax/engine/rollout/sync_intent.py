@@ -16,8 +16,11 @@ SYNC_INTENT_TTL_ENV = "RELAX_SYNC_INTENT_TTL_SECONDS"
 SYNC_INTENT_WINDOW_GROUPS_ENV = "RELAX_SYNC_INTENT_WINDOW_GROUPS"
 SYNC_INTENT_QUIESCE_MULTIPLIER_ENV = "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER"
 SYNC_INTENT_QUIESCE_FLOOR_ENV = "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS"
+SYNC_INTENT_ABORT_RETRY_INTERVAL_ENV = "RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS"
+SYNC_INTENT_ABORT_TIMEOUT_ENV = "RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS"
 DEFAULT_ROLLOUT_REQUEST_PRIORITY = 0
-OLD_DEBT_REQUEST_PRIORITY = 1
+CARRYOVER_RESUME_REQUEST_PRIORITY = 1
+OLD_DEBT_REQUEST_PRIORITY = 2
 SyncIntentPhase = Literal["data_wait", "actor_train", "quiesce", "weight_sync"]
 _PHASE_ORDER: dict[SyncIntentPhase, int] = {
     "data_wait": 0,
@@ -65,6 +68,14 @@ def sync_intent_quiesce_multiplier() -> float:
 
 def sync_intent_quiesce_floor_seconds() -> float:
     return _positive_float_env(SYNC_INTENT_QUIESCE_FLOOR_ENV, "2.0")
+
+
+def sync_intent_abort_retry_interval_seconds() -> float:
+    return _positive_float_env(SYNC_INTENT_ABORT_RETRY_INTERVAL_ENV, "0.5")
+
+
+def sync_intent_abort_timeout_seconds() -> float:
+    return _positive_float_env(SYNC_INTENT_ABORT_TIMEOUT_ENV, "15")
 
 
 @dataclass(frozen=True)
@@ -295,11 +306,12 @@ def plan_adaptive_window_fetch(
     remaining_commit_groups: int,
     hedge_groups: int,
     window_initialized: bool,
+    completed_buffer_groups: int = 0,
 ) -> int:
-    """Seed one hedged window, then refill only missing commit candidates."""
+    """Seed a carry-over-aware window, then refill only the commit gap."""
 
-    if min(resident_groups, remaining_commit_groups, hedge_groups) < 0:
-        raise ValueError("resident, remaining commit, and hedge groups must be non-negative")
+    if min(resident_groups, remaining_commit_groups, hedge_groups, completed_buffer_groups) < 0:
+        raise ValueError("resident, remaining commit, hedge, and completed buffer groups must be non-negative")
     if baseline_fetch_groups <= 0:
         raise ValueError("baseline_fetch_groups must be positive")
     if remaining_commit_groups == 0:
@@ -309,7 +321,9 @@ def plan_adaptive_window_fetch(
     else:
         configured_window = sync_intent_window_groups()
         maximum_window = configured_window if configured_window is not None else baseline_fetch_groups
-        desired_window = min(maximum_window, remaining_commit_groups + hedge_groups)
+        fresh_shortfall = max(remaining_commit_groups - completed_buffer_groups, 0)
+        bounded_hedge = min(hedge_groups, fresh_shortfall)
+        desired_window = min(maximum_window, remaining_commit_groups + bounded_hedge)
     return max(desired_window - resident_groups, 0)
 
 
@@ -320,13 +334,27 @@ def mark_work_origin(
     fresh_origin: str = "fresh",
 ) -> None:
     for group_index, group in enumerate(samples):
-        origin = "old_debt" if group_index < old_debt_groups else fresh_origin
+        if group_index < old_debt_groups:
+            origin = "old_debt"
+        elif _is_partial_resume_group(group):
+            origin = "partial_resume"
+        else:
+            origin = fresh_origin
         for sample in group:
             metadata = getattr(sample, "metadata", None)
             if not isinstance(metadata, dict):
                 metadata = {}
                 setattr(sample, "metadata", metadata)
             metadata["work_origin"] = origin
+
+
+def _is_partial_resume_group(group: list[object]) -> bool:
+    for sample in group:
+        status = getattr(sample, "status", None)
+        status_value = getattr(status, "value", status)
+        if status_value == "aborted" or int(getattr(sample, "abort_count", 0) or 0) > 0:
+            return True
+    return False
 
 
 def resolve_partition_request_priority(args: object, sample: object) -> int | None:
@@ -338,4 +366,6 @@ def resolve_partition_request_priority(args: object, sample: object) -> int | No
         return None
     if work_origin == "old_debt":
         return OLD_DEBT_REQUEST_PRIORITY
+    if work_origin == "partial_resume":
+        return CARRYOVER_RESUME_REQUEST_PRIORITY
     return DEFAULT_ROLLOUT_REQUEST_PRIORITY

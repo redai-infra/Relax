@@ -248,6 +248,107 @@ async def test_multiturn_loop_abort_between_turns() -> None:
     assert not mgr.semaphore.locked()
 
 
+async def test_abort_retries_until_late_pending_task_is_terminal(monkeypatch) -> None:
+    release_pending = asyncio.Event()
+    sample = SimpleNamespace(
+        status=Sample.Status.ABORTED,
+        abort_count=0,
+        response="partial",
+        metadata={},
+    )
+
+    async def pending_group():
+        await release_pending.wait()
+        return [sample]
+
+    task = asyncio.create_task(pending_group())
+    state = SimpleNamespace(
+        aborted=False,
+        evaluating=0,
+        protected_pendings=set(),
+        pendings={task},
+    )
+    attempts = 0
+
+    async def fake_get(_url):
+        return {"urls": ["http://engine"], "workers": [{"url": "http://engine"}]}
+
+    async def fake_post(_url, _payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            release_pending.set()
+        return {}
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "get", fake_get)
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    args = SimpleNamespace(
+        use_slime_router=False,
+        partial_rollout=True,
+        sglang_router_ip="router",
+        sglang_router_port=3000,
+    )
+
+    aborted, protected = await sglang_rollout.abort(
+        args,
+        rollout_id=3,
+        retry_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    assert attempts == 2
+    assert aborted == [[sample]]
+    assert protected == []
+    assert sample.abort_count == 1
+    assert state.aborted
+    assert not state.pendings
+
+
+async def test_abort_retry_timeout_fails_closed(monkeypatch) -> None:
+    never = asyncio.Event()
+
+    async def pending_group():
+        await never.wait()
+        return []
+
+    task = asyncio.create_task(pending_group())
+    state = SimpleNamespace(
+        aborted=False,
+        evaluating=0,
+        protected_pendings=set(),
+        pendings={task},
+    )
+
+    async def fake_get(_url):
+        return {"urls": ["http://engine"], "workers": [{"url": "http://engine"}]}
+
+    async def fake_post(_url, _payload):
+        return {}
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "get", fake_get)
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    args = SimpleNamespace(
+        use_slime_router=False,
+        partial_rollout=True,
+        sglang_router_ip="router",
+        sglang_router_port=3000,
+    )
+
+    with pytest.raises(RuntimeError, match="Abort drain timed out"):
+        await sglang_rollout.abort(
+            args,
+            rollout_id=4,
+            retry_interval_seconds=0.01,
+            timeout_seconds=0.03,
+        )
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 # --------------------------------------------------------------------------- #
 # T9-T11: _dispatch_generate dispatch / lock scope / containment / misuse guard
 # --------------------------------------------------------------------------- #
