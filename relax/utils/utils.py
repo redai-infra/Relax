@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.ppo_utils import compute_rloo_baselines_and_advantages
 from relax.utils.types import Sample
 
 
@@ -109,6 +110,9 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         "sample_indices": [sample.index for sample in samples],
     }
 
+    if args.advantage_estimator == "rloo":
+        train_data["group_indices"] = [sample.group_index for sample in samples]
+
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
@@ -178,6 +182,14 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return custom_reward_post_process_func(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if args.advantage_estimator == "rloo":
+        rewards = torch.tensor(raw_rewards, dtype=torch.float32)
+        compute_rloo_baselines_and_advantages(
+            rewards,
+            [sample.group_index for sample in samples],
+            args.n_samples_per_prompt,
+        )
+        return raw_rewards, raw_rewards
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
     if (
@@ -427,11 +439,12 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     data = [Sample.from_dict(sample) for sample in data]
     if (ratio := args.load_debug_rollout_data_subsample) is not None:
         original_num_rows = len(data)
-        if (
+        group_aware_subsampling = args.advantage_estimator == "rloo" or (
             args.custom_reward_post_process_path is None
             and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
             and args.rewards_normalization
-        ):
+        )
+        if group_aware_subsampling:
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))
             if None in group_ids:
                 raise ValueError("Sample.group_index is required for group-aware debug subsampling.")

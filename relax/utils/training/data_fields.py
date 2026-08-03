@@ -13,6 +13,8 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "rewards",
         "raw_reward",
     ]
+    if getattr(args, "advantage_estimator", None) == "rloo":
+        fields.append("group_indices")
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:

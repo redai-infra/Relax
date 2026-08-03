@@ -908,6 +908,7 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "group_indices",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
@@ -958,7 +959,10 @@ def log_rollout_data(
                             # Tensors have mismatched shapes (e.g. variable-length mbs in
                             # streaming mode) — fall back to per-mb mean then average.
                             val = torch.stack([v.float().mean() for v in val])
-                        val = val.mean() * cp_size
+                        # RLOO sequence metrics are already reconstructed and replicated
+                        # on every CP rank; token-sharded auxiliary metrics still need CP scaling.
+                        metric_cp_scale = 1 if key.startswith("rloo_") else cp_size
+                        val = val.mean() * metric_cp_scale
                 else:
                     if not isinstance(val[0], (int, float)):
                         continue

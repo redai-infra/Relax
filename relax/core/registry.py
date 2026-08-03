@@ -81,6 +81,13 @@ class ROLES_PPO_FULLY_ASYNC_ON_POLICY(StrEnum):
 
 
 ALGOS = {
+    "rloo": {
+        ROLES.rollout: Rollout,
+        ROLES.actor: Actor,
+        ROLES.advantages: Advantages,
+        ROLES.reference: ActorFwd,
+        ROLES.actor_fwd: ActorFwd,
+    },
     "grpo": {
         ROLES.rollout: Rollout,
         ROLES.actor: Actor,

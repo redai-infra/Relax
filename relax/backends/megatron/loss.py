@@ -26,6 +26,8 @@ from relax.utils.training.ppo_utils import (
     compute_log_probs,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_rloo_baselines_and_advantages,
+    compute_rloo_loss,
     compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -510,13 +512,59 @@ def get_values(
     return torch.empty((0,), device=logits.device), res
 
 
+def _gather_rloo_inputs_across_dp(
+    shaped_rewards: torch.Tensor,
+    group_indices: list[int | None],
+) -> tuple[torch.Tensor, torch.Tensor, slice]:
+    """Gather sequence rewards and group IDs over DP, preserving rank-local
+    order."""
+    for position, group_index in enumerate(group_indices):
+        if group_index is None:
+            raise ValueError(f"Sample.group_index is required for RLOO (missing at sample position {position}).")
+
+    local_group_indices = torch.tensor(group_indices, dtype=torch.int64, device=shaped_rewards.device)
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    if dp_size == 1:
+        return shaped_rewards, local_group_indices, slice(0, shaped_rewards.numel())
+
+    local_count = shaped_rewards.numel()
+    counts: list[int | None] = [None] * dp_size
+    dist.all_gather_object(
+        counts,
+        local_count,
+        group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+    )
+    if any(count is None for count in counts):
+        raise RuntimeError("RLOO failed to gather local DP batch sizes.")
+    gathered_counts = [int(count) for count in counts]
+    max_count = max(gathered_counts)
+
+    padded_rewards = F.pad(shaped_rewards, (0, max_count - local_count))
+    padded_group_indices = F.pad(local_group_indices, (0, max_count - local_count), value=-1)
+    dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+    gathered_rewards = [torch.empty_like(padded_rewards) for _ in range(dp_size)]
+    gathered_group_indices = [torch.empty_like(padded_group_indices) for _ in range(dp_size)]
+    dist.all_gather(gathered_rewards, padded_rewards, group=dp_group)
+    dist.all_gather(gathered_group_indices, padded_group_indices, group=dp_group)
+
+    global_rewards = torch.cat(
+        [rank_rewards[:count] for rank_rewards, count in zip(gathered_rewards, gathered_counts, strict=True)]
+    )
+    global_group_indices = torch.cat(
+        [rank_groups[:count] for rank_groups, count in zip(gathered_group_indices, gathered_counts, strict=True)]
+    )
+    dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+    local_start = sum(gathered_counts[:dp_rank])
+    return global_rewards, global_group_indices, slice(local_start, local_start + local_count)
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on
     `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
+    estimator. Supported methods: "grpo", "rloo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
     and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
@@ -572,6 +620,57 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         # TODO: is the copy necessary?
         advantages = [r for r in returns]  # noqa: C416
 
+    elif args.advantage_estimator == "rloo":
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
+        group_indices = rollout_data.get("group_indices")
+        if group_indices is None:
+            raise ValueError("RLOO requires group_indices in rollout data.")
+
+        if args.kl_coef != 0:
+            padded_iter = padded_total_lengths if padded_total_lengths is not None else [None] * len(kl)
+            max_seq_iter = max_seq_lens if max_seq_lens is not None else [None] * len(kl)
+            full_kl = [
+                all_gather_with_cp(
+                    k,
+                    total_length,
+                    response_length,
+                    padded_total_length,
+                    qkv_format=args.qkv_format,
+                    max_seq_len=max_seq_len,
+                )
+                for k, total_length, response_length, padded_total_length, max_seq_len in zip(
+                    kl, total_lengths, response_lengths, padded_iter, max_seq_iter, strict=True
+                )
+            ]
+            sequence_kl = torch.stack(
+                [
+                    (sample_kl * mask.to(sample_kl.device)).sum()
+                    for sample_kl, mask in zip(full_kl, loss_masks, strict=True)
+                ]
+            )
+        else:
+            sequence_kl = torch.zeros_like(rewards)
+
+        shaped_rewards = rewards - args.kl_coef * sequence_kl.detach()
+        global_rewards, global_group_indices, local_slice = _gather_rloo_inputs_across_dp(
+            shaped_rewards, group_indices
+        )
+        global_baselines, global_advantages = compute_rloo_baselines_and_advantages(
+            global_rewards,
+            global_group_indices,
+            args.n_samples_per_prompt,
+        )
+        baselines, sequence_advantages = global_baselines[local_slice], global_advantages[local_slice]
+        returns = get_grpo_returns(sequence_advantages, kl)
+        advantages = list(returns)
+        rollout_data["rloo_shaped_reward"] = list(shaped_rewards.split(1))
+        rollout_data["rloo_sequence_kl"] = list(sequence_kl.split(1))
+        rollout_data["rloo_baseline"] = list(baselines.split(1))
+        rollout_data["rloo_advantage"] = list(sequence_advantages.split(1))
+        rollout_data["rloo_advantage_abs"] = list(sequence_advantages.abs().split(1))
+        rollout_data["rloo_empty_response_fraction"] = [
+            (mask.sum() == 0).to(dtype=torch.float32).reshape(1) for mask in loss_masks
+        ]
     elif args.advantage_estimator == "ppo":
         old_rewards = rewards
         rewards = []
@@ -828,7 +927,7 @@ def policy_loss_function(
         old_log_probs = [lp.detach() for lp in log_probs]
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    need_full_log_probs = args.use_opsm or args.advantage_estimator in ["gspo", "rloo"]
 
     full_log_probs = None
     full_old_log_probs = None
@@ -837,6 +936,7 @@ def policy_loss_function(
             padded_iter = [None] * len(log_probs)
         else:
             padded_iter = padded_total_lengths
+        max_seq_iter = max_seq_lens if max_seq_lens is not None else [None] * len(log_probs)
         # OPSM supports CP: reconstruct each sample's full response from its CP-local
         # zig-zag shards. Under dynamic CP, gather over this mb's dynamic CP sub-group
         # (size/rank/group), not the static CP group. (GSPO does not support CP.)
@@ -853,12 +953,14 @@ def policy_loss_function(
                 total_length,
                 response_length,
                 padded_total_length,
+                qkv_format=args.qkv_format,
+                max_seq_len=max_seq_len,
                 dynamic_cp_size=dynamic_cp_size,
                 dynamic_cp_rank=dynamic_cp_rank,
                 dynamic_cp_group=dynamic_cp_group,
             )
-            for log_prob, total_length, response_length, padded_total_length in zip(
-                log_probs, total_lengths, response_lengths, padded_iter, strict=False
+            for log_prob, total_length, response_length, padded_total_length, max_seq_len in zip(
+                log_probs, total_lengths, response_lengths, padded_iter, max_seq_iter, strict=False
             )
         ]
         full_old_log_probs = [
@@ -867,12 +969,14 @@ def policy_loss_function(
                 total_length,
                 response_length,
                 padded_total_length,
+                qkv_format=args.qkv_format,
+                max_seq_len=max_seq_len,
                 dynamic_cp_size=dynamic_cp_size,
                 dynamic_cp_rank=dynamic_cp_rank,
                 dynamic_cp_group=dynamic_cp_group,
             )
-            for old_log_prob, total_length, response_length, padded_total_length in zip(
-                old_log_probs, total_lengths, response_lengths, padded_iter, strict=False
+            for old_log_prob, total_length, response_length, padded_total_length, max_seq_len in zip(
+                old_log_probs, total_lengths, response_lengths, padded_iter, max_seq_iter, strict=False
             )
         ]
 
@@ -902,7 +1006,19 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    if args.advantage_estimator == "sapo":
+    if args.advantage_estimator == "rloo":
+        sequence_log_probs = torch.stack(
+            [
+                (sample_log_probs * mask.to(sample_log_probs.device)).sum()
+                for sample_log_probs, mask in zip(full_log_probs, batch["loss_masks"], strict=True)
+            ]
+        )
+        sequence_advantages = torch.cat(batch["rloo_advantage"], dim=0).to(sequence_log_probs.device)
+        sequence_pg_loss = compute_rloo_loss(sequence_log_probs, sequence_advantages).sum()
+        rloo_cp_rank = batch.get("dynamic_cp_rank", mpu.get_context_parallel_rank())
+        pg_loss = sequence_pg_loss if rloo_cp_rank == 0 else 0.0 * sequence_pg_loss
+        pg_clipfrac = torch.zeros_like(pg_loss)
+    elif args.advantage_estimator == "sapo":
         tau_pos = getattr(args, "sapo_tau_pos", 1.0)
         tau_neg = getattr(args, "sapo_tau_neg", 1.05)
         pg_loss, pg_clipfrac = compute_sapo_loss(
@@ -984,8 +1100,9 @@ def policy_loss_function(
     else:
         pg_loss_reducer = sum_of_sample_mean
 
-    pg_loss = pg_loss_reducer(pg_loss)
-    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
+    if args.advantage_estimator != "rloo":
+        pg_loss = pg_loss_reducer(pg_loss)
+        pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
@@ -1033,9 +1150,13 @@ def policy_loss_function(
             (torch.exp(old_log_probs) - torch.exp(rollout_log_probs)).abs()
         )
 
+    rloo_metric_scale = 1
+    if args.advantage_estimator == "rloo" and rloo_cp_rank == 0:
+        rloo_metric_scale = batch.get("dynamic_cp_size", mpu.get_context_parallel_world_size())
+
     reported_loss = {
-        "loss": loss.clone().detach(),
-        "pg_loss": pg_loss.clone().detach(),
+        "loss": loss.clone().detach() * rloo_metric_scale,
+        "pg_loss": pg_loss.clone().detach() * rloo_metric_scale,
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
@@ -1277,12 +1398,14 @@ def loss_function(
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
     num_samples = len(batch["response_lengths"])
+    sequence_level_rloo = args.advantage_estimator == "rloo"
+    use_token_normalization = args.calculate_per_token_loss and not sequence_level_rloo
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
-        args.calculate_per_token_loss,
+        use_token_normalization,
         args.qkv_format,
         batch.get("max_seq_lens", None),
         batch.get("padded_total_lengths", None),
@@ -1339,7 +1462,7 @@ def loss_function(
     # scaling); the per-token branch does NO CP scaling (normalization is the
     # all-reduced CP-local token count in finalize_model_grads).
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
-    if not args.calculate_per_token_loss:
+    if not use_token_normalization:
         if is_dummy:
             # Zero-out gradient contribution but keep the autograd graph
             # connected so PP/CP backward collectives still complete.
@@ -1366,7 +1489,7 @@ def loss_function(
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     log_values = torch.tensor(
         [
-            num_samples if not args.calculate_per_token_loss else effective_num_tokens,
+            num_samples if not use_token_normalization else effective_num_tokens,
         ]
         + list(log.values()),
         device=logits.device,
@@ -1377,7 +1500,7 @@ def loss_function(
 
     return (
         loss,
-        (effective_num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        (effective_num_tokens if use_token_normalization else torch.tensor(1, device=logits.device)),
         {
             "keys": list(log.keys()),
             "values": log_values,

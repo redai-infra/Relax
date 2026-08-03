@@ -194,3 +194,52 @@ def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
 
     with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
         arguments_module.slime_validate_args(args)
+
+
+def _rloo_args() -> SimpleNamespace:
+    args = _opd_args()
+    args.advantage_estimator = "rloo"
+    args.use_opd = False
+    args.custom_reward_post_process_path = None
+    args.use_opsm = False
+    args.entropy_coef = 0.0
+    args.kl_loss_type = "k1"
+    args.num_steps_per_rollout = None
+    args.rewards_normalization = False
+    args.mask_offpolicy_in_partial_rollout = False
+    return args
+
+
+@pytest.mark.parametrize(
+    ("global_batch_size", "num_steps_per_rollout"),
+    [
+        (16, None),
+        (16, 2),
+    ],
+)
+def test_rloo_rejects_multiple_optimizer_updates_per_rollout(
+    arguments_module, global_batch_size, num_steps_per_rollout
+):
+    args = _rloo_args()
+    args.global_batch_size = global_batch_size
+    args.num_steps_per_rollout = num_steps_per_rollout
+
+    with pytest.raises(ValueError, match="exactly one optimizer update per rollout"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_rloo_rejects_partial_rollout_even_with_offpolicy_prefix_mask(arguments_module):
+    args = _rloo_args()
+    args.partial_rollout = True
+    args.mask_offpolicy_in_partial_rollout = True
+
+    with pytest.raises(ValueError, match="does not support partial rollout"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_rloo_accepts_one_full_grouped_batch_per_rollout(arguments_module):
+    args = _rloo_args()
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.global_batch_size == args.rollout_batch_size * args.n_samples_per_prompt

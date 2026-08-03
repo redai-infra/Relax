@@ -1627,6 +1627,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=[
                     "grpo",
+                    "rloo",
                     "gspo",
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
@@ -2825,6 +2826,38 @@ def slime_validate_args(args):
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
     if not is_sft:
+        if args.advantage_estimator == "rloo":
+            if args.fully_async or args.hybrid:
+                raise ValueError("RLOO currently supports synchronous colocate training only.")
+            if getattr(args, "partial_rollout", False):
+                raise ValueError(
+                    "RLOO does not support partial rollout because recycled prefixes are off-policy; "
+                    "disable --partial-rollout."
+                )
+            if args.n_samples_per_prompt < 2:
+                raise ValueError(f"RLOO requires --n-samples-per-prompt >= 2, got {args.n_samples_per_prompt}.")
+            if args.normalize_advantages:
+                raise ValueError("RLOO uses its leave-one-out advantage directly; remove --normalize-advantages.")
+            if args.use_kl_loss:
+                raise ValueError(
+                    "RLOO applies KL through sequence reward shaping; use --kl-coef instead of --use-kl-loss."
+                )
+            if args.kl_coef != 0 and args.kl_loss_type != "k1":
+                raise ValueError("RLOO reward shaping requires --kl-loss-type k1.")
+            if args.custom_reward_post_process_path is not None:
+                raise ValueError("RLOO does not support --custom-reward-post-process-path.")
+            if getattr(args, "agentic_custom_advantage_path", None) is not None:
+                raise ValueError("RLOO does not support --agentic-custom-advantage-path.")
+            if args.use_tis or args.get_mismatch_metrics or args.use_opsm:
+                raise ValueError("RLOO does not yet support TIS, mismatch metrics, or OPSM.")
+            if args.use_opd:
+                raise ValueError("RLOO with on-policy distillation is not supported in the synchronous baseline.")
+            if args.entropy_coef != 0:
+                raise ValueError("RLOO sequence loss currently requires --entropy-coef 0.")
+            if getattr(args, "dynamic_context_parallel", False):
+                raise ValueError("RLOO currently supports static context parallelism only.")
+            if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+                raise ValueError("RLOO does not support a custom policy-loss reducer.")
         if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
             assert args.normalize_advantages, (
                 "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
@@ -3168,6 +3201,15 @@ def slime_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    if (
+        args.advantage_estimator == "rloo"
+        and args.global_batch_size != args.rollout_batch_size * args.n_samples_per_prompt
+    ):
+        raise ValueError(
+            "RLOO requires exactly one optimizer update per rollout; set --global-batch-size equal to "
+            "--rollout-batch-size * --n-samples-per-prompt and remove multi-step rollout settings."
+        )
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False

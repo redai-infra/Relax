@@ -17,6 +17,64 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def compute_rloo_baselines_and_advantages(
+    rewards: torch.Tensor,
+    group_indices: list[int | None] | torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-prompt leave-one-out baselines in sample order."""
+    if group_size < 2:
+        raise ValueError(f"RLOO requires group_size >= 2, got {group_size}.")
+    if rewards.ndim != 1:
+        raise ValueError(f"RLOO rewards must be one-dimensional, got shape {tuple(rewards.shape)}.")
+    if len(group_indices) != rewards.numel():
+        raise ValueError(
+            f"RLOO rewards/group_indices length mismatch: {rewards.numel()} rewards vs {len(group_indices)} groups."
+        )
+
+    invalid_positions = torch.nonzero(~torch.isfinite(rewards), as_tuple=False).flatten()
+    if invalid_positions.numel() > 0:
+        positions = invalid_positions.tolist()
+        raise ValueError(f"RLOO rewards must be finite; invalid sample positions: {positions}.")
+
+    if not isinstance(group_indices, torch.Tensor):
+        for position, group_index in enumerate(group_indices):
+            if group_index is None:
+                raise ValueError(f"Sample.group_index is required for RLOO (missing at sample position {position}).")
+        group_indices = torch.tensor(group_indices, dtype=torch.int64, device=rewards.device)
+    else:
+        if group_indices.ndim != 1:
+            raise ValueError(f"RLOO group_indices must be one-dimensional, got shape {tuple(group_indices.shape)}.")
+        group_indices = group_indices.to(device=rewards.device, dtype=torch.int64)
+
+    unique_groups, inverse_indices, group_counts = torch.unique(
+        group_indices,
+        sorted=False,
+        return_inverse=True,
+        return_counts=True,
+    )
+    invalid_groups = torch.nonzero(group_counts != group_size, as_tuple=False).flatten()
+    if invalid_groups.numel() > 0:
+        invalid_group = invalid_groups[0]
+        raise ValueError(
+            f"RLOO reward group {unique_groups[invalid_group].item()} has "
+            f"{group_counts[invalid_group].item()} samples, expected {group_size}."
+        )
+
+    group_sums = torch.zeros(unique_groups.numel(), dtype=rewards.dtype, device=rewards.device)
+    group_sums.scatter_add_(0, inverse_indices, rewards)
+    baselines = (group_sums[inverse_indices] - rewards) / (group_size - 1)
+    advantages = rewards - baselines
+
+    return baselines, advantages
+
+
+@torch.compile(dynamic=True)
+def compute_rloo_loss(sequence_log_probs: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+    """Return the per-sequence REINFORCE loss."""
+    return -(advantages.detach() * sequence_log_probs)
+
+
 def validate_ppo_config(config: Namespace) -> None:
     if getattr(config, "advantage_estimator", None) != "ppo":
         return
