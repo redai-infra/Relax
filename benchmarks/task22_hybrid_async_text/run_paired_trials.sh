@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Run three paired Task 22 trials. Each trial contains baseline, zero-KL, and
-# interval-two weight-publication runs with the same seed and workload.
+# Run three paired Task 22 trials. Each trial contains an auto-zero-KL
+# baseline, an explicit zero-KL control, and an interval-two run with the same
+# seed and workload.
 
 set -Eeuo pipefail
 
@@ -91,8 +92,7 @@ run_component() {
     local use_kl_loss="disabled"
     local update_weights_interval="1"
     if [[ "${variant}" == "baseline" ]]; then
-        reference_forward="enabled"
-        use_kl_loss="enabled"
+        use_kl_loss="auto-disabled"
     elif [[ "${variant}" == "optimized" ]]; then
         update_weights_interval="2"
     fi

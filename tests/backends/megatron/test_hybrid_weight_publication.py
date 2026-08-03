@@ -4,7 +4,7 @@ import pytest
 
 
 try:
-    from relax.backends.megatron.actor import _should_publish_hybrid_weights
+    from relax.backends.megatron.actor import _should_publish_hybrid_weights, _warn_if_hybrid_publication_degraded
 except (ImportError, AssertionError) as _exc:
     pytest.skip(f"relax.backends.megatron.actor unavailable: {_exc}", allow_module_level=True)
 
@@ -56,3 +56,22 @@ def test_hybrid_weight_publication_uses_known_evaluation_boundaries() -> None:
 def test_hybrid_weight_publication_rejects_nonpositive_interval() -> None:
     with pytest.raises(ValueError, match="must be positive"):
         _should_publish_hybrid_weights(0, 0, 20)
+
+
+def test_hybrid_weight_publication_warns_once_when_evaluation_forces_interval_one(caplog) -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "eval_interval": 10,
+            "eval_prompt_data": ["aime", "/data/aime.jsonl"],
+            "num_rollout_per_epoch": None,
+            "update_weights_interval": 2,
+        },
+    )()
+
+    warned = _warn_if_hybrid_publication_degraded(args, already_warned=False)
+    warned = _warn_if_hybrid_publication_degraded(args, already_warned=warned)
+
+    assert warned is True
+    assert caplog.text.count("Hybrid weight publication interval is disabled") == 1

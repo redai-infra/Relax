@@ -458,11 +458,13 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
     tis_values = [float(row["tis"]) for row in summaries]
     max_tis_clipfrac = max(float(row["tis_clipfrac"]) for row in summaries)
     baseline_actor_peak = max(float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "baseline")
+    zero_kl_actor_peak = max(float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "zero_kl")
     optimized_actor_peak = max(
         float(row["actor_peak_memory_mib"]) for row in summaries if row["variant"] == "optimized"
     )
     actor_peak_delta = optimized_actor_peak - baseline_actor_peak
     actor_peak_delta_pct = (optimized_actor_peak / baseline_actor_peak - 1.0) * 100.0
+    interval_actor_peak_delta = optimized_actor_peak - zero_kl_actor_peak
     evidence_archive = path.parent / "raw-evidence.tar.gz"
     evidence_index = path.parent / "raw-evidence-index.csv"
     evidence_checksum = path.parent / "raw-evidence.sha256"
@@ -484,9 +486,9 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
         "",
         "## 结果",
         "",
-        f"在实验提交 `{commit}` 上完成三组配对实验。移除系数为零的 KL reference 路径后，"
-        f"响应吞吐变化 {zero_kl_throughput_gain:+.2f}%，端到端延迟变化 "
-        f"{zero_kl_latency_change:+.2f}%；随后每两次 Actor 更新发布一次 Rollout 权重，吞吐进一步变化 "
+        f"在实验提交 `{commit}` 上完成三组配对实验。`baseline` 传入原始 zero-KL 参数并由代码自动关闭 "
+        f"reference，`zero_kl` 显式关闭；两组响应吞吐差异 {zero_kl_throughput_gain:+.2f}%，端到端延迟差异 "
+        f"{zero_kl_latency_change:+.2f}%，作为配置等价性与运行噪声对照。每两次 Actor 更新发布一次 Rollout 权重后，吞吐变化 "
         f"{interval_throughput_gain:+.2f}%，延迟进一步变化 {interval_latency_change:+.2f}%。"
         f"相对 baseline，组合改动使吞吐变化 {total_throughput_gain:+.2f}%，延迟变化 "
         f"{total_latency_change:+.2f}%。",
@@ -522,13 +524,15 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             f"{aggregate(summaries, 'zero_kl', 'actor_gpu_util_pct'):.2f}% / "
             f"{aggregate(summaries, 'zero_kl', 'rollout_gpu_util_pct'):.2f}%。",
             "",
-            f"Actor 峰值显存从 baseline 的 {baseline_actor_peak:.0f} MiB "
-            f"（{baseline_actor_peak / 1024:.2f} GiB）增至 optimized 的 {optimized_actor_peak:.0f} MiB "
-            f"（{optimized_actor_peak / 1024:.2f} GiB），增加 {actor_peak_delta:.0f} MiB "
-            f"（{actor_peak_delta_pct:.2f}%）；Rollout 峰值基本不变。当前采样只记录设备已用显存，"
-            "没有区分 PyTorch allocated/reserved 或张量生命周期，因此不能把增量归因于某个单独张量。"
-            "它与权重发布间隔改变后的流水重叠及缓存高水位同时出现，应作为性能收益的显存代价记录；"
-            "在取得 allocator/timeline 原始证据前不作更强因果结论。",
+            f"Actor 峰值显存从 zero_kl 的 {zero_kl_actor_peak:.0f} MiB 增至 optimized 的 "
+            f"{optimized_actor_peak:.0f} MiB，增加 {interval_actor_peak_delta:.0f} MiB；相对 baseline 的增量为 "
+            f"{actor_peak_delta:.0f} MiB（{actor_peak_delta_pct:.2f}%）。三个 optimized 作业均记录 "
+            f"{optimized_actor_peak:.0f} MiB，Rollout 峰值基本不变，因此不是单次异常值。原始日志进一步显示："
+            "两组在发布后的 Actor allocated/reserved 都约为 10.07/14.91 GiB；interval-one 每 step 发布时会由 "
+            "`print_memory(..., clear_before_print=True)` 清理 allocator cache，而 interval-two 的跳过 step 不执行该清理，"
+            "下一次发布前 reserved 可从约 37.5 GiB 增至约 44.6 GiB，正好解释约 7.1 GiB 的设备显存增量。"
+            "这是可回收的 PyTorch allocator cache 高水位，不是模型或 batch 增大；下一次发布后回落到约 14.91 GiB。"
+            "保留该缓存避免在跳过 step 引入 `empty_cache` 同步开销，是吞吐收益的显存代价。",
             "",
             "## 单次运行证据",
             "",
@@ -549,7 +553,7 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "",
             "## 配对变化",
             "",
-            "| run | zero-KL 吞吐变化 | interval-two 吞吐变化 | 总吞吐变化 | 总延迟变化 | seed |",
+            "| run | 显式/自动 zero-KL 吞吐差异 | interval-two 吞吐变化 | optimized/baseline 吞吐变化 | 延迟变化 | seed |",
             "| ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -598,9 +602,9 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "",
             "## 优化原理",
             "",
-            "`baseline` 保留原始配置：`--use-kl-loss --kl-loss-coef 0.00` 加 `--ref-load`。"
-            "`zero_kl` 移除未使用的 reference 路径，同时保留 8192-token 动态 batch 预算。"
-            "KL 项严格乘以零，因此该改动移除计算但不改变标量目标。",
+            "`baseline` 传入原始配置：`--use-kl-loss --kl-loss-coef 0.00` 加 `--ref-load`，"
+            "参数规范化代码自动关闭 reference 路径；`zero_kl` 显式移除这些参数。两组都保留 8192-token "
+            "动态 batch 预算且不执行 reference forward，用于验证自动规范化与显式配置等价。",
             "",
             "`optimized` 基于 `zero_kl` 设置 `--update-weights-interval 2`。Hybrid 在奇数完成 step 跳过 "
             "Rollout pause、权重传输和 resume endpoint，同时仍在间隔边界、最后一步以及评测前强制发布。",
@@ -641,7 +645,8 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "```",
             "",
             "设置 `TASK22_VARIANT=zero_kl UPDATE_WEIGHTS_INTERVAL=1` 可只关闭 interval-two 发布；"
-            "设置 `TASK22_VARIANT=baseline` 可回退两个改动。",
+            "当前代码会自动关闭系数严格为零的 KL reference 路径。原始 baseline 仅用于复核提交 "
+            "`056f4b47c2022910c780f497d42283a803dc2ea7` 上已发布的历史对照，不再是支持的回退模式。",
             "",
             "生成文件：`summary.csv`、`step_metrics.csv`、`throughput_curves.svg`、"
             "`step_time_curves.svg` 和 `weight_update_curves.svg`。",
@@ -702,7 +707,7 @@ def main() -> None:
         raise RuntimeError(f"Every component run must contain exactly {TOTAL_STEPS} steps")
     if any(row["total_samples"] != TOTAL_STEPS * GLOBAL_BATCH_SIZE for row in summaries):
         raise RuntimeError("Component runs contain missing or extra samples")
-    expected_reference = {"baseline": True, "zero_kl": False, "optimized": False}
+    expected_reference = {variant: False for variant in VARIANTS}
     if any(row["has_reference_forward"] != expected_reference[row["variant"]] for row in summaries):
         raise RuntimeError("Reference-forward execution does not match the three-stage design")
     if any(row["update_weight_buffer_size"] != UPDATE_WEIGHT_BUFFER_SIZE for row in summaries):

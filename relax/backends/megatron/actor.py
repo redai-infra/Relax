@@ -130,6 +130,20 @@ def _should_publish_hybrid_weights(
     return (eval_interval is not None and step % eval_interval == 0) or step % num_rollout_per_epoch == 0
 
 
+def _warn_if_hybrid_publication_degraded(args: Any, already_warned: bool) -> bool:
+    evaluation_configured = args.eval_interval is not None and args.eval_prompt_data is not None
+    epoch_length_unknown = getattr(args, "num_rollout_per_epoch", None) is None
+    if already_warned or args.update_weights_interval == 1 or not evaluation_configured or not epoch_length_unknown:
+        return already_warned
+
+    logger.warning(
+        "Hybrid weight publication interval is disabled because evaluation is configured but "
+        "num_rollout_per_epoch is unavailable to the Actor. Publishing every step so epoch-boundary "
+        "evaluation cannot use stale weights."
+    )
+    return True
+
+
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
     if not counts or any((not isinstance(c, int)) or c <= 0 for c in counts):
         raise ValueError(f"rollout mini counts must be positive integers, got {counts}")
@@ -613,15 +627,24 @@ class MegatronTrainRayActor(TrainRayActor):
         # (see Rollout._run_eval_with_mark), so we don't emit them here.
         if not has_rollout:
             return
+        rollout_serve_url = None
         try:
             rollout_serve_url = get_serve_url("rollout")
-            response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
+            response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id}, timeout=30)
             response.raise_for_status()
-            if end_update_weight:
-                response = requests.get(f"{rollout_serve_url}/end_update_weight")
-                response.raise_for_status()
         except Exception as e:
             logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
+        finally:
+            if end_update_weight:
+                self._end_rollout_weight_update(rollout_serve_url, rollout_id)
+
+    def _end_rollout_weight_update(self, rollout_serve_url: str | None, rollout_id: int) -> None:
+        try:
+            rollout_serve_url = rollout_serve_url or get_serve_url("rollout")
+            response = requests.get(f"{rollout_serve_url}/end_update_weight", timeout=30)
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Error resuming rollout after weight update for rollout_id {rollout_id}: {e}")
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
@@ -1447,6 +1470,10 @@ class MegatronTrainRayActor(TrainRayActor):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
             return
 
+        self._hybrid_publication_degraded_warned = _warn_if_hybrid_publication_degraded(
+            self.args,
+            getattr(self, "_hybrid_publication_degraded_warned", False),
+        )
         should_publish_weights = _should_publish_hybrid_weights(
             rollout_id,
             self.args.update_weights_interval,
@@ -1456,11 +1483,26 @@ class MegatronTrainRayActor(TrainRayActor):
             num_rollout_per_epoch=getattr(self.args, "num_rollout_per_epoch", None),
         )
         if should_publish_weights:
-            # Pause rollout only when a matching update/end_update_weight pair
-            # will run. Skipped publications must leave rollout progressing.
+            # _check_services_health waits until the current partition has a
+            # usable producer result, then pauses the Rollout service. Pair that
+            # pause with update_weights and end_update_weight below. On skipped
+            # boundaries we call none of the three: TransferQueue consumption
+            # and Rollout's max-staleness gate keep the pipeline bounded, while
+            # pausing without the matching end_update_weight would deadlock it.
             self._wait_for_previous_eval()
-            self._check_services_health()
-            self.update_weights()
+            _, rollout_unavailable = self._check_services_health()
+            if rollout_unavailable:
+                logger.warning(
+                    f"Skipping Hybrid weight publication at rollout_id {rollout_id}: Rollout is unavailable."
+                )
+                should_publish_weights = False
+            else:
+                try:
+                    self.update_weights()
+                except Exception:
+                    if dist.get_rank() == 0:
+                        self._end_rollout_weight_update(None, rollout_id)
+                    raise
 
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())

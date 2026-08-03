@@ -584,9 +584,18 @@ class Rollout(Base):
         if can_update:
             self._weight_update_ready.clear()
             self.status = "paused"
-            await self.rollout_manager.health_monitoring_pause.remote()
-            await self.rollout_manager.set_weight_updating.remote(True)
-            self._weight_update_ready.set()
+            try:
+                await self.rollout_manager.health_monitoring_pause.remote()
+                await self.rollout_manager.set_weight_updating.remote(True)
+            except Exception:
+                self.status = "running"
+                try:
+                    await self.rollout_manager.set_weight_updating.remote(False)
+                except Exception:
+                    self._logger.exception("Failed to roll back Rollout weight-update state")
+                raise
+            finally:
+                self._weight_update_ready.set()
             return 1
         return 0
 
