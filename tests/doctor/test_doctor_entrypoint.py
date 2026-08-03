@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import argparse
 from types import SimpleNamespace
 
 from relax.entrypoints import doctor
@@ -164,3 +165,39 @@ def test_doctor_skip_hf_validate_is_forwarded(monkeypatch):
     assert doctor.main(["--doctor-skip-hf-validate", "--", "--num-rollout", "1"]) == 0
     assert captured["argv"] == ["--num-rollout", "1", "--skip-hf-validate"]
     assert captured["validate"] is True
+
+
+def test_entrypoint_rejects_option_not_registered_by_any_parser(monkeypatch, capsys):
+    def fake_parse_training_args(argv, *, validate=True):
+        relax_parser = argparse.ArgumentParser(add_help=False)
+        relax_parser.add_argument("--num-rollout")
+        relax_parser.parse_known_args(argv)
+
+        backend_parser = argparse.ArgumentParser(add_help=False)
+        backend_parser.add_argument("--backend-option")
+        backend_parser.parse_known_args(argv)
+        return _args()
+
+    monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
+
+    code = doctor.main(
+        [
+            "--format",
+            "json",
+            "--",
+            "--num-rollout",
+            "1",
+            "--backend-option",
+            "enabled",
+            "--does-not-exist",
+            "123",
+        ]
+    )
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert '"rule_id": "CONFIG_UNKNOWN_ARGUMENT"' in output
+    assert '"unknown_options": [' in output
+    assert '"--does-not-exist"' in output
+    assert '"--num-rollout"' not in output.split('"unknown_options":', 1)[1].split("]", 1)[0]
+    assert '"--backend-option"' not in output.split('"unknown_options":', 1)[1].split("]", 1)[0]

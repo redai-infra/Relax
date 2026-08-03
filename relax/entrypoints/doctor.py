@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterator
 from typing import Any
 
+from relax.utils.doctor.option_audit import capture_registered_options, find_unknown_options
 from relax.utils.doctor.runner import render_json, render_text, run_doctor
 
 
@@ -41,23 +42,26 @@ def main(argv: list[str] | None = None) -> int:
 
     args = None
     parse_error = None
-    try:
-        args = parse_training_args(training_argv)
-    except SystemExit as exc:
-        parse_error = f"argparse exited with code {exc.code}"
-    except Exception as exc:  # noqa: BLE001 - all config failures should become diagnostics
-        parse_error = f"{type(exc).__name__}: {exc}"
+    with capture_registered_options() as registered_options:
         try:
-            args = parse_training_args(training_argv, validate=False)
-        except SystemExit as fallback_exc:
-            parse_error = f"{parse_error}; fallback argparse exited with code {fallback_exc.code}"
-        except Exception as fallback_exc:  # noqa: BLE001 - preserve the original validation failure
-            parse_error = f"{parse_error}; fallback parse failed: {type(fallback_exc).__name__}: {fallback_exc}"
+            args = parse_training_args(training_argv)
+        except SystemExit as exc:
+            parse_error = f"argparse exited with code {exc.code}"
+        except Exception as exc:  # noqa: BLE001 - all config failures should become diagnostics
+            parse_error = f"{type(exc).__name__}: {exc}"
+            try:
+                args = parse_training_args(training_argv, validate=False)
+            except SystemExit as fallback_exc:
+                parse_error = f"{parse_error}; fallback argparse exited with code {fallback_exc.code}"
+            except Exception as fallback_exc:  # noqa: BLE001 - preserve the original validation failure
+                parse_error = f"{parse_error}; fallback parse failed: {type(fallback_exc).__name__}: {fallback_exc}"
+    unknown_options = find_unknown_options(training_argv, registered_options) if args is not None else []
 
     report = run_doctor(
         argv=training_argv,
         args=args,
         parse_error=parse_error,
+        unknown_options=unknown_options,
         strict_warnings=options.strict_warnings,
     )
     output = render_json(report) if options.format == "json" else render_text(report)

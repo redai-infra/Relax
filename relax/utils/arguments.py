@@ -3170,6 +3170,8 @@ def slime_validate_args(args):
         )
 
     if args.num_steps_per_rollout is not None:
+        if args.num_steps_per_rollout <= 0:
+            raise ValueError("--num-steps-per-rollout must be greater than zero.")
         global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
         if args.global_batch_size is not None:
             assert args.global_batch_size == global_batch_size, (

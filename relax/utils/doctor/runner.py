@@ -25,6 +25,7 @@ def run_doctor(
     argv: list[str],
     args: Any | None,
     parse_error: str | None = None,
+    unknown_options: list[str] | None = None,
     strict_warnings: bool = False,
 ) -> DoctorReport:
     config_state = "unavailable" if args is None else ("partial" if parse_error is not None else "validated")
@@ -44,6 +45,16 @@ def run_doctor(
     )
 
     diagnostics: list[DiagnosticResult] = []
+    if unknown_options:
+        diagnostics.append(
+            DiagnosticResult(
+                rule_id="CONFIG_UNKNOWN_ARGUMENT",
+                severity="error",
+                message=f"unknown command-line option(s): {unknown_options}.",
+                fix="Fix misspelled options or remove flags that are not registered by Relax, Megatron, or SGLang.",
+                details={"unknown_options": unknown_options},
+            )
+        )
     for rule in get_rules():
         if config_state != "validated" and not rule.supports_partial:
             continue

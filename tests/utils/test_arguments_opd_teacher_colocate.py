@@ -231,3 +231,11 @@ def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
 
     with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
         arguments_module.slime_validate_args(args)
+
+
+def test_arguments_rejects_non_positive_num_steps_per_rollout(arguments_module):
+    args = _opd_args()
+    args.num_steps_per_rollout = 0
+
+    with pytest.raises(ValueError, match="num-steps-per-rollout must be greater than zero"):
+        arguments_module.slime_validate_args(args)
