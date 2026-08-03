@@ -25,7 +25,11 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
-from relax.engine.rollout.sync_intent import resolve_partition_request_priority, sync_intent_policy_enabled
+from relax.engine.rollout.sync_intent import (
+    plan_dp_aligned_extra_groups,
+    resolve_partition_request_priority,
+    sync_intent_policy_enabled,
+)
 from relax.utils.async_utils import run
 from relax.utils.cross_version_kv import cross_version_kv_enabled, cross_version_kv_group_ready_for_finalize
 from relax.utils.data.data import Dataset
@@ -1231,8 +1235,11 @@ async def generate_rollout_async(
             ]
             # Trim so total groups in TQ is divisible by dp_size (required by SeqlenBalancedSampler)
             dp_size = compute_dp_size(args)
-            max_total = len(data) + len(extra_completed)
-            max_extra = max_total - (max_total % dp_size) - len(data)
+            max_extra = plan_dp_aligned_extra_groups(
+                current_groups=len(data),
+                available_extra_groups=len(extra_completed),
+                dp_size=dp_size,
+            )
             accepted = extra_completed[:max_extra]
             surplus = extra_completed[max_extra:]
             aborted_samples.extend(surplus)

@@ -80,6 +80,23 @@ def count_cross_version_kv_progress_hedge_groups(groups: Sequence[Sequence[objec
     )
 
 
+def clear_cross_version_kv_progress_hedge_marker(group: Sequence[object]) -> bool:
+    was_hedge = False
+    for sample in group:
+        metadata = getattr(sample, "metadata", {})
+        was_hedge = bool(metadata.pop("a3_progress_hedge", False)) or was_hedge
+    return was_hedge
+
+
+def clear_cross_version_kv_task_markers(group: Sequence[object]) -> bool:
+    """Clear markers that are valid only while the original task is alive."""
+    was_hedge = clear_cross_version_kv_progress_hedge_marker(group)
+    for sample in group:
+        metadata = getattr(sample, "metadata", {})
+        metadata.pop("cross_version_kv_carried", None)
+    return was_hedge
+
+
 def estimate_cross_version_kv_group_remaining_tokens(
     group: Sequence[object],
     *,

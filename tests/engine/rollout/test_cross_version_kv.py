@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.cross_version_kv import (
+    clear_cross_version_kv_progress_hedge_marker,
+    clear_cross_version_kv_task_markers,
     count_cross_version_kv_progress_hedge_groups,
     cross_version_kv_group_ready_for_finalize,
     cross_version_kv_pause_mode,
@@ -150,6 +152,34 @@ def test_carried_progress_hedge_rebuilds_inflight_accounting() -> None:
     ]
 
     assert count_cross_version_kv_progress_hedge_groups(groups) == 2
+
+
+def test_hedge_completion_preserves_carried_marker_until_fallback_classification() -> None:
+    sample = SimpleNamespace(
+        metadata={
+            "a3_progress_hedge": True,
+            "cross_version_kv_carried": True,
+        }
+    )
+
+    assert clear_cross_version_kv_progress_hedge_marker([sample])
+    assert "a3_progress_hedge" not in sample.metadata
+    assert sample.metadata["cross_version_kv_carried"] is True
+
+
+def test_abort_to_buffer_clears_all_task_lifetime_markers() -> None:
+    sample = SimpleNamespace(
+        metadata={
+            "a3_progress_hedge": True,
+            "cross_version_kv_carried": True,
+            "cross_version_kv_carryovers": 2,
+        }
+    )
+
+    assert clear_cross_version_kv_task_markers([sample])
+    assert "a3_progress_hedge" not in sample.metadata
+    assert "cross_version_kv_carried" not in sample.metadata
+    assert sample.metadata["cross_version_kv_carryovers"] == 2
 
 
 @pytest.mark.parametrize(

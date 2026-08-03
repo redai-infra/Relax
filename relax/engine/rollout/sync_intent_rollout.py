@@ -28,13 +28,17 @@ from relax.engine.rollout.sync_intent import (
     get_sync_intent,
     mark_work_origin,
     plan_adaptive_window_fetch,
+    plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
     sync_intent_abort_retry_interval_seconds,
     sync_intent_abort_timeout_seconds,
     sync_intent_protected_drain_timeout_seconds,
+    validate_disjoint_rollout_groups,
     wait_for_sync_intent_end,
 )
 from relax.utils.cross_version_kv import (
+    clear_cross_version_kv_progress_hedge_marker,
+    clear_cross_version_kv_task_markers,
     count_cross_version_kv_progress_hedge_groups,
     cross_version_kv_enabled,
     estimate_cross_version_kv_group_remaining_tokens,
@@ -209,7 +213,6 @@ async def generate_rollout_async_with_sync_intent(
     strict_fallback_groups = 0
     strict_fallback_prefix_tokens = 0
     completed_cross_version_groups = 0
-    a3_progress_hedge_cap = 0
     a3_progress_hedge_inflight = 0
     a3_progress_hedge_groups = 0
     a3_estimated_remaining_tokens = 0
@@ -238,17 +241,6 @@ async def generate_rollout_async_with_sync_intent(
             )
             for group in adopted_fresh_groups
         )
-        a3_progress_hedge_cap = plan_cross_version_kv_progress_hedge(
-            adopted_groups=adopted_cross_version_groups,
-            adopted_debt_groups=adopted_debt_groups,
-            resident_groups=state.remaining_batch_size,
-            remaining_fresh_groups=args.rollout_batch_size,
-            rollout_batch_size=args.rollout_batch_size,
-            strict_retry_pending=strict_retry_pending,
-            estimated_remaining_tokens=a3_estimated_remaining_tokens,
-            max_response_length=args.rollout_max_response_len,
-        )
-
     committed_prev = 0
     prev_target = num_old_samples
     curr_target = 0 if is_final_backfill else args.rollout_batch_size
@@ -294,8 +286,7 @@ async def generate_rollout_async_with_sync_intent(
             )
             default_fetch_groups = max(default_fetch_groups, missing_debt_groups)
             using_a3_progress_hedge = False
-            remaining_hedge_budget = max(a3_progress_hedge_cap - a3_progress_hedge_inflight, 0)
-            if default_fetch_groups == 0 and missing_debt_groups == 0 and remaining_hedge_budget > 0:
+            if default_fetch_groups == 0 and missing_debt_groups == 0:
                 live_hedge = plan_cross_version_kv_progress_hedge(
                     adopted_groups=adopted_cross_version_groups,
                     adopted_debt_groups=adopted_debt_groups,
@@ -306,7 +297,7 @@ async def generate_rollout_async_with_sync_intent(
                     estimated_remaining_tokens=a3_estimated_remaining_tokens,
                     max_response_length=args.rollout_max_response_len,
                 )
-                default_fetch_groups = min(remaining_hedge_budget, live_hedge)
+                default_fetch_groups = live_hedge
                 using_a3_progress_hedge = default_fetch_groups > 0
             if default_fetch_groups == 0:
                 break
@@ -383,13 +374,12 @@ async def generate_rollout_async_with_sync_intent(
             started_at = task_started_at.pop(task, None)
             source_group = task_groups.pop(task, None)
             state.remaining_batch_size -= 1
+            if state.remaining_batch_size < 0:
+                raise RuntimeError("Rollout resident group accounting became negative")
             group: list[Sample] = task.result()
-            source_group_is_hedge = source_group is not None and any(
-                sample.metadata.get("a3_progress_hedge", False) for sample in source_group
+            source_group_is_hedge = source_group is not None and clear_cross_version_kv_progress_hedge_marker(
+                source_group
             )
-            if source_group is not None:
-                for sample in source_group:
-                    sample.metadata.pop("a3_progress_hedge", None)
             if source_group_is_hedge:
                 a3_progress_hedge_inflight -= 1
                 if a3_progress_hedge_inflight < 0:
@@ -400,7 +390,9 @@ async def generate_rollout_async_with_sync_intent(
             ):
                 raise RuntimeError("Cross-version task returned different sample identities")
             group_is_debt = bool(group) and all(sample.metadata.get("work_origin") == "old_debt" for sample in group)
-            if group_is_debt and intent_debt_groups_inflight > 0:
+            if group_is_debt:
+                if intent_debt_groups_inflight <= 0:
+                    raise RuntimeError("Rollout debt inflight accounting became negative")
                 intent_debt_groups_inflight -= 1
 
             if do_print:
@@ -419,6 +411,8 @@ async def generate_rollout_async_with_sync_intent(
                 and any(sample.metadata.get("cross_version_kv_carried") for sample in group)
             )
             if cross_version_fallback:
+                # Fail closed for the rest of this physical rollout: do not
+                # overlap fresh hedge admission with any strict rebuild wave.
                 strict_retry_pending = True
                 prefix_tokens = sum(sample.response_length for sample in group)
                 strict_fallback_groups += 1
@@ -454,6 +448,7 @@ async def generate_rollout_async_with_sync_intent(
                 state.recent_completed_response_lengths = state.recent_completed_response_lengths[-512:]
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
+                clear_cross_version_kv_task_markers(group)
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 continue
 
@@ -463,17 +458,20 @@ async def generate_rollout_async_with_sync_intent(
             if group_aborted:
                 if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
                     completed_cross_version_groups += 1
+                clear_cross_version_kv_task_markers(group)
                 for sample in group:
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
                 aborted_samples.append(group)
                 if not group_is_debt and progressed_fresh_groups < curr_target:
+                    # Lifecycle progress lets this physical rollout finish after
+                    # publication aborts, but aborted work is never train data.
                     progressed_fresh_groups += 1
-                    data.append(group)
                     pbar.update(args.n_samples_per_prompt)
             elif group_is_debt and accepted_debt_groups < prev_target:
                 if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
                     completed_cross_version_groups += 1
+                clear_cross_version_kv_task_markers(group)
                 debt_batch_to_transfer.append(group)
                 accepted_debt_groups += 1
                 data.append(group)
@@ -481,6 +479,7 @@ async def generate_rollout_async_with_sync_intent(
             elif not group_is_debt and progressed_fresh_groups < curr_target:
                 if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
                     completed_cross_version_groups += 1
+                clear_cross_version_kv_task_markers(group)
                 fresh_batch_to_transfer.append(group)
                 accepted_fresh_groups += 1
                 progressed_fresh_groups += 1
@@ -489,6 +488,7 @@ async def generate_rollout_async_with_sync_intent(
             else:
                 if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
                     completed_cross_version_groups += 1
+                clear_cross_version_kv_task_markers(group)
                 oversample_surplus.append(group)
 
         transfer_batch_size = (
@@ -571,11 +571,14 @@ async def generate_rollout_async_with_sync_intent(
     await stop_sglang_profile(args, rollout_id)
 
     rollout_time = timer.end("rollout")
-    sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-    logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
-        f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
-    )
+    if data:
+        sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
+        logger.info(
+            f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+            f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        )
+    else:
+        logger.info("Finish rollout with no accepted groups; all lifecycle progress is buffered for retry.")
     all_samples = [sample for group in data for sample in group]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
 
@@ -600,6 +603,10 @@ async def generate_rollout_async_with_sync_intent(
         )
         aborted_samples.extend(new_aborted)
         aborted_samples.extend(completed_protected)
+        for group in new_aborted:
+            clear_cross_version_kv_task_markers(group)
+        for group in completed_protected:
+            clear_cross_version_kv_task_markers(group)
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."
@@ -652,13 +659,18 @@ async def generate_rollout_async_with_sync_intent(
                 if not all(sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) for sample in group)
             ]
             dp_size = compute_dp_size(args)
-            max_total = len(data) + len(extra_completed)
-            max_extra = max_total - (max_total % dp_size) - len(data)
+            max_extra = plan_dp_aligned_extra_groups(
+                current_groups=len(data),
+                available_extra_groups=len(extra_completed),
+                dp_size=dp_size,
+            )
             accepted = extra_completed[:max_extra]
             aborted_samples.extend(extra_completed[max_extra:])
             data.extend(accepted)
             if accepted:
                 await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+
+    validate_disjoint_rollout_groups(data, aborted_samples)
 
     global CURRENT_ROLLOUT_BATCH
     if CURRENT_ROLLOUT_BATCH:

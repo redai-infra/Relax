@@ -18,11 +18,13 @@ from relax.engine.rollout.sync_intent import (
     SyncIntentSnapshot,
     mark_work_origin,
     plan_adaptive_window_fetch,
+    plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
     resolve_partition_request_priority,
     should_admit_fresh,
     sync_intent_policy_enabled,
     sync_intent_protected_drain_timeout_seconds,
+    validate_disjoint_rollout_groups,
 )
 
 
@@ -39,6 +41,42 @@ def test_policy_enable_values(monkeypatch: pytest.MonkeyPatch) -> None:
     for value in ("1", "true", "yes", "on"):
         monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, value)
         assert sync_intent_policy_enabled()
+
+
+@pytest.mark.parametrize(
+    ("current", "available", "dp_size", "expected"),
+    [
+        (1, 5, 8, 0),
+        (1, 7, 8, 7),
+        (9, 1, 8, 0),
+        (9, 7, 8, 7),
+        (8, 5, 8, 0),
+        (8, 8, 8, 8),
+    ],
+)
+def test_dp_aligned_extra_never_uses_negative_slice(
+    current: int,
+    available: int,
+    dp_size: int,
+    expected: int,
+) -> None:
+    assert (
+        plan_dp_aligned_extra_groups(
+            current_groups=current,
+            available_extra_groups=available,
+            dp_size=dp_size,
+        )
+        == expected
+    )
+
+
+def test_rollout_output_and_buffer_must_not_share_sample_identity() -> None:
+    sample = object()
+
+    with pytest.raises(RuntimeError, match="dual accepted/buffer ownership"):
+        validate_disjoint_rollout_groups([[sample]], [[sample]])
+
+    validate_disjoint_rollout_groups([[object()]], [[object()]])
 
 
 def test_protected_drain_uses_long_independent_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

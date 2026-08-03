@@ -278,6 +278,31 @@ def plan_intent_guard_fetch(
     return default_fetch_groups
 
 
+def plan_dp_aligned_extra_groups(
+    *,
+    current_groups: int,
+    available_extra_groups: int,
+    dp_size: int,
+) -> int:
+    if min(current_groups, available_extra_groups) < 0:
+        raise ValueError("group counts must be non-negative")
+    if dp_size <= 0:
+        raise ValueError("dp_size must be positive")
+    aligned_total = ((current_groups + available_extra_groups) // dp_size) * dp_size
+    return max(aligned_total - current_groups, 0)
+
+
+def validate_disjoint_rollout_groups(
+    accepted_groups: list[list[object]],
+    buffered_groups: list[list[object]],
+) -> None:
+    accepted_ids = {id(sample) for group in accepted_groups for sample in group}
+    buffered_ids = {id(sample) for group in buffered_groups for sample in group}
+    overlap = accepted_ids & buffered_ids
+    if overlap:
+        raise RuntimeError(f"Rollout samples have dual accepted/buffer ownership: {len(overlap)} samples")
+
+
 def should_admit_fresh(
     snapshot: SyncIntentSnapshot,
     *,
