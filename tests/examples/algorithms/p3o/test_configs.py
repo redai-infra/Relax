@@ -217,8 +217,8 @@ def test_p3o_runtime_env_bypasses_proxy_for_colocated_services():
     """Verify that proxy environment variables are not set in Ray runtime env.
 
     Per PR cleanup task: proxy clearing settings were removed as they are
-    deployment-specific and should not be hardcoded in launch scripts.
-    This test now verifies their absence rather than their presence.
+    deployment-specific and should not be hardcoded in launch scripts. This
+    test now verifies their absence rather than their presence.
     """
     common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
 

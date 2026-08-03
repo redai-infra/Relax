@@ -55,9 +55,7 @@ def get_logits_and_tokens_offset_with_cp(
     if padded_total_length is not None:
         # Bridge VL+CP+thd: per-sample padded length is already aligned to tp*cp*2.
         if padded_total_length % (2 * cp_size) != 0:
-            raise ValueError(
-                f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}"
-            )
+            raise ValueError(f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}")
         chunk_size = padded_total_length // (2 * cp_size)
     elif qkv_format == "thd":
         chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
@@ -319,9 +317,7 @@ def all_gather_with_cp(
     chunk_1 = tensor[logits_offset[0][1] - logits_offset[0][0] :]
     expected_chunk_1_len = logits_offset[1][1] - logits_offset[1][0]
     if chunk_1.shape[0] != expected_chunk_1_len:
-        raise ValueError(
-            f"chunk_1 length {chunk_1.shape[0]} != expected {expected_chunk_1_len}"
-        )
+        raise ValueError(f"chunk_1 length {chunk_1.shape[0]} != expected {expected_chunk_1_len}")
 
     def zero(len: int) -> torch.Tensor:
         return torch.zeros(

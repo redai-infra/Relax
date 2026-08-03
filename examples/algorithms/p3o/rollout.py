@@ -14,14 +14,10 @@ from relax.utils.types import Sample
 def _behavior_temperature() -> float:
     raw_value = os.environ.get("P3O_BEHAVIOR_TEMPERATURE")
     if raw_value is None:
-        raise ValueError(
-            "P3O_BEHAVIOR_TEMPERATURE must be set when temperature override is enabled"
-        )
+        raise ValueError("P3O_BEHAVIOR_TEMPERATURE must be set when temperature override is enabled")
     value = float(raw_value)
     if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(
-            "P3O_BEHAVIOR_TEMPERATURE must be finite and greater than zero"
-        )
+        raise ValueError("P3O_BEHAVIOR_TEMPERATURE must be finite and greater than zero")
     return value
 
 
