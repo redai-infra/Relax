@@ -2747,6 +2747,11 @@ def slime_validate_args(args):
         if args.advantage_estimator == "rloo":
             if args.fully_async or args.hybrid:
                 raise ValueError("RLOO currently supports synchronous colocate training only.")
+            if getattr(args, "partial_rollout", False):
+                raise ValueError(
+                    "RLOO does not support partial rollout because recycled prefixes are off-policy; "
+                    "disable --partial-rollout."
+                )
             if args.n_samples_per_prompt < 2:
                 raise ValueError(f"RLOO requires --n-samples-per-prompt >= 2, got {args.n_samples_per_prompt}.")
             if args.normalize_advantages:
@@ -3082,6 +3087,15 @@ def slime_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    if (
+        args.advantage_estimator == "rloo"
+        and args.global_batch_size != args.rollout_batch_size * args.n_samples_per_prompt
+    ):
+        raise ValueError(
+            "RLOO requires exactly one optimizer update per rollout; set --global-batch-size equal to "
+            "--rollout-batch-size * --n-samples-per-prompt and remove multi-step rollout settings."
+        )
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False

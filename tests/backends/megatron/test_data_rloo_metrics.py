@@ -44,6 +44,7 @@ def test_log_rollout_data_keeps_rloo_sequence_metrics_cp_invariant(monkeypatch):
         "rloo_advantage": [torch.tensor([-1.0]), torch.tensor([1.0])],
         "rloo_advantage_abs": [torch.tensor([1.0]), torch.tensor([1.0])],
         "rloo_empty_response_fraction": [torch.tensor([0.0]), torch.tensor([1.0])],
+        "group_indices": [7, 9],
         "custom_tensor_metric": [torch.tensor([1.0]), torch.tensor([3.0])],
     }
 
@@ -55,4 +56,5 @@ def test_log_rollout_data_keeps_rloo_sequence_metrics_cp_invariant(monkeypatch):
     assert captured["rloo_advantage"] == 0.0
     assert captured["rloo_advantage_abs"] == 1.0
     assert captured["rloo_empty_response_fraction"] == 0.5
+    assert "group_indices" not in captured
     assert captured["custom_tensor_metric"] == 4.0

@@ -439,11 +439,12 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
     data = [Sample.from_dict(sample) for sample in data]
     if (ratio := args.load_debug_rollout_data_subsample) is not None:
         original_num_rows = len(data)
-        if (
+        group_aware_subsampling = args.advantage_estimator == "rloo" or (
             args.custom_reward_post_process_path is None
             and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"]
             and args.rewards_normalization
-        ):
+        )
+        if group_aware_subsampling:
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))
             if None in group_ids:
                 raise ValueError("Sample.group_index is required for group-aware debug subsampling.")

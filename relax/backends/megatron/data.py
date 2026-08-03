@@ -908,6 +908,7 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "group_indices",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",

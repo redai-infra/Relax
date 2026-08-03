@@ -30,10 +30,14 @@ def test_rloo_native_cp_attention_mask_selects_zigzag_query_rows(monkeypatch, cp
     )
     batch = {"tokens": torch.zeros((1, 4), dtype=torch.long)}
 
+    monkeypatch.setattr(model.torch, "triu", lambda *_args, **_kwargs: pytest.fail("global mask allocated"))
     actual = model._get_rloo_native_cp_attention_mask(args, batch)
 
-    full_mask = torch.triu(torch.ones((8, 8), dtype=torch.bool), diagonal=1)
-    expected = full_mask[expected_rows].reshape(1, 1, 4, 8)
+    query_positions = torch.tensor(expected_rows)
+    key_positions = torch.arange(8)
+    expected = (key_positions.unsqueeze(0) > query_positions.unsqueeze(1)).reshape(1, 1, 4, 8)
+    assert actual.shape == (1, 1, 4, 8)
+    assert actual.numel() == 4 * 8
     assert torch.equal(actual, expected)
 
 

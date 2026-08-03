@@ -206,18 +206,16 @@ def _get_rloo_native_cp_attention_mask(args: Namespace, batch: dict) -> torch.Te
     chunk_size = local_sequence_length // 2
     global_sequence_length = local_sequence_length * cp_size
     cp_rank = mpu.get_context_parallel_rank()
-    first = slice(cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
-    second_chunk = 2 * cp_size - cp_rank - 1
-    second = slice(second_chunk * chunk_size, (second_chunk + 1) * chunk_size)
-    full_mask = torch.triu(
-        torch.ones(
-            (global_sequence_length, global_sequence_length),
-            dtype=torch.bool,
-            device=tokens.device,
-        ),
-        diagonal=1,
+    first_start = cp_rank * chunk_size
+    second_start = (2 * cp_size - cp_rank - 1) * chunk_size
+    query_positions = torch.cat(
+        [
+            torch.arange(first_start, first_start + chunk_size, device=tokens.device),
+            torch.arange(second_start, second_start + chunk_size, device=tokens.device),
+        ]
     )
-    return torch.cat([full_mask[first], full_mask[second]], dim=0).reshape(
+    key_positions = torch.arange(global_sequence_length, device=tokens.device)
+    return (key_positions.unsqueeze(0) > query_positions.unsqueeze(1)).reshape(
         1, 1, local_sequence_length, global_sequence_length
     )
 
