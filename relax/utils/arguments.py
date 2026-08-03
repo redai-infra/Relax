@@ -1622,6 +1622,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "p3o",
                 ],
                 default="grpo",
                 help=(
@@ -2627,6 +2628,76 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _validate_p3o_args(args) -> None:
+    """Reject P3O configurations whose ESS scope or replay would be wrong.
+
+    These are hard errors, not warnings. Every condition below silently changes
+    the objective (not just performance), and the failure mode is a plausible
+    loss curve that does not implement P3O.
+    """
+    # These are raises rather than asserts on purpose: `python -O` strips
+    # asserts, and every condition here silently changes the objective rather
+    # than crashing, so a stripped check would let a non-P3O run masquerade as
+    # one for its entire duration.
+    if not args.use_rollout_logprobs:
+        raise ValueError(
+            "P3O requires the rollout sampling distribution as its behavior policy. "
+            "Add --use-rollout-logprobs; without it there is no importance ratio to correct."
+        )
+    if not args.calculate_per_token_loss:
+        raise ValueError(
+            "P3O requires --calculate-per-token-loss. Per-sample-mean normalization "
+            "reintroduces a per-micro-batch denominator, so the loss would depend on "
+            "how the optimizer step is split into micro-batches."
+        )
+    if args.use_tis:
+        raise ValueError(
+            "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
+            "rollout/training mismatch, and stacking them double-corrects the ratio."
+        )
+    if getattr(args, "use_critic", False):
+        raise ValueError(
+            "P3O does not use a critic; it is a score-function estimator over group-relative "
+            "advantages. Drop --use-critic."
+        )
+
+    incompatible_flags = {
+        "get_mismatch_metrics": "--get-mismatch-metrics",
+        "use_opsm": "--use-opsm",
+        "enable_mtp_training": "--enable-mtp-training",
+        "use_routing_replay": "--use-routing-replay",
+        "use_rollout_routing_replay": "--use-rollout-routing-replay",
+        "overlap_moe_expert_parallel_comm": "--overlap-moe-expert-parallel-comm",
+    }
+    for attr, flag in incompatible_flags.items():
+        if getattr(args, attr, False):
+            raise ValueError(f"P3O does not support {flag} in the replayed two-pass optimizer step.")
+    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        raise ValueError("P3O requires token-sum normalization and does not support a custom PG-loss reducer.")
+
+    # The ESS pre-pass replays the same micro-batch window under no_grad. Ops that
+    # mutate state on a forward would make the two passes disagree.
+    if getattr(args, "fp8", None) is not None:
+        raise ValueError(
+            "P3O's ESS pre-pass runs a second forward over the same window, which would "
+            "advance FP8 amax history and make the training forward non-reproducible. "
+            "Disable FP8 or run P3O without the two-pass ESS scope."
+        )
+    dropout = max(getattr(args, "attention_dropout", 0.0) or 0.0, getattr(args, "hidden_dropout", 0.0) or 0.0)
+    if dropout > 0.0:
+        raise ValueError(
+            f"P3O requires deterministic replay of the optimizer-step window, but dropout is "
+            f"enabled (max rate {dropout}). Set --attention-dropout 0.0 and --hidden-dropout 0.0."
+        )
+
+    if getattr(args, "fully_async", False):
+        raise ValueError(
+            "P3O's optimizer-step ESS scope requires the whole micro-batch window to be "
+            "available before the training pass. Fully-async mode streams micro-batches, so "
+            "the window is not knowable in advance."
+        )
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -3256,3 +3327,10 @@ def slime_validate_args(args):
     if args.genrm_model_path:
         args.genrm_engine_config = args.genrm_engine_config or {}
         args.genrm_sampling_config = args.genrm_sampling_config or {}
+
+    # Validate the final effective values. Several execution flags are derived
+    # above (hybrid and routing replay), and custom YAML is applied near the end;
+    # validating earlier would let those paths silently bypass P3O's replay
+    # contract.
+    if args.advantage_estimator == "p3o":
+        _validate_p3o_args(args)
