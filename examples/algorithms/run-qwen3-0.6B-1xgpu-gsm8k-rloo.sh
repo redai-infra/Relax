@@ -69,6 +69,9 @@ N_SAMPLES="${N_SAMPLES:=8}"
 # tolerates this via the ratio; RLOO does not. Enforced at startup by
 # validate_rloo_args, so overriding these to imply two steps fails fast.
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=32}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:=1}"
+# Overridable for the multi-GPU CP validation; 1 keeps the single-GPU default.
+CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:=1}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3-0.6B
@@ -95,9 +98,12 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1
 
    # Scaling to more data-parallel ranks: the mini rollout batch must divide
-   # dp_size, so DP=8 needs --micro-batch-size 8 and --global-batch-size 64.
+   # dp_size, so DP=8 needs MICRO_BATCH_SIZE=8 plus ROLLOUT_BATCH_SIZE=8 and
+   # GLOBAL_BATCH_SIZE=64 -- all three together, since RLOO requires
+   # rollout_batch_size * n_samples_per_prompt == global_batch_size.
    # Measured on 8xH100; DP<=4 works with the defaults below.
    --global-batch-size ${GLOBAL_BATCH_SIZE}
+   --micro-batch-size ${MICRO_BATCH_SIZE}
    --balance-data
    --use-fault-tolerance
 )
@@ -105,10 +111,15 @@ ROLLOUT_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   # Overridable so the multi-GPU CP checks can reuse this recipe unchanged;
+   # CP > 1 additionally requires --calculate-per-token-loss, already set below.
+   --context-parallel-size ${CONTEXT_PARALLEL_SIZE}
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
+   # Required for RLOO: with this flag the reduction is a per-sample token sum,
+   # which is the completion-level objective once the gradient is normalized by
+   # the sample count (see loss.py:uses_completion_level_reduction).
    --calculate-per-token-loss
    --use-dynamic-batch-size
    --max-tokens-per-gpu 8192
