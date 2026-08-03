@@ -177,17 +177,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--hybrid-async-weight-sync",
+                "--hybrid-weights-backuper-on-gpu",
                 action="store_true",
                 default=False,
                 help=(
-                    "Hybrid mode only: push the actor->rollout DCS weight sync in a background "
-                    "thread, joined at the top of the next iteration's push instead of blocking "
-                    "immediately. Opt-in and off by default: measured as no faster than the "
-                    "synchronous push on 2xH20 (the DCS push's H2D copy + TP all-gather + NCCL "
-                    "broadcast still run on the actor's own GPU and contend with the next step's "
-                    "compute either way), see exps/hybrid_async_perf_h20/README.md. Ignored when "
-                    "--disable-weights-backuper or --keep-old-actor is set."
+                    "Hybrid mode only: keep the 'actor' TensorBackuper snapshot used for the "
+                    "DCS actor->rollout weight push on-device instead of host-pinned memory, "
+                    "trading a permanent extra device-resident copy of the model (full size at "
+                    "TP=1, sharded by TP degree otherwise) for skipping the D2H backup copy + "
+                    "H2D push-time copy (relax/distributed/checkpoint_service/backends/"
+                    "device_direct.py's _named_params_and_buffers). Off by default: raises peak "
+                    "GPU memory, so only enable if headroom is confirmed for the model being trained."
                 ),
             )
             parser.add_argument(

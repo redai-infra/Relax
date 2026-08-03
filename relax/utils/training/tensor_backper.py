@@ -40,7 +40,7 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def backup(self, tag: str):
+    def backup(self, tag: str, *, on_device: bool = False):
         raise NotImplementedError
 
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -64,13 +64,22 @@ class _TensorBackuperNormal(TensorBackuper):
         return self._backups[tag]
 
     @torch.no_grad()
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
+        """Snapshot the source tensors into ``tag``.
+
+        By default the snapshot lives on host-pinned memory. Passing
+        ``on_device=True`` keeps it on the source tensor's own device instead
+        (a D2D copy, avoiding the D2H/H2D PCIe round trip), at the cost of
+        holding a full extra device-resident copy of every tensor in ``tag``
+        for as long as the tag exists.
+        """
         from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
 
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                snapshot = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                target_device = param.device if on_device else torch.device("cpu")
+                snapshot = torch.empty_like(param, device=target_device, pin_memory=_PIN_MEMORY and not on_device)
                 for attr in _MEGATRON_TP_ATTRS:
                     if hasattr(param, attr):
                         setattr(snapshot, attr, getattr(param, attr))
@@ -118,7 +127,7 @@ class _TensorBackuperNoop(TensorBackuper):
         assert _compute_hash_dict(ans) == self._backup_hash_dict
         return ans
 
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
         device_utils.synchronize()

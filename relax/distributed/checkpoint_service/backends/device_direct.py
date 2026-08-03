@@ -161,12 +161,15 @@ class DeviceDirectBackend(CommBackend):
         Defaults to reading the live model directly; ``weights_getter``
         overrides this with a decoupled snapshot (e.g. hybrid mode's
         TensorBackuper tag) when the caller cannot safely read live params at
-        push time. That snapshot lives on host memory, but all_gather_param and
-        the NCCL/GLOO broadcast below require device tensors, so coerce here
-        (mirrors UpdateWeightFromTensor's equivalent H2D copy for its CUDA-IPC
-        push). ``tensor.to(device)`` returns a brand-new Tensor object, which
-        drops the tensor_model_parallel/partition_dim/etc. attributes
-        TensorBackuper attached to the CPU snapshot — copy them onto the device
+        push time. That snapshot is host-pinned by default (or already device-
+        resident when the backuper was populated with ``on_device=True``, e.g.
+        via ``--hybrid-weights-backuper-on-gpu``); all_gather_param and the
+        NCCL/GLOO broadcast below require device tensors either way, so the
+        host case is coerced here (mirrors UpdateWeightFromTensor's equivalent
+        H2D copy for its CUDA-IPC push) — the device-resident case just skips
+        this branch. ``tensor.to(device)`` returns a brand-new Tensor object,
+        which drops the tensor_model_parallel/partition_dim/etc. attributes
+        TensorBackuper attached to the snapshot — copy them onto the device
         copy too, same as Megatron's own copy_tensor_model_parallel_attributes
         does after any such reallocation.
         """

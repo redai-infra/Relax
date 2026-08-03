@@ -251,8 +251,9 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.vocab_size = self.tokenizer.vocab_size
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
         # internally via _switch_model, and pushes weights to rollout via DCS
-        # (relax.distributed.checkpoint_service), reading from the "actor" CPU
-        # snapshot tag instead of the live model directly.
+        # (relax.distributed.checkpoint_service), reading from the "actor"
+        # snapshot tag (host-pinned by default, or on-device with
+        # --hybrid-weights-backuper-on-gpu) instead of the live model directly.
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
@@ -265,7 +266,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
             self._active_model_tag: str | None = "actor"
-            self.weights_backuper.backup("actor")
+            # Only the "actor" tag (the DCS push source) ever goes on-device; ref/
+            # teacher/old_actor stay host-pinned regardless, see --hybrid-weights-
+            # backuper-on-gpu help text for the memory tradeoff.
+            self._weights_backup_on_device = self.args.hybrid and self.args.hybrid_weights_backuper_on_gpu
+            self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
 
             if with_ref:
                 self.load_other_checkpoint("ref", args.ref_load)
@@ -282,52 +287,21 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
 
             if self.args.hybrid:
-                # Mutable indirection so the background push (see
-                # _hybrid_async_weight_sync below) can point the DCS client at an
-                # isolated double-buffered snapshot without racing the "actor" tag
-                # that train_hybrid's per-step backup("actor") keeps overwriting.
-                # A no-op reassignment (tag stays "actor") when the async path is
-                # off, so this is always safe to set.
-                self._hybrid_send_tag_active = "actor"
                 # Push actor->rollout weights via DCS instead of the CUDA-IPC
                 # UpdateWeightFromTensor path (see docs/en/guide/hybrid-training.md).
+                # Always synchronous: an earlier version overlapped this push with
+                # the next training iteration via a background ThreadPoolExecutor,
+                # but that thread's DCS collectives (TP all-gather, Gloo barrier,
+                # NCCL/GLOO broadcast) share the same Megatron process groups the
+                # main thread's next-iteration collectives use, with no ordering
+                # coordination between the two — a real cross-thread collective
+                # deadlock risk, not just a theoretical one, on top of measuring no
+                # faster than this synchronous push on 2xH20 (see
+                # exps/hybrid_async_perf_h20/README.md). Removed entirely rather
+                # than kept opt-in.
                 self.checkpoint_engine_client = self._create_checkpoint_engine_client(
-                    role, weights_getter=lambda: self.weights_backuper.get(self._hybrid_send_tag_active)
+                    role, weights_getter=lambda: self.weights_backuper.get("actor")
                 )
-
-                # Opt-in: overlap the actor->rollout weight push with the next
-                # training iteration instead of blocking train_hybrid on it,
-                # gated behind --hybrid-async-weight-sync (default off). Measured
-                # as no faster than the synchronous push on 2xH20 (see
-                # exps/hybrid_async_perf_h20/README.md) — the DCS push's H2D copy
-                # + TP all-gather + NCCL broadcast still run on the actor's own
-                # GPU and contend with the next step's compute either way. Kept
-                # as an opt-in switch rather than removed, since larger-scale /
-                # slower-interconnect setups may see a different tradeoff.
-                # Safe only because the push reads a CPU-pinned TensorBackuper
-                # snapshot decoupled from the live GPU params the next step
-                # mutates. Disabled when there is no real CPU backup
-                # (--disable-weights-backuper, whose _TensorBackuperNoop doesn't
-                # support extra tags/copy()) or when --keep-old-actor is set,
-                # since that bookkeeping mutates the same CPU tags that
-                # _switch_model("old_actor") reads on the very next iteration's
-                # main thread — overlapping those would race.
-                self._hybrid_async_weight_sync = (
-                    self.args.hybrid_async_weight_sync
-                    and self.args.enable_weights_backuper
-                    and not self.args.keep_old_actor
-                )
-                if self._hybrid_async_weight_sync:
-                    from concurrent.futures import ThreadPoolExecutor
-
-                    self._hybrid_sync_executor = ThreadPoolExecutor(max_workers=1)
-                    self._pending_hybrid_sync_future = None
-                    self._hybrid_send_tag_counter = 0
-                    # TensorBackuper.copy() only overwrites keys that already exist
-                    # in the destination tag, so both double-buffer slots must be
-                    # pre-populated once before train_hybrid's per-step copy() calls.
-                    self.weights_backuper.backup("hybrid_send_0")
-                    self.weights_backuper.backup("hybrid_send_1")
             else:
                 update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
                 # Push-side repack is decided by the HF config: an FP8 release auto-routes
@@ -430,16 +404,6 @@ class MegatronTrainRayActor(TrainRayActor):
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
-
-    def _next_hybrid_send_tag(self) -> str:
-        self._hybrid_send_tag_counter += 1
-        return f"hybrid_send_{self._hybrid_send_tag_counter % 2}"
-
-    def _join_pending_hybrid_weight_sync(self) -> None:
-        future = self._pending_hybrid_sync_future
-        if future is not None:
-            self._pending_hybrid_sync_future = None
-            future.result()
 
     def _create_checkpoint_engine_client(self, role, weights_getter=None):
         is_pp_src_rank = (
@@ -962,7 +926,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
 
         # Update ref model if needed
         if (
@@ -1292,10 +1256,13 @@ class MegatronTrainRayActor(TrainRayActor):
         build_rollout_minibatch_plan) to reduce peak GPU memory during forward passes,
         matching fully-async behavior. Advantages are computed after all sub-batches
         are collected to ensure correct global normalization across the full batch
-        and DP group. The merged batch is then re-chunked into
-        num_iters_per_train_update pieces and trained as that many separate
-        optimizer steps, pipelining optimizer updates independently of how the
-        forward phase was sub-batched.
+        and DP group. The merged batch is then trained as a single optimizer step
+        (get_data_iterator derives its own microbatch chunking from
+        --micro-batch-size / --max-tokens-per-gpu, same as colocate/fully-async);
+        peak training-side memory is bounded by that per-microbatch chunking alone,
+        not by splitting into multiple separate optimizer.step() calls — the latter
+        would let later chunks train against a policy that earlier chunks' steps
+        already moved away from rollout_log_probs/log_probs.
         """
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
@@ -1409,22 +1376,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
-            # ── Phase 3: re-chunk the merged batch into num_iters_per_train_update
-            # pieces and train each as its own optimizer step. This is independent of
-            # how many sub-batches phase 1 used to fetch/forward data (that count
-            # comes from --num-steps-per-rollout via build_rollout_minibatch_plan);
-            # here we split the fully merged batch to pipeline optimizer updates
-            # with TransferQueue consumption and bound training-side peak memory.
-            num_iters = self.args.num_iters_per_train_update
-            num_local_samples = len(rollout_data["total_lengths"])
-            if num_local_samples % num_iters != 0:
-                raise RuntimeError(
-                    f"train_hybrid({rollout_id}): num_local_samples ({num_local_samples}) must be "
-                    f"divisible by num_iters_per_train_update ({num_iters})."
-                )
-            rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [
-                num_local_samples // num_iters for _ in range(num_iters)
-            ]
+            # ── Phase 3: train on the fully merged batch. Deliberately do NOT set
+            # ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY here (that would force
+            # get_data_iterator to split into multiple *separate* optimizer.step()
+            # calls, one per chunk — the previous num_iters_per_train_update-based
+            # re-chunking did exactly that, and it means chunk 2+ compute their
+            # PPO-style ratio against a policy that chunk 1's step has already
+            # moved away from rollout_log_probs/log_probs: real policy drift that
+            # isn't present anywhere else in the codebase at this granularity).
+            # Leaving the key unset lets get_data_iterator fall back to its
+            # global_batch_size-derived step count (same path colocate/fully-async
+            # use), which is 1 step under the standard on-policy sizing
+            # (global_batch_size == rollout_batch_size * n_samples_per_prompt).
+            # Peak training-side memory is still bounded the normal Megatron way,
+            # via --micro-batch-size / --max-tokens-per-gpu chunking microbatches
+            # *within* that single step (same params, gradients only accumulate,
+            # optimizer.step() fires once) — no drift, no separate CLI knob needed.
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -1448,7 +1415,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # Update CPU actor weight backup
-        self.weights_backuper.backup("actor")
+        self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
 
         # Update ref model if needed
         if (
@@ -1499,12 +1466,6 @@ class MegatronTrainRayActor(TrainRayActor):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
             return
 
-        if self._hybrid_async_weight_sync:
-            # Join the PREVIOUS iteration's push here (not the one we're about
-            # to fire) so the NCCL broadcast overlaps with this iteration's own
-            # data pull + forward/backward instead of blocking on it.
-            self._join_pending_hybrid_weight_sync()
-
         # Mirror train_async's pause/resume coordination so the rollout service
         # has a chance to finish its in-flight step (and refill any partition
         # gaps it owes) before we swap weights. Without this gate the rollout
@@ -1513,43 +1474,23 @@ class MegatronTrainRayActor(TrainRayActor):
         self._wait_for_previous_eval()
         self._check_services_health()
 
-        if self._hybrid_async_weight_sync:
-            send_tag = self._next_hybrid_send_tag()
-            # Isolated snapshot for this push, decoupled from the "actor" tag so
-            # the next iteration's backup("actor") can't race a still-in-flight
-            # broadcast reading this buffer.
-            self.weights_backuper.copy(src_tag="actor", dst_tag=send_tag)
+        # Push weights to rollout via DCS, reading the "actor" CPU snapshot tag
+        # (see _create_checkpoint_engine_client). Always synchronous — see the
+        # comment in __init__ on why overlapping this with the next training
+        # iteration on a background thread was tried and reverted (cross-thread
+        # collective deadlock risk against Megatron's own process groups).
+        run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        dist.barrier(group=get_gloo_group())
+        self._run_step_evaluation(rollout_id, end_update_weight=True)
 
-            def _push_and_notify(rid=rollout_id, tag=send_tag):
-                self._hybrid_send_tag_active = tag
-                run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
-                tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rid))
-                dist.barrier(group=get_gloo_group())
-                self._run_step_evaluation(rid, end_update_weight=True)
-
-            self._pending_hybrid_sync_future = self._hybrid_sync_executor.submit(_push_and_notify)
-
-            if is_train_done:
-                # No next iteration to overlap with. Join now so the
-                # controller's atexit shutdown doesn't race the in-flight
-                # push/eval against SGLang engine teardown.
-                self._join_pending_hybrid_weight_sync()
-                self._wait_for_previous_eval()
-        else:
-            # Push weights to rollout via DCS, reading the "actor" CPU snapshot
-            # tag (see _create_checkpoint_engine_client).
-            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-            dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(rollout_id, end_update_weight=True)
-
-            # On the final training step the rollout component has already
-            # exited its main loop, so the eval just triggered above will not
-            # be awaited anywhere. Block until it finishes; otherwise the
-            # controller's atexit shutdown races with eval and tears down the
-            # SGLang engines mid-flight.
-            if is_train_done:
-                self._wait_for_previous_eval()
+        # On the final training step the rollout component has already
+        # exited its main loop, so the eval just triggered above will not
+        # be awaited anywhere. Block until it finishes; otherwise the
+        # controller's atexit shutdown races with eval and tears down the
+        # SGLang engines mid-flight.
+        if is_train_done:
+            self._wait_for_previous_eval()
 
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
