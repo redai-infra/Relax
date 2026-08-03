@@ -17,6 +17,18 @@ from relax.components.advantages import Advantages
 from relax.components.critic import Critic
 from relax.components.rollout import Rollout
 from relax.components.sft import SFT
+from relax.core.service_plan import (
+    MODE_COLOCATE,
+    MODE_FULLY_ASYNC,
+    MODE_FULLY_ASYNC_ON_POLICY,
+    MODE_PPO_COLOCATE,
+    MODE_PPO_FULLY_ASYNC,
+    MODE_PPO_FULLY_ASYNC_ON_POLICY,
+    MODE_ROLLOUT_ONLY,
+    MODE_SFT,
+    MODE_TRAIN_ONLY,
+    resolve_role_mode,
+)
 
 
 # NOTE(dev): Use StrEnum and keep visiting order with definition order
@@ -125,27 +137,15 @@ ALGOS = {
 
 
 def process_role(config):
-    if config.debug_rollout_only:
-        return ROLES_ROLLOUT_ONLY
-    if config.debug_train_only:
-        return ROLES_TRAIN_ONLY
-    if getattr(config, "loss_type", None) == "sft":
-        return ROLES_SFT_ONLY
-    if getattr(config, "advantage_estimator", None) == "ppo":
-        if config.fully_async:
-            if getattr(config, "true_on_policy_mode", False):
-                return ROLES_PPO_FULLY_ASYNC_ON_POLICY
-            return ROLES_PPO_FULLY_ASYNC
-        return ROLES_PPO_COLOCATE
-    if config.hybrid:
-        # hybrid mode: actor handles ref/actor_fwd internally
-        # via _switch_model, only need actor + rollout services
-        return ROLES_COLOCATE
-    if config.fully_async:
-        if getattr(config, "true_on_policy_mode", False):
-            # actor_fwd's log_probs equal the train forward's log_probs in this regime
-            # (same weights, deterministic Megatron forward), so we recompute inline.
-            return ROLES_FULLY_ASYNC_ON_POLICY
-        return ROLES
-    else:
-        return ROLES_COLOCATE
+    role_sets = {
+        MODE_TRAIN_ONLY: ROLES_TRAIN_ONLY,
+        MODE_ROLLOUT_ONLY: ROLES_ROLLOUT_ONLY,
+        MODE_COLOCATE: ROLES_COLOCATE,
+        MODE_SFT: ROLES_SFT_ONLY,
+        MODE_FULLY_ASYNC: ROLES,
+        MODE_FULLY_ASYNC_ON_POLICY: ROLES_FULLY_ASYNC_ON_POLICY,
+        MODE_PPO_COLOCATE: ROLES_PPO_COLOCATE,
+        MODE_PPO_FULLY_ASYNC: ROLES_PPO_FULLY_ASYNC,
+        MODE_PPO_FULLY_ASYNC_ON_POLICY: ROLES_PPO_FULLY_ASYNC_ON_POLICY,
+    }
+    return role_sets[resolve_role_mode(config)]

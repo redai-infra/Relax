@@ -11,6 +11,7 @@ from sglang_router.launch_router import RouterArgs
 
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
+from relax.core.service_plan import build_service_plan
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
@@ -3300,3 +3301,5 @@ def slime_validate_args(args):
     if args.genrm_model_path:
         args.genrm_engine_config = args.genrm_engine_config or {}
         args.genrm_sampling_config = args.genrm_sampling_config or {}
+
+    build_service_plan(args).raise_for_errors()

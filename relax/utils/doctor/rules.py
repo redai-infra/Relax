@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from relax.core.service_plan import CPU_ONLY_ROLES
 from relax.utils.doctor.models import DiagnosticResult, DoctorContext
 
 
@@ -142,6 +143,22 @@ def check_resource_shape(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:
         return []
+    if ctx.config_state == "validated":
+        resource_errors = [
+            error
+            for error in ctx.topology.get("plan_errors", [])
+            if error.get("code") in {"resource_shape", "num_serves", "gpu_count", "gpu_required"}
+        ]
+        return [
+            _result(
+                "CONFIG_RESOURCE_SHAPE",
+                error["message"],
+                "Use [1, 0] only for CPU roles; model roles require [1, <positive num_gpus>].",
+                details=error,
+            )
+            for error in resource_errors
+        ]
+
     diagnostics = []
     for role, spec in _resource(args).items():
         if not isinstance(spec, Sequence) or isinstance(spec, (str, bytes, bytearray)) or len(spec) != 2:
@@ -161,6 +178,15 @@ def check_resource_shape(ctx: DoctorContext) -> list[DiagnosticResult]:
                     "CONFIG_RESOURCE_SHAPE",
                     f"resource entry for role {role!r} must contain integers and num_gpus >= 0.",
                     "Use integer values and keep CPU-only roles at [1, 0].",
+                    details={"role": role, "value": spec},
+                )
+            )
+        elif num_gpus == 0 and role not in CPU_ONLY_ROLES:
+            diagnostics.append(
+                _result(
+                    "CONFIG_RESOURCE_SHAPE",
+                    f"model role {role!r} requires num_gpus > 0.",
+                    "Assign at least one GPU to model roles; only CPU roles may use [1, 0].",
                     details={"role": role, "value": spec},
                 )
             )

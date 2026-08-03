@@ -308,6 +308,8 @@ def _derive_cluster_args_from_resource(args):
     # --- actor ---
     if "actor" in args.resource:
         _, actor_total_gpus = args.resource["actor"]
+        if actor_total_gpus <= 0:
+            raise ValueError("resource role 'actor' requires num_gpus > 0.")
         # Only override when the user relied on the defaults (1 node × 8 gpus)
         derived_gpus_per_node = min(num_gpus_per_node, actor_total_gpus)
         derived_num_nodes = max(1, actor_total_gpus // derived_gpus_per_node)

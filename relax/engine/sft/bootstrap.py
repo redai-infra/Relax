@@ -17,6 +17,7 @@ orchestrator. Three responsibilities:
 
 from argparse import Namespace
 
+from relax.core.service_plan import resolve_algo_key
 from relax.utils.logging_utils import get_logger
 
 
@@ -33,9 +34,7 @@ def resolve_sft_algo_key(config: Namespace) -> str:
     Same priority order as ``process_role`` in ``relax.core.registry`` so the
     ROLES set and the ALGOS dict stay consistent.
     """
-    if _is_sft(config):
-        return "sft"
-    return config.advantage_estimator
+    return resolve_algo_key(config)
 
 
 def resolve_sft_num_rollout(config: Namespace) -> None:

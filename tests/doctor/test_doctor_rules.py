@@ -128,6 +128,19 @@ def test_hybrid_resource_preview_uses_dedicated_actor_and_rollout_gpus():
     assert {item["placement_group"] for item in report.topology["role_plan"]} == {"dedicated"}
 
 
+def test_model_roles_reject_zero_gpu_resources():
+    report = run_doctor(
+        argv=[],
+        args=_namespace({"resource": {"actor": [1, 0], "rollout": [1, 8]}}),
+    )
+
+    assert not report.ok
+    assert "CONFIG_RESOURCE_SHAPE" in _rule_ids(report)
+    diagnostic = next(item for item in report.diagnostics if item.rule_id == "CONFIG_RESOURCE_SHAPE")
+    assert diagnostic.details["code"] == "gpu_required"
+    assert diagnostic.details["role"] == "actor"
+
+
 def test_fully_async_without_kl_does_not_require_reference():
     args = _namespace(
         {

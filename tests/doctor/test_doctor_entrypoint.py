@@ -152,6 +152,25 @@ def test_partial_fallback_skips_rules_that_require_normalized_config(monkeypatch
     assert "CONFIG_ALGORITHM_SUPPORTED" not in output
 
 
+def test_partial_fallback_reports_zero_gpu_model_role(monkeypatch, capsys):
+    def fake_parse_training_args(_argv, *, validate=True):
+        if validate:
+            raise ValueError("resource role 'actor' requires num_gpus > 0")
+        args = _args()
+        args.resource = {"actor": [1, 0], "rollout": [1, 8]}
+        return args
+
+    monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
+
+    code = doctor.main(["--format", "json", "--", "--resource", '{"actor": [1, 0], "rollout": [1, 8]}'])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert '"rule_id": "CONFIG_PARSE_ERROR"' in output
+    assert '"rule_id": "CONFIG_RESOURCE_SHAPE"' in output
+    assert "requires num_gpus > 0" in output
+
+
 def test_doctor_skip_hf_validate_is_forwarded(monkeypatch):
     captured = {}
 

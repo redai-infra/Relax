@@ -239,3 +239,11 @@ def test_arguments_rejects_non_positive_num_steps_per_rollout(arguments_module):
 
     with pytest.raises(ValueError, match="num-steps-per-rollout must be greater than zero"):
         arguments_module.slime_validate_args(args)
+
+
+def test_arguments_rejects_zero_gpu_model_role(arguments_module):
+    args = _opd_args()
+    args.resource["rollout"] = [1, 0]
+
+    with pytest.raises(ValueError, match="model role 'rollout' requires num_gpus > 0"):
+        arguments_module.slime_validate_args(args)
