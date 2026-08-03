@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import re
 from collections.abc import Iterator
+
+
+_NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
 
 
 @contextlib.contextmanager
@@ -34,10 +38,23 @@ def find_unknown_options(argv: list[str], registered: set[str]) -> list[str]:
 
     unknown = []
     seen = set()
+    registered_short_options = sorted(
+        (option for option in registered if option.startswith("-") and not option.startswith("--")),
+        key=len,
+        reverse=True,
+    )
     for item in argv:
-        if not item.startswith("--") or item == "--":
+        if not item.startswith("-") or item in {"-", "--"}:
             continue
-        option = item.split("=", 1)[0]
+        if item.startswith("--"):
+            option = item.split("=", 1)[0]
+        elif _NEGATIVE_NUMBER_RE.fullmatch(item):
+            continue
+        else:
+            option = next(
+                (candidate for candidate in registered_short_options if item.startswith(candidate)),
+                item.split("=", 1)[0],
+            )
         if option in registered or option in seen:
             continue
         seen.add(option)

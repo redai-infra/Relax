@@ -220,3 +220,24 @@ def test_entrypoint_rejects_option_not_registered_by_any_parser(monkeypatch, cap
     assert '"--does-not-exist"' in output
     assert '"--num-rollout"' not in output.split('"unknown_options":', 1)[1].split("]", 1)[0]
     assert '"--backend-option"' not in output.split('"unknown_options":', 1)[1].split("]", 1)[0]
+
+
+def test_entrypoint_rejects_unknown_short_option_without_flagging_negative_value(monkeypatch, capsys):
+    def fake_parse_training_args(argv, *, validate=True):
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--rollout-top-k", type=int)
+        parser.add_argument("-k", type=int)
+        parser.parse_known_args(argv)
+        return _args()
+
+    monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
+
+    code = doctor.main(["--format", "json", "--", "--rollout-top-k", "-1", "-k8", "-x"])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert '"rule_id": "CONFIG_UNKNOWN_ARGUMENT"' in output
+    unknown_options = output.split('"unknown_options":', 1)[1].split("]", 1)[0]
+    assert '"-x"' in unknown_options
+    assert '"-1"' not in unknown_options
+    assert '"-k"' not in unknown_options
