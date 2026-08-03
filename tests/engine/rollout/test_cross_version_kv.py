@@ -74,15 +74,18 @@ def test_cross_version_kv_validation_accepts_task22_contract() -> None:
     args = SimpleNamespace(
         enable_cross_version_kv_continuation=True,
         hybrid=True,
-        fully_async=True,
+        fully_async=False,
         partial_rollout=True,
-        colocate=True,
+        colocate=False,
         offload_rollout=False,
         update_weights_interval=1,
         cross_version_kv_max_gap=2,
         max_staleness=2,
     )
 
+    # slime_validate_args normalizes --hybrid before invoking the helper.
+    args.fully_async = True
+    args.colocate = True
     validate_cross_version_kv_args(args, sync_intent_enabled=True)
 
 

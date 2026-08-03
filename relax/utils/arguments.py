@@ -2703,12 +2703,6 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    validate_cross_version_kv_args(
-        args,
-        sync_intent_enabled=os.environ.get("RELAX_SYNC_INTENT_POLICY", "0").strip().lower()
-        in {"1", "true", "yes", "on"},
-    )
-
     if getattr(args, "lora_rank", 0) > 0:
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
             raise ValueError(
@@ -3053,6 +3047,14 @@ def slime_validate_args(args):
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
         )
+
+    # Cross-version KV continuation depends on Hybrid's normalized execution
+    # flags, so validate only after --hybrid has enabled fully_async+colocate.
+    validate_cross_version_kv_args(
+        args,
+        sync_intent_enabled=os.environ.get("RELAX_SYNC_INTENT_POLICY", "0").strip().lower()
+        in {"1", "true", "yes", "on"},
+    )
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."
