@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 
 Severity = Literal["error", "warning", "info"]
+ConfigState = Literal["validated", "partial", "unavailable"]
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class DoctorContext:
     argv: list[str]
     args: Any | None
     parse_error: str | None
+    config_state: ConfigState
     config: dict[str, Any]
     topology: dict[str, Any]
     command: list[str]
@@ -43,6 +45,7 @@ class DoctorReport:
     argv: list[str]
     command: list[str]
     diagnostics: list[DiagnosticResult]
+    config_state: ConfigState
     config: dict[str, Any]
     topology: dict[str, Any]
 
@@ -52,6 +55,7 @@ class DoctorReport:
             "argv": self.argv,
             "command": self.command,
             "diagnostics": [item.to_dict() for item in self.diagnostics],
+            "config_state": self.config_state,
             "config": self.config,
             "topology": self.topology,
         }

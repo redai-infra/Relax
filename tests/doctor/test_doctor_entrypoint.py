@@ -128,7 +128,27 @@ def test_entrypoint_falls_back_to_targeted_rules_after_validation_error(monkeypa
     assert code == 1
     assert calls == [True, False]
     assert '"rule_id": "CONFIG_MODE_CONFLICT"' in output
-    assert "CONFIG_PARSE_ERROR" not in output
+    assert '"rule_id": "CONFIG_PARSE_ERROR"' in output
+    assert '"config_state": "partial"' in output
+    assert '"topology": {}' in output
+
+
+def test_partial_fallback_skips_rules_that_require_normalized_config(monkeypatch, capsys):
+    def fake_parse_training_args(_argv, *, validate=True):
+        if validate:
+            raise ValueError("validation stopped before normalization")
+        args = _args()
+        args.advantage_estimator = "unknown"
+        return args
+
+    monkeypatch.setattr(doctor, "parse_training_args", fake_parse_training_args)
+
+    code = doctor.main(["--format", "json", "--", "--advantage-estimator", "unknown"])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert '"rule_id": "CONFIG_PARSE_ERROR"' in output
+    assert "CONFIG_ALGORITHM_SUPPORTED" not in output
 
 
 def test_doctor_skip_hf_validate_is_forwarded(monkeypatch):

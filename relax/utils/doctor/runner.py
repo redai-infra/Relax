@@ -27,15 +27,17 @@ def run_doctor(
     parse_error: str | None = None,
     strict_warnings: bool = False,
 ) -> DoctorReport:
-    safe_argv, argv_secrets = sanitize_argv(argv)
+    config_state = "unavailable" if args is None else ("partial" if parse_error is not None else "validated")
     config, config_secrets = sanitize_config(serialize_config(args))
-    secret_values = argv_secrets | config_secrets
+    safe_argv, argv_secrets = sanitize_argv(argv, known_secrets=config_secrets)
+    secret_values = config_secrets | argv_secrets
     safe_parse_error = sanitize_text(parse_error, secret_values)
-    topology = build_topology_plan(args)
+    topology = build_topology_plan(args) if config_state == "validated" else {}
     context = DoctorContext(
         argv=safe_argv,
         args=args,
         parse_error=safe_parse_error,
+        config_state=config_state,
         config=config,
         topology=topology,
         command=build_expected_command(safe_argv),
@@ -43,11 +45,20 @@ def run_doctor(
 
     diagnostics: list[DiagnosticResult] = []
     for rule in get_rules():
-        diagnostics.extend(rule.check(context))
-
-    targeted_errors = any(item.severity == "error" and item.rule_id != "CONFIG_PARSE_ERROR" for item in diagnostics)
-    if targeted_errors:
-        diagnostics = [item for item in diagnostics if item.rule_id != "CONFIG_PARSE_ERROR"]
+        if config_state != "validated" and not rule.supports_partial:
+            continue
+        try:
+            diagnostics.extend(rule.check(context))
+        except Exception as exc:  # noqa: BLE001 - reports must remain structured for malformed input
+            diagnostics.append(
+                DiagnosticResult(
+                    rule_id="DOCTOR_RULE_EXECUTION_ERROR",
+                    severity="error",
+                    message=f"diagnostic rule {rule.rule_id} failed: {type(exc).__name__}: {exc}",
+                    fix="Fix the reported input first; if the failure persists, report the rule id to Relax maintainers.",
+                    details={"failed_rule_id": rule.rule_id},
+                )
+            )
 
     diagnostics = [
         DiagnosticResult(
@@ -78,6 +89,7 @@ def run_doctor(
         argv=safe_argv,
         command=context.command,
         diagnostics=diagnostics,
+        config_state=config_state,
         config=config,
         topology=topology,
     )
@@ -118,7 +130,11 @@ def render_text(report: DoctorReport) -> str:
             "Role topology:",
             _indent_json(report.topology),
             "",
-            "Final merged config:",
+            {
+                "validated": "Final merged config:",
+                "partial": "Partial parsed config:",
+                "unavailable": "Config unavailable:",
+            }[report.config_state],
             _indent_json(report.config),
         ]
     )

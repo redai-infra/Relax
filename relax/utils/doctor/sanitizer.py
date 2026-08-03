@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -22,12 +23,15 @@ _SENSITIVE_NAMES = {
     "private_key",
     "secret",
     "token",
+    "wandb_key",
 }
 
+_STRUCTURED_SECRET_OPTIONS = {"train_env_vars"}
 
-def sanitize_argv(argv: list[str]) -> tuple[list[str], set[str]]:
+
+def sanitize_argv(argv: list[str], *, known_secrets: set[str] | None = None) -> tuple[list[str], set[str]]:
     sanitized = []
-    secret_values: set[str] = set()
+    secret_values = set(known_secrets or ())
     index = 0
     while index < len(argv):
         item = argv[index]
@@ -48,21 +52,28 @@ def sanitize_argv(argv: list[str]) -> tuple[list[str], set[str]]:
                 sanitized.append(f"{option}={REDACTED}")
                 if value:
                     secret_values.add(value)
+            elif _normalize_name(option) in _STRUCTURED_SECRET_OPTIONS:
+                sanitized.append(f"{option}={_sanitize_json_mapping(value, secret_values)}")
             else:
                 sanitized.append(item)
             index += 1
             continue
 
         sanitized.append(item)
-        if item.startswith("--") and is_sensitive_name(item) and index + 1 < len(argv):
+        if item.startswith("--") and index + 1 < len(argv):
             value = argv[index + 1]
-            sanitized.append(REDACTED)
-            if value:
-                secret_values.add(value)
-            index += 2
-            continue
+            if is_sensitive_name(item):
+                sanitized.append(REDACTED)
+                if value:
+                    secret_values.add(value)
+                index += 2
+                continue
+            if _normalize_name(item) in _STRUCTURED_SECRET_OPTIONS:
+                sanitized.append(_sanitize_json_mapping(value, secret_values))
+                index += 2
+                continue
         index += 1
-    return sanitized, secret_values
+    return [sanitize_text(item, secret_values) or "" for item in sanitized], secret_values
 
 
 def sanitize_config(config: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
@@ -87,13 +98,28 @@ def sanitize_details(value: Any, secret_values: set[str]) -> Any:
 
 
 def is_sensitive_name(name: str) -> bool:
-    normalized = name.lstrip("-").replace("-", "_").lower()
+    normalized = _normalize_name(name)
     if normalized in _SENSITIVE_NAMES:
         return True
     parts = normalized.split("_")
     if any(part in {"password", "passwd", "secret", "token", "credential", "credentials"} for part in parts):
         return True
     return "api" in parts and "key" in parts or "private" in parts and "key" in parts
+
+
+def _normalize_name(name: str) -> str:
+    return name.lstrip("-").replace("-", "_").lower()
+
+
+def _sanitize_json_mapping(value: str, secret_values: set[str]) -> str:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return sanitize_text(value, secret_values) or ""
+    if not isinstance(parsed, Mapping):
+        return sanitize_text(value, secret_values) or ""
+    sanitized = _sanitize_value(parsed, secret_values=secret_values)
+    return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def _sanitize_value(value: Any, *, secret_values: set[str], key: str | None = None) -> Any:

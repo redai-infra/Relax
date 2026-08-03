@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from relax.utils.doctor import runner as doctor_runner
 from relax.utils.doctor.runner import render_json, render_text, run_doctor
 
 
@@ -241,6 +242,7 @@ def test_parse_error_is_reported_as_ci_failure():
     report = run_doctor(argv=["--bad-flag"], args=None, parse_error="argparse exited with code 2")
 
     assert not report.ok
+    assert report.config_state == "unavailable"
     assert "CONFIG_PARSE_ERROR" in _rule_ids(report)
 
 
@@ -261,6 +263,7 @@ def test_text_and_json_reports_include_required_sections():
     assert "Role topology" in text_report
     assert "Final merged config" in text_report
     assert json_report["command"] == ["python", "-m", "relax.entrypoints.train", "--num-rollout", "1"]
+    assert json_report["config_state"] == "validated"
     assert "topology" in json_report
     assert "config" in json_report
 
@@ -323,3 +326,69 @@ def test_parse_error_redacts_secret_from_raw_argv():
     assert not report.ok
     assert secret not in output
     assert "TOKEN=<redacted>" in output
+
+
+def test_report_redacts_structured_train_env_and_wandb_key():
+    train_secret = "train-value"
+    wandb_secret = "wandb-value"
+    args = _namespace(
+        {
+            "train_env_vars": {"OPENAI_API_KEY": train_secret},
+            "wandb_key": wandb_secret,
+        }
+    )
+
+    report = run_doctor(
+        argv=[
+            "--train-env-vars",
+            f'{{"OPENAI_API_KEY":"{train_secret}"}}',
+            "--wandb-key",
+            wandb_secret,
+        ],
+        args=args,
+    )
+    output = render_json(report)
+
+    assert train_secret not in output
+    assert wandb_secret not in output
+    assert report.argv == [
+        "--train-env-vars",
+        '{"OPENAI_API_KEY":"<redacted>"}',
+        "--wandb-key",
+        "<redacted>",
+    ]
+    assert report.command[-4:] == report.argv
+    assert report.config["train_env_vars"] == {"OPENAI_API_KEY": "<redacted>"}
+    assert report.config["wandb_key"] == "<redacted>"
+
+
+def test_zero_num_steps_returns_structured_batch_diagnostic():
+    report = run_doctor(argv=[], args=_namespace({"num_steps_per_rollout": 0}))
+
+    assert not report.ok
+    assert "CONFIG_BATCH_SIZE" in _rule_ids(report)
+    diagnostic = next(item for item in report.diagnostics if item.rule_id == "CONFIG_BATCH_SIZE")
+    assert diagnostic.details == {"num_steps_per_rollout": 0}
+
+
+def test_rule_exception_is_converted_to_structured_diagnostic(monkeypatch):
+    def broken_rule(_context):
+        raise RuntimeError("broken rule")
+
+    monkeypatch.setattr(
+        doctor_runner,
+        "get_rules",
+        lambda: [
+            SimpleNamespace(
+                rule_id="BROKEN_RULE",
+                supports_partial=True,
+                check=broken_rule,
+            )
+        ],
+    )
+
+    report = run_doctor(argv=[], args=_namespace())
+
+    assert not report.ok
+    assert [item.rule_id for item in report.diagnostics] == ["DOCTOR_RULE_EXECUTION_ERROR"]
+    assert report.diagnostics[0].details == {"failed_rule_id": "BROKEN_RULE"}

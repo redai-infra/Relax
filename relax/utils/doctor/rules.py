@@ -21,14 +21,22 @@ class DiagnosticRule:
     rule_id: str
     title: str
     check: RuleFn
+    supports_partial: bool = False
 
 
 _RULES: list[DiagnosticRule] = []
 
 
-def diagnostic_rule(rule_id: str, title: str) -> Callable[[RuleFn], RuleFn]:
+def diagnostic_rule(rule_id: str, title: str, *, supports_partial: bool = False) -> Callable[[RuleFn], RuleFn]:
     def decorator(func: RuleFn) -> RuleFn:
-        _RULES.append(DiagnosticRule(rule_id=rule_id, title=title, check=func))
+        _RULES.append(
+            DiagnosticRule(
+                rule_id=rule_id,
+                title=title,
+                check=func,
+                supports_partial=supports_partial,
+            )
+        )
         return func
 
     return decorator
@@ -96,7 +104,7 @@ def _dataset_paths(value: Any) -> list[str]:
     return paths
 
 
-@diagnostic_rule("CONFIG_PARSE_ERROR", "Training arguments can be parsed")
+@diagnostic_rule("CONFIG_PARSE_ERROR", "Training arguments can be parsed", supports_partial=True)
 def check_parse_error(ctx: DoctorContext) -> list[DiagnosticResult]:
     if ctx.parse_error is None:
         return []
@@ -109,7 +117,7 @@ def check_parse_error(ctx: DoctorContext) -> list[DiagnosticResult]:
     ]
 
 
-@diagnostic_rule("CONFIG_RESOURCE_REQUIRED", "Resource map is present")
+@diagnostic_rule("CONFIG_RESOURCE_REQUIRED", "Resource map is present", supports_partial=True)
 def check_resource_required(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:
@@ -125,7 +133,11 @@ def check_resource_required(ctx: DoctorContext) -> list[DiagnosticResult]:
     return []
 
 
-@diagnostic_rule("CONFIG_RESOURCE_SHAPE", "Each resource entry has one serve and non-negative GPUs")
+@diagnostic_rule(
+    "CONFIG_RESOURCE_SHAPE",
+    "Each resource entry has one serve and non-negative GPUs",
+    supports_partial=True,
+)
 def check_resource_shape(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:
@@ -201,7 +213,7 @@ def check_required_roles(ctx: DoctorContext) -> list[DiagnosticResult]:
     ]
 
 
-@diagnostic_rule("CONFIG_MODE_CONFLICT", "Training mode flags are mutually consistent")
+@diagnostic_rule("CONFIG_MODE_CONFLICT", "Training mode flags are mutually consistent", supports_partial=True)
 def check_mode_conflict(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:
@@ -217,7 +229,7 @@ def check_mode_conflict(ctx: DoctorContext) -> list[DiagnosticResult]:
     return []
 
 
-@diagnostic_rule("CONFIG_DEBUG_MODE_CONFLICT", "Debug-only modes do not conflict")
+@diagnostic_rule("CONFIG_DEBUG_MODE_CONFLICT", "Debug-only modes do not conflict", supports_partial=True)
 def check_debug_mode_conflict(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:
@@ -312,7 +324,7 @@ def check_sft_requirements(ctx: DoctorContext) -> list[DiagnosticResult]:
     return diagnostics
 
 
-@diagnostic_rule("CONFIG_BATCH_SIZE", "Batch-size fields are internally consistent")
+@diagnostic_rule("CONFIG_BATCH_SIZE", "Batch-size fields are internally consistent", supports_partial=True)
 def check_batch_size(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:
@@ -331,6 +343,16 @@ def check_batch_size(ctx: DoctorContext) -> list[DiagnosticResult]:
         )
     num_steps = getattr(args, "num_steps_per_rollout", None)
     if rollout_batch_size is not None and num_steps is not None:
+        if not _is_positive_int(num_steps):
+            diagnostics.append(
+                _result(
+                    "CONFIG_BATCH_SIZE",
+                    "num_steps_per_rollout must be a positive integer.",
+                    "Set --num-steps-per-rollout to an integer greater than zero.",
+                    details={"num_steps_per_rollout": num_steps},
+                )
+            )
+            return diagnostics
         expected = rollout_batch_size * n_samples_per_prompt // num_steps
         if global_batch_size is not None and global_batch_size != expected:
             diagnostics.append(
@@ -580,7 +602,7 @@ def check_genrm_colocate(ctx: DoctorContext) -> list[DiagnosticResult]:
     return []
 
 
-@diagnostic_rule("CONFIG_PATHS", "Local paths referenced by the config exist")
+@diagnostic_rule("CONFIG_PATHS", "Local paths referenced by the config exist", supports_partial=True)
 def check_paths(ctx: DoctorContext) -> list[DiagnosticResult]:
     args = _args(ctx)
     if args is None:

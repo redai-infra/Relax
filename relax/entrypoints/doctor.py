@@ -49,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
         parse_error = f"{type(exc).__name__}: {exc}"
         try:
             args = parse_training_args(training_argv, validate=False)
+        except SystemExit as fallback_exc:
+            parse_error = f"{parse_error}; fallback argparse exited with code {fallback_exc.code}"
         except Exception as fallback_exc:  # noqa: BLE001 - preserve the original validation failure
             parse_error = f"{parse_error}; fallback parse failed: {type(fallback_exc).__name__}: {fallback_exc}"
 
