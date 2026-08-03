@@ -66,7 +66,8 @@ N_SAMPLES="${N_SAMPLES:=8}"
 # choice: RLOO is unclipped REINFORCE with no importance-ratio term, so a second
 # step within the same rollout trains at updated weights against log-probs
 # sampled from the old ones, with nothing correcting the mismatch. PPO-Clip
-# tolerates this via the ratio; RLOO does not.
+# tolerates this via the ratio; RLOO does not. Enforced at startup by
+# validate_rloo_args, so overriding these to imply two steps fails fast.
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:=32}"
 
 CKPT_ARGS=(

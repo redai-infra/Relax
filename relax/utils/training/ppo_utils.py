@@ -35,6 +35,128 @@ def validate_ppo_config(config: Namespace) -> None:
     _validate_actor_critic_resume_consistency(config)
 
 
+def validate_rloo_args(args: Namespace) -> None:
+    """Reject RLOO configurations that would silently stop being RLOO.
+
+    Every guard here prevents a failure that is silent or late: a flag that
+    quietly changes the estimator, or a configuration that only reveals itself as
+    all-zero advantages several minutes into a run. Kept as a pure function on
+    ``args`` so production validation and the tests exercise the same code -- a
+    test that re-implements the guards would still pass if the production copy
+    were deleted.
+
+    Called from ``slime_validate_args`` after the batch-size derivation, because
+    the single-optimizer-step guard has to read the derived
+    ``global_batch_size``.
+
+    Args:
+        args: The parsed namespace. Nothing is mutated.
+
+    Raises:
+        AssertionError: With a message naming the flag to remove, matching how
+            the rest of ``slime_validate_args`` reports configuration errors.
+    """
+    if getattr(args, "advantage_estimator", None) != "rloo":
+        return
+
+    assert not args.fully_async and not args.hybrid, (
+        "RLOO is synchronous-only: run it with --colocate. Asynchronous RLOO is out of "
+        "scope for this estimator and has not been validated, so it is rejected rather "
+        "than silently allowed."
+    )
+    assert args.n_samples_per_prompt >= 2, (
+        f"RLOO needs at least 2 samples per prompt to form a leave-one-out baseline, got "
+        f"--n-samples-per-prompt {args.n_samples_per_prompt}. A group of one has no baseline "
+        f"and would train on all-zero advantages."
+    )
+    assert args.rewards_normalization, (
+        "RLOO's leave-one-out baseline is built in the reward-normalization step, so "
+        "--disable-rewards-normalization would degrade it to REINFORCE without a baseline. "
+        "Remove that flag, or pick a different --advantage-estimator."
+    )
+    assert not args.normalize_advantages, (
+        "--normalize-advantages re-whitens advantages across the data-parallel group "
+        "(distributed_masked_whiten in loss.py), which re-introduces exactly the "
+        "standard-deviation normalization RLOO omits -- and does so after the DP split, so "
+        "the resulting advantage depends on how the batch was partitioned. Remove the flag "
+        "to keep RLOO's estimator intact."
+    )
+
+    # Exactly one optimizer step per rollout is a correctness requirement, not a
+    # tuning choice. RLOO's loss carries no importance ratio, so a second step
+    # within the same rollout trains at updated weights against log-probabilities
+    # sampled from the old ones, and nothing corrects the gap -- PPO-Clip absorbs
+    # this through the ratio, RLOO cannot. The step count is
+    # ``num_steps_per_rollout`` when set, otherwise
+    # ``rollout_batch_size * n_samples_per_prompt // global_batch_size``
+    # (see get_rollout_mini_batch_plan in backends/megatron/data.py), so both
+    # forms are checked here.
+    num_steps_per_rollout = getattr(args, "num_steps_per_rollout", None)
+    assert num_steps_per_rollout in (None, 1), (
+        f"RLOO requires exactly one optimizer step per rollout, got --num-steps-per-rollout "
+        f"{num_steps_per_rollout}. Its loss has no importance-ratio correction, so every step after "
+        f"the first trains off-policy against uncorrected log-probabilities. Set "
+        f"--num-steps-per-rollout 1, or use a clipped estimator such as grpo for multi-step updates."
+    )
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if rollout_batch_size is not None and global_batch_size:
+        samples_per_rollout = rollout_batch_size * args.n_samples_per_prompt
+        assert samples_per_rollout == global_batch_size, (
+            f"RLOO requires exactly one optimizer step per rollout, so rollout_batch_size "
+            f"({rollout_batch_size}) * n_samples_per_prompt ({args.n_samples_per_prompt}) = "
+            f"{samples_per_rollout} must equal --global-batch-size ({global_batch_size}); this "
+            f"configuration yields {samples_per_rollout / global_batch_size:g} steps. Its loss has no "
+            f"importance-ratio correction, so every step after the first trains off-policy against "
+            f"uncorrected log-probabilities."
+        )
+
+    # --kl-coef shapes the reward before the advantage is formed. RLOO reuses
+    # get_grpo_returns, which takes only the *shape* of kl and drops its values,
+    # so a non-zero coefficient would pay for the reference forward and its
+    # communication while leaving the training objective bit-for-bit unchanged.
+    # (GRPO inherits the same property; fixing it there would change existing
+    # numerics, so it is out of scope here.) Reward-shaped KL for RLOO is a
+    # deliberate follow-up, so the flag is refused rather than silently ignored;
+    # --use-kl-loss is the supported route and is applied as an additive term in
+    # policy_loss_function.
+    assert getattr(args, "kl_coef", 0) == 0, (
+        f"--kl-coef {args.kl_coef} has no effect under RLOO: the advantage is built from "
+        f"get_grpo_returns, which uses only the shape of the reference KL and not its values, so "
+        f"the reference forward would be computed and discarded. Use --use-kl-loss (with "
+        f"--kl-loss-coef) to add a KL term to the loss, or set --kl-coef 0."
+    )
+
+    # Every hook below replaces or short-circuits the code that builds the
+    # leave-one-out baseline, so RLOO would degrade to baseline-free REINFORCE
+    # without any error -- the same failure --disable-rewards-normalization
+    # causes, reached through a different door. The first two return from
+    # post_process_rewards before the group-normalization branch; the third
+    # replaces convert_samples_to_train_data, which is what calls it at all.
+    for flag, attribute, reason in (
+        (
+            "--custom-reward-post-process-path",
+            "custom_reward_post_process_path",
+            "post_process_rewards returns that function's output before reaching the RLOO branch",
+        ),
+        (
+            "--agentic-custom-advantage-path",
+            "agentic_custom_advantage_path",
+            "post_process_rewards returns Sample.custom_advantage before reaching the RLOO branch",
+        ),
+        (
+            "--custom-convert-samples-to-train-data-path",
+            "custom_convert_samples_to_train_data_path",
+            "that function replaces convert_samples_to_train_data, which is what calls post_process_rewards",
+        ),
+    ):
+        assert getattr(args, attribute, None) is None, (
+            f"{flag} bypasses RLOO's leave-one-out baseline: {reason}, so training would silently "
+            f"run baseline-free REINFORCE. Compute the leave-one-out baseline inside your own "
+            f"function and pick a different --advantage-estimator, or drop {flag}."
+        )
+
+
 def _validate_actor_critic_resume_consistency(config: Namespace) -> None:
     """Keep actor and critic checkpoints in lockstep.
 

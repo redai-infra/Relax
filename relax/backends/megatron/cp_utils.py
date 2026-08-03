@@ -165,6 +165,59 @@ def get_sum_of_sample_mean(
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
 
 
+def get_cp_local_num_samples(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Count the micro-batch's samples once across the whole CP group.
+
+    The denominator for a completion-level objective is the number of *samples*,
+    but the loss and its normalizer are summed over the CP group, so returning
+    ``len(samples)`` on every rank would count each sample ``cp_size`` times. This
+    is the sample-count analogue of :func:`get_cp_local_num_tokens`.
+
+    Every rank holds the full sample list (CP splits a sample's tokens, never the
+    batch), so the count is attributed entirely to CP rank 0 and the other ranks
+    report 0. Apportioning it by each rank's share of the tokens would also
+    all-reduce correctly, but not in whole numbers: Megatron accumulates this
+    normalizer into an integer tensor (``streaming_schedules.py``), so a
+    fractional share would fail to cast. Rank 0 always participates in the
+    all-reduce, so the sum is exact for any CP degree, including one that differs
+    between micro-batches.
+
+    A sample with no valid tokens still counts: the sum of log-probabilities over
+    an empty completion is 0, which is a genuine zero term in the paper's ``1/k``
+    mean rather than a sample to drop. That also keeps this equal to the
+    ``num_samples`` the metric path uses.
+
+    Args:
+        total_lengths: Unused; accepted so the signature matches
+            :func:`get_cp_local_num_tokens` and callers can pass the same
+            arguments.
+        response_lengths: Per-sample response lengths; only the count is read.
+        loss_masks: Per-sample response masks; only the device is read.
+        qkv_format: Unused, for signature symmetry.
+        max_seq_lens: Unused, for signature symmetry.
+        padded_total_lengths: Unused, for signature symmetry.
+        dynamic_cp_size: CP degree for this micro-batch; falls back to ``mpu``.
+        dynamic_cp_rank: CP rank for this micro-batch; falls back to ``mpu``.
+
+    Returns:
+        Scalar integer tensor: ``len(response_lengths)`` on CP rank 0, else 0.
+    """
+    del total_lengths, qkv_format, max_seq_lens, padded_total_lengths
+    cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
+    device = loss_masks[0].device if loss_masks else torch.device("cpu")
+    count = len(response_lengths) if cp_rank == 0 else 0
+    return torch.tensor(count, device=device, dtype=torch.int)
+
+
 def get_cp_local_num_tokens(
     total_lengths: list[int],
     response_lengths: list[int],

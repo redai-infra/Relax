@@ -223,7 +223,7 @@ $$\hat{A}_i = \frac{k}{k-1}\left(R_i - \bar{R}\right)$$
 即 RLOO 等于组内中心化奖励乘以 $k/(k-1)$。由此有两点推论：
 
 - **不做标准差缩放。** GRPO 除以组内标准差，这会让各组之间相互重新加权：奖励接近一致的组，其微小差异会被放大。RLOO 用的因子与组内离散度无关，因此各组保持原有的相对权重。这正是 Dr. GRPO 对 std 归一化提出的质疑。
-- **组内 advantage 仍然和为零**，因此 reduction 与日志行为与 GRPO 完全一致。
+- **组内 advantage 仍然和为零**，因此日志行为与 GRPO 一致。归约方式不同 —— 见下文。
 
 #### 与 `--disable-grpo-std-normalization` 的关系
 
@@ -258,9 +258,24 @@ $$L_i = -\operatorname{sg}(\hat{A}_i)\,\log \pi_\theta(y_i)$$
 
 这是与本页其他组相对估计器（它们都包在 PPO-Clip 外）的**有意分歧**。复用裁剪目标会让它变成「带 leave-one-out baseline 的 GRPO」而非论文里的 RLOO，而裁剪本身会给一个正是因无偏才被选用的估计器引入偏差。因此 **`--eps-clip` 与 `--eps-clip-high` 对 RLOO 无效**，`train/pg_clipfrac` 恒为 0。
 
-由于没有重要性比值校正，RLOO 假定采样策略等于训练策略。这在每轮 1 个 optimizer step 时成立；若用多个内层 epoch，估计量就变成 off-policy，论文的保证不再适用。仓库提供的 recipe 保持每轮 1 步。
+由于没有重要性比值校正，RLOO 假定采样策略等于训练策略。这在每轮 1 个 optimizer step 时成立；若用多个内层 epoch，估计量就变成 off-policy，且没有任何东西修正这个偏差。**这一点在启动时强制校验**，而不是交给 recipe：`rollout_batch_size * n_samples_per_prompt` 必须等于 `--global-batch-size`，且 `--num-steps-per-rollout` 必须未设置或为 `1`。
 
-下游其余部分 —— KL loss、TIS、DP/CP 切分、归约 —— 均保持不变。
+#### 归约是 completion 级的
+
+上式中的 $\log \pi_\theta(y_i)$ 是**整条** completion 的 log-probability —— 在其 token 上求和，且**不做**长度归一化 —— 组目标是对样本求平均：
+
+$$L = \frac{1}{k}\sum_i -\operatorname{sg}(\hat{A}_i)\sum_t \log \pi_\theta(y_{i,t})$$
+
+这与本页其他按 token 归一化的估计器都不同。另外两种归约都会改变估计量本身，而非仅改变其尺度：
+
+- 按样本对 token 取**均值**得到 $-\hat{A}_i / T_i \sum_t \log \pi$，等于按 response 长度对样本重新加权 —— 长 response 的每 token 梯度更小；
+- 按 micro-batch 的总 token 数归一化，会让更新尺度取决于采样器这一步恰好产出了多少 token。
+
+因此 RLOO 保留 `--calculate-per-token-loss` 给出的「每样本 token 求和」（在 CP 下本来也必须开启该开关），但把梯度的分母从 token 数换成**样本数**。该计数的构造保证它在 context-parallel 组内 all-reduce 后等于真实样本数，因此任意 CP 度下目标函数完全一致。
+
+上报指标有意保持在其他估计器共用的 per-token 尺度上，因此 `train/pg_loss`、`train/entropy_loss`、`train/ppo_kl` 仍可跨估计器对比；只有梯度归一化发生了变化。
+
+下游其余部分 —— KL loss、TIS、DP/CP 切分 —— 均保持不变。
 
 ### 关键参数
 
@@ -271,6 +286,11 @@ $$L_i = -\operatorname{sg}(\hat{A}_i)\,\log \pi_\theta(y_i)$$
 | `--disable-rewards-normalization` | 关闭 | 保持关闭。该开关会完全跳过组内 baseline，直接把原始 reward 当作 advantage |
 | `--disable-grpo-std-normalization` | 关闭 | 对 RLOO 无效 —— std 分支只针对 GRPO 家族，没有可禁用的对象 |
 | `--eps-clip` | `0.2` | **无效** —— RLOO 不裁剪，`train/pg_clipfrac` 恒为 0 |
+| `--num-steps-per-rollout`、`--global-batch-size` | — | **启动时强制每轮 rollout 恰好一次 optimizer step**：`rollout_batch_size * n_samples_per_prompt == global_batch_size`，且 `--num-steps-per-rollout` 必须未设置或为 `1`。RLOO 没有 importance-ratio 项，rollout 内的第二步会在未修正的情况下 off-policy 训练 |
+| `--kl-coef` | `0.0` | **非零即拒绝。** RLOO 未实现 reward-shaped KL：advantage 来自 `get_grpo_returns`，它只使用 reference KL 的形状而不使用其数值，因此非零系数会白白付出 reference forward 的代价却不改变目标。请改用 `--use-kl-loss` |
+| `--use-kl-loss` / `--kl-loss-coef` | 关闭 / `0.0` | 支持。与 GRPO 一样，KL 作为独立的 loss 项相加 |
+| `--normalize-advantages` | 关闭 | **启动即拒绝。** 它会在 DP 切分*之后*跨 DP 组重新白化 advantage，把 RLOO 刻意省去的 std 归一化又加回来 |
+| `--custom-reward-post-process-path`、`--agentic-custom-advantage-path`、`--custom-convert-samples-to-train-data-path` | 未设置 | **启动即拒绝。** 三者都会替换或短路构造 leave-one-out baseline 的那一步，RLOO 会静默退化为无 baseline 的 REINFORCE |
 | `--fully-async` / `--hybrid` | 关闭 | **启动即拒绝。** RLOO 仅支持同步，异步从未验证 |
 
 ### 快速开始

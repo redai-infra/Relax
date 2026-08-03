@@ -223,7 +223,7 @@ $$\hat{A}_i = \frac{k}{k-1}\left(R_i - \bar{R}\right)$$
 so RLOO is the group-centered reward rescaled by $k/(k-1)$. Two consequences follow:
 
 - **No standard-deviation scaling.** GRPO divides by the group standard deviation, which reweights groups against each other: a group whose rewards are nearly identical gets its small differences amplified. RLOO applies a single factor that does not depend on the group's spread, so groups keep their relative weight. This is the same concern Dr. GRPO raises about std normalization.
-- **Advantages still sum to zero** within each group, so the reduction and logging behaviour is identical to GRPO.
+- **Advantages still sum to zero** within each group, so the logging behaviour matches GRPO. The reduction does not — see below.
 
 #### Relationship to `--disable-grpo-std-normalization`
 
@@ -258,9 +258,24 @@ $$L_i = -\operatorname{sg}(\hat{A}_i)\,\log \pi_\theta(y_i)$$
 
 This is a deliberate departure from the other group-relative estimators here, which all wrap PPO-Clip. Reusing the clipped objective would make this "GRPO with a leave-one-out baseline" rather than RLOO as published, and the clipping would bias an estimator chosen precisely for being unbiased. Consequently **`--eps-clip` and `--eps-clip-high` have no effect under RLOO**, and `train/pg_clipfrac` is always 0.
 
-Because there is no importance-ratio correction, RLOO assumes the sampling policy equals the training policy. That holds with one optimizer step per rollout; with several inner epochs the estimator becomes off-policy and the paper's guarantees no longer apply. The provided recipe keeps one step per rollout.
+Because there is no importance-ratio correction, RLOO assumes the sampling policy equals the training policy. That holds with one optimizer step per rollout; with several inner epochs the estimator becomes off-policy and nothing corrects the gap. **This is enforced at startup**, not left to the recipe: `rollout_batch_size * n_samples_per_prompt` must equal `--global-batch-size`, and `--num-steps-per-rollout` must be unset or `1`.
 
-Everything else downstream — KL loss, TIS, DP/CP splitting, the reduction — is unchanged.
+#### The reduction is completion-level
+
+$\log \pi_\theta(y_i)$ above is the log-probability of the whole completion — summed over its tokens, with **no** length normalization — and the group objective is the mean over samples:
+
+$$L = \frac{1}{k}\sum_i -\operatorname{sg}(\hat{A}_i)\sum_t \log \pi_\theta(y_{i,t})$$
+
+That differs from every other estimator here, which normalizes per token. Both alternatives would change the estimator rather than just its scale:
+
+- a per-sample **mean** over tokens gives $-\hat{A}_i / T_i \sum_t \log \pi$, which reweights samples by response length — long responses get a smaller per-token gradient;
+- normalizing the micro-batch by its total token count makes the update scale depend on how many tokens the sampler happened to produce that step.
+
+RLOO therefore keeps `--calculate-per-token-loss`'s per-sample token sum (which is required anyway under CP) but divides the gradient by the **sample** count rather than the token count. The count is computed so that it all-reduces to the true number of samples across the context-parallel group, so the objective is identical at any CP degree.
+
+Reported metrics are deliberately left on the per-token scale that every other estimator uses, so `train/pg_loss`, `train/entropy_loss` and `train/ppo_kl` stay comparable across estimators; only the gradient normalization changes.
+
+Everything else downstream — KL loss, TIS, DP/CP splitting — is unchanged.
 
 ### Key Parameters
 
@@ -271,6 +286,11 @@ Everything else downstream — KL loss, TIS, DP/CP splitting, the reduction — 
 | `--disable-rewards-normalization` | off | Leave off. This flag skips the group baseline entirely, leaving the raw reward as the advantage |
 | `--disable-grpo-std-normalization` | off | No effect under RLOO — the std branch is GRPO-family only, so there is nothing to disable |
 | `--eps-clip` | `0.2` | **No effect** — RLOO does not clip; `train/pg_clipfrac` stays 0 |
+| `--num-steps-per-rollout`, `--global-batch-size` | — | **Exactly one optimizer step per rollout is enforced at startup**: `rollout_batch_size * n_samples_per_prompt == global_batch_size`, and `--num-steps-per-rollout` must be unset or `1`. RLOO has no importance-ratio term, so a second step within a rollout trains off-policy uncorrected |
+| `--kl-coef` | `0.0` | **Rejected when non-zero.** Reward-shaped KL is not implemented for RLOO: the advantage comes from `get_grpo_returns`, which uses only the shape of the reference KL, so a non-zero coefficient would pay for the reference forward and change nothing. Use `--use-kl-loss` |
+| `--use-kl-loss` / `--kl-loss-coef` | off / `0.0` | Supported. KL is added as a separate loss term, as it is for GRPO |
+| `--normalize-advantages` | off | **Rejected at startup.** It re-whitens advantages across the DP group *after* the split, re-introducing the std normalization RLOO omits |
+| `--custom-reward-post-process-path`, `--agentic-custom-advantage-path`, `--custom-convert-samples-to-train-data-path` | unset | **Rejected at startup.** Each replaces or short-circuits the step that builds the leave-one-out baseline, so RLOO would silently become baseline-free REINFORCE |
 | `--fully-async` / `--hybrid` | off | **Rejected at startup.** RLOO is synchronous-only and asynchronous RLOO was never validated |
 
 ### Quick Start

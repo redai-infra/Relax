@@ -26,6 +26,7 @@ from relax.utils.training.eval_config import (
     build_named_prompt_data_configs,
     ensure_dataset_list,
 )
+from relax.utils.training.ppo_utils import validate_rloo_args
 
 
 logger = get_logger(__name__)
@@ -2771,32 +2772,6 @@ def slime_validate_args(args):
                 "require advantage normalization. Please add `--normalize-advantages` to your command."
             )
 
-        if args.advantage_estimator == "rloo":
-            # Fail at parse time rather than let a user discover mid-run that the
-            # estimator they picked was never validated in this mode.
-            assert not args.fully_async and not args.hybrid, (
-                "RLOO is synchronous-only: run it with --colocate. Asynchronous RLOO is out of "
-                "scope for this estimator and has not been validated, so it is rejected rather "
-                "than silently allowed."
-            )
-            assert args.n_samples_per_prompt >= 2, (
-                f"RLOO needs at least 2 samples per prompt to form a leave-one-out baseline, got "
-                f"--n-samples-per-prompt {args.n_samples_per_prompt}. A group of one has no baseline "
-                f"and would train on all-zero advantages."
-            )
-            assert args.rewards_normalization, (
-                "RLOO's leave-one-out baseline is built in the reward-normalization step, so "
-                "--disable-rewards-normalization would degrade it to REINFORCE without a baseline. "
-                "Remove that flag, or pick a different --advantage-estimator."
-            )
-            assert not args.normalize_advantages, (
-                "--normalize-advantages re-whitens advantages across the data-parallel group "
-                "(distributed_masked_whiten in loss.py), which re-introduces exactly the "
-                "standard-deviation normalization RLOO omits -- and does so after the DP split, so "
-                "the resulting advantage depends on how the batch was partitioned. Remove the flag "
-                "to keep RLOO's estimator intact."
-            )
-
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
@@ -3113,6 +3088,10 @@ def slime_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    # After the batch-size derivation above, so the RLOO guards can read the
+    # derived global_batch_size and num_steps_per_rollout.
+    validate_rloo_args(args)
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False

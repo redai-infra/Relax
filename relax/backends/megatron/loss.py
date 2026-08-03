@@ -38,6 +38,7 @@ from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
     all_gather_with_cp,
+    get_cp_local_num_samples,
     get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
@@ -760,6 +761,41 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def uses_completion_level_reduction(args: Namespace) -> bool:
+    """Whether this estimator's objective is a per-sample token *sum*.
+
+    RLOO optimizes ``mean_i(-A_i * sum_t log pi(y_it))`` -- the log-probability is
+    summed over the whole completion and only then averaged over samples, with no
+    length normalization anywhere. Every other estimator optimizes a per-token
+    mean.
+
+    With ``--calculate-per-token-loss`` the reduction ``get_sum_of_sample_mean``
+    returns is already the per-sample token sum; what differs is the denominator
+    Megatron divides by, which is a token count rather than a sample count. So the
+    completion-level objective needs no third reduction mode -- only a different
+    normalizer, applied in ``get_batch_and_compute_loss``.
+
+    Keeping the predicate in one place so the loss scaling, the gradient
+    normalizer and the metric denominator cannot drift apart: all three key off
+    this function.
+
+    Args:
+        args: Parsed arguments; ``advantage_estimator`` and
+            ``calculate_per_token_loss`` are read.
+
+    Returns:
+        True when the loss must be normalized by sample count rather than token
+        count. False when ``--calculate-per-token-loss`` is off, since then the
+        reduction is a per-sample mean and the sample-count denominator would not
+        give the paper's objective either -- ``validate_rloo_args`` requires the
+        flag for RLOO, so this is unreachable rather than a silent fallback.
+    """
+    return (
+        getattr(args, "advantage_estimator", None) == "rloo"
+        and getattr(args, "calculate_per_token_loss", False) is True
+    )
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1315,6 +1351,30 @@ def loss_function(
     )
     num_samples = len(batch["response_lengths"])
 
+    # RLOO's objective is completion-level: sum log-probabilities over each
+    # response, then average over samples. With --calculate-per-token-loss the
+    # reduction below already gives the per-sample token sum, so the only thing
+    # that differs is what the gradient is normalized by -- samples, not tokens.
+    # Counted so that it all-reduces to the true sample count across the CP group,
+    # the same property get_cp_local_num_tokens gives the token denominator.
+    #
+    # Deliberately separate from `num_tokens`, which stays the *metric*
+    # denominator: reported pg_loss / entropy_loss / ppo_kl remain per-token means
+    # and so remain comparable with the other estimators. Only the gradient
+    # normalization changes.
+    grad_num_tokens = num_tokens
+    if uses_completion_level_reduction(args):
+        grad_num_tokens = get_cp_local_num_samples(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens", None),
+            batch.get("padded_total_lengths", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
+
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -1401,6 +1461,9 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
+    # Gradient normalizer; equals effective_num_tokens except for completion-level
+    # estimators, where it is the CP-local sample count instead.
+    effective_grad_num_tokens = torch.zeros_like(grad_num_tokens) if is_dummy else grad_num_tokens
     log_values = torch.tensor(
         [
             num_samples if not args.calculate_per_token_loss else effective_num_tokens,
@@ -1414,7 +1477,7 @@ def loss_function(
 
     return (
         loss,
-        (effective_num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        (effective_grad_num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
         {
             "keys": list(log.keys()),
             "values": log_values,

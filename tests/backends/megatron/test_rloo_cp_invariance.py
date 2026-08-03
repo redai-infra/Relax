@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from relax.backends.megatron.cp_utils import (
+    get_cp_local_num_samples,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
 )
@@ -238,3 +239,175 @@ def test_cp_all_reduce_matches_single_rank(world_size, calculate_per_token_loss,
         f"world_size={world_size}, per_token={calculate_per_token_loss}: "
         f"all_reduce gave {result['all_reduced']!r} but CP=1 gave {result['cp1']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Completion-level objective. RLOO optimizes mean_i(-A_i * sum_t log pi(y_it)):
+# the log-probability is summed over each response and only then averaged over
+# samples, with no length normalization. The tests below pin the reduced scalar
+# loss AND the gradient against an independently written formula, over unequal
+# response lengths with padding, at CP=1/2/4.
+# ---------------------------------------------------------------------------
+
+
+def _completion_level_batch(dtype=torch.float64):
+    """Unequal response lengths, trailing padding, one all-masked response."""
+    rewards = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=dtype)
+    advantages = get_rloo_advantages(rewards)
+
+    # Lengths are multiples of 4 so every CP degree under test splits them evenly;
+    # the valid-token counts still differ per sample because of the padding.
+    response_lengths = [8, 16, 12, 8]
+    pad_counts = [2, 5, 0, 8]  # the last response is fully masked out
+    total_lengths = [length + 6 for length in response_lengths]
+
+    loss_masks, log_probs, per_token_advantages = [], [], []
+    generator = torch.Generator().manual_seed(7)
+    for length, pad, advantage in zip(response_lengths, pad_counts, advantages, strict=True):
+        mask = torch.ones(length, dtype=dtype)
+        if pad:
+            mask[length - pad :] = 0
+        loss_masks.append(mask)
+        log_probs.append(-torch.rand(length, generator=generator, dtype=dtype))
+        per_token_advantages.append(torch.full((length,), float(advantage), dtype=dtype))
+
+    return total_lengths, response_lengths, loss_masks, log_probs, per_token_advantages
+
+
+def _oracle_completion_level_loss(loss_masks, log_probs, per_token_advantages):
+    """mean_i(-A_i * sum over i's valid tokens of log pi), written independently."""
+    per_sample = []
+    for mask, logp, advantage in zip(loss_masks, log_probs, per_token_advantages, strict=True):
+        per_sample.append(-(advantage * logp * mask).sum())
+    return torch.stack(per_sample).sum() / len(per_sample)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_completion_level_loss_matches_an_independent_formula(cp_size):
+    """The token-sum reduction over sample-count normalization is exactly the
+    paper's objective, at every CP degree.
+
+    Numerator and denominator are both CP-local, mirroring the training path:
+    `sum_of_token` on each rank's slice, `get_cp_local_num_samples` for the
+    denominator, and the two summed across the CP group by the all-reduce.
+    """
+    total_lengths, response_lengths, loss_masks, log_probs, per_token_advantages = _completion_level_batch()
+    per_token_loss = [-(a * lp) for a, lp in zip(per_token_advantages, log_probs, strict=True)]
+
+    numerator, denominator = 0.0, 0.0
+    for cp_rank in range(cp_size):
+        reduce_tokens = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            loss_masks,
+            calculate_per_token_loss=True,
+            dynamic_cp_size=cp_size,
+            dynamic_cp_rank=cp_rank,
+        )
+        values = (
+            torch.cat(per_token_loss, dim=0)
+            if cp_size == 1
+            else _slice_for_rank(per_token_loss, total_lengths, response_lengths, cp_size, cp_rank)
+        )
+        numerator += float(reduce_tokens(values))
+        denominator += float(
+            get_cp_local_num_samples(
+                total_lengths,
+                response_lengths,
+                loss_masks,
+                dynamic_cp_size=cp_size,
+                dynamic_cp_rank=cp_rank,
+            )
+        )
+
+    expected = float(_oracle_completion_level_loss(loss_masks, log_probs, per_token_advantages))
+    assert numerator / denominator == pytest.approx(expected, abs=1e-12), (
+        f"cp_size={cp_size}: completion-level reduction gave {numerator / denominator!r}, "
+        f"independent formula gave {expected!r}"
+    )
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_cp_local_sample_count_all_reduces_to_the_sample_count(cp_size):
+    """The denominator is CP-local, so it must all-reduce to the true sample
+    count -- otherwise each sample would be counted cp_size times.
+
+    It is also required to be a whole number on every rank, because Megatron
+    accumulates this normalizer into an integer tensor.
+
+    The fully-masked sample still counts as one sample: the sum of
+    log-probabilities over an empty completion is a genuine zero term in the
+    paper's 1/k mean, not a sample to drop.
+    """
+    total_lengths, response_lengths, loss_masks, _, _ = _completion_level_batch()
+
+    per_rank = [
+        get_cp_local_num_samples(
+            total_lengths,
+            response_lengths,
+            loss_masks,
+            dynamic_cp_size=cp_size,
+            dynamic_cp_rank=cp_rank,
+        )
+        for cp_rank in range(cp_size)
+    ]
+
+    for cp_rank, count in enumerate(per_rank):
+        assert not count.is_floating_point(), (
+            f"cp_size={cp_size}, rank={cp_rank}: normalizer is {count.dtype}, but Megatron "
+            f"accumulates it into an integer tensor"
+        )
+
+    got = sum(int(count) for count in per_rank)
+    assert got == len(response_lengths), (
+        f"cp_size={cp_size}: per-rank counts {[int(c) for c in per_rank]} summed to {got}, "
+        f"expected {len(response_lengths)}"
+    )
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_completion_level_gradient_matches_an_independent_formula(cp_size):
+    """Gradient, not just the scalar: d/d log_pi of mean_i(-A_i * sum_t log pi)
+    is -A_i / num_samples on every valid token and 0 on padding.
+
+    A length-normalizing reduction would instead give -A_i / (T_i * num_samples),
+    so this distinguishes the completion-level objective from both existing
+    branches rather than only checking the loss value.
+    """
+    total_lengths, response_lengths, loss_masks, log_probs, per_token_advantages = _completion_level_batch()
+
+    leaves = [lp.clone().requires_grad_(True) for lp in log_probs]
+    numerator, denominator = 0.0, 0.0
+    for cp_rank in range(cp_size):
+        reduce_tokens = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            loss_masks,
+            calculate_per_token_loss=True,
+            dynamic_cp_size=cp_size,
+            dynamic_cp_rank=cp_rank,
+        )
+        per_token_loss = [-(a * lp) for a, lp in zip(per_token_advantages, leaves, strict=True)]
+        values = (
+            torch.cat(per_token_loss, dim=0)
+            if cp_size == 1
+            else _slice_for_rank(per_token_loss, total_lengths, response_lengths, cp_size, cp_rank)
+        )
+        numerator = numerator + reduce_tokens(values)
+        denominator += float(
+            get_cp_local_num_samples(
+                total_lengths,
+                response_lengths,
+                loss_masks,
+                dynamic_cp_size=cp_size,
+                dynamic_cp_rank=cp_rank,
+            )
+        )
+    (numerator / denominator).backward()
+
+    num_samples = len(loss_masks)
+    for i, (leaf, mask, advantage) in enumerate(zip(leaves, loss_masks, per_token_advantages, strict=True)):
+        expected = -advantage * mask / num_samples
+        assert torch.allclose(leaf.grad, expected, atol=1e-12), (
+            f"cp_size={cp_size}, sample {i}: gradient {leaf.grad.tolist()} != {expected.tolist()}"
+        )
