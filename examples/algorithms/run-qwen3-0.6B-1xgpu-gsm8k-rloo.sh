@@ -147,6 +147,15 @@ RLOO_ARGS=(
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
+   # Disabled deliberately. The completion-level objective sums log-probabilities
+   # over each response and normalizes by sample count, so the gradient norm is
+   # ~response_length larger than a per-token objective's: measured 250-760 on
+   # 1xH100 / Qwen3-0.6B / GSM8K. Megatron's default --clip-grad 1.0 would clip
+   # every single step, which both discards the objective's scale and makes any
+   # RLOO-vs-GRPO comparison invalid (the two arms would be optimised under
+   # different effective terms). Set a threshold matched to the observed norm if
+   # you want clipping, rather than leaving the default.
+   --clip-grad 0
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
