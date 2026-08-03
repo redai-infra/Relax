@@ -14,31 +14,7 @@
 
 ______________________________________________________________________
 
-## 1. Qwen3.6-35B-A3B + SGLang hybrid mamba：间歇性 IMA
-
-**症状**：`colocate + --max-staleness 0` 已经设对，但 agentic rollout 跑几十分钟到几小时后，SGLang 报 `Scheduler hit an exception: torch.AcceleratorError: CUDA error: an illegal memory access`，堆栈在 `process_batch_result_decode` 的 `.tolist()` / `.copy_done.synchronize()`。
-
-**触发条件**：hybrid mamba 模型 + agentic 高 churn（每 session 5-20 chat completion，request 快速进出 mamba 池）。
-
-**保守但稳的 SGLang 配置**（perf 代价：decode 慢 3-5×，无 prefix cache，根治需升级 SGLang）：
-
-```bash
---sglang-mem-fraction-static 0.6
---sglang-mamba-scheduler-strategy no_buffer
---sglang-disable-overlap-schedule
---sglang-disable-radix-cache
---sglang-cuda-graph-max-bs 8       # 比 --sglang-disable-cuda-graph 好：small-batch 仍走 graph replay，避开 bs=16 的 mamba path IMA
-```
-
-**误诊提醒**：
-
-- colocate sleep 周期里 router (`smg::core::worker`) 报的 `ConnectionRefused/Reset` health check 警告是**预期噪音**——`release_memory_occupation` 后 HTTP 短暂不接活正常。只要 engine 之前 `Registered engine` 过就 OK。
-- `Rollout N: waiting for data system to catch up, waited Xs` 是 colocate 时分复用等 train 释放 GPU，**不是** hang。看到后续 `Start rollout N+1` 就 OK。
-- 单次 IMA 后 Ray Serve 可能能自恢复，但**多次累积** engine 端口全 ConnectionRefused 后必须手动重启。
-
-______________________________________________________________________
-
-## 2. colocate 必须 `--max-staleness 0`
+## 1. colocate 必须 `--max-staleness 0`
 
 `--max-staleness > 0` 是 `--fully-async` / `--hybrid` 的特性。纯 colocate 下必须 0，否则调度器会让 rollout 提前 dispatch，SGLang wake_up 时踩 memory_saver region，**第一次 prefill** 就 IMA，堆栈指向 `HybridReqToTokenPool.alloc` 类的 mamba 池 op，容易被误导去查 SGLang sizing bug。
 
@@ -46,7 +22,7 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## 3. Agentic prepare-gate livelock（rollout 卡 20h+）
+## 2. Agentic prepare-gate livelock（rollout 卡 20h+）
 
 **症状**：`emitted_materialized_session_count_total` 平台化，进度条在 248/256 附近震荡，日志刷 `POST /agentic_api/chat/completions CANCELLED 900099ms`，`prepare_gate_blocked_ir_count` 一直涨到几百，SGLang `#running-req` 却很低甚至 idle。
 
@@ -64,7 +40,7 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## 4. 可恢复 tool error 不要终止 session
+## 3. 可恢复 tool error 不要终止 session
 
 `code_extract_failed` / `tool_call_extract_failed` / sandbox unavailable / sandbox exec failed / `search_failed` 应返回 `done=False` + natural language feedback，让模型自纠。直接 terminate 会浪费 rollout 且贡献 zero-reward。
 
@@ -72,7 +48,7 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## 5. apptainer session tmpdir 泄露
+## 4. apptainer session tmpdir 泄露
 
 **症状**：单节点上一堆 `relax-apptainer-*` 目录，跨多次 run 累积；严重时打满容器盘触发 eviction。
 
@@ -85,7 +61,7 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## 6. jsonl `agent_turns` 骗人，看 TB `num_turn/mean`
+## 5. jsonl `agent_turns` 骗人，看 TB `num_turn/mean`
 
 `rollout_result/train/*.jsonl` 里 `agent_turns` 字段用 `metadata["rollout_turns"]`，agentic 新栈只写 `metadata["agentic_trace"]["turn_count"]`——共享 dump 只识别老 key，导致 agentic 的 jsonl `agent_turns` 永远是默认值 1，误以为模型不 tool-call。
 
@@ -93,7 +69,7 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## 7. Reward 必须给 tool bonus，否则 tool use 崩
+## 6. Reward 必须给 tool bonus，否则 tool use 崩
 
 上游 `deepeyesv2.py` 的 `tool_reward` 是**死代码**：算了但从不加进 final_score。final_score 只算 `0.8*acc + 0.2*format`。论文靠 cold-start SFT 打入工具调用习惯，在没 SFT 的 base 上直接跑必收敛到 1-turn 直答。
 
@@ -103,13 +79,13 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## 8. 多模必须 `--no-rope-fusion`
+## 7. 多模必须 `--no-rope-fusion`
 
 Relax 多模训练（image / video / omni）都要带 `--no-rope-fusion`。RoPE fusion 与多模 position id 处理不兼容。不要在 perf-doctor review 时把它当遗留 flag 建议删。
 
 ______________________________________________________________________
 
-## 9. `--agent-env` 多次出现互相覆盖
+## 8. `--agent-env` 多次出现互相覆盖
 
 `--agent-env` 在 `relax/utils/arguments.py:1201-1209` 用 `nargs="+"`（不是 `action="append"`），同 dest 多次出现后值覆盖前值。所有 KV 必须写在**同一个** `--agent-env` flag 后：
 
