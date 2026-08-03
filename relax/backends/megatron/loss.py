@@ -526,7 +526,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
+    estimator. Supported methods: "grpo", "dr_grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
     and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
@@ -576,9 +576,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
+    if args.advantage_estimator in ["grpo", "dr_grpo", "gspo", "sapo", "cispo", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
+        if args.advantage_estimator == "dr_grpo" and args.kl_coef != 0:
+            returns = [ret - args.kl_coef * k.detach() for ret, k in zip(returns, kl, strict=True)]
         # TODO: is the copy necessary?
         advantages = [r for r in returns]  # noqa: C416
 
@@ -728,6 +730,38 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
+
+
+def prepare_policy_optimizer_window_metadata(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    step_local_sample_counts: list[int],
+) -> list[dict[str, torch.Tensor]] | None:
+    """Prepare optimizer-window metadata consumed by the policy loss."""
+    if args.advantage_estimator == "dr_grpo":
+        step_stats = []
+        start = 0
+        for step_local_sample_count in step_local_sample_counts:
+            end = start + step_local_sample_count
+            local_response_tokens = torch.stack(
+                [mask.sum().to(dtype=torch.float32) for mask in rollout_data["loss_masks"][start:end]]
+            ).sum()
+            step_stats.append(
+                torch.stack(
+                    [
+                        local_response_tokens.new_tensor(step_local_sample_count),
+                        local_response_tokens,
+                    ]
+                )
+            )
+            start = end
+
+        stats = torch.stack(step_stats)
+        dist.all_reduce(stats, group=mpu.get_data_parallel_group(with_context_parallel=False))
+        step_loss_scales = stats[:, 1] / (stats[:, 0] * args.rollout_max_response_len)
+        return [{"__loss_scale__": scale} for scale in step_loss_scales]
+
+    return None
 
 
 def vanilla_tis_function(
@@ -948,6 +982,8 @@ def policy_loss_function(
             advantages=batch["advantages"],
             loss_masks=batch["loss_masks"],
         )
+        if args.advantage_estimator == "dr_grpo":
+            opsm_clipfrac = sum_of_sample_mean((1 - opsm_mask).float())
 
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
     if args.advantage_estimator == "gspo":
@@ -1086,12 +1122,17 @@ def policy_loss_function(
 
         loss = loss + args.kl_loss_coef * kl_loss
 
+    token_reducer = None
+    if args.advantage_estimator == "dr_grpo":
+        token_reducer = sum_of_sample_mean
+
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,
         batch=batch,
         log_probs=log_probs,
         old_log_probs=old_log_probs,
         log_probs_and_entropy=log_probs_and_entropy,
+        token_reducer=token_reducer,
     )
     if opd_loss is not None:
         loss = loss + opd_loss
@@ -1443,12 +1484,19 @@ def loss_function(
     else:
         if is_dummy:
             loss = 0.0 * loss
+        elif explicit_loss_scale is not None:
+            loss = loss * explicit_loss_scale
         # Non-dummy per-token path: do NOT scale by cp_size. `loss` is the
         # CP-local token-sum; finalize_model_grads normalizes the summed gradient
         # by the all-reduced CP-local `num_tokens`. A `* cp_size` here would weight
         # each sample by its CP degree — wrong when CP differs across micro-batches
         # (dynamic CP). Under static CP the removed factor exactly cancels the old
         # full-count denominator, leaving the final loss/grad unchanged.
+
+    if args.advantage_estimator == "dr_grpo" and explicit_loss_scale is not None:
+        for key in ("loss", "pg_loss", "entropy_loss", "kl_loss"):
+            if key in log:
+                log[key] = log[key] * explicit_loss_scale
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     log_values = torch.tensor(

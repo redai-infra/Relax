@@ -1,0 +1,144 @@
+# Dr.GRPO Training
+
+Relax supports Dr.GRPO (Group Relative Policy Optimization Done Right) for synchronous dense-model training with the Megatron backend.
+
+## Overview
+
+Dr.GRPO removes two normalization terms that can bias vanilla GRPO: division of each response by its own length and division of group-relative rewards by the group standard deviation. The algorithm was introduced in [Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783).
+
+Select it with `--advantage-estimator dr_grpo`. Dr.GRPO uses the same Rollout, Actor, Advantages, Reference, and ActorFwd service topology as GRPO; it does not require a Critic.
+
+## Algorithm
+
+For response `i` in a prompt group, Relax's default reward post-processing first computes the group-centered reward:
+
+$$
+A_i = r_i - \frac{1}{G}\sum_{j=1}^{G} r_j
+$$
+
+where $G$ is the number of responses sampled for the same prompt. Unlike GRPO, Dr.GRPO does not divide $A_i$ by the group reward standard deviation. The default Dr.GRPO policy objective uses one fixed denominator for the whole optimizer window:
+
+$$
+\mathcal{L}_{\mathrm{Dr.GRPO}} = \frac{S_{\mathrm{actor}}}{N B}
+$$
+
+where:
+
+- `N` is the global number of responses in the optimizer window;
+- `B` is `--rollout-max-response-len`;
+- masked or padding tokens do not contribute to the numerator.
+
+This fixed budget prevents short responses from receiving a larger per-token weight only because they contain fewer response tokens.
+
+::: warning Optional advantage normalization
+`--normalize-advantages` is honored when explicitly enabled. It applies an additional masked whitening step after group reward centering and therefore changes the original Dr.GRPO advantage semantics. The option is disabled by default.
+:::
+
+## Relax Implementation
+
+Relax keeps Megatron's CP-compatible per-token gradient normalization and applies Dr.GRPO as an optimizer-window scale.
+
+Let $T$ be the number of valid response tokens in the optimizer window and let $S$ be the combined Actor algorithm loss numerator. Relax computes:
+
+$$
+\alpha = \frac{T}{N B},
+\qquad
+\frac{\alpha S}{T} = \frac{S}{N B}
+$$
+
+The implementation is split across four existing layers:
+
+| Layer | Responsibility |
+|---|---|
+| Reward post-processing | Center rewards within each prompt group without group-std division |
+| Optimizer-window preparation | Count global `(N, T)` after the final loss masks are available and compute `alpha` |
+| Data iterator metadata | Replay the opaque `__loss_scale__` value on every micro-batch in the same optimizer window |
+| Megatron loss path | Scale the combined Actor loss, then reuse Megatron's global `/T` gradient normalization |
+
+The same scale is applied to the policy-gradient, entropy, and explicit KL terms in the combined Actor loss. Micro-batch boundaries only control execution and do not change `N`, `T`, or the final denominator.
+
+### Context Parallelism
+
+Dr.GRPO automatically enables `calculate_per_token_loss`. With CP greater than one, each CP rank contributes only the valid response tokens in its local zig-zag shard. Megatron sums the CP-local token counts before applying `/T`, so padding, CP degree, and micro-batch partitioning do not duplicate token counts.
+
+The optimizer-window `(N, T)` reduction uses the DP group without CP. CP ranks receive the same `alpha`, while Megatron remains responsible for assembling the global token normalizer.
+
+## Quick Start
+
+Start from an existing synchronous GRPO recipe, such as `scripts/training/text/run-qwen3-4B-8xgpu.sh`, and replace its algorithm block:
+
+```bash
+DR_GRPO_ARGS=(
+   --advantage-estimator dr_grpo
+   --rollout-max-response-len 8192
+   --eps-clip 0.2
+   --eps-clip-high 0.28
+   --entropy-coef 0.0
+   --kl-coef 0.0
+)
+```
+
+Keep the Megatron per-token path enabled explicitly in the recipe, especially when using CP:
+
+```bash
+PERF_ARGS=(
+   --calculate-per-token-loss
+   --context-parallel-size 1
+   --qkv-format thd
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 10240
+)
+```
+
+`--advantage-estimator dr_grpo` also enables `calculate_per_token_loss` during argument processing, but keeping the flag in a launch script makes its CP requirement visible.
+
+The resource topology is unchanged from GRPO:
+
+```bash
+--resource '{"actor": [1, 8], "rollout": [1, 8]}' \
+--colocate
+```
+
+Adjust the GPU counts, model configuration, data paths, and token budget for your environment.
+
+## Configuration
+
+| Parameter | Default | Dr.GRPO behavior |
+|---|---|---|
+| `--advantage-estimator dr_grpo` | `grpo` | Select Dr.GRPO and its fixed-budget reduction |
+| `--rollout-max-response-len` | `None` | Defines `B`; set it to the generation response-token budget |
+| `--n-samples-per-prompt` | `1` | Number of responses in each reward-centering group |
+| `--global-batch-size` | `None` | Number of responses in one optimizer step for the usual fixed-size schedule |
+| `--calculate-per-token-loss` | off | Automatically enabled for Dr.GRPO; required by Megatron when CP is enabled |
+| `--normalize-advantages` | off | Optionally apply masked advantage whitening after group centering |
+| `--disable-rewards-normalization` | off | Does not disable mandatory group centering for Dr.GRPO |
+| `--kl-coef` | `0.0` | Apply token-level KL reward shaping before the fixed-budget reduction |
+| `--use-kl-loss` | off | Add an explicit KL loss term |
+| `--kl-loss-coef` | `0.0` | Coefficient of the explicit KL loss |
+| `--entropy-coef` | `0.0` | Coefficient of the entropy bonus |
+
+`--kl-coef` and a non-zero `--kl-loss-coef` cannot be enabled together. This is enforced by Relax's argument validation.
+
+## Best Practices
+
+1. Set `--rollout-max-response-len` explicitly and keep it equal to the response budget used by Rollout. It is part of the Dr.GRPO objective, not only a memory limit.
+2. Compare reward, evaluation accuracy, and response length when comparing GRPO and Dr.GRPO. Their Actor loss and gradient norm magnitudes use different denominators and are not directly comparable.
+3. Keep `--normalize-advantages` disabled when reproducing the paper's reward semantics. Enable it only as an intentional experiment.
+4. A custom reward post-processor overrides the default group centering. It must provide the intended Dr.GRPO advantages.
+5. When using `--custom-pg-loss-reducer-function-path`, ensure the custom reducer preserves the token-sum numerator expected by the final fixed-budget scale.
+
+## Troubleshooting
+
+### CP training requires per-token loss
+
+Keep `--calculate-per-token-loss` enabled. Dr.GRPO sets it automatically, and Megatron validates the same requirement when `--context-parallel-size` is greater than one.
+
+### The fixed denominator is incorrect
+
+Check that `--rollout-max-response-len` matches the intended response budget and that custom rollout post-processing produces the final `loss_masks` before Actor training. `T` is counted from those final masks.
+
+## Next Steps
+
+- [Algorithm Reference](../examples/algorithms.md) — Compare Dr.GRPO with other policy-gradient algorithms
+- [Configuration](./configuration.md) — Review rollout, batch, and parallelism parameters
+- [PPO Training](./ppo-training.md) — Use the Actor-Critic training path

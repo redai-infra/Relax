@@ -247,6 +247,7 @@ export default defineConfig({
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
                 { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
+                { text: 'Dr.GRPO Training', link: '/en/guide/dr-grpo-training' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
@@ -359,6 +360,7 @@ export default defineConfig({
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
                 { text: 'REINFORCE++ 训练与数值验证报告', link: '/zh/guide/reinforce-plus-plus-training-report' },
+                { text: 'Dr.GRPO 训练', link: '/zh/guide/dr-grpo-training' },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]

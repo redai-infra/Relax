@@ -2,7 +2,7 @@
 
 Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-GRPO, RLOO, CISPO, GSPO, and SAPO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+GRPO, Dr.GRPO, RLOO, CISPO, GSPO, and SAPO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
 REINFORCE++ and REINFORCE++-baseline also reuse the GRPO service topology, but
 their return, global normalization and KL contracts are algorithm-specific.
@@ -114,6 +114,46 @@ bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
 ```
 
 Set `ADVANTAGE_ESTIMATOR=grpo` to run a control arm with the same recipe and seeds. The recipe writes normalized GSM8K data to a writable artifact cache (override with `RLOO_DATA_CACHE_DIR`) and appends an instruction to emit the final answer as `\boxed{...}`, matching the `math` reward parser contract.
+
+---
+
+## Dr.GRPO
+
+Dr.GRPO (Group Relative Policy Optimization Done Right) removes response-length normalization and group reward standard-deviation normalization from GRPO. Relax uses the group-centered reward and reduces the Actor token-loss sum by the fixed budget `N * B`, where `N` is the global response count in the optimizer window and `B` is `--rollout-max-response-len`.
+
+Reference: [Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783).
+
+### How It Works
+
+$$
+A_i = r_i - \frac{1}{G}\sum_{j=1}^{G} r_j,
+\qquad
+\mathcal{L}_{\mathrm{Dr.GRPO}} = \frac{S_{\mathrm{actor}}}{N B}
+$$
+
+Relax implements the fixed denominator by scaling the combined Actor loss with $T/(N B)$ and then reusing Megatron's CP-compatible $1/T$ normalization.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--advantage-estimator dr_grpo` | — | Enable Dr.GRPO |
+| `--rollout-max-response-len` | `None` | Fixed response budget `B`; it must be set |
+| `--normalize-advantages` | off | Optional additional masked whitening; changes the paper's default semantics |
+| `--calculate-per-token-loss` | off | Automatically enabled by Dr.GRPO and required for CP |
+
+### Quick Start
+
+```bash
+DR_GRPO_ARGS=(
+   --advantage-estimator dr_grpo
+   --rollout-max-response-len 8192
+   --eps-clip 0.2
+   --eps-clip-high 0.28
+)
+```
+
+See [Dr.GRPO Training](../guide/dr-grpo-training.md) for implementation details, CP behavior, usage, and troubleshooting.
 
 ---
 
@@ -285,6 +325,7 @@ SAPO_ARGS=(
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
 | **REINFORCE++** | Token KL-to-go return + global token normalization | PPO-Clip (hard clip) | k1 KL in shaped reward |
 | **REINFORCE++-baseline** | Inclusive group mean + global token normalization | PPO-Clip (hard clip) | Separate k2 KL loss |
+| **Dr.GRPO** | Group-centered reward without group std | PPO-Clip with fixed `N * B` denominator | Optional KL reward shaping or explicit KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
@@ -292,6 +333,7 @@ SAPO_ARGS=(
 
 ## Next Steps
 
+- [Dr.GRPO Training](../guide/dr-grpo-training.md)
 - [PPO Training](../guide/ppo-training.md)
 - [REINFORCE++ Training](../guide/reinforce-plus-plus.md)
 - [Quick Start](../guide/quick-start.md)

@@ -663,8 +663,10 @@ class DataIterator:
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
         self.max_tokens_per_gpu = max_tokens_per_gpu
+        self.metadata_by_microbatch: list[dict[str, Any]] | None = None
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
+        self.microbatch_offset = 0
 
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch for the requested keys.
@@ -695,12 +697,36 @@ class DataIterator:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
+
+        if self.metadata_by_microbatch is not None:
+            batch.update(self.metadata_by_microbatch[self.microbatch_offset])
+        self.microbatch_offset += 1
         return batch
 
     def reset(self) -> "DataIterator":
         """Reset internal offset to the start and return self."""
         self.offset = 0
+        self.microbatch_offset = 0
         return self
+
+
+def bind_optimizer_window_metadata(
+    data_iterators: list[DataIterator],
+    num_microbatches: list[int],
+    metadata_by_window: list[dict[str, Any]] | None,
+) -> None:
+    """Replay opaque optimizer-specific window metadata on its micro-
+    batches."""
+    if metadata_by_window is None:
+        return
+
+    metadata_by_microbatch = [
+        metadata.copy()
+        for metadata, step_num_microbatches in zip(metadata_by_window, num_microbatches, strict=True)
+        for _ in range(step_num_microbatches)
+    ]
+    for iterator in data_iterators:
+        iterator.metadata_by_microbatch = metadata_by_microbatch
 
 
 def get_data_iterator(
@@ -735,6 +761,8 @@ def get_data_iterator(
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
+    if num_local_samples == 0:
+        raise ValueError("rollout data must contain at least one local sample")
     if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
         global_batch_size = num_local_samples * dp_size
     else:
@@ -798,6 +826,7 @@ def get_data_iterator(
 
     if step_local_sample_counts is None:
         step_local_sample_counts = [num_local_gbs for _ in range(num_steps_per_rollout)]
+    rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = step_local_sample_counts
 
     if not args.use_dynamic_batch_size:
         invalid_counts = [count for count in step_local_sample_counts if count % args.micro_batch_size != 0]

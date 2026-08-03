@@ -1729,6 +1729,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=[
                     "grpo",
+                    "dr_grpo",
                     "gspo",
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
@@ -3632,6 +3633,10 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    if args.advantage_estimator == "dr_grpo":
+        args.calculate_per_token_loss = True
+        logger.info("Dr.GRPO selected Megatron per-token normalization.")
 
     if args.eval_max_context_len is None:
         logger.info(
