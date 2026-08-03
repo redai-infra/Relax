@@ -86,8 +86,8 @@ def test_per_token_loss_is_required():
     samples by response length -- a different estimator, and switched silently
     because `uses_completion_level_reduction` keys off the same flag.
 
-    Megatron only forces it when CP > 1, so a CP=1 run would otherwise train the
-    wrong objective without any error.
+    Megatron only forces it when CP > 1, so a CP=1 run would otherwise train
+    the wrong objective without any error.
     """
     with pytest.raises(AssertionError, match="requires --calculate-per-token-loss"):
         validate_rloo_args(_args(calculate_per_token_loss=False))
