@@ -211,6 +211,29 @@
     }
   },
   {
+    "name": "zero_num_steps_per_rollout",
+    "expected_rule": "CONFIG_BATCH_SIZE",
+    "config": {
+      "num_steps_per_rollout": 0
+    }
+  },
+  {
+    "name": "zero_gpu_model_role",
+    "expected_rule": "CONFIG_RESOURCE_SHAPE",
+    "config": {
+      "resource": {
+        "actor": [
+          1,
+          0
+        ],
+        "rollout": [
+          1,
+          8
+        ]
+      }
+    }
+  },
+  {
     "name": "rotate_ckpt_missing_options",
     "expected_rule": "CONFIG_ROTATE_CKPT",
     "config": {

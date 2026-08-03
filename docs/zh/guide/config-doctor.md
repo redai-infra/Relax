@@ -16,8 +16,9 @@ python -m relax.entrypoints.doctor -- \
   --colocate
 ```
 
-输出包含四类核心信息：
+输出包含以下核心信息：
 
+- `config_state`：`validated`、`partial` 或 `unavailable`，用于区分完整配置与回退结果。
 - `Final merged config`：解析和归一化后的训练配置。
 - `Role topology`：算法、候选角色、必需角色、实际规划角色、每个 role 的资源计划和 placement group 关系。
 - `resource_summary`：按 colocate / fully-async / hybrid 规则推导出的 GPU 需求。
@@ -49,15 +50,19 @@ python -m relax.entrypoints.doctor --doctor-skip-hf-validate -- <training args>
 
 ## 校验回退与定向诊断
 
-doctor 首先执行与训练入口相同的完整参数解析和校验。完整校验失败时，它会再执行一次无校验解析，只构造合并后的参数 Namespace，不读取远端 HF 配置、不派生资源参数、不执行 backend 校验或 TransferQueue 版本检查。这样，模式冲突、缺失 role 等配置错误仍能由对应规则给出具体 rule id 和修复说明，而不是只返回通用的 `CONFIG_PARSE_ERROR`。
+doctor 首先执行与训练入口相同的完整参数解析和校验。完整校验失败时，它会再执行一次无校验解析，只构造标记为 `partial` 的参数 Namespace，不读取远端 HF 配置、不派生资源参数、不执行 backend 校验或 TransferQueue 版本检查。
 
-如果参数本身无法被 argparse 解析，无校验解析也无法构造 Namespace，报告会保留 `CONFIG_PARSE_ERROR`。两种解析路径都只读取配置，不会调用 `ray.init()` 或创建任何训练服务。
+partial 配置只运行明确声明为 partial-safe 的规则，并且不生成角色拓扑或 GPU 需求。报告始终保留原始 `CONFIG_PARSE_ERROR`，即使其他定向规则也命中，因此不会隐藏完整校验的真实失败。任何规则内部异常都会转换为结构化的 `DOCTOR_RULE_EXECUTION_ERROR`，不会让 CLI 直接 traceback。
+
+doctor 会汇总 Relax、Megatron、SGLang 和 teacher parser 实际注册的选项。未被任何 parser 注册的参数返回 `CONFIG_UNKNOWN_ARGUMENT`，例如拼错的 `--does-not-exist` 不会再被静默忽略。
 
 ## 拓扑与资源语义
 
 `candidate_roles` 表示算法注册表可能创建的角色，`required_roles` 表示当前配置必须提供资源的角色，`roles` 表示结合 `--resource` 后实际进入预览的角色。Fully-async 模式仅在启用 `--use-kl-loss` 或设置非零 `--kl-coef` 时要求 `reference`；满足 true-on-policy 条件时不要求 `actor_fwd`。
 
-同步 colocate 模式下，actor、rollout 及符合条件的 critic 共享 placement group，GPU 需求取共享角色中的最大值。Hybrid 模式虽然同时具有 fully-async 和 colocate 执行标志，但 actor 与 rollout 使用独立 placement group，因此资源总量按两者 GPU 数量求和。
+角色选择、optional role、managed teacher、placement group 和 GPU 汇总统一由 `relax/core/service_plan.py` 推导，Controller 与 doctor 使用同一结果。同步 colocate 模式下，actor、rollout 及符合条件的 critic 共享 placement group，GPU 需求取共享角色中的最大值；Hybrid actor 与 rollout 使用独立 placement group，资源总量按各 role 求和。
+
+`advantages` 和 `sft` 是允许 `[1, 0]` 的 CPU role。actor、rollout、critic、reference、actor_fwd、genrm 和 managed teacher 等模型 role 必须配置正数 GPU。
 
 ## 数据路径检查
 
@@ -65,14 +70,15 @@ doctor 首先执行与训练入口相同的完整参数解析和校验。完整�
 
 ## 敏感信息脱敏
 
-Text 和 JSON 报告会统一脱敏 `--agent-env`、API key、token、password、credential、private key 和通知 URL 等敏感值。脱敏覆盖原始参数、预计启动命令、最终合并配置、解析错误以及诊断详情，敏感值统一显示为 `<redacted>`。
+Text 和 JSON 报告会统一脱敏 `--agent-env`、`--train-env-vars` 内的敏感字段、`--wandb-key`、API key、token、password、credential、private key 和通知 URL。脱敏覆盖原始参数、预计启动命令、最终合并配置、解析错误以及诊断详情，敏感值统一显示为 `<redacted>`。
 
 ## 已覆盖的错误类型
 
 doctor 以 rule id 输出诊断结果。当前规则覆盖：
 
 - `CONFIG_RESOURCE_REQUIRED`：缺少 `--resource`。
-- `CONFIG_RESOURCE_SHAPE`：resource 结构非法或 `num_serves != 1`。
+- `CONFIG_RESOURCE_SHAPE`：resource 结构非法、`num_serves != 1` 或模型 role 使用 0 GPU。
+- `CONFIG_UNKNOWN_ARGUMENT`：参数未被任何运行时 parser 注册。
 - `CONFIG_ALGORITHM_SUPPORTED`：算法 key 未注册。
 - `CONFIG_REQUIRED_ROLES`：当前模式需要的 role 未写入 resource。
 - `CONFIG_MODE_CONFLICT`：`--fully-async` 与 `--colocate` 直接组合。
@@ -97,4 +103,4 @@ doctor 以 rule id 输出诊断结果。当前规则覆盖：
 
 新增规则放在 `relax/utils/doctor/rules.py`，使用 `@diagnostic_rule(rule_id, title)` 注册。规则只读取 `DoctorContext`，返回 `DiagnosticResult` 列表，不启动外部进程，不调用 Ray，不分配 GPU。
 
-新增算法或 backend 时，应同步更新 `relax/utils/doctor/topology.py` 中的纯拓扑映射，并添加对应错误样例。错误样例位于 `tests/doctor/fixtures/error_cases.json`。
+新增算法、role 或 backend 时，应更新 `relax/core/service_plan.py` 的共享规划逻辑，并添加 Controller/doctor 共用的计划测试。错误样例位于 `tests/doctor/fixtures/error_cases.json`。

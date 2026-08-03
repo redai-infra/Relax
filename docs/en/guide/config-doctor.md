@@ -16,8 +16,9 @@ python -m relax.entrypoints.doctor -- \
   --colocate
 ```
 
-The report contains four core sections:
+The report contains these core fields:
 
+- `config_state`: `validated`, `partial`, or `unavailable`, distinguishing complete configurations from fallback results.
 - `Final merged config`: the parsed and normalized training configuration.
 - `Role topology`: algorithm key, candidate roles, required roles, planned roles, per-role resource plan, and placement-group relation.
 - `resource_summary`: GPU demand derived from colocate / fully-async / hybrid rules.
@@ -49,15 +50,19 @@ This appends `--skip-hf-validate` to the training arguments and avoids fetching 
 
 ## Validation Fallback and Targeted Diagnostics
 
-Doctor first runs the same complete argument parsing and validation as the training entrypoint. If validation fails, it parses again without validation to construct only the merged argument Namespace. This fallback does not fetch remote HF configuration, derive resource fields, run backend validation, or check the TransferQueue version. Mode conflicts and missing roles can therefore retain their targeted rule ids and fixes instead of collapsing into a generic `CONFIG_PARSE_ERROR`.
+Doctor first runs the same complete argument parsing and validation as the training entrypoint. If validation fails, it parses again without validation and marks the resulting Namespace as `partial`. This fallback does not fetch remote HF configuration, derive resource fields, run backend validation, or check the TransferQueue version.
 
-If argparse cannot parse the arguments themselves, the fallback cannot construct a Namespace and the report retains `CONFIG_PARSE_ERROR`. Both paths only read configuration; neither calls `ray.init()` nor creates training services.
+A partial configuration runs only rules explicitly declared partial-safe and does not produce a role topology or GPU estimate. The report always retains the original `CONFIG_PARSE_ERROR`, even when targeted rules also match, so the complete validation failure is not hidden. Any rule exception is converted to a structured `DOCTOR_RULE_EXECUTION_ERROR` instead of escaping as a traceback.
+
+Doctor collects the options actually registered by the Relax, Megatron, SGLang, and teacher parsers. An option not registered by any parser produces `CONFIG_UNKNOWN_ARGUMENT`, so a misspelled flag such as `--does-not-exist` is no longer silently ignored.
 
 ## Topology and Resource Semantics
 
 `candidate_roles` are roles the algorithm registry may create, `required_roles` must have resources for the current configuration, and `roles` are the roles actually planned after applying `--resource`. Fully-async mode requires `reference` only when `--use-kl-loss` or a non-zero `--kl-coef` is set. It does not require `actor_fwd` when the effective configuration is true-on-policy.
 
-In synchronous colocate mode, actor, rollout, and an eligible critic share a placement group, so GPU demand is the maximum among the shared roles. Hybrid mode carries both fully-async and colocate execution flags, but actor and rollout use separate placement groups, so their GPU counts are added.
+Role selection, optional roles, managed teachers, placement groups, and GPU totals are derived by `relax/core/service_plan.py`; Controller and Doctor consume the same result. In synchronous colocate mode, actor, rollout, and an eligible critic share a placement group, so GPU demand is the maximum among shared roles. Hybrid actor and rollout services use separate placement groups, so their GPU counts are added.
+
+`advantages` and `sft` are CPU roles that may use `[1, 0]`. Model roles such as actor, rollout, critic, reference, actor_fwd, genrm, and managed teacher require a positive GPU count.
 
 ## Dataset Path Checks
 
@@ -65,14 +70,15 @@ In synchronous colocate mode, actor, rollout, and an eligible critic share a pla
 
 ## Sensitive Value Redaction
 
-Text and JSON reports redact sensitive values from `--agent-env`, API keys, tokens, passwords, credentials, private keys, and notification URLs. Redaction covers raw arguments, the expected command, the final merged configuration, parse errors, and diagnostic details. Sensitive values are rendered as `<redacted>`.
+Text and JSON reports redact `--agent-env`, sensitive fields nested in `--train-env-vars`, `--wandb-key`, API keys, tokens, passwords, credentials, private keys, and notification URLs. Redaction covers raw arguments, the expected command, the final merged configuration, parse errors, and diagnostic details. Sensitive values are rendered as `<redacted>`.
 
 ## Covered Error Classes
 
 Doctor emits diagnostics by rule id. Current rules cover:
 
 - `CONFIG_RESOURCE_REQUIRED`: missing `--resource`.
-- `CONFIG_RESOURCE_SHAPE`: malformed resource entry or `num_serves != 1`.
+- `CONFIG_RESOURCE_SHAPE`: malformed resource entry, `num_serves != 1`, or a model role with zero GPUs.
+- `CONFIG_UNKNOWN_ARGUMENT`: an option is not registered by any runtime parser.
 - `CONFIG_ALGORITHM_SUPPORTED`: unregistered algorithm key.
 - `CONFIG_REQUIRED_ROLES`: required roles are absent from `--resource`.
 - `CONFIG_MODE_CONFLICT`: direct `--fully-async` plus `--colocate` combination.
@@ -97,4 +103,4 @@ Doctor emits diagnostics by rule id. Current rules cover:
 
 Add new rules in `relax/utils/doctor/rules.py` with `@diagnostic_rule(rule_id, title)`. A rule reads `DoctorContext` and returns `DiagnosticResult` objects. It must not start external processes, call Ray, or allocate GPU resources.
 
-When adding an algorithm or backend, update the pure topology mapping in `relax/utils/doctor/topology.py` and add an error sample to `tests/doctor/fixtures/error_cases.json`.
+When adding an algorithm, role, or backend, update the shared plan in `relax/core/service_plan.py` and add plan coverage used by both Controller and Doctor. Error samples live in `tests/doctor/fixtures/error_cases.json`.
