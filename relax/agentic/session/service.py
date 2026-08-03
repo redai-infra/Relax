@@ -2804,6 +2804,19 @@ class AgenticChatAPIService:
             request_payload = _normalized_chat_request(payload)
             session_id = _session_id_from_request(request=request)
         except AgenticChatRequestError as exc:
+            # Surface the reason a chat request is rejected. A rejected request
+            # yields no chat IR, so the whole prepare group is later dropped
+            # ("completed before producing a chat IR"); logging the detail here
+            # is the only place the concrete cause (bad messages/tools, parser
+            # failure, etc.) is visible.
+            if int(getattr(exc, "status_code", 400)) < 500:
+                logger.warning(
+                    "Rejected agentic chat request (status=%s code=%s param=%s): %s",
+                    getattr(exc, "status_code", 400),
+                    getattr(exc, "code", None),
+                    getattr(exc, "param", None),
+                    getattr(exc, "message", str(exc)),
+                )
             return _openai_error_response(_openai_error_from_exc(exc))
         request_ready_at = time.time()
         shard_dispatch_at = time.time()
@@ -2836,6 +2849,22 @@ class AgenticChatAPIService:
                 status_code=499,
             )
         if isinstance(response, dict) and isinstance(response.get("error"), dict):
+            # The shard produced an error instead of a completion (e.g. tool-call
+            # / reasoning parser failed on the model output, or context length
+            # exceeded). This is returned to the agent as a non-2xx and the
+            # session ends without a chat IR, so the prepare group is dropped
+            # downstream. Log the concrete cause here so it is diagnosable.
+            err = response["error"]
+            status = response.get("_http_status", 400)
+            if not isinstance(status, int) or status < 500:
+                logger.warning(
+                    "Agentic chat shard returned error (status=%s code=%s param=%s) for session=%s: %s",
+                    status,
+                    err.get("code"),
+                    err.get("param"),
+                    session_id,
+                    err.get("message"),
+                )
             return _openai_error_response(response)
         service_remote_return_at = time.time()
         service_profile = {
@@ -2897,6 +2926,17 @@ class AgenticChatAPIService:
     @_resolve_fastapi_request_endpoint
     async def bare_chat_completions(self, request: Request) -> JSONResponse:
         return await self._chat_completions_impl(request)
+
+    # ``from __future__ import annotations`` (top of this file) stringifies this
+    # signature, and Ray Serve's ``@serve.ingress`` rebuilds each route endpoint
+    # with a ``__globals__`` that does NOT contain this module's imports. FastAPI
+    # then fails to resolve the string ``"Request"`` and silently demotes the
+    # parameter to a required *query* field, so every chat POST is rejected with
+    # HTTP 422 ("loc: [query, request], Field required") before reaching the
+    # handler -- collapsing all agentic rollouts (no chat IR -> every prepare
+    # group dropped -> training stalls). Pinning the real annotation objects lets
+    # the route rebuild skip re-evaluating the stringized names entirely.
+    bare_chat_completions.__annotations__ = {"request": Request, "return": JSONResponse}
 
     @app.get("/models")
     @app.get("/v1/models")

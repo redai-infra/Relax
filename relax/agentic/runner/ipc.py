@@ -32,6 +32,8 @@ _LENGTH_PREFIX_STRUCT = struct.Struct("!I")
 # asyncio/uvloop defaults backlog to 100, which drops connect() with EAGAIN under that load.
 _LAUNCHER_SERVER_BACKLOG = max(1024, socket.SOMAXCONN)
 _LAUNCH_SEMAPHORE: asyncio.BoundedSemaphore | None = None
+_DEFAULT_TERMINATION_WAIT_TIMEOUT_S = 5.0
+_DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S = 5.0
 
 
 class LauncherProtocolError(RuntimeError):
@@ -157,8 +159,31 @@ class LauncherClient:
     async def wait(self, *, handle: str) -> dict[str, Any]:
         return await self._request({"op": "wait", "handle": handle})
 
-    async def kill(self, *, handle: str, signal_value: int = 15, forget: bool = True) -> dict[str, Any]:
-        return await self._request({"op": "kill", "handle": handle, "signal": int(signal_value), "forget": forget})
+    async def kill(
+        self,
+        *,
+        handle: str,
+        signal_value: int = 15,
+        forget: bool = True,
+        wait: bool = False,
+        force: bool = False,
+        wait_timeout_s: float = _DEFAULT_TERMINATION_WAIT_TIMEOUT_S,
+        force_signal_value: int = signal.SIGKILL,
+        force_wait_timeout_s: float = _DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S,
+    ) -> dict[str, Any]:
+        return await self._request(
+            {
+                "op": "kill",
+                "handle": handle,
+                "signal": int(signal_value),
+                "forget": forget,
+                "wait": wait,
+                "force": force,
+                "wait_timeout_s": wait_timeout_s,
+                "force_signal": int(force_signal_value),
+                "force_wait_timeout_s": force_wait_timeout_s,
+            }
+        )
 
     async def kill_all(self, *, signal_value: int = 15) -> dict[str, Any]:
         return await self._request({"op": "kill_all", "signal": int(signal_value)})
@@ -311,12 +336,12 @@ class _CompletedProcess:
 @dataclass
 class _ProcHandle:
     proc: asyncio.subprocess.Process
+    pgid: int | None
     started_at: float
     completed: _CompletedProcess | None = None
+    wait_task: asyncio.Task | None = None
 
-    async def wait(self) -> _CompletedProcess:
-        if self.completed is not None:
-            return self.completed
+    async def _wait_once(self) -> _CompletedProcess:
         stdout, stderr = await self.proc.communicate()
         exited_at = time.time()
         self.completed = _CompletedProcess(
@@ -328,17 +353,55 @@ class _ProcHandle:
         )
         return self.completed
 
+    async def wait(self) -> _CompletedProcess:
+        if self.completed is not None:
+            return self.completed
+        if self.wait_task is None:
+            self.wait_task = asyncio.create_task(self._wait_once())
+        return await self.wait_task
+
 
 _HANDLES: dict[str, _ProcHandle] = {}
 
 
-def _kill_process_group(pid: int | None, signal_value: int) -> None:
-    if pid is None:
-        return
+def _process_group_alive(pgid: int | None) -> bool:
+    if pgid is None:
+        return False
     try:
-        os.killpg(os.getpgid(pid), signal_value)
-    except Exception:
-        return
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _kill_process_group(pgid: int | None, signal_value: int) -> bool:
+    if pgid is None:
+        return False
+    try:
+        os.killpg(pgid, signal_value)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+async def _wait_for_process_exit(proc_handle: _ProcHandle, *, timeout_s: float) -> _CompletedProcess | None:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    completed = proc_handle.completed
+    while True:
+        remaining_s = deadline - time.monotonic()
+        if completed is None:
+            if remaining_s <= 0:
+                return None
+            try:
+                completed = await asyncio.wait_for(asyncio.shield(proc_handle.wait()), timeout=remaining_s)
+            except asyncio.TimeoutError:
+                return None
+        if not _process_group_alive(proc_handle.pgid):
+            return completed
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            return None
+        await asyncio.sleep(min(0.05, remaining_s))
 
 
 async def _launch(request: dict[str, object]) -> dict[str, object]:
@@ -369,8 +432,12 @@ async def _launch(request: dict[str, object]) -> dict[str, object]:
             close_fds=True,
         )
     spawn_returned_at = time.time()
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = None
     handle = uuid4().hex
-    _HANDLES[handle] = _ProcHandle(proc=proc, started_at=started_at)
+    _HANDLES[handle] = _ProcHandle(proc=proc, pgid=pgid, started_at=started_at)
     return {
         "handle": handle,
         "pid": proc.pid,
@@ -406,20 +473,96 @@ async def _kill(request: dict[str, object]) -> dict[str, object]:
     handle = request.get("handle")
     signal_value = request.get("signal", signal.SIGTERM)
     forget = request.get("forget", True)
+    wait = request.get("wait", False)
+    force = request.get("force", False)
+    wait_timeout_s = request.get("wait_timeout_s", _DEFAULT_TERMINATION_WAIT_TIMEOUT_S)
+    force_signal_value = request.get("force_signal", signal.SIGKILL)
+    force_wait_timeout_s = request.get(
+        "force_wait_timeout_s",
+        _DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S,
+    )
     if not isinstance(handle, str) or not handle:
         raise ValueError("Launcher daemon kill requires a non-empty handle.")
     if not isinstance(signal_value, int):
         raise TypeError("Launcher daemon signal must be an integer.")
     if not isinstance(forget, bool):
         raise TypeError("Launcher daemon forget flag must be a boolean.")
+    if not isinstance(wait, bool):
+        raise TypeError("Launcher daemon wait flag must be a boolean.")
+    if not isinstance(force, bool):
+        raise TypeError("Launcher daemon force flag must be a boolean.")
+    if not isinstance(wait_timeout_s, (int, float)):
+        raise TypeError("Launcher daemon wait timeout must be numeric.")
+    if not isinstance(force_signal_value, int):
+        raise TypeError("Launcher daemon force signal must be an integer.")
+    if not isinstance(force_wait_timeout_s, (int, float)):
+        raise TypeError("Launcher daemon force wait timeout must be numeric.")
     proc_handle = _HANDLES.get(handle)
     if proc_handle is None:
-        raise KeyError(f"Unknown launcher handle: {handle}")
+        # Killing an unknown handle is idempotent success: the target process is
+        # already gone (daemon restarted, handle already forgotten, or process
+        # reaped), so the goal of kill is satisfied. Raising here would surface a
+        # spurious release failure and trigger an unnecessary Global Restart.
+        logger.warning("Launcher daemon kill for unknown handle treated as already-terminated: %s", handle)
+        return {"handle": handle, "killed": False, "waited": bool(wait), "already_gone": True}
+    completed: _CompletedProcess | None = None
+    forced_best_effort = False
     try:
-        _kill_process_group(proc_handle.proc.pid, signal_value)
-        return {"handle": handle, "killed": True}
+        killed = _kill_process_group(proc_handle.pgid, signal_value)
+        if wait:
+            completed = await _wait_for_process_exit(proc_handle, timeout_s=float(wait_timeout_s))
+            force_sent = False
+            if completed is None and force:
+                force_sent = _kill_process_group(proc_handle.pgid, int(force_signal_value))
+                completed = await _wait_for_process_exit(proc_handle, timeout_s=float(force_wait_timeout_s))
+            if completed is None:
+                if force_sent:
+                    # SIGKILL has been delivered but the process group has not
+                    # confirmed exit within the wait window. This happens when a
+                    # descendant (e.g. an apptainer `starter`) is wedged in an
+                    # uninterruptible (D-state) kernel call on slow shared
+                    # storage: SIGKILL cannot be caught or ignored, so the target
+                    # is guaranteed to terminate once that call returns, but we
+                    # cannot observe it now. Raising here surfaces a spurious
+                    # release failure that escalates to a Controller global
+                    # restart (which force-kills the actor + inference engine
+                    # mid-step) -- far more destructive than tolerating a doomed
+                    # process. Report best-effort success and forget the handle;
+                    # normal child reaping collects it once the syscall returns.
+                    forced_best_effort = True
+                    logger.warning(
+                        "Launcher process not confirmed exited after SIGKILL; treating as "
+                        "best-effort terminated (kill pending, likely a D-state child on slow "
+                        "storage): handle=%s pid=%s pgid=%s",
+                        handle,
+                        proc_handle.proc.pid,
+                        proc_handle.pgid,
+                    )
+                    return {
+                        "handle": handle,
+                        "killed": killed,
+                        "waited": True,
+                        "force_sent": force_sent,
+                        "exit_code": None,
+                        "exited_at": None,
+                        "exit_confirmed": False,
+                    }
+                raise RuntimeError(
+                    "Launcher process did not exit after termination: "
+                    f"handle={handle} pid={proc_handle.proc.pid} pgid={proc_handle.pgid} signal={signal_value} "
+                    f"force_sent={force_sent}."
+                )
+            return {
+                "handle": handle,
+                "killed": killed,
+                "waited": True,
+                "force_sent": force_sent,
+                "exit_code": completed.exit_code,
+                "exited_at": completed.exited_at,
+            }
+        return {"handle": handle, "killed": killed, "waited": False}
     finally:
-        if forget:
+        if forget and (not wait or completed is not None or forced_best_effort):
             _HANDLES.pop(handle, None)
 
 
@@ -429,11 +572,24 @@ async def _kill_all(request: dict[str, object]) -> dict[str, object]:
         raise TypeError("Launcher daemon signal must be an integer.")
     handles = list(_HANDLES.items())
     for handle, proc_handle in handles:
-        try:
-            _kill_process_group(proc_handle.proc.pid, signal_value)
-        finally:
-            _HANDLES.pop(handle, None)
-    return {"killed": len(handles)}
+        _kill_process_group(proc_handle.pgid, signal_value)
+    failed_handles: list[str] = []
+    for handle, proc_handle in handles:
+        completed = await _wait_for_process_exit(
+            proc_handle,
+            timeout_s=_DEFAULT_TERMINATION_WAIT_TIMEOUT_S,
+        )
+        if completed is None:
+            _kill_process_group(proc_handle.pgid, signal.SIGKILL)
+            completed = await _wait_for_process_exit(
+                proc_handle,
+                timeout_s=_DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S,
+            )
+        if completed is None:
+            failed_handles.append(handle)
+            continue
+        _HANDLES.pop(handle, None)
+    return {"killed": len(handles) - len(failed_handles), "failed": len(failed_handles)}
 
 
 async def _shutdown() -> dict[str, object]:

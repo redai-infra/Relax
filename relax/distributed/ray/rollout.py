@@ -3871,6 +3871,15 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
+        if not rewards:
+            # Every rollout for this eval dataset failed or was dropped (e.g. all
+            # sandbox containers failed setup), so there are no rewards to average.
+            # Surface it loudly but don't crash the whole run on a division by zero.
+            logger.warning(
+                f"Eval dataset {key!r} produced no valid samples (all rollouts failed or were "
+                f"dropped); skipping eval metrics for this dataset."
+            )
+            continue
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
