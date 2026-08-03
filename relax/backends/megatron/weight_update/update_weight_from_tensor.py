@@ -29,6 +29,7 @@ from relax.utils.megatron_peft_utils import (
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .live_weight_sync import estimate_full_model_bytes, required_live_weight_sync_bytes
 from .lora_adapter_sync import LoraAdapterSync
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
@@ -55,6 +56,7 @@ class UpdateWeightFromTensor:
         model: Sequence[torch.nn.Module],
         weights_getter: Callable[[], Mapping[str, torch.Tensor]],
         *,
+        live_weights_getter: Callable[[], Mapping[str, torch.Tensor]] | None = None,
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
     ) -> None:
@@ -66,6 +68,7 @@ class UpdateWeightFromTensor:
         self.args = args
         self.model = model
         self.weights_getter = weights_getter
+        self.live_weights_getter = live_weights_getter
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
@@ -87,6 +90,25 @@ class UpdateWeightFromTensor:
         self._ipc_engine = None
         self._model_update_groups = None
         self.distributed_rollout_engines: list[ActorHandle] = []
+        self._live_weight_sync_required_bytes: int | None = None
+
+    @property
+    def live_weight_sync_required_bytes(self) -> int:
+        if self.live_weights_getter is None:
+            raise RuntimeError("live weight sync requires a live_weights_getter")
+        if self._live_weight_sync_required_bytes is None:
+            full_model_bytes, largest_param_bytes = estimate_full_model_bytes(
+                self.live_weights_getter(),
+                tensor_parallel_size=mpu.get_tensor_model_parallel_world_size(),
+                expert_tensor_parallel_size=mpu.get_expert_tensor_parallel_world_size(),
+            )
+            self._live_weight_sync_required_bytes = required_live_weight_sync_bytes(
+                full_model_bytes=full_model_bytes,
+                largest_param_bytes=largest_param_bytes,
+                update_weight_buffer_size=self.args.update_weight_buffer_size,
+                memory_margin_bytes=self.args.train_memory_margin_bytes,
+            )
+        return self._live_weight_sync_required_bytes
 
     def connect_rollout_engines(
         self,
@@ -175,7 +197,7 @@ class UpdateWeightFromTensor:
                 self._ipc_engine = engine
 
     @torch.no_grad()
-    def update_weights(self) -> None:
+    def update_weights(self, *, use_live_weights: bool = False) -> None:
         """version++, flush caches, process buckets with pipelining.
 
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
@@ -187,6 +209,11 @@ class UpdateWeightFromTensor:
         HF export so the rollout engine serves one merged model; otherwise all
         weights are sent as-is.
         """
+        if use_live_weights and self.live_weights_getter is None:
+            raise RuntimeError("live weight sync requires a live_weights_getter")
+        if use_live_weights and self.lora_enabled:
+            raise RuntimeError("live weight sync does not support LoRA weight updates")
+
         # LoRA adapter mode has its own base-once + adapter-delta sync protocol.
         if self.lora_enabled and self.lora_adapter_mode:
             self._update_weights_adapter_mode()
@@ -210,7 +237,7 @@ class UpdateWeightFromTensor:
                 )
         dist.barrier(group=get_gloo_group())
 
-        megatron_local_weights = self.weights_getter()
+        megatron_local_weights = self.live_weights_getter() if use_live_weights else self.weights_getter()
 
         if self.lora_enabled and self.lora_merge_mode:
             renamed = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}

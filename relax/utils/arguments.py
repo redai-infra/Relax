@@ -897,6 +897,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--colocate-live-weight-sync",
+                action="store_true",
+                help=(
+                    "Synchronize colocated rollout weights directly from the live Actor before train offload. "
+                    "Falls back to the existing sleep-first path when any rank lacks memory."
+                ),
+            )
+            parser.add_argument(
                 "--update-weights-interval",
                 type=int,
                 default=1,
@@ -3178,6 +3186,20 @@ def slime_validate_args(args):
                     "Add --selective-offload to use the application-level offload instead, "
                     "or drop expandable_segments."
                 )
+
+    if getattr(args, "colocate_live_weight_sync", False):
+        if not args.colocate or args.hybrid or not args.offload_train or not args.offload_rollout:
+            raise ValueError(
+                "--colocate-live-weight-sync requires synchronous colocate mode with train and rollout offload"
+            )
+        if args.megatron_to_hf_mode != "bridge":
+            raise ValueError("--colocate-live-weight-sync currently requires --megatron-to-hf-mode bridge")
+        if args.pipeline_model_parallel_size != 1 or args.expert_model_parallel_size != 1:
+            raise ValueError("--colocate-live-weight-sync currently requires pipeline and expert parallel size 1")
+        if args.use_critic or genrm_enabled or managed_opd_teacher_enabled:
+            raise ValueError("--colocate-live-weight-sync currently supports the Actor + rollout topology only")
+        if getattr(args, "lora_rank", 0) > 0:
+            raise ValueError("--colocate-live-weight-sync does not currently support LoRA")
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

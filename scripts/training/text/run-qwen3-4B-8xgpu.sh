@@ -115,6 +115,13 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.8
 )
 
+LIVE_WEIGHT_SYNC_ARGS=()
+case "${COLOCATE_LIVE_WEIGHT_SYNC:-0}" in
+   0) ;;
+   1) LIVE_WEIGHT_SYNC_ARGS+=(--colocate-live-weight-sync) ;;
+   *) echo "COLOCATE_LIVE_WEIGHT_SYNC must be 0 or 1" >&2; exit 2 ;;
+esac
+
 WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
@@ -156,4 +163,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
+    "${LIVE_WEIGHT_SYNC_ARGS[@]}" \
     "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-GRPO-gpu8-${now}.log

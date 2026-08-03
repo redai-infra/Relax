@@ -92,6 +92,7 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .weight_update.common import named_params_and_buffers
+from .weight_update.live_weight_sync import get_distributed_memory_status, run_live_weight_sync
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
@@ -285,6 +286,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 getattr(self.hf_config, "quantization_config", None),
                 args.hf_checkpoint,
             )
+            update_weight_kwargs: dict[str, Any] = {}
+            if update_weight_cls is UpdateWeightFromTensor and getattr(args, "colocate_live_weight_sync", False):
+                update_weight_kwargs["live_weights_getter"] = lambda: dict(
+                    named_params_and_buffers(
+                        self.args,
+                        self.model,
+                        convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                    )
+                )
             self.weight_updater = update_weight_cls(
                 self.args,
                 self.model,
@@ -293,6 +303,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self.args.model_name is None
                 else self.args.model_name,
                 quantization_config=push_quant_config,
+                **update_weight_kwargs,
             )
         else:
             is_pp_src_rank = (
@@ -402,6 +413,36 @@ class MegatronTrainRayActor(TrainRayActor):
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
         print_memory("after wake_up model")
+
+    def _can_sync_live_actor_weights(self) -> bool:
+        clear_memory()
+        local_free_bytes, _ = device_utils.mem_get_info()
+        local_required_bytes = self.weight_updater.live_weight_sync_required_bytes
+        status = get_distributed_memory_status(
+            local_free_bytes=local_free_bytes,
+            local_required_bytes=local_required_bytes,
+            process_group=get_gloo_group(),
+        )
+        if dist.get_rank() == 0:
+            logger.info(
+                "colocate live-weight sync memory check: min_free=%.2f GiB, required=%.2f GiB, enabled=%s",
+                status.min_free_bytes / 1024**3,
+                status.max_required_bytes / 1024**3,
+                status.can_sync,
+            )
+        return status.can_sync
+
+    def _onload_rollout_after_weight_sync(self) -> None:
+        if not self.args.offload_rollout or dist.get_rank() != 0:
+            return
+
+        post_sync_handles = []
+        if self._per_step_rollout:
+            post_sync_handles.append(self.rollout_manager.onload_kv.remote())
+        if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+            post_sync_handles.append(self.genrm_manager.onload.remote())
+        if post_sync_handles:
+            ray.get(post_sync_handles)
 
     def _switch_model(self, target_tag: str) -> None:
         # Backend-specific bookkeeping is handled in device utils so this
@@ -959,10 +1000,22 @@ class MegatronTrainRayActor(TrainRayActor):
             self.save_model(rollout_id, force_sync=is_train_done)
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
-            if self.args.offload_train:
-                self.sleep()
-            if has_rollout:
-                self.update_weights()
+            use_live_weight_sync = (
+                has_rollout
+                and getattr(self.args, "colocate_live_weight_sync", False)
+                and self._can_sync_live_actor_weights()
+            )
+            if use_live_weight_sync:
+                run_live_weight_sync(
+                    update_weights=lambda: self.update_weights(use_live_weights=True),
+                    offload_actor=self.sleep,
+                    onload_rollout_kv=self._onload_rollout_after_weight_sync,
+                )
+            else:
+                if self.args.offload_train:
+                    self.sleep()
+                if has_rollout:
+                    self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
@@ -1601,16 +1654,16 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     @timer
-    def update_weights(self) -> None:
+    def update_weights(self, *, use_live_weights: bool = False) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
         if self.args.offload_train:
-            # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
-            # completed sleep() (and released GPU memory via tms.pause()) before
-            # SGLang's resume_memory_occupation tries to reclaim GPU memory.
-            # Without this, rank 0 may trigger SGLang resume while other ranks
-            # still hold GPU memory, causing cuMemCreate OOM in SGLang schedulers.
+            # CRITICAL: Before onload_weights, the legacy path must ensure every
+            # rank completed sleep() and released GPU memory via tms.pause(). The
+            # live path instead reaches here after its collective memory preflight.
+            # Without an all-rank transition, rank 0 may resume SGLang while other
+            # ranks still hold memory, causing cuMemCreate OOM in the schedulers.
             dist.barrier(group=get_gloo_group())
 
         if self.args.offload_rollout and dist.get_rank() == 0:
@@ -1638,7 +1691,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if reconnect_rollout_engines:
             self.wake_up()
-        elif self.args.offload_train:
+        elif self.args.offload_train and not use_live_weights:
             reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
 
         if num_new_engines > 0 or reconnect_rollout_engines:
@@ -1654,7 +1707,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            if use_live_weights:
+                self.weight_updater.update_weights(use_live_weights=True)
+            else:
+                self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
 
             if self.args.ci_test and len(rollout_engines) > 0:
@@ -1677,7 +1733,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("old_actor")
         if reconnect_rollout_engines:
             self.sleep()
-        elif self.args.offload_train:
+        elif self.args.offload_train and not use_live_weights:
             destroy_process_groups()
 
         # RL warms KV here for the next per-step generate. SFT's /predict
@@ -1687,14 +1743,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # custom_reward_post_process function owns GenRM lifecycle, so skip
         # onloading GenRM here (it must stay offloaded for rollout to have
         # all GPUs during generate in shared-bundles mode).
-        if self.args.offload_rollout and dist.get_rank() == 0:
-            post_sync_handles = []
-            if self._per_step_rollout:
-                post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
-                post_sync_handles.append(self.genrm_manager.onload.remote())
-            if post_sync_handles:
-                ray.get(post_sync_handles)
+        if not use_live_weights:
+            self._onload_rollout_after_weight_sync()
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:
