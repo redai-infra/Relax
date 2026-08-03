@@ -172,7 +172,7 @@ def check_resource_shape(ctx: DoctorContext) -> list[DiagnosticResult]:
             )
             continue
         num_serves, num_gpus = spec
-        if not isinstance(num_serves, int) or not isinstance(num_gpus, int) or num_gpus < 0:
+        if type(num_serves) is not int or type(num_gpus) is not int or num_gpus < 0:
             diagnostics.append(
                 _result(
                     "CONFIG_RESOURCE_SHAPE",

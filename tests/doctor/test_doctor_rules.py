@@ -141,6 +141,32 @@ def test_model_roles_reject_zero_gpu_resources():
     assert diagnostic.details["role"] == "actor"
 
 
+@pytest.mark.parametrize(
+    "actor_resource",
+    (
+        [True, 8],
+        [False, 8],
+        [1, True],
+        [1, False],
+    ),
+)
+def test_partial_resource_shape_rejects_boolean_values(actor_resource):
+    report = run_doctor(
+        argv=[],
+        args=_namespace({"resource": {"actor": actor_resource, "rollout": [1, 8]}}),
+        parse_error="service plan rejected a non-integer resource value",
+    )
+
+    resource_diagnostics = [item for item in report.diagnostics if item.rule_id == "CONFIG_RESOURCE_SHAPE"]
+    assert report.config_state == "partial"
+    assert len(resource_diagnostics) == 1
+    assert "must contain integers" in resource_diagnostics[0].message
+    assert resource_diagnostics[0].details == {
+        "role": "actor",
+        "value": actor_resource,
+    }
+
+
 def test_fully_async_without_kl_does_not_require_reference():
     args = _namespace(
         {
