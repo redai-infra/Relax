@@ -49,7 +49,7 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
-from relax.utils.http_utils import get, init_http_client, post
+from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 
 
@@ -322,14 +322,14 @@ async def _sglang_worker_urls(args: Namespace) -> list[str]:
                 if isinstance(worker, dict) and worker.get("url") and bool(worker.get("is_healthy", False))
             ]
             if urls:
-                return urls
+                return router_worker_base_urls(urls)
     except Exception as exc:
         worker_query_error = exc
     try:
         response = await get(f"{base_url}/list_workers")
         urls = response.get("urls", [])
         if isinstance(urls, list):
-            return [url for url in urls if isinstance(url, str) and url]
+            return router_worker_base_urls(url for url in urls if isinstance(url, str) and url)
     except Exception as exc:
         if worker_query_error is not None:
             raise RuntimeError("Failed to query worker urls from both /workers and /list_workers") from exc

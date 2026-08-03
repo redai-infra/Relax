@@ -34,6 +34,7 @@ from relax.utils.http_utils import (
     get_host_info,
     init_http_client,
     post,
+    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
@@ -1085,6 +1086,7 @@ class RolloutManager(ReloadableMixin):
         else:
             response = await get(f"{router_base}/workers")
             worker_urls = [w["url"] for w in response["workers"]]
+        worker_urls = router_worker_base_urls(worker_urls)
         if not worker_urls:
             worker_urls = [router_base]
 
@@ -3072,12 +3074,16 @@ class RolloutManager(ReloadableMixin):
             shutdown_timeout = getattr(self.args, "scale_in_shutdown_timeout", 20.0)
 
             request.update_status(ScaleInStatus.DRAINING)
-            await self._drain_engines(engine_infos, timeout=drain_timeout, force=request.force)
+            unregistered_engine_infos, router_failed = await self._drain_engines(
+                engine_infos,
+                timeout=drain_timeout,
+                force=request.force,
+            )
 
             request.update_status(ScaleInStatus.REMOVING)
             removed = []
-            failed = []
-            for group, node0_idx in engine_infos:
+            failed = list(router_failed)
+            for group, node0_idx in unregistered_engine_infos:
                 engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
                 try:
                     await self._remove_engine(group, node0_idx, shutdown_timeout=shutdown_timeout)
@@ -3093,9 +3099,10 @@ class RolloutManager(ReloadableMixin):
             self._cleanup_engine_groups(srv)
 
             if failed:
+                failure_prefix = "Scale-in partially failed" if removed else "Scale-in failed"
                 request.update_status(
                     ScaleInStatus.FAILED,
-                    f"Scale-in partially failed: {len(failed)} engines could not be removed",
+                    f"{failure_prefix}: {len(failed)} engines could not be removed",
                 )
             else:
                 request.update_status(ScaleInStatus.COMPLETED)
@@ -3151,56 +3158,72 @@ class RolloutManager(ReloadableMixin):
 
         return engine_infos
 
-    async def _drain_engines(self, engine_infos: list, timeout: float, force: bool) -> None:
-        """Mark all engines as unhealthy in parallel, then wait once for the
-        drain period.
+    async def _drain_engines(self, engine_infos: list, timeout: float, force: bool) -> tuple[list, list[str]]:
+        """Remove all engines from the router, then wait once for the drain
+        period.
 
         Previous implementation waited ``timeout`` seconds per engine (serial),
-        causing total drain time of ``N * timeout``.  Now we mark all engines
-        unhealthy concurrently and then do a single ``asyncio.sleep(timeout)``
+        causing total drain time of ``N * timeout``. Now we remove all engines
+        from routing concurrently and then do a single ``asyncio.sleep(timeout)``
         so total drain time is always just ``timeout`` regardless of engine count.
+
+        Returns the engine infos confirmed absent from the router and the IDs
+        of engines that must remain alive.
         """
 
-        # Step 1: Mark health monitors and router concurrently for ALL engines
+        # Step 1: Stop routing new requests to all target engines.
         async def _mark_one_engine(group, node0_idx):
             engine = group.engines[node0_idx]
             if engine is None:
                 return
             engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+
+            router_removal_timeout = max(5.0, min(timeout, 30.0))
+            removed = await asyncio.wait_for(
+                engine.unregister_from_router.remote(
+                    wait_for_removal=True,
+                    timeout=router_removal_timeout,
+                ),
+                timeout=router_removal_timeout + 5.0,
+            )
+            if not removed:
+                raise RuntimeError(f"Router did not remove engine {engine_id}")
+            logger.info(f"[ScaleIn] Removed engine {engine_id} from router")
+
             for monitor in self._health_monitors:
                 if monitor._engine_group is group:
                     monitor.mark_intentionally_removed(node0_idx)
 
-            if group.router_ip and group.router_port:
-                try:
-                    url = await asyncio.wait_for(engine.get_url.remote(), timeout=5)
-                    if url:
-                        import httpx
+        # Stop routing to all engines concurrently. Only engines with confirmed
+        # removal are safe to drain and shut down.
+        removal_results = await asyncio.gather(
+            *[_mark_one_engine(g, idx) for g, idx in engine_infos],
+            return_exceptions=True,
+        )
+        unregistered_engine_infos = []
+        failed_engine_ids = []
+        for (group, node0_idx), result in zip(engine_infos, removal_results):
+            if isinstance(result, BaseException):
+                engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+                failure_detail = str(result) or type(result).__name__
+                logger.warning(
+                    f"[ScaleIn] Keeping engine {engine_id} alive because router removal failed: {failure_detail}"
+                )
+                failed_engine_ids.append(engine_id)
+            else:
+                unregistered_engine_infos.append((group, node0_idx))
 
-                        router_url = f"http://{_wrap_ipv6(group.router_ip)}:{group.router_port}"
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            await asyncio.wait_for(
-                                client.put(
-                                    f"{router_url}/workers",
-                                    json={"url": url, "is_healthy": False},
-                                ),
-                                timeout=5,
-                            )
-                            logger.info(f"[ScaleIn] Marked engine {engine_id} as unhealthy in router")
-                except Exception as e:
-                    logger.warning(f"[ScaleIn] Failed to mark engine {engine_id} unhealthy in router: {e}")
-
-        # Mark all engines concurrently
-        await asyncio.gather(*[_mark_one_engine(g, idx) for g, idx in engine_infos], return_exceptions=True)
-
-        # Step 2: Single drain wait for all engines
+        # Step 2: Single drain wait for engines that are safe to remove.
         drain_time = timeout if not force else 0
-        if drain_time > 0:
-            engine_ids = [f"group_{g.rank_offset}_engine_{idx}" for g, idx in engine_infos]
+        if drain_time > 0 and unregistered_engine_infos:
+            engine_ids = [f"group_{g.rank_offset}_engine_{idx}" for g, idx in unregistered_engine_infos]
             logger.info(
-                f"[ScaleIn] Draining {len(engine_infos)} engines for {drain_time}s (force={force}): {engine_ids}"
+                f"[ScaleIn] Draining {len(unregistered_engine_infos)} engines "
+                f"for {drain_time}s (force={force}): {engine_ids}"
             )
             await asyncio.sleep(drain_time)
+
+        return unregistered_engine_infos, failed_engine_ids
 
     async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
         engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"

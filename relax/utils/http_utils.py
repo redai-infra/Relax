@@ -6,6 +6,8 @@ import json
 import multiprocessing
 import random
 import socket
+from collections.abc import Iterable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -116,6 +118,35 @@ def _wrap_ipv6(host):
         return f"[{host.strip('[]')}]"
     except ipaddress.AddressValueError:
         return host
+
+
+def router_worker_base_url(url: str) -> str:
+    """Convert a router worker identity URL to its reachable base URL."""
+    base_url, separator, dp_rank = url.rpartition("@")
+    if not (separator and dp_rank.isascii() and dp_rank.isdigit()):
+        return url
+
+    try:
+        parsed_base_url = urlsplit(base_url)
+        has_explicit_port = parsed_base_url.port is not None
+    except ValueError:
+        return url
+
+    if (
+        parsed_base_url.scheme in {"http", "https"}
+        and parsed_base_url.hostname
+        and has_explicit_port
+        and parsed_base_url.path in {"", "/"}
+        and not parsed_base_url.query
+        and not parsed_base_url.fragment
+    ):
+        return base_url
+    return url
+
+
+def router_worker_base_urls(urls: Iterable[str]) -> list[str]:
+    """Convert worker identity URLs to stable, deduplicated base URLs."""
+    return list(dict.fromkeys(router_worker_base_url(url) for url in urls))
 
 
 def run_router(args):

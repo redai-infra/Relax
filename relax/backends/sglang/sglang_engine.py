@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import ray
 import requests
@@ -22,7 +22,7 @@ from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run
 from relax.utils.env import Envs
-from relax.utils.http_utils import get_host_info
+from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
 
@@ -253,6 +253,8 @@ class SGLangEngine(RayActor):
         self.num_gpus_per_engine = num_gpus_per_engine
         self._evicted = threading.Event()
         self._is_weight_updating: bool = False
+        self._router_worker_id: str | None = None
+        self._router_unregister_submitted = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -758,45 +760,136 @@ class SGLangEngine(RayActor):
                     timeout=30,
                 )
             response.raise_for_status()
+            self._router_worker_id = None
+            if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
+                try:
+                    response_payload = response.json()
+                except ValueError:
+                    response_payload = {}
+                if isinstance(response_payload, dict):
+                    worker_id = response_payload.get("worker_id")
+                    if worker_id is not None and str(worker_id):
+                        self._router_worker_id = str(worker_id)
+                if self._router_worker_id is None:
+                    location = response.headers.get("Location")
+                    if not location and isinstance(response_payload, dict):
+                        location = response_payload.get("location")
+                    try:
+                        location_path = urlsplit(location).path.rstrip("/")
+                    except (TypeError, ValueError):
+                        location_path = ""
+                    parent_path, separator, worker_id = location_path.rpartition("/")
+                    if separator and parent_path.endswith("/workers") and worker_id:
+                        self._router_worker_id = worker_id
+                if self._router_worker_id is None:
+                    logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
+            self._router_unregister_submitted = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
             logger.warning(f"Failed to register engine to router: {e}")
             return False
 
-    def unregister_from_router(self) -> bool:
+    def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        last_error = None
+        while True:
+            try:
+                response = requests.get(
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    timeout=min(5.0, max(1.0, deadline - time.monotonic())),
+                )
+                response.raise_for_status()
+                workers = response.json().get("workers", [])
+                if not any(
+                    isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
+                    for worker in workers
+                ):
+                    return True
+                last_error = None
+            except Exception as e:
+                last_error = e
+
+            if time.monotonic() >= deadline:
+                error_suffix = f": {last_error}" if last_error is not None else ""
+                logger.warning(f"Timed out waiting for worker {worker_url} to leave the router{error_suffix}")
+                return False
+            time.sleep(0.5)
+
+    def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
-
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        router_version = parse(sglang_router.__version__)
+        if self._router_unregister_submitted:
+            if not wait_for_removal or router_version < parse("0.3.0"):
+                return True
+            removed = self._wait_for_router_removal(worker_url, timeout)
+            if not removed:
+                self._router_unregister_submitted = False
+            return removed
+
         try:
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
                     timeout=30,
                 )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
+            elif router_version < parse("0.3.0"):
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
                     timeout=30,
                 )
+            elif self._router_worker_id is not None:
+                response = requests.delete(
+                    f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}",
+                    timeout=30,
+                )
             else:
-                all_workers = requests.get(
+                workers_response = requests.get(
                     f"http://{self.router_ip}:{self.router_port}/workers",
                     timeout=30,
-                ).json()["workers"]
+                )
+                workers_response.raise_for_status()
+                all_workers = workers_response.json().get("workers", [])
+                exact_worker = None
+                dp_worker_found = False
                 for worker in all_workers:
-                    if worker["url"] == worker_url:
-                        worker_id = worker["id"]
-                        response = requests.delete(
-                            f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}",
-                            timeout=30,
-                        )
-                        break
-                else:
+                    if not isinstance(worker, dict):
+                        continue
+                    listed_worker_url = worker.get("url")
+                    if listed_worker_url == worker_url:
+                        exact_worker = worker
+                    elif (
+                        isinstance(listed_worker_url, str) and router_worker_base_url(listed_worker_url) == worker_url
+                    ):
+                        dp_worker_found = True
+
+                if dp_worker_found:
+                    logger.warning(
+                        f"Cannot unregister DP-aware engine {worker_url} without its registration worker ID."
+                    )
+                    return False
+                if exact_worker is None:
                     logger.warning(f"Worker {worker_url} not found in router during unregister.")
                     return False
-            response.raise_for_status()
+
+                worker_id = exact_worker.get("id")
+                if worker_id is None or str(worker_id) == "":
+                    logger.warning(f"Router worker {worker_url} did not have a worker ID during unregister.")
+                    return False
+                response = requests.delete(
+                    f"http://{self.router_ip}:{self.router_port}/workers/{quote(str(worker_id), safe='')}",
+                    timeout=30,
+                )
+            if response.status_code != 404:
+                response.raise_for_status()
+            self._router_unregister_submitted = True
+            if wait_for_removal and router_version >= parse("0.3.0"):
+                removed = self._wait_for_router_removal(worker_url, timeout)
+                if not removed:
+                    self._router_unregister_submitted = False
+                    return False
             logger.info(f"Unregistered engine {worker_url} from router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
