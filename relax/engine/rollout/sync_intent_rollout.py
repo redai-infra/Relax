@@ -31,9 +31,15 @@ from relax.engine.rollout.sync_intent import (
     plan_intent_guard_fetch,
     sync_intent_abort_retry_interval_seconds,
     sync_intent_abort_timeout_seconds,
+    sync_intent_protected_drain_timeout_seconds,
     wait_for_sync_intent_end,
 )
-from relax.utils.cross_version_kv import cross_version_kv_enabled, mark_cross_version_kv_carry
+from relax.utils.cross_version_kv import (
+    cross_version_kv_enabled,
+    estimate_cross_version_kv_group_remaining_tokens,
+    mark_cross_version_kv_carry,
+    plan_cross_version_kv_progress_hedge,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -165,6 +171,8 @@ async def generate_rollout_async_with_sync_intent(
     state = GenerateState(args)
     if not hasattr(state, "recent_group_latency_seconds"):
         state.recent_group_latency_seconds: list[float] = []
+    if not hasattr(state, "recent_completed_response_lengths"):
+        state.recent_completed_response_lengths: list[int] = []
     await start_sglang_profile(args, rollout_id)
 
     dynamic_filter = (
@@ -200,6 +208,11 @@ async def generate_rollout_async_with_sync_intent(
     strict_fallback_groups = 0
     strict_fallback_prefix_tokens = 0
     completed_cross_version_groups = 0
+    a3_progress_hedge_cap = 0
+    a3_progress_hedge_inflight = 0
+    a3_progress_hedge_groups = 0
+    a3_estimated_remaining_tokens = 0
+    strict_retry_pending = False
     if cross_version_kv_enabled(args):
         adopted_debt_groups = _adopt_cross_version_tasks(
             state,
@@ -211,6 +224,28 @@ async def generate_rollout_async_with_sync_intent(
         adopted_cross_version_groups = len(task_groups)
         intent_debt_groups_inflight = adopted_debt_groups
         candidate_window_initialized = bool(task_groups)
+        strict_retry_pending = any(
+            sample.status == Sample.Status.ABORTED for group in task_groups.values() for sample in group
+        )
+        adopted_fresh_groups = list(task_groups.values())[adopted_debt_groups:]
+        a3_estimated_remaining_tokens = sum(
+            estimate_cross_version_kv_group_remaining_tokens(
+                group,
+                recent_completed_response_lengths=state.recent_completed_response_lengths,
+                max_response_length=args.rollout_max_response_len,
+            )
+            for group in adopted_fresh_groups
+        )
+        a3_progress_hedge_cap = plan_cross_version_kv_progress_hedge(
+            adopted_groups=adopted_cross_version_groups,
+            adopted_debt_groups=adopted_debt_groups,
+            resident_groups=state.remaining_batch_size,
+            remaining_fresh_groups=args.rollout_batch_size,
+            rollout_batch_size=args.rollout_batch_size,
+            strict_retry_pending=strict_retry_pending,
+            estimated_remaining_tokens=a3_estimated_remaining_tokens,
+            max_response_length=args.rollout_max_response_len,
+        )
 
     committed_prev = 0
     prev_target = num_old_samples
@@ -256,6 +291,21 @@ async def generate_rollout_async_with_sync_intent(
                 completed_buffer_groups=completed_buffer_groups,
             )
             default_fetch_groups = max(default_fetch_groups, missing_debt_groups)
+            using_a3_progress_hedge = False
+            remaining_hedge_budget = max(a3_progress_hedge_cap - a3_progress_hedge_inflight, 0)
+            if default_fetch_groups == 0 and missing_debt_groups == 0 and remaining_hedge_budget > 0:
+                live_hedge = plan_cross_version_kv_progress_hedge(
+                    adopted_groups=adopted_cross_version_groups,
+                    adopted_debt_groups=adopted_debt_groups,
+                    resident_groups=state.remaining_batch_size,
+                    remaining_fresh_groups=max(curr_target - progressed_fresh_groups, 0),
+                    rollout_batch_size=args.rollout_batch_size,
+                    strict_retry_pending=strict_retry_pending,
+                    estimated_remaining_tokens=a3_estimated_remaining_tokens,
+                    max_response_length=args.rollout_max_response_len,
+                )
+                default_fetch_groups = min(remaining_hedge_budget, live_hedge)
+                using_a3_progress_hedge = default_fetch_groups > 0
             if default_fetch_groups == 0:
                 break
 
@@ -277,7 +327,6 @@ async def generate_rollout_async_with_sync_intent(
                 assert intent_snapshot.sync_id is not None
                 await asyncio.to_thread(wait_for_sync_intent_end, intent_snapshot.sync_id)
                 continue
-
             get_samples_started_at = monotonic()
             use_prefetched = state.prefetched_samples_ref is not None and fetch_groups == default_fetch_groups
             if use_prefetched:
@@ -288,6 +337,20 @@ async def generate_rollout_async_with_sync_intent(
                 ref = data_source.get_samples.remote(fetch_groups)
             samples = await loop.run_in_executor(None, ray.get, ref)
             get_samples_times.append(monotonic() - get_samples_started_at)
+            if using_a3_progress_hedge:
+                for group in samples:
+                    for sample in group:
+                        sample.metadata["a3_progress_hedge"] = True
+                a3_progress_hedge_inflight += len(samples)
+                a3_progress_hedge_groups += len(samples)
+                logger.info(
+                    "TASK22_A3 event=progress_hedge rollout_id=%s groups=%s "
+                    "resident_groups=%s remaining_fresh_groups=%s",
+                    rollout_id,
+                    len(samples),
+                    state.remaining_batch_size,
+                    max(curr_target - progressed_fresh_groups, 0),
+                )
 
             active_guard = intent_snapshot.active and (
                 intent_snapshot.actor_rollout_id is None or rollout_id > intent_snapshot.actor_rollout_id
@@ -319,6 +382,16 @@ async def generate_rollout_async_with_sync_intent(
             source_group = task_groups.pop(task, None)
             state.remaining_batch_size -= 1
             group: list[Sample] = task.result()
+            source_group_is_hedge = source_group is not None and any(
+                sample.metadata.get("a3_progress_hedge", False) for sample in source_group
+            )
+            if source_group is not None:
+                for sample in source_group:
+                    sample.metadata.pop("a3_progress_hedge", None)
+            if source_group_is_hedge:
+                a3_progress_hedge_inflight -= 1
+                if a3_progress_hedge_inflight < 0:
+                    raise RuntimeError("A3 progress hedge inflight accounting became negative")
             if source_group is not None and (
                 len(group) != len(source_group)
                 or any(result is not source for result, source in zip(group, source_group, strict=True))
@@ -337,48 +410,55 @@ async def generate_rollout_async_with_sync_intent(
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
+            group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
+            cross_version_fallback = (
+                group_aborted
+                and cross_version_kv_enabled(args)
+                and any(sample.metadata.get("cross_version_kv_carried") for sample in group)
+            )
+            if cross_version_fallback:
+                strict_retry_pending = True
+                prefix_tokens = sum(sample.response_length for sample in group)
+                strict_fallback_groups += 1
+                strict_fallback_prefix_tokens += prefix_tokens
+                for sample in group:
+                    if sample.status == Sample.Status.ABORTED:
+                        sample.abort_count += 1
+                    sample.metadata["cross_version_kv_carried"] = False
+                    sample.metadata["cross_version_kv_carryovers"] = 0
+                    sample.metadata["cross_version_kv_fallbacks"] = (
+                        int(sample.metadata.get("cross_version_kv_fallbacks", 0)) + 1
+                    )
+                await _submit_generate_tasks_debt_first(
+                    state,
+                    args,
+                    [group],
+                    1 if group_is_debt else 0,
+                    task_started_at,
+                    task_groups,
+                )
+                if group_is_debt:
+                    intent_debt_groups_inflight += 1
+                logger.info(
+                    "TASK22_A3 event=strict_fallback rollout_id=%s origin=%s groups=1 retained_prefix_tokens=%s",
+                    rollout_id,
+                    "old_debt" if group_is_debt else "fresh",
+                    prefix_tokens,
+                )
+                continue
+
+            if not group_aborted:
+                state.recent_completed_response_lengths.extend(sample.response_length for sample in group)
+                state.recent_completed_response_lengths = state.recent_completed_response_lengths[-512:]
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 continue
 
-            group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
             if started_at is not None and not group_aborted:
                 state.recent_group_latency_seconds.append(monotonic() - started_at)
                 state.recent_group_latency_seconds = state.recent_group_latency_seconds[-64:]
             if group_aborted:
-                cross_version_fallback = cross_version_kv_enabled(args) and any(
-                    sample.metadata.get("cross_version_kv_carried") for sample in group
-                )
-                if cross_version_fallback:
-                    prefix_tokens = sum(sample.response_length for sample in group)
-                    strict_fallback_groups += 1
-                    strict_fallback_prefix_tokens += prefix_tokens
-                    for sample in group:
-                        if sample.status == Sample.Status.ABORTED:
-                            sample.abort_count += 1
-                        sample.metadata["cross_version_kv_carried"] = False
-                        sample.metadata["cross_version_kv_carryovers"] = 0
-                        sample.metadata["cross_version_kv_fallbacks"] = (
-                            int(sample.metadata.get("cross_version_kv_fallbacks", 0)) + 1
-                        )
-                    await _submit_generate_tasks_debt_first(
-                        state,
-                        args,
-                        [group],
-                        1 if group_is_debt else 0,
-                        task_started_at,
-                        task_groups,
-                    )
-                    if group_is_debt:
-                        intent_debt_groups_inflight += 1
-                    logger.info(
-                        "TASK22_A3 event=strict_fallback rollout_id=%s origin=%s groups=1 retained_prefix_tokens=%s",
-                        rollout_id,
-                        "old_debt" if group_is_debt else "fresh",
-                        prefix_tokens,
-                    )
-                    continue
                 if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
                     completed_cross_version_groups += 1
                 for sample in group:
@@ -514,6 +594,7 @@ async def generate_rollout_async_with_sync_intent(
             rollout_id,
             retry_interval_seconds=sync_intent_abort_retry_interval_seconds(),
             timeout_seconds=sync_intent_abort_timeout_seconds(),
+            protected_timeout_seconds=sync_intent_protected_drain_timeout_seconds(),
         )
         aborted_samples.extend(new_aborted)
         aborted_samples.extend(completed_protected)
@@ -535,6 +616,8 @@ async def generate_rollout_async_with_sync_intent(
             "rollout/a3/adopted_debt_groups": adopted_debt_groups,
             "rollout/a3/completed_groups": completed_cross_version_groups,
             "rollout/a3/carried_groups": carried_groups,
+            "rollout/a3/estimated_remaining_tokens": a3_estimated_remaining_tokens,
+            "rollout/a3/progress_hedge_groups": a3_progress_hedge_groups,
             "rollout/a3/strict_fallback_groups": strict_fallback_groups,
             "rollout/a3/strict_fallback_prefix_tokens": strict_fallback_prefix_tokens,
         }

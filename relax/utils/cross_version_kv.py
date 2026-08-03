@@ -59,6 +59,95 @@ def cross_version_kv_pause_mode(args: object, weight_version: int) -> CrossVersi
     return "in_place"
 
 
+def cross_version_kv_group_ready_for_finalize(group: Sequence[object]) -> bool:
+    """Return whether group-level reward and post-processing are safe."""
+    for sample in group:
+        status = getattr(sample, "status", None)
+        if getattr(status, "value", status) == "aborted":
+            return False
+    return True
+
+
+def cross_version_kv_resident_cap(rollout_batch_size: int) -> int:
+    if rollout_batch_size <= 0:
+        raise ValueError("rollout_batch_size must be positive")
+    return rollout_batch_size + max(1, rollout_batch_size // 4)
+
+
+def estimate_cross_version_kv_group_remaining_tokens(
+    group: Sequence[object],
+    *,
+    recent_completed_response_lengths: Sequence[int],
+    max_response_length: int,
+) -> int:
+    """Estimate group tail from the conditional residual-length distribution."""
+    if max_response_length <= 0:
+        raise ValueError("max_response_length must be positive")
+    history = sorted(
+        min(int(length), max_response_length) for length in recent_completed_response_lengths if int(length) >= 0
+    )
+    estimated_remaining = 0
+    for sample in group:
+        status = getattr(sample, "status", None)
+        status_value = getattr(status, "value", status)
+        if status_value in {"completed", "truncated"}:
+            continue
+        current_length = min(max(int(getattr(sample, "response_length", 0)), 0), max_response_length)
+        residuals = [length - current_length for length in history if length > current_length]
+        if len(residuals) >= 4:
+            # A bounded upper-middle estimate avoids treating surviving requests
+            # as nearly done while remaining robust to one extreme completion.
+            residuals.sort()
+            estimate = residuals[(3 * (len(residuals) - 1)) // 4]
+        else:
+            estimate = max_response_length - current_length
+        estimated_remaining = max(estimated_remaining, estimate)
+    return estimated_remaining
+
+
+def plan_cross_version_kv_progress_hedge(
+    *,
+    adopted_groups: int,
+    adopted_debt_groups: int,
+    resident_groups: int,
+    remaining_fresh_groups: int,
+    rollout_batch_size: int,
+    strict_retry_pending: bool = False,
+    estimated_remaining_tokens: int | None = None,
+    max_response_length: int | None = None,
+) -> int:
+    """Reserve bounded current-partition progress behind carried fresh work."""
+    values = (
+        adopted_groups,
+        adopted_debt_groups,
+        resident_groups,
+        remaining_fresh_groups,
+        rollout_batch_size,
+    )
+    if min(values) < 0:
+        raise ValueError("A3 progress hedge inputs must be non-negative")
+    if rollout_batch_size == 0:
+        raise ValueError("rollout_batch_size must be positive")
+    if adopted_debt_groups > adopted_groups:
+        raise ValueError("adopted_debt_groups must not exceed adopted_groups")
+    if estimated_remaining_tokens is not None and estimated_remaining_tokens < 0:
+        raise ValueError("estimated_remaining_tokens must be non-negative")
+    if estimated_remaining_tokens is not None and (max_response_length is None or max_response_length <= 0):
+        raise ValueError("max_response_length must be positive with an estimate")
+
+    adopted_fresh_groups = adopted_groups - adopted_debt_groups
+    if strict_retry_pending or adopted_fresh_groups == 0 or remaining_fresh_groups == 0:
+        return 0
+
+    max_resident_groups = cross_version_kv_resident_cap(rollout_batch_size)
+    hedge_cap = max_resident_groups - rollout_batch_size
+    if estimated_remaining_tokens is not None:
+        pressure_groups = (estimated_remaining_tokens + max_response_length - 1) // max_response_length
+        hedge_cap = min(hedge_cap, pressure_groups)
+    free_slots = max(max_resident_groups - resident_groups, 0)
+    return min(hedge_cap, adopted_fresh_groups, remaining_fresh_groups, free_slots)
+
+
 def mark_cross_version_kv_carry(
     groups: Sequence[Sequence[object]],
     *,

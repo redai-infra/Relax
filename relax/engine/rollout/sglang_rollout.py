@@ -27,6 +27,7 @@ from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainO
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.engine.rollout.sync_intent import resolve_partition_request_priority, sync_intent_policy_enabled
 from relax.utils.async_utils import run
+from relax.utils.cross_version_kv import cross_version_kv_enabled, cross_version_kv_group_ready_for_finalize
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
@@ -719,8 +720,11 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
-    # eval should still compute group reward even if abort was triggered by a concurrent rollout
-    if (not state.aborted or evaluation) and args.group_rm:
+    # A backend-side strict pause can abort only part of a group without
+    # toggling state.aborted. Defer group reward and OPD prefill until every
+    # member is terminal so a cross-version retry can reuse completed siblings.
+    group_ready = evaluation or not cross_version_kv_enabled(args) or cross_version_kv_group_ready_for_finalize(group)
+    if (not state.aborted or evaluation) and args.group_rm and group_ready:
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
@@ -737,6 +741,7 @@ async def abort(
     *,
     retry_interval_seconds: float | None = None,
     timeout_seconds: float | None = None,
+    protected_timeout_seconds: float | None = None,
 ) -> tuple[list[list[Sample]], list[list[Sample]]]:
     if retry_interval_seconds is not None and retry_interval_seconds <= 0:
         raise ValueError("retry_interval_seconds must be positive")
@@ -744,6 +749,8 @@ async def abort(
         raise ValueError("timeout_seconds must be positive")
     if timeout_seconds is not None and retry_interval_seconds is None:
         raise ValueError("timeout_seconds requires retry_interval_seconds")
+    if protected_timeout_seconds is not None and protected_timeout_seconds <= 0:
+        raise ValueError("protected_timeout_seconds must be positive")
 
     aborted_samples = []
     completed_protected_samples = []
@@ -762,6 +769,8 @@ async def abort(
             await asyncio.sleep(0.5)
         logger.info(f"Eval completed. Proceeding with abort for rollout {rollout_id}.")
 
+    protected_drain_started_at = monotonic()
+
     # Step 1: Wait for protected tasks (abort_count >= partial_rollout_max_aborted_count) to finish naturally.
     if state.protected_pendings:
         logger.info(
@@ -769,9 +778,24 @@ async def abort(
             f"(abort_count >= partial_rollout_max_aborted_count) to complete before aborting others."
         )
         while state.protected_pendings:
+            wait_timeout = None
+            if protected_timeout_seconds is not None:
+                wait_timeout = protected_timeout_seconds - (monotonic() - protected_drain_started_at)
+                if wait_timeout <= 0:
+                    raise RuntimeError(
+                        f"Protected abort drain timed out for rollout_id={rollout_id}: "
+                        f"protected_groups={len(state.protected_pendings)}"
+                    )
             done, state.protected_pendings = await asyncio.wait(
-                state.protected_pendings, return_when=asyncio.FIRST_COMPLETED
+                state.protected_pendings,
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                raise RuntimeError(
+                    f"Protected abort drain timed out for rollout_id={rollout_id}: "
+                    f"protected_groups={len(state.protected_pendings)}"
+                )
             for task in done:
                 group = task.result()
                 completed_protected_samples.append(group)

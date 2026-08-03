@@ -78,6 +78,127 @@ def _completed_sample() -> SimpleNamespace:
     )
 
 
+async def test_group_rm_waits_for_cross_version_strict_retry(monkeypatch) -> None:
+    completed = _completed_sample()
+    aborted = SimpleNamespace(
+        status=Sample.Status.ABORTED,
+        response="partial",
+        response_length=1,
+        reward=None,
+        loss_mask=None,
+        session_id=None,
+        metadata={},
+        generate_function_path=None,
+    )
+    state = SimpleNamespace(aborted=False, opd_manager=None)
+    reward_calls: list[list[SimpleNamespace]] = []
+    dispatch_calls: list[SimpleNamespace] = []
+
+    async def fake_dispatch(_state, _args, sample, _sampling_params, **_kwargs):
+        dispatch_calls.append(sample)
+        sample.status = Sample.Status.COMPLETED
+        sample.response = "resumed"
+        return sample
+
+    async def fake_group_rm(_args, group):
+        reward_calls.append(list(group))
+        return [1.0] * len(group)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_dispatch_generate", fake_dispatch)
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_group_rm)
+    args = SimpleNamespace(
+        enable_cross_version_kv_continuation=True,
+        partial_rollout=True,
+        mask_offpolicy_in_partial_rollout=True,
+        group_rm=True,
+        sglang_enable_deterministic_inference=False,
+    )
+
+    original_group = [completed, aborted]
+    result = await generate_and_rm_group(args, original_group, sampling_params={})
+
+    assert result[0] is completed
+    assert result[1] is aborted
+    assert dispatch_calls == [aborted]
+    assert reward_calls == [original_group]
+    assert completed.reward == 1.0
+    assert aborted.reward == 1.0
+
+
+async def test_group_rm_skips_mixed_terminal_group(monkeypatch) -> None:
+    completed = _completed_sample()
+    aborted = SimpleNamespace(
+        status=Sample.Status.ABORTED,
+        response="partial",
+        response_length=1,
+        reward=None,
+        loss_mask=None,
+        session_id=None,
+        metadata={},
+    )
+    state = SimpleNamespace(aborted=False, opd_manager=None)
+    reward_called = False
+
+    async def fake_generate_and_rm(_args, sample, _sampling_params, **_kwargs):
+        return sample
+
+    async def fake_group_rm(_args, _group):
+        nonlocal reward_called
+        reward_called = True
+        return [1.0, 1.0]
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_group_rm)
+    args = SimpleNamespace(
+        enable_cross_version_kv_continuation=True,
+        group_rm=True,
+        sglang_enable_deterministic_inference=False,
+    )
+
+    result = await generate_and_rm_group(args, [completed, aborted], sampling_params={})
+
+    assert result == [completed, aborted]
+    assert not reward_called
+
+
+@pytest.mark.parametrize(
+    ("a3_enabled", "evaluation"),
+    [(False, False), (True, True)],
+)
+async def test_group_rm_preserves_default_and_evaluation_behavior(
+    monkeypatch,
+    a3_enabled: bool,
+    evaluation: bool,
+) -> None:
+    completed = _completed_sample()
+    aborted = SimpleNamespace(status=Sample.Status.ABORTED, session_id=None)
+    state = SimpleNamespace(aborted=False, opd_manager=None)
+    reward_calls = 0
+
+    async def fake_generate_and_rm(_args, sample, _sampling_params, **_kwargs):
+        return sample
+
+    async def fake_group_rm(_args, group):
+        nonlocal reward_calls
+        reward_calls += 1
+        return [1.0] * len(group)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_group_rm)
+    args = SimpleNamespace(
+        enable_cross_version_kv_continuation=a3_enabled,
+        group_rm=True,
+        sglang_enable_deterministic_inference=False,
+    )
+
+    await generate_and_rm_group(args, [completed, aborted], sampling_params={}, evaluation=evaluation)
+
+    assert reward_calls == 1
+
+
 # --------------------------------------------------------------------------- #
 # T1-T8: InferencePermitManager
 # --------------------------------------------------------------------------- #
@@ -342,6 +463,42 @@ async def test_abort_retry_timeout_fails_closed(monkeypatch) -> None:
             rollout_id=4,
             retry_interval_seconds=0.01,
             timeout_seconds=0.03,
+        )
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_protected_abort_drain_timeout_fails_closed(monkeypatch) -> None:
+    never = asyncio.Event()
+
+    async def protected_group():
+        await never.wait()
+        return []
+
+    task = asyncio.create_task(protected_group())
+    state = SimpleNamespace(
+        aborted=False,
+        evaluating=0,
+        protected_pendings={task},
+        pendings=set(),
+    )
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    args = SimpleNamespace(
+        use_slime_router=False,
+        partial_rollout=True,
+        sglang_router_ip="router",
+        sglang_router_port=3000,
+    )
+
+    with pytest.raises(RuntimeError, match="Protected abort drain timed out"):
+        await sglang_rollout.abort(
+            args,
+            rollout_id=4,
+            retry_interval_seconds=0.01,
+            timeout_seconds=1.0,
+            protected_timeout_seconds=0.01,
         )
 
     task.cancel()

@@ -9,6 +9,7 @@ from relax.engine.rollout.sync_intent import (
     DEFAULT_ROLLOUT_REQUEST_PRIORITY,
     OLD_DEBT_REQUEST_PRIORITY,
     SYNC_INTENT_POLICY_ENV,
+    SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_ENV,
     SYNC_INTENT_QUIESCE_FLOOR_ENV,
     SYNC_INTENT_QUIESCE_MULTIPLIER_ENV,
     SYNC_INTENT_TTL_ENV,
@@ -21,6 +22,7 @@ from relax.engine.rollout.sync_intent import (
     resolve_partition_request_priority,
     should_admit_fresh,
     sync_intent_policy_enabled,
+    sync_intent_protected_drain_timeout_seconds,
 )
 
 
@@ -37,6 +39,11 @@ def test_policy_enable_values(monkeypatch: pytest.MonkeyPatch) -> None:
     for value in ("1", "true", "yes", "on"):
         monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, value)
         assert sync_intent_policy_enabled()
+
+
+def test_protected_drain_uses_long_independent_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_ENV, raising=False)
+    assert sync_intent_protected_drain_timeout_seconds() == 600
 
 
 def test_sync_intent_identity_is_idempotent_and_monotonic() -> None:

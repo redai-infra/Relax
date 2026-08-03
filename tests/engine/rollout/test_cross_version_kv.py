@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.cross_version_kv import (
+    cross_version_kv_group_ready_for_finalize,
     cross_version_kv_pause_mode,
+    cross_version_kv_resident_cap,
     cross_version_kv_strict_refresh,
+    estimate_cross_version_kv_group_remaining_tokens,
     mark_cross_version_kv_carry,
+    plan_cross_version_kv_progress_hedge,
     validate_cross_version_kv_args,
 )
 
@@ -68,6 +72,142 @@ def test_strictly_aborted_carry_starts_new_kv_epoch() -> None:
 
     assert adopted == 1
     assert sample.metadata["cross_version_kv_carryovers"] == 0
+
+
+def test_mixed_group_defers_group_finalize_until_retry_completes() -> None:
+    completed = SimpleNamespace(status="completed")
+    aborted = SimpleNamespace(status="aborted")
+
+    assert not cross_version_kv_group_ready_for_finalize([completed, aborted])
+
+    aborted.status = "completed"
+
+    assert cross_version_kv_group_ready_for_finalize([completed, aborted])
+
+
+def test_progress_hedge_prevents_carried_fresh_from_freezing_current_work() -> None:
+    assert cross_version_kv_resident_cap(8) == 10
+    assert (
+        plan_cross_version_kv_progress_hedge(
+            adopted_groups=8,
+            adopted_debt_groups=0,
+            resident_groups=8,
+            remaining_fresh_groups=8,
+            rollout_batch_size=8,
+        )
+        == 2
+    )
+
+
+def test_remaining_token_estimate_uses_conditional_tail() -> None:
+    group = [SimpleNamespace(response_length=4000), SimpleNamespace(response_length=6000)]
+
+    estimated = estimate_cross_version_kv_group_remaining_tokens(
+        group,
+        recent_completed_response_lengths=[4500, 5000, 6200, 6500, 7000, 7500, 8000, 8192],
+        max_response_length=8192,
+    )
+
+    assert estimated == 3500
+
+
+def test_remaining_token_estimate_falls_back_to_safe_upper_bound() -> None:
+    group = [SimpleNamespace(response_length=7000)]
+
+    estimated = estimate_cross_version_kv_group_remaining_tokens(
+        group,
+        recent_completed_response_lengths=[1000, 2000, 3000],
+        max_response_length=8192,
+    )
+
+    assert estimated == 1192
+
+
+def test_remaining_token_estimate_ignores_completed_siblings() -> None:
+    group = [
+        SimpleNamespace(status="completed", response_length=1000),
+        SimpleNamespace(status="pending", response_length=7000),
+    ]
+
+    estimated = estimate_cross_version_kv_group_remaining_tokens(
+        group,
+        recent_completed_response_lengths=[],
+        max_response_length=8192,
+    )
+
+    assert estimated == 1192
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (
+            {
+                "adopted_groups": 4,
+                "adopted_debt_groups": 4,
+                "resident_groups": 4,
+                "remaining_fresh_groups": 8,
+                "rollout_batch_size": 8,
+            },
+            0,
+        ),
+        (
+            {
+                "adopted_groups": 10,
+                "adopted_debt_groups": 0,
+                "resident_groups": 10,
+                "remaining_fresh_groups": 8,
+                "rollout_batch_size": 8,
+            },
+            0,
+        ),
+        (
+            {
+                "adopted_groups": 8,
+                "adopted_debt_groups": 0,
+                "resident_groups": 9,
+                "remaining_fresh_groups": 8,
+                "rollout_batch_size": 8,
+            },
+            1,
+        ),
+        (
+            {
+                "adopted_groups": 8,
+                "adopted_debt_groups": 0,
+                "resident_groups": 8,
+                "remaining_fresh_groups": 1,
+                "rollout_batch_size": 8,
+            },
+            1,
+        ),
+        (
+            {
+                "adopted_groups": 8,
+                "adopted_debt_groups": 0,
+                "resident_groups": 8,
+                "remaining_fresh_groups": 8,
+                "rollout_batch_size": 8,
+                "strict_retry_pending": True,
+            },
+            0,
+        ),
+        (
+            {
+                "adopted_groups": 8,
+                "adopted_debt_groups": 0,
+                "resident_groups": 8,
+                "remaining_fresh_groups": 8,
+                "rollout_batch_size": 8,
+                "estimated_remaining_tokens": 8192,
+                "max_response_length": 8192,
+            },
+            1,
+        ),
+    ],
+)
+def test_progress_hedge_is_bounded_and_skips_debt_or_strict_rebuild(values: dict, expected: int) -> None:
+    assert plan_cross_version_kv_progress_hedge(**values) == expected
 
 
 def test_cross_version_kv_validation_accepts_task22_contract() -> None:
