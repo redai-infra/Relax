@@ -359,8 +359,7 @@ class Controller:
         if plan.shares_actor_rollout_pg:
             # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
             if actor_rollout_pgs is None:
-                num_gpus = next(spec.num_gpus for spec in plan.planned_specs if spec.role == "actor")
-                actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
+                actor_rollout_pgs = create_placement_group(num_gpus=plan.shared_gpu)
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None

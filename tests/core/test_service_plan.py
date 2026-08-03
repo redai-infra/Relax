@@ -42,6 +42,21 @@ def test_service_plan_matches_sync_and_hybrid_placement():
     assert hybrid_plan.total_required_gpus == 16
 
 
+def test_service_plan_sizes_shared_pg_for_largest_role():
+    plan = build_service_plan(
+        _config(
+            resource={
+                "actor": [1, 4],
+                "rollout": [1, 8],
+            }
+        )
+    )
+
+    assert plan.shares_actor_rollout_pg is True
+    assert plan.shared_gpu == 8
+    assert plan.total_required_gpus == 8
+
+
 def test_service_plan_resolves_fully_async_conditional_roles():
     resources = {
         "actor": [1, 4],
