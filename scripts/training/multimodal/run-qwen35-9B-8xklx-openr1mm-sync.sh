@@ -2,111 +2,100 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-9B 8xP800 colocate (sync) training script for DAPO math dataset.
+# Qwen3.5-9B 8xklx sync training script (ray-job mode).
+# The Ray cluster is managed externally — do NOT kill ray or start a new cluster.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen35-9B-8xklx.sh
+#   bash scripts/training/multimodal/run-qwen35-9B-8xklx-sync.sh [sync]
 
 set -ex
 set -o pipefail
 
+
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
-
 export WORKDIR="${WORKDIR:-/workspace}"
 export MODEL_DIR="${MODEL_DIR:-/workspace}"
 export DATA_DIR="${DATA_DIR:-/workspace}"
-export PROJECT_NAME=Relax-Qwen3.5-9B-P800
 export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
-
-export MEGATRON=${WORKDIR}/Megatron-LM
-
-export CUDA_ENABLE_P2P_NO_UVA=0
-export CUDA_FAKE_UVA_ENABLE=1
-export CUDA_ERROR_LEVEL=0
-export XMLIR_MEMCPY_RETRY_SYNC=true
-
-export XPU_SUPPORT_IPC_EVENT=1
-export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"eth1,eth1,eth2,eth2,eth3,eth3,eth4,eth4"}
-
-unset http_proxy
-unset https_proxy
+export PROJECT_NAME="${PROJECT_NAME:=Qwen3.5-9B-multimodal-openr1mm}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local-klx.sh"
 fi
-source "${SCRIPT_DIR}/../../models/qwen35-9B.sh"
-
+source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
+
+NUM_GPUS_TOTAL="${NUM_GPUS_TOTAL:-8}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
    --ref-load ${MODEL_DIR}/Qwen3.5-9B
-   --megatron-to-hf-mode bridge
-
-   --load ${EXP_DIR}/Qwen3-9B_mcore_8xgpu/
-   --save ${EXP_DIR}/Qwen3-9B_mcore_8xgpu/
-   --save-interval 50
+   # --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct
+   # --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct
+   --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
+   --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
+   --save-interval 100
    --max-actor-ckpt-to-keep 1
+   --megatron-to-hf-mode bridge
+   --warm-hf-checkpoint-page-cache
 )
 
-PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
-EVAL_DATA=${DATA_DIR}/aime-2024/aime-2024.jsonl
+PROMPT_SET=${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
+
+SYSTEM_PROMPT="A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
+
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
    --input-key prompt
    --label-key label
    --apply-chat-template
-   --rollout-shuffle
-   --rm-type dapo
-   --reward-key score
+   # --rollout-shuffle
+   --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 64
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
-   --rollout-temperature 1
+   --rollout-max-response-len 1024
+   --rollout-max-prompt-len 2048
+   --rollout-temperature 0.8
    --global-batch-size 512
-   --balance-data
-   --use-fault-tolerance
-)
-
-EVAL_ARGS=(
-   --log-passrate
-   --skip-eval-before-train
-   --eval-interval 20
-   --eval-prompt-data aime ${EVAL_DATA}
-   --n-samples-per-eval-prompt 8
-   --eval-max-response-len 8192
-   --eval-top-p 0.7
+   --multimodal-keys '{"image":"image"}'
+   --system-prompt "${SYSTEM_PROMPT}"
+   --use-streaming-dataset
 )
 
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
+   # --decoder-last-pipeline-num-layers 
+   # --decoder-first-pipeline-num-layers 8
+   
    --context-parallel-size 1
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
-   --recompute-granularity full
-   --recompute-method block
-   --recompute-num-layers 16
-
+   # --recompute-granularity full
+   # --recompute-method uniform
+   # --recompute-num-layers 1
+   --calculate-per-token-loss
+   # --micro-batch-size 2
+   # --qkv-format bshd
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 24576
-   # --micro-batch-size 1 # avoid OOM
+   --max-tokens-per-gpu 8192
 
    --no-rope-fusion
 )
 
 GRPO_ARGS=(
-   --advantage-estimator grpo
    --use-kl-loss
+   --advantage-estimator grpo
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
+   --kl-coef 0.00
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -120,16 +109,28 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+   --clip-grad 1.0
+)
 
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
-   --use-precision-aware-optimizer
+WANDB_ARGS=(
+   # --use-tensorboard
+   # --use-clearml
+   # --use-metrics-service
+   # --tb-project-name ${PROJECT_NAME}
+   # --tb-experiment-name qwen35-9b-GRPO-gpu8-${MODE}-${now}
+   --use-wandb
+   --wandb-project ${PROJECT_NAME}
+   --wandb-group qwen35-9b-GRPO-klx-image-${now}
+   --disable-wandb-random-suffix
+   --no-use-metrics-service
+   --no-use-tensorboard
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.8
+   --sglang-mem-fraction-static 0.75
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --sglang-mm-enable-dp-encoder
 
    --sglang-disable-custom-all-reduce
    --sglang-page-size 64
@@ -140,16 +141,6 @@ SGLANG_ARGS=(
    # --sglang-disable-cuda-graph
    --sglang-reasoning-parser qwen3
    --sglang-tool-call-parser qwen3_coder
-)
-
-WANDB_ARGS=(
-   --tb-experiment-name qwen3.5-p800-9B-${now}
-   --use-wandb
-   --wandb-project ${PROJECT_NAME}
-   --wandb-group qwen3.5-p800-9B-${now}
-   --wandb-key ${WANDB_API_KEY}
-   --disable-wandb-random-suffix
-   --no-use-metrics-service
 )
 
 MISC_ARGS=(
@@ -168,10 +159,8 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
     \"LD_LIBRARY_PATH\":\"${WORKDIR}/xhpc-ubuntu2004_x86_64/xpudnn/so:${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"OPENBLAS_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
-    \"OMP_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
-    \"MKL_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
-    \"NUMEXPR_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"OPENBLAS_NUM_THREADS\": \"64\",
+    \"OMP_NUM_THREADS\": \"64\",
     \"TOKENIZERS_PARALLELISM\": \"true\",
     \"NCCL_CUMEM_ENABLE\": \"0\",
     \"NCCL_SOCKET_IFNAME\": \"eth0\",
@@ -240,7 +229,7 @@ RUNTIME_ENV_JSON="{
     \"TRITON_SKIP_AUTOTUNE\": \"1\",
     \"XMLIR_FORCE_USE_XPU_GRAPH\": \"1\",
     \"XSGL_USE_TORCH_CAUSAL_CONV\": \"1\",
-    \"XSGL_FUSE_SPLIT_NORM_ROPE_NEOX\": \"1\",
+    \"XSGL_FUSE_SPLIT_NORM_ROPE_NEOX\": \"0\",
     \"XPU_FLASH_ATTENTION_DECODER_USE_BALANCE\": \"1\",
     \"CUDA_ENABLE_P2P_NO_UVA\": \"0\",
     \"CUDA_FAKE_UVA_ENABLE\": \"1\",
@@ -255,28 +244,35 @@ RUNTIME_ENV_JSON="{
     \"XMLIR_MATMUL_FAST_MODE\": \"1\",
     \"XMLIR_ENABLE_FAST_FC\": \"1\",
     \"HYDRAX_USE_PROTEUS\": \"0\",
+    \"OPENBLAS_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"OMP_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"MKL_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"NUMEXPR_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"XMLIR_ENABLE_H2D_SSE_COPY\": \"1\",
+    \"XTE_RECOMPUTE_LN_OUT_TOTAL\": \"1\",
     \"HEALTH_GENERATE_TOPK\": \"-1\"
   }
 }"
 
+
 mkdir -p log
+
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \
-   --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
-   --colocate \
+   --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
    --max-staleness 0 \
    --num-data-storage-units 1 \
+   --colocate \
    --use-health-check \
+   --balance-data \
    --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${GRPO_ARGS[@]}" \
-   "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
-   "${EVAL_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9B-GRPO-gpu8-${now}.log
+   "${WANDB_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-colocate-${now}.log
