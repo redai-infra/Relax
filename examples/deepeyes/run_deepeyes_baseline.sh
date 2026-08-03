@@ -5,6 +5,9 @@
 set -ex
 set -o pipefail
 
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NUM_GPU=$(expr length "$CUDA_VISIBLE_DEVICES" / 2 + 1)
+
 ###############################################################################
 #                                 ENVIRONMENT                                 #
 ###############################################################################
@@ -16,16 +19,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
 fi
-source "${MODEL_CONFIG_DIR}/qwen3-vl-30B-A3B.sh"
+source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 
 # DeepEyes sends pre-tokenized input_ids that SGLang's stock Qwen-VL processor
 # mishandles; --deepeyes-qwen-vl-patch applies the runtime monkey-patch at
 # SGLang engine start-up (replaces the old ``cp qwen_vl.py /sgl-workspace/...``
-# overlay). The flag is translated to RELAX_DEEPEYES_QWEN_VL_PATCH=1 in
-# sglang_engine._init_normal so the spawned SGLang subprocess inherits it.
-# Default off (stock SGLang behavior). Set DEEPEYES_PATCH=1 to apply the
-# DeepEyes Qwen-VL processor monkey-patch at SGLang engine start-up — needed
-# for correct DeepEyes multi-turn rollout (pre-tokenized input_ids).
+# overlay). Default off (stock SGLang behavior). Set DEEPEYES_PATCH=1 to enable
+# the patch — needed for correct DeepEyes multi-turn rollout (pre-tokenized
+# input_ids). See relax/backends/sglang/patches/qwen_vl_patch.py.
 DEEPEYES_PATCH="${DEEPEYES_PATCH:-0}"
 
 ###############################################################################
@@ -33,34 +34,36 @@ DEEPEYES_PATCH="${DEEPEYES_PATCH:-0}"
 ###############################################################################
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/deepeyes_r3}"
-EXP_NAME="qwen3vl-deepeyes-r3-${TIMESTAMP}"
+EXP_NAME="qwen3vl-4B-deepeyes-r3-${TIMESTAMP}"
 
 # Require MODEL_DIR, DATA_DIR, SAVE_DIR from environment or set defaults
-if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; then
-    echo "ERROR: MODEL_DIR, DATA_DIR, and SAVE_DIR must be set."
-    echo "Example: MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/save bash $0"
-    exit 1
-fi
+MODEL_DIR="${MODEL_DIR:=/apdcephfs_hldy/share_304318596/weiyangguo/models}"
+DATA_DIR="${DATA_DIR:=/apdcephfs/private_weiyangguo/Agent-Omni/Relax-Task/Relax/datasets}"
+SAVE_DIR="${SAVE_DIR:=/apdcephfs/private_weiyangguo/Agent-Omni/Relax-Task/Relax/outputs}"
 mkdir -p ${SAVE_DIR}
 
 ###############################################################################
 #                              JUDGE MODEL API                                #
 ###############################################################################
 
-source "${SCRIPT_DIR}/sglang_judge_service.sh"
+# LLM judge: source the remote OpenAI-compatible judge service (no local sglang
+# server). Override DEEPEYES_JUDGE_BASE_URL / DEEPEYES_JUDGE_API_KEY /
+# DEEPEYES_JUDGE_MODELS before running to point at a different endpoint.
+# Fall back to the local sglang judge by sourcing sglang_judge_service.sh instead.
+source "${SCRIPT_DIR}/openai_judge_service.sh"
 
 ###############################################################################
 #                                  MODEL CONFIG                               #
 ###############################################################################
 
 CKPT_ARGS=(
-    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-30B-A3B-Thinking
-    --ref-load ${MODEL_DIR}/Qwen3-VL-30B-A3B-Thinking
-    --save ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
+    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct
+    --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct
+    --save ${SAVE_DIR}/Qwen3-VL-4B-Instruct-Checkpoint
     --megatron-to-hf-mode bridge
     --save-interval 100
     --max-actor-ckpt-to-keep 3
-    # --load ${SAVE_DIR}/Qwen3-VL-30B-A3B-Thinking-Checkpoint
+    # --load ${SAVE_DIR}/Qwen3-VL-4B-Instruct-Checkpoint
 )
 
 ###############################################################################
@@ -102,15 +105,6 @@ ROLLOUT_ARGS=(
     --use-fault-tolerance
     --rollout-shuffle
 )
-###############################################################################
-#                             ROUTING REPLAY CONFIG                            #
-###############################################################################
-
-ROUTING_REPLAY_ARGS=(
-    --use-rollout-routing-replay
-    --use-slime-router
-)
-
 ###############################################################################
 #                                EVAL CONFIG                                  #
 ###############################################################################
@@ -178,6 +172,8 @@ LOG_ARGS=(
     --use-metrics-service
     --tb-project-name ${PROJECT_NAME}
     --tb-experiment-name ${EXP_NAME}
+    # SwanLab: opt-in via USE_SWANLAB=1 (see the USE_SWANLAB block below).
+    # Requires `pip install swanlab` (and `swanlab[dashboard]` for local mode).
     # --dump-details dump_details_8k_0204
     # --use-wandb
     # --wandb-project slime-dev
@@ -185,17 +181,33 @@ LOG_ARGS=(
     # --wandb-key ${WANDB_KEY}
 )
 
+# SwanLab: opt-in via USE_SWANLAB=1. Requires `pip install swanlab` in the image.
+# Override project/run name via SWANLAB_PROJECT / SWANLAB_EXPERIMENT_NAME; api key
+# via SWANLAB_API_KEY (or let swanlab read it from env).
+USE_SWANLAB="${USE_SWANLAB:-0}"
+if [ "${USE_SWANLAB}" = "1" ]; then
+    LOG_ARGS+=(
+        --use-swanlab
+        --swanlab-project "${SWANLAB_PROJECT:-${PROJECT_NAME}}"
+        --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-${EXP_NAME}}"
+    )
+    if [ -n "${SWANLAB_API_KEY:-}" ]; then
+        LOG_ARGS+=(--swanlab-api-key "${SWANLAB_API_KEY}")
+    fi
+    if [ -n "${SWANLAB_MODE:-}" ]; then
+        LOG_ARGS+=(--swanlab-mode "${SWANLAB_MODE}")
+    fi
+fi
+
 ###############################################################################
 #                              MEGATRON CONFIG                                #
 ###############################################################################
 
 MEGATRON_ARGS=(
-    --tensor-model-parallel-size 4
+    --tensor-model-parallel-size 2
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
-    --expert-model-parallel-size 8
-    --expert-tensor-parallel-size 1
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
@@ -214,7 +226,7 @@ MEGATRON_ARGS=(
 
 RAY_RESOURCE_ARGS=(
     --rollout-num-gpus-per-engine 1
-    --resource '{"actor": [1, 8], "rollout": [1, 8]}'
+    --resource '{"actor": [1, 4], "rollout": [1, 4]}'
     --max-staleness 0
     --num-data-storage-units 1
     --colocate
@@ -232,7 +244,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \
-    "${ROUTING_REPLAY_ARGS[@]}" \
     "${GRPO_ARGS[@]}" \
     "${OPTIMIZER_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \

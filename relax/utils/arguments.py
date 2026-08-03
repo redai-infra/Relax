@@ -1785,6 +1785,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "results on GPU to avoid redundant CPU round-trips.",
             )
             parser.add_argument(
+                "--deepeyes-qwen-vl-patch",
+                action="store_true",
+                default=False,
+                help="Apply the DeepEyes Qwen-VL processor monkey-patch at SGLang engine "
+                "start-up. Needed for DeepEyes multi-turn rollout, which sends "
+                "pre-tokenized input_ids (list[int]) that SGLang's stock processor would "
+                "decode->retokenize, drifting token counts and double-expanding "
+                "<|image_pad|>. Default off: stock SGLang Qwen-VL behavior is unchanged. "
+                "See relax/backends/sglang/patches/qwen_vl_patch.py and "
+                "docs/{zh,en}/guide/sglang-patches.md.",
+            )
+            parser.add_argument(
                 "--use-opsm",
                 action="store_true",
                 default=False,
