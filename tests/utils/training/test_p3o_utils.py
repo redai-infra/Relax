@@ -44,6 +44,11 @@ TENSOR_TOL = dict(rtol=1e-6, atol=1e-6)
 
 GOLDEN_BEHAVIOR_LOG_PROB = -2.0
 GOLDEN_ADVANTAGES = [[1.0, -1.0, 0.0], [2.0, -0.5, 0.0]]
+GOLDEN_COEFFICIENTS = [[GOLDEN_ESS, GOLDEN_ESS, 0.0], [0.5, GOLDEN_ESS, 0.0]]
+GOLDEN_TOKEN_TOTALS = [
+    [1.3235294111, -0.7994998778, 0.0],
+    [2.7969356343, 0.0121528449, 0.0],
+]
 
 
 def _golden_batch(requires_grad: bool = False):
@@ -101,6 +106,30 @@ def test_p3o_utils_total_loss_matches_reference_golden_value():
     ctx = finalize_p3o_step_context(stats)
     terms = compute_p3o_token_terms(log_probs, behavior_log_probs, advantages, valid_mask, ctx)
 
+    assert float(_mean_loss(terms, valid_mask)) == pytest.approx(GOLDEN_LOSS_MEAN, **TOL)
+
+
+def test_p3o_reference_oracle_matches_ess_cap_and_token_loss():
+    """Expose the complete FeynRL formula oracle in one elementwise check."""
+    log_probs, behavior_log_probs, advantages, valid_mask = _golden_batch()
+    context = finalize_p3o_step_context(compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask))
+    terms = compute_p3o_token_terms(log_probs, behavior_log_probs, advantages, valid_mask, context)
+
+    expected_coefficients = torch.tensor(GOLDEN_COEFFICIENTS, dtype=torch.float32)
+    expected_token_totals = torch.tensor(GOLDEN_TOKEN_TOTALS, dtype=torch.float32)
+
+    assert float(context.normalized_ess) == pytest.approx(GOLDEN_ESS, **TOL)
+    assert float(context.adaptive_cap) == pytest.approx(GOLDEN_ESS, **TOL)
+    torch.testing.assert_close(
+        torch.minimum(terms.ratio, context.adaptive_cap.float()),
+        expected_coefficients,
+        **TENSOR_TOL,
+    )
+    torch.testing.assert_close(
+        terms.score_loss + terms.adaptive_kl_loss,
+        expected_token_totals,
+        **TENSOR_TOL,
+    )
     assert float(_mean_loss(terms, valid_mask)) == pytest.approx(GOLDEN_LOSS_MEAN, **TOL)
 
 

@@ -46,6 +46,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .rollout_policy_lag import compute_rollout_policy_lag_steps
 
 
 logger = get_logger(__name__)
@@ -1441,7 +1442,7 @@ def train(
             if getattr(args, "advantage_estimator", None) == "p3o" and args.update_weights_interval > 1:
                 snapshot_step = getattr(args, "rollout_policy_snapshot_step", 0)
                 current_step = accumulated_step_id + 1  # +1 because this step just completed
-                lag_steps = current_step - snapshot_step
+                lag_steps = compute_rollout_policy_lag_steps(current_step, snapshot_step)
                 log_dict["train/actor_optimizer_step"] = current_step
                 log_dict["train/rollout_policy_snapshot_step"] = snapshot_step
                 log_dict["train/p3o/rollout_policy_lag_steps"] = lag_steps

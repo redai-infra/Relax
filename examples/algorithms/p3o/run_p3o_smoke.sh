@@ -14,6 +14,16 @@ case "${CONFIG}" in
         export TASK40_ALGORITHM=grpo
         export TASK40_BEHAVIOR_MISMATCH=0
         ;;
+    p3o_temperature_0p6)
+        export TASK40_ALGORITHM=p3o
+        export TASK40_BEHAVIOR_MISMATCH=1
+        export TASK40_BEHAVIOR_TEMPERATURE=0.6
+        ;;
+    grpo_temperature_0p6)
+        export TASK40_ALGORITHM=grpo
+        export TASK40_BEHAVIOR_MISMATCH=1
+        export TASK40_BEHAVIOR_TEMPERATURE=0.6
+        ;;
     p3o_temperature_1p2)
         export TASK40_ALGORITHM=p3o
         export TASK40_BEHAVIOR_MISMATCH=1

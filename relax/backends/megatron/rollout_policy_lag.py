@@ -27,6 +27,21 @@ def rollout_weights_tag(update_weights_interval: int) -> str:
     return ROLLOUT_POLICY_TAG if interval > 1 else "actor"
 
 
+def compute_rollout_policy_lag_steps(current_optimizer_step: int, rollout_policy_snapshot_step: int) -> int:
+    """Return the age of the behavior snapshot used by a training batch.
+
+    The metric is emitted before the post-batch rollout snapshot refresh. At a
+    refresh boundary the just-trained batch therefore still reports the age of
+    the snapshot that generated it; the next batch observes the refreshed
+    snapshot.
+    """
+    if rollout_policy_snapshot_step < 0:
+        raise ValueError("rollout_policy_snapshot_step must be non-negative")
+    if current_optimizer_step < rollout_policy_snapshot_step:
+        raise ValueError("current_optimizer_step cannot precede the rollout policy snapshot")
+    return current_optimizer_step - rollout_policy_snapshot_step
+
+
 def should_refresh_rollout_policy(
     rollout_id: int,
     update_weights_interval: int,

@@ -14,7 +14,7 @@ from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 
 with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
-    from relax.backends.megatron import p3o_step
+    from relax.backends.megatron import cp_utils, p3o_step
     from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 
 from relax.utils.training.p3o_utils import P3OSufficientStats
@@ -205,7 +205,7 @@ def test_compute_p3o_step_context_vl_unsplit_forward_kwargs(monkeypatch):
     )
     # cp_utils.maybe_padded_total_lengths queries mpu for the CP world size; this
     # test is single-process, so report CP=1 instead of a bare MagicMock.
-    monkeypatch.setattr(p3o_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
     p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
 
@@ -273,7 +273,7 @@ def test_compute_p3o_step_context_vl_thd_bridge_forward_kwargs(monkeypatch):
         micro_batch_size=1,
         decoder_seq_length=None,
     )
-    monkeypatch.setattr(p3o_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
     p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
 
@@ -358,7 +358,7 @@ def test_compute_p3o_step_context_dynamic_cp_group_switching(monkeypatch):
         micro_batch_size=1,
         decoder_seq_length=None,
     )
-    monkeypatch.setattr(p3o_step.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setitem(sys.modules, "relax.backends.megatron.loss", MagicMock())
     p3o_step.compute_p3o_step_context(args, [iter([None])], [fake_model], num_microbatches=1)
 

@@ -1,0 +1,53 @@
+figure.facecolor: white
+axes.facecolor: white
+savefig.facecolor: white
+savefig.edgecolor: white
+savefig.bbox: tight
+savefig.pad_inches: 0.04
+savefig.dpi: 220
+
+axes.edgecolor: lightgray
+axes.labelcolor: dimgray
+axes.linewidth: 0.8
+axes.grid: True
+axes.axisbelow: True
+axes.spines.top: False
+axes.spines.right: False
+axes.titlelocation: left
+axes.titlesize: 11
+axes.labelsize: 10.5
+axes.xmargin: 0.02
+axes.ymargin: 0.04
+
+grid.color: gainsboro
+grid.linewidth: 0.65
+grid.linestyle: -
+grid.alpha: 0.65
+
+font.size: 10
+font.family: sans-serif
+font.sans-serif: DejaVu Sans, Arial, Liberation Sans
+
+xtick.color: dimgray
+ytick.color: dimgray
+xtick.labelsize: 9
+ytick.labelsize: 9
+xtick.major.size: 3
+ytick.major.size: 3
+xtick.major.width: 0.8
+ytick.major.width: 0.8
+
+legend.frameon: False
+legend.fontsize: 9
+legend.title_fontsize: 9
+legend.borderaxespad: 0.4
+legend.handlelength: 1.8
+
+lines.linewidth: 1.9
+lines.markersize: 4.2
+patch.linewidth: 0.0
+errorbar.capsize: 2.4
+
+pdf.fonttype: 42
+ps.fonttype: 42
+svg.fonttype: none

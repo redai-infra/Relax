@@ -13,6 +13,7 @@ TASK40_BEHAVIOR_MISMATCH="${TASK40_BEHAVIOR_MISMATCH:-0}"
 TASK40_BEHAVIOR_TEMPERATURE="${TASK40_BEHAVIOR_TEMPERATURE:-1.2}"
 TASK40_MAX_STALENESS="${TASK40_MAX_STALENESS:-0}"
 TASK40_UPDATE_WEIGHTS_INTERVAL="${TASK40_UPDATE_WEIGHTS_INTERVAL:-1}"
+TASK40_PIPELINE_MODEL_PARALLEL_SIZE="${TASK40_PIPELINE_MODEL_PARALLEL_SIZE:-1}"
 TASK40_MODE="${TASK40_MODE:-formal}"
 TASK40_SEED="${TASK40_SEED:-42}"
 TASK40_MODEL_DIR="${TASK40_MODEL_DIR:-/workspace/Qwen3-0.6B}"
@@ -21,6 +22,8 @@ TASK40_EVAL_DATA="${TASK40_EVAL_DATA:-/workspace/gsm8k/main/test-00000-of-00001.
 TASK40_OUTPUT_ROOT="${TASK40_OUTPUT_ROOT:-/workspace/Output/task40/formal}"
 TASK40_RAY_DASHBOARD="${TASK40_RAY_DASHBOARD:-http://127.0.0.1:8265}"
 TASK40_MEGATRON_DIR="${TASK40_MEGATRON_DIR:-/root/Megatron-LM}"
+TASK40_NCCL_DEBUG="${TASK40_NCCL_DEBUG:-WARN}"
+TASK40_TORCH_DISTRIBUTED_DEBUG="${TASK40_TORCH_DISTRIBUTED_DEBUG:-OFF}"
 
 if [[ "${TASK40_ALGORITHM}" != "p3o" && "${TASK40_ALGORITHM}" != "grpo" ]]; then
     echo "Unsupported TASK40_ALGORITHM=${TASK40_ALGORITHM}" >&2
@@ -40,6 +43,10 @@ if [[ "${TASK40_MODE}" != "formal" && "${TASK40_MODE}" != "smoke" ]]; then
 fi
 if [[ ! "${TASK40_UPDATE_WEIGHTS_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
     echo "TASK40_UPDATE_WEIGHTS_INTERVAL must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${TASK40_PIPELINE_MODEL_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TASK40_PIPELINE_MODEL_PARALLEL_SIZE must be a positive integer" >&2
     exit 2
 fi
 
@@ -71,12 +78,15 @@ TASK40_CONFIG_NAME="${TASK40_ALGORITHM}_$(
         elif [[ "${TASK40_MAX_STALENESS}" != "0" ]]; then
             echo "staleness_${TASK40_MAX_STALENESS}_mismatch"
         else
-            echo "temperature_1p2"
+            echo "temperature_${TASK40_BEHAVIOR_TEMPERATURE//./p}"
         fi
     else
         echo "on_policy"
     fi
 )"
+if [[ "${TASK40_PIPELINE_MODEL_PARALLEL_SIZE}" != "1" ]]; then
+    TASK40_CONFIG_NAME="${TASK40_CONFIG_NAME}_pp${TASK40_PIPELINE_MODEL_PARALLEL_SIZE}"
+fi
 
 task40_build_args() {
     TASK40_CKPT_ARGS=(
@@ -108,7 +118,7 @@ task40_build_args() {
 
     TASK40_PERF_ARGS=(
         --tensor-model-parallel-size 1
-        --pipeline-model-parallel-size 1
+        --pipeline-model-parallel-size "${TASK40_PIPELINE_MODEL_PARALLEL_SIZE}"
         --context-parallel-size 1
         --expert-model-parallel-size 1
         --expert-tensor-parallel-size 1
@@ -214,14 +224,26 @@ task40_run() {
     fi
     mkdir "${TASK40_RUN_DIR}/tensorboard"
     TASK40_JOB_ID="${TASK40_CONFIG_NAME}-seed-${TASK40_SEED}-${TASK40_RUN_ID}"
+    TASK40_GIT_COMMIT="$(git -C "${TASK40_REPO_ROOT}" rev-parse HEAD)"
+    TASK40_GIT_BRANCH="$(git -C "${TASK40_REPO_ROOT}" symbolic-ref --short -q HEAD || true)"
+    TASK40_GIT_DIRTY=0
+    if [[ -n "$(git -C "${TASK40_REPO_ROOT}" status --short)" ]]; then
+        TASK40_GIT_DIRTY=1
+    fi
 
     printf '%s\n' "${TASK40_TRAIN_ARGS[@]}" >"${TASK40_RUN_DIR}/resolved_args.txt"
     {
+        echo "GIT_COMMIT=${TASK40_GIT_COMMIT}"
+        echo "GIT_BRANCH=${TASK40_GIT_BRANCH:-DETACHED}"
+        echo "GIT_DIRTY=${TASK40_GIT_DIRTY}"
         echo "config=${TASK40_CONFIG_NAME}"
         echo "mode=${TASK40_MODE}"
         echo "seed=${TASK40_SEED}"
         echo "max_staleness=${TASK40_MAX_STALENESS}"
         echo "update_weights_interval=${TASK40_UPDATE_WEIGHTS_INTERVAL}"
+        echo "pipeline_model_parallel_size=${TASK40_PIPELINE_MODEL_PARALLEL_SIZE}"
+        echo "nccl_debug=${TASK40_NCCL_DEBUG}"
+        echo "torch_distributed_debug=${TASK40_TORCH_DISTRIBUTED_DEBUG}"
         echo "behavior_temperature=${TASK40_BEHAVIOR_TEMPERATURE}"
         echo "ray_job_id=${TASK40_JOB_ID}"
         echo "repo=${TASK40_REPO_ROOT}"
@@ -236,6 +258,8 @@ task40_run() {
         TASK40_RUNTIME_PYTHONPATH="${TASK40_REPO_ROOT}:${TASK40_MEGATRON_DIR}" \
         TASK40_TENSORBOARD_DIR="${TASK40_RUN_DIR}/tensorboard" \
         TASK40_RUNTIME_BEHAVIOR_TEMPERATURE="${TASK40_BEHAVIOR_TEMPERATURE}" \
+        TASK40_RUNTIME_NCCL_DEBUG="${TASK40_NCCL_DEBUG}" \
+        TASK40_RUNTIME_TORCH_DISTRIBUTED_DEBUG="${TASK40_TORCH_DISTRIBUTED_DEBUG}" \
         python3 - <<'PY'
 import json
 import os
@@ -248,6 +272,8 @@ print(
                 "PYTHONPATH": os.environ["TASK40_RUNTIME_PYTHONPATH"],
                 "TENSORBOARD_DIR": os.environ["TASK40_TENSORBOARD_DIR"],
                 "TASK40_BEHAVIOR_TEMPERATURE": os.environ["TASK40_RUNTIME_BEHAVIOR_TEMPERATURE"],
+                "NCCL_DEBUG": os.environ["TASK40_RUNTIME_NCCL_DEBUG"],
+                "TORCH_DISTRIBUTED_DEBUG": os.environ["TASK40_RUNTIME_TORCH_DISTRIBUTED_DEBUG"],
                 "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
                 "HTTP_PROXY": "",
                 "HTTPS_PROXY": "",

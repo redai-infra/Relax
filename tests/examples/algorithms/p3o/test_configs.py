@@ -18,6 +18,10 @@ FORMAL_SCRIPTS = {
     "p3o_temperature_1p2": SCRIPT_DIR / "run_p3o_temperature_1p2_a100x4.sh",
     "grpo_temperature_1p2": SCRIPT_DIR / "run_grpo_temperature_1p2_a100x4.sh",
 }
+LOW_TEMPERATURE_SCRIPTS = {
+    "p3o_temperature_0p6": SCRIPT_DIR / "run_p3o_temperature_0p6_a100x4.sh",
+    "grpo_temperature_0p6": SCRIPT_DIR / "run_grpo_temperature_0p6_a100x4.sh",
+}
 FIXED_LAG_SCRIPTS = {
     "p3o_fixed_lag_2_mismatch": SCRIPT_DIR / "run_p3o_fixed_lag_2_mismatch_a100x4.sh",
     "grpo_fixed_lag_2_mismatch": SCRIPT_DIR / "run_grpo_fixed_lag_2_mismatch_a100x4.sh",
@@ -138,6 +142,22 @@ def test_p3o_configs_are_comparable_except_algorithm_and_behavior():
         assert "--eps-clip-high" not in resolved[name]
 
 
+def test_p3o_low_temperature_configs_are_matched_and_named_from_temperature():
+    resolved = {name: _dry_run(script) for name, script in LOW_TEMPERATURE_SCRIPTS.items()}
+
+    p3o_args = resolved["p3o_temperature_0p6"]
+    grpo_args = resolved["grpo_temperature_0p6"]
+    assert _option_value(p3o_args, "--tb-experiment-name") == "p3o_temperature_0p6-seed-42"
+    assert _option_value(grpo_args, "--tb-experiment-name") == "grpo_temperature_0p6-seed-42"
+    assert _option_value(p3o_args, "--update-weights-interval") == "1"
+    assert _option_value(grpo_args, "--update-weights-interval") == "1"
+    assert _option_value(p3o_args, "--custom-generate-function-path") == ("examples.algorithms.p3o.rollout.generate")
+    assert _comparable_args(p3o_args) == _comparable_args(grpo_args)
+
+    smoke_args = _dry_run(SCRIPT_DIR / "run_p3o_smoke.sh", "p3o_temperature_0p6")
+    assert _option_value(smoke_args, "--tb-experiment-name") == "p3o_temperature_0p6-seed-42"
+
+
 def test_p3o_fixed_lag_configs_are_matched_and_parameterized():
     resolved = {name: _dry_run(script) for name, script in FIXED_LAG_SCRIPTS.items()}
 
@@ -180,11 +200,25 @@ def test_p3o_smoke_uses_one_small_optimizer_step():
     assert "--eval-prompt-data" not in args
 
 
+def test_p3o_smoke_can_select_pipeline_parallel_size_two():
+    args = _dry_run(
+        SCRIPT_DIR / "run_p3o_smoke.sh",
+        "p3o_on_policy",
+        env_overrides={"TASK40_PIPELINE_MODEL_PARALLEL_SIZE": "2", "TASK40_NUM_ROLLOUT": "3"},
+    )
+
+    assert _option_value(args, "--pipeline-model-parallel-size") == "2"
+    assert _option_value(args, "--num-rollout") == "3"
+    assert _option_value(args, "--tb-experiment-name") == "p3o_on_policy_pp2-seed-42"
+
+
 def test_p3o_runtime_env_allows_ray_job_driver_merge():
     common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
 
     assert '"RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"' in common_script
     assert '"TASK40_BEHAVIOR_TEMPERATURE": os.environ["TASK40_RUNTIME_BEHAVIOR_TEMPERATURE"]' in common_script
+    assert '"NCCL_DEBUG": os.environ["TASK40_RUNTIME_NCCL_DEBUG"]' in common_script
+    assert '"TORCH_DISTRIBUTED_DEBUG": os.environ["TASK40_RUNTIME_TORCH_DISTRIBUTED_DEBUG"]' in common_script
 
 
 def test_p3o_runtime_env_bypasses_proxy_for_colocated_services():
@@ -215,3 +249,13 @@ def test_p3o_runner_records_explicit_ray_job_identity_and_terminal_status():
     assert "--submission-id" in common_script
     assert 'TASK40_JOB_ID="${TASK40_CONFIG_NAME}-seed-${TASK40_SEED}-${TASK40_RUN_ID}"' in common_script
     assert '"${TASK40_RUN_DIR}/job_status.txt"' in common_script
+
+
+def test_p3o_runner_records_git_identity():
+    common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
+
+    assert 'TASK40_GIT_COMMIT="$(git -C "${TASK40_REPO_ROOT}" rev-parse HEAD)"' in common_script
+    assert 'TASK40_GIT_BRANCH="$(git -C "${TASK40_REPO_ROOT}" symbolic-ref --short -q HEAD || true)"' in common_script
+    assert 'echo "GIT_COMMIT=${TASK40_GIT_COMMIT}"' in common_script
+    assert 'echo "GIT_BRANCH=${TASK40_GIT_BRANCH:-DETACHED}"' in common_script
+    assert 'echo "GIT_DIRTY=${TASK40_GIT_DIRTY}"' in common_script

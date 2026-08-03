@@ -2,7 +2,12 @@
 
 """Tests for P3O rollout policy lag observability enhancements."""
 
-import pytest
+from pathlib import Path
+
+from relax.backends.megatron.rollout_policy_lag import compute_rollout_policy_lag_steps
+
+
+MODEL_PATH = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "model.py"
 
 
 class TestP3OObservability:
@@ -34,7 +39,7 @@ class TestP3OObservability:
         snapshot_step = 11
         current_step = 15  # rollout_id=14 completed
 
-        expected_lag = current_step - snapshot_step
+        expected_lag = compute_rollout_policy_lag_steps(current_step, snapshot_step)
         assert expected_lag == 4, f"Expected lag=4, got {expected_lag}"
 
     def test_on_policy_mode_lag_is_zero(self):
@@ -54,40 +59,20 @@ class TestP3OObservability:
         assert lag == 0, "On-policy lag should be 0"
 
     def test_lag_boundaries(self):
-        """Test lag values at interval boundaries."""
-        # Just after refresh (rollout_id=10 completed, step 11)
-        snapshot_step = 11
-        current_step = 11
-        assert current_step - snapshot_step == 0
+        """The refresh affects the next batch, not the boundary batch
+        metric."""
+        observations = [(1, 0), (2, 0), (3, 2)]
+        actual = [compute_rollout_policy_lag_steps(current, snapshot) for current, snapshot in observations]
 
-        # One step later (rollout_id=11, step 12)
-        current_step = 12
-        assert current_step - snapshot_step == 1
-
-        # Just before next refresh (rollout_id=20, step 21)
-        current_step = 21
-        assert current_step - snapshot_step == 10
-
-        # After next refresh (rollout_id=21, step 22)
-        snapshot_step = 22
-        current_step = 22
-        assert current_step - snapshot_step == 0
+        assert actual == [1, 2, 1]
 
 
-@pytest.mark.skipif(True, reason="Integration test, requires full actor initialization")
-class TestP3OObservabilityIntegration:
-    """Integration tests requiring actor/model setup."""
+def test_p3o_observability_production_logging_uses_shared_lag_semantics():
+    """Pin the production metric keys and shared age calculation without a full
+    Ray actor."""
+    source = MODEL_PATH.read_text(encoding="utf-8")
 
-    def test_metrics_logged_to_tensorboard(self):
-        """Verify P3O lag metrics appear in TensorBoard logs."""
-        # This would require a full training setup
-        # Expected metrics:
-        # - train/actor_optimizer_step
-        # - train/rollout_policy_snapshot_step
-        # - train/p3o/rollout_policy_lag_steps
-        pass
-
-    def test_lag_tracked_across_rollouts(self):
-        """Verify lag increases from 1 to interval-1 then resets."""
-        # Requires multi-rollout actor training
-        pass
+    assert "compute_rollout_policy_lag_steps(current_step, snapshot_step)" in source
+    assert 'log_dict["train/actor_optimizer_step"]' in source
+    assert 'log_dict["train/rollout_policy_snapshot_step"]' in source
+    assert 'log_dict["train/p3o/rollout_policy_lag_steps"]' in source
