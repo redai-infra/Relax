@@ -74,6 +74,12 @@ def cross_version_kv_resident_cap(rollout_batch_size: int) -> int:
     return rollout_batch_size + max(1, rollout_batch_size // 4)
 
 
+def count_cross_version_kv_progress_hedge_groups(groups: Sequence[Sequence[object]]) -> int:
+    return sum(
+        any(bool(getattr(sample, "metadata", {}).get("a3_progress_hedge")) for sample in group) for group in groups
+    )
+
+
 def estimate_cross_version_kv_group_remaining_tokens(
     group: Sequence[object],
     *,

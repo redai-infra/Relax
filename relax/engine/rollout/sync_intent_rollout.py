@@ -35,6 +35,7 @@ from relax.engine.rollout.sync_intent import (
     wait_for_sync_intent_end,
 )
 from relax.utils.cross_version_kv import (
+    count_cross_version_kv_progress_hedge_groups,
     cross_version_kv_enabled,
     estimate_cross_version_kv_group_remaining_tokens,
     mark_cross_version_kv_carry,
@@ -222,6 +223,7 @@ async def generate_rollout_async_with_sync_intent(
             task_groups,
         )
         adopted_cross_version_groups = len(task_groups)
+        a3_progress_hedge_inflight = count_cross_version_kv_progress_hedge_groups(task_groups.values())
         intent_debt_groups_inflight = adopted_debt_groups
         candidate_window_initialized = bool(task_groups)
         strict_retry_pending = any(

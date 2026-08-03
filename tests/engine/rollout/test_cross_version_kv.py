@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.cross_version_kv import (
+    count_cross_version_kv_progress_hedge_groups,
     cross_version_kv_group_ready_for_finalize,
     cross_version_kv_pause_mode,
     cross_version_kv_resident_cap,
@@ -136,6 +137,19 @@ def test_remaining_token_estimate_ignores_completed_siblings() -> None:
     )
 
     assert estimated == 1192
+
+
+def test_carried_progress_hedge_rebuilds_inflight_accounting() -> None:
+    groups = [
+        [SimpleNamespace(metadata={"a3_progress_hedge": True})],
+        [SimpleNamespace(metadata={})],
+        [
+            SimpleNamespace(metadata={}),
+            SimpleNamespace(metadata={"a3_progress_hedge": True}),
+        ],
+    ]
+
+    assert count_cross_version_kv_progress_hedge_groups(groups) == 2
 
 
 @pytest.mark.parametrize(
