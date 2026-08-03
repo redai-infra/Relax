@@ -92,6 +92,12 @@ from .data import (
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .rollout_policy_lag import (
+    ROLLOUT_POLICY_TAG,
+    maybe_refresh_rollout_policy,
+    rollout_weights_tag,
+    validate_update_weights_interval,
+)
 from .weight_update.common import named_params_and_buffers
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
@@ -253,7 +259,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # internally via _switch_model and pushes weights to rollout via
         # UpdateWeightFromTensor instead of DCS.
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
+        update_weights_interval = validate_update_weights_interval(self.args.update_weights_interval)
+        if update_weights_interval > 1 and not use_tensor_backuper:
+            raise ValueError(
+                "update_weights_interval > 1 requires the synchronous or hybrid TensorBackuper weight-update path"
+            )
         if use_tensor_backuper:
+            use_rollout_policy_snapshot = update_weights_interval > 1
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
                     self.args,
@@ -261,10 +273,15 @@ class MegatronTrainRayActor(TrainRayActor):
                     convert_to_global_name=args.megatron_to_hf_mode == "raw",
                     translate_gpu_to_cpu=not self.args.enable_weights_backuper,
                 ),
-                single_tag=None if args.enable_weights_backuper else "actor",
+                single_tag=None if args.enable_weights_backuper or use_rollout_policy_snapshot else "actor",
             )
             self._active_model_tag: str | None = "actor"
             self.weights_backuper.backup("actor")
+            self._rollout_weights_tag = rollout_weights_tag(update_weights_interval)
+            # Track the rollout at which rollout policy snapshot was created (for observability)
+            self._rollout_policy_snapshot_rollout = start_rollout_id
+            if use_rollout_policy_snapshot:
+                self.weights_backuper.backup(ROLLOUT_POLICY_TAG)
 
             if with_ref:
                 self.load_other_checkpoint("ref", args.ref_load)
@@ -300,7 +317,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater = update_weight_cls(
                 self.args,
                 self.model,
-                weights_getter=lambda: self.weights_backuper.get("actor"),
+                weights_getter=lambda: self.weights_backuper.get(self._rollout_weights_tag),
                 model_name=type(self.hf_config).__name__.lower()
                 if self.args.model_name is None
                 else self.args.model_name,
@@ -880,6 +897,8 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            # Store rollout policy snapshot rollout for observability in training metrics
+            self.args.rollout_policy_snapshot_rollout = self.get_rollout_policy_snapshot_rollout()
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -962,7 +981,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.offload_train:
                 self.sleep()
             if has_rollout:
-                self.update_weights()
+                self.update_weights(rollout_id=rollout_id)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
@@ -1433,7 +1452,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._check_services_health()
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
-        self.update_weights()
+        self.update_weights(rollout_id=rollout_id)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1600,10 +1619,51 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()
 
+    def _maybe_refresh_rollout_policy(self, rollout_id: int | None) -> None:
+        interval = self.args.update_weights_interval
+        if interval == 1 or rollout_id is None:
+            return
+
+        if maybe_refresh_rollout_policy(
+            self.weights_backuper,
+            rollout_id,
+            interval,
+            self.args.num_rollout,
+        ):
+            # Store the rollout at which we refreshed the snapshot
+            self._rollout_policy_snapshot_rollout = rollout_id + 1
+            logger.info(
+                "Refreshed rollout policy snapshot after rollout_id=%s (update_weights_interval=%s); "
+                "snapshot now at rollout=%s",
+                rollout_id,
+                interval,
+                self._rollout_policy_snapshot_rollout,
+            )
+        else:
+            next_rollout_lag = (rollout_id + 1) % interval
+            logger.info(
+                "Retaining rollout policy snapshot after rollout_id=%s; next rollout policy age=%s rollout(s) "
+                "(update_weights_interval=%s)",
+                rollout_id,
+                next_rollout_lag,
+                interval,
+            )
+
+    def get_rollout_policy_snapshot_rollout(self) -> int:
+        """Return the rollout at which the current rollout policy snapshot was
+        created.
+
+        Returns 0 for on-policy (interval=1) or when snapshot tracking is
+        unavailable.
+        """
+        return getattr(self, "_rollout_policy_snapshot_rollout", 0)
+
     @timer
-    def update_weights(self) -> None:
+    def update_weights(self, rollout_id: int | None = None) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
+
+        self._maybe_refresh_rollout_policy(rollout_id)
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have

@@ -48,19 +48,22 @@ def get_logits_and_tokens_offset_with_cp(
     """All offsets start from the begining of the prompt."""
     cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-    assert cp_size > 1
+    if cp_size <= 1:
+        raise ValueError(f"Context parallel size must be > 1, got {cp_size}")
 
     prompt_length = total_length - response_length
     if padded_total_length is not None:
         # Bridge VL+CP+thd: per-sample padded length is already aligned to tp*cp*2.
-        assert padded_total_length % (2 * cp_size) == 0, (
-            f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}"
-        )
+        if padded_total_length % (2 * cp_size) != 0:
+            raise ValueError(
+                f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}"
+            )
         chunk_size = padded_total_length // (2 * cp_size)
     elif qkv_format == "thd":
         chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
     else:
-        assert max_seq_len is not None, "max_seq_len must be provided for qkv_format=bshd"
+        if max_seq_len is None:
+            raise ValueError("max_seq_len must be provided for qkv_format=bshd")
         chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
 
     # the offset of 2 chunks
@@ -225,6 +228,60 @@ def get_cp_local_num_tokens(
     return total
 
 
+def get_cp_local_valid_mask(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Build the CP-local boolean mask of loss-contributing response tokens.
+
+    Returns a single 1-D mask over this rank's concatenated response tokens,
+    aligned with the layout that ``get_sum_of_sample_mean`` reduces over. Callers
+    that must compute a statistic and a loss over *identical* token sets (P3O's
+    ESS pre-pass and its loss) share this helper instead of re-deriving the
+    zig-zag slicing, which is where the two can silently drift apart.
+
+    For ``cp_size == 1`` this is just the concatenation of ``loss_masks``.
+    """
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if cp_size == 1:
+        return torch.cat([loss_mask.bool() for loss_mask in loss_masks], dim=0)
+
+    chunks: list[torch.Tensor] = []
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
+        prompt_length = total_length - response_length
+        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+            total_length,
+            response_length,
+            qkv_format,
+            max_seq_len,
+            padded_total_length,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
+        )
+        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
+        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
+        chunks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0).bool())
+
+    if not chunks:
+        if not loss_masks:
+            raise ValueError(
+                "P3O cp_utils: both loss_masks and computed chunks are empty; "
+                "cannot determine device for the returned tensor."
+            )
+        return torch.zeros(0, dtype=torch.bool, device=loss_masks[0].device)
+    return torch.cat(chunks, dim=0)
+
+
 def all_gather_with_cp(
     tensor: torch.Tensor,
     total_length: int,
@@ -260,7 +317,11 @@ def all_gather_with_cp(
 
     chunk_0 = tensor[: logits_offset[0][1] - logits_offset[0][0]]
     chunk_1 = tensor[logits_offset[0][1] - logits_offset[0][0] :]
-    assert chunk_1.shape[0] == logits_offset[1][1] - logits_offset[1][0]
+    expected_chunk_1_len = logits_offset[1][1] - logits_offset[1][0]
+    if chunk_1.shape[0] != expected_chunk_1_len:
+        raise ValueError(
+            f"chunk_1 length {chunk_1.shape[0]} != expected {expected_chunk_1_len}"
+        )
 
     def zero(len: int) -> torch.Tensor:
         return torch.zeros(
@@ -290,7 +351,8 @@ def all_gather_with_cp(
         right = zero(total_length - 1 - logits_offset[1][1])
         full_tensor = torch.cat([left, chunk_0, mid, chunk_1, right], dim=0)
 
-    assert full_tensor.shape[0] == response_length, f"Expected {response_length}, got {full_tensor.shape}"
+    if full_tensor.shape[0] != response_length:
+        raise ValueError(f"Expected response_length={response_length}, got shape {full_tensor.shape}")
     full_tensor = dist.nn.all_reduce(full_tensor, group=cp_group)
     return full_tensor
 
@@ -307,7 +369,8 @@ def slice_with_cp(
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
     if qkv_format == "bshd":
-        assert max_seq_len is not None
+        if max_seq_len is None:
+            raise ValueError("max_seq_len is required when qkv_format=bshd")
 
     def pad_tokens(tokens, pad):
         if isinstance(pad_value, Callable):
@@ -351,10 +414,11 @@ def slice_log_prob_with_cp(
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
 ) -> list[float] | torch.Tensor:
-    assert len(log_prob) == response_length, (
-        f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
-        f"response_length={response_length}, total_length={total_length}"
-    )
+    if len(log_prob) != response_length:
+        raise ValueError(
+            f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
+            f"response_length={response_length}, total_length={total_length}"
+        )
 
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
@@ -477,7 +541,8 @@ def _nccl_all_gather_variable_tensors(
     Every rank in ``group`` must call this with a non-empty ``values`` so the
     collective is symmetric and a device/dtype is available.
     """
-    assert values, "_nccl_all_gather_variable_tensors requires a non-empty values list on every rank"
+    if not values:
+        raise ValueError("_nccl_all_gather_variable_tensors requires a non-empty values list on every rank")
     local_sizes = torch.tensor([v.shape[0] for v in values], dtype=torch.long, device=values[0].device)
     num_samples = torch.tensor([len(values)], dtype=torch.long, device=values[0].device)
 
@@ -581,10 +646,11 @@ def dynamic_cp_merge_output(
                 # A subdivided mb always carries a partition order; reorder back to the
                 # original mb sample order so the write-back aligns with micro_batch_indices.
                 # Fail loud (not a silent wrong order) if the invariant ever breaks.
-                assert partition_order is not None and len(partition_order) == len(values), (
-                    "dynamic-CP merge: partition_order missing or length mismatch "
-                    f"(order={None if partition_order is None else len(partition_order)}, values={len(values)})"
-                )
+                if partition_order is None or len(partition_order) != len(values):
+                    raise ValueError(
+                        "dynamic-CP merge: partition_order missing or length mismatch "
+                        f"(order={None if partition_order is None else len(partition_order)}, values={len(values)})"
+                    )
                 reordered: list = [None] * len(values)
                 for new_pos, orig_pos in enumerate(partition_order):
                     reordered[orig_pos] = values[new_pos]
