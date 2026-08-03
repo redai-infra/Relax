@@ -271,7 +271,7 @@ That differs from every other estimator here, which normalizes per token. Both a
 - a per-sample **mean** over tokens gives $-\hat{A}_i / T_i \sum_t \log \pi$, which reweights samples by response length — long responses get a smaller per-token gradient;
 - normalizing the micro-batch by its total token count makes the update scale depend on how many tokens the sampler happened to produce that step.
 
-RLOO therefore keeps `--calculate-per-token-loss`'s per-sample token sum (which is required anyway under CP) but divides the gradient by the **sample** count rather than the token count. The count is computed so that it all-reduces to the true number of samples across the context-parallel group, so the objective is identical at any CP degree.
+RLOO therefore keeps `--calculate-per-token-loss`'s per-sample token sum but divides the gradient by the **sample** count rather than the token count. **That flag is required for RLOO and enforced at startup**: without it the reduction is a per-sample mean, which is a different estimator, and the swap would otherwise be silent. The count is computed so that it all-reduces to the true number of samples across the context-parallel group, so the objective is identical at any CP degree.
 
 Reported metrics are deliberately left on the per-token scale that every other estimator uses, so `train/pg_loss`, `train/entropy_loss` and `train/ppo_kl` stay comparable across estimators; only the gradient normalization changes.
 

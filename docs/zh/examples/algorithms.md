@@ -271,7 +271,7 @@ $$L = \frac{1}{k}\sum_i -\operatorname{sg}(\hat{A}_i)\sum_t \log \pi_\theta(y_{i
 - 按样本对 token 取**均值**得到 $-\hat{A}_i / T_i \sum_t \log \pi$，等于按 response 长度对样本重新加权 —— 长 response 的每 token 梯度更小；
 - 按 micro-batch 的总 token 数归一化，会让更新尺度取决于采样器这一步恰好产出了多少 token。
 
-因此 RLOO 保留 `--calculate-per-token-loss` 给出的「每样本 token 求和」（在 CP 下本来也必须开启该开关），但把梯度的分母从 token 数换成**样本数**。该计数的构造保证它在 context-parallel 组内 all-reduce 后等于真实样本数，因此任意 CP 度下目标函数完全一致。
+因此 RLOO 保留 `--calculate-per-token-loss` 给出的「每样本 token 求和」，但把梯度的分母从 token 数换成**样本数**。**该开关对 RLOO 是必需的，并在启动时强制校验**：不开它归约就变成每样本取均值，那是另一个估计量，而且这种切换本来是静默的。该计数的构造保证它在 context-parallel 组内 all-reduce 后等于真实样本数，因此任意 CP 度下目标函数完全一致。
 
 上报指标有意保持在其他估计器共用的 per-token 尺度上，因此 `train/pg_loss`、`train/entropy_loss`、`train/ppo_kl` 仍可跨估计器对比；只有梯度归一化发生了变化。
 

@@ -82,6 +82,21 @@ def validate_rloo_args(args: Namespace) -> None:
         "to keep RLOO's estimator intact."
     )
 
+    # RLOO's objective is completion-level: a per-sample token sum normalized by
+    # the sample count. `get_sum_of_sample_mean` only yields that token sum with
+    # --calculate-per-token-loss; without it the reduction is a per-sample *mean*,
+    # which re-weights samples by response length and is not the published
+    # estimator. `uses_completion_level_reduction` keys off the same flag, so
+    # omitting it would silently swap the objective rather than fail -- exactly the
+    # failure this whole function exists to prevent. Megatron only forces the flag
+    # when CP > 1 (backends/megatron/arguments.py), so CP == 1 needs it here.
+    assert getattr(args, "calculate_per_token_loss", False), (
+        "RLOO requires --calculate-per-token-loss. Its objective sums log-probabilities over "
+        "each completion and averages over samples; without that flag the reduction is a "
+        "per-sample mean, which re-weights samples by response length and is a different "
+        "estimator. Add --calculate-per-token-loss, or pick a different --advantage-estimator."
+    )
+
     # Exactly one optimizer step per rollout is a correctness requirement, not a
     # tuning choice. RLOO's loss carries no importance ratio, so a second step
     # within the same rollout trains at updated weights against log-probabilities

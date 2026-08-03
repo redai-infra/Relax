@@ -28,6 +28,7 @@ def _args(**overrides) -> Namespace:
         n_samples_per_prompt=8,
         rewards_normalization=True,
         normalize_advantages=False,
+        calculate_per_token_loss=True,
         num_steps_per_rollout=None,
         rollout_batch_size=4,
         global_batch_size=32,
@@ -78,6 +79,18 @@ def test_normalize_advantages_is_rejected():
     """
     with pytest.raises(AssertionError, match="data-parallel group"):
         validate_rloo_args(_args(normalize_advantages=True))
+
+
+def test_per_token_loss_is_required():
+    """Without the flag the reduction is a per-sample mean, which re-weights
+    samples by response length -- a different estimator, and switched silently
+    because `uses_completion_level_reduction` keys off the same flag.
+
+    Megatron only forces it when CP > 1, so a CP=1 run would otherwise train the
+    wrong objective without any error.
+    """
+    with pytest.raises(AssertionError, match="requires --calculate-per-token-loss"):
+        validate_rloo_args(_args(calculate_per_token_loss=False))
 
 
 @pytest.mark.parametrize("num_steps_per_rollout", [2, 4])
@@ -152,6 +165,9 @@ def test_guards_do_not_fire_for_other_estimators():
                 fully_async=True,
                 n_samples_per_prompt=1,
                 custom_reward_post_process_path="my_module.my_func",
+                calculate_per_token_loss=False,
+                kl_coef=0.1,
+                num_steps_per_rollout=2,
             )
         )
 
