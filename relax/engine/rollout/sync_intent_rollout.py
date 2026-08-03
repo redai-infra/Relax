@@ -33,6 +33,7 @@ from relax.engine.rollout.sync_intent import (
     sync_intent_abort_timeout_seconds,
     wait_for_sync_intent_end,
 )
+from relax.utils.cross_version_kv import cross_version_kv_enabled, mark_cross_version_kv_carry
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -50,6 +51,7 @@ def _submit_generate_tasks(
     args: Namespace,
     samples: list[list[Sample]],
     task_started_at: dict[asyncio.Task[Any], float],
+    task_groups: dict[asyncio.Task[Any], list[Sample]],
     submitted_events: list[asyncio.Event] | None = None,
 ) -> None:
     if submitted_events is not None and len(submitted_events) != len(samples):
@@ -67,6 +69,7 @@ def _submit_generate_tasks(
             )
         )
         task_started_at[task] = monotonic()
+        task_groups[task] = group
         if event is not None:
             task.add_done_callback(lambda _task, event=event: event.set())
         if max_aborted_count is not None and any(sample.abort_count >= max_aborted_count for sample in group):
@@ -82,15 +85,71 @@ async def _submit_generate_tasks_debt_first(
     samples: list[list[Sample]],
     debt_groups: int,
     task_started_at: dict[asyncio.Task[Any], float],
+    task_groups: dict[asyncio.Task[Any], list[Sample]],
 ) -> None:
     debt = samples[:debt_groups]
     fresh = samples[debt_groups:]
     if debt:
         submitted_events = [asyncio.Event() for _ in debt]
-        _submit_generate_tasks(state, args, debt, task_started_at, submitted_events)
+        _submit_generate_tasks(state, args, debt, task_started_at, task_groups, submitted_events)
         await asyncio.gather(*(event.wait() for event in submitted_events))
     if fresh:
-        _submit_generate_tasks(state, args, fresh, task_started_at)
+        _submit_generate_tasks(state, args, fresh, task_started_at, task_groups)
+
+
+def _adopt_cross_version_tasks(
+    state: GenerateState,
+    args: Namespace,
+    num_old_samples: int,
+    task_started_at: dict[asyncio.Task[Any], float],
+    task_groups: dict[asyncio.Task[Any], list[Sample]],
+) -> int:
+    tasks = list(state.cross_version_kv_tasks)
+    groups = state.cross_version_kv_task_groups
+    started_at = state.cross_version_kv_task_started_at
+    protected = set(state.cross_version_kv_protected_tasks)
+    state.cross_version_kv_tasks = []
+    state.cross_version_kv_task_groups = {}
+    state.cross_version_kv_task_started_at = {}
+    state.cross_version_kv_protected_tasks = set()
+
+    task_group_list = [groups[task] for task in tasks]
+    adopted_debt = mark_cross_version_kv_carry(
+        task_group_list,
+        num_old_samples=num_old_samples,
+    )
+    for task in tasks:
+        group = groups[task]
+        if task in protected:
+            state.protected_pendings.add(task)
+        else:
+            state.pendings.add(task)
+        task_started_at[task] = started_at.get(task, monotonic())
+        task_groups[task] = group
+
+    state.remaining_batch_size += len(tasks)
+    if tasks:
+        logger.info(
+            "TASK22_A3 event=adopt carried_groups=%s debt_groups=%s fresh_groups=%s",
+            len(tasks),
+            adopted_debt,
+            len(tasks) - adopted_debt,
+        )
+    return adopted_debt
+
+
+def _persist_cross_version_tasks(
+    state: GenerateState,
+    task_started_at: dict[asyncio.Task[Any], float],
+    task_groups: dict[asyncio.Task[Any], list[Sample]],
+) -> int:
+    pending = state.pendings | state.protected_pendings
+    ordered_tasks = [task for task in task_groups if task in pending]
+    state.cross_version_kv_tasks = ordered_tasks
+    state.cross_version_kv_task_groups = {task: task_groups[task] for task in ordered_tasks}
+    state.cross_version_kv_task_started_at = {task: task_started_at.get(task, monotonic()) for task in ordered_tasks}
+    state.cross_version_kv_protected_tasks = {task for task in ordered_tasks if task in state.protected_pendings}
+    return len(ordered_tasks)
 
 
 async def generate_rollout_async_with_sync_intent(
@@ -135,6 +194,23 @@ async def generate_rollout_async_with_sync_intent(
     original_hedge_groups = 0 if is_final_backfill else max(args.over_sampling_batch_size - args.rollout_batch_size, 0)
     candidate_window_initialized = False
     task_started_at: dict[asyncio.Task[Any], float] = {}
+    task_groups: dict[asyncio.Task[Any], list[Sample]] = {}
+    adopted_debt_groups = 0
+    adopted_cross_version_groups = 0
+    strict_fallback_groups = 0
+    strict_fallback_prefix_tokens = 0
+    completed_cross_version_groups = 0
+    if cross_version_kv_enabled(args):
+        adopted_debt_groups = _adopt_cross_version_tasks(
+            state,
+            args,
+            num_old_samples,
+            task_started_at,
+            task_groups,
+        )
+        adopted_cross_version_groups = len(task_groups)
+        intent_debt_groups_inflight = adopted_debt_groups
+        candidate_window_initialized = bool(task_groups)
 
     committed_prev = 0
     prev_target = num_old_samples
@@ -230,6 +306,7 @@ async def generate_rollout_async_with_sync_intent(
                 samples,
                 old_debt_in_fetch,
                 task_started_at,
+                task_groups,
             )
             candidate_window_initialized = True
 
@@ -239,8 +316,14 @@ async def generate_rollout_async_with_sync_intent(
         state.protected_pendings &= remaining
         for task in done:
             started_at = task_started_at.pop(task, None)
+            source_group = task_groups.pop(task, None)
             state.remaining_batch_size -= 1
             group: list[Sample] = task.result()
+            if source_group is not None and (
+                len(group) != len(source_group)
+                or any(result is not source for result, source in zip(group, source_group, strict=True))
+            ):
+                raise RuntimeError("Cross-version task returned different sample identities")
             group_is_debt = bool(group) and all(sample.metadata.get("work_origin") == "old_debt" for sample in group)
             if group_is_debt and intent_debt_groups_inflight > 0:
                 intent_debt_groups_inflight -= 1
@@ -264,6 +347,40 @@ async def generate_rollout_async_with_sync_intent(
                 state.recent_group_latency_seconds.append(monotonic() - started_at)
                 state.recent_group_latency_seconds = state.recent_group_latency_seconds[-64:]
             if group_aborted:
+                cross_version_fallback = cross_version_kv_enabled(args) and any(
+                    sample.metadata.get("cross_version_kv_carried") for sample in group
+                )
+                if cross_version_fallback:
+                    prefix_tokens = sum(sample.response_length for sample in group)
+                    strict_fallback_groups += 1
+                    strict_fallback_prefix_tokens += prefix_tokens
+                    for sample in group:
+                        if sample.status == Sample.Status.ABORTED:
+                            sample.abort_count += 1
+                        sample.metadata["cross_version_kv_carried"] = False
+                        sample.metadata["cross_version_kv_carryovers"] = 0
+                        sample.metadata["cross_version_kv_fallbacks"] = (
+                            int(sample.metadata.get("cross_version_kv_fallbacks", 0)) + 1
+                        )
+                    await _submit_generate_tasks_debt_first(
+                        state,
+                        args,
+                        [group],
+                        1 if group_is_debt else 0,
+                        task_started_at,
+                        task_groups,
+                    )
+                    if group_is_debt:
+                        intent_debt_groups_inflight += 1
+                    logger.info(
+                        "TASK22_A3 event=strict_fallback rollout_id=%s origin=%s groups=1 retained_prefix_tokens=%s",
+                        rollout_id,
+                        "old_debt" if group_is_debt else "fresh",
+                        prefix_tokens,
+                    )
+                    continue
+                if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
+                    completed_cross_version_groups += 1
                 for sample in group:
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
@@ -273,17 +390,23 @@ async def generate_rollout_async_with_sync_intent(
                     data.append(group)
                     pbar.update(args.n_samples_per_prompt)
             elif group_is_debt and accepted_debt_groups < prev_target:
+                if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
+                    completed_cross_version_groups += 1
                 debt_batch_to_transfer.append(group)
                 accepted_debt_groups += 1
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
             elif not group_is_debt and progressed_fresh_groups < curr_target:
+                if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
+                    completed_cross_version_groups += 1
                 fresh_batch_to_transfer.append(group)
                 accepted_fresh_groups += 1
                 progressed_fresh_groups += 1
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
             else:
+                if any(sample.metadata.get("cross_version_kv_carried") for sample in group):
+                    completed_cross_version_groups += 1
                 oversample_surplus.append(group)
 
         transfer_batch_size = (
@@ -374,20 +497,48 @@ async def generate_rollout_async_with_sync_intent(
     all_samples = [sample for group in data for sample in group]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
 
-    new_aborted, completed_protected = await abort(
-        args,
-        rollout_id,
-        retry_interval_seconds=sync_intent_abort_retry_interval_seconds(),
-        timeout_seconds=sync_intent_abort_timeout_seconds(),
-    )
-    aborted_samples.extend(new_aborted)
-    aborted_samples.extend(completed_protected)
+    can_carry_tasks = cross_version_kv_enabled(args) and not is_final_backfill and rollout_id + 1 < args.num_rollout
+    carried_groups = 0
+    if can_carry_tasks:
+        carried_groups = _persist_cross_version_tasks(state, task_started_at, task_groups)
+        logger.info(
+            "TASK22_A3 event=carry rollout_id=%s carried_groups=%s current_weight_version=%s max_gap=%s",
+            rollout_id,
+            carried_groups,
+            getattr(args, "cross_version_kv_weight_version", "actor-managed"),
+            args.cross_version_kv_max_gap,
+        )
+    else:
+        new_aborted, completed_protected = await abort(
+            args,
+            rollout_id,
+            retry_interval_seconds=sync_intent_abort_retry_interval_seconds(),
+            timeout_seconds=sync_intent_abort_timeout_seconds(),
+        )
+        aborted_samples.extend(new_aborted)
+        aborted_samples.extend(completed_protected)
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."
         )
+    elif carried_groups:
+        logger.info(
+            "Rollout preserved %s in-flight groups for cross-version KV continuation at rollout_id=%s.",
+            carried_groups,
+            rollout_id,
+        )
     else:
         logger.info(f"Rollout fully completed for rollout_id: {rollout_id}.")
+    timing_metrics.update(
+        {
+            "rollout/a3/adopted_groups": adopted_cross_version_groups,
+            "rollout/a3/adopted_debt_groups": adopted_debt_groups,
+            "rollout/a3/completed_groups": completed_cross_version_groups,
+            "rollout/a3/carried_groups": carried_groups,
+            "rollout/a3/strict_fallback_groups": strict_fallback_groups,
+            "rollout/a3/strict_fallback_prefix_tokens": strict_fallback_prefix_tokens,
+        }
+    )
 
     committed_current = 0 if is_final_backfill else accepted_fresh_groups
     if is_final_backfill:

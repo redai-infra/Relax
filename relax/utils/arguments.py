@@ -12,6 +12,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
+from relax.utils.cross_version_kv import validate_cross_version_kv_args
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
@@ -878,6 +879,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Interval for updating the weights",
+            )
+            parser.add_argument(
+                "--enable-cross-version-kv-continuation",
+                action="store_true",
+                help=(
+                    "Keep in-flight SGLang requests and their KV cache across adjacent "
+                    "weight publications. This experimental Hybrid-async path periodically "
+                    "falls back to abort+flush to bound the KV/weight version gap."
+                ),
+            )
+            parser.add_argument(
+                "--cross-version-kv-max-gap",
+                type=int,
+                default=2,
+                help="Maximum number of weight publications that an in-flight KV cache may span.",
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -2686,6 +2702,12 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    validate_cross_version_kv_args(
+        args,
+        sync_intent_enabled=os.environ.get("RELAX_SYNC_INTENT_POLICY", "0").strip().lower()
+        in {"1", "true", "yes", "on"},
+    )
 
     if getattr(args, "lora_rank", 0) > 0:
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):

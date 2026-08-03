@@ -184,6 +184,17 @@ class GenerateState(metaclass=SingletonMeta):
         # 0 before the first step / when the previous step met its target. fully_async only.
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
+        # Experimental cross-version KV continuation keeps the original
+        # asyncio tasks alive across physical rollout calls. The next call
+        # takes ownership and assigns the first deficit groups to old debt.
+        if not hasattr(self, "cross_version_kv_tasks"):
+            self.cross_version_kv_tasks: list[asyncio.Task[Any]] = []
+        if not hasattr(self, "cross_version_kv_task_groups"):
+            self.cross_version_kv_task_groups: dict[asyncio.Task[Any], list[Sample]] = {}
+        if not hasattr(self, "cross_version_kv_task_started_at"):
+            self.cross_version_kv_task_started_at: dict[asyncio.Task[Any], float] = {}
+        if not hasattr(self, "cross_version_kv_protected_tasks"):
+            self.cross_version_kv_protected_tasks: set[asyncio.Task[Any]] = set()
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
