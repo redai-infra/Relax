@@ -20,6 +20,8 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 GPU_ID="${GPU_ID:-0}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-12}"
 RUN_NAME="${RUN_NAME:-mem-agent-qwen3-0.6b-pilot}"
+LOAD_PATH="${LOAD_PATH:-}"
+START_ROLLOUT_ID="${START_ROLLOUT_ID:-0}"
 
 [[ -f "${TRAIN_DATA}" ]] || {
   echo "Missing Pass@N-screened pilot data: ${TRAIN_DATA}" >&2
@@ -30,6 +32,18 @@ RUN_NAME="${RUN_NAME:-mem-agent-qwen3-0.6b-pilot}"
   exit 1
 }
 [[ -f "${MODEL_PATH}/config.json" ]] || { echo "Missing model config: ${MODEL_PATH}/config.json" >&2; exit 1; }
+((START_ROLLOUT_ID >= 0 && START_ROLLOUT_ID < NUM_ROLLOUT)) || {
+  echo "START_ROLLOUT_ID must be in [0, NUM_ROLLOUT)." >&2
+  exit 1
+}
+if ((START_ROLLOUT_ID > 0)) && [[ -z "${LOAD_PATH}" ]]; then
+  echo "A positive START_ROLLOUT_ID requires LOAD_PATH." >&2
+  exit 1
+fi
+if [[ -n "${LOAD_PATH}" && ! -d "${LOAD_PATH}" ]]; then
+  echo "Missing resume checkpoint directory: ${LOAD_PATH}" >&2
+  exit 1
+fi
 mkdir -p "${RUN_ROOT}/logs" "${RUN_ROOT}/tensorboard" "${SAVE_DIR}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
@@ -57,6 +71,13 @@ fi
 unset -f ray
 source "${MODEL_CONFIG_DIR}/qwen3-0.6B.sh"
 
+RESUME_ARGS=()
+if [[ -n "${LOAD_PATH}" ]]; then
+  # --num-rollout remains the total target. ReLax restores optimizer/model
+  # state from LOAD_PATH and continues at this explicit rollout id.
+  RESUME_ARGS+=(--load "${LOAD_PATH}" --start-rollout-id "${START_ROLLOUT_ID}")
+fi
+
 NOW="$(date '+%Y%m%dT%H%M%S%z')"
 LOG_FILE="${RUN_ROOT}/logs/${RUN_NAME}-${NOW}.log"
 GPU_LOG="${RUN_ROOT}/logs/${RUN_NAME}-${NOW}-gpu.csv"
@@ -73,6 +94,7 @@ ray job submit --address="http://127.0.0.1:8265" \
   --resource '{"actor": [1, 1], "rollout": [1, 1]}' \
   "${MODEL_ARGS[@]}" \
   --hf-checkpoint "${MODEL_PATH}" \
+  "${RESUME_ARGS[@]}" \
   --ref-load "${MODEL_PATH}" \
   --megatron-to-hf-mode bridge \
   --warm-hf-checkpoint-page-cache \
@@ -153,5 +175,6 @@ python3 "${SCRIPT_DIR}/summarize_reward.py" \
   --output "${RUN_ROOT}/training-reward.summary.json" \
   --csv-output "${RUN_ROOT}/training-reward.csv" \
   --svg-output "${RUN_ROOT}/training-reward.svg" \
-  --expected-steps "${NUM_ROLLOUT}" \
+  --expected-steps "$((NUM_ROLLOUT - START_ROLLOUT_ID))" \
+  --expected-start "${START_ROLLOUT_ID}" \
   --window-size 5

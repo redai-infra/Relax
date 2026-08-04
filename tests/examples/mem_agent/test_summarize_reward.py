@@ -51,6 +51,20 @@ def test_summary_rejects_missing_rollout_and_invalid_reward():
         extract_reward_points(["perf 0: {'rollout/mem_agent_raw_reward/mean': 1.1}\n"])
 
 
+def test_summary_accepts_complete_resumed_rollout_range():
+    summary = summarize_reward_points(
+        [(20, 0.25), (21, 0.5), (22, 0.75)],
+        expected_steps=3,
+        expected_start=20,
+        window_size=1,
+    )
+
+    assert summary["first_rollout_id"] == 20
+    assert summary["last_rollout_id"] == 22
+    with pytest.raises(ValueError, match="incomplete"):
+        summarize_reward_points([(20, 0.25), (22, 0.75)], expected_steps=3, expected_start=20)
+
+
 def test_reward_csv_and_svg_keep_auditable_points(tmp_path):
     points = [(0, 0.25), (1, 0.75)]
     csv_path = tmp_path / "reward.csv"

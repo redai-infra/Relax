@@ -61,6 +61,7 @@ def summarize_reward_points(
     points: list[tuple[int, float]],
     *,
     expected_steps: int | None = None,
+    expected_start: int = 0,
     window_size: int = 10,
     metric: str = DEFAULT_METRIC,
 ) -> dict[str, Any]:
@@ -76,7 +77,9 @@ def summarize_reward_points(
     if expected_steps is not None:
         if expected_steps <= 0:
             raise ValueError("expected_steps must be positive.")
-        expected_ids = list(range(expected_steps))
+        if expected_start < 0:
+            raise ValueError("expected_start must be non-negative.")
+        expected_ids = list(range(expected_start, expected_start + expected_steps))
         if rollout_ids != expected_ids:
             raise ValueError(f"Reward rollout ids are incomplete: expected {expected_ids}, got {rollout_ids}.")
 
@@ -91,6 +94,8 @@ def summarize_reward_points(
         "schema_version": SCHEMA_VERSION,
         "metric": metric,
         "num_steps": len(points),
+        "first_rollout_id": rollout_ids[0],
+        "last_rollout_id": rollout_ids[-1],
         "window_size_requested": window_size,
         "window_size_used": effective_window,
         "first_window_mean": first_mean,
@@ -168,6 +173,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metric", default=DEFAULT_METRIC)
     parser.add_argument("--expected-steps", type=int)
+    parser.add_argument(
+        "--expected-start",
+        type=int,
+        default=0,
+        help="First expected rollout id for a resumed phase (default: 0).",
+    )
     parser.add_argument("--window-size", type=int, default=10)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument("--svg-output", type=Path)
@@ -178,6 +189,7 @@ def main() -> None:
     summary = summarize_reward_points(
         points,
         expected_steps=args.expected_steps,
+        expected_start=args.expected_start,
         window_size=args.window_size,
         metric=args.metric,
     )
