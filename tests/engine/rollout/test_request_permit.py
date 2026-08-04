@@ -64,6 +64,7 @@ class _StubSample:
     def __init__(self) -> None:
         self.status = Sample.Status.PENDING
         self.generate_function_path = None
+        self.metadata = {}
 
 
 def _completed_sample() -> SimpleNamespace:
