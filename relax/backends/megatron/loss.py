@@ -25,6 +25,7 @@ from relax.utils.training.p3o_utils import (
     compute_p3o_token_terms,
 )
 from relax.utils.training.ppo_utils import (
+    GRPO_STYLE_ADVANTAGE_ESTIMATORS,
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_cispo_loss,
@@ -573,7 +574,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o"]:
+    if args.advantage_estimator in GRPO_STYLE_ADVANTAGE_ESTIMATORS:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?

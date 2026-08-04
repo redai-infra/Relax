@@ -14,6 +14,10 @@ from tensordict import TensorDict
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.ppo_utils import (
+    GROUP_REWARD_NORMALIZATION_ESTIMATORS,
+    GRPO_STYLE_ADVANTAGE_ESTIMATORS,
+)
 from relax.utils.types import Sample
 
 
@@ -180,10 +184,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
-    if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o", "reinforce_plus_plus_baseline"]
-        and args.rewards_normalization
-    ):
+    if args.advantage_estimator in GROUP_REWARD_NORMALIZATION_ESTIMATORS and args.rewards_normalization:
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)
         positions_by_group: dict[int, list[int]] = {}
@@ -202,7 +203,7 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                 )
             group_rewards = rewards[positions]
             group_rewards = group_rewards - group_rewards.mean()
-            if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o"] and args.grpo_std_normalization:
+            if args.advantage_estimator in GRPO_STYLE_ADVANTAGE_ESTIMATORS and args.grpo_std_normalization:
                 group_rewards = group_rewards / (group_rewards.std() + 1e-6)
             normalized_rewards[positions] = group_rewards
 
@@ -429,7 +430,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         original_num_rows = len(data)
         if (
             args.custom_reward_post_process_path is None
-            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "p3o", "reinforce_plus_plus_baseline"]
+            and args.advantage_estimator in GROUP_REWARD_NORMALIZATION_ESTIMATORS
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

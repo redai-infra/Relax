@@ -1663,6 +1663,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def update_weights(self, rollout_id: int | None = None) -> None:
+        """Publish the selected actor snapshot to rollout workers.
+
+        Args:
+            rollout_id: Zero-based rollout identifier that controls periodic
+                rollout-policy snapshot refreshes. ``None`` skips refresh
+                bookkeeping for callers outside the rollout loop.
+        """
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 

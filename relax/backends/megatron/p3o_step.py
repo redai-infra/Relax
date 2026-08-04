@@ -93,26 +93,30 @@ def _local_stats_from_batch(
 def synchronize_p3o_stats(
     stats: P3OSufficientStats,
     invalid_count: torch.Tensor,
+    *,
+    dp_cp_group: torch.distributed.ProcessGroup | None,
+    pp_group: torch.distributed.ProcessGroup | None,
+    is_pipeline_last_stage: bool,
 ) -> P3OSufficientStats:
     """Reduce last-stage stats over DP x CP, then publish them over PP.
 
     Pipeline-last is the only stage with logits. It first sums ``S1/S2/N`` and
     the invalid-ratio flag over DP x CP. The already-global vector is then
     broadcast, never summed, over PP so every stage finalizes the same context.
-    TP replicas use independent but equivalent groups.
+    TP replicas use independent but equivalent groups. Process groups are
+    supplied by the caller so the collective scope is explicit at the runtime
+    integration boundary.
     """
     vector = torch.cat((stats.as_vector(), invalid_count.reshape(1).to(dtype=torch.float64)))
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if mpu.is_pipeline_last_stage(ignore_virtual=True):
-            group = mpu.get_data_parallel_group(with_context_parallel=True)
-            torch.distributed.all_reduce(vector, op=torch.distributed.ReduceOp.SUM, group=group)
+        if is_pipeline_last_stage:
+            torch.distributed.all_reduce(vector, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group)
 
-        pp_size = mpu.get_pipeline_model_parallel_world_size()
-        if pp_size > 1:
+        if pp_group is not None:
             torch.distributed.broadcast(
                 vector,
-                group=mpu.get_pipeline_model_parallel_group(),
-                group_src=pp_size - 1,
+                group=pp_group,
+                group_src=torch.distributed.get_world_size(group=pp_group) - 1,
             )
 
     valid = vector[3] <= 0
@@ -284,7 +288,23 @@ def compute_p3o_step_context(
 
     # Accumulate every local micro-batch first, reduce exactly once over DP x CP
     # on pipeline-last, then broadcast that fixed vector over PP.
-    reduced = synchronize_p3o_stats(stats_acc[0], invalid_count_acc[0])
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    is_pipeline_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+    dp_cp_group = (
+        mpu.get_data_parallel_group(with_context_parallel=True) if distributed and is_pipeline_last_stage else None
+    )
+    pp_group = (
+        mpu.get_pipeline_model_parallel_group()
+        if distributed and mpu.get_pipeline_model_parallel_world_size() > 1
+        else None
+    )
+    reduced = synchronize_p3o_stats(
+        stats_acc[0],
+        invalid_count_acc[0],
+        dp_cp_group=dp_cp_group,
+        pp_group=pp_group,
+        is_pipeline_last_stage=is_pipeline_last_stage,
+    )
     step_context = finalize_p3o_step_context(reduced)
 
     if step_context.clamp_events:

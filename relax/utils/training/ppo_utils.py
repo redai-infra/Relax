@@ -17,6 +17,10 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+GRPO_STYLE_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "gspo", "sapo", "cispo", "p3o"})
+GROUP_REWARD_NORMALIZATION_ESTIMATORS = GRPO_STYLE_ADVANTAGE_ESTIMATORS | {"reinforce_plus_plus_baseline"}
+
+
 def validate_ppo_config(config: Namespace) -> None:
     if getattr(config, "advantage_estimator", None) != "ppo":
         return
@@ -1209,23 +1213,3 @@ def maybe_verify_critic_value_head_movement(model, optimizer, update_successful:
                 count,
             )
             setattr(model[0], _CRITIC_VH_VERIFIED_ATTR, True)
-
-
-# ---------------------------------------------------------------------------
-# P3O helpers – narrow re-exports from p3o_utils
-#
-# P3O helpers are implemented in p3o_utils.py and re-exported here for
-# compatibility with callers that use the existing ppo_utils namespace.
-# All P3O-specific formulas and logic live in the dedicated p3o_utils module.
-# ---------------------------------------------------------------------------
-from relax.utils.training.p3o_utils import (  # noqa: E402, F401
-    P3OStepContext,
-    P3OSufficientStats,
-    P3OTokenTerms,
-    compute_p3o_behavior_kl_proxy,
-    compute_p3o_log_ratio,
-    compute_p3o_sufficient_stats,
-    compute_p3o_sufficient_stats_unchecked,
-    compute_p3o_token_terms,
-    finalize_p3o_step_context,
-)

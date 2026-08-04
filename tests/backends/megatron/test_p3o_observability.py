@@ -50,14 +50,18 @@ def test_rollout_policy_age_rejects_invalid_versions(current_rollout_id, snapsho
 def test_rollout_policy_age_interval_three_sequence():
     snapshot_rollout = 0
     observed = []
+    refreshes = []
     backuper = _RecordingBackuper()
 
     for rollout_id in range(6):
         observed.append(compute_rollout_policy_age_rollouts(rollout_id, snapshot_rollout))
-        if maybe_refresh_rollout_policy(backuper, rollout_id, 3, 6):
+        refreshed = maybe_refresh_rollout_policy(backuper, rollout_id, 3, 7)
+        refreshes.append(refreshed)
+        if refreshed:
             snapshot_rollout = rollout_id + 1
 
     assert observed == [0, 1, 2, 0, 1, 2]
+    assert refreshes == [False, False, True, False, False, True]
     assert backuper.copies == [("actor", ROLLOUT_POLICY_TAG), ("actor", ROLLOUT_POLICY_TAG)]
 
 
@@ -80,16 +84,6 @@ def test_rollout_policy_age_metrics_have_exact_keys_and_values():
     }
 
 
-@pytest.mark.parametrize("optimizer_steps_per_rollout", [1, 2, 8])
-def test_rollout_policy_age_is_independent_of_optimizer_steps_per_rollout(optimizer_steps_per_rollout):
-    optimizer_step = 4 * optimizer_steps_per_rollout
-
-    metrics = build_rollout_policy_age_metrics(current_rollout_id=4, rollout_policy_snapshot_rollout=3)
-
-    assert optimizer_step >= 4
-    assert metrics["train/p3o/rollout_policy_age_rollouts"] == 1
-
-
 def test_rollout_policy_refresh_calls_backuper_only_at_boundary():
     backuper = _RecordingBackuper()
 
@@ -103,3 +97,14 @@ def test_rollout_policy_refresh_calls_backuper_only_at_boundary():
 def test_on_policy_mode_uses_actor_and_refreshes_every_rollout():
     assert rollout_weights_tag(1) == "actor"
     assert should_refresh_rollout_policy(5, 1, 10)
+
+
+def test_periodic_sync_mode_uses_rollout_policy_snapshot():
+    assert rollout_weights_tag(3) == ROLLOUT_POLICY_TAG
+
+
+def test_final_rollout_forces_refresh_away_from_interval_boundary():
+    backuper = _RecordingBackuper()
+
+    assert maybe_refresh_rollout_policy(backuper, rollout_id=4, update_weights_interval=3, num_rollout=5)
+    assert backuper.copies == [("actor", ROLLOUT_POLICY_TAG)]
