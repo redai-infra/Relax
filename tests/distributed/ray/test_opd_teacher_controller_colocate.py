@@ -59,3 +59,24 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         "runtime_env": {"env_vars": {"A": "B"}},
     }
     assert config.opd_teacher_url == "http://teacher/generate"
+
+
+def test_managed_teacher_runtime_skips_debug_train_only(monkeypatch):
+    from relax.utils.opd import opd_utils
+
+    def fail_if_started(*_args, **_kwargs):
+        raise AssertionError("teacher manager must not start")
+
+    monkeypatch.setattr(opd_utils, "create_managed_opd_teacher_manager", fail_if_started)
+    config = Namespace(
+        use_opd=True,
+        opd_type="sglang",
+        colocate=False,
+        hybrid=False,
+        debug_train_only=True,
+        resource={"actor": [1, 8], "teacher": [1, 8]},
+        teacher_hf_checkpoint="/teacher",
+        opd_teacher_routes=None,
+    )
+
+    assert opd_utils.maybe_start_managed_opd_teacher(config) == (None, None)

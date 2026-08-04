@@ -128,6 +128,25 @@ def test_hybrid_resource_preview_uses_dedicated_actor_and_rollout_gpus():
     assert {item["placement_group"] for item in report.topology["role_plan"]} == {"dedicated"}
 
 
+def test_debug_train_only_topology_excludes_managed_teacher():
+    args = _namespace(
+        {
+            "debug_train_only": True,
+            "use_opd": True,
+            "opd_type": "sglang",
+            "teacher_hf_checkpoint": "/teacher",
+            "resource": {"actor": [1, 8], "teacher": [1, 8]},
+        }
+    )
+
+    report = run_doctor(argv=[], args=args)
+
+    assert report.ok
+    assert report.topology["roles"] == ["actor"]
+    assert report.topology["resource_summary"]["total_required_gpus"] == 8
+    assert all(spec["role"] != "teacher" for spec in report.topology["role_plan"])
+
+
 def test_model_roles_reject_zero_gpu_resources():
     report = run_doctor(
         argv=[],

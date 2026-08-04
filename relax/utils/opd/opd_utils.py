@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
-from relax.core.service_plan import is_managed_teacher_colocate, is_managed_teacher_enabled
+from relax.core.service_plan import (
+    is_managed_teacher_colocate,
+    is_managed_teacher_enabled,
+    should_start_managed_teacher,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_opsd_worker
 
@@ -175,7 +179,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not should_start_managed_teacher(args):
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────

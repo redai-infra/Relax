@@ -163,3 +163,30 @@ def test_service_plan_accounts_for_managed_teacher_placement():
     assert shared.total_required_gpus == 8
     assert dedicated_teacher.placement_group == "dedicated"
     assert dedicated.total_required_gpus == 10
+
+
+def test_service_plan_matches_managed_teacher_debug_runtime_modes():
+    train_only = build_service_plan(
+        _config(
+            debug_train_only=True,
+            use_opd=True,
+            teacher_hf_checkpoint="/teacher",
+            resource={"actor": [1, 8], "teacher": [1, 8]},
+        )
+    )
+    rollout_only = build_service_plan(
+        _config(
+            debug_rollout_only=True,
+            colocate=False,
+            use_opd=True,
+            teacher_hf_checkpoint="/teacher",
+            resource={"rollout": [1, 4], "teacher": [1, 2]},
+        )
+    )
+
+    assert train_only.roles == ("actor",)
+    assert train_only.total_required_gpus == 8
+    assert all(spec.role != "teacher" for spec in train_only.service_specs)
+
+    assert rollout_only.roles == ("rollout", "teacher")
+    assert rollout_only.total_required_gpus == 6

@@ -218,9 +218,13 @@ def is_managed_teacher_enabled(config: Any) -> bool:
     )
 
 
+def should_start_managed_teacher(config: Any) -> bool:
+    return is_managed_teacher_enabled(config) and not getattr(config, "debug_train_only", False)
+
+
 def is_managed_teacher_colocate(config: Any) -> bool:
     return (
-        is_managed_teacher_enabled(config)
+        should_start_managed_teacher(config)
         and getattr(config, "colocate", False)
         and not getattr(config, "hybrid", False)
         and "actor" in config.resource
@@ -238,7 +242,7 @@ def build_service_plan(config: Any) -> ServicePlan:
     if "reference" in required_roles and not _needs_reference(config):
         required_roles.remove("reference")
 
-    managed_teacher = is_managed_teacher_enabled(config)
+    managed_teacher = should_start_managed_teacher(config)
     if managed_teacher:
         candidate_roles.append("teacher")
         required_roles.append("teacher")
