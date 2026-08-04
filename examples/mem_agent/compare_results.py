@@ -11,6 +11,8 @@ from typing import Any
 
 COMPATIBILITY_FIELDS = (
     "data_file",
+    "data_sha256",
+    "evaluator_schema_version",
     "mode",
     "tokenizer",
     "temperature",
@@ -24,12 +26,26 @@ COMPATIBILITY_FIELDS = (
     "server_max_model_len",
     "total",
 )
+COMPLETENESS_FIELDS = ("successful", "errors")
 
 
 def validate_compatible_summaries(*summaries: dict[str, Any]) -> None:
-    """Reject a comparison when any controlled evaluation field differs."""
+    """Reject incomplete runs or mismatched controlled evaluation fields."""
     if len(summaries) < 2:
         raise ValueError("At least two summaries are required for compatibility validation.")
+    for summary in summaries:
+        for field in COMPLETENESS_FIELDS:
+            if field not in summary:
+                raise KeyError(f"Completeness field {field!r} must exist in every summary.")
+        total = int(summary.get("total", 0))
+        successful = int(summary["successful"])
+        errors = int(summary["errors"])
+        # A request error is retained as a zero-score row for diagnosis, but
+        # an effects claim must come from a non-empty, fully completed run.
+        if total <= 0 or errors != 0 or successful != total:
+            raise ValueError(
+                f"Evaluation summary is incomplete: total={total}, successful={successful}, errors={errors}."
+            )
     for field in COMPATIBILITY_FIELDS:
         if any(field not in summary for summary in summaries):
             raise KeyError(f"Compatibility field {field!r} must exist in every summary.")

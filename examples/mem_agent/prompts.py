@@ -11,7 +11,7 @@ STOP_TOKEN_STRINGS = ("<|im_end|>", "<|endoftext|>")
 
 MEMORY_TEMPLATE = """You are presented with a problem, a section of an article that may contain the answer to the problem, and a previous memory. Please read the provided section carefully and update the memory with the new information that helps to answer the problem. Be sure to retain all relevant details from the previous memory while adding any new, useful information.
 
-<problem>
+<problem>{problem_tag_suffix}
 {question}
 </problem>
 
@@ -28,7 +28,7 @@ Updated memory:
 
 FINAL_TEMPLATE = """You are presented with a problem and a previous memory. Please answer the problem based on the previous memory and put the answer in \\boxed{{}}.
 
-<problem>
+<problem>{problem_tag_suffix}
 {question}
 </problem>
 
@@ -63,12 +63,31 @@ def truncate_text_to_tokens(tokenizer: Any, text: str, max_tokens: int) -> tuple
     return bounded_text, len(bounded_ids)
 
 
-def memory_instruction(question: str, memory: str, chunk: str) -> str:
-    return MEMORY_TEMPLATE.format(question=question, memory=memory, chunk=chunk)
+def _problem_tag_suffix(evaluation: bool) -> str:
+    """Preserve the one-character prompt difference in fixed VIME code.
+
+    VIME training has ``<problem> `` while its evaluator has ``<problem>``.
+    Keeping the variants explicit makes both reproduction paths byte-aligned
+    instead of silently choosing one template for both.
+    """
+    return "" if evaluation else " "
 
 
-def final_instruction(question: str, memory: str) -> str:
-    return FINAL_TEMPLATE.format(question=question, memory=memory)
+def memory_instruction(question: str, memory: str, chunk: str, *, evaluation: bool = False) -> str:
+    return MEMORY_TEMPLATE.format(
+        question=question,
+        memory=memory,
+        chunk=chunk,
+        problem_tag_suffix=_problem_tag_suffix(evaluation),
+    )
+
+
+def final_instruction(question: str, memory: str, *, evaluation: bool = False) -> str:
+    return FINAL_TEMPLATE.format(
+        question=question,
+        memory=memory,
+        problem_tag_suffix=_problem_tag_suffix(evaluation),
+    )
 
 
 def render_chat_prompt(tokenizer: Any, instruction: str) -> str:

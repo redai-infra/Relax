@@ -54,13 +54,15 @@ async def test_evaluation_error_keeps_ground_truth_and_counts_as_zero(monkeypatc
         raise RuntimeError("server unavailable")
 
     monkeypatch.setattr("examples.mem_agent.eval_ruler_hqa.recurrent_infer", failed_infer)
+    data_file = tmp_path / "eval.jsonl"
+    data_file.write_text('{"input":"Question","context":"Context","answers":["A"]}\n', encoding="utf-8")
     args = SimpleNamespace(
         mode="recurrent",
         concurrency=1,
         timeout=1,
         model="model",
         tokenizer="tokenizer",
-        data_file=tmp_path / "eval.jsonl",
+        data_file=data_file,
         temperature=0.7,
         top_p=0.95,
         chunk_tokens=2048,
@@ -83,3 +85,5 @@ async def test_evaluation_error_keeps_ground_truth_and_counts_as_zero(monkeypatc
     assert summary["total"] == 1
     assert summary["errors"] == 1
     assert summary["sub_em_pct"] == 0.0
+    assert len(summary["data_sha256"]) == 64
+    assert summary["evaluator_schema_version"] == "mem-agent-vime-eval-v1"

@@ -26,6 +26,8 @@ def test_compare_baseline_requires_strict_improvement():
 def test_comparator_rejects_control_variable_mismatch():
     common = {
         "data_file": "eval_50.jsonl",
+        "data_sha256": "a" * 64,
+        "evaluator_schema_version": "mem-agent-vime-eval-v1",
         "mode": "recurrent",
         "tokenizer": "frozen-tokenizer",
         "temperature": 0.7,
@@ -38,9 +40,19 @@ def test_comparator_rejects_control_variable_mismatch():
         "max_input_tokens": 7936,
         "server_max_model_len": 8192,
         "total": 128,
+        "successful": 128,
+        "errors": 0,
     }
     mismatched = {**common, "chunk_tokens": 4096}
 
     validate_compatible_summaries(common, dict(common))
     with pytest.raises(ValueError, match="chunk_tokens"):
         validate_compatible_summaries(common, mismatched)
+
+    changed_data = {**common, "data_sha256": "b" * 64}
+    with pytest.raises(ValueError, match="data_sha256"):
+        validate_compatible_summaries(common, changed_data)
+
+    incomplete = {**common, "successful": 127, "errors": 1}
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_compatible_summaries(common, incomplete)

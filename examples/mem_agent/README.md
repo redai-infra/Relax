@@ -48,7 +48,7 @@ RESULTS_DIR=/data/results/mem-agent-relax \
 bash examples/mem_agent/run-eval.sh
 ```
 
-The evaluator writes raw per-sample JSONL and a summary JSON for HotpotQA dev and RULER-HQA 50/200/800. Failed requests keep their ground truth in the raw file and remain in the denominator with score zero. `boxed_em_pct` is the HotpotQA reward-compatible accuracy and `sub_em_pct` is the primary VIME-compatible RULER-HQA metric. Set `MODE=base` to run the optional single-context diagnostic; its context truncation always preserves the question and answer instruction.
+The evaluator writes raw per-sample JSONL and a summary JSON for HotpotQA dev and RULER-HQA 50/200/800. Failed requests keep their ground truth in the raw file and remain in the denominator with score zero. Formal comparison additionally rejects empty runs and any run with request errors. Each summary records the normalized input file SHA-256 and evaluator schema version, so equal paths with different bytes or incompatible evaluator revisions cannot be compared. `boxed_em_pct` is the HotpotQA reward-compatible accuracy and `sub_em_pct` is the primary VIME-compatible RULER-HQA metric. Set `MODE=base` to run the optional single-context diagnostic; its context truncation always preserves the question and answer instruction.
 
 `TOKENIZER_PATH` should point to the frozen base snapshot. `run-pipeline.sh` preserves it automatically before switching `MODEL_PATH` to the converted checkpoint. When `NUM_ROLLOUT=2` is used, the pipeline also selects `iter_0000001` automatically instead of the 100-step default `iter_0000099`.
 

@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from examples.mem_agent.prompts import NO_MEMORY, truncate_text_to_tokens
+from examples.mem_agent.prompts import NO_MEMORY, final_instruction, memory_instruction, truncate_text_to_tokens
 from examples.mem_agent.rollout import chunk_context, generate, generate_trajectory
 from relax.utils.types import Sample
 
@@ -93,6 +93,18 @@ def test_chunk_context_preserves_boundaries_and_marks_truncation():
     chunks, truncated = chunk_context(tokenizer, "abcdefgh", chunk_tokens=3, max_chunks=2)
     assert [tokenizer.decode(chunk) for chunk in chunks] == ["abc", "def"]
     assert truncated is True
+
+
+def test_prompt_variants_match_fixed_vime_training_and_evaluation_templates():
+    train_memory = memory_instruction("Q", "M", "C")
+    eval_memory = memory_instruction("Q", "M", "C", evaluation=True)
+    train_final = final_instruction("Q", "M")
+    eval_final = final_instruction("Q", "M", evaluation=True)
+
+    assert "<problem> \nQ\n</problem>" in train_memory
+    assert "<problem>\nQ\n</problem>" in eval_memory
+    assert "<problem> \nQ\n</problem>" in train_final
+    assert "<problem>\nQ\n</problem>" in eval_final
 
 
 def test_truncate_text_to_tokens_retokenizes_to_the_hard_limit():

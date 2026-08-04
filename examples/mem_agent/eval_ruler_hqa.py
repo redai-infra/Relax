@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,18 @@ from examples.mem_agent.prompts import (
     truncate_text_to_tokens,
 )
 from examples.mem_agent.reward import exact_match_any, extract_last_boxed
+
+
+EVALUATOR_SCHEMA_VERSION = "mem-agent-vime-eval-v1"
+
+
+def sha256_file(path: Path) -> str:
+    """Hash the exact normalized dataset consumed by one evaluation run."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def load_data(path: Path) -> list[dict[str, Any]]:
@@ -103,7 +116,7 @@ async def recurrent_infer(
                 args.base_url,
                 args.api_key,
                 args.model,
-                memory_instruction(question, memory, chunk),
+                memory_instruction(question, memory, chunk, evaluation=True),
                 args.temperature,
                 args.top_p,
                 args.max_memory_tokens,
@@ -118,7 +131,7 @@ async def recurrent_infer(
         args.base_url,
         args.api_key,
         args.model,
-        final_instruction(question, memory),
+        final_instruction(question, memory, evaluation=True),
         args.temperature,
         args.top_p,
         args.max_final_tokens,
@@ -166,6 +179,10 @@ async def base_infer(
 async def run_evaluation(
     data: list[dict[str, Any]], args: argparse.Namespace, tokenizer: Any
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # Capture the digest before any long-running inference. A later overwrite
+    # of the path must not make the summary claim that different bytes were
+    # evaluated.
+    data_sha256 = sha256_file(args.data_file)
     semaphore = asyncio.Semaphore(args.concurrency)
     timeout = aiohttp.ClientTimeout(total=args.timeout)
 
@@ -222,6 +239,11 @@ async def run_evaluation(
         "model": args.model,
         "tokenizer": args.tokenizer,
         "data_file": str(args.data_file),
+        # Path equality alone is not proof that sequential checkpoint runs saw
+        # identical bytes. The comparator requires this digest and evaluator
+        # schema before it accepts a controlled comparison.
+        "data_sha256": data_sha256,
+        "evaluator_schema_version": EVALUATOR_SCHEMA_VERSION,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "sampling_count": 1,
