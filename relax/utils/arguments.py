@@ -2862,6 +2862,17 @@ def slime_validate_args(args):
                 "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
                 "require advantage normalization. Please add `--normalize-advantages` to your command."
             )
+        if args.advantage_estimator == "reinforce_plus_plus_baseline":
+            # Paper convention (arXiv:2501.03262 §3.2): the baseline variant
+            # applies a separate k2 KL loss (--use-kl-loss --kl-loss-type k2),
+            # NOT a per-token KL penalty folded into the advantage. Setting
+            # --kl-coef would be silently ignored, so reject it.
+            assert args.kl_coef == 0, (
+                "The 'reinforce_plus_plus_baseline' advantage estimator does not fold a "
+                "per-token KL penalty into the advantage (paper §3.2: group-mean baseline + "
+                "global normalization + separate k2 KL loss). Use `--use-kl-loss "
+                "--kl-loss-type k2 --kl-loss-coef <λ>` instead of `--kl-coef`."
+            )
 
         if args.fully_async:
             assert not args.normalize_advantages, (

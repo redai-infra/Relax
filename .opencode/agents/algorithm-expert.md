@@ -24,7 +24,7 @@ Relax 中 RL 算法族的配置、损失计算和奖励函数。For project-leve
 | **SAPO** | Soft gating 替代 hard clipping | `compute_sapo_loss()` |
 | **DAPO** | Dynamic batch size | `--use-dynamic-batch-size` |
 | **REINFORCE++** | Discounted REINFORCE | `--advantage-estimator reinforce_plus_plus` |
-| **REINFORCE++ BL** | + leave-one-out baseline | `--advantage-estimator reinforce_plus_plus_baseline` |
+| **REINFORCE++ BL** | + group-mean baseline（论文 §3.2，独立 k2 KL loss） | `--advantage-estimator reinforce_plus_plus_baseline` |
 | **OPD** | Teacher-student KL penalty | `--on-policy-distillation` |
 
 ## 核心参数
