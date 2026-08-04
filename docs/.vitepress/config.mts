@@ -246,7 +246,8 @@ export default defineConfig({
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
-                { text: 'Configuration', link: '/en/guide/configuration' }
+                { text: 'Configuration', link: '/en/guide/configuration' },
+                { text: 'Config Doctor', link: '/en/guide/config-doctor' }
               ]
             },
             {
@@ -355,7 +356,8 @@ export default defineConfig({
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
-                { text: '配置说明', link: '/zh/guide/configuration' }
+                { text: '配置说明', link: '/zh/guide/configuration' },
+                { text: 'Config Doctor', link: '/zh/guide/config-doctor' }
               ]
             },
             {

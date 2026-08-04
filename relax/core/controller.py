@@ -30,11 +30,12 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.core.optional_roles import register_extra_roles
-from relax.core.registry import ALGOS, ROLES, process_role
+from relax.core.registry import ALGOS, ROLES
 from relax.core.service import Service, create_placement_group
+from relax.core.service_plan import ACTOR_ROLLOUT_PG_ROLES, ServicePlan, build_service_plan
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
-from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
+from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.health_system import HealthManager
@@ -60,23 +61,6 @@ def _is_colocate(config: Namespace) -> bool:
 
 
 logger = get_logger(__name__)
-
-ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", "genrm"]
-
-
-def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
-    """Roles that share the actor/rollout placement group.
-
-    PPO co-hosts the critic on the same GPUs only when its resource entry
-    matches the actor's; otherwise critic runs on its own placement group.
-    """
-    roles = list(ACTOR_ROLLOUT_PG_ROLES)
-    if getattr(config, "advantage_estimator", None) != "ppo":
-        return roles
-    resource = getattr(config, "resource", None) or {}
-    if resource.get("critic") == resource.get("actor"):
-        roles.append("critic")
-    return roles
 
 
 class Controller:
@@ -297,7 +281,9 @@ class Controller:
                 config=self.config,
                 num_gpus=num_gpus,
                 data_source=data_source,
-                actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
+                actor_rollout_pgs=(
+                    actor_rollout_pgs if actor_rollout_pgs and str(role) in actor_rollout_pg_roles else None
+                ),
                 runtime_env=self.runtime_env,
             )
             logger.info(f"Service {role} has been created successfully")
@@ -306,41 +292,26 @@ class Controller:
             logger.exception(f"Failed to create service {role}: {e}")
             return (role, None, str(e))
 
-    def _validate_gpu_resources(self, roles_to_create, colocate, actor_rollout_pg_roles):
+    def _validate_gpu_resources(self, plan: ServicePlan):
         """Validate that the cluster has enough GPUs before creating placement
         groups.
-
-        In colocate mode, roles in actor_rollout_pg_roles share one placement group,
-        so only the max GPU count among them is needed. In non-colocate (fully_async)
-        mode, each role gets its own placement group and GPUs are summed.
 
         Raises:
             RuntimeError: If the cluster does not have enough GPUs.
         """
-        if colocate:
-            shared_gpu = 0
-            independent_gpu = 0
-            for role, _cls, num_gpus, _ds in roles_to_create:
-                if role in actor_rollout_pg_roles:
-                    shared_gpu = max(shared_gpu, num_gpus)
-                else:
-                    independent_gpu += num_gpus
-            total_required = shared_gpu + independent_gpu
-        else:
-            total_required = sum(num_gpus for _, _, num_gpus, _ in roles_to_create)
-
         cluster_resources = ray.cluster_resources()
         accel_resource = device_utils.get_ray_accelerator_name()
         total_available = int(cluster_resources.get(accel_resource, 0))
 
         logger.info(
-            f"Resource validation: required GPUs={total_required}, cluster GPUs={total_available}, colocate={colocate}"
+            f"Resource validation: required GPUs={plan.total_required_gpus}, "
+            f"cluster GPUs={total_available}, shares_actor_rollout_pg={plan.shares_actor_rollout_pg}"
         )
 
-        if total_required > total_available:
-            role_details = ", ".join(f"{role}={num_gpus}" for role, _, num_gpus, _ in roles_to_create)
+        if plan.total_required_gpus > total_available:
+            role_details = ", ".join(f"{spec.role}={spec.num_gpus}" for spec in plan.planned_specs)
             raise RuntimeError(
-                f"Insufficient GPU resources: {total_required} GPUs required but only "
+                f"Insufficient GPU resources: {plan.total_required_gpus} GPUs required but only "
                 f"{total_available} available in the cluster. "
                 f"Role breakdown: [{role_details}]. "
                 f"Either add more GPU nodes, reduce GPU allocation per role, "
@@ -350,61 +321,45 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
+        plan = build_service_plan(self.config)
+        plan.raise_for_errors()
+        self._validate_gpu_resources(plan)
+
         actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
             runtime_env=self.runtime_env,
         )
 
-        algo_key = resolve_sft_algo_key(self.config)
-        if algo_key not in ALGOS:
-            raise ValueError(f"Algorithm key '{algo_key}' not registered in ALGOS. Available: {list(ALGOS.keys())}")
-        algo: dict = ALGOS.get(algo_key).copy()
-        ROLES = process_role(self.config)
-
-        # Fail-fast on missing SFT producer role; without this the train
-        # workers silently block on TransferQueue forever.
-        validate_sft_resource(self.config)
-        # Register optional services (e.g., GenRM, SFT-side rollout)
-        extra_roles = register_extra_roles(self.config, algo)
-
-        roles_iter = list(ROLES) + extra_roles
-        role_names = {str(r) for r in roles_iter}
-        # SFT path returns ROLES_SFT_ONLY (no `rollout` attr); rollout may be
-        # injected via extra_roles — gate on the unified name set, not the enum.
-        colocate = self.config.colocate and "rollout" in role_names and "actor" in role_names
+        algo: dict = ALGOS[plan.algo_key].copy()
+        register_extra_roles(self.config, algo)
 
         roles_to_create = []
-        for role in roles_iter:
+        for spec in plan.planned_specs:
+            if spec.role == "teacher":
+                # Managed teachers are started separately above.
+                continue
+            role = next((key for key in algo if str(key) == spec.role), spec.role)
             cls = algo.get(role)
             if cls is None:
-                logger.warning(f"No class registered for role '{role}', skipping")
-                continue
-            if str(role) == "rollout":
+                raise ValueError(f"No class registered for planned role {spec.role!r}")
+            if spec.num_gpus is None:
+                raise ValueError(f"Planned role {spec.role!r} is missing num_gpus")
+            if spec.role == "rollout":
                 data_source_cls = load_function(self.config.data_source_path)
                 data_source = ray.remote(num_cpus=1)(data_source_cls).remote(self.config)
             else:
                 data_source = None
-            # Optional roles (e.g. reference) may be absent from resource config
-            if role not in self.config.resource:
-                logger.warning(
-                    f"Role '{role}' not in resource config (available: {list(self.config.resource.keys())}), skipping"
-                )
-                continue
-            num_serves, num_gpus = self.config.resource.get(role)
-            assert num_serves == 1, f"Currently only support num_serves=1 for {role}, but received {num_serves=}"
             self._health_manager.mark_healthy(role)
             logger.info(f"Service {role} start creating.")
 
-            roles_to_create.append((role, cls, num_gpus, data_source))
+            roles_to_create.append((role, cls, spec.num_gpus, data_source))
 
-        actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
-        self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
+        actor_rollout_pg_roles = plan.actor_rollout_pg_roles
 
-        if colocate and not self.config.hybrid:
+        if plan.shares_actor_rollout_pg:
             # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
             if actor_rollout_pgs is None:
-                num_gpus = self.config.resource.get(ROLES.actor)[1]
-                actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
+                actor_rollout_pgs = create_placement_group(num_gpus=plan.shared_gpu)
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None

@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
+from relax.core.service_plan import (
+    is_managed_teacher_colocate,
+    is_managed_teacher_enabled,
+    should_start_managed_teacher,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_opsd_worker
 
@@ -62,26 +67,11 @@ _SGLANG_PASSTHROUGH_SKIP_ARGS = (
 
 
 def is_managed_opd_teacher_enabled(args: Any) -> bool:
-    return (
-        getattr(args, "use_opd", False)
-        and getattr(args, "opd_type", None) == "sglang"
-        and (
-            getattr(args, "teacher_hf_checkpoint", None) is not None
-            or getattr(args, "opd_teacher_routes", None) is not None
-        )
-        and getattr(args, "resource", None) is not None
-        and "teacher" in args.resource
-    )
+    return is_managed_teacher_enabled(args)
 
 
 def is_managed_opd_teacher_colocate(args: Any) -> bool:
-    return (
-        is_managed_opd_teacher_enabled(args)
-        and getattr(args, "colocate", False)
-        and not getattr(args, "hybrid", False)
-        and "actor" in args.resource
-        and "rollout" in args.resource
-    )
+    return is_managed_teacher_colocate(args)
 
 
 def _mirror_teacher_sglang_server_args(parser: Any) -> None:
@@ -189,7 +179,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
-    if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
+    if not should_start_managed_teacher(args):
         return None, None
 
     # ── Multi-teacher (MOPD) path: --opd-teacher-routes ────────────────────

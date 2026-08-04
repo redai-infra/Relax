@@ -4,13 +4,15 @@
 
 from argparse import Namespace
 
+from relax.core.service_plan import resolve_optional_roles
+
 
 GENRM_ROLE = "genrm"
 
 
 def register_genrm(config: Namespace, algo: dict) -> list[str]:
     """Conditionally register GenRM into the algo dict."""
-    if getattr(config, "genrm_model_path", None) is None:
+    if GENRM_ROLE not in resolve_optional_roles(config):
         return []
 
     from relax.components.genrm import GenRM
@@ -29,9 +31,7 @@ def register_sft_rollout(config: Namespace, algo: dict) -> list:
     Rollout is only spun up when ``--sft-predict-interval`` is set — that is
     the sole consumer of generative eval under SFT today.
     """
-    if getattr(config, "loss_type", None) != "sft":
-        return []
-    if getattr(config, "sft_predict_interval", None) is None:
+    if "rollout" not in resolve_optional_roles(config):
         return []
 
     from relax.components.rollout import Rollout
