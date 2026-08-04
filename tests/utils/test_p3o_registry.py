@@ -16,7 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backends" / "megat
 from _megatron_stub import stubbed_megatron_modules  # noqa: E402
 
 
-with stubbed_megatron_modules():
+with stubbed_megatron_modules(
+    ("megatron", "ray", "tensordict", "transfer_queue", "sglang", "sglang_router", "pybase64")
+):
     from relax.core.registry import ALGOS  # noqa: E402
     from relax.utils.arguments import get_slime_extra_args_provider  # noqa: E402
     from relax.utils.types import Sample  # noqa: E402
