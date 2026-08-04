@@ -1438,9 +1438,12 @@ class RolloutManager(ReloadableMixin):
             if num_replicas <= 0:
                 raise ValueError("num_replicas must be > 0 for ray_native mode")
 
-            # Idempotency: num_replicas is the absolute target total engine count
+            # Idempotency: num_replicas is the absolute target total engine count.
+            # Count logical engines the same way _fetch_engines and scale-in do
+            # (node-0 engines, excluding dead ``None`` slots) so multi-node groups
+            # and post-scale-in empty slots don't over-count into a false NOOP.
             target_total = num_replicas
-            current_total = sum(len(g.all_engines) for g in srv.engine_groups)
+            current_total = sum(1 for g in srv.engine_groups for e in g.engines if e is not None)
 
             # Also count engines in non-terminal in-flight requests for this model
             in_flight_engines = sum(
@@ -2972,11 +2975,10 @@ class RolloutManager(ReloadableMixin):
         if srv is None:
             raise ValueError(f"Model '{model_name}' not found")
 
+        # Count initial (non-scaled-out) engines to enforce the lower bound.
+        initial_count = sum(1 for g in srv.engine_groups if not g.is_scaled_out for e in g.engines if e is not None)
+
         if num_replicas > 0:
-            # Count initial (non-scaled-out) engines to enforce the lower bound.
-            initial_count = sum(
-                1 for g in srv.engine_groups if not g.is_scaled_out for e in g.engines if e is not None
-            )
             if num_replicas < initial_count:
                 return {
                     "request_id": str(uuid.uuid4()),
@@ -2996,7 +2998,17 @@ class RolloutManager(ReloadableMixin):
         elif engine_urls:
             pass
         else:
-            raise ValueError("Either num_replicas > 0 or engine_urls must be provided")
+            # num_replicas <= 0 and no engine_urls: semantically equals "target 0 < initial
+            # engine count". Return a clean REJECTED instead of raising ValueError (which the
+            # HTTP handler would surface as a 500 Internal Server Error).
+            return {
+                "request_id": str(uuid.uuid4()),
+                "status": "REJECTED",
+                "message": (
+                    f"Cannot scale below initial engine count: "
+                    f"num_replicas={num_replicas} < initial_engines={initial_count}"
+                ),
+            }
 
         request = ScaleInRequest(
             request_id=str(uuid.uuid4()),

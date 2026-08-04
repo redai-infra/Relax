@@ -208,7 +208,10 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
             f"[OPD teacher] pre-building shared PG: actor={actor_gpus}, "
             f"rollout={args.resource['rollout'][1]}, teacher={args.resource['teacher'][1]}"
         )
-        shared_pg = create_placement_group(num_gpus=actor_gpus)
+        shared_pg = create_placement_group(
+            num_gpus=actor_gpus,
+            node_group_affinity=getattr(args, "enable_affinity", True),
+        )
 
     # args.resource["teacher"] = [num_cpus, num_gpus]. The teacher replica layout
     # is derived from the GPU total and --teacher-num-gpus-per-engine (TP per
@@ -311,7 +314,10 @@ def _start_managed_multi_teacher(
             f"--rollout-num-gpus 8 with resource['teacher'][1]=8."
         )
 
-    shared_pg = create_placement_group(num_gpus=actor_gpus)
+    shared_pg = create_placement_group(
+        num_gpus=actor_gpus,
+        node_group_affinity=getattr(args, "enable_affinity", True),
+    )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
         f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "

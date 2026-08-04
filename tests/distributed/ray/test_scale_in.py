@@ -111,11 +111,17 @@ class TestCreateScaleInRequest:
             manager.create_scale_in_request(model_name="nope", engine_urls=["a:1"])
 
     def test_neither_replicas_nor_urls(self, patch_ray_get):
+        """Neither num_replicas>0 nor engine_urls given == target 0 < initial
+        count.
+
+        Returns a clean REJECTED instead of raising ValueError (which the HTTP
+        handler would map to 500). See create_scale_in_request.
+        """
         g = make_engine_group()
         srv = make_rollout_server(engine_groups=[g])
         manager = create_test_manager(servers={"default": srv})
-        with pytest.raises(ValueError, match="Either"):
-            manager.create_scale_in_request()
+        result = manager.create_scale_in_request()
+        assert result["status"] == "REJECTED"
 
     def test_by_engine_urls(self, patch_ray_get):
         initial = make_engine_group(engines=[make_mock_engine()])

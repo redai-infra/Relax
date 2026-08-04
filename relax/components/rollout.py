@@ -815,14 +815,17 @@ class Rollout(Base):
                 detail="Scale-in is not available when --use-slime-router is enabled. "
                 "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
             )
-        result = await self.rollout_manager.create_scale_in_request.remote(
-            model_name=request.model_name,
-            num_replicas=request.num_replicas,
-            engine_urls=request.engine_urls,
-            timeout_secs=request.timeout_secs,
-            force=request.force,
-            dry_run=request.dry_run,
-        )
+        try:
+            result = await self.rollout_manager.create_scale_in_request.remote(
+                model_name=request.model_name,
+                num_replicas=request.num_replicas,
+                engine_urls=request.engine_urls,
+                timeout_secs=request.timeout_secs,
+                force=request.force,
+                dry_run=request.dry_run,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if result["status"] == "CONFLICT":
             raise HTTPException(status_code=409, detail=result["message"])
         if result["status"] == "REJECTED":

@@ -147,7 +147,10 @@ class TeacherManager:
                 bundle_offset=self._bundle_offset,
             )
         else:
-            pg, reordered_bundle_indices, reordered_gpu_ids = create_placement_group(num_gpus=self.gpus_per_replica)
+            pg, reordered_bundle_indices, reordered_gpu_ids = create_placement_group(
+                num_gpus=self.gpus_per_replica,
+                node_group_affinity=getattr(self.args, "enable_affinity", True),
+            )
             owns_pg = True
             gpu_index = _resolve_teacher_gpu_index(
                 args=self.args,

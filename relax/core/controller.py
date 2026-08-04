@@ -434,7 +434,10 @@ class Controller:
             # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
             if actor_rollout_pgs is None:
                 num_gpus = self.config.resource.get(ROLES.actor)[1]
-                actor_rollout_pgs = create_placement_group(num_gpus=num_gpus)
+                actor_rollout_pgs = create_placement_group(
+                    num_gpus=num_gpus,
+                    node_group_affinity=self.config.enable_affinity,
+                )
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None

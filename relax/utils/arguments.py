@@ -2433,6 +2433,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: --autoscaler-config relax/utils/autoscaler/autoscaler.yaml"
                 ),
             )
+            parser.add_argument(
+                "--enable-affinity",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether baseline roles (actor / rollout-seed / colocate shared PG) require the "
+                    "'stable' worker-group node-group affinity markers, keeping elastic "
+                    "(autoscaler-enabled) jobs' baseline off elastic workers (which get reclaimed -> "
+                    "whole-job restart). Defaults to True. This flag is forwarded to "
+                    "create_placement_group(node_group_affinity=...); passing --no-enable-affinity "
+                    "opts every baseline placement group out of the marker requirement (escape valve) "
+                    "-- use it on plain/local clusters that don't declare the "
+                    "'{group}_gpu'/'{group}_cpu' custom resources so placement stays unconstrained "
+                    "and never hangs waiting for the markers. (Whether the job is elastic at all is "
+                    "gated separately by --autoscaler-config + its YAML 'enabled'.)"
+                ),
+            )
             return parser
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
