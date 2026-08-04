@@ -65,6 +65,7 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert "training-reward.svg" in train
     assert "--start-rollout-id" in train
     assert "--load" in train
+    assert "--override-opt-param-scheduler" in train
     assert "NUM_ROLLOUT - START_ROLLOUT_ID" in train
     assert '--expected-steps "$((NUM_ROLLOUT - START_ROLLOUT_ID))"' in train
     assert '--expected-start "${START_ROLLOUT_ID}"' in train

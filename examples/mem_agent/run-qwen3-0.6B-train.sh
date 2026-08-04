@@ -80,8 +80,14 @@ source "${MODEL_CONFIG_DIR}/qwen3-0.6B.sh"
 RESUME_ARGS=()
 if [[ -n "${LOAD_PATH}" ]]; then
   # --num-rollout remains the total target. ReLax restores optimizer/model
-  # state from LOAD_PATH and continues at this explicit rollout id.
-  RESUME_ARGS+=(--load "${LOAD_PATH}" --start-rollout-id "${START_ROLLOUT_ID}")
+  # state from LOAD_PATH and continues at this explicit rollout id. The trend
+  # gate and full pilot intentionally use different total rollout targets, so
+  # keep the new constant-LR scheduler horizon while loading the saved state.
+  RESUME_ARGS+=(
+    --load "${LOAD_PATH}"
+    --start-rollout-id "${START_ROLLOUT_ID}"
+    --override-opt-param-scheduler
+  )
 fi
 
 NOW="$(date '+%Y%m%dT%H%M%S%z')"
