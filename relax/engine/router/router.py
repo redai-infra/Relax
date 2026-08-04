@@ -10,11 +10,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+from relax.engine.router.work_accounting import WorkerWorkLedger
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 
 
 logger = get_logger(__name__)
+
+WORK_ESTIMATE_HEADER = "x-relax-estimated-tokens"
+WORK_REQUEST_KEY_HEADER = "x-relax-request-key"
+WORK_ORIGIN_HEADER = "x-relax-work-origin"
 
 
 def run_router(args):
@@ -40,7 +45,9 @@ class SlimeRouter:
         self.app = FastAPI(lifespan=lifespan)
 
         # URL -> Active Request Count (load state)
-        self.worker_request_counts: dict[str, int] = {}
+        self.work_ledger = WorkerWorkLedger()
+        self.worker_request_counts = self.work_ledger.active_requests
+        self.worker_estimated_tokens = self.work_ledger.reserved_tokens
         # URL -> Consecutive Failures
         self.worker_failure_counts: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
@@ -56,6 +63,7 @@ class SlimeRouter:
         self.sticky_idle_secs = getattr(args, "slime_router_sticky_idle_secs", 600.0)
         self.sticky_map: dict[str, list] = {}
         self.sticky_stats = {"hit": 0, "assigned": 0, "remap": 0, "evicted": 0, "no_routing_key": 0}
+        self.work_aware_enabled = getattr(args, "slime_router_work_aware", False)
 
         max_connections = getattr(args, "slime_router_max_connections", None)
         if max_connections is None:
@@ -83,6 +91,7 @@ class SlimeRouter:
         # sglang-router api
         self.app.post("/add_worker")(self.add_worker)
         self.app.get("/list_workers")(self.list_workers)
+        self.app.get("/work_state")(self.work_state)
         self.app.post("/retrieve_from_text")(self.retrieve_from_text)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
@@ -125,11 +134,13 @@ class SlimeRouter:
                                 f"[slime-router] Worker {url} failed {threshold} consecutive health checks. Marking as DEAD."
                             )
                             self.dead_workers.add(url)
+                            self.work_ledger.set_dead(url, dead=True)
                             # TODO (chenyang): Connect back 'dead' workers requires a mechanism to sync
                             # model versions to avoid off-policy issues from stale weights, since these
                             # dead workers' parameters may not be refitted.
                     else:
                         self.worker_failure_counts[url] = 0
+                        self.work_ledger.set_dead(url, dead=False)
 
                 logger.debug(
                     f"[slime-router] Health check complete. {len(self.worker_request_counts) - len(self.dead_workers)} workers healthy."
@@ -153,14 +164,27 @@ class SlimeRouter:
         """Proxy all other requests to the SGLang router."""
         # Forward all other paths to SGLang router
         routing_key = request.headers.get(self.sticky_header) if self.sticky_enabled else None
-        worker_url = self._use_url(routing_key)
+        estimated_tokens = self._parse_estimated_tokens(request.headers.get(WORK_ESTIMATE_HEADER))
+        request_key = request.headers.get(WORK_REQUEST_KEY_HEADER, "")
+        work_origin = request.headers.get(WORK_ORIGIN_HEADER, "unknown")
+        use_work_accounting = self.work_aware_enabled and path == "generate"
+        worker_url = self._use_url(
+            routing_key,
+            estimated_tokens=estimated_tokens if use_work_accounting else 0,
+            use_work_aware=use_work_accounting,
+        )
+        reserved_tokens_after_select = self.worker_estimated_tokens[worker_url]
         url = f"{worker_url}/{path}"
 
-        # Get request body and headers
-        body = await request.body()
-        headers = dict(request.headers)
-
+        request_started_at = time.monotonic()
+        generated_tokens = None
         try:
+            # Reservation starts at worker selection and must be released even if
+            # reading the downstream request body is cancelled.
+            body = await request.body()
+            headers = dict(request.headers)
+            for header in (WORK_ESTIMATE_HEADER, WORK_REQUEST_KEY_HEADER, WORK_ORIGIN_HEADER):
+                headers.pop(header, None)
             response = await self.client.request(request.method, url, content=body, headers=headers)
             # Eagerly read content so we can return JSON (not streaming)
             content = await response.aread()
@@ -177,6 +201,7 @@ class SlimeRouter:
             try:
                 # Prefer parsing JSON if possible
                 data = json.loads(content)
+                generated_tokens = self._generated_tokens(data)
                 return JSONResponse(
                     content=data,
                     status_code=response.status_code,
@@ -195,7 +220,23 @@ class SlimeRouter:
                     await response.aclose()
 
         finally:
-            self._finish_url(worker_url)
+            elapsed_seconds = time.monotonic() - request_started_at
+            self._finish_url(
+                worker_url,
+                estimated_tokens=estimated_tokens if use_work_accounting else 0,
+            )
+            if use_work_accounting:
+                logger.info(
+                    "TASK22_WORK_ROUTER event=dispatch_done request_key=%s origin=%s worker=%s "
+                    "estimated_tokens=%s reserved_tokens_after_select=%s generated_tokens=%s elapsed_seconds=%.6f",
+                    request_key,
+                    work_origin,
+                    worker_url,
+                    estimated_tokens,
+                    reserved_tokens_after_select,
+                    generated_tokens,
+                    elapsed_seconds,
+                )
 
     async def add_worker(self, request: Request):
         """Add a new worker to the router.
@@ -220,7 +261,7 @@ class SlimeRouter:
 
         # Add if new, keep a simple request count per worker
         if worker_url not in self.worker_request_counts:
-            self.worker_request_counts[worker_url] = 0
+            self.work_ledger.add_worker(worker_url)
             self.worker_failure_counts[worker_url] = 0
             if self.verbose:
                 print(f"[slime-router] Added new worker: {worker_url}")
@@ -230,6 +271,12 @@ class SlimeRouter:
     async def list_workers(self, request: Request):
         """List all registered workers."""
         return {"urls": list(self.worker_request_counts.keys())}
+
+    async def work_state(self):
+        return {
+            "work_aware_enabled": self.work_aware_enabled,
+            "workers": self.work_ledger.snapshot(),
+        }
 
     async def retrieve_from_text(self, request: Request):
         """Get token information from text input."""
@@ -256,15 +303,48 @@ class SlimeRouter:
     def _select_least_loaded(self):
         """Return the worker URL with the fewest active requests (no
         bookkeeping)."""
-        if not self.dead_workers:
-            # Healthy path: select from all workers
-            return min(self.worker_request_counts, key=self.worker_request_counts.get)
-        # Degraded path: select from workers not in dead_workers
-        valid_workers = (w for w in self.worker_request_counts if w not in self.dead_workers)
+        valid_workers = (
+            worker
+            for worker in self.worker_request_counts
+            if worker not in self.dead_workers and worker not in self.work_ledger.dead_workers
+        )
         try:
             return min(valid_workers, key=self.worker_request_counts.get)
         except ValueError:
             raise RuntimeError("No healthy workers available in the pool") from None
+
+    @staticmethod
+    def _parse_estimated_tokens(value: str | None) -> int:
+        if value is None:
+            return 0
+        try:
+            parsed = int(value)
+        except ValueError:
+            return 0
+        return max(parsed, 0)
+
+    @staticmethod
+    def _generated_tokens(data) -> int | None:
+        if not isinstance(data, dict):
+            return None
+        output_ids = data.get("output_ids")
+        if isinstance(output_ids, list):
+            return len(output_ids)
+        meta_info = data.get("meta_info")
+        if isinstance(meta_info, dict):
+            completion_tokens = meta_info.get("completion_tokens")
+            if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool):
+                return max(completion_tokens, 0)
+        return None
+
+    def _healthy_workers(self) -> list[str]:
+        workers = [worker for worker in self.worker_request_counts if worker not in self.dead_workers]
+        if not workers:
+            raise RuntimeError("No healthy workers available in the pool")
+        return workers
+
+    def _select_work_aware(self, estimated_tokens: int) -> str:
+        return self.work_ledger.select(estimated_tokens)
 
     def _pick_sticky_url(self, routing_key):
         """Resolve a routing key to a worker, pinning new keys and remapping
@@ -276,26 +356,51 @@ class SlimeRouter:
         """
         now = time.monotonic()
         entry = self.sticky_map.get(routing_key)
-        if entry is not None and entry[0] in self.worker_request_counts and entry[0] not in self.dead_workers:
+        if (
+            entry is not None
+            and entry[0] in self.worker_request_counts
+            and entry[0] not in self.dead_workers
+            and entry[0] not in self.work_ledger.dead_workers
+        ):
             entry[1] = now  # refresh last_seen so the assignment survives idle eviction
             self.sticky_stats["hit"] += 1
             return entry[0]
 
         # New key, or the pinned worker left the healthy set -> (re)assign via fallback.
-        url = self._select_least_loaded()
+        url = self._select_work_aware(0) if self.work_aware_enabled else self._select_least_loaded()
         self.sticky_stats["remap" if entry is not None else "assigned"] += 1
         self.sticky_map[routing_key] = [url, now]
         return url
 
-    def _use_url(self, routing_key=None):
+    def _use_url(
+        self,
+        routing_key=None,
+        *,
+        estimated_tokens: int = 0,
+        use_work_aware: bool | None = None,
+    ):
         """Select a worker URL and account for the new in-flight request."""
+        if use_work_aware is None:
+            use_work_aware = self.work_aware_enabled
         if self.sticky_enabled and routing_key:
-            url = self._pick_sticky_url(routing_key)
+            entry = self.sticky_map.get(routing_key)
+            if (
+                entry is not None
+                and entry[0] in self.worker_request_counts
+                and entry[0] not in self.dead_workers
+                and entry[0] not in self.work_ledger.dead_workers
+            ):
+                url = self._pick_sticky_url(routing_key)
+            else:
+                url = self._select_work_aware(estimated_tokens) if use_work_aware else self._select_least_loaded()
+                now = time.monotonic()
+                self.sticky_stats["remap" if entry is not None else "assigned"] += 1
+                self.sticky_map[routing_key] = [url, now]
         else:
             if self.sticky_enabled:
                 self.sticky_stats["no_routing_key"] += 1
-            url = self._select_least_loaded()
-        self.worker_request_counts[url] += 1
+            url = self._select_work_aware(estimated_tokens) if use_work_aware else self._select_least_loaded()
+        self.work_ledger.reserve(url, estimated_tokens)
         return url
 
     def _evict_idle_sticky(self):
@@ -313,11 +418,14 @@ class SlimeRouter:
         if stale:
             self.sticky_stats["evicted"] += len(stale)
 
-    def _finish_url(self, url):
+    def _finish_url(
+        self,
+        url,
+        *,
+        estimated_tokens: int = 0,
+    ):
         """Mark the request to the given URL as finished."""
-        assert url in self.worker_request_counts, f"URL {url} not recognized"
-        self.worker_request_counts[url] -= 1
-        assert self.worker_request_counts[url] >= 0, f"URL {url} count went negative"
+        self.work_ledger.release(url, estimated_tokens)
 
 
 if __name__ == "__main__":

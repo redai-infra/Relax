@@ -27,21 +27,17 @@ REQUIRED_FLAGS = (
     "--balance-data",
 )
 
-FORBIDDEN_FLAGS = (
+COMMON_FORBIDDEN_FLAGS = (
     "--ref-load",
     "--ref-update-interval",
     "--use-kl-loss",
     "--kl-loss-coef",
     "--kl-loss-type",
     "--kl-coef",
-    "--enable-cross-version-kv-continuation",
-    "--cross-version-kv-max-gap",
     "--keep-old-actor",
-    "--sglang-enable-priority-scheduling",
-    "--sglang-disable-priority-preemption",
-    "--sglang-default-priority-value",
     "--fully-async",
     "--colocate",
+    "--slime-router-sticky",
 )
 
 EXPECTED_VALUES = {
@@ -112,10 +108,52 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
 
     for flag in REQUIRED_FLAGS:
         _require_once(argv, flag)
-    for flag in FORBIDDEN_FLAGS:
+    env = runtime.get("env_vars")
+    if not isinstance(env, dict) or not all(isinstance(key, str) for key in env):
+        raise ContractError("runtime env lacks a string-keyed env_vars object")
+    arm = env.get("TASK22_EXPERIMENT_ARM", "baseline")
+    if arm not in {"baseline", "a3_workaware_on"}:
+        raise ContractError(f"unknown TASK22_EXPERIMENT_ARM: {arm!r}")
+
+    for flag in COMMON_FORBIDDEN_FLAGS:
         if _positions(argv, flag):
             raise ContractError(f"forbidden zero-KL baseline flag: {flag}")
+    if arm == "baseline":
+        arm_forbidden_flags = (
+            "--enable-cross-version-kv-continuation",
+            "--cross-version-kv-max-gap",
+            "--use-slime-router",
+            "--slime-router-work-aware",
+            "--sglang-enable-priority-scheduling",
+            "--sglang-disable-priority-preemption",
+            "--sglang-default-priority-value",
+        )
+        arm_required_flags: tuple[str, ...] = ()
+        arm_expected_values: dict[str, str] = {}
+    else:
+        arm_forbidden_flags = ()
+        arm_required_flags = (
+            "--enable-cross-version-kv-continuation",
+            "--use-slime-router",
+            "--slime-router-work-aware",
+            "--sglang-enable-priority-scheduling",
+            "--sglang-disable-priority-preemption",
+        )
+        arm_expected_values = {
+            "--cross-version-kv-max-gap": "2",
+            "--sglang-default-priority-value": "0",
+        }
+    for flag in arm_forbidden_flags:
+        if _positions(argv, flag):
+            label = "zero-KL baseline" if arm == "baseline" else arm
+            raise ContractError(f"forbidden {label} flag: {flag}")
+    for flag in arm_required_flags:
+        _require_once(argv, flag)
     for flag, expected in EXPECTED_VALUES.items():
+        actual = _value(argv, flag)
+        if actual != expected:
+            raise ContractError(f"{flag} mismatch: {actual!r} != {expected!r}")
+    for flag, expected in arm_expected_values.items():
         actual = _value(argv, flag)
         if actual != expected:
             raise ContractError(f"{flag} mismatch: {actual!r} != {expected!r}")
@@ -127,9 +165,6 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
     if resource != EXPECTED_RESOURCE:
         raise ContractError(f"--resource mismatch: {resource!r} != {EXPECTED_RESOURCE!r}")
 
-    env = runtime.get("env_vars")
-    if not isinstance(env, dict) or not all(isinstance(key, str) for key in env):
-        raise ContractError("runtime env lacks a string-keyed env_vars object")
     calibration_dir = env.get("TASK22_CALIBRATION_DIR")
     if not isinstance(calibration_dir, str) or not calibration_dir.startswith("/root/task22-local/runs/"):
         raise ContractError("TASK22_CALIBRATION_DIR must use local /root/task22-local/runs storage")
@@ -141,28 +176,46 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         raise ContractError("RELAX_RID_ONLY_REQUEST_LOGGING must be 1")
 
     policy_value = str(env.get("RELAX_SYNC_INTENT_POLICY", "0")).strip().lower()
-    if policy_value not in DISABLED_VALUES:
-        raise ContractError("RELAX_SYNC_INTENT_POLICY must be disabled")
-    forbidden_env = sorted(
-        key
-        for key in env
-        if key.startswith("RELAX_TASK22_")
-        or (key.startswith("RELAX_SYNC_INTENT_") and key != "RELAX_SYNC_INTENT_POLICY")
-    )
-    if forbidden_env:
-        raise ContractError(f"optimization environment must be absent: {forbidden_env}")
+    if arm == "baseline":
+        if policy_value not in DISABLED_VALUES:
+            raise ContractError("RELAX_SYNC_INTENT_POLICY must be disabled")
+        forbidden_env = sorted(
+            key
+            for key in env
+            if key.startswith("RELAX_TASK22_")
+            or (key.startswith("RELAX_SYNC_INTENT_") and key != "RELAX_SYNC_INTENT_POLICY")
+        )
+        if forbidden_env:
+            raise ContractError(f"optimization environment must be absent: {forbidden_env}")
+    else:
+        if policy_value not in {"1", "true", "yes", "on"}:
+            raise ContractError("RELAX_SYNC_INTENT_POLICY must be enabled")
+        required_sync_env = {
+            "RELAX_SYNC_INTENT_TTL_SECONDS": "600",
+            "RELAX_SYNC_INTENT_WINDOW_GROUPS": "16",
+            "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER": "1.25",
+            "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS": "2.0",
+            "RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS": "0.5",
+            "RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS": "15",
+            "RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS": "600",
+        }
+        for key, expected in required_sync_env.items():
+            if env.get(key) != expected:
+                raise ContractError(f"{key} mismatch: {env.get(key)!r} != {expected!r}")
 
     return {
         "schema_version": 1,
-        "purpose": "zero_kl_instrumented_baseline",
+        "purpose": f"zero_kl_instrumented_{arm}",
+        "experiment_arm": arm,
         "num_rollout": 11,
         "headline": {"logical_step_lo": 2, "logical_step_hi": 9},
         "resource": EXPECTED_RESOURCE,
         "max_response_tokens": 8192,
         "zero_kl_reference_forward": False,
-        "sync_intent_policy": False,
-        "cross_version_kv_continuation": False,
-        "priority_scheduling": False,
+        "sync_intent_policy": arm == "a3_workaware_on",
+        "cross_version_kv_continuation": arm == "a3_workaware_on",
+        "priority_scheduling": arm == "a3_workaware_on",
+        "slime_router_work_aware": arm == "a3_workaware_on",
         "update_weights_interval": 1,
     }
 

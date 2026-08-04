@@ -176,7 +176,34 @@ GPU_MONITOR_PID=$!
 export SGLANG_LOG_SCHEDULER_STATUS_TARGET="stdout"
 export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="1.0"
 export RELAX_RID_ONLY_REQUEST_LOGGING="1"
-export RELAX_SYNC_INTENT_POLICY="0"
+TASK22_EXPERIMENT_ARM="${TASK22_EXPERIMENT_ARM:-baseline}"
+export TASK22_EXPERIMENT_ARM
+unset RELAX_SYNC_INTENT_TTL_SECONDS
+unset RELAX_SYNC_INTENT_WINDOW_GROUPS
+unset RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER
+unset RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS
+unset RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS
+unset RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS
+unset RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS
+case "$TASK22_EXPERIMENT_ARM" in
+    baseline)
+        export RELAX_SYNC_INTENT_POLICY="0"
+        ;;
+    a3_workaware_on)
+        export RELAX_SYNC_INTENT_POLICY="1"
+        export RELAX_SYNC_INTENT_TTL_SECONDS="600"
+        export RELAX_SYNC_INTENT_WINDOW_GROUPS="16"
+        export RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER="1.25"
+        export RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS="2.0"
+        export RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS="0.5"
+        export RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS="15"
+        export RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS="600"
+        ;;
+    *)
+        echo "Unknown TASK22_EXPERIMENT_ARM=$TASK22_EXPERIMENT_ARM" >&2
+        exit 4
+        ;;
+esac
 # RTX PRO 6000 Blackwell Server Edition reports SM120.  FlashInfer 0.6.11
 # cannot infer that target under the image's CUDA 12.8 toolchain, but accepts
 # the explicit forward-compatible architecture spelling used by the prior
@@ -218,11 +245,20 @@ for name in (
     "RAY_DEDUP_LOGS",
     "RELAX_RID_ONLY_REQUEST_LOGGING",
     "RELAX_SYNC_INTENT_POLICY",
+    "RELAX_SYNC_INTENT_TTL_SECONDS",
+    "RELAX_SYNC_INTENT_WINDOW_GROUPS",
+    "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER",
+    "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS",
+    "RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS",
+    "RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS",
+    "RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS",
     "SGLANG_LOG_SCHEDULER_STATUS_INTERVAL",
     "SGLANG_LOG_SCHEDULER_STATUS_TARGET",
     "TASK22_CALIBRATION_DIR",
+    "TASK22_EXPERIMENT_ARM",
 ):
-    env[name] = os.environ[name]
+    if name in os.environ:
+        env[name] = os.environ[name]
 print(json.dumps(runtime, sort_keys=True, separators=(",", ":")))
 PY
 )"
@@ -289,6 +325,15 @@ SGLANG_ARGS=(
     --sglang-cuda-graph-max-bs 64
     --sglang-disable-piecewise-cuda-graph
 )
+if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" ]]; then
+    SGLANG_ARGS+=(
+        --use-slime-router
+        --slime-router-work-aware
+        --sglang-enable-priority-scheduling
+        --sglang-disable-priority-preemption
+        --sglang-default-priority-value 0
+    )
+fi
 METRIC_ARGS=(
     --use-clearml
     --use-metrics-service
@@ -322,6 +367,12 @@ TRAIN_ARGS=(
     "${SGLANG_ARGS[@]}"
     "${MISC_ARGS[@]}"
 )
+if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" ]]; then
+    TRAIN_ARGS+=(
+        --enable-cross-version-kv-continuation
+        --cross-version-kv-max-gap 2
+    )
+fi
 
 export TASK22_GIT_SHA="$(git -C "$REPO" rev-parse HEAD)"
 export TASK22_REPO="$REPO"
@@ -334,7 +385,7 @@ print(json.dumps(sys.argv[1:], separators=(",", ":")))
 PY
 )"
 export TASK22_RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON"
-export MODEL_DIR DATA_DIR NUM_ROLLOUT
+export MODEL_DIR DATA_DIR NUM_ROLLOUT TASK22_EXPERIMENT_ARM
 TASK22_PYTHON="$PYTHON_BIN" MODEL_DIR="$MODEL_DIR" DATA_DIR="$DATA_DIR" \
     TASK22_TRAIN_ARGS_JSON="$TASK22_TRAIN_ARGS_JSON" TASK22_RUNTIME_ENV_JSON="$RUNTIME_ENV_JSON" \
     "$REPO/scripts/task22/preflight_zero_kl_instrumented_baseline.sh" \
@@ -399,12 +450,17 @@ for row in csv.reader(io.StringIO(gpu_raw)):
 payload = {
     "schema_version": 1,
     "git_sha": os.environ["TASK22_GIT_SHA"],
+    "experiment_arm": os.environ["TASK22_EXPERIMENT_ARM"],
     "python": os.environ["TASK22_PYTHON"],
     "headline": {"logical_step_lo": 2, "logical_step_hi": 9},
     "measurement_contract": {
-        "purpose": "zero-KL instrumented baseline bottleneck calibration",
+        "purpose": (
+            "zero-KL A3 work-aware ON"
+            if os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on"
+            else "zero-KL instrumented baseline bottleneck calibration"
+        ),
         "historical_wall_directly_comparable": False,
-        "reason": "1s scheduler/permit/timing instrumentation enabled; use a future clean zero-KL A/B for gains",
+        "reason": "1s scheduler/permit/timing instrumentation enabled; compare only with the matched zero-KL baseline",
     },
     "train_argv": json.loads(os.environ["TASK22_TRAIN_ARGS_JSON"]),
     "artifacts": {
@@ -428,9 +484,10 @@ payload = {
         "over_sampling_batch_size_groups": 16,
         "update_weights_interval": 1,
         "zero_kl_reference_forward": False,
-        "sync_intent_policy": False,
-        "cross_version_kv_continuation": False,
-        "priority_scheduling": False,
+        "sync_intent_policy": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
+        "cross_version_kv_continuation": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
+        "priority_scheduling": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
+        "slime_router_work_aware": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
         "rollout_seed": 42,
         "train_seed": 1234,
     },
@@ -454,6 +511,8 @@ source_paths = {
     "relax_actor": repo / "relax/backends/megatron/actor.py",
     "relax_permit_observability": repo / "relax/engine/rollout/permit_observability.py",
     "relax_request_permit": repo / "relax/engine/rollout/request_permit.py",
+    "relax_router": repo / "relax/engine/router/router.py",
+    "relax_router_work_accounting": repo / "relax/engine/router/work_accounting.py",
     "relax_sglang_rollout": repo / "relax/engine/rollout/sglang_rollout.py",
 }
 try:

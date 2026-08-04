@@ -33,6 +33,8 @@ cd "$REPO"
     relax/engine/rollout/permit_observability.py \
     relax/engine/rollout/request_permit.py \
     relax/engine/rollout/sglang_rollout.py \
+    relax/engine/router/router.py \
+    relax/engine/router/work_accounting.py \
     scripts/task22/analyze_phase_elastic_calibration.py \
     scripts/task22/smoke_sglang_calibration.py \
     scripts/task22/validate_zero_kl_baseline_contract.py
@@ -44,6 +46,8 @@ if [[ "${TASK22_FAST_PREFLIGHT:-0}" != "1" ]]; then
         tests/engine/rollout/test_request_permit_snapshot.py \
         tests/engine/rollout/test_cross_version_kv.py \
         tests/engine/rollout/test_sync_intent.py \
+        tests/engine/router/test_work_accounting.py \
+        tests/engine/router/test_slime_router_work_lifecycle.py \
         tests/tools/test_task22_phase_elastic_calibration_analyzer.py \
         tests/tools/test_task22_zero_kl_baseline_contract.py
 else

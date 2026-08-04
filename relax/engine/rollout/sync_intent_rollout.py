@@ -22,7 +22,10 @@ from relax.engine.rollout.sglang_rollout import (
     GenerateState,
     _aggregate_rollout_timing,
     abort,
+    begin_permit_observability_rollout,
+    export_terminal_permit_observability_rows,
     generate_and_rm_group,
+    permit_observability_dir,
 )
 from relax.engine.rollout.sync_intent import (
     get_sync_intent,
@@ -174,6 +177,7 @@ async def generate_rollout_async_with_sync_intent(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    begin_permit_observability_rollout(state, rollout_id)
     if not hasattr(state, "recent_group_latency_seconds"):
         state.recent_group_latency_seconds: list[float] = []
     if not hasattr(state, "recent_completed_response_lengths"):
@@ -397,10 +401,20 @@ async def generate_rollout_async_with_sync_intent(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
-                    f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
-                )
+                if permit_observability_dir() is not None:
+                    logger.info(
+                        "First rollout sample: prompt_response_redacted=true response_tokens=%s "
+                        "group_index=%s sample_index=%s status=%s",
+                        sample.response_length,
+                        sample.group_index,
+                        sample.index,
+                        sample.status,
+                    )
+                else:
+                    logger.info(
+                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                        f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    )
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
@@ -573,10 +587,18 @@ async def generate_rollout_async_with_sync_intent(
     rollout_time = timer.end("rollout")
     if data:
         sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-        logger.info(
-            f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
-            f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
-        )
+        if permit_observability_dir() is not None:
+            logger.info(
+                "Finish rollout: prompt_response_redacted=true response_tokens=%s group_index=%s sample_index=%s",
+                sample.response_length,
+                sample.group_index,
+                sample.index,
+            )
+        else:
+            logger.info(
+                f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+                f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+            )
     else:
         logger.info("Finish rollout with no accepted groups; all lifecycle progress is buffered for retry.")
     all_samples = [sample for group in data for sample in group]
@@ -619,6 +641,14 @@ async def generate_rollout_async_with_sync_intent(
         )
     else:
         logger.info(f"Rollout fully completed for rollout_id: {rollout_id}.")
+    exported_permit_counts = export_terminal_permit_observability_rows(state)
+    if exported_permit_counts:
+        logger.info(
+            "TASK22_CALIBRATION_PERMIT rollout_id=%s terminal_rows=%s exported=%s",
+            rollout_id,
+            exported_permit_counts.get(rollout_id, 0),
+            exported_permit_counts,
+        )
     timing_metrics.update(
         {
             "rollout/a3/adopted_groups": adopted_cross_version_groups,

@@ -38,6 +38,39 @@ def _valid_argv():
     return [*flags, *values]
 
 
+def _valid_on_runtime():
+    runtime = _valid_runtime()
+    runtime["env_vars"].update(
+        {
+            "TASK22_EXPERIMENT_ARM": "a3_workaware_on",
+            "RELAX_SYNC_INTENT_POLICY": "1",
+            "RELAX_SYNC_INTENT_TTL_SECONDS": "600",
+            "RELAX_SYNC_INTENT_WINDOW_GROUPS": "16",
+            "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER": "1.25",
+            "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS": "2.0",
+            "RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS": "0.5",
+            "RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS": "15",
+            "RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS": "600",
+        }
+    )
+    return runtime
+
+
+def _valid_on_argv():
+    return [
+        *_valid_argv(),
+        "--enable-cross-version-kv-continuation",
+        "--cross-version-kv-max-gap",
+        "2",
+        "--use-slime-router",
+        "--slime-router-work-aware",
+        "--sglang-enable-priority-scheduling",
+        "--sglang-disable-priority-preemption",
+        "--sglang-default-priority-value",
+        "0",
+    ]
+
+
 def test_contract_accepts_short_instrumented_zero_kl_baseline() -> None:
     summary = validate_contract(_valid_runtime(), _valid_argv())
 
@@ -49,6 +82,55 @@ def test_contract_accepts_short_instrumented_zero_kl_baseline() -> None:
     assert summary["cross_version_kv_continuation"] is False
     assert summary["priority_scheduling"] is False
     assert summary["update_weights_interval"] == 1
+
+
+def test_contract_accepts_a3_workaware_on() -> None:
+    summary = validate_contract(_valid_on_runtime(), _valid_on_argv())
+
+    assert summary["experiment_arm"] == "a3_workaware_on"
+    assert summary["sync_intent_policy"] is True
+    assert summary["cross_version_kv_continuation"] is True
+    assert summary["priority_scheduling"] is True
+    assert summary["slime_router_work_aware"] is True
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("--enable-cross-version-kv-continuation", "must appear exactly once"),
+        ("--use-slime-router", "must appear exactly once"),
+        ("--slime-router-work-aware", "must appear exactly once"),
+    ],
+)
+def test_on_contract_rejects_missing_required_flag(flag, expected) -> None:
+    argv = _valid_on_argv()
+    argv.remove(flag)
+
+    with pytest.raises(ContractError, match=expected):
+        validate_contract(_valid_on_runtime(), argv)
+
+
+def test_on_contract_rejects_wrong_gap() -> None:
+    argv = _valid_on_argv()
+    argv[argv.index("--cross-version-kv-max-gap") + 1] = "3"
+
+    with pytest.raises(ContractError, match="--cross-version-kv-max-gap mismatch"):
+        validate_contract(_valid_on_runtime(), argv)
+
+
+def test_on_contract_rejects_sticky_router() -> None:
+    argv = [*_valid_on_argv(), "--slime-router-sticky"]
+
+    with pytest.raises(ContractError, match="forbidden zero-KL baseline flag"):
+        validate_contract(_valid_on_runtime(), argv)
+
+
+def test_on_contract_rejects_sync_env_drift() -> None:
+    runtime = _valid_on_runtime()
+    runtime["env_vars"]["RELAX_SYNC_INTENT_WINDOW_GROUPS"] = "8"
+
+    with pytest.raises(ContractError, match="RELAX_SYNC_INTENT_WINDOW_GROUPS mismatch"):
+        validate_contract(runtime, _valid_on_argv())
 
 
 @pytest.mark.parametrize(

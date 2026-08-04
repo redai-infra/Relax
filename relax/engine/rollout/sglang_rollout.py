@@ -52,6 +52,7 @@ from relax.engine.rollout.sync_intent import (
     resolve_partition_request_priority,
     sync_intent_policy_enabled,
 )
+from relax.engine.router.work_accounting import build_work_routing_headers
 from relax.utils.async_utils import run
 from relax.utils.cross_version_kv import cross_version_kv_enabled, cross_version_kv_group_ready_for_finalize
 from relax.utils.data.data import Dataset
@@ -105,6 +106,35 @@ def _permit_snapshot(state: Any) -> dict[str, int] | None:
         return None
     snapshot = manager.snapshot()
     return {"capacity": snapshot.capacity, "in_use": snapshot.in_use, "waiting": snapshot.waiting}
+
+
+def begin_permit_observability_rollout(state: Any, rollout_id: int) -> None:
+    state.current_rollout_id = rollout_id
+    if not hasattr(state, "permit_observability_rows"):
+        state.permit_observability_rows: list[dict[str, Any]] = []
+
+
+def export_terminal_permit_observability_rows(state: Any) -> dict[int, int]:
+    calibration_directory = permit_observability_dir()
+    if calibration_directory is None:
+        return {}
+    terminal_statuses = {"terminal", "cancelled_before_grant", "ended_before_grant"}
+    rows_by_rollout: dict[int, list[dict[str, Any]]] = {}
+    for row in state.permit_observability_rows:
+        rollout_id = row.get("physical_rollout_id")
+        if (
+            isinstance(rollout_id, int)
+            and not isinstance(rollout_id, bool)
+            and row.get("permit_wait_status") in terminal_statuses
+        ):
+            rows_by_rollout.setdefault(rollout_id, []).append(row)
+    for rollout_id, rows in rows_by_rollout.items():
+        export_permit_wait_rows(
+            rows,
+            directory=calibration_directory,
+            physical_rollout_id=rollout_id,
+        )
+    return {rollout_id: len(rows) for rollout_id, rows in rows_by_rollout.items()}
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -230,6 +260,10 @@ class GenerateState(metaclass=SingletonMeta):
             self.cross_version_kv_task_started_at: dict[asyncio.Task[Any], float] = {}
         if not hasattr(self, "cross_version_kv_protected_tasks"):
             self.cross_version_kv_protected_tasks: set[asyncio.Task[Any]] = set()
+        if not hasattr(self, "recent_completed_response_lengths"):
+            self.recent_completed_response_lengths: list[int] = []
+        if not hasattr(self, "recent_group_latency_seconds"):
+            self.recent_group_latency_seconds: list[float] = []
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
@@ -448,6 +482,17 @@ async def generate(
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
+    if getattr(args, "slime_router_work_aware", False):
+        assert args.use_slime_router, "--slime-router-work-aware requires --use-slime-router"
+        headers = dict(headers or {})
+        headers.update(
+            build_work_routing_headers(
+                sample,
+                request_key=str(calibration_rid or sample.index),
+                recent_completed_response_lengths=getattr(state, "recent_completed_response_lengths", []),
+                max_response_length=args.rollout_max_response_len,
+            )
+        )
 
     if calibration_rid is not None:
         mark_engine_request_started(sample)
@@ -986,8 +1031,7 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
-    state.current_rollout_id = rollout_id
-    state.permit_observability_rows = []
+    begin_permit_observability_rollout(state, rollout_id)
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1285,18 +1329,13 @@ async def generate_rollout_async(
     new_aborted, completed_protected = await abort(args, rollout_id)
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
-    calibration_directory = permit_observability_dir()
-    if calibration_directory is not None:
-        permit_path = export_permit_wait_rows(
-            state.permit_observability_rows,
-            directory=calibration_directory,
-            physical_rollout_id=rollout_id,
-        )
+    if permit_observability_dir() is not None:
+        exported_counts = export_terminal_permit_observability_rows(state)
         logger.info(
-            "TASK22_CALIBRATION_PERMIT rollout_id=%s rows=%s path=%s",
+            "TASK22_CALIBRATION_PERMIT rollout_id=%s terminal_rows=%s exported=%s",
             rollout_id,
-            len(state.permit_observability_rows),
-            permit_path,
+            exported_counts.get(rollout_id, 0),
+            exported_counts,
         )
     if aborted_samples:
         logger.info(
