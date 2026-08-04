@@ -9,17 +9,26 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH.}"
 SAVE_DIR="${SAVE_DIR:?Set SAVE_DIR.}"
 RESULTS_DIR="${RESULTS_DIR:?Set RESULTS_DIR.}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+RUN_NAME="${RUN_NAME:-mem-agent-qwen3-4b}"
 if ((NUM_ROLLOUT <= 0)); then
   echo "NUM_ROLLOUT must be positive." >&2
   exit 1
 fi
 
-export DATA_DIR MODEL_PATH SAVE_DIR RESULTS_DIR NUM_ROLLOUT
+export DATA_DIR MODEL_PATH SAVE_DIR RESULTS_DIR NUM_ROLLOUT RUN_NAME
 
 if [[ "${SKIP_PREPARE:-0}" != "1" ]]; then
   bash "${SCRIPT_DIR}/prepare-data.sh"
 fi
 bash "${SCRIPT_DIR}/run-qwen3-4B-train.sh"
+
+# The rollout logger writes every raw reward mean to the Ray job text log.
+# Materialize the complete per-step series and first/last-window statistics
+# before conversion so a successful pipeline always leaves effect evidence.
+python3 "${SCRIPT_DIR}/summarize_reward.py" \
+  --log-file "${SCRIPT_DIR}/../../logs/${RUN_NAME}.log" \
+  --expected-steps "${NUM_ROLLOUT}" \
+  --output "${RESULTS_DIR}/training-reward.summary.json"
 
 export CHECKPOINT_DIR="${SAVE_DIR}"
 # ReLax numbers checkpoints from zero, so a two-step pipeline produces

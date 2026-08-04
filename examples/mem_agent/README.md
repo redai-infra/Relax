@@ -2,7 +2,7 @@
 
 This example trains Qwen3-4B to update a bounded textual memory while reading a long document chunk by chunk. Every memory-update turn and the final-answer turn is saved as an independent training row. Only the final boxed answer receives a rule-based reward; GRPO normalization happens before the trajectory is expanded.
 
-The training log reports the trajectory-level 0/1 outcome as `rollout/mem_agent_raw_reward/mean` on every rollout step. This diagnostic mirrors the primary `score` exactly but is not consumed by GRPO, making first/last-window reward comparisons auditable without changing optimization.
+The training log reports the trajectory-level 0/1 outcome as `rollout/mem_agent_raw_reward/mean` on every rollout step. This diagnostic mirrors the primary `score` exactly but is not consumed by GRPO. `run-pipeline.sh` then runs `summarize_reward.py` and writes `training-reward.summary.json`, containing every raw point, the first/last-window means, their delta, and the peak. It rejects a run whose rollout ids are incomplete instead of producing a partial trend.
 
 The reproducibility contract is frozen to:
 

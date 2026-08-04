@@ -48,8 +48,16 @@ def test_pipeline_and_acceptance_scripts_cover_required_stages_and_metrics():
     paired = (EXAMPLE / "run-paired-eval.sh").read_text(encoding="utf-8")
     evaluator = (EXAMPLE / "run-eval.sh").read_text(encoding="utf-8")
 
-    for stage in ("prepare-data.sh", "run-qwen3-4B-train.sh", "convert-to-hf.sh", "run-eval.sh"):
+    for stage in (
+        "prepare-data.sh",
+        "run-qwen3-4B-train.sh",
+        "summarize_reward.py",
+        "convert-to-hf.sh",
+        "run-eval.sh",
+    ):
         assert stage in pipeline
+    assert '--expected-steps "${NUM_ROLLOUT}"' in pipeline
+    assert "training-reward.summary.json" in pipeline
     assert 'BASE_MODEL_PATH="${BASE_MODEL_PATH:?' in paired
     assert paired.count("MODE=recurrent") == 3
     assert '--pair "ruler-hqa-${length}"' in paired
