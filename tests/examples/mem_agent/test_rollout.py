@@ -107,6 +107,35 @@ def test_prompt_variants_match_fixed_vime_training_and_evaluation_templates():
     assert "<problem>\nQ\n</problem>" in eval_final
 
 
+@pytest.mark.asyncio
+async def test_generate_trajectory_uses_evaluation_prompt_variant():
+    tokenizer = FakeTokenizer()
+    responses = iter(["MEM", r"\boxed{x}"])
+    prompts = []
+
+    async def fake_generate(args, turn, sampling_params, evaluation):
+        del args, sampling_params
+        assert evaluation is True
+        prompts.append(turn.prompt)
+        response = next(responses)
+        response_ids = tokenizer.encode(response)
+        turn.response = response
+        turn.tokens = tokenizer.encode(turn.prompt) + response_ids
+        turn.rollout_tokens = list(turn.tokens)
+        turn.response_length = len(response_ids)
+        turn.loss_mask = [1] * len(response_ids)
+        turn.rollout_log_probs = []
+        turn.status = Sample.Status.COMPLETED
+        return turn
+
+    sample = Sample(index=0, group_index=0, prompt="Q", metadata={"context": "abc"})
+    result = await generate_trajectory(_args(), sample, {}, tokenizer, generator=fake_generate, evaluation=True)
+
+    assert result.status == Sample.Status.COMPLETED
+    assert all("<problem>\nQ\n</problem>" in prompt for prompt in prompts)
+    assert all("<problem> \nQ\n</problem>" not in prompt for prompt in prompts)
+
+
 def test_truncate_text_to_tokens_retokenizes_to_the_hard_limit():
     text, length = truncate_text_to_tokens(FakeTokenizer(), "MEMORY", 3)
     assert text == "MEM"

@@ -38,6 +38,11 @@ def test_train_script_keeps_trajectory_loss_and_real_turn_context_envelope():
     assert "--calculate-per-token-loss" not in script
 
 
+def test_reward_exposes_a_step_level_raw_reward_metric():
+    reward_source = (EXAMPLE / "reward.py").read_text(encoding="utf-8")
+    assert '"mem_agent_raw_reward": score' in reward_source
+
+
 def test_pipeline_and_acceptance_scripts_cover_required_stages_and_metrics():
     pipeline = (EXAMPLE / "run-pipeline.sh").read_text(encoding="utf-8")
     paired = (EXAMPLE / "run-paired-eval.sh").read_text(encoding="utf-8")
@@ -56,6 +61,7 @@ def test_pipeline_and_acceptance_scripts_cover_required_stages_and_metrics():
         "--top-p 0.95",
         "--chunk-tokens 2048",
         "--max-memory-tokens 1024",
+        "--max-chunks 64",
         '--server-max-model-len "${MAX_MODEL_LEN}"',
     ):
         assert value in evaluator

@@ -51,6 +51,11 @@ async def reward_func(args: Any, sample: Any, **kwargs: Any) -> dict[str, Any]:
     score = float(bool(prediction) and exact_match_any(prediction, list(ground_truths)))
     return {
         "score": score,
+        # ReLax intentionally excludes the primary reward key from auxiliary
+        # metric aggregation. Mirror the same 0/1 value under a diagnostic key
+        # so every rollout step logs rollout/mem_agent_raw_reward/mean without
+        # changing the score used by GRPO.
+        "mem_agent_raw_reward": score,
         "pred": prediction,
         "gt": str(ground_truths[0]) if ground_truths else "",
         "diagnostic": "matched" if score else ("missing_boxed" if not prediction else "answer_mismatch"),

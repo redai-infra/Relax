@@ -147,7 +147,10 @@ async def generate_trajectory(
     # memory text survives; prior prompts and token history are not appended.
     for chunk_ids in chunks:
         chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True)
-        prompt = render_chat_prompt(tokenizer, memory_instruction(question, memory, chunk))
+        prompt = render_chat_prompt(
+            tokenizer,
+            memory_instruction(question, memory, chunk, evaluation=evaluation),
+        )
         turn_sample = await _run_turn(
             args,
             sample,
@@ -176,7 +179,7 @@ async def generate_trajectory(
 
     # The final request deliberately excludes context/chunks. This enforces
     # the question + latest-memory information boundary from the task spec.
-    final_prompt = render_chat_prompt(tokenizer, final_instruction(question, memory))
+    final_prompt = render_chat_prompt(tokenizer, final_instruction(question, memory, evaluation=evaluation))
     final_sample = await _run_turn(
         args,
         sample,

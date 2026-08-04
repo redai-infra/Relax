@@ -2,6 +2,8 @@
 
 This example trains Qwen3-4B to update a bounded textual memory while reading a long document chunk by chunk. Every memory-update turn and the final-answer turn is saved as an independent training row. Only the final boxed answer receives a rule-based reward; GRPO normalization happens before the trajectory is expanded.
 
+The training log reports the trajectory-level 0/1 outcome as `rollout/mem_agent_raw_reward/mean` on every rollout step. This diagnostic mirrors the primary `score` exactly but is not consumed by GRPO, making first/last-window reward comparisons auditable without changing optimization.
+
 The reproducibility contract is frozen to:
 
 - model: `Qwen/Qwen3-4B@1cfa9a7208912126459214e8b04321603b3df60c`;
@@ -48,7 +50,7 @@ RESULTS_DIR=/data/results/mem-agent-relax \
 bash examples/mem_agent/run-eval.sh
 ```
 
-The evaluator writes raw per-sample JSONL and a summary JSON for HotpotQA dev and RULER-HQA 50/200/800. Failed requests keep their ground truth in the raw file and remain in the denominator with score zero. Formal comparison additionally rejects empty runs and any run with request errors. Each summary records the normalized input file SHA-256 and evaluator schema version, so equal paths with different bytes or incompatible evaluator revisions cannot be compared. `boxed_em_pct` is the HotpotQA reward-compatible accuracy and `sub_em_pct` is the primary VIME-compatible RULER-HQA metric. Set `MODE=base` to run the optional single-context diagnostic; its context truncation always preserves the question and answer instruction.
+The evaluator writes raw per-sample JSONL and a summary JSON for HotpotQA dev and RULER-HQA 50/200/800. Its 64-chunk limit is the effective value of fixed VIME's official `run-eval.sh`: that script sources `_common.sh`, which exports `MEM_MAX_CHUNKS=64`, even though the Python evaluator alone has a 512 fallback. Failed requests keep their ground truth in the raw file and remain in the denominator with score zero. Formal comparison additionally rejects empty runs and any run with request errors. Each summary records the normalized input file SHA-256 and evaluator schema version, so equal paths with different bytes or incompatible evaluator revisions cannot be compared. `boxed_em_pct` is the HotpotQA reward-compatible accuracy and `sub_em_pct` is the primary VIME-compatible RULER-HQA metric. Set `MODE=base` to run the optional single-context diagnostic; its context truncation always preserves the question and answer instruction.
 
 `TOKENIZER_PATH` should point to the frozen base snapshot. `run-pipeline.sh` preserves it automatically before switching `MODEL_PATH` to the converted checkpoint. When `NUM_ROLLOUT=2` is used, the pipeline also selects `iter_0000001` automatically instead of the 100-step default `iter_0000099`.
 

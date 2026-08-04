@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from examples.mem_agent.reward import extract_last_boxed, normalize_answer, reward_func
+from relax.utils.metrics.metric_utils import compute_rollout_explicit_reward_metrics
 from relax.utils.types import Sample
 
 
@@ -29,8 +30,16 @@ async def test_reward_scores_only_final_output_against_all_ground_truths():
     )
     result = await reward_func(SimpleNamespace(), sample)
     assert result["score"] == 1.0
+    assert result["mem_agent_raw_reward"] == 1.0
     assert result["pred"] == "The Eiffel Tower"
     assert result["diagnostic"] == "matched"
+
+    sample.reward = result
+    metrics = compute_rollout_explicit_reward_metrics(
+        SimpleNamespace(reward_key="score", log_passrate=False, n_samples_per_prompt=1),
+        [sample],
+    )
+    assert metrics["mem_agent_raw_reward/mean"] == 1.0
 
 
 @pytest.mark.asyncio

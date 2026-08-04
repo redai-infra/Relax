@@ -47,6 +47,9 @@ curl -fsS "http://${SERVE_HOST}:${SERVE_PORT}/v1/models" >/dev/null
 run_eval() {
   local data_file="$1"
   local suffix="$2"
+  # Fixed VIME's Python evaluator has a 512 fallback, but its official
+  # run-eval.sh sources _common.sh, which exports MEM_MAX_CHUNKS=64. Pin the
+  # effective official-run value explicitly instead of relying on inheritance.
   python3 "${SCRIPT_DIR}/eval_ruler_hqa.py" \
     --data-file "${data_file}" \
     --model "${MODEL_PATH}" \
