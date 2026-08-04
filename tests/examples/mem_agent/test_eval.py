@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.mem_agent.eval_ruler_hqa import base_infer, run_evaluation
+from examples.mem_agent.eval_ruler_hqa import _request_seed, base_infer, run_evaluation, summarize_pass_at_n
 
 
 class CharacterTokenizer:
@@ -23,8 +23,19 @@ class CharacterTokenizer:
 async def test_base_infer_truncates_context_without_dropping_question(monkeypatch):
     captured = {}
 
-    async def fake_chat_once(session, base_url, api_key, model, instruction, temperature, top_p, max_tokens):
-        del session, base_url, api_key, model, temperature, top_p, max_tokens
+    async def fake_chat_once(
+        session,
+        base_url,
+        api_key,
+        model,
+        instruction,
+        temperature,
+        top_p,
+        max_tokens,
+        seed,
+        enable_thinking,
+    ):
+        del session, base_url, api_key, model, temperature, top_p, max_tokens, seed, enable_thinking
         captured["instruction"] = instruction
         return r"\boxed{x}"
 
@@ -37,9 +48,14 @@ async def test_base_infer_truncates_context_without_dropping_question(monkeypatc
         temperature=0.0,
         top_p=1.0,
         max_final_tokens=16,
+        seed=42,
+        enable_thinking=False,
     )
     _, diagnostics = await base_infer(
-        {"context": "c" * 500, "input": "Which answer?"}, args, CharacterTokenizer(), object()
+        {"_id": "q1", "context": "c" * 500, "input": "Which answer?"},
+        args,
+        CharacterTokenizer(),
+        object(),
     )
 
     assert diagnostics["context_truncated"] is True
@@ -49,8 +65,8 @@ async def test_base_infer_truncates_context_without_dropping_question(monkeypatc
 
 @pytest.mark.asyncio
 async def test_evaluation_error_keeps_ground_truth_and_counts_as_zero(monkeypatch, tmp_path):
-    async def failed_infer(item, args, tokenizer, session):
-        del item, args, tokenizer, session
+    async def failed_infer(item, args, tokenizer, session, sample_index=0):
+        del item, args, tokenizer, session, sample_index
         raise RuntimeError("server unavailable")
 
     monkeypatch.setattr("examples.mem_agent.eval_ruler_hqa.recurrent_infer", failed_infer)
@@ -71,6 +87,9 @@ async def test_evaluation_error_keeps_ground_truth_and_counts_as_zero(monkeypatc
         max_chunks=64,
         max_input_tokens=7936,
         server_max_model_len=8192,
+        samples_per_item=2,
+        seed=42,
+        enable_thinking=False,
     )
     records, summary = await run_evaluation(
         [{"_id": "q1", "input": "Question", "context": "Context", "answers": ["A", "Alias"]}],
@@ -82,8 +101,33 @@ async def test_evaluation_error_keeps_ground_truth_and_counts_as_zero(monkeypatc
     assert records[0]["pred"] == ""
     assert records[0]["judge_boxed_em"] == 0.0
     assert "server unavailable" in records[0]["error"]
-    assert summary["total"] == 1
-    assert summary["errors"] == 1
+    assert summary["total"] == 2
+    assert summary["errors"] == 2
     assert summary["sub_em_pct"] == 0.0
     assert len(summary["data_sha256"]) == 64
     assert summary["evaluator_schema_version"] == "mem-agent-vime-eval-v1"
+    assert summary["sampling_count"] == 2
+    assert summary["pass_at_n"] == 0.0
+
+
+def test_pass_at_n_requires_nonzero_reward_and_reports_group_variance():
+    records = [{"_id": "q1", "sample_index": index, "judge_boxed_em": float(index == 0)} for index in range(4)]
+    records += [{"_id": "q2", "sample_index": index, "judge_boxed_em": 0.0} for index in range(4)]
+
+    summary = summarize_pass_at_n(records, samples_per_item=4)
+
+    assert summary["pass_at_n"] == 0.5
+    assert summary["pass_at_n_pct"] == 50.0
+    assert summary["reward_variance_groups"] == 1
+    assert summary["mean_successes_per_prompt"] == 0.5
+
+
+def test_request_seed_is_stable_and_distinguishes_samples_and_turns():
+    args = SimpleNamespace(seed=42)
+
+    first = _request_seed(args, "q1", 0, "memory", 0)
+
+    assert first == _request_seed(args, "q1", 0, "memory", 0)
+    assert first != _request_seed(args, "q1", 1, "memory", 0)
+    assert first != _request_seed(args, "q1", 0, "final", 1)
+    assert _request_seed(SimpleNamespace(seed=None), "q1", 0, "final", 0) is None

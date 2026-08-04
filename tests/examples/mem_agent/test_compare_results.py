@@ -33,6 +33,8 @@ def test_comparator_rejects_control_variable_mismatch():
         "temperature": 0.7,
         "top_p": 0.95,
         "sampling_count": 1,
+        "seed": None,
+        "enable_thinking": None,
         "chunk_tokens": 2048,
         "max_memory_tokens": 1024,
         "max_final_tokens": 256,

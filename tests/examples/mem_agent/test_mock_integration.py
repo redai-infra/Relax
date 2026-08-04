@@ -23,7 +23,8 @@ class FakeTokenizer:
         del skip_special_tokens
         return "".join(chr(token_id) for token_id in token_ids)
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        del kwargs
         assert not tokenize and add_generation_prompt
         return f"<chat>{messages[0]['content']}</chat>"
 

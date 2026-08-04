@@ -36,6 +36,25 @@ def test_convert_row_supports_training_and_ruler_formats():
     assert ruler["metadata"]["question"] == "Where?"
 
 
+def test_convert_row_supports_official_hotpotqa_distractor_struct():
+    row = convert_row(
+        {
+            "id": "hp-1",
+            "question": "Who?",
+            "answer": "Alice",
+            "level": "medium",
+            "context": {
+                "title": ["First", "Second"],
+                "sentences": [["Alice appears here."], ["Another paragraph."]],
+            },
+        }
+    )
+
+    assert row["_id"] == "hp-1"
+    assert row["label"] == "Alice"
+    assert row["metadata"]["context"] == "First\nAlice appears here.\n\nSecond\nAnother paragraph."
+
+
 def test_convert_file_and_manifest_are_deterministic(tmp_path):
     source = tmp_path / "eval.json"
     source.write_text(

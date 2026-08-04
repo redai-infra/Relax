@@ -38,6 +38,37 @@ def test_train_script_keeps_trajectory_loss_and_real_turn_context_envelope():
     assert "--calculate-per-token-loss" not in script
 
 
+def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
+    config = yaml.safe_load((EXAMPLE / "config-pilot-qwen3-0.6b.yaml").read_text(encoding="utf-8"))
+    train = (EXAMPLE / "run-qwen3-0.6B-train.sh").read_text(encoding="utf-8")
+    baseline = (EXAMPLE / "run-qwen3-0.6B-baseline.sh").read_text(encoding="utf-8")
+    evaluation = (EXAMPLE / "run-qwen3-0.6B-eval.sh").read_text(encoding="utf-8")
+
+    assert config["model_id"] == "Qwen/Qwen3-0.6B"
+    assert config["model_revision"] == "c1899de289a04d12100db370d81485cdf75e47ca"
+    assert config["mem_agent_chunk_tokens"] == 512
+    assert config["mem_agent_max_memory_tokens"] == 128
+    assert config["mem_agent_max_final_tokens"] == 64
+    assert config["mem_agent_max_chunks"] == 4
+    assert config["mem_agent_enable_thinking"] is False
+    assert config["custom_train_sample_expansion_factor"] == 5
+    assert config["mem_agent_train_rows_multiple"] == 1
+    assert "qwen3-0.6B.sh" in train
+    assert '--resource \'{"actor": [1, 1], "rollout": [1, 1]}\'' in train
+    assert "--tensor-model-parallel-size 1" in train
+    assert "--rollout-max-context-len 1536" in train
+    assert "--max-tokens-per-gpu 1536" in train
+    assert "--log-passrate" in train
+    assert "pilot-selection.manifest.json" in train
+    assert "training-reward.svg" in train
+    assert '--expected-steps "${NUM_ROLLOUT}"' in train
+    assert '--samples-per-item "${SAMPLES_PER_ITEM}"' in baseline
+    assert 'prepare_pilot_data.py" select' in baseline
+    assert "--disable-thinking" in baseline
+    assert "pilot-boxed-em boxed_em_pct" in evaluation
+    assert "pilot-pass-at-n pass_at_n_pct" in evaluation
+
+
 def test_reward_exposes_a_step_level_raw_reward_metric():
     reward_source = (EXAMPLE / "reward.py").read_text(encoding="utf-8")
     assert '"mem_agent_raw_reward": score' in reward_source

@@ -36,19 +36,57 @@ def _first_user_content(prompt: Any) -> str:
     return ""
 
 
+def _context_text(value: Any) -> str:
+    """Flatten both MemAgent strings and official HotpotQA paragraph
+    structs."""
+    value = _json_safe(value)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        titles = value.get("title", [])
+        sentences = value.get("sentences", [])
+        if isinstance(titles, str):
+            titles = [titles]
+        if sentences and isinstance(sentences[0], str):
+            sentences = [sentences]
+        paragraphs = []
+        for index, paragraph_sentences in enumerate(sentences):
+            title = str(titles[index]).strip() if index < len(titles) else ""
+            body = " ".join(str(sentence).strip() for sentence in paragraph_sentences if str(sentence).strip())
+            paragraphs.append("\n".join(part for part in (title, body) if part))
+        return "\n\n".join(part for part in paragraphs if part).strip()
+    if isinstance(value, list):
+        paragraphs = []
+        for part in value:
+            if isinstance(part, dict):
+                paragraphs.append(_context_text(part))
+            elif isinstance(part, (list, tuple)) and len(part) == 2:
+                title, sentences = part
+                body = " ".join(str(sentence).strip() for sentence in sentences if str(sentence).strip())
+                paragraphs.append("\n".join(item for item in (str(title).strip(), body) if item))
+            else:
+                paragraphs.append(str(part).strip())
+        return "\n\n".join(part for part in paragraphs if part).strip()
+    return str(value).strip()
+
+
 def convert_row(row: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize either training parquet rows or RULER-HQA JSON rows."""
     row = _json_safe(row)
-    context = row.get("context", "")
-    if isinstance(context, list):
-        context = "\n\n".join(str(part) for part in context)
-    context = str(context).strip()
+    context = _context_text(row.get("context", ""))
     if not context:
         return None
 
     if row.get("input"):
         question = str(row["input"]).strip()
         ground_truth = row.get("answers", [])
+        extra_info = row
+    elif row.get("question") and row.get("answer") is not None:
+        # The resource-constrained pilot uses the official HotpotQA distractor
+        # rows directly. Formal VIME reproduction still uses the frozen 32K
+        # MemAgent parquet path above; both normalize to the same public schema.
+        question = str(row["question"]).strip()
+        ground_truth = [row["answer"]]
         extra_info = row
     else:
         extra_info = row.get("extra_info") or {}
@@ -65,7 +103,7 @@ def convert_row(row: dict[str, Any]) -> dict[str, Any] | None:
     if not question or not ground_truth:
         return None
 
-    return {
+    converted = {
         "prompt": question,
         "label": ground_truth[0],
         "metadata": {
@@ -76,6 +114,10 @@ def convert_row(row: dict[str, Any]) -> dict[str, Any] | None:
             "data_source": str(row.get("data_source", "hotpotqa")),
         },
     }
+    source_id = row.get("id", row.get("_id"))
+    if source_id is not None:
+        converted["_id"] = str(source_id)
+    return converted
 
 
 def read_rows(path: Path) -> Iterable[dict[str, Any]]:

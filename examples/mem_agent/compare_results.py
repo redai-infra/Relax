@@ -18,6 +18,8 @@ COMPATIBILITY_FIELDS = (
     "temperature",
     "top_p",
     "sampling_count",
+    "seed",
+    "enable_thinking",
     "chunk_tokens",
     "max_memory_tokens",
     "max_final_tokens",
@@ -112,7 +114,7 @@ def main() -> None:
         nargs=3,
         action="append",
         metavar=("LABEL", "VIME_SUMMARY", "RELAX_SUMMARY"),
-        required=True,
+        default=[],
         help="Repeat for every RULER-HQA length selected for acceptance.",
     )
     parser.add_argument("--metric", default="sub_em_pct")
@@ -127,6 +129,8 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if not args.pair and not args.baseline_pair:
+        parser.error("At least one --pair or --baseline-pair is required.")
 
     comparisons = []
     for label, vime_path, relax_path in args.pair:

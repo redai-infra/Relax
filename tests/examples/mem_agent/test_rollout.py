@@ -13,6 +13,9 @@ from relax.utils.types import Sample
 
 
 class FakeTokenizer:
+    def __init__(self):
+        self.template_kwargs = []
+
     def encode(self, text, add_special_tokens=False):
         del add_special_tokens
         return [ord(character) for character in text]
@@ -21,9 +24,10 @@ class FakeTokenizer:
         del skip_special_tokens
         return "".join(chr(token_id) for token_id in token_ids)
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
         assert tokenize is False
         assert add_generation_prompt is True
+        self.template_kwargs.append(kwargs)
         return f"<chat>{messages[0]['content']}</chat>"
 
 
@@ -134,6 +138,33 @@ async def test_generate_trajectory_uses_evaluation_prompt_variant():
     assert result.status == Sample.Status.COMPLETED
     assert all("<problem>\nQ\n</problem>" in prompt for prompt in prompts)
     assert all("<problem> \nQ\n</problem>" not in prompt for prompt in prompts)
+
+
+@pytest.mark.asyncio
+async def test_generate_trajectory_can_disable_qwen_thinking_for_small_pilot():
+    tokenizer = FakeTokenizer()
+    responses = iter(["MEM", r"\boxed{x}"])
+
+    async def fake_generate(args, turn, sampling_params, evaluation):
+        del args, sampling_params, evaluation
+        response = next(responses)
+        response_ids = tokenizer.encode(response)
+        turn.response = response
+        turn.tokens = tokenizer.encode(turn.prompt) + response_ids
+        turn.rollout_tokens = list(turn.tokens)
+        turn.response_length = len(response_ids)
+        turn.loss_mask = [1] * len(response_ids)
+        turn.rollout_log_probs = [-0.1] * len(response_ids)
+        turn.status = Sample.Status.COMPLETED
+        return turn
+
+    args = _args()
+    args.mem_agent_enable_thinking = False
+    sample = Sample(index=0, group_index=0, prompt="Q", metadata={"context": "abc"})
+    result = await generate_trajectory(args, sample, {}, tokenizer, generator=fake_generate)
+
+    assert result.status == Sample.Status.COMPLETED
+    assert tokenizer.template_kwargs == [{"enable_thinking": False}, {"enable_thinking": False}]
 
 
 def test_truncate_text_to_tokens_retokenizes_to_the_hard_limit():

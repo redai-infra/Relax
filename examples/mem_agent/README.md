@@ -80,3 +80,32 @@ bash examples/mem_agent/run-pipeline.sh
 ```
 
 GPU execution is intentionally not started by the CPU test suite. The caller remains responsible for starting the ReLax/Ray environment described by the repository deployment guide.
+
+## Qwen3-0.6B single-4090 pilot
+
+The 0.6B recipe is a low-cost pipeline and learnability diagnostic; it does not replace the frozen Qwen3-4B VIME/ReLax acceptance run. It fixes `Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca`, disables Qwen3 thinking, uses 512-token chunks, a 128-token memory, a 64-token final answer, and at most four chunks.
+
+Prepare 24 immutable 2--4-chunk candidates before allocating a GPU:
+
+```bash
+TOKENIZER_PATH=/data/models/Qwen3-0.6B \
+DATA_DIR=/data/task36-pilot \
+bash examples/mem_agent/prepare-pilot-candidates.sh
+```
+
+The baseline samples every candidate eight times. Selection fails unless at least 12 prompts have both a success and a failure; 2--6 successes out of 8 are preferred. Eight prompts become the training split and four disjoint prompts become the held-out pilot split. This Pass@N-screened set deliberately supplies GRPO reward variance and must not be reported as an unbiased HotpotQA metric.
+
+```bash
+MODEL_PATH=/data/models/Qwen3-0.6B \
+DATA_DIR=/data/task36-pilot \
+RESULTS_DIR=/data/task36-runs/baseline \
+bash examples/mem_agent/run-qwen3-0.6B-baseline.sh
+
+MODEL_PATH=/data/models/Qwen3-0.6B \
+DATA_DIR=/data/task36-pilot \
+RUN_ROOT=/data/task36-runs/train \
+NUM_ROLLOUT=2 \
+bash examples/mem_agent/run-qwen3-0.6B-train.sh
+```
+
+The train script is TP=1 and produces the complete Ray job log, TensorBoard events, `training-reward.summary.json`, exact `training-reward.csv` points, and `training-reward.svg`. Run the two-step smoke first. Only after its generated/transferred/consumed row counts agree should a longer run start. Converted checkpoints are evaluated against the frozen pilot split with the same seed, sampling parameters, prompt path, and tokenizer via `run-qwen3-0.6B-eval.sh`.

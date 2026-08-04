@@ -90,7 +90,21 @@ def final_instruction(question: str, memory: str, *, evaluation: bool = False) -
     )
 
 
-def render_chat_prompt(tokenizer: Any, instruction: str) -> str:
-    """Render one independent user turn with the model's chat template."""
+def render_chat_prompt(tokenizer: Any, instruction: str, *, enable_thinking: bool | None = None) -> str:
+    """Render one independent user turn with the model's chat template.
+
+    The formal Qwen3-4B reproduction leaves ``enable_thinking`` unspecified to
+    match fixed VIME. The resource-constrained Qwen3-0.6B pilot can disable it
+    explicitly so a short response budget contains memory/answer text instead
+    of only a truncated reasoning trace.
+    """
     messages = [{"role": "user", "content": instruction}]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    template_kwargs = {}
+    if enable_thinking is not None:
+        template_kwargs["enable_thinking"] = enable_thinking
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **template_kwargs,
+    )

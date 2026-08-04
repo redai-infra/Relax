@@ -125,6 +125,7 @@ async def generate_trajectory(
     max_memory_tokens = int(getattr(args, "mem_agent_max_memory_tokens", 1024))
     max_final_tokens = int(getattr(args, "mem_agent_max_final_tokens", 256))
     max_chunks = int(getattr(args, "mem_agent_max_chunks", 64))
+    enable_thinking = getattr(args, "mem_agent_enable_thinking", None)
     if not getattr(args, "mem_agent_strict_alignment", True):
         raise ValueError("MemAgent training requires mem_agent_strict_alignment=true.")
     if max_memory_tokens <= 0 or max_final_tokens <= 0:
@@ -150,6 +151,7 @@ async def generate_trajectory(
         prompt = render_chat_prompt(
             tokenizer,
             memory_instruction(question, memory, chunk, evaluation=evaluation),
+            enable_thinking=enable_thinking,
         )
         turn_sample = await _run_turn(
             args,
@@ -179,7 +181,11 @@ async def generate_trajectory(
 
     # The final request deliberately excludes context/chunks. This enforces
     # the question + latest-memory information boundary from the task spec.
-    final_prompt = render_chat_prompt(tokenizer, final_instruction(question, memory, evaluation=evaluation))
+    final_prompt = render_chat_prompt(
+        tokenizer,
+        final_instruction(question, memory, evaluation=evaluation),
+        enable_thinking=enable_thinking,
+    )
     final_sample = await _run_turn(
         args,
         sample,

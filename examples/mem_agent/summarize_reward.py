@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import json
 import math
 import re
@@ -105,6 +106,62 @@ def summarize_reward_points(
     }
 
 
+def write_reward_csv(path: Path, points: list[tuple[int, float]]) -> None:
+    """Write the exact plotted points in a spreadsheet-friendly form."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as destination:
+        writer = csv.writer(destination)
+        writer.writerow(["rollout_id", "reward"])
+        writer.writerows(points)
+
+
+def write_reward_svg(path: Path, points: list[tuple[int, float]]) -> None:
+    """Render a dependency-free reward curve whose source remains the CSV."""
+    if not points:
+        raise ValueError("Cannot render an empty reward curve.")
+    width, height = 800, 420
+    left, right, top, bottom = 70, 30, 35, 60
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    min_step, max_step = points[0][0], points[-1][0]
+
+    def x_position(step: int) -> float:
+        if min_step == max_step:
+            return left + plot_width / 2
+        return left + (step - min_step) * plot_width / (max_step - min_step)
+
+    def y_position(reward: float) -> float:
+        return top + (1.0 - reward) * plot_height
+
+    polyline = " ".join(f"{x_position(step):.2f},{y_position(value):.2f}" for step, value in points)
+    circles = "\n".join(
+        f'<circle cx="{x_position(step):.2f}" cy="{y_position(value):.2f}" r="3" />' for step, value in points
+    )
+    grid = "\n".join(
+        (
+            f'<line x1="{left}" y1="{y_position(level):.2f}" x2="{width - right}" '
+            f'y2="{y_position(level):.2f}" class="grid" />'
+            f'<text x="{left - 12}" y="{y_position(level) + 5:.2f}" text-anchor="end">{level:.2f}</text>'
+        )
+        for level in (0.0, 0.25, 0.5, 0.75, 1.0)
+    )
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+<style>text {{ font: 13px sans-serif; fill: #222; }} .axis {{ stroke: #333; }} .grid {{ stroke: #ddd; }} polyline {{ fill: none; stroke: #2673c9; stroke-width: 2; }} circle {{ fill: #2673c9; }}</style>
+<rect width="100%" height="100%" fill="white" />
+<text x="{width / 2}" y="22" text-anchor="middle" font-size="16">MemAgent rollout reward</text>
+{grid}
+<line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" class="axis" />
+<line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" class="axis" />
+<polyline points="{polyline}" />
+{circles}
+<text x="{width / 2}" y="{height - 18}" text-anchor="middle">rollout_id ({min_step}..{max_step})</text>
+<text x="18" y="{height / 2}" text-anchor="middle" transform="rotate(-90 18 {height / 2})">reward</text>
+</svg>
+"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(svg, encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log-file", type=Path, required=True)
@@ -112,6 +169,8 @@ def main() -> None:
     parser.add_argument("--metric", default=DEFAULT_METRIC)
     parser.add_argument("--expected-steps", type=int)
     parser.add_argument("--window-size", type=int, default=10)
+    parser.add_argument("--csv-output", type=Path)
+    parser.add_argument("--svg-output", type=Path)
     args = parser.parse_args()
 
     with args.log_file.open(encoding="utf-8", errors="replace") as source:
@@ -127,6 +186,10 @@ def main() -> None:
     with args.output.open("w", encoding="utf-8") as destination:
         json.dump(summary, destination, ensure_ascii=False, indent=2)
         destination.write("\n")
+    if args.csv_output is not None:
+        write_reward_csv(args.csv_output, points)
+    if args.svg_output is not None:
+        write_reward_svg(args.svg_output, points)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

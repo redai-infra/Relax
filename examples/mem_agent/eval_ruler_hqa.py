@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +55,7 @@ def load_data(path: Path) -> list[dict[str, Any]]:
         else:
             metadata = item.get("metadata") or {}
             normalized = {
-                "_id": index,
+                "_id": item.get("_id", index),
                 "input": item.get("prompt", metadata.get("question", "")),
                 "answers": metadata.get("ground_truth", [item.get("label", "")]),
                 "context": metadata.get("context", ""),
@@ -74,6 +75,8 @@ async def _chat_once(
     temperature: float,
     top_p: float,
     max_tokens: int,
+    seed: int | None = None,
+    enable_thinking: bool | None = None,
 ) -> str:
     payload = {
         "model": model,
@@ -82,6 +85,13 @@ async def _chat_once(
         "top_p": top_p,
         "max_tokens": max_tokens,
     }
+    if seed is not None:
+        payload["seed"] = seed
+    if enable_thinking is not None:
+        # vLLM and SGLang expose Qwen's chat-template controls through this
+        # OpenAI-compatible extension. Formal VIME evaluation leaves it unset;
+        # the short-response 0.6B pilot disables thinking explicitly.
+        payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
     async with session.post(
         f"{base_url.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -99,6 +109,7 @@ async def recurrent_infer(
     args: argparse.Namespace,
     tokenizer: Any,
     session: aiohttp.ClientSession,
+    sample_index: int = 0,
 ) -> tuple[str, dict[str, Any]]:
     question = str(item["input"]).strip()
     context_ids = tokenizer.encode(str(item["context"]).strip(), add_special_tokens=False)
@@ -108,7 +119,7 @@ async def recurrent_infer(
     chunks = all_chunks[: args.max_chunks]
     memory = NO_MEMORY
     memory_lengths = []
-    for chunk_ids in chunks:
+    for chunk_index, chunk_ids in enumerate(chunks):
         chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True)
         generated_memory = strip_stop_tokens(
             await _chat_once(
@@ -120,6 +131,8 @@ async def recurrent_infer(
                 args.temperature,
                 args.top_p,
                 args.max_memory_tokens,
+                _request_seed(args, item["_id"], sample_index, "memory", chunk_index),
+                args.enable_thinking,
             )
         )
         # Match training exactly: the next turn only sees the re-tokenized,
@@ -135,6 +148,8 @@ async def recurrent_infer(
         args.temperature,
         args.top_p,
         args.max_final_tokens,
+        _request_seed(args, item["_id"], sample_index, "final", len(chunks)),
+        args.enable_thinking,
     )
     return answer, {
         "num_chunks": len(chunks),
@@ -148,6 +163,7 @@ async def base_infer(
     args: argparse.Namespace,
     tokenizer: Any,
     session: aiohttp.ClientSession,
+    sample_index: int = 0,
 ) -> tuple[str, dict[str, Any]]:
     suffix = f"\n\nQuestion: {item['input']}\nPlease answer the question and put the answer in \\boxed{{}}."
     suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
@@ -172,8 +188,48 @@ async def base_infer(
         args.temperature,
         args.top_p,
         args.max_final_tokens,
+        _request_seed(args, item["_id"], sample_index, "base", 0),
+        args.enable_thinking,
     )
     return answer, {"num_chunks": 1, "context_truncated": context_truncated, "memory_token_lengths": []}
+
+
+def _request_seed(
+    args: argparse.Namespace,
+    item_id: Any,
+    sample_index: int,
+    stage: str,
+    turn_index: int,
+) -> int | None:
+    """Derive a stable per-request seed without coupling concurrent tasks."""
+    base_seed = getattr(args, "seed", None)
+    if base_seed is None:
+        return None
+    material = f"{base_seed}|{item_id}|{sample_index}|{stage}|{turn_index}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "big") & 0x7FFFFFFF
+
+
+def summarize_pass_at_n(records: list[dict[str, Any]], samples_per_item: int) -> dict[str, float | int]:
+    """Summarize boxed-reward Pass@N and GRPO-useful group variance."""
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        grouped[str(record["_id"])].append(record)
+
+    complete_groups = [group for group in grouped.values() if len(group) == samples_per_item]
+    success_counts = [
+        sum(float(record.get("judge_boxed_em", 0.0)) == 1.0 for record in group) for group in complete_groups
+    ]
+    pass_count = sum(count > 0 for count in success_counts)
+    variance_count = sum(0 < count < samples_per_item for count in success_counts)
+    denominator = len(complete_groups)
+    return {
+        "pass_at_n": pass_count / denominator if denominator else 0.0,
+        "pass_at_n_pct": 100 * pass_count / denominator if denominator else 0.0,
+        "complete_prompt_groups": denominator,
+        "reward_variance_groups": variance_count,
+        "reward_variance_group_pct": 100 * variance_count / denominator if denominator else 0.0,
+        "mean_successes_per_prompt": sum(success_counts) / denominator if denominator else 0.0,
+    }
 
 
 async def run_evaluation(
@@ -188,22 +244,27 @@ async def run_evaluation(
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
 
-        async def evaluate_one(item: dict[str, Any]) -> dict[str, Any]:
+        async def evaluate_one(item: dict[str, Any], sample_index: int) -> dict[str, Any]:
             answers = item["answers"] if isinstance(item["answers"], list) else [item["answers"]]
             answers = [str(answer) for answer in answers]
             ground_truth = answers[0]
             try:
                 async with semaphore:
                     if args.mode == "recurrent":
-                        response, diagnostics = await recurrent_infer(item, args, tokenizer, session)
+                        response, diagnostics = await recurrent_infer(
+                            item, args, tokenizer, session, sample_index=sample_index
+                        )
                     else:
-                        response, diagnostics = await base_infer(item, args, tokenizer, session)
+                        response, diagnostics = await base_infer(
+                            item, args, tokenizer, session, sample_index=sample_index
+                        )
                 # RULER-HQA's VIME-compatible metrics score the first reference.
                 # boxed_em additionally mirrors the HotpotQA training reward and
                 # accepts any annotated answer.
                 prediction = extract_last_boxed(response[-300:])
                 return {
                     "_id": item["_id"],
+                    "sample_index": sample_index,
                     "answer": ground_truth,
                     "answers": answers,
                     "pred": prediction,
@@ -220,6 +281,7 @@ async def run_evaluation(
                 # serving request itself failed.
                 return {
                     "_id": item["_id"],
+                    "sample_index": sample_index,
                     "answer": ground_truth,
                     "answers": answers,
                     "pred": "",
@@ -231,10 +293,13 @@ async def run_evaluation(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
 
-        records = await asyncio.gather(*(evaluate_one(item) for item in data))
+        records = await asyncio.gather(
+            *(evaluate_one(item, sample_index) for item in data for sample_index in range(args.samples_per_item))
+        )
 
     summary = {
         **aggregate(records),
+        **summarize_pass_at_n(records, args.samples_per_item),
         "mode": args.mode,
         "model": args.model,
         "tokenizer": args.tokenizer,
@@ -246,7 +311,9 @@ async def run_evaluation(
         "evaluator_schema_version": EVALUATOR_SCHEMA_VERSION,
         "temperature": args.temperature,
         "top_p": args.top_p,
-        "sampling_count": 1,
+        "sampling_count": args.samples_per_item,
+        "seed": args.seed,
+        "enable_thinking": args.enable_thinking,
         "chunk_tokens": args.chunk_tokens,
         "max_memory_tokens": args.max_memory_tokens,
         "max_final_tokens": args.max_final_tokens,
@@ -267,6 +334,12 @@ def main() -> None:
     parser.add_argument("--mode", choices=("recurrent", "base"), default="recurrent")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api-key", default="EMPTY")
+    parser.add_argument("--samples-per-item", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=None)
+    thinking = parser.add_mutually_exclusive_group()
+    thinking.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
+    thinking.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
+    parser.set_defaults(enable_thinking=None)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--chunk-tokens", type=int, default=2048)
@@ -278,6 +351,8 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--timeout", type=int, default=86400)
     args = parser.parse_args()
+    if args.samples_per_item <= 0:
+        parser.error("--samples-per-item must be positive")
 
     from transformers import AutoTokenizer
 

@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from examples.mem_agent.summarize_reward import extract_reward_points, summarize_reward_points
+from examples.mem_agent.summarize_reward import (
+    extract_reward_points,
+    summarize_reward_points,
+    write_reward_csv,
+    write_reward_svg,
+)
 
 
 def test_extract_and_summarize_complete_reward_series():
@@ -44,3 +49,18 @@ def test_summary_rejects_missing_rollout_and_invalid_reward():
 
     with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
         extract_reward_points(["perf 0: {'rollout/mem_agent_raw_reward/mean': 1.1}\n"])
+
+
+def test_reward_csv_and_svg_keep_auditable_points(tmp_path):
+    points = [(0, 0.25), (1, 0.75)]
+    csv_path = tmp_path / "reward.csv"
+    svg_path = tmp_path / "reward.svg"
+
+    write_reward_csv(csv_path, points)
+    write_reward_svg(svg_path, points)
+
+    assert csv_path.read_text(encoding="utf-8").splitlines() == ["rollout_id,reward", "0,0.25", "1,0.75"]
+    svg = svg_path.read_text(encoding="utf-8")
+    assert "MemAgent rollout reward" in svg
+    assert '<polyline points="' in svg
+    assert svg.count("<circle ") == 2
