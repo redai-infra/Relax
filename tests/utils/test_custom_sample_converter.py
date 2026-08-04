@@ -53,6 +53,8 @@ def _args(**overrides):
         "grpo_std_normalization": True,
         "n_samples_per_prompt": 1,
         "mem_agent_credit_assignment": "split",
+        "mem_agent_max_memory_tokens": 1024,
+        "mem_agent_max_final_tokens": 256,
         "debug_train_only": False,
         "load_debug_rollout_data_subsample": None,
         "use_dynamic_global_batch_size": False,

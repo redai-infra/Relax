@@ -172,22 +172,23 @@ async def run_evaluation(
     async with aiohttp.ClientSession(timeout=timeout) as session:
 
         async def evaluate_one(item: dict[str, Any]) -> dict[str, Any]:
+            answers = item["answers"] if isinstance(item["answers"], list) else [item["answers"]]
+            answers = [str(answer) for answer in answers]
+            ground_truth = answers[0]
             try:
                 async with semaphore:
                     if args.mode == "recurrent":
                         response, diagnostics = await recurrent_infer(item, args, tokenizer, session)
                     else:
                         response, diagnostics = await base_infer(item, args, tokenizer, session)
-                answers = item["answers"] if isinstance(item["answers"], list) else [item["answers"]]
                 # RULER-HQA's VIME-compatible metrics score the first reference.
                 # boxed_em additionally mirrors the HotpotQA training reward and
                 # accepts any annotated answer.
-                ground_truth = str(answers[0])
                 prediction = extract_last_boxed(response[-300:])
                 return {
                     "_id": item["_id"],
                     "answer": ground_truth,
-                    "answers": [str(answer) for answer in answers],
+                    "answers": answers,
                     "pred": prediction,
                     "judge_f1": f1_score(prediction, ground_truth),
                     "judge_em": exact_match(prediction, ground_truth),
@@ -197,7 +198,21 @@ async def run_evaluation(
                     **diagnostics,
                 }
             except Exception as exc:
-                return {"_id": item["_id"], "error": f"{type(exc).__name__}: {exc}"}
+                # Preserve the target and explicit zero scores in raw output.
+                # Reviewers can therefore audit every input row even when the
+                # serving request itself failed.
+                return {
+                    "_id": item["_id"],
+                    "answer": ground_truth,
+                    "answers": answers,
+                    "pred": "",
+                    "judge_f1": 0.0,
+                    "judge_em": 0.0,
+                    "judge_sub_em": 0.0,
+                    "judge_boxed_em": 0.0,
+                    "response": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
 
         records = await asyncio.gather(*(evaluate_one(item) for item in data))
 
@@ -205,6 +220,7 @@ async def run_evaluation(
         **aggregate(records),
         "mode": args.mode,
         "model": args.model,
+        "tokenizer": args.tokenizer,
         "data_file": str(args.data_file),
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -213,6 +229,8 @@ async def run_evaluation(
         "max_memory_tokens": args.max_memory_tokens,
         "max_final_tokens": args.max_final_tokens,
         "max_chunks": args.max_chunks,
+        "max_input_tokens": args.max_input_tokens,
+        "server_max_model_len": args.server_max_model_len,
     }
     return records, summary
 
@@ -234,6 +252,7 @@ def main() -> None:
     parser.add_argument("--max-final-tokens", type=int, default=256)
     parser.add_argument("--max-chunks", type=int, default=64)
     parser.add_argument("--max-input-tokens", type=int, default=7936)
+    parser.add_argument("--server-max-model-len", type=int, default=8192)
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--timeout", type=int, default=86400)
     args = parser.parse_args()

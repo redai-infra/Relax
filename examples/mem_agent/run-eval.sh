@@ -61,6 +61,7 @@ run_eval() {
     --max-memory-tokens 1024 \
     --max-final-tokens 256 \
     --max-chunks 64 \
+    --server-max-model-len "${MAX_MODEL_LEN}" \
     --concurrency "${CONCURRENCY}"
 }
 

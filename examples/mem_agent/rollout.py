@@ -45,10 +45,16 @@ def _question_from_sample(sample: Sample) -> str:
     return ""
 
 
-def _validate_turn(turn: dict[str, Any], require_log_probs: bool) -> None:
+def _validate_turn(turn: dict[str, Any], require_log_probs: bool, max_response_tokens: int) -> None:
+    if turn["finish_reason"] not in (Sample.Status.COMPLETED.value, Sample.Status.TRUNCATED.value):
+        raise ValueError(f"MemAgent turn has invalid finish status: {turn['finish_reason']}.")
     response_length = turn["response_length"]
     if response_length <= 0:
         raise ValueError("MemAgent turn returned no trainable response tokens.")
+    if response_length > max_response_tokens:
+        raise ValueError(
+            f"MemAgent turn returned {response_length} response tokens, exceeding its limit {max_response_tokens}."
+        )
     if len(turn["tokens"]) < response_length:
         raise ValueError("MemAgent turn response_length exceeds total token count.")
     if len(turn["loss_mask"]) != response_length:
@@ -58,7 +64,13 @@ def _validate_turn(turn: dict[str, Any], require_log_probs: bool) -> None:
         raise ValueError("MemAgent turn rollout_log_probs are not aligned with response tokens.")
 
 
-def _turn_record(turn_sample: Sample, turn_index: int, kind: str, evaluation: bool) -> dict[str, Any]:
+def _turn_record(
+    turn_sample: Sample,
+    turn_index: int,
+    kind: str,
+    evaluation: bool,
+    max_response_tokens: int,
+) -> dict[str, Any]:
     record = {
         "turn_index": turn_index,
         "kind": kind,
@@ -68,7 +80,7 @@ def _turn_record(turn_sample: Sample, turn_index: int, kind: str, evaluation: bo
         "rollout_log_probs": list(turn_sample.rollout_log_probs or []),
         "finish_reason": turn_sample.status.value,
     }
-    _validate_turn(record, require_log_probs=not evaluation)
+    _validate_turn(record, require_log_probs=not evaluation, max_response_tokens=max_response_tokens)
     return record
 
 
@@ -151,7 +163,7 @@ async def generate_trajectory(
             sample.status = Sample.Status.ABORTED
             sample.rollout_log_probs = []
             return sample
-        turns.append(_turn_record(turn_sample, len(turns), "memory", evaluation))
+        turns.append(_turn_record(turn_sample, len(turns), "memory", evaluation, max_memory_tokens))
         # Overwrite on every turn, including an empty post-processed response;
         # carrying the old value forward would silently change the recurrence.
         memory, memory_length = truncate_text_to_tokens(
@@ -178,7 +190,7 @@ async def generate_trajectory(
         sample.status = Sample.Status.ABORTED
         sample.rollout_log_probs = []
         return sample
-    turns.append(_turn_record(final_sample, len(turns), "final", evaluation))
+    turns.append(_turn_record(final_sample, len(turns), "final", evaluation, max_final_tokens))
 
     final_output = strip_stop_tokens(final_sample.response)
     # Preserve a valid top-level Sample for logs and failure recovery. The

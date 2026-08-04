@@ -45,6 +45,7 @@ async def test_generate_trajectory_overwrites_memory_and_expands_every_turn():
 
     async def fake_generate(args, turn, sampling_params, evaluation):
         del args
+        assert turn.session_id == "s"
         prompts.append(turn.prompt)
         max_new_tokens.append(sampling_params["max_new_tokens"])
         response = responses.pop(0)
@@ -69,6 +70,7 @@ async def test_generate_trajectory_overwrites_memory_and_expands_every_turn():
     assert result.metadata["num_chunks"] == 2
     assert result.metadata["context_truncated"] is False
     assert result.metadata["memory_token_lengths"] == [2, 2]
+    assert result.session_id == "s"
     assert len(result.train_metadata["mem_agent_turns"]) == 3
     assert NO_MEMORY in prompts[0]
     assert "abc" in prompts[0]
@@ -208,3 +210,27 @@ async def test_public_generate_entry_uses_sglang_state_and_turn_generator(monkey
     assert result.status == Sample.Status.COMPLETED
     assert result.response == r"\boxed{x}"
     assert [turn["kind"] for turn in result.train_metadata["mem_agent_turns"]] == ["memory", "final"]
+
+
+@pytest.mark.asyncio
+async def test_generate_trajectory_rejects_response_longer_than_turn_limit():
+    tokenizer = FakeTokenizer()
+
+    async def oversized_generate(args, turn, sampling_params, evaluation):
+        del args, sampling_params, evaluation
+        response_ids = tokenizer.encode("TOO-LONG")
+        turn.response = "TOO-LONG"
+        turn.tokens = tokenizer.encode(turn.prompt) + response_ids
+        turn.rollout_tokens = list(turn.tokens)
+        turn.response_length = len(response_ids)
+        turn.loss_mask = [1] * len(response_ids)
+        turn.rollout_log_probs = [-0.1] * len(response_ids)
+        turn.status = Sample.Status.COMPLETED
+        return turn
+
+    args = _args()
+    args.mem_agent_max_memory_tokens = 3
+    sample = Sample(index=0, group_index=0, prompt="Q", metadata={"context": "abc"})
+
+    with pytest.raises(ValueError, match="exceeding its limit 3"):
+        await generate_trajectory(args, sample, {}, tokenizer, generator=oversized_generate)

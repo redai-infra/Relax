@@ -11,10 +11,10 @@ from examples.mem_agent.convert import convert_samples
 from relax.utils.types import Sample
 
 
-def _turn(turn_index: int) -> dict:
+def _turn(turn_index: int, kind: str) -> dict:
     return {
         "turn_index": turn_index,
-        "kind": "final" if turn_index == 2 else "memory",
+        "kind": kind,
         "tokens": [100 + turn_index, 200 + turn_index, 201 + turn_index],
         "response_length": 2,
         "loss_mask": [1, 1],
@@ -29,7 +29,12 @@ def _sample(index: int, reward: float, turn_count: int) -> Sample:
         group_index=9,
         reward={"score": reward},
         status=Sample.Status.COMPLETED,
-        train_metadata={"mem_agent_turns": [_turn(turn_index) for turn_index in range(turn_count)]},
+        train_metadata={
+            "mem_agent_turns": [
+                _turn(turn_index, "final" if turn_index == turn_count - 1 else "memory")
+                for turn_index in range(turn_count)
+            ]
+        },
     )
 
 
@@ -43,6 +48,8 @@ def _args(credit_assignment="split", debug_train_only=True):
         n_samples_per_prompt=2,
         grpo_std_normalization=True,
         mem_agent_credit_assignment=credit_assignment,
+        mem_agent_max_memory_tokens=1024,
+        mem_agent_max_final_tokens=256,
         debug_train_only=debug_train_only,
     )
 
@@ -80,6 +87,11 @@ def test_converter_rejects_misaligned_or_failed_trajectory():
     with pytest.raises(ValueError, match="status=failed"):
         convert_samples(_args(), [failed, _sample(6, 1.0, 1)])
 
+    aborted = _sample(7, 0.0, 1)
+    aborted.status = Sample.Status.ABORTED
+    with pytest.raises(ValueError, match="status=aborted"):
+        convert_samples(_args(), [aborted, _sample(8, 1.0, 1)])
+
 
 def test_converter_rejects_inconsistent_group_turn_counts_and_non_divisible_rows():
     with pytest.raises(ValueError, match="inconsistent turn counts"):
@@ -89,3 +101,17 @@ def test_converter_rejects_inconsistent_group_turn_counts_and_non_divisible_rows
     args.mem_agent_train_rows_multiple = 4
     with pytest.raises(ValueError, match="is not divisible"):
         convert_samples(args, [_sample(3, 0.0, 3), _sample(4, 1.0, 3)])
+
+
+def test_converter_rejects_structurally_invalid_or_overlong_turns():
+    malformed = _sample(3, 0.0, 2)
+    malformed.train_metadata["mem_agent_turns"][-1]["kind"] = "memory"
+    with pytest.raises(ValueError, match="exactly one final turn"):
+        convert_samples(_args(), [malformed, _sample(4, 1.0, 2)])
+
+    overlong = _sample(5, 0.0, 2)
+    overlong.train_metadata["mem_agent_turns"][0]["response_length"] = 2
+    args = _args()
+    args.mem_agent_max_memory_tokens = 1
+    with pytest.raises(ValueError, match="response_length=2 exceeds 1"):
+        convert_samples(args, [overlong, _sample(6, 1.0, 2)])

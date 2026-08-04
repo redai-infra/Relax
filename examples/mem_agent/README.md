@@ -48,13 +48,14 @@ RESULTS_DIR=/data/results/mem-agent-relax \
 bash examples/mem_agent/run-eval.sh
 ```
 
-The evaluator writes raw per-sample JSONL and a summary JSON for HotpotQA dev and RULER-HQA 50/200/800. Failed requests remain in the denominator with score zero. `boxed_em_pct` is the HotpotQA reward-compatible accuracy and `sub_em_pct` is the primary VIME-compatible RULER-HQA metric. Set `MODE=base` to run the single-context base baseline; its context truncation always preserves the question and answer instruction.
+The evaluator writes raw per-sample JSONL and a summary JSON for HotpotQA dev and RULER-HQA 50/200/800. Failed requests keep their ground truth in the raw file and remain in the denominator with score zero. `boxed_em_pct` is the HotpotQA reward-compatible accuracy and `sub_em_pct` is the primary VIME-compatible RULER-HQA metric. Set `MODE=base` to run the optional single-context diagnostic; its context truncation always preserves the question and answer instruction.
 
 `TOKENIZER_PATH` should point to the frozen base snapshot. `run-pipeline.sh` preserves it automatically before switching `MODEL_PATH` to the converted checkpoint. When `NUM_ROLLOUT=2` is used, the pipeline also selects `iter_0000001` automatically instead of the 100-step default `iter_0000099`.
 
-For the VIME reproduction tolerance, evaluate an official VIME checkpoint when one is available; otherwise use a checkpoint produced once from the fixed VIME recipe. The paired runner holds the tokenizer, data, prompts, sampling parameters, and evaluator constant. It evaluates RULER-HQA 50/200/800 by default; `LENGTHS` can freeze a smaller pre-agreed subset before either result is observed. It exits non-zero when any selected `sub_em_pct` differs by more than 3 percentage points and retains raw per-sample output for review:
+For the VIME reproduction tolerance, evaluate an official VIME checkpoint when one is available; otherwise use a checkpoint produced once from the fixed VIME recipe. The acceptance runner holds the tokenizer, data, prompts, sampling parameters, recurrent inference mode, and evaluator constant across frozen base, VIME, and ReLax. It evaluates RULER-HQA 50/200/800 by default; `LENGTHS` can freeze a smaller pre-agreed subset before any result is observed. It exits non-zero unless every selected VIME/ReLax `sub_em_pct` gap is at most 3 percentage points, ReLax beats frozen base on every selected RULER-HQA `sub_em_pct`, and ReLax beats frozen base on HotpotQA `boxed_em_pct`. Raw per-sample files are retained for review:
 
 ```bash
+BASE_MODEL_PATH=/data/models/Qwen3-4B \
 VIME_MODEL_PATH=/data/checkpoints/vime-hf \
 RELAX_MODEL_PATH=/data/checkpoints/mem-agent-relax-hf \
 TOKENIZER_PATH=/data/models/Qwen3-4B \

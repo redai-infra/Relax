@@ -36,3 +36,26 @@ def test_train_script_keeps_trajectory_loss_and_real_turn_context_envelope():
     assert "--custom-convert-samples-to-train-data-path examples.mem_agent.convert.convert_samples" in script
     assert "--use-dynamic-global-batch-size" not in script
     assert "--calculate-per-token-loss" not in script
+
+
+def test_pipeline_and_acceptance_scripts_cover_required_stages_and_metrics():
+    pipeline = (EXAMPLE / "run-pipeline.sh").read_text(encoding="utf-8")
+    paired = (EXAMPLE / "run-paired-eval.sh").read_text(encoding="utf-8")
+    evaluator = (EXAMPLE / "run-eval.sh").read_text(encoding="utf-8")
+
+    for stage in ("prepare-data.sh", "run-qwen3-4B-train.sh", "convert-to-hf.sh", "run-eval.sh"):
+        assert stage in pipeline
+    assert 'BASE_MODEL_PATH="${BASE_MODEL_PATH:?' in paired
+    assert paired.count("MODE=recurrent") == 3
+    assert '--pair "ruler-hqa-${length}"' in paired
+    assert '--baseline-pair "ruler-hqa-${length}" sub_em_pct' in paired
+    assert "--baseline-pair hotpotqa-dev boxed_em_pct" in paired
+    assert 'LENGTHS="${LENGTHS:-50 200 800}"' in paired
+    for value in (
+        "--temperature 0.7",
+        "--top-p 0.95",
+        "--chunk-tokens 2048",
+        "--max-memory-tokens 1024",
+        '--server-max-model-len "${MAX_MODEL_LEN}"',
+    ):
+        assert value in evaluator

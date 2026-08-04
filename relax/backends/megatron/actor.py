@@ -681,6 +681,10 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     batch_size = expanded_rows // dp_size
                     num_rollout_minis = 1
+                    logger.info(
+                        f"Expanded train row contract rollout_id={rollout_id}: "
+                        f"transferred_global_rows={expanded_rows}, dp_size={dp_size}, local_rows={batch_size}"
+                    )
                 elif self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
                     dynamic_size = ray.get(self.rollout_manager.get_dynamic_global_batch_size.remote())
                     batch_size = dynamic_size // dp_size
@@ -734,6 +738,11 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"rollout mini batch local size mismatch for rollout_id={rollout_id}, "
                         f"batch_index={batch_index - 1}: expected {batch_size}, "
                         f"got {len(rollout_data['total_lengths'])}."
+                    )
+                if getattr(self.args, "custom_train_expanded_batch", False):
+                    logger.info(
+                        f"Consumed expanded train rows rollout_id={rollout_id}: "
+                        f"local_rows={len(rollout_data['total_lengths'])}, expected_local_rows={batch_size}"
                     )
                 rollout_mini_batches.append(rollout_data)
                 rollout_mini_batch_metas.append(batch_meta)

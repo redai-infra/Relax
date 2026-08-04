@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.mem_agent.eval_ruler_hqa import base_infer
+from examples.mem_agent.eval_ruler_hqa import base_infer, run_evaluation
 
 
 class CharacterTokenizer:
@@ -45,3 +45,41 @@ async def test_base_infer_truncates_context_without_dropping_question(monkeypatc
     assert diagnostics["context_truncated"] is True
     assert "Question: Which answer?" in captured["instruction"]
     assert len(captured["instruction"]) <= args.max_input_tokens
+
+
+@pytest.mark.asyncio
+async def test_evaluation_error_keeps_ground_truth_and_counts_as_zero(monkeypatch, tmp_path):
+    async def failed_infer(item, args, tokenizer, session):
+        del item, args, tokenizer, session
+        raise RuntimeError("server unavailable")
+
+    monkeypatch.setattr("examples.mem_agent.eval_ruler_hqa.recurrent_infer", failed_infer)
+    args = SimpleNamespace(
+        mode="recurrent",
+        concurrency=1,
+        timeout=1,
+        model="model",
+        tokenizer="tokenizer",
+        data_file=tmp_path / "eval.jsonl",
+        temperature=0.7,
+        top_p=0.95,
+        chunk_tokens=2048,
+        max_memory_tokens=1024,
+        max_final_tokens=256,
+        max_chunks=64,
+        max_input_tokens=7936,
+        server_max_model_len=8192,
+    )
+    records, summary = await run_evaluation(
+        [{"_id": "q1", "input": "Question", "context": "Context", "answers": ["A", "Alias"]}],
+        args,
+        CharacterTokenizer(),
+    )
+
+    assert records[0]["answers"] == ["A", "Alias"]
+    assert records[0]["pred"] == ""
+    assert records[0]["judge_boxed_em"] == 0.0
+    assert "server unavailable" in records[0]["error"]
+    assert summary["total"] == 1
+    assert summary["errors"] == 1
+    assert summary["sub_em_pct"] == 0.0

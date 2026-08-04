@@ -58,7 +58,7 @@ from relax.utils.training.train_dump_utils import (
 from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
-from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, TrainBatchRowCountTracker
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -794,12 +794,9 @@ class RolloutManager(ReloadableMixin):
         self.pg = pg
         self.args = args
         self._dynamic_global_batch_size = None
-        # Expanded row counts are keyed by rollout ID because rollout and actor
-        # scheduling can overlap. A single "latest" value lets step N+1 reuse
-        # step N's count and can leave TransferQueue rows unread.
-        self._train_batch_row_counts: dict[int, int] = {}
-        self._train_batch_row_errors: dict[int, str] = {}
-        self._train_batch_row_events: dict[int, asyncio.Event] = {}
+        # Actor and rollout scheduling can overlap. The tracker prevents step
+        # N+1 from reusing step N's expanded row count.
+        self._train_batch_row_tracker = TrainBatchRowCountTracker()
 
         init_tracking(args, primary=False)
 
@@ -1006,13 +1003,7 @@ class RolloutManager(ReloadableMixin):
         same event object lets both call orders converge without polling or
         falling back to a stale count from the previous step.
         """
-        event = self._train_batch_row_events.setdefault(rollout_id, asyncio.Event())
-        await event.wait()
-        if error := self._train_batch_row_errors.get(rollout_id):
-            raise RuntimeError(f"Failed to determine train rows for rollout_id={rollout_id}: {error}")
-        if rollout_id not in self._train_batch_row_counts:
-            raise RuntimeError(f"Train row count is unavailable for rollout_id={rollout_id}.")
-        return self._train_batch_row_counts[rollout_id]
+        return await self._train_batch_row_tracker.wait(rollout_id)
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
@@ -1021,16 +1012,9 @@ class RolloutManager(ReloadableMixin):
     async def generate(self, rollout_id):
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
-        row_event = self._train_batch_row_events.setdefault(rollout_id, asyncio.Event())
-        row_event.clear()
-        self._train_batch_row_counts.pop(rollout_id, None)
-        self._train_batch_row_errors.pop(rollout_id, None)
-        # Counts are only coordination state; retain a short overlap window for
-        # late actor/critic consumers and bound the actor's memory usage.
-        for stale_rollout_id in [key for key in self._train_batch_row_events if key < rollout_id - 2]:
-            self._train_batch_row_events.pop(stale_rollout_id, None)
-            self._train_batch_row_counts.pop(stale_rollout_id, None)
-            self._train_batch_row_errors.pop(stale_rollout_id, None)
+        expanded_batch = getattr(self.args, "custom_train_expanded_batch", False)
+        if expanded_batch:
+            self._train_batch_row_tracker.start(rollout_id)
         try:
             if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
                 self._try_ci_fault_injection()
@@ -1043,7 +1027,7 @@ class RolloutManager(ReloadableMixin):
                 self.data_system_client,
                 evaluation=False,
             )
-            if getattr(self.args, "custom_train_expanded_batch", False):
+            if expanded_batch:
                 # The transfer helper reports the exact rows it actually put.
                 # Re-converting output.samples here is unsafe because custom
                 # converters may filter rows or be stateful.
@@ -1051,21 +1035,15 @@ class RolloutManager(ReloadableMixin):
                 row_count = metrics.get("rollout/train_batch_row_count")
                 if row_count is None:
                     raise RuntimeError("Expanded rollout did not report its transferred train row count.")
-                row_count = int(row_count)
-                if row_count <= 0:
-                    raise RuntimeError(f"Expanded rollout produced an invalid train row count: {row_count}.")
                 # This count controls TQ consumption only. global_batch_size
                 # remains trajectory-based for GRPO loss normalization.
-                self._train_batch_row_counts[rollout_id] = row_count
+                self._train_batch_row_tracker.complete(rollout_id, row_count)
             elif self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
                 self._dynamic_global_batch_size = len(output.samples) * self.args.n_samples_per_prompt
         except Exception as exc:
-            if getattr(self.args, "custom_train_expanded_batch", False):
-                self._train_batch_row_errors[rollout_id] = f"{type(exc).__name__}: {exc}"
+            if expanded_batch:
+                self._train_batch_row_tracker.fail(rollout_id, exc)
             raise
-        finally:
-            if getattr(self.args, "custom_train_expanded_batch", False):
-                row_event.set()
 
     async def eval(self, rollout_id):
         self.health_monitoring_resume()

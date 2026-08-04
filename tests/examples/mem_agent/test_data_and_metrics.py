@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from examples.mem_agent.metrics import aggregate, exact_match, f1_score, sub_exact_match
-from examples.mem_agent.prepare_data import convert_file, convert_row, update_manifest
+from examples.mem_agent.prepare_data import (
+    convert_file,
+    convert_row,
+    download_hf_file,
+    read_rows,
+    update_manifest,
+)
 
 
 def test_convert_row_supports_training_and_ruler_formats():
@@ -45,6 +53,45 @@ def test_convert_file_and_manifest_are_deterministic(tmp_path):
     assert payload["artifacts"][0]["converted"]["written_rows"] == 1
     assert len(payload["artifacts"][0]["converted"]["sha256"]) == 64
     assert json.loads(output.read_text(encoding="utf-8"))["metadata"]["ground_truth"] == ["Paris"]
+
+
+def test_parquet_reader_and_huggingface_download_are_pinned_and_normalizable(monkeypatch, tmp_path):
+    parquet_row = {
+        "prompt": [{"role": "user", "content": "Who?"}],
+        "context": "Document",
+        "reward_model": {"ground_truth": ["Alice"]},
+    }
+
+    class FakeFrame:
+        def to_dict(self, orient):
+            assert orient == "records"
+            return [parquet_row]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pandas",
+        SimpleNamespace(read_parquet=lambda path: FakeFrame()),
+    )
+    assert convert_row(list(read_rows(tmp_path / "train.parquet"))[0])["label"] == "Alice"
+
+    captured = {}
+    fake_hub = ModuleType("huggingface_hub")
+
+    def fake_download(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path / kwargs["filename"])
+
+    fake_hub.hf_hub_download = fake_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    path = download_hf_file("dataset/id", "fixed-revision", "train.parquet", tmp_path / "cache")
+    assert path == tmp_path / "train.parquet"
+    assert captured == {
+        "repo_id": "dataset/id",
+        "repo_type": "dataset",
+        "revision": "fixed-revision",
+        "filename": "train.parquet",
+        "cache_dir": str(tmp_path / "cache"),
+    }
 
 
 def test_ruler_metrics_match_expected_semantics():
