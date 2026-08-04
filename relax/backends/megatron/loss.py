@@ -1438,16 +1438,26 @@ def loss_function(
     # normalizer is correct even when CP differs across micro-batches (dynamic CP).
     # Under static CP it equals the old full-sample count distributed across ranks,
     # so the final loss/grad/metric are unchanged after all-reduce.
-    num_tokens = get_cp_local_num_tokens(
+    token_count_args = (
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
         args.qkv_format,
         batch.get("max_seq_lens", None),
         batch.get("padded_total_lengths", None),
-        dynamic_cp_size=batch.get("dynamic_cp_size", None),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
+    token_count_kwargs = {
+        "dynamic_cp_size": batch.get("dynamic_cp_size", None),
+        "dynamic_cp_rank": batch.get("dynamic_cp_rank", None),
+    }
+    if getattr(args, "advantage_estimator", None) == "p3o":
+        # P3O's optimizer-step objective is normalized by the exact global count
+        # used for ESS. The generic helper preserves a historical clamp-to-one
+        # for fully masked samples when CP=1, which would create phantom tokens
+        # and make the final loss depend on the CP partition.
+        num_tokens = get_cp_local_valid_mask(*token_count_args, **token_count_kwargs).sum()
+    else:
+        num_tokens = get_cp_local_num_tokens(*token_count_args, **token_count_kwargs)
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(

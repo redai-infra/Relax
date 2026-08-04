@@ -34,7 +34,7 @@ else
     : "${P3O_MEGATRON_DIR:?P3O_MEGATRON_DIR must be set}"
 fi
 
-P3O_RAY_DASHBOARD="${P3O_RAY_DASHBOARD:-http://127.0.0.1:8265}"
+: "${P3O_RAY_DASHBOARD:?P3O_RAY_DASHBOARD must be set}"
 
 if [[ "${P3O_ALGORITHM}" != "p3o" && "${P3O_ALGORITHM}" != "grpo" ]]; then
     echo "Unsupported P3O_ALGORITHM=${P3O_ALGORITHM}" >&2

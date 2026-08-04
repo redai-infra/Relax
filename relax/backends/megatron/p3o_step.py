@@ -22,7 +22,7 @@ rejected in ``arguments.py`` rather than silently tolerated here.
 """
 
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -115,8 +115,12 @@ def synchronize_p3o_stats(
                 group_src=pp_size - 1,
             )
 
-    if vector[3].item() > 0:
-        raise ValueError(P3O_NONFINITE_RATIO_ERROR)
+    valid = vector[3] <= 0
+    if valid.device.type == "cpu":
+        if not bool(valid):
+            raise ValueError(P3O_NONFINITE_RATIO_ERROR)
+    else:
+        torch._assert_async(valid, P3O_NONFINITE_RATIO_ERROR)
     return P3OSufficientStats.from_vector(vector[:3])
 
 
@@ -290,7 +294,7 @@ def compute_p3o_step_context(
 
 
 @contextmanager
-def p3o_step_context_published(args: Namespace, step_context: P3OStepContext):
+def p3o_step_context_published(args: Namespace, step_context: P3OStepContext) -> Iterator[None]:
     """Publish the step context on ``args`` for the duration of the train pass.
 
     The loss function reads the cap from here rather than from the micro-batch

@@ -50,6 +50,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import (
@@ -105,7 +106,7 @@ from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"

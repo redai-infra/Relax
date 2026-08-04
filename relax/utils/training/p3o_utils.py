@@ -18,15 +18,10 @@ statistics are produced here and reduced by the caller before being frozen into
 a :class:`P3OStepContext`.
 """
 
-import math
 from dataclasses import dataclass
 
 import torch
 
-from relax.utils.logging_utils import get_logger
-
-
-logger = get_logger(__name__)
 
 # Epsilon placed in the ESS denominator. Kept bit-compatible with the reference
 # implementation (FeynRL ``algs/P3O/p3o.py::calculate_ess``) so golden-value
@@ -43,6 +38,24 @@ NONFINITE_RATIO_MESSAGE = (
     "P3O: non-finite importance ratio at a valid response token; refusing to "
     "silently fall back to ESS=1. Check rollout log-probs and mask alignment."
 )
+
+
+def _require_identical_shapes(**tensors: torch.Tensor) -> None:
+    """Reject broadcasting between token-aligned P3O inputs."""
+    shapes = {name: tuple(tensor.shape) for name, tensor in tensors.items()}
+    if len(set(shapes.values())) != 1:
+        formatted = ", ".join(f"{name}={shape}" for name, shape in shapes.items())
+        raise ValueError(f"P3O token tensors must have identical shapes; got {formatted}")
+
+
+def _assert_scalar_condition(condition: torch.Tensor, message: str) -> None:
+    """Assert a scalar condition without synchronizing a CUDA hot path."""
+    condition = condition.reshape(())
+    if condition.device.type == "cpu":
+        if not bool(condition):
+            raise ValueError(message)
+        return
+    torch._assert_async(condition, message)
 
 
 @dataclass(frozen=True)
@@ -100,7 +113,8 @@ class P3OStepContext:
         valid_token_count: Global valid response-token count ``N``.
         ratio_mean: ``S1 / N``.
         ratio_std: Population std derived from the global moments.
-        clamp_events: Number of ``[0, 1]`` round-off corrections applied to ESS.
+        clamp_events: Compatibility field. ESS is clamped on-device without a
+            host synchronization, so this remains zero.
     """
 
     normalized_ess: torch.Tensor
@@ -154,6 +168,11 @@ def compute_p3o_log_ratio(
     Returns:
         ``l_i = log pi_theta - log pi_b`` in float32, zero at invalid positions.
     """
+    _require_identical_shapes(
+        log_probs=log_probs,
+        behavior_log_probs=behavior_log_probs,
+        valid_mask=valid_mask,
+    )
     log_ratio = log_probs.float() - behavior_log_probs.float()
     return torch.where(valid_mask, log_ratio, torch.zeros_like(log_ratio))
 
@@ -262,32 +281,19 @@ def finalize_p3o_step_context(stats: P3OSufficientStats) -> P3OStepContext:
     sum_ratio_sq = stats.sum_ratio_sq.to(torch.float64)
     count = stats.valid_token_count.to(torch.float64)
 
-    if not (math.isfinite(float(sum_ratio)) and math.isfinite(float(sum_ratio_sq)) and math.isfinite(float(count))):
-        raise ValueError(
-            f"P3O: non-finite global ESS statistics (S1={float(sum_ratio)}, "
-            f"S2={float(sum_ratio_sq)}, N={float(count)})."
-        )
-
-    if float(count) < 0.5:
-        raise ValueError(
+    _assert_scalar_condition(
+        torch.stack((sum_ratio, sum_ratio_sq, count)).isfinite().all(),
+        "P3O: non-finite global ESS statistics.",
+    )
+    _assert_scalar_condition(
+        count >= 0.5,
+        (
             "P3O: global valid response-token count is zero for this optimizer step. "
             "The step cannot be normalized; skip or abort instead of assuming ESS=1."
-        )
+        ),
+    )
 
     raw_ess = sum_ratio.pow(2) / (count * (sum_ratio_sq + ESS_DENOM_EPS))
-
-    # Only float round-off should ever push ESS outside [0, 1]; record how often
-    # it happens rather than clamping silently.
-    clamp_events = 0
-    if float(raw_ess) < 0.0 or float(raw_ess) > 1.0:
-        clamp_events = 1
-        logger.warning(
-            "P3O: normalized ESS %.12f outside [0, 1]; clamping round-off (S1=%.6f, S2=%.6f, N=%.0f)",
-            float(raw_ess),
-            float(sum_ratio),
-            float(sum_ratio_sq),
-            float(count),
-        )
     ess = raw_ess.clamp(min=0.0, max=1.0)
 
     ratio_mean = sum_ratio / count
@@ -300,7 +306,7 @@ def finalize_p3o_step_context(stats: P3OSufficientStats) -> P3OStepContext:
         valid_token_count=count,
         ratio_mean=ratio_mean,
         ratio_std=ratio_std,
-        clamp_events=clamp_events,
+        clamp_events=0,
     )
 
 
@@ -365,6 +371,12 @@ def compute_p3o_token_terms(
     Returns:
         :class:`P3OTokenTerms` with no reduction applied.
     """
+    _require_identical_shapes(
+        log_probs=log_probs,
+        behavior_log_probs=behavior_log_probs,
+        advantages=advantages,
+        valid_mask=valid_mask,
+    )
     mask_bool = valid_mask.bool()
     behavior_log_probs = behavior_log_probs.detach()
     cap = step_context.adaptive_cap.to(dtype=torch.float32, device=log_probs.device)

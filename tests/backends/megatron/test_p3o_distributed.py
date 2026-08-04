@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 
-with stubbed_megatron_modules():
+with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
     from relax.backends.megatron import p3o_step
     from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 

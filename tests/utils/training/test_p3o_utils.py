@@ -284,6 +284,30 @@ def test_p3o_utils_empty_global_batch_raises():
         finalize_p3o_step_context(stats)
 
 
+@pytest.mark.parametrize("mismatched", ["behavior", "mask"])
+def test_p3o_utils_sufficient_stats_reject_shape_mismatch(mismatched):
+    log_probs = torch.zeros(2, 3)
+    behavior_log_probs = torch.zeros(2, 2) if mismatched == "behavior" else torch.zeros(2, 3)
+    valid_mask = torch.ones(2, 2, dtype=torch.bool) if mismatched == "mask" else torch.ones(2, 3, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="identical shapes"):
+        compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask)
+
+
+def test_p3o_utils_token_terms_reject_advantage_shape_mismatch():
+    log_probs, behavior_log_probs, _, valid_mask = _golden_batch()
+    context = finalize_p3o_step_context(compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask))
+
+    with pytest.raises(ValueError, match="advantages"):
+        compute_p3o_token_terms(
+            log_probs,
+            behavior_log_probs,
+            torch.zeros(2, 1),
+            valid_mask,
+            context,
+        )
+
+
 def test_p3o_utils_cap_hits_track_ratios_above_cap():
     log_probs, behavior_log_probs, advantages, valid_mask = _golden_batch()
     ctx = finalize_p3o_step_context(compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask))
