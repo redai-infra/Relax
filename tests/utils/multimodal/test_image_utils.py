@@ -4,9 +4,9 @@
 
 All image inputs are constructed in memory (PIL / PNG bytes / data URI); no
 real image files or network access are required. The patch-alignment test
-derives patch_size / merge_size from the Qwen3-VL-4B-Instruct processor pointed
-to by the RELAX_TEST_QWEN3_VL_4B environment variable, and is skipped when the
-model directory is unavailable.
+derives patch_size / merge_size from the preprocessor config of the
+Qwen3-VL-4B-Instruct model pointed to by the RELAX_TEST_QWEN3_VL_4B
+environment variable, and is skipped when the model directory is unavailable.
 """
 
 import base64
@@ -80,6 +80,24 @@ def test_get_resize_height_width_rejects_extreme_aspect_ratio():
 def test_get_resize_height_width_without_scale_factor_keeps_size():
     h_bar, w_bar = get_resize_height_width(None, 101, 133, None, MAX_PIXELS, MIN_PIXELS)
     assert (h_bar, w_bar) == (101, 133)
+
+
+def test_get_resize_height_width_without_scale_factor_clamps_to_max_pixels():
+    # 2000x1000 = 2,000,000 px > max_pixels; must shrink without grid alignment.
+    max_pixels = 100 * 28 * 28  # 78,400
+    h_bar, w_bar = get_resize_height_width(None, 2000, 1000, None, max_pixels, MIN_PIXELS)
+    assert h_bar * w_bar <= max_pixels
+    # beta = sqrt(2e6/78400) ≈ 5.05 -> floor(395.98)=395, floor(197.99)=197
+    assert (h_bar, w_bar) == (395, 197)
+
+
+def test_get_resize_height_width_without_scale_factor_boosts_to_min_pixels():
+    # 28x28 = 784 px < min_pixels; must grow without grid alignment.
+    min_pixels = 8 * 28 * 28  # 6,272
+    h_bar, w_bar = get_resize_height_width(None, 28, 28, None, MAX_PIXELS, min_pixels)
+    assert h_bar * w_bar >= min_pixels
+    # beta = sqrt(6272/784) ≈ 2.83 -> ceil(79.20) = 80
+    assert (h_bar, w_bar) == (80, 80)
 
 
 # ── image_smart_resize ───────────────────────────────────────────────────────
@@ -203,18 +221,10 @@ _MODEL_DIR = os.environ.get("RELAX_TEST_QWEN3_VL_4B")
 
 
 def _qwen3_vl_patch_grid(model_dir: str) -> tuple:
-    """Return (patch_size, merge_size) from the model's processor config."""
-    try:
-        from transformers import AutoProcessor
-
-        processor = AutoProcessor.from_pretrained(model_dir)
-        image_processor = processor.image_processor
-        return image_processor.patch_size, image_processor.merge_size
-    except Exception:
-        # Fall back to the raw preprocessor config; still model-derived.
-        with open(os.path.join(model_dir, "preprocessor_config.json"), encoding="utf-8") as f:
-            config = json.load(f)
-        return config["patch_size"], config["merge_size"]
+    """Return (patch_size, merge_size) from the model's preprocessor config."""
+    with open(os.path.join(model_dir, "preprocessor_config.json"), encoding="utf-8") as f:
+        config = json.load(f)
+    return config["patch_size"], config["merge_size"]
 
 
 @pytest.mark.skipif(
