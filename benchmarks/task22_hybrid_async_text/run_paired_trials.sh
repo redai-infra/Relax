@@ -103,7 +103,8 @@ run_component() {
         while true; do
             local sample_time
             sample_time="$(date --iso-8601=seconds)"
-            nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total \
+            nvidia-smi --id="${ACTOR_GPU},${ROLLOUT_GPU}" \
+                --query-gpu=index,utilization.gpu,memory.used,memory.total \
                 --format=csv,noheader,nounits | while IFS= read -r row; do
                 printf '%s,%s\n' "${sample_time}" "${row}"
             done

@@ -582,7 +582,8 @@ def write_report(summaries: list[dict[str, Any]], path: Path) -> None:
             "",
             "## 固定工作量与方法",
             "",
-            "- 硬件：物理 GPU 2 和 3，均为 NVIDIA RTX PRO 6000 Blackwell；Actor 1 卡、Rollout 1 卡。",
+            f"- 硬件：物理 GPU {environment['actor_gpu']} 和 {environment['rollout_gpu']}，"
+            f"均为 {environment['gpu_name']}；Actor 1 卡、Rollout 1 卡。",
             f"- 主机：{environment['cpu_logical_count']} 个逻辑 CPU（{environment['cpu_model']}），"
             f"内存 {int(environment['memory_total_kib']) / 1024**2:.1f} GiB。",
             f"- 运行时：{environment['python']}；Torch {environment['torch']}（CUDA "

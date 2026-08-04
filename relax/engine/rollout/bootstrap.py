@@ -14,7 +14,8 @@ logger = get_logger(__name__)
 
 
 def resolve_rl_num_rollout(config: Namespace, data_source: Any) -> None:
-    """Resolve RL epoch sizing before Actor and Rollout services are created."""
+    """Resolve RL epoch sizing before Actor and Rollout services are
+    created."""
     if getattr(config, "loss_type", None) == "sft":
         return
 
