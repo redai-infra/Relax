@@ -3635,6 +3635,8 @@ def slime_validate_args(args):
             setattr(args, k, v)
 
     if args.advantage_estimator == "dr_grpo":
+        if type(args.rollout_max_response_len) is not int or args.rollout_max_response_len <= 0:
+            raise ValueError("--rollout-max-response-len must be a positive integer for Dr.GRPO.")
         args.calculate_per_token_loss = True
         logger.info("Dr.GRPO selected Megatron per-token normalization.")
 

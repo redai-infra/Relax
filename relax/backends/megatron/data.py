@@ -668,7 +668,7 @@ class DataIterator:
         self.offset = 0
         self.microbatch_offset = 0
 
-    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
+    def get_next(self, keys: Sequence[str]) -> dict[str, Any]:
         """Return the next micro-batch for the requested keys.
 
         - If `micro_batch_indices` is provided, selects rows according to the current
