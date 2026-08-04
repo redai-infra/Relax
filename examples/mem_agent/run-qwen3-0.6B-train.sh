@@ -11,6 +11,7 @@ DATA_DIR="${DATA_DIR:?Set DATA_DIR to the screened Task 36 pilot data directory.
 RUN_ROOT="${RUN_ROOT:?Set RUN_ROOT to the Task 36 experiment output directory.}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
 TRAIN_DATA="${TRAIN_DATA:-${DATA_DIR}/pilot-train.jsonl}"
+SELECTION_MANIFEST="${SELECTION_MANIFEST:-${DATA_DIR}/pilot-selection.manifest.json}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-20}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"
@@ -24,8 +25,8 @@ RUN_NAME="${RUN_NAME:-mem-agent-qwen3-0.6b-pilot}"
   echo "Missing Pass@N-screened pilot data: ${TRAIN_DATA}" >&2
   exit 1
 }
-[[ -f "${DATA_DIR}/pilot-selection.manifest.json" ]] || {
-  echo "Missing pilot selection manifest; baseline screening must run before training." >&2
+[[ -f "${SELECTION_MANIFEST}" ]] || {
+  echo "Missing selection manifest: ${SELECTION_MANIFEST}; baseline screening must run before training." >&2
   exit 1
 }
 [[ -f "${MODEL_PATH}/config.json" ]] || { echo "Missing model config: ${MODEL_PATH}/config.json" >&2; exit 1; }

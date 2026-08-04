@@ -137,6 +137,98 @@ def build_candidates(
     }
 
 
+def freeze_static_splits(
+    rows: list[dict[str, Any]],
+    tokenizer: Any,
+    *,
+    chunk_tokens: int,
+    min_chunks: int,
+    max_chunks: int,
+    train_candidate_count: int,
+    smoke_count: int,
+    diagnostic_count: int,
+    heldout_count: int,
+    seed: int,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    """Freeze disjoint IDs before any outcome-based Pass@N screening.
+
+    Held-out and diagnostic rows are placed first in the deterministic shuffle.
+    Increasing only the training candidate count therefore cannot silently
+    change either evaluation split.
+    """
+    counts = {
+        "train_candidate": train_candidate_count,
+        "smoke": smoke_count,
+        "diagnostic": diagnostic_count,
+        "heldout": heldout_count,
+    }
+    if any(count <= 0 for count in counts.values()):
+        raise ValueError("All static split counts must be positive.")
+
+    selected, filter_manifest = build_candidates(
+        rows,
+        tokenizer,
+        chunk_tokens=chunk_tokens,
+        min_chunks=min_chunks,
+        max_chunks=max_chunks,
+        candidate_count=sum(counts.values()),
+        seed=seed,
+    )
+    ids = [str(row["_id"]) for row in selected]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Static pilot candidates contain duplicate IDs.")
+
+    heldout_end = heldout_count
+    diagnostic_end = heldout_end + diagnostic_count
+    smoke_end = diagnostic_end + smoke_count
+    heldout_rows = selected[:heldout_end]
+    diagnostic_rows = selected[heldout_end:diagnostic_end]
+    smoke_rows = selected[diagnostic_end:smoke_end]
+    train_candidates = selected[smoke_end:]
+    split_rows = {
+        "train_candidate": train_candidates,
+        "smoke": smoke_rows,
+        "diagnostic": diagnostic_rows,
+        "heldout": heldout_rows,
+    }
+    for split, split_items in split_rows.items():
+        for row in split_items:
+            row.setdefault("metadata", {}).setdefault("pilot", {})["static_split"] = split
+
+    split_ids = {split: [str(row["_id"]) for row in split_items] for split, split_items in split_rows.items()}
+    assert not (set(split_ids["train_candidate"]) & set(split_ids["diagnostic"]))
+    assert not (set(split_ids["train_candidate"]) & set(split_ids["heldout"]))
+    assert not (set(split_ids["train_candidate"]) & set(split_ids["smoke"]))
+    assert not (set(split_ids["smoke"]) & set(split_ids["diagnostic"]))
+    assert not (set(split_ids["smoke"]) & set(split_ids["heldout"]))
+    assert not (set(split_ids["diagnostic"]) & set(split_ids["heldout"]))
+    return (
+        train_candidates,
+        smoke_rows,
+        diagnostic_rows,
+        heldout_rows,
+        {
+            "schema_version": "mem-agent-pilot-static-splits-v1",
+            "seed": seed,
+            "counts": counts,
+            "selected_ids": split_ids,
+            "pass_at_n_screening": {
+                "train_candidate": "pending",
+                "smoke": "pending",
+                "diagnostic": "forbidden",
+                "heldout": "forbidden",
+            },
+            "filter": filter_manifest,
+        },
+    )
+
+
 def _screening_groups(
     candidates: list[dict[str, Any]],
     records: list[dict[str, Any]],
@@ -310,6 +402,23 @@ def main() -> None:
     candidates.add_argument("--seed", type=int, default=42)
     candidates.add_argument("--allow-answer-not-in-context", action="store_true")
 
+    freeze = subparsers.add_parser("freeze")
+    freeze.add_argument("--input", type=Path, required=True)
+    freeze.add_argument("--tokenizer", required=True)
+    freeze.add_argument("--train-candidates-output", type=Path, required=True)
+    freeze.add_argument("--smoke-output", type=Path, required=True)
+    freeze.add_argument("--diagnostic-output", type=Path, required=True)
+    freeze.add_argument("--heldout-output", type=Path, required=True)
+    freeze.add_argument("--manifest", type=Path, required=True)
+    freeze.add_argument("--chunk-tokens", type=int, default=512)
+    freeze.add_argument("--min-chunks", type=int, default=2)
+    freeze.add_argument("--max-chunks", type=int, default=4)
+    freeze.add_argument("--train-candidate-count", type=int, default=4000)
+    freeze.add_argument("--smoke-count", type=int, default=48)
+    freeze.add_argument("--diagnostic-count", type=int, default=128)
+    freeze.add_argument("--heldout-count", type=int, default=500)
+    freeze.add_argument("--seed", type=int, default=42)
+
     select = subparsers.add_parser("select")
     select.add_argument("--candidates", type=Path, required=True)
     select.add_argument("--baseline-records", type=Path, required=True)
@@ -343,6 +452,47 @@ def main() -> None:
                 "source_sha256": sha256_file(args.input),
                 "output_file": str(args.output),
                 "output_sha256": sha256_file(args.output),
+                "tokenizer": args.tokenizer,
+            }
+        )
+        _write_manifest(args.manifest, manifest)
+        return
+
+    if args.command == "freeze":
+        from transformers import AutoTokenizer
+
+        train_candidates, smoke_rows, diagnostic_rows, heldout_rows, manifest = freeze_static_splits(
+            read_jsonl(args.input),
+            AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True),
+            chunk_tokens=args.chunk_tokens,
+            min_chunks=args.min_chunks,
+            max_chunks=args.max_chunks,
+            train_candidate_count=args.train_candidate_count,
+            smoke_count=args.smoke_count,
+            diagnostic_count=args.diagnostic_count,
+            heldout_count=args.heldout_count,
+            seed=args.seed,
+        )
+        outputs = {
+            "train_candidate": (args.train_candidates_output, train_candidates),
+            "smoke": (args.smoke_output, smoke_rows),
+            "diagnostic": (args.diagnostic_output, diagnostic_rows),
+            "heldout": (args.heldout_output, heldout_rows),
+        }
+        for _, (path, output_rows) in outputs.items():
+            write_jsonl(path, output_rows)
+        manifest.update(
+            {
+                "source_file": str(args.input),
+                "source_sha256": sha256_file(args.input),
+                "outputs": {
+                    split: {
+                        "file": str(path),
+                        "rows": len(output_rows),
+                        "sha256": sha256_file(path),
+                    }
+                    for split, (path, output_rows) in outputs.items()
+                },
                 "tokenizer": args.tokenizer,
             }
         )

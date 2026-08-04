@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from examples.mem_agent.prepare_pilot_data import build_candidates, select_pilot_sets
+from examples.mem_agent.prepare_pilot_data import build_candidates, freeze_static_splits, select_pilot_sets
 
 
 class CharacterTokenizer:
@@ -96,3 +96,31 @@ def test_pass_at_n_selection_fails_before_gpu_training_when_pool_is_too_hard():
             eval_count=1,
             seed=42,
         )
+
+
+def test_static_splits_are_disjoint_and_freeze_heldout_before_screening():
+    rows = [_row(index, f"abcdx{index}ef") | {"_id": f"q{index}"} for index in range(10)]
+
+    train, smoke, diagnostic, heldout, manifest = freeze_static_splits(
+        rows,
+        CharacterTokenizer(),
+        chunk_tokens=4,
+        min_chunks=2,
+        max_chunks=3,
+        train_candidate_count=4,
+        smoke_count=1,
+        diagnostic_count=2,
+        heldout_count=2,
+        seed=42,
+    )
+
+    split_ids = [{row["_id"] for row in split} for split in (train, smoke, diagnostic, heldout)]
+    assert [len(split) for split in (train, smoke, diagnostic, heldout)] == [4, 1, 2, 2]
+    assert sum(len(left & right) for index, left in enumerate(split_ids) for right in split_ids[index + 1 :]) == 0
+    assert all(row["metadata"]["pilot"]["static_split"] == "heldout" for row in heldout)
+    assert manifest["pass_at_n_screening"] == {
+        "train_candidate": "pending",
+        "smoke": "pending",
+        "diagnostic": "forbidden",
+        "heldout": "forbidden",
+    }

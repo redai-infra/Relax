@@ -43,6 +43,8 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     train = (EXAMPLE / "run-qwen3-0.6B-train.sh").read_text(encoding="utf-8")
     baseline = (EXAMPLE / "run-qwen3-0.6B-baseline.sh").read_text(encoding="utf-8")
     evaluation = (EXAMPLE / "run-qwen3-0.6B-eval.sh").read_text(encoding="utf-8")
+    formal_prepare = (EXAMPLE / "prepare-qwen3-0.6B-formal-data.sh").read_text(encoding="utf-8")
+    formal_screen = (EXAMPLE / "run-qwen3-0.6B-formal-screen.sh").read_text(encoding="utf-8")
 
     assert config["model_id"] == "Qwen/Qwen3-0.6B"
     assert config["model_revision"] == "c1899de289a04d12100db370d81485cdf75e47ca"
@@ -59,7 +61,7 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert "--rollout-max-context-len 1536" in train
     assert "--max-tokens-per-gpu 1536" in train
     assert "--log-passrate" in train
-    assert "pilot-selection.manifest.json" in train
+    assert 'SELECTION_MANIFEST="${SELECTION_MANIFEST:-${DATA_DIR}/pilot-selection.manifest.json}"' in train
     assert "training-reward.svg" in train
     assert '--expected-steps "${NUM_ROLLOUT}"' in train
     assert '--samples-per-item "${SAMPLES_PER_ITEM}"' in baseline
@@ -72,6 +74,14 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert 'GPU_LOG="${RESULTS_DIR}/${RUN_NAME}.gpu.csv"' in evaluation
     assert 'export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in baseline
     assert 'export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in evaluation
+    assert 'TRAIN_CANDIDATE_COUNT="${TRAIN_CANDIDATE_COUNT:-4000}"' in formal_prepare
+    assert 'SMOKE_COUNT="${SMOKE_COUNT:-48}"' in formal_prepare
+    assert 'DIAGNOSTIC_COUNT="${DIAGNOSTIC_COUNT:-128}"' in formal_prepare
+    assert 'HELDOUT_COUNT="${HELDOUT_COUNT:-500}"' in formal_prepare
+    assert 'TRAIN_COUNT="${TRAIN_COUNT:-1000}"' in formal_screen
+    assert 'CONCURRENCY="${CONCURRENCY:-32}"' in formal_screen
+    assert "--eval-count 0" in formal_screen
+    assert "formal-heldout.jsonl" not in formal_screen
 
 
 def test_reward_exposes_a_step_level_raw_reward_metric():
