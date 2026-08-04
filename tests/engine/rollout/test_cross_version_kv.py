@@ -9,6 +9,7 @@ from relax.utils.cross_version_kv import (
     clear_cross_version_kv_task_markers,
     count_cross_version_kv_progress_hedge_groups,
     cross_version_kv_group_ready_for_finalize,
+    cross_version_kv_group_requires_strict_retry,
     cross_version_kv_pause_mode,
     cross_version_kv_resident_cap,
     cross_version_kv_strict_refresh,
@@ -87,6 +88,14 @@ def test_mixed_group_defers_group_finalize_until_retry_completes() -> None:
     aborted.status = "completed"
 
     assert cross_version_kv_group_ready_for_finalize([completed, aborted])
+
+
+def test_targeted_retirement_requires_strict_retry_before_carry_adoption() -> None:
+    targeted = SimpleNamespace(metadata={"targeted_retirement_aborted": True})
+    ordinary = SimpleNamespace(metadata={})
+
+    assert cross_version_kv_group_requires_strict_retry([ordinary, targeted])
+    assert not cross_version_kv_group_requires_strict_retry([ordinary])
 
 
 def test_progress_hedge_prevents_carried_fresh_from_freezing_current_work() -> None:
@@ -174,12 +183,14 @@ def test_abort_to_buffer_clears_all_task_lifetime_markers() -> None:
             "a3_progress_hedge": True,
             "cross_version_kv_carried": True,
             "cross_version_kv_carryovers": 2,
+            "targeted_retirement_aborted": True,
         }
     )
 
     assert clear_cross_version_kv_task_markers([sample])
     assert "a3_progress_hedge" not in sample.metadata
     assert "cross_version_kv_carried" not in sample.metadata
+    assert "targeted_retirement_aborted" not in sample.metadata
     assert sample.metadata["cross_version_kv_carryovers"] == 2
 
 

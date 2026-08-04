@@ -13,9 +13,11 @@ Provides:
 
 import asyncio
 import time
+from collections.abc import Callable, Mapping
 from typing import Any, Dict, Optional, Sequence
 
 import httpx
+import torch
 
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
 from relax.distributed.checkpoint_service.config import BackendType, DCSConfig, RoleInfo
@@ -59,6 +61,7 @@ class CheckpointEngineClient:
         model_name: Optional[str] = None,
         quantization_config: Optional[Dict[str, int | str | list[str]]] = None,
         lock: Any = None,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ):
         """Initialize checkpoint engine client.
 
@@ -77,6 +80,8 @@ class CheckpointEngineClient:
             model_name (Optional[str]): Model name (e.g., "qwen3-4B"). Default: None
             quantization_config (Optional[Dict]): Quantization configuration. Default: None
             lock :
+            weights_getter: Optional snapshot source for Actor-to-Rollout DCS
+                updates. Defaults to reading the live model.
         """
         self.coordinator_url = coordinator_url.rstrip("/")
         self.config = config or DCSConfig()
@@ -97,6 +102,7 @@ class CheckpointEngineClient:
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.lock = lock
+        self.weights_getter = weights_getter
 
         # State
         self._registered = False
@@ -250,6 +256,7 @@ class CheckpointEngineClient:
                 quantization_config=self.quantization_config,
                 coordinator_url=self.coordinator_url,
                 lock=lock,
+                weights_getter=self.weights_getter,
             )
 
     async def init_process_groups_for_actor_fwd_ref(self, rollout_id: int) -> None:
@@ -279,16 +286,26 @@ class CheckpointEngineClient:
             return
         self._backend.recv_weight()
 
-    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
+    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> dict[str, Any]:
         """Update weights for rollout role from trainer."""
+        started_at = time.monotonic()
         response = await self._http_client.get(f"{self.coordinator_url}/topology")
         response.raise_for_status()
         data = response.json()
         logger.info(f"get topology: {data}")
+        topology_seconds = time.monotonic() - started_at
+        group_metrics = {}
         if not actor_fwd_only:
-            self._backend.init_process_group_for_rollout(data)
-        self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
+            group_metrics = self._backend.init_process_group_for_rollout(data) or {}
+        weight_metrics = self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only) or {}
+        metrics = {
+            "topology_seconds": topology_seconds,
+            **group_metrics,
+            **weight_metrics,
+            "client_total_seconds": time.monotonic() - started_at,
+        }
         logger.info("Weights updated for rollout role.")
+        return metrics
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat signals to coordinator."""

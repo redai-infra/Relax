@@ -44,6 +44,7 @@ from relax.utils.cross_version_kv import (
     clear_cross_version_kv_task_markers,
     count_cross_version_kv_progress_hedge_groups,
     cross_version_kv_enabled,
+    cross_version_kv_group_requires_strict_retry,
     estimate_cross_version_kv_group_remaining_tokens,
     mark_cross_version_kv_carry,
     plan_cross_version_kv_progress_hedge,
@@ -422,7 +423,7 @@ async def generate_rollout_async_with_sync_intent(
             cross_version_fallback = (
                 group_aborted
                 and cross_version_kv_enabled(args)
-                and any(sample.metadata.get("cross_version_kv_carried") for sample in group)
+                and cross_version_kv_group_requires_strict_retry(group)
             )
             if cross_version_fallback:
                 # Fail closed for the rest of this physical rollout: do not
@@ -434,6 +435,7 @@ async def generate_rollout_async_with_sync_intent(
                 for sample in group:
                     if sample.status == Sample.Status.ABORTED:
                         sample.abort_count += 1
+                    sample.metadata.pop("targeted_retirement_aborted", None)
                     sample.metadata["cross_version_kv_carried"] = False
                     sample.metadata["cross_version_kv_carryovers"] = 0
                     sample.metadata["cross_version_kv_fallbacks"] = (

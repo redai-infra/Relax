@@ -56,6 +56,18 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+def test_hybrid_gpu_snapshot_aliases_share_one_destination(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    canonical = parser.parse_args(["--hybrid-weights-backuper-on-gpu"])
+    maintainer_spelling = parser.parse_args(["--hybrid-weights-backup-on-gpu"])
+
+    assert canonical.hybrid_weights_backuper_on_gpu is True
+    assert maintainer_spelling.hybrid_weights_backuper_on_gpu is True
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
@@ -183,6 +195,25 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+def test_hybrid_dcs_weight_sync_requires_hybrid(arguments_module):
+    args = _opd_args()
+    args.hybrid_dcs_weight_sync = True
+
+    with pytest.raises(ValueError, match="requires --hybrid"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_hybrid_dcs_weight_sync_joint_mode_requires_slime_router(arguments_module):
+    args = _opd_args()
+    args.hybrid = True
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    args.use_slime_router = False
+
+    with pytest.raises(ValueError, match="requires --use-slime-router"):
+        arguments_module.slime_validate_args(args)
 
 
 def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):

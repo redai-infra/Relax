@@ -30,11 +30,17 @@ cd "$REPO"
 
 "$PYTHON_BIN" -m py_compile \
     relax/backends/megatron/actor.py \
+    relax/distributed/checkpoint_service/backends/device_direct.py \
+    relax/distributed/checkpoint_service/client/engine.py \
     relax/engine/rollout/permit_observability.py \
     relax/engine/rollout/request_permit.py \
     relax/engine/rollout/sglang_rollout.py \
+    relax/engine/rollout/sync_intent_rollout.py \
+    relax/engine/router/request_version_ledger.py \
     relax/engine/router/router.py \
     relax/engine/router/work_accounting.py \
+    relax/utils/cross_version_kv.py \
+    scripts/task22/analyze_dcs_weight_sync.py \
     scripts/task22/analyze_phase_elastic_calibration.py \
     scripts/task22/smoke_sglang_calibration.py \
     scripts/task22/validate_zero_kl_baseline_contract.py
@@ -46,10 +52,14 @@ if [[ "${TASK22_FAST_PREFLIGHT:-0}" != "1" ]]; then
         tests/engine/rollout/test_request_permit_snapshot.py \
         tests/engine/rollout/test_cross_version_kv.py \
         tests/engine/rollout/test_sync_intent.py \
+        tests/engine/router/test_request_version_ledger.py \
         tests/engine/router/test_work_accounting.py \
         tests/engine/router/test_slime_router_work_lifecycle.py \
+        tests/distributed/checkpoint_service/test_dcs_weight_sync_metrics.py \
+        tests/tools/test_task22_dcs_weight_sync_analyzer.py \
         tests/tools/test_task22_phase_elastic_calibration_analyzer.py \
-        tests/tools/test_task22_zero_kl_baseline_contract.py
+        tests/tools/test_task22_zero_kl_baseline_contract.py \
+        tests/utils/test_tensor_backuper_gpu_snapshot.py
 else
     echo "TASK22_ZERO_KL_PREFLIGHT tests=SKIPPED_LOCAL_VERIFIED"
 fi
@@ -83,6 +93,17 @@ print("TASK22_ZERO_KL_PREFLIGHT gpu_contract=PASS")
 PY
 
 TASK22_PYTHON="$PYTHON_BIN" scripts/task22/prepare_sglang_calibration.sh
+
+if [[ "${TASK22_EXPERIMENT_ARM:-baseline}" == "dcs_joint_on" ]]; then
+    "$PYTHON_BIN" - <<'PY'
+from sglang.srt.managers.io_struct import GenerateReqInput
+
+fields = getattr(GenerateReqInput, "__dataclass_fields__", {})
+if "extra_key" not in fields:
+    raise SystemExit("joint DCS requires SGLang GenerateReqInput.extra_key")
+print("TASK22_ZERO_KL_PREFLIGHT sglang_extra_key=PASS")
+PY
+fi
 
 [[ -r "$MODEL_DIR/Qwen3-4B/config.json" ]] || {
     echo "Qwen3-4B checkpoint is missing" >&2

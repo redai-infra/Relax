@@ -11,6 +11,7 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 _PIN_MEMORY = device_utils.use_pinned_host_memory()
+_MEGATRON_TP_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
 
 
 class TensorBackuper(ABC):
@@ -34,7 +35,7 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def backup(self, tag: str):
+    def backup(self, tag: str, *, on_device: bool = False):
         raise NotImplementedError
 
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -49,6 +50,7 @@ class _TensorBackuperNormal(TensorBackuper):
     def __init__(self, source_getter):
         super().__init__(source_getter=source_getter)
         self._backups: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+        self._backup_on_device: dict[str, bool] = {}
 
     @property
     def backup_tags(self):
@@ -58,11 +60,22 @@ class _TensorBackuperNormal(TensorBackuper):
         return self._backups[tag]
 
     @torch.no_grad()
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
+        from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
+
         backup_dict = self._backups[tag]
+        prior_policy = self._backup_on_device.setdefault(tag, on_device)
+        if prior_policy != on_device:
+            raise RuntimeError(f"TensorBackuper tag {tag!r} changed device policy")
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                target_device = param.device if on_device else torch.device("cpu")
+                snapshot = torch.empty_like(param, device=target_device, pin_memory=_PIN_MEMORY and not on_device)
+                for attr in _MEGATRON_TP_ATTRS:
+                    if hasattr(param, attr):
+                        setattr(snapshot, attr, getattr(param, attr))
+                set_defaults_if_not_set_tensor_model_parallel_attributes(snapshot)
+                backup_dict[name] = snapshot
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_utils.synchronize()
 
@@ -97,7 +110,7 @@ class _TensorBackuperNoop(TensorBackuper):
         assert _compute_hash_dict(ans) == self._backup_hash_dict
         return ans
 
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
         device_utils.synchronize()

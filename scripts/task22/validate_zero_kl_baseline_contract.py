@@ -112,7 +112,7 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
     if not isinstance(env, dict) or not all(isinstance(key, str) for key in env):
         raise ContractError("runtime env lacks a string-keyed env_vars object")
     arm = env.get("TASK22_EXPERIMENT_ARM", "baseline")
-    if arm not in {"baseline", "a3_workaware_on"}:
+    if arm not in {"baseline", "a3_workaware_on", "dcs_joint_on"}:
         raise ContractError(f"unknown TASK22_EXPERIMENT_ARM: {arm!r}")
 
     for flag in COMMON_FORBIDDEN_FLAGS:
@@ -120,6 +120,8 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
             raise ContractError(f"forbidden zero-KL baseline flag: {flag}")
     if arm == "baseline":
         arm_forbidden_flags = (
+            "--hybrid-dcs-weight-sync",
+            "--hybrid-weights-backuper-on-gpu",
             "--enable-cross-version-kv-continuation",
             "--cross-version-kv-max-gap",
             "--use-slime-router",
@@ -130,8 +132,8 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         )
         arm_required_flags: tuple[str, ...] = ()
         arm_expected_values: dict[str, str] = {}
-    else:
-        arm_forbidden_flags = ()
+    elif arm == "a3_workaware_on":
+        arm_forbidden_flags = ("--hybrid-dcs-weight-sync", "--hybrid-weights-backuper-on-gpu")
         arm_required_flags = (
             "--enable-cross-version-kv-continuation",
             "--use-slime-router",
@@ -142,6 +144,23 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         arm_expected_values = {
             "--cross-version-kv-max-gap": "2",
             "--sglang-default-priority-value": "0",
+        }
+    else:
+        arm_forbidden_flags = ()
+        arm_required_flags = (
+            "--enable-cross-version-kv-continuation",
+            "--use-slime-router",
+            "--slime-router-work-aware",
+            "--sglang-enable-priority-scheduling",
+            "--sglang-disable-priority-preemption",
+            "--hybrid-dcs-weight-sync",
+            "--hybrid-weights-backuper-on-gpu",
+        )
+        arm_expected_values = {
+            "--cross-version-kv-max-gap": "2",
+            "--sglang-default-priority-value": "0",
+            "--checkpoint-engine-backend": "nccl",
+            "--targeted-retirement-timeout-seconds": "15",
         }
     for flag in arm_forbidden_flags:
         if _positions(argv, flag):
@@ -176,7 +195,8 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         raise ContractError("RELAX_RID_ONLY_REQUEST_LOGGING must be 1")
 
     policy_value = str(env.get("RELAX_SYNC_INTENT_POLICY", "0")).strip().lower()
-    if arm == "baseline":
+    policy_enabled = arm in {"a3_workaware_on", "dcs_joint_on"}
+    if not policy_enabled:
         if policy_value not in DISABLED_VALUES:
             raise ContractError("RELAX_SYNC_INTENT_POLICY must be disabled")
         forbidden_env = sorted(
@@ -212,10 +232,13 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         "resource": EXPECTED_RESOURCE,
         "max_response_tokens": 8192,
         "zero_kl_reference_forward": False,
-        "sync_intent_policy": arm == "a3_workaware_on",
-        "cross_version_kv_continuation": arm == "a3_workaware_on",
-        "priority_scheduling": arm == "a3_workaware_on",
-        "slime_router_work_aware": arm == "a3_workaware_on",
+        "sync_intent_policy": policy_enabled,
+        "cross_version_kv_continuation": policy_enabled,
+        "priority_scheduling": policy_enabled,
+        "slime_router_work_aware": policy_enabled,
+        "hybrid_dcs_weight_sync": arm == "dcs_joint_on",
+        "hybrid_weights_backuper_on_gpu": arm == "dcs_joint_on",
+        "targeted_retirement": arm == "dcs_joint_on",
         "update_weights_interval": 1,
     }
 

@@ -199,6 +199,16 @@ case "$TASK22_EXPERIMENT_ARM" in
         export RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS="15"
         export RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS="600"
         ;;
+    dcs_joint_on)
+        export RELAX_SYNC_INTENT_POLICY="1"
+        export RELAX_SYNC_INTENT_TTL_SECONDS="600"
+        export RELAX_SYNC_INTENT_WINDOW_GROUPS="16"
+        export RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER="1.25"
+        export RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS="2.0"
+        export RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS="0.5"
+        export RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS="15"
+        export RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS="600"
+        ;;
     *)
         echo "Unknown TASK22_EXPERIMENT_ARM=$TASK22_EXPERIMENT_ARM" >&2
         exit 4
@@ -325,7 +335,7 @@ SGLANG_ARGS=(
     --sglang-cuda-graph-max-bs 64
     --sglang-disable-piecewise-cuda-graph
 )
-if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" ]]; then
+if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
     SGLANG_ARGS+=(
         --use-slime-router
         --slime-router-work-aware
@@ -367,10 +377,18 @@ TRAIN_ARGS=(
     "${SGLANG_ARGS[@]}"
     "${MISC_ARGS[@]}"
 )
-if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" ]]; then
+if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
     TRAIN_ARGS+=(
         --enable-cross-version-kv-continuation
         --cross-version-kv-max-gap 2
+    )
+fi
+if [[ "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
+    TRAIN_ARGS+=(
+        --hybrid-dcs-weight-sync
+        --hybrid-weights-backuper-on-gpu
+        --checkpoint-engine-backend nccl
+        --targeted-retirement-timeout-seconds 15
     )
 fi
 
@@ -457,7 +475,11 @@ payload = {
         "purpose": (
             "zero-KL A3 work-aware ON"
             if os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on"
-            else "zero-KL instrumented baseline bottleneck calibration"
+            else (
+                "zero-KL Admission + A3 + targeted retirement + in-place Hybrid DCS ON"
+                if os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on"
+                else "zero-KL instrumented baseline bottleneck calibration"
+            )
         ),
         "historical_wall_directly_comparable": False,
         "reason": "1s scheduler/permit/timing instrumentation enabled; compare only with the matched zero-KL baseline",
@@ -484,10 +506,14 @@ payload = {
         "over_sampling_batch_size_groups": 16,
         "update_weights_interval": 1,
         "zero_kl_reference_forward": False,
-        "sync_intent_policy": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
-        "cross_version_kv_continuation": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
-        "priority_scheduling": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
-        "slime_router_work_aware": os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on",
+        "sync_intent_policy": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
+        "cross_version_kv_continuation": os.environ["TASK22_EXPERIMENT_ARM"]
+        in {"a3_workaware_on", "dcs_joint_on"},
+        "priority_scheduling": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
+        "slime_router_work_aware": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
+        "hybrid_dcs_weight_sync": os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on",
+        "hybrid_weights_backuper_on_gpu": os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on",
+        "targeted_retirement": os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on",
         "rollout_seed": 42,
         "train_seed": 1234,
     },
@@ -509,11 +535,15 @@ payload = {
 repo = Path(os.environ["TASK22_REPO"]).resolve()
 source_paths = {
     "relax_actor": repo / "relax/backends/megatron/actor.py",
+    "relax_dcs_client": repo / "relax/distributed/checkpoint_service/client/engine.py",
+    "relax_dcs_device_direct": repo / "relax/distributed/checkpoint_service/backends/device_direct.py",
     "relax_permit_observability": repo / "relax/engine/rollout/permit_observability.py",
     "relax_request_permit": repo / "relax/engine/rollout/request_permit.py",
     "relax_router": repo / "relax/engine/router/router.py",
+    "relax_router_request_version_ledger": repo / "relax/engine/router/request_version_ledger.py",
     "relax_router_work_accounting": repo / "relax/engine/router/work_accounting.py",
     "relax_sglang_rollout": repo / "relax/engine/rollout/sglang_rollout.py",
+    "relax_tensor_backuper": repo / "relax/utils/training/tensor_backper.py",
 }
 try:
     import importlib.metadata
@@ -562,3 +592,9 @@ PY
     --runtime-env-json="$RUNTIME_ENV_JSON" \
     -- "$PYTHON_BIN" -m relax.entrypoints.train \
     "${TRAIN_ARGS[@]}" 2>&1 | tee "$DRIVER_LOG_PATH"
+
+if [[ "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
+    "$PYTHON_BIN" "$REPO/scripts/task22/analyze_dcs_weight_sync.py" \
+        --driver-log "$DRIVER_LOG_PATH" \
+        --output "$TASK22_LOCAL_RUN_DIR/analysis_dcs_weight_sync.json"
+fi

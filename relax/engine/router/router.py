@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+from relax.engine.router.request_version_ledger import PublicationError, RequestVersionLedger
 from relax.engine.router.work_accounting import WorkerWorkLedger
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -20,6 +21,7 @@ logger = get_logger(__name__)
 WORK_ESTIMATE_HEADER = "x-relax-estimated-tokens"
 WORK_REQUEST_KEY_HEADER = "x-relax-request-key"
 WORK_ORIGIN_HEADER = "x-relax-work-origin"
+PUBLICATION_PREFIX = "_relax/weight_publication"
 
 
 def run_router(args):
@@ -53,6 +55,11 @@ class SlimeRouter:
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
         self.max_weight_version = None
+        self.targeted_publication_enabled = bool(
+            getattr(args, "hybrid_dcs_weight_sync", False)
+            and getattr(args, "enable_cross_version_kv_continuation", False)
+        )
+        self.request_version_ledger = RequestVersionLedger()
 
         # Sticky-session routing: pin a routing key (read from ``sticky_header``) to a
         # worker URL so repeated requests for the same key reuse that worker's prefix/KV
@@ -77,6 +84,11 @@ class SlimeRouter:
             limits=httpx.Limits(max_connections=max_connections),
             timeout=httpx.Timeout(timeout),
         )
+        retirement_timeout = float(getattr(args, "targeted_retirement_timeout_seconds", 15.0))
+        self.control_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=max(max_connections, 64)),
+            timeout=httpx.Timeout(min(retirement_timeout, 5.0)),
+        )
 
         self._setup_routes()
 
@@ -93,6 +105,11 @@ class SlimeRouter:
         self.app.get("/list_workers")(self.list_workers)
         self.app.get("/work_state")(self.work_state)
         self.app.post("/retrieve_from_text")(self.retrieve_from_text)
+        if self.targeted_publication_enabled:
+            self.app.get(f"/{PUBLICATION_PREFIX}/state")(self.publication_state)
+            self.app.post(f"/{PUBLICATION_PREFIX}/prepare")(self.prepare_publication)
+            self.app.post(f"/{PUBLICATION_PREFIX}/commit")(self.commit_publication)
+            self.app.post(f"/{PUBLICATION_PREFIX}/fail")(self.fail_publication)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
 
@@ -168,11 +185,46 @@ class SlimeRouter:
         request_key = request.headers.get(WORK_REQUEST_KEY_HEADER, "")
         work_origin = request.headers.get(WORK_ORIGIN_HEADER, "unknown")
         use_work_accounting = self.work_aware_enabled and path == "generate"
-        worker_url = self._use_url(
-            routing_key,
-            estimated_tokens=estimated_tokens if use_work_accounting else 0,
-            use_work_aware=use_work_accounting,
-        )
+        use_request_version = self.targeted_publication_enabled and path == "generate"
+        body = await request.body()
+        rid = None
+        payload = None
+        if use_request_version:
+            try:
+                payload = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                return JSONResponse(status_code=400, content={"error": "joint publication requires a JSON body"})
+            rid = payload.get("rid") if isinstance(payload, dict) else None
+            if not isinstance(rid, str) or not rid:
+                return JSONResponse(status_code=400, content={"error": "joint publication requires a non-empty rid"})
+            try:
+                request_version = await self.request_version_ledger.register_selected(
+                    rid,
+                    lambda: self._use_url(
+                        routing_key,
+                        estimated_tokens=estimated_tokens if use_work_accounting else 0,
+                        use_work_aware=use_work_accounting,
+                    ),
+                )
+            except PublicationError as exc:
+                return JSONResponse(status_code=503, content={"error": str(exc), "retryable": False})
+            worker_url = request_version.worker
+            base_extra_key = payload.get("extra_key", "")
+            if base_extra_key is not None and not isinstance(base_extra_key, str):
+                await self.request_version_ledger.unregister(rid)
+                self._finish_url(
+                    worker_url,
+                    estimated_tokens=estimated_tokens if use_work_accounting else 0,
+                )
+                return JSONResponse(status_code=400, content={"error": "extra_key must be a string"})
+            payload["extra_key"] = f"{base_extra_key}:weight-version:{request_version.kv_epoch_version}"
+            body = json.dumps(payload, separators=(",", ":")).encode()
+        else:
+            worker_url = self._use_url(
+                routing_key,
+                estimated_tokens=estimated_tokens if use_work_accounting else 0,
+                use_work_aware=use_work_accounting,
+            )
         reserved_tokens_after_select = self.worker_estimated_tokens[worker_url]
         url = f"{worker_url}/{path}"
 
@@ -181,9 +233,8 @@ class SlimeRouter:
         try:
             # Reservation starts at worker selection and must be released even if
             # reading the downstream request body is cancelled.
-            body = await request.body()
             headers = dict(request.headers)
-            for header in (WORK_ESTIMATE_HEADER, WORK_REQUEST_KEY_HEADER, WORK_ORIGIN_HEADER):
+            for header in (WORK_ESTIMATE_HEADER, WORK_REQUEST_KEY_HEADER, WORK_ORIGIN_HEADER, "content-length"):
                 headers.pop(header, None)
             response = await self.client.request(request.method, url, content=body, headers=headers)
             # Eagerly read content so we can return JSON (not streaming)
@@ -232,6 +283,8 @@ class SlimeRouter:
             )
         finally:
             elapsed_seconds = time.monotonic() - request_started_at
+            if rid is not None:
+                await self.request_version_ledger.unregister(rid)
             self._finish_url(
                 worker_url,
                 estimated_tokens=estimated_tokens if use_work_accounting else 0,
@@ -248,6 +301,71 @@ class SlimeRouter:
                     generated_tokens,
                     elapsed_seconds,
                 )
+
+    async def publication_state(self):
+        return await self.request_version_ledger.snapshot()
+
+    async def prepare_publication(self, request: Request):
+        payload = await request.json()
+        target_version = int(payload.get("target_version", -1))
+        max_gap = int(payload.get("max_gap", -1))
+        timeout_seconds = float(payload.get("timeout_seconds", 15.0))
+        started_at = time.monotonic()
+
+        async def abort_request(worker: str, rid: str) -> None:
+            async with self.control_client.stream("POST", f"{worker}/abort_request", json={"rid": rid}) as response:
+                response.raise_for_status()
+                await response.aread()
+
+        plan = await self.request_version_ledger.prepare(
+            target_version=target_version,
+            max_gap=max_gap,
+            abort_request=abort_request,
+            timeout_seconds=timeout_seconds,
+        )
+        result = plan.to_dict()
+        result["prepare_seconds"] = time.monotonic() - started_at
+        logger.info(
+            "TASK22_TARGETED_RETIRE event=prepare publication_id=%s target_version=%s "
+            "active_requests=%s expired_requests=%s safe_requests=%s workers=%s prepare_seconds=%.6f",
+            plan.publication_id,
+            plan.target_version,
+            plan.active_request_count,
+            len(plan.expired_rids),
+            plan.active_request_count - len(plan.expired_rids),
+            len(plan.expired_by_worker),
+            result["prepare_seconds"],
+        )
+        return result
+
+    async def commit_publication(self, request: Request):
+        payload = await request.json()
+        plan = await self.request_version_ledger.commit(
+            str(payload.get("publication_id", "")),
+            int(payload.get("target_version", -1)),
+        )
+        logger.info(
+            "TASK22_TARGETED_RETIRE event=commit publication_id=%s target_version=%s expired_requests=%s",
+            plan.publication_id,
+            plan.target_version,
+            len(plan.expired_rids),
+        )
+        return {"status": "committed", **plan.to_dict()}
+
+    async def fail_publication(self, request: Request):
+        payload = await request.json()
+        plan = await self.request_version_ledger.fail(
+            str(payload.get("publication_id", "")),
+            int(payload.get("target_version", -1)),
+            str(payload.get("reason", "weight publication failed")),
+        )
+        logger.error(
+            "TASK22_TARGETED_RETIRE event=fail publication_id=%s target_version=%s reason=%s",
+            plan.publication_id,
+            plan.target_version,
+            payload.get("reason", "weight publication failed"),
+        )
+        return {"status": "failed", **plan.to_dict()}
 
     async def add_worker(self, request: Request):
         """Add a new worker to the router.

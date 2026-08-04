@@ -178,6 +178,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-dcs-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Hybrid mode only: push Actor weights to Rollout through the synchronous DCS "
+                    "collective path instead of the default CUDA-IPC UpdateWeightFromTensor path. "
+                    "Default off. With cross-version KV continuation this requires the SlimeRouter "
+                    "request-version ledger and targeted retirement protocol."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                "--hybrid-weights-backup-on-gpu",
+                dest="hybrid_weights_backuper_on_gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Hybrid DCS mode only: keep the Actor snapshot used for weight sync on its "
+                    "source GPU instead of host-pinned memory. This removes the snapshot D2H/H2D "
+                    "round trip at the cost of one extra TP-sharded model copy on Actor GPUs."
+                ),
+            )
+            parser.add_argument(
                 "--checkpoint-engine-backend",
                 type=str,
                 default=device_utils.get_dist_backend(),
@@ -894,6 +917,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=2,
                 help="Maximum number of weight publications that an in-flight KV cache may span.",
+            )
+            parser.add_argument(
+                "--targeted-retirement-timeout-seconds",
+                type=float,
+                default=15.0,
+                help=(
+                    "Maximum time to wait for request-level retirement before an in-place "
+                    "DCS weight publication. Used only when Hybrid DCS and cross-version KV "
+                    "continuation are enabled together."
+                ),
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -3064,6 +3097,28 @@ def slime_validate_args(args):
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
         )
+
+    if getattr(args, "hybrid_dcs_weight_sync", False):
+        if not args.hybrid:
+            raise ValueError("--hybrid-dcs-weight-sync requires --hybrid.")
+        if getattr(args, "enable_cross_version_kv_continuation", False):
+            if not getattr(args, "use_slime_router", False):
+                raise ValueError("Joint Hybrid DCS and cross-version KV requires --use-slime-router.")
+            if not getattr(args, "slime_router_work_aware", False):
+                raise ValueError("Joint Hybrid DCS and cross-version KV requires --slime-router-work-aware.")
+            if float(getattr(args, "targeted_retirement_timeout_seconds", 0.0)) <= 0:
+                raise ValueError("--targeted-retirement-timeout-seconds must be positive.")
+        if getattr(args, "offload_train", False) or getattr(args, "offload_rollout", False):
+            raise ValueError("--hybrid-dcs-weight-sync does not yet support train or rollout offload.")
+        if getattr(args, "pipeline_model_parallel_size", 1) != 1:
+            raise ValueError("--hybrid-dcs-weight-sync currently requires --pipeline-model-parallel-size 1.")
+        if getattr(args, "expert_model_parallel_size", 1) != 1:
+            raise ValueError("--hybrid-dcs-weight-sync currently requires --expert-model-parallel-size 1.")
+    if getattr(args, "hybrid_weights_backuper_on_gpu", False):
+        if not getattr(args, "hybrid_dcs_weight_sync", False):
+            raise ValueError("--hybrid-weights-backuper-on-gpu requires --hybrid-dcs-weight-sync.")
+        if not getattr(args, "enable_weights_backuper", True):
+            raise ValueError("--hybrid-weights-backuper-on-gpu requires the weights backuper to remain enabled.")
 
     # Cross-version KV continuation depends on Hybrid's normalized execution
     # flags, so validate only after --hybrid has enabled fully_async+colocate.

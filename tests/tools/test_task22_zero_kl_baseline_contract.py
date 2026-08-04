@@ -71,6 +71,24 @@ def _valid_on_argv():
     ]
 
 
+def _valid_dcs_runtime():
+    runtime = _valid_on_runtime()
+    runtime["env_vars"]["TASK22_EXPERIMENT_ARM"] = "dcs_joint_on"
+    return runtime
+
+
+def _valid_dcs_argv():
+    return [
+        *_valid_on_argv(),
+        "--hybrid-dcs-weight-sync",
+        "--hybrid-weights-backuper-on-gpu",
+        "--checkpoint-engine-backend",
+        "nccl",
+        "--targeted-retirement-timeout-seconds",
+        "15",
+    ]
+
+
 def test_contract_accepts_short_instrumented_zero_kl_baseline() -> None:
     summary = validate_contract(_valid_runtime(), _valid_argv())
 
@@ -92,6 +110,52 @@ def test_contract_accepts_a3_workaware_on() -> None:
     assert summary["cross_version_kv_continuation"] is True
     assert summary["priority_scheduling"] is True
     assert summary["slime_router_work_aware"] is True
+
+
+def test_contract_accepts_joint_dcs_weight_sync_on() -> None:
+    summary = validate_contract(_valid_dcs_runtime(), _valid_dcs_argv())
+
+    assert summary["experiment_arm"] == "dcs_joint_on"
+    assert summary["hybrid_dcs_weight_sync"] is True
+    assert summary["hybrid_weights_backuper_on_gpu"] is True
+    assert summary["sync_intent_policy"] is True
+    assert summary["cross_version_kv_continuation"] is True
+    assert summary["priority_scheduling"] is True
+    assert summary["slime_router_work_aware"] is True
+    assert summary["targeted_retirement"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        (("remove", "--hybrid-dcs-weight-sync", None), "must appear exactly once"),
+        (("remove", "--hybrid-weights-backuper-on-gpu", None), "must appear exactly once"),
+        (("replace", "--checkpoint-engine-backend", "gloo"), "--checkpoint-engine-backend mismatch"),
+        (
+            ("remove", "--enable-cross-version-kv-continuation", None),
+            "must appear exactly once",
+        ),
+        (("remove", "--use-slime-router", None), "must appear exactly once"),
+        (
+            ("replace", "--targeted-retirement-timeout-seconds", "0"),
+            "--targeted-retirement-timeout-seconds mismatch",
+        ),
+    ],
+)
+def test_dcs_contract_rejects_backend_or_arm_drift(mutation, expected) -> None:
+    argv = _valid_dcs_argv()
+    operation, flag, replacement = mutation
+    if operation == "replace":
+        argv[argv.index(flag) + 1] = replacement
+    elif operation == "append":
+        argv.append(flag)
+        if replacement is not None:
+            argv.append(replacement)
+    else:
+        argv.remove(flag)
+
+    with pytest.raises(ContractError, match=expected):
+        validate_contract(_valid_dcs_runtime(), argv)
 
 
 @pytest.mark.parametrize(

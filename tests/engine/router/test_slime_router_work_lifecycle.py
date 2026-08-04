@@ -14,6 +14,8 @@ def _args():
         slime_router_sticky=False,
         slime_router_sticky_idle_secs=600.0,
         slime_router_work_aware=True,
+        hybrid_dcs_weight_sync=False,
+        enable_cross_version_kv_continuation=False,
         slime_router_max_connections=8,
         slime_router_timeout=None,
         slime_router_middleware_paths=[],
@@ -25,8 +27,8 @@ def _args():
     )
 
 
-def _request(*, estimated_tokens: str = "4096") -> Request:
-    body = b"{}"
+def _request(*, estimated_tokens: str = "4096", rid: str | None = None) -> Request:
+    body = json.dumps({"rid": rid} if rid is not None else {}).encode()
     sent = False
 
     async def receive():
@@ -74,3 +76,63 @@ async def test_proxy_returns_retryable_502_and_releases_work_after_downstream_fa
         "reserved_tokens": 0,
         "healthy": True,
     }
+
+
+async def test_targeted_publication_tracks_request_version_and_releases_on_failure() -> None:
+    args = _args()
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    router = SlimeRouter(args)
+    router.work_ledger.add_worker("http://engine-a")
+
+    async def fail(*_args, **_kwargs):
+        raise httpx.ReadError("downstream aborted request")
+
+    router.client.request = fail
+    try:
+        response = await router.proxy(_request(rid="rid-targeted"), "generate")
+        state = await router.request_version_ledger.snapshot()
+    finally:
+        await router.client.aclose()
+        await router.control_client.aclose()
+
+    assert response.status_code == 502
+    assert state["active"] == {}
+    assert router.work_ledger.snapshot()["http://engine-a"]["active_requests"] == 0
+
+
+async def test_targeted_publication_namespaces_cache_by_request_and_weight_epoch() -> None:
+    args = _args()
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    router = SlimeRouter(args)
+    router.work_ledger.add_worker("http://engine-a")
+    router.request_version_ledger.current_version = 3
+    captured = {}
+
+    async def succeed(method, url, *, content, headers):
+        captured.update(
+            {
+                "method": method,
+                "url": url,
+                "payload": json.loads(content),
+                "headers": headers,
+            }
+        )
+        return httpx.Response(
+            200,
+            json={"output_ids": [1], "meta_info": {"completion_tokens": 1}},
+            request=httpx.Request(method, url),
+        )
+
+    router.client.request = succeed
+    try:
+        response = await router.proxy(_request(rid="rid-targeted"), "generate")
+    finally:
+        await router.client.aclose()
+        await router.control_client.aclose()
+
+    assert response.status_code == 200
+    assert captured["payload"]["extra_key"] == ":weight-version:3"
+    assert "content-length" not in captured["headers"]
+    assert (await router.request_version_ledger.snapshot())["active"] == {}

@@ -17,7 +17,7 @@ import asyncio
 import logging
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -81,6 +81,7 @@ class DeviceDirectBackend(CommBackend):
         coordinator_url=None,
         lock: Any = None,
         timeout_seconds: int = 300,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ) -> None:
         """Initialize DeviceDirectBackend.
 
@@ -94,6 +95,8 @@ class DeviceDirectBackend(CommBackend):
             coordinator_url: URL of the coordinator service
             lock: Remote lock for coordinating weight updates
             timeout_seconds: Operation timeout (default 300)
+            weights_getter: Optional snapshot source for Actor-to-Rollout
+                updates. Defaults to reading the live model.
         """
         super().__init__(backend_type, role_info)
         self.args = args
@@ -105,6 +108,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
+        self._weights_getter = weights_getter
         self.device = next(model[0].parameters()).device if model else device_utils.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
@@ -147,6 +151,83 @@ class DeviceDirectBackend(CommBackend):
         self._lora_sync = LoraAdapterSync(args, model) if self._lora_adapter_mode else None
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
+        self._weight_sync_metrics: dict[str, float | int] | None = None
+        self._active_publication: dict[str, Any] | None = None
+
+    def _targeted_publication_enabled(self) -> bool:
+        return bool(
+            getattr(self.args, "hybrid_dcs_weight_sync", False)
+            and getattr(self.args, "enable_cross_version_kv_continuation", False)
+        )
+
+    def _router_publication_request(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        base_url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
+        response = self.http_client.post(f"{base_url}/_relax/weight_publication/{action}", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def _publication_control(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one router transaction on rank 0 and propagate its result."""
+        result: dict[str, Any] | None = None
+        error: str | None = None
+        if dist.get_rank() == 0:
+            try:
+                result = self._router_publication_request(action, payload)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        objects = [{"result": result, "error": error}]
+        dist.broadcast_object_list(objects, src=0, group=get_gloo_group())
+        outcome = objects[0]
+        if outcome["error"] is not None:
+            raise RuntimeError(f"Router publication {action} failed: {outcome['error']}")
+        return outcome["result"] or {}
+
+    def _rollout_control(self, endpoint: str, payload: dict[str, Any] | None = None) -> None:
+        """Run one rollout control fan-out on rank 0 and propagate errors."""
+        error: str | None = None
+        if dist.get_rank() == 0:
+            try:
+                ray.get(self._batch_request(endpoint, payload))
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        objects = [{"error": error}]
+        dist.broadcast_object_list(objects, src=0, group=get_gloo_group())
+        if objects[0]["error"] is not None:
+            raise RuntimeError(f"Rollout control {endpoint} failed: {objects[0]['error']}")
+
+    def _materialize_weight_source(self) -> list[tuple[str, torch.Tensor]]:
+        """Materialize the configured weight source once per DCS update."""
+        started_at = time.monotonic()
+        moved_bytes = 0
+        if self._weights_getter is None:
+            result = list(named_params_and_buffers(self.args, self.model))
+        else:
+            from megatron.core.tensor_parallel import (
+                copy_tensor_model_parallel_attributes,
+                set_defaults_if_not_set_tensor_model_parallel_attributes,
+            )
+
+            result = []
+            for name, tensor in self._weights_getter().items():
+                if tensor.device != self.device:
+                    moved = tensor.to(self.device)
+                    copy_tensor_model_parallel_attributes(moved, tensor)
+                    if hasattr(tensor, "parallel_mode"):
+                        moved.parallel_mode = tensor.parallel_mode
+                    set_defaults_if_not_set_tensor_model_parallel_attributes(moved)
+                    tensor = moved
+                    moved_bytes += tensor.numel() * tensor.element_size()
+                result.append((name, tensor))
+            if moved_bytes:
+                device_utils.synchronize()
+
+        metrics = self._weight_sync_metrics
+        if metrics is not None:
+            metrics["source_materialize_seconds"] = time.monotonic() - started_at
+            metrics["source_h2d_bytes"] = moved_bytes
+            metrics["source_tensor_count"] = len(result)
+            metrics["source_local_bytes"] = sum(tensor.numel() * tensor.element_size() for _, tensor in result)
+        return result
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -327,12 +408,19 @@ class DeviceDirectBackend(CommBackend):
                 continue
         raise RuntimeError(f"No free port available in range [{port_min}, {port_max}]")
 
-    def init_process_group_for_rollout(self, topology_data: Optional[Dict] = None) -> None:
+    def init_process_group_for_rollout(self, topology_data: Optional[Dict] = None) -> dict[str, Any]:
         """Initialize PyTorch distributed process group for rollout
         communication."""
 
         if self.role_info is None:
             raise RuntimeError("Role info not set. Cannot initialize process group.")
+        started_at = time.monotonic()
+        result = {
+            "group_reused": False,
+            "group_world_size": 0,
+            "rollout_receiver_count": 0,
+            "group_setup_seconds": 0.0,
+        }
         self._is_pp_src_rank = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
         )
@@ -359,7 +447,20 @@ class DeviceDirectBackend(CommBackend):
                 and not self._healthcheck_rollout_engines()
             ):
                 logger.info("Reusing rollout weight-update group (topology unchanged).")
-                return
+                default_gpus = self.args.rollout_num_gpus_per_engine
+                result.update(
+                    {
+                        "group_reused": True,
+                        "group_world_size": 1
+                        + sum(
+                            int((info.get("metadata") or {}).get("num_gpus_per_engine", default_gpus))
+                            for info in self.rollout_topology.values()
+                        ),
+                        "rollout_receiver_count": len(self.rollout_topology),
+                        "group_setup_seconds": time.monotonic() - started_at,
+                    }
+                )
+                return result
 
             # Rebuild path (first update, topology change, or an unhealthy engine):
             # drop any stale engines/group before recreating, and invalidate the
@@ -394,6 +495,8 @@ class DeviceDirectBackend(CommBackend):
                 rank_offsets[int(rank)] = cumulative_offset
                 cumulative_offset += gpus_for_node
             world_size = cumulative_offset
+            result["group_world_size"] = world_size
+            result["rollout_receiver_count"] = len(self.rollout_topology)
 
             max_retries = 3
             last_error = None
@@ -452,6 +555,8 @@ class DeviceDirectBackend(CommBackend):
             # Group successfully (re)built — remember the topology it serves so the
             # next update with the same topology takes the reuse fast path above.
             self._rollout_topology_signature = new_sig
+        result["group_setup_seconds"] = time.monotonic() - started_at
+        return result
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.
@@ -529,14 +634,65 @@ class DeviceDirectBackend(CommBackend):
                     f"Actor_fwd PP{pp_rank} joined group {group_name} as rank {global_rank} (world_size={world_size})"
                 )
 
+    def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> dict[str, float | int | bool]:
+        self._active_publication = None
+        try:
+            return self._update_weights_for_rollout_impl(rollout_only, actor_fwd_only)
+        except BaseException as exc:
+            publication = self._active_publication
+            if publication is not None and dist.get_rank() == 0:
+                try:
+                    self._router_publication_request(
+                        "fail",
+                        {
+                            "publication_id": publication["publication_id"],
+                            "target_version": publication["target_version"],
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                except Exception:
+                    logger.exception("Failed to poison the targeted publication after a DCS error")
+            raise
+        finally:
+            self._active_publication = None
+
     @torch.no_grad()
-    def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
+    def _update_weights_for_rollout_impl(
+        self, rollout_only=False, actor_fwd_only=False
+    ) -> dict[str, float | int | bool]:
         """Update weights used by rollout nodes.
 
-        Sequence: pause rollout generation, flush caches, gather and broadcast
-        model parameters (non-expert then expert), then resume generation.
+        Sequence: materialize weights, prepare the publication boundary, pause
+        rollout generation, gather and broadcast model parameters (non-expert
+        then expert), then resume and commit the boundary.
         """
+        update_started_at = time.monotonic()
         self.weight_version += 1
+        self._weight_sync_metrics = {
+            "weight_version": self.weight_version,
+            "source_materialize_seconds": 0.0,
+            "source_h2d_bytes": 0,
+            "source_tensor_count": 0,
+            "source_local_bytes": 0,
+            "tp_gather_seconds": 0.0,
+            "hf_conversion_seconds": 0.0,
+            "lock_wait_seconds": 0.0,
+            "broadcast_seconds": 0.0,
+            "receiver_finalize_seconds": 0.0,
+            "broadcast_bucket_count": 0,
+            "broadcast_tensor_count": 0,
+            "broadcast_bytes": 0,
+            "fanout_bytes": 0,
+            "pause_flush_seconds": 0.0,
+            "continue_seconds": 0.0,
+            "targeted_prepare_seconds": 0.0,
+            "targeted_active_requests": 0,
+            "targeted_expired_requests": 0,
+            "targeted_safe_requests": 0,
+        }
+        weight_source = self._materialize_weight_source()
+        targeted_publication = self._targeted_publication_enabled() and not actor_fwd_only
+        publication: dict[str, Any] | None = None
 
         # LoRA: in merge mode, pre-gather every adapter to a full tensor so each base weight can
         # be folded before conversion (reuses the existing NCCL broadcast). In adapter mode, the
@@ -547,17 +703,33 @@ class DeviceDirectBackend(CommBackend):
         self._lora_skip_rollout_base = self._lora_adapter_mode and self._lora_sync.base_sync_done
 
         if not actor_fwd_only:
+            if targeted_publication:
+                publication = self._publication_control(
+                    "prepare",
+                    {
+                        "target_version": self.weight_version,
+                        "max_gap": int(self.args.cross_version_kv_max_gap),
+                        "timeout_seconds": float(self.args.targeted_retirement_timeout_seconds),
+                    },
+                )
+                self._active_publication = publication
+                self._weight_sync_metrics["targeted_prepare_seconds"] = float(publication.get("prepare_seconds", 0.0))
+                self._weight_sync_metrics["targeted_active_requests"] = int(publication.get("active_request_count", 0))
+                self._weight_sync_metrics["targeted_expired_requests"] = int(publication.get("expired_count", 0))
+                self._weight_sync_metrics["targeted_safe_requests"] = int(publication.get("safe_count", 0))
+            pause_started_at = time.monotonic()
             if dist.get_rank() == 0:
-                # Pause generation on all rollout nodes
                 logger.info("Pausing generation on all rollout nodes...")
-                ray.get(self._batch_request("/pause_generation"))
+            pause_payload = {"mode": "in_place"} if targeted_publication else None
+            self._rollout_control("/pause_generation", pause_payload)
 
-                # Flush cache on all rollout nodes
-                logger.info("Flushing cache on all rollout nodes...")
-                for rank, engine in self.rollout_engines.items():
-                    ray.get(engine.flush_cache.remote())
-
-            dist.barrier(group=get_gloo_group())
+            if not targeted_publication:
+                if dist.get_rank() == 0:
+                    logger.info("Flushing cache on all rollout nodes...")
+                    for rank, engine in self.rollout_engines.items():
+                        ray.get(engine.flush_cache.remote())
+                dist.barrier(group=get_gloo_group())
+            self._weight_sync_metrics["pause_flush_seconds"] = time.monotonic() - pause_started_at
 
         buffer_size = 0
         converted_named_tensors = []
@@ -565,7 +737,7 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in weight_source:
             if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
@@ -590,7 +762,7 @@ class DeviceDirectBackend(CommBackend):
 
         buffer_size = 0
         named_tensors = []
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in weight_source:
             if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
@@ -630,11 +802,22 @@ class DeviceDirectBackend(CommBackend):
             self._lora_sync.base_sync_done = True
 
         if not actor_fwd_only:
+            continue_started_at = time.monotonic()
             if dist.get_rank() == 0:
-                # Continue generation on all rollout nodes
                 logger.info("Resuming generation on all rollout nodes...")
-                self._batch_request("/continue_generation")
-            dist.barrier(group=get_gloo_group())
+            continue_payload = {"torch_empty_cache": False} if targeted_publication else None
+            self._rollout_control("/continue_generation", continue_payload)
+            self._weight_sync_metrics["continue_seconds"] = time.monotonic() - continue_started_at
+            if targeted_publication:
+                assert publication is not None
+                self._publication_control(
+                    "commit",
+                    {
+                        "publication_id": publication["publication_id"],
+                        "target_version": self.weight_version,
+                    },
+                )
+                self._active_publication = None
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
             # group) when the topology is unchanged. They are torn down only when the
@@ -650,6 +833,10 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_utils.empty_cache()
+        self._weight_sync_metrics["total_seconds"] = time.monotonic() - update_started_at
+        metrics = dict(self._weight_sync_metrics)
+        self._weight_sync_metrics = None
+        return metrics
 
     def _update_weight_from_distributed(
         self,
@@ -666,7 +853,10 @@ class DeviceDirectBackend(CommBackend):
 
         Returns updated buffer size on the source rank, otherwise None.
         """
+        gather_started_at = time.monotonic()
         param = all_gather_param(self.args, name, param)
+        if self._weight_sync_metrics is not None:
+            self._weight_sync_metrics["tp_gather_seconds"] += time.monotonic() - gather_started_at
         if not self._is_pp_src_rank:
             return
 
@@ -691,12 +881,15 @@ class DeviceDirectBackend(CommBackend):
                 convert_param = param
                 if self._lora_merge_mode:
                     convert_param = self._merge_full_base(name, param)
+                conversion_started_at = time.monotonic()
                 if self._use_bridge:
                     converted_named_tensors += self._bridge_converter.convert(name, convert_param)
                 else:
                     converted_named_tensors += convert_to_hf(
                         self.args, self.model_name, name, convert_param, self.quantization_config
                     )
+                if self._weight_sync_metrics is not None:
+                    self._weight_sync_metrics["hf_conversion_seconds"] += time.monotonic() - conversion_started_at
         buffer_size += param_size
         return buffer_size
 
@@ -801,29 +994,49 @@ class DeviceDirectBackend(CommBackend):
         updates complete.
         """
 
-        while not ray.get(self.lock.acquire.remote()):
-            time.sleep(0.1)
-        # Prepare payload for weight update
-        weight_payload = {
-            "names": [name for name, _ in converted_named_tensors],
-            "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
-            "shapes": [param.shape for _, param in converted_named_tensors],
-            "group_name": self._group_name,
-            "weight_version": str(self.weight_version),
-            "flush_cache": False,
-        }
-        # Send weight update to all rollout nodes via Ray actors
-        futures = self._batch_request("/update_weights_from_distributed", weight_payload)
+        lock_started_at = time.monotonic()
+        acquired = False
+        try:
+            while not acquired:
+                acquired = ray.get(self.lock.acquire.remote())
+                if not acquired:
+                    time.sleep(0.1)
+            if self._weight_sync_metrics is not None:
+                self._weight_sync_metrics["lock_wait_seconds"] += time.monotonic() - lock_started_at
+            broadcast_bytes = sum(param.numel() * param.element_size() for _, param in converted_named_tensors)
+            # Prepare payload for weight update
+            weight_payload = {
+                "names": [name for name, _ in converted_named_tensors],
+                "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
+                "shapes": [param.shape for _, param in converted_named_tensors],
+                "group_name": self._group_name,
+                "weight_version": str(self.weight_version),
+                "flush_cache": False,
+            }
+            # Send weight update to all rollout nodes via Ray actors
+            futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
-        # Broadcast weights via PyTorch distributed
-        handles = []
-        for _, param in converted_named_tensors:
-            handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
-        for handle in handles:
-            handle.wait()
-        ray.get(futures)  # Ensure remote update completes
-
-        ray.get(self.lock.release.remote())
+            # Broadcast weights via PyTorch distributed
+            broadcast_started_at = time.monotonic()
+            handles = []
+            for _, param in converted_named_tensors:
+                handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
+            for handle in handles:
+                handle.wait()
+            broadcast_finished_at = time.monotonic()
+            ray.get(futures)  # Ensure remote update completes
+            receiver_finished_at = time.monotonic()
+        finally:
+            if acquired:
+                ray.get(self.lock.release.remote())
+        if self._weight_sync_metrics is not None:
+            self._weight_sync_metrics["broadcast_seconds"] += broadcast_finished_at - broadcast_started_at
+            self._weight_sync_metrics["receiver_finalize_seconds"] += receiver_finished_at - broadcast_finished_at
+            self._weight_sync_metrics["broadcast_bucket_count"] += 1
+            self._weight_sync_metrics["broadcast_tensor_count"] += len(converted_named_tensors)
+            self._weight_sync_metrics["broadcast_bytes"] += broadcast_bytes
+            receiver_count = len(self.rollout_topology)
+            self._weight_sync_metrics["fanout_bytes"] += broadcast_bytes * receiver_count
         if pbar is not None:
             pbar.update(1)
 

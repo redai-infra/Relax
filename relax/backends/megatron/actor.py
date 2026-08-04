@@ -287,7 +287,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
             self._active_model_tag: str | None = "actor"
-            self.weights_backuper.backup("actor")
+            self._actor_snapshot_on_device = bool(
+                self.args.hybrid
+                and getattr(self.args, "hybrid_dcs_weight_sync", False)
+                and getattr(self.args, "hybrid_weights_backuper_on_gpu", False)
+            )
+            self._backup_actor_snapshot(rollout_id=None)
 
             if with_ref:
                 self.load_other_checkpoint("ref", args.ref_load)
@@ -303,7 +308,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 if args.update_weights_interval == 1:
                     self.weights_backuper.backup("rollout_actor")
 
-            update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
             # Push-side repack is decided by the HF config: an FP8 release auto-routes
             # through quantize_params_fp8, a compressed-tensors release through
             # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
@@ -320,15 +324,23 @@ class MegatronTrainRayActor(TrainRayActor):
                 getattr(self.hf_config, "quantization_config", None),
                 args.hf_checkpoint,
             )
-            self.weight_updater = update_weight_cls(
-                self.args,
-                self.model,
-                weights_getter=lambda: self.weights_backuper.get("actor"),
-                model_name=type(self.hf_config).__name__.lower()
-                if self.args.model_name is None
-                else self.args.model_name,
-                quantization_config=push_quant_config,
-            )
+            if self.args.hybrid and getattr(self.args, "hybrid_dcs_weight_sync", False):
+                self.checkpoint_engine_client = self._create_checkpoint_engine_client(
+                    role,
+                    quantization_config=push_quant_config,
+                    weights_getter=lambda: self.weights_backuper.get("actor"),
+                )
+            else:
+                update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+                self.weight_updater = update_weight_cls(
+                    self.args,
+                    self.model,
+                    weights_getter=lambda: self.weights_backuper.get("actor"),
+                    model_name=type(self.hf_config).__name__.lower()
+                    if self.args.model_name is None
+                    else self.args.model_name,
+                    quantization_config=push_quant_config,
+                )
         else:
             is_pp_src_rank = (
                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -402,6 +414,64 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         return start_rollout_id
+
+    def _create_checkpoint_engine_client(self, role, *, quantization_config, weights_getter=None):
+        is_pp_src_rank = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        if is_pp_src_rank:
+            master_address = ray._private.services.get_node_ip_address()
+            with socket.socket() as sock:
+                sock.bind(("", 0))
+                master_port = sock.getsockname()[1]
+        else:
+            master_address = None
+            master_port = None
+        metadata = {
+            "tp_size": mpu.get_tensor_model_parallel_world_size(),
+            "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+            "pp_size": mpu.get_pipeline_model_parallel_world_size(),
+            "ep_size": mpu.get_expert_model_parallel_world_size(),
+            "cp_size": mpu.get_context_parallel_world_size(),
+            "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+            "is_pp_src_rank": is_pp_src_rank,
+            "master_address": master_address,
+            "master_port": master_port,
+        }
+        return run(
+            create_client(
+                args=self.args,
+                coordinator_url=self.args.coordinator_url,
+                role=role,
+                rank=dist.get_rank(),
+                model=self.model,
+                model_name=type(self.hf_config).__name__.lower()
+                if self.args.model_name is None
+                else self.args.model_name,
+                quantization_config=quantization_config,
+                backend_type=self.args.checkpoint_engine_backend,
+                metadata=metadata,
+                lock=self.lock,
+                weights_getter=weights_getter,
+            )
+        )
+
+    def _backup_actor_snapshot(self, rollout_id: int | None) -> None:
+        started_at = time.monotonic()
+        self.weights_backuper.backup("actor", on_device=self._actor_snapshot_on_device)
+        elapsed_seconds = time.monotonic() - started_at
+        if os.environ.get("TASK22_CALIBRATION_DIR") and is_megatron_main_rank():
+            snapshot = self.weights_backuper.get("actor")
+            local_bytes = sum(tensor.numel() * tensor.element_size() for tensor in snapshot.values())
+            logger.info(
+                "TASK22_WEIGHT_SNAPSHOT logical_step=%s on_device=%s "
+                "local_tensors=%s local_bytes=%s elapsed_seconds=%.6f",
+                -1 if rollout_id is None else rollout_id,
+                str(self._actor_snapshot_on_device).lower(),
+                len(snapshot),
+                local_bytes,
+                elapsed_seconds,
+            )
 
     @timer
     def sleep(self) -> None:
@@ -923,7 +993,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        self._backup_actor_snapshot(rollout_id)
 
         # Update ref model if needed
         if (
@@ -1422,7 +1492,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # Update CPU actor weight backup
-        self.weights_backuper.backup("actor")
+        self._backup_actor_snapshot(rollout_id)
 
         # Update ref model if needed
         if (
@@ -1488,7 +1558,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self._update_sync_intent_phase(rollout_id, "weight_sync")
         weight_sync_begin = time.time()
         _task22_calibration_actor_phase(rollout_id, "weight_sync_begin", weight_sync_begin)
-        self.update_weights()
+        self.update_weights(rollout_id=rollout_id)
         _task22_calibration_actor_phase(rollout_id, "weight_sync", weight_sync_begin, time.time())
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
@@ -1729,7 +1799,7 @@ class MegatronTrainRayActor(TrainRayActor):
             destroy_process_groups()
 
     @timer
-    def update_weights(self) -> None:
+    def update_weights(self, rollout_id: int | None = None) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
@@ -1754,6 +1824,58 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_rollout_engines.remote())
             dist.barrier(group=get_gloo_group())
+
+        if self.args.hybrid and getattr(self.args, "hybrid_dcs_weight_sync", False):
+            router_address = ray.get(self.rollout_manager.get_router_address.remote())
+            router_ip = router_address.get("router_ip")
+            router_port = router_address.get("router_port")
+            if not router_ip or not router_port:
+                raise RuntimeError(f"Hybrid DCS requires a live rollout router, got {router_address}")
+            self.args.sglang_router_ip = router_ip
+            self.args.sglang_router_port = router_port
+            metrics = run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+            if dist.get_rank() == 0:
+                logger.info(
+                    "TASK22_DCS_WEIGHT_SYNC logical_step=%s weight_version=%s "
+                    "group_reused=%s group_world_size=%s rollout_receivers=%s "
+                    "topology_seconds=%.6f group_setup_seconds=%.6f "
+                    "source_materialize_seconds=%.6f source_h2d_bytes=%s source_local_bytes=%s "
+                    "tp_gather_seconds=%.6f hf_conversion_seconds=%.6f "
+                    "lock_wait_seconds=%.6f broadcast_seconds=%.6f receiver_finalize_seconds=%.6f "
+                    "pause_flush_seconds=%.6f continue_seconds=%.6f "
+                    "targeted_prepare_seconds=%.6f targeted_active_requests=%s "
+                    "targeted_expired_requests=%s targeted_safe_requests=%s "
+                    "broadcast_buckets=%s broadcast_tensors=%s broadcast_bytes=%s fanout_bytes=%s "
+                    "backend_total_seconds=%.6f client_total_seconds=%.6f",
+                    -1 if rollout_id is None else rollout_id,
+                    metrics.get("weight_version", -1),
+                    str(bool(metrics.get("group_reused", False))).lower(),
+                    metrics.get("group_world_size", 0),
+                    metrics.get("rollout_receiver_count", 0),
+                    float(metrics.get("topology_seconds", 0.0)),
+                    float(metrics.get("group_setup_seconds", 0.0)),
+                    float(metrics.get("source_materialize_seconds", 0.0)),
+                    metrics.get("source_h2d_bytes", 0),
+                    metrics.get("source_local_bytes", 0),
+                    float(metrics.get("tp_gather_seconds", 0.0)),
+                    float(metrics.get("hf_conversion_seconds", 0.0)),
+                    float(metrics.get("lock_wait_seconds", 0.0)),
+                    float(metrics.get("broadcast_seconds", 0.0)),
+                    float(metrics.get("receiver_finalize_seconds", 0.0)),
+                    float(metrics.get("pause_flush_seconds", 0.0)),
+                    float(metrics.get("continue_seconds", 0.0)),
+                    float(metrics.get("targeted_prepare_seconds", 0.0)),
+                    metrics.get("targeted_active_requests", 0),
+                    metrics.get("targeted_expired_requests", 0),
+                    metrics.get("targeted_safe_requests", 0),
+                    metrics.get("broadcast_bucket_count", 0),
+                    metrics.get("broadcast_tensor_count", 0),
+                    metrics.get("broadcast_bytes", 0),
+                    metrics.get("fanout_bytes", 0),
+                    float(metrics.get("total_seconds", 0.0)),
+                    float(metrics.get("client_total_seconds", 0.0)),
+                )
+            return
 
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote()

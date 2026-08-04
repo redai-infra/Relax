@@ -470,8 +470,20 @@ async def generate(
         if permit_observability_dir() is not None and isinstance(sample_metadata, dict)
         else None
     )
-    if calibration_rid is not None:
-        payload["rid"] = str(calibration_rid)
+    targeted_publication = bool(
+        getattr(args, "hybrid_dcs_weight_sync", False) and getattr(args, "enable_cross_version_kv_continuation", False)
+    )
+    request_rid = calibration_rid
+    if targeted_publication and request_rid is None:
+        if sample.session_id is None:
+            raise RuntimeError("targeted publication requires a sample session_id")
+        request_rid = f"relax:{sample.session_id}:attempt:{sample.abort_count}"
+    if request_rid is not None:
+        payload["rid"] = str(request_rid)
+    if targeted_publication:
+        if sample.group_index is None:
+            raise RuntimeError("targeted publication requires a group_index")
+        payload["extra_key"] = f"relax-kv-group:{sample.group_index}:epoch:{sample.abort_count}"
 
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
@@ -488,7 +500,7 @@ async def generate(
         headers.update(
             build_work_routing_headers(
                 sample,
-                request_key=str(calibration_rid or sample.index),
+                request_key=str(request_rid or sample.index),
                 recent_completed_response_lengths=getattr(state, "recent_completed_response_lengths", []),
                 max_response_length=args.rollout_max_response_len,
             )
@@ -587,6 +599,8 @@ async def generate(
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
+    if targeted_publication and sample.status == Sample.Status.ABORTED:
+        sample.metadata["targeted_retirement_aborted"] = True
     _t_post_generate = monotonic() - _t_post_generate_start
 
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}

@@ -234,6 +234,16 @@ def cross_version_kv_group_ready_for_finalize(group: Sequence[object]) -> bool:
     return True
 
 
+def cross_version_kv_group_requires_strict_retry(group: Sequence[object]) -> bool:
+    return any(
+        bool(
+            getattr(sample, "metadata", {}).get("cross_version_kv_carried")
+            or getattr(sample, "metadata", {}).get("targeted_retirement_aborted")
+        )
+        for sample in group
+    )
+
+
 def cross_version_kv_resident_cap(rollout_batch_size: int) -> int:
     if rollout_batch_size <= 0:
         raise ValueError("rollout_batch_size must be positive")
@@ -259,6 +269,7 @@ def clear_cross_version_kv_task_markers(group: Sequence[object]) -> bool:
     was_hedge = clear_cross_version_kv_progress_hedge_marker(group)
     for sample in group:
         metadata = getattr(sample, "metadata", {})
+        metadata.pop("targeted_retirement_aborted", None)
         metadata.pop("cross_version_kv_carried", None)
     return was_hedge
 
