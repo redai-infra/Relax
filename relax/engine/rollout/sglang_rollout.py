@@ -642,6 +642,8 @@ async def _dispatch_generate(
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
     manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
     observe_permit = permit_observability_dir() is not None and not evaluation and not manages_permit
+    if observe_permit and not hasattr(state, "permit_observability_rows"):
+        state.permit_observability_rows = []
     wait_row: dict[str, Any] | None = None
 
     async def _run() -> Sample | list[Sample]:

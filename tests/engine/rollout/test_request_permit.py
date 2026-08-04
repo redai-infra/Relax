@@ -545,6 +545,23 @@ async def test_dispatch_optin_vs_legacy_lock_scope(monkeypatch) -> None:
     assert not optin_state.semaphore.locked()
 
 
+async def test_dispatch_lightweight_state_supports_calibration_observability(monkeypatch, tmp_path) -> None:
+    state = _StubState(capacity=1)
+
+    async def legacy_func(args, sample, sampling_params):
+        return sample
+
+    monkeypatch.setenv("TASK22_CALIBRATION_DIR", str(tmp_path))
+    monkeypatch.setattr(sglang_rollout, "load_function", lambda path: legacy_func)
+
+    sample = _StubSample()
+    await _dispatch_generate(state, _StubArgs("x"), sample, {})
+
+    assert len(state.permit_observability_rows) == 1
+    assert state.permit_observability_rows[0]["permit_wait_status"] == "terminal"
+    assert sample.metadata == {}
+
+
 async def test_group_dispatch_barrier_releases_for_completed_partial_samples() -> None:
     args = SimpleNamespace(
         partial_rollout=True,
