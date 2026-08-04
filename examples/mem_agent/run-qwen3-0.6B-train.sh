@@ -58,6 +58,13 @@ source "${MODEL_CONFIG_DIR}/qwen3-0.6B.sh"
 
 NOW="$(date '+%Y%m%dT%H%M%S%z')"
 LOG_FILE="${RUN_ROOT}/logs/${RUN_NAME}-${NOW}.log"
+GPU_LOG="${RUN_ROOT}/logs/${RUN_NAME}-${NOW}-gpu.csv"
+nvidia-smi \
+  --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu,power.draw \
+  --format=csv,nounits \
+  --loop=5 >"${GPU_LOG}" 2>&1 &
+GPU_MONITOR_PID=$!
+trap 'kill -TERM "${GPU_MONITOR_PID}" 2>/dev/null || true; wait "${GPU_MONITOR_PID}" 2>/dev/null || true' EXIT INT TERM
 
 ray job submit --address="http://127.0.0.1:8265" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \

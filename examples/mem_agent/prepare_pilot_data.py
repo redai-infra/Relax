@@ -2,8 +2,8 @@
 """Build a short-context, non-degenerate Qwen3-0.6B MemAgent pilot set.
 
 The workflow is deliberately two-stage. ``candidates`` filters only immutable
-input properties such as token length. After an untrained recurrent Pass@N
-run, ``select`` keeps prompts with both successes and failures. This gives GRPO
+input properties such as token length. After an untrained recurrent Pass@N run,
+``select`` keeps prompts with both successes and failures. This gives GRPO
 useful within-group reward variance without pretending the screened pilot is a
 formal, unbiased HotpotQA benchmark.
 """
@@ -72,7 +72,8 @@ def build_candidates(
     seed: int,
     require_answer_in_context: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Filter by immutable length/content properties and sample deterministically."""
+    """Filter by immutable length/content properties and sample
+    deterministically."""
     if not 0 < min_chunks <= max_chunks:
         raise ValueError("Expected 0 < min_chunks <= max_chunks.")
     if chunk_tokens <= 0 or candidate_count <= 0:
@@ -195,7 +196,8 @@ def select_pilot_sets(
     preferred_min_successes: int = 2,
     preferred_max_successes: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Select disjoint train/eval diagnostics with Pass@N and reward variance."""
+    """Select disjoint train/eval diagnostics with Pass@N and reward
+    variance."""
     if samples_per_item <= 1:
         raise ValueError("Pass@N screening requires samples_per_item > 1.")
     max_successes = samples_per_item - 1 if max_successes is None else max_successes

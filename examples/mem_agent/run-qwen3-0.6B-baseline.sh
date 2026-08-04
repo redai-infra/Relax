@@ -23,6 +23,14 @@ export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="${NO_PROXY}"
 
 SERVER_LOG="${RESULTS_DIR}/qwen3-0.6b-baseline-server.log"
+GPU_LOG="${RESULTS_DIR}/qwen3-0.6b-baseline-gpu.csv"
+# Keep low-frequency GPU telemetry beside the raw model outputs so startup,
+# OOM and idle/hang diagnoses do not depend on an external dashboard.
+nvidia-smi \
+  --query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu,power.draw \
+  --format=csv,nounits \
+  --loop=5 >"${GPU_LOG}" 2>&1 &
+GPU_MONITOR_PID=$!
 python3 -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host 127.0.0.1 \
@@ -34,7 +42,11 @@ python3 -m sglang.launch_server \
   --trust-remote-code \
   >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
-trap 'kill -TERM "${SERVER_PID}" 2>/dev/null || true; wait "${SERVER_PID}" 2>/dev/null || true' EXIT INT TERM
+cleanup() {
+  kill -TERM "${SERVER_PID}" "${GPU_MONITOR_PID}" 2>/dev/null || true
+  wait "${SERVER_PID}" "${GPU_MONITOR_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 
 for _ in $(seq 1 120); do
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
