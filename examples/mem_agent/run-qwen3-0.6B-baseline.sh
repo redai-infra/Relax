@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the frozen Qwen3-0.6B BF16 checkpoint.}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 DATA_DIR="${DATA_DIR:?Set DATA_DIR to the Task 36 pilot data directory.}"
@@ -21,6 +22,9 @@ mkdir -p "${RESULTS_DIR}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="${NO_PROXY}"
+# The evaluator is executed by file path, so Python otherwise places only
+# examples/mem_agent on sys.path and cannot import examples.mem_agent.*.
+export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 SERVER_LOG="${RESULTS_DIR}/qwen3-0.6b-baseline-server.log"
 GPU_LOG="${RESULTS_DIR}/qwen3-0.6b-baseline-gpu.csv"

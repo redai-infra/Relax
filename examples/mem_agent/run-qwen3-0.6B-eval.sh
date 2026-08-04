@@ -4,6 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a converted Qwen3-0.6B checkpoint.}"
 TOKENIZER_PATH="${TOKENIZER_PATH:?Set TOKENIZER_PATH to the frozen base tokenizer.}"
 EVAL_DATA="${EVAL_DATA:?Set EVAL_DATA to the frozen pilot-eval.jsonl.}"
@@ -19,6 +20,9 @@ mkdir -p "${RESULTS_DIR}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="${NO_PROXY}"
+# Keep standalone file execution import-compatible with the package modules
+# used by eval_ruler_hqa.py.
+export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 SERVER_LOG="${RESULTS_DIR}/${RUN_NAME}.server.log"
 GPU_LOG="${RESULTS_DIR}/${RUN_NAME}.gpu.csv"

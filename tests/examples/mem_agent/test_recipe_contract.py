@@ -70,6 +70,8 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert "qwen3-0.6b-baseline-gpu.csv" in baseline
     assert 'GPU_LOG="${RUN_ROOT}/logs/${RUN_NAME}-${NOW}-gpu.csv"' in train
     assert 'GPU_LOG="${RESULTS_DIR}/${RUN_NAME}.gpu.csv"' in evaluation
+    assert 'export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in baseline
+    assert 'export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in evaluation
 
 
 def test_reward_exposes_a_step_level_raw_reward_metric():
