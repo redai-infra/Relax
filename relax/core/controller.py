@@ -34,6 +34,7 @@ from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.engine.rollout.bootstrap import resolve_rl_num_rollout
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -99,8 +100,9 @@ class Controller:
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
 
-        # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
-        # is launched (RL is resolved later in placement_group.py).
+        # SFT can size directly from its dataset. RL sizing happens after its
+        # data-source actor is created in register_all_serve, still before any
+        # Actor or Rollout service is launched.
         resolve_sft_num_rollout(self.config)
 
         # Initialize data management system
@@ -382,6 +384,10 @@ class Controller:
             if str(role) == "rollout":
                 data_source_cls = load_function(self.config.data_source_path)
                 data_source = ray.remote(num_cpus=1)(data_source_cls).remote(self.config)
+                # Actor and Rollout services are created in parallel for
+                # fully-async training, so resolve epoch boundaries on the
+                # controller before either service receives its config.
+                resolve_rl_num_rollout(self.config, data_source)
             else:
                 data_source = None
             # Optional roles (e.g. reference) may be absent from resource config

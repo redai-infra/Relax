@@ -1,0 +1,43 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from argparse import Namespace
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+
+try:
+    from relax.distributed.ray import placement_group
+    from relax.distributed.ray import rollout as rollout_module
+except (ImportError, AssertionError) as _exc:
+    pytest.skip(f"Relax Ray rollout dependencies unavailable: {_exc}", allow_module_level=True)
+
+
+def test_create_rollout_manager_non_global_dataset_skips_epoch_query(monkeypatch) -> None:
+    get_num_rollout_per_epoch = Mock(side_effect=AssertionError("must not query epoch length"))
+    manager = SimpleNamespace(
+        get_num_rollout_per_epoch=SimpleNamespace(remote=get_num_rollout_per_epoch),
+    )
+    remote_constructor = Mock(return_value=manager)
+    rollout_manager_cls = SimpleNamespace(
+        options=Mock(return_value=SimpleNamespace(remote=remote_constructor)),
+    )
+    monkeypatch.setattr(rollout_module, "RolloutManager", rollout_manager_cls)
+    monkeypatch.setattr(placement_group, "_get_head_node_id", lambda: "01" * 28)
+
+    args = Namespace(
+        loss_type="grpo",
+        rollout_global_dataset=False,
+        num_rollout_per_epoch=None,
+        num_epoch=None,
+        num_rollout=20,
+        check_weight_update_equal=False,
+        offload_rollout=False,
+    )
+
+    returned_manager, num_rollout_per_epoch = placement_group.create_rollout_manager(args, pg=None)
+
+    assert returned_manager is manager
+    assert num_rollout_per_epoch is None
+    get_num_rollout_per_epoch.assert_not_called()
