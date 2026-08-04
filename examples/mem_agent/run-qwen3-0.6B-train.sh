@@ -55,6 +55,10 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
+# local.sh currently reads this variable without a nounset-safe default before
+# replacing it with the detected HAS_NVLINK value. Preserve the same empty
+# semantic explicitly so this `set -u` example can source the common entrypoint.
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-}"
 
 # PPIO exposes many logical CPUs under a much smaller cgroup pids.max. Limit
 # only `ray start`; all other Ray CLI calls retain their original arguments.

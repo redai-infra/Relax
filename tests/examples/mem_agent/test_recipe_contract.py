@@ -75,6 +75,7 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert "pilot-pass-at-n pass_at_n_pct" in evaluation
     assert "qwen3-0.6b-baseline-gpu.csv" in baseline
     assert 'GPU_LOG="${RUN_ROOT}/logs/${RUN_NAME}-${NOW}-gpu.csv"' in train
+    assert 'export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-}"' in train
     assert 'GPU_LOG="${RESULTS_DIR}/${RUN_NAME}.gpu.csv"' in evaluation
     assert 'export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in baseline
     assert 'export PYTHONPATH="${RELAX_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in evaluation
