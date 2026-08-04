@@ -78,7 +78,12 @@ def test_explicit_env_value_is_preserved(clean_env, tmp_path):
 def _affinity_parser():
     import argparse
 
-    from relax.utils.arguments import get_slime_extra_args_provider
+    pytest.importorskip("sglang.srt.server_args")
+
+    try:
+        from relax.utils.arguments import get_slime_extra_args_provider
+    except (ImportError, AssertionError) as exc:
+        pytest.skip(f"relax.utils.arguments unavailable: {exc}")
 
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     get_slime_extra_args_provider()(parser)

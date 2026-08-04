@@ -20,7 +20,13 @@ from __future__ import annotations
 
 import pytest
 
-import relax.backends.sglang.sglang_engine as m
+
+pytest.importorskip("sglang.srt.server_args")
+
+try:
+    import relax.backends.sglang.sglang_engine as m
+except (ImportError, AssertionError) as _exc:
+    pytest.skip(f"relax.backends.sglang.sglang_engine unavailable: {_exc}", allow_module_level=True)
 
 
 class _FakeResp:

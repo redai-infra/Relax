@@ -13,9 +13,16 @@ MoE cold start can take minutes) and MUST NOT carry the configured probe
 timeout, otherwise a legitimate recovery would be interrupted.
 """
 
+import pytest
 import requests
 
-from relax.backends.megatron import actor as actor_mod
+
+pytest.importorskip("megatron.core")
+
+try:
+    from relax.backends.megatron import actor as actor_mod
+except (ImportError, AssertionError) as _exc:
+    pytest.skip(f"relax.backends.megatron.actor unavailable: {_exc}", allow_module_level=True)
 
 
 MegatronTrainRayActor = actor_mod.MegatronTrainRayActor

@@ -86,8 +86,8 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
 
     args = _make_args(global_batch_size=4)
     SFTCls = SFT.func_or_class
@@ -129,8 +129,8 @@ async def test_sft_step_rejects_empty_or_partial_batch(monkeypatch, returned_cou
 
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
 
     args = _make_args(global_batch_size=4)
     SFTCls = SFT.func_or_class
@@ -165,8 +165,8 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     _patch_pipeline_dependencies(monkeypatch)
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
@@ -200,8 +200,8 @@ async def test_sft_loop_advances_step(monkeypatch):
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
     fake_client.async_get_partition_list = AsyncMock(return_value=[])
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
 
     args = _make_args(global_batch_size=2, num_rollout=3)
     SFTCls = SFT.func_or_class

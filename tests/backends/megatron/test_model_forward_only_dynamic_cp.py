@@ -5,7 +5,11 @@
 from argparse import Namespace
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+
+pytest.importorskip("megatron.training.global_vars")
 
 
 class _FakeIterator:
