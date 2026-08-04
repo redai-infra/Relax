@@ -1009,6 +1009,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 run_live_weight_sync(
                     update_weights=lambda: self.update_weights(use_live_weights=True),
                     offload_actor=self.sleep,
+                    # ``sleep`` destroys only reloadable accelerator process
+                    # groups. The dedicated Gloo group stays alive and keeps
+                    # rank 0 from restoring KV while another rank still owns
+                    # Actor memory.
+                    synchronize_after_offload=lambda: dist.barrier(group=get_gloo_group()),
                     onload_rollout_kv=self._onload_rollout_after_weight_sync,
                 )
             else:

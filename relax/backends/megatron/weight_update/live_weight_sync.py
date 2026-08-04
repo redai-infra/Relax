@@ -77,11 +77,13 @@ def run_live_weight_sync(
     *,
     update_weights: Callable[[], None],
     offload_actor: Callable[[], None],
+    synchronize_after_offload: Callable[[], None],
     onload_rollout_kv: Callable[[], None],
 ) -> None:
-    """Keep Actor cleanup mandatory and restore KV only after a successful sync."""
+    """Offload every Actor rank before restoring rollout KV memory."""
     try:
         update_weights()
     finally:
         offload_actor()
+    synchronize_after_offload()
     onload_rollout_kv()
