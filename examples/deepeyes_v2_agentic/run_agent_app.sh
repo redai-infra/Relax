@@ -19,7 +19,7 @@ export OPENAI_API_KEY="${RELAX_SESSION_ID}"
 # 0 but never produced a chat IR) leave no trace, and successful sessions
 # leave no trace either — both make hang/perf debugging impossible.
 #
-# Mirrors nemo_gym_agentic/run_agent_app.sh: tee both streams to a
+# Mirrors nemo_gym_agentic/scripts/run_agent_app.sh: tee both streams to a
 # persistent per-session file keyed by AGENT_DEBUG_LOG_DIR (set by the
 # training launcher to log/agent/${TIMESTAMP}) and keep ALL logs regardless
 # of exit code. The training script picks a fresh ${TIMESTAMP} directory

@@ -62,7 +62,15 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
-        if self.args.offload_train and self.args.train_backend == "megatron":
+        # Only preload the torch_memory_saver hook when it is actually the offload
+        # mechanism. --selective-offload uses application-level selective CPU offload
+        # and must NOT LD_PRELOAD the TMS hook (its global allocator hook + whole-pool
+        # CPU backup would defeat the purpose and confuse torch_memory_saver_preloaded()).
+        if (
+            self.args.offload_train
+            and self.args.train_backend == "megatron"
+            and not getattr(self.args, "selective_offload", False)
+        ):
             import torch_memory_saver
 
             dynlib_path = os.path.join(

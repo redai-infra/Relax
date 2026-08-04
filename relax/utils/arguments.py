@@ -358,6 +358,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
             )
             parser.add_argument(
+                "--selective-offload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Offload the training actor to CPU during colocate sleep/wake by copying only the "
+                    "live train state (weights + optimizer state) instead of torch_memory_saver's "
+                    "whole-pool pause. Default is torch_memory_saver; use this on backends where "
+                    "its VMM pause() is unavailable/unsafe (e.g. Kunlunxin P800)."
+                ),
+            )
+            parser.add_argument(
                 "--disable-weights-backuper",
                 action="store_false",
                 dest="enable_weights_backuper",
@@ -3185,6 +3196,27 @@ def slime_validate_args(args):
 
     if args.use_critic:
         args.offload_train = True
+
+    # expandable_segments cannot coexist with torch_memory_saver, the default mechanism
+    # behind --offload-train. TMS's hook is armed from TMS_INIT_ENABLE inside the
+    # LD_PRELOAD'ed .so before any Python runs, so neither its own sanity check nor any
+    # in-process guard can intervene — the actor just dies with a bare
+    # "CUresult error: 1 (invalid argument)" from cu_mem_create. Fail here instead, while
+    # the message can still be read. Only the CUDA variable names are checked on purpose:
+    # NPU uses a different torch_memory_saver build and its scripts already combine
+    # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True with offload successfully.
+    if args.offload_train and not getattr(args, "selective_offload", False):
+        alloc_conf_sources = {
+            **{name: os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
+            **{key: str(value) for key, value in getattr(args, "train_env_vars", {}).items()},
+        }
+        for name, value in alloc_conf_sources.items():
+            if "expandable_segments:True" in value:
+                raise ValueError(
+                    f"{name} enables expandable_segments, which torch_memory_saver cannot track. "
+                    "Add --selective-offload to use the application-level offload instead, "
+                    "or drop expandable_segments."
+                )
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
