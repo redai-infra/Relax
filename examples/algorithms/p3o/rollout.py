@@ -7,15 +7,24 @@ import os
 from argparse import Namespace
 from typing import Any
 
-from relax.engine.rollout.sglang_rollout import generate as _sglang_generate
 from relax.utils.types import Sample
+
+
+async def _sglang_generate(*args: Any, **kwargs: Any) -> Sample:
+    """Import the heavyweight rollout backend only when generation starts."""
+    from relax.engine.rollout.sglang_rollout import generate
+
+    return await generate(*args, **kwargs)
 
 
 def _behavior_temperature() -> float:
     raw_value = os.environ.get("P3O_BEHAVIOR_TEMPERATURE")
     if raw_value is None:
         raise ValueError("P3O_BEHAVIOR_TEMPERATURE must be set when temperature override is enabled")
-    value = float(raw_value)
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError("P3O_BEHAVIOR_TEMPERATURE must be numeric") from exc
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("P3O_BEHAVIOR_TEMPERATURE must be finite and greater than zero")
     return value

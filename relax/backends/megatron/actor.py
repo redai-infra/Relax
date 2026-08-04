@@ -95,6 +95,7 @@ from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .rollout_policy_lag import (
     ROLLOUT_POLICY_TAG,
+    initial_rollout_policy_snapshot_rollout,
     maybe_refresh_rollout_policy,
     rollout_weights_tag,
     validate_update_weights_interval,
@@ -280,7 +281,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("actor")
             self._rollout_weights_tag = rollout_weights_tag(update_weights_interval)
             # Track the rollout at which rollout policy snapshot was created (for observability)
-            self._rollout_policy_snapshot_rollout = start_rollout_id
+            self._rollout_policy_snapshot_rollout = initial_rollout_policy_snapshot_rollout(start_rollout_id)
             if use_rollout_policy_snapshot:
                 self.weights_backuper.backup(ROLLOUT_POLICY_TAG)
 
@@ -1634,19 +1635,20 @@ class MegatronTrainRayActor(TrainRayActor):
             # Store the rollout at which we refreshed the snapshot
             self._rollout_policy_snapshot_rollout = rollout_id + 1
             logger.info(
-                "Refreshed rollout policy snapshot after rollout_id=%s (update_weights_interval=%s); "
-                "snapshot now at rollout=%s",
-                rollout_id,
-                interval,
-                self._rollout_policy_snapshot_rollout,
-            )
-        else:
-            next_rollout_lag = (rollout_id + 1) % interval
-            logger.info(
-                "Retaining rollout policy snapshot after rollout_id=%s; next rollout policy age=%s rollout(s) "
+                "Refreshed rollout policy snapshot after rollout_id=%s; snapshot version for the next rollout is %s "
                 "(update_weights_interval=%s)",
                 rollout_id,
-                next_rollout_lag,
+                self._rollout_policy_snapshot_rollout,
+                interval,
+            )
+        else:
+            next_rollout_snapshot_age = (rollout_id + 1) % interval
+            logger.info(
+                "Retaining rollout policy snapshot after rollout_id=%s; next rollout snapshot age will be %s "
+                "rollout(s) "
+                "(update_weights_interval=%s)",
+                rollout_id,
+                next_rollout_snapshot_age,
                 interval,
             )
 

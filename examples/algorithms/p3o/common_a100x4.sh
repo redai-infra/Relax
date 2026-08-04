@@ -10,7 +10,7 @@ source "${P3O_REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
 
 P3O_ALGORITHM="${P3O_ALGORITHM:?set P3O_ALGORITHM to p3o or grpo}"
 P3O_ENABLE_TEMPERATURE_OVERRIDE="${P3O_ENABLE_TEMPERATURE_OVERRIDE:-0}"
-P3O_BEHAVIOR_TEMPERATURE="${P3O_BEHAVIOR_TEMPERATURE:-0.6}"
+P3O_BEHAVIOR_TEMPERATURE="${P3O_BEHAVIOR_TEMPERATURE:-}"
 P3O_MAX_STALENESS="${P3O_MAX_STALENESS:-0}"
 P3O_UPDATE_WEIGHTS_INTERVAL="${P3O_UPDATE_WEIGHTS_INTERVAL:-1}"
 P3O_PIPELINE_MODEL_PARALLEL_SIZE="${P3O_PIPELINE_MODEL_PARALLEL_SIZE:-1}"
@@ -29,9 +29,13 @@ if [[ "${P3O_DRY_RUN}" == "1" ]]; then
 else
     : "${P3O_MODEL_DIR:?P3O_MODEL_DIR must be set}"
     : "${P3O_TRAIN_DATA:?P3O_TRAIN_DATA must be set}"
-    : "${P3O_EVAL_DATA:?P3O_EVAL_DATA must be set}"
     : "${P3O_OUTPUT_ROOT:?P3O_OUTPUT_ROOT must be set}"
     : "${P3O_MEGATRON_DIR:?P3O_MEGATRON_DIR must be set}"
+    if [[ "${P3O_MODE}" == "formal" ]]; then
+        : "${P3O_EVAL_DATA:?P3O_EVAL_DATA must be set in formal mode}"
+    else
+        P3O_EVAL_DATA="${P3O_EVAL_DATA:-}"
+    fi
 fi
 
 : "${P3O_RAY_DASHBOARD:?P3O_RAY_DASHBOARD must be set}"
@@ -45,10 +49,18 @@ if [[ "${P3O_ENABLE_TEMPERATURE_OVERRIDE}" != "0" && "${P3O_ENABLE_TEMPERATURE_O
     exit 2
 fi
 if [[ "${P3O_ENABLE_TEMPERATURE_OVERRIDE}" == "1" ]]; then
-    if [[ ! "${P3O_BEHAVIOR_TEMPERATURE}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${P3O_BEHAVIOR_TEMPERATURE}" == "0" ]]; then
-        echo "P3O_BEHAVIOR_TEMPERATURE must be a positive decimal number" >&2
-        exit 2
-    fi
+    python - "${P3O_BEHAVIOR_TEMPERATURE}" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("P3O_BEHAVIOR_TEMPERATURE must be numeric") from exc
+
+if not math.isfinite(value) or value <= 0.0:
+    raise SystemExit("P3O_BEHAVIOR_TEMPERATURE must be finite and greater than zero")
+PY
 fi
 if [[ "${P3O_MODE}" != "formal" && "${P3O_MODE}" != "smoke" ]]; then
     echo "P3O_MODE must be formal or smoke" >&2
@@ -217,12 +229,16 @@ P3O_run() {
         return 0
     fi
 
-    for required_path in "${P3O_MODEL_DIR}" "${P3O_TRAIN_DATA}" "${P3O_EVAL_DATA}"; do
+    for required_path in "${P3O_MODEL_DIR}" "${P3O_TRAIN_DATA}" "${P3O_MEGATRON_DIR}"; do
         if [[ ! -e "${required_path}" ]]; then
             echo "Required P3O asset is missing: ${required_path}" >&2
             exit 2
         fi
     done
+    if [[ "${P3O_MODE}" == "formal" && ! -e "${P3O_EVAL_DATA}" ]]; then
+        echo "Required P3O asset is missing: ${P3O_EVAL_DATA}" >&2
+        exit 2
+    fi
 
     P3O_RUN_ID="${P3O_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
     P3O_RUN_DIR="${P3O_OUTPUT_ROOT}/${P3O_CONFIG_NAME}/seed_${P3O_SEED}/${P3O_RUN_ID}"

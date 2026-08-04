@@ -46,7 +46,7 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
-from .rollout_policy_lag import compute_rollout_policy_age_rollouts
+from .rollout_policy_lag import build_rollout_policy_age_metrics
 
 
 logger = get_logger(__name__)
@@ -1442,10 +1442,12 @@ def train(
             if getattr(args, "advantage_estimator", None) == "p3o" and args.update_weights_interval > 1:
                 snapshot_rollout = getattr(args, "rollout_policy_snapshot_rollout", 0)
                 current_rollout = rollout_id
-                age_rollouts = compute_rollout_policy_age_rollouts(current_rollout, snapshot_rollout)
-                log_dict["train/current_rollout_id"] = current_rollout
-                log_dict["train/rollout_policy_snapshot_rollout"] = snapshot_rollout
-                log_dict["train/p3o/rollout_policy_age_rollouts"] = age_rollouts
+                log_dict.update(
+                    build_rollout_policy_age_metrics(
+                        current_rollout_id=current_rollout,
+                        rollout_policy_snapshot_rollout=snapshot_rollout,
+                    )
+                )
 
             tracking_utils.log(args, log_dict, step_key="train/step")
             tracking_utils.flush_metrics(args, accumulated_step_id)

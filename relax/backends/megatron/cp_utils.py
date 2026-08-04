@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,14 @@ except ModuleNotFoundError as exc:
     if exc.name not in {"megatron", "megatron.core"}:
         raise
     mpu = None
+
+
+def _validate_metadata_lengths(**metadata: Sequence[object] | None) -> None:
+    """Reject CP metadata lists that would otherwise be silently truncated."""
+    lengths = {name: len(values) for name, values in metadata.items() if values is not None}
+    if len(set(lengths.values())) > 1:
+        formatted = ", ".join(f"{name}={length}" for name, length in lengths.items())
+        raise ValueError(f"CP metadata lengths must match; got {formatted}")
 
 
 def maybe_padded_total_lengths(
@@ -100,6 +108,13 @@ def get_sum_of_sample_mean(
     dynamic_cp_rank: int | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
+    _validate_metadata_lengths(
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        loss_masks=loss_masks,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
@@ -107,7 +122,7 @@ def get_sum_of_sample_mean(
             return sum(
                 [
                     (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=True)
                 ]
             )
 
@@ -115,7 +130,7 @@ def get_sum_of_sample_mean(
             return sum(
                 [
                     (x_i * loss_mask_i).sum()
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=True)
                 ]
             )
 
@@ -124,7 +139,7 @@ def get_sum_of_sample_mean(
         chunked_loss_masks: list[torch.Tensor] = []
 
         for i, (total_length, response_length, loss_mask) in enumerate(
-            zip(total_lengths, response_lengths, loss_masks, strict=False)
+            zip(total_lengths, response_lengths, loss_masks, strict=True)
         ):
             max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
@@ -148,7 +163,7 @@ def get_sum_of_sample_mean(
                 [
                     (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
                     for x_i, chunked_loss_mask, loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=True
                     )
                 ]
             )
@@ -158,7 +173,7 @@ def get_sum_of_sample_mean(
                 [
                     (x_i * chunked_loss_mask).sum()
                     for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=True
                     )
                 ]
             )
@@ -193,6 +208,13 @@ def get_cp_local_num_tokens(
     For ``cp_size == 1`` this reduces to the total number of unmasked tokens
     (preserving the historical per-sample ``clamp_min(., 1)``).
     """
+    _validate_metadata_lengths(
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        loss_masks=loss_masks,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
         return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
@@ -201,7 +223,7 @@ def get_cp_local_num_tokens(
     # counted tokens exactly match the ones sum_of_token contributes on this rank.
     total: torch.Tensor | None = None
     for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
+        zip(total_lengths, response_lengths, loss_masks, strict=True)
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
         padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
@@ -246,13 +268,20 @@ def get_cp_local_valid_mask(
 
     For ``cp_size == 1`` this is just the concatenation of ``loss_masks``.
     """
+    _validate_metadata_lengths(
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        loss_masks=loss_masks,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
         return torch.cat([loss_mask.bool() for loss_mask in loss_masks], dim=0)
 
     chunks: list[torch.Tensor] = []
     for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
+        zip(total_lengths, response_lengths, loss_masks, strict=True)
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
         padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
@@ -619,6 +648,12 @@ def dynamic_cp_merge_output(
             if dynamic_cp_size > 1:
                 dynamic_cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
                 ptls = padded_total_lengths if padded_total_lengths is not None else [None] * len(values)
+                _validate_metadata_lengths(
+                    values=values,
+                    total_lengths=total_lengths,
+                    response_lengths=response_lengths,
+                    padded_total_lengths=ptls,
+                )
                 values = [
                     all_gather_with_cp(
                         v,
@@ -629,7 +664,7 @@ def dynamic_cp_merge_output(
                         dynamic_cp_rank=dynamic_cp_rank,
                         dynamic_cp_group=dynamic_cp_group,
                     )
-                    for v, tl, rl, ptl in zip(values, total_lengths, response_lengths, ptls, strict=False)
+                    for v, tl, rl, ptl in zip(values, total_lengths, response_lengths, ptls, strict=True)
                 ]
 
             # 2. collect all sub-groups' samples across the static CP group and reorder.

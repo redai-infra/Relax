@@ -47,6 +47,29 @@ def compute_rollout_policy_age_rollouts(
     return current_rollout_id - snapshot_rollout_id
 
 
+def initial_rollout_policy_snapshot_rollout(start_rollout_id: int) -> int:
+    """Return the snapshot version aligned with a fresh or resumed run."""
+    if start_rollout_id < 0:
+        raise ValueError("start_rollout_id must be non-negative")
+    return start_rollout_id
+
+
+def build_rollout_policy_age_metrics(
+    *,
+    current_rollout_id: int,
+    rollout_policy_snapshot_rollout: int,
+) -> dict[str, int]:
+    """Build rollout-unit policy-age metrics for one training batch."""
+    return {
+        "train/current_rollout_id": current_rollout_id,
+        "train/rollout_policy_snapshot_rollout": rollout_policy_snapshot_rollout,
+        "train/p3o/rollout_policy_age_rollouts": compute_rollout_policy_age_rollouts(
+            current_rollout_id,
+            rollout_policy_snapshot_rollout,
+        ),
+    }
+
+
 def should_refresh_rollout_policy(
     rollout_id: int,
     update_weights_interval: int,
