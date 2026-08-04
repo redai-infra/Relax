@@ -608,3 +608,52 @@ J1 首轮使用完整双步 cycle，不挑有利前缀。
 
 任一成本搬移、15–16 group envelope 复现、hard-cap wait、partition 未闭合或 fatal 都是
 NO-GO。
+
+## J0b 回放结果
+
+J0b 使用以下两条 pre-A3 request-level trace：
+
+```text
+phase_feedback_fix_on_20260802_212004
+phase_feedback_on20_20260802_230341
+```
+
+回放工具：
+
+```text
+scripts/task22/replay_joint_carry_admit.py
+```
+
+修正了旧模拟中 driver 秒级日志偏移与 permit Unix epoch 的不同原点问题。Driver 日志
+显式按 `UTC+08:00` 解析，分析 wall 从旧 `simulation_results.json` 读取。
+
+19 个 headline-window boundary 的结果：
+
+```text
+analysis-window coverage: PASS
+identity / assignment checks: PASS
+zero-resident buffer-refill cap diagnostic: PASS
+observed dynamic quorum upper bound: PASS
+joint carry budget replay: BLOCKED
+closed-loop A3 trace: MISSING
+J1 decision: HOLD
+```
+
+保守单边上界：
+
+```text
+dynamic debt quorum:
+  78.1614 s
+  +2.7566%
+
+dynamic debt quorum + soft floor 2 + cap 2 s:
+  66.6384 s
+  +2.3407%
+```
+
+零 resident buffer-refill 初始计划最大 admit 为 9，resident cap violation 为 0。该结果
+不能和历史 physical rollout 的累计 16 unique groups 直接比较，也不能证明 A3 carry
+下的 shared budget 已闭合。
+
+J1 保持 HOLD，因为两条 run 均未启用 A3，且没有 `joint_planner_ledger`。需要一条
+`A3 enabled + joint ledger non-empty + no fatal` 的 shadow trace，才能继续 runtime 集成。
