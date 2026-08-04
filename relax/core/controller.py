@@ -143,22 +143,33 @@ class Controller:
             logger.info("Global health check system disabled (use --use-health-check to enable)")
 
     def _initialize_data_system(self):
+        from relax.utils.utils import get_train_data_group_size, get_train_sample_expansion_factor
+
         algo_key = resolve_sft_algo_key(self.config)
         batch_size_for_capacity = (
             self.config.over_sampling_batch_size
             if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
             else self.config.rollout_batch_size
         )
+        # A custom converter can expand one trajectory into multiple training
+        # rows. This declared factor is only a storage upper bound; the actual
+        # row count is measured after conversion by RolloutManager.
         total_storage_size = (
-            batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
+            batch_size_for_capacity
+            * (self.config.max_staleness + 1)
+            * self.config.n_samples_per_prompt
+            * get_train_sample_expansion_factor(self.config)
         )
+        # MemAgent completes GRPO normalization before turn expansion, so its
+        # converted rows opt into sampler group size 1.
+        train_data_group_size = get_train_data_group_size(self.config)
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path streams data per DP via token
             # budget; the controller-side sampler maintains per-DP buckets and
             # balances tokens at small-unit granularity.  See
             # docs/zh/guide/fully-async-training.md.
             sampler = StreamingTokenBudgetSampler(
-                n_samples_per_prompt=self.config.n_samples_per_prompt,
+                n_samples_per_prompt=train_data_group_size,
             )
             logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
         elif algo_key == "sft" or getattr(self.config, "balance_data", False):
@@ -166,12 +177,12 @@ class Controller:
             # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.
             dp_size = compute_dp_size(self.config)
             sampler = SeqlenBalancedSampler(
-                n_samples_per_prompt=self.config.n_samples_per_prompt,
+                n_samples_per_prompt=train_data_group_size,
                 dp_size=dp_size,
             )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
         else:
-            sampler = GRPOGroupNSampler(n_samples_per_prompt=self.config.n_samples_per_prompt)
+            sampler = GRPOGroupNSampler(n_samples_per_prompt=train_data_group_size)
 
         tq_config = OmegaConf.create(
             {

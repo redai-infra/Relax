@@ -1,0 +1,16 @@
+mem_agent_chunk_tokens: 2048
+mem_agent_max_memory_tokens: 1024
+mem_agent_max_final_tokens: 256
+mem_agent_max_chunks: 64
+mem_agent_credit_assignment: split
+mem_agent_strict_alignment: true
+# One trajectory has at most 64 memory turns plus one final-answer turn.
+# These fields reserve enough queue capacity, disable post-expansion GRPO
+# regrouping, and tell the actor to consume every converted row in one step.
+custom_train_sample_expansion_factor: 65
+custom_train_data_group_size: 1
+custom_train_expanded_batch: true
+# TP=2 on eight actor GPUs gives four data-parallel consumers (CP stays 1).
+mem_agent_train_rows_multiple: 4
+model_id: Qwen/Qwen3-4B
+model_revision: 1cfa9a7208912126459214e8b04321603b3df60c

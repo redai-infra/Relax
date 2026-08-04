@@ -21,6 +21,23 @@ logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
 
 
+def get_train_sample_expansion_factor(args: Any) -> int:
+    """Return the declared upper bound for custom converter row expansion."""
+    factor = int(getattr(args, "custom_train_sample_expansion_factor", 1))
+    if factor <= 0:
+        raise ValueError("custom_train_sample_expansion_factor must be positive.")
+    return factor
+
+
+def get_train_data_group_size(args: Any) -> int:
+    """Return TransferQueue's grouping unit for converted training rows."""
+    default_group_size = getattr(args, "n_samples_per_prompt", 1)
+    group_size = int(getattr(args, "custom_train_data_group_size", default_group_size))
+    if group_size <= 0:
+        raise ValueError("custom_train_data_group_size must be positive.")
+    return group_size
+
+
 def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
     """Extract per-image ViT token counts from multimodal_train_inputs.
 
@@ -164,6 +181,15 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         return train_data
     rollout_batch = dict_to_tensordict(train_data, len(total_lengths))
     return rollout_batch
+
+
+def convert_samples_to_train_data_with_custom(args: Any, samples: list[Sample] | list[list[Sample]]):
+    """Use the configured sample converter while preserving the default
+    path."""
+    converter = convert_samples_to_train_data
+    if custom_path := getattr(args, "custom_convert_samples_to_train_data_path", None):
+        converter = load_function(custom_path)
+    return converter(args, samples)
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
@@ -326,9 +352,10 @@ def post_process_env(args, env):
     if "env_vars" not in env or not isinstance(env["env_vars"], dict):
         env["env_vars"] = {}
 
-    # Dynamic-batch streaming ends via the producer's is_last signal, not a
-    # pre-allocated partition, so pre-allocate the minimum (1) and let it grow.
-    # The non-dynamic path still pre-allocates the exact count for its .all() check.
+    # TQ pre-allocation is a trajectory-level sizing hint, not the final row
+    # count. A custom converter may expand each trajectory by a data-dependent
+    # amount, so reserving the declared maximum would leave an unread tail. The
+    # controller separately raises the storage capacity for expanded rows.
     if getattr(args, "fully_async", False) and getattr(args, "use_dynamic_batch_size", False):
         env["env_vars"]["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(
             args.rollout_batch_size * args.n_samples_per_prompt
@@ -411,7 +438,13 @@ def merge_dict_list(dict_list):
     return merged
 
 
-def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str, Any]:
+def get_debug_data(
+    args,
+    rollout_id: int,
+    batch_size: int | None,
+    dp_rank: int,
+    dp_size: int | None = None,
+) -> Dict[str, Any]:
     """Fetch debug data for a given rollout_id from the data system.
 
     Parameters:
@@ -446,7 +479,23 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         logger.info(
             f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
         )
-    rollout_batch = convert_samples_to_train_data(args, data)
+    rollout_batch = convert_samples_to_train_data_with_custom(args, data)
+
+    # Custom converters can expand the debug dump. The partial-rollout dynamic
+    # path has the same requirement: slice converted rows, not trajectories.
+    custom_expanded_batch = getattr(args, "custom_train_expanded_batch", False)
+    partial_dynamic_batch = getattr(args, "partial_rollout", False) and getattr(
+        args, "use_dynamic_global_batch_size", False
+    )
+    if custom_expanded_batch or partial_dynamic_batch:
+        if dp_size is None or dp_size <= 0:
+            raise ValueError("dp_size is required for dynamic debug rollout replay.")
+        converted_size = len(rollout_batch["total_lengths"])
+        if converted_size % dp_size:
+            raise ValueError(f"Converted debug row count {converted_size} must be divisible by dp_size={dp_size}.")
+        batch_size = converted_size // dp_size
+    if batch_size is None:
+        raise ValueError("batch_size is required for debug rollout replay.")
 
     for key in rollout_batch:
         rollout_batch[key] = rollout_batch[key][dp_rank * batch_size : (dp_rank + 1) * batch_size]
@@ -460,7 +509,7 @@ async def transfer_batch_to_data_system(
     rollout_id: int,
     data_system_client: Any,
     is_last: bool = False,
-) -> None:
+) -> tuple[int, int]:
     """Helper function to transfer a batch of samples to the data system
     client.
 
@@ -472,6 +521,11 @@ async def transfer_batch_to_data_system(
         is_last: Mark this as the final batch of the partition train_{rollout_id}
             so the data system can detect streaming end-of-stream without a preset
             global batch size. See the is_last bookkeeping in generate_rollout.
+
+    Returns:
+        The destination rollout ID and the exact number of converted rows put
+        into its partition. The rollout manager uses this producer-side count
+        instead of running a second, potentially divergent conversion.
     """
     try:
         # Guard against empty batch_samples
@@ -479,7 +533,7 @@ async def transfer_batch_to_data_system(
             logger.warning(
                 f"transfer_batch_to_data_system called with empty batch_samples for rollout_id={rollout_id}, batch_count={batch_count}"
             )
-            return
+            return rollout_id, 0
         batch_samples = sorted(
             batch_samples, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
         )
@@ -488,7 +542,7 @@ async def transfer_batch_to_data_system(
             batch_samples = sum(batch_samples, [])
         global CURRENT_ROLLOUT_BATCH
         CURRENT_ROLLOUT_BATCH.extend(batch_samples)
-        rollout_batch = convert_samples_to_train_data(args, batch_samples)
+        rollout_batch = convert_samples_to_train_data_with_custom(args, batch_samples)
         logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
 
@@ -505,6 +559,7 @@ async def transfer_batch_to_data_system(
         )
 
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
+        return rollout_id, len(rollout_batch["total_lengths"])
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")
         raise
