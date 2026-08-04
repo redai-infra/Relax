@@ -1001,7 +1001,10 @@ class MegatronTrainRayActor(TrainRayActor):
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
             use_live_weight_sync = (
-                has_rollout
+                # Final checkpointing destroys reloadable Megatron process
+                # groups, so preserve the CPU-backed path for that step.
+                not is_train_done
+                and has_rollout
                 and getattr(self.args, "colocate_live_weight_sync", False)
                 and self._can_sync_live_actor_weights()
             )
