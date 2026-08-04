@@ -40,7 +40,7 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - `reinforce_plus_plus_baseline` 先减去包含自身的 prompt group mean，不除 group std，再做相同的全局归一化
 - baseline 变体不把 token KL 放入 advantage，而是使用独立的 k2 KL loss
 - 两个变体当前只支持同步 colocate、CP=1 和 response-mean reduction
-- 完整公式、mask 与边界行为参见[REINFORCE++ 设计文档](../../docs/en/guide/reinforce-plus-plus.md)
+- 完整公式、mask 与边界行为参见[REINFORCE++ 设计文档](../../docs/zh/guide/reinforce-plus-plus.md)
 
 ### CISPO（保留梯度信号）
 

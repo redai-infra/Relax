@@ -61,7 +61,8 @@ Both new variants use a token-level PPO clipped surrogate and response-mean
 loss reduction. Padding and mask-zero tokens contribute to neither moments nor
 loss. The dedicated distributed normalizer uses population variance
 (`ddof=0`) and `rsqrt(max(variance, 1e-8))`. A zero-variance population returns
-finite zeros; a globally empty mask raises a coordinated error.
+finite zeros; a globally empty mask triggers a coordinated device-side
+asynchronous error without extracting a host scalar in the training hot path.
 
 Because REINFORCE++ also changes where and how KL is injected, the comparison
 between REINFORCE++ and the baseline variant is an algorithm-package
@@ -205,6 +206,35 @@ skips remain upstream modules that require a full Megatron installation. These
 post-experiment changes affect only masked/degenerate inputs and monitoring
 scalar synchronization; the GPU results remain attributed to the frozen
 experiment commit above.
+
+Following maintainer review, the implementation was rebased again onto
+upstream `ce650113` and narrowed without changing either algorithm's numerical
+contract. Commit `0e1531b` replaces the per-batch `global_count.item()` check
+with a device-side asynchronous assertion and a finite device-side denominator.
+It also restores `relax/backends/megatron/cp_utils.py` exactly to upstream and
+moves non-finite masked-token protection into a reducer wrapper selected only
+for the two REINFORCE++ estimators. GRPO, GSPO, SAPO and the other existing
+algorithms therefore retain the upstream shared-reducer behavior.
+
+The review-fix validation reported:
+
+- `51 passed` in the focused Task 29 suite, including the real two-process
+  Gloo collective;
+- `224 passed, 12 skipped` for `tests/utils + tests/core` in the pinned
+  container;
+- `168 passed, 4 skipped` for the complete Megatron backend suite in the
+  pinned container;
+- a successful VitePress 1.6.4 production build for both English and Chinese
+  pages;
+- 100 CUDA iterations under PyTorch synchronization debug mode without a
+  host-synchronization error (`TASK29_CUDA_SYNC_DEBUG_OK`).
+
+Two post-review three-step Qwen3-0.6B smoke runs exercised the narrowed
+production dispatch on NVIDIA A40 GPUs: REINFORCE++ job `938288` and
+REINFORCE++-baseline job `938293`. Both jobs completed all three Actor updates,
+passed the structured finite-metric log validator, produced non-empty
+TensorBoard, checkpoint, and rollout artifacts, and left an empty job-scoped
+Ray cleanup list.
 
 At the experiment commit, the pinned container passed 43 Task 29 tests and 14
 metrics tests. All nine formal trainings produced 50 rollout records, 50 Actor

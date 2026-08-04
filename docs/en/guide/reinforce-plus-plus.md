@@ -158,7 +158,8 @@ Expected edge behavior:
   REINFORCE++ returns;
 - a fully masked local response contributes a zero tensor and still reaches
   the data-parallel collective;
-- a globally empty mask raises `ValueError` on every participating rank.
+- a globally empty mask triggers a device-side asynchronous assertion on every
+  participating rank without extracting a host scalar in the training hot path.
 
 Because the baseline scalar is broadcast to each valid token, longer responses
 have greater weight in these token-level global moments. This is intentional.
