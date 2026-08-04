@@ -160,6 +160,30 @@ def test_model_roles_reject_zero_gpu_resources():
     assert diagnostic.details["role"] == "actor"
 
 
+@pytest.mark.parametrize("parse_error", (None, "service plan rejected GPU allocation for a CPU-only role"))
+def test_cpu_only_roles_reject_positive_gpu_resources(parse_error):
+    report = run_doctor(
+        argv=[],
+        args=_namespace(
+            {
+                "fully_async": True,
+                "colocate": False,
+                "resource": {
+                    "actor": [1, 4],
+                    "rollout": [1, 4],
+                    "advantages": [1, 1],
+                    "actor_fwd": [1, 2],
+                },
+            }
+        ),
+        parse_error=parse_error,
+    )
+
+    resource_diagnostics = [item for item in report.diagnostics if item.rule_id == "CONFIG_RESOURCE_SHAPE"]
+    assert len(resource_diagnostics) == 1
+    assert "CPU-only role 'advantages' requires num_gpus=0" in resource_diagnostics[0].message
+
+
 @pytest.mark.parametrize(
     "actor_resource",
     (

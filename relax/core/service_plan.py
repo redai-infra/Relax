@@ -121,7 +121,8 @@ class ServicePlan:
         invalid_roles = [
             error.role
             for error in self.errors
-            if error.code in {"resource_shape", "num_serves", "gpu_count", "gpu_required"} and error.role
+            if error.code in {"resource_shape", "num_serves", "gpu_count", "gpu_required", "cpu_gpu_forbidden"}
+            and error.role
         ]
         return {
             "algo_key": self.algo_key,
@@ -319,6 +320,15 @@ def build_service_plan(config: Any) -> ServicePlan:
                 PlanError(
                     code="gpu_count",
                     message=f"role {role!r} requires num_gpus >= 0, got {num_gpus}.",
+                    role=role,
+                    value=raw,
+                )
+            )
+        elif num_gpus > 0 and role in CPU_ONLY_ROLES:
+            role_errors.append(
+                PlanError(
+                    code="cpu_gpu_forbidden",
+                    message=f"CPU-only role {role!r} requires num_gpus=0, got {num_gpus}.",
                     role=role,
                     value=raw,
                 )

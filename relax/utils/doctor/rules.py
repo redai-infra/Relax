@@ -147,7 +147,7 @@ def check_resource_shape(ctx: DoctorContext) -> list[DiagnosticResult]:
         resource_errors = [
             error
             for error in ctx.topology.get("plan_errors", [])
-            if error.get("code") in {"resource_shape", "num_serves", "gpu_count", "gpu_required"}
+            if error.get("code") in {"resource_shape", "num_serves", "gpu_count", "gpu_required", "cpu_gpu_forbidden"}
         ]
         return [
             _result(
@@ -178,6 +178,15 @@ def check_resource_shape(ctx: DoctorContext) -> list[DiagnosticResult]:
                     "CONFIG_RESOURCE_SHAPE",
                     f"resource entry for role {role!r} must contain integers and num_gpus >= 0.",
                     "Use integer values and keep CPU-only roles at [1, 0].",
+                    details={"role": role, "value": spec},
+                )
+            )
+        elif num_gpus > 0 and role in CPU_ONLY_ROLES:
+            diagnostics.append(
+                _result(
+                    "CONFIG_RESOURCE_SHAPE",
+                    f"CPU-only role {role!r} requires num_gpus=0, got {num_gpus}.",
+                    "Set num_gpus to 0 for CPU-only roles.",
                     details={"role": role, "value": spec},
                 )
             )

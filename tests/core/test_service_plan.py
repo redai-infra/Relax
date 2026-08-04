@@ -120,6 +120,30 @@ def test_service_plan_allows_only_cpu_roles_to_use_zero_gpus():
     assert not any(error.code == "gpu_required" and error.role == "advantages" for error in plan.errors)
 
 
+def test_service_plan_rejects_gpu_allocations_for_cpu_only_roles():
+    advantages_plan = build_service_plan(
+        _config(
+            fully_async=True,
+            colocate=False,
+            resource={
+                "actor": [1, 4],
+                "rollout": [1, 4],
+                "advantages": [1, 1],
+                "actor_fwd": [1, 2],
+            },
+        )
+    )
+    sft_plan = build_service_plan(
+        _config(
+            loss_type="sft",
+            resource={"sft": [1, 1], "actor": [1, 8]},
+        )
+    )
+
+    assert any(error.code == "cpu_gpu_forbidden" and error.role == "advantages" for error in advantages_plan.errors)
+    assert any(error.code == "cpu_gpu_forbidden" and error.role == "sft" for error in sft_plan.errors)
+
+
 def test_service_plan_handles_sft_and_debug_modes():
     sft_plan = build_service_plan(
         _config(
