@@ -6,10 +6,9 @@ from unittest.mock import Mock
 import pytest
 
 
-try:
-    from relax.backends.megatron.actor import _should_publish_hybrid_weights, _warn_if_hybrid_publication_degraded
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"relax.backends.megatron.actor unavailable: {_exc}", allow_module_level=True)
+pytest.importorskip("megatron", reason="Megatron is an optional test dependency")
+
+from relax.backends.megatron.actor import _should_publish_hybrid_weights, _warn_if_hybrid_publication_degraded
 
 
 def test_hybrid_weight_publication_interval_one_preserves_existing_behavior() -> None:

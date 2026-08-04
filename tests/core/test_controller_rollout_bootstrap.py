@@ -7,11 +7,12 @@ from unittest.mock import Mock
 import pytest
 
 
-try:
-    from relax.core import controller as controller_module
-    from relax.engine.rollout import bootstrap
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"relax.core.controller unavailable: {_exc}", allow_module_level=True)
+pytest.importorskip("ray", reason="Ray is an optional test dependency")
+pytest.importorskip("transfer_queue", reason="TransferQueue is an optional test dependency")
+pytest.importorskip("megatron", reason="Megatron is an optional test dependency")
+
+from relax.core import controller as controller_module
+from relax.engine.rollout import bootstrap
 
 
 def test_controller_resolves_rollout_epoch_before_actor_service_creation(monkeypatch) -> None:

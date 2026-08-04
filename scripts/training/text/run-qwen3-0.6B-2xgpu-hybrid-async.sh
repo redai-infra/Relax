@@ -64,11 +64,7 @@ PY
 }
 
 MODEL_PATH="${MODEL_PATH:-${HOME}/model/Qwen3-0.6B}"
-PROMPT_DATA="${PROMPT_DATA:-${REPO_ROOT}/benchmarks/data/task22_gsm8k_main16.jsonl}"
-TASK22_DATA_PREP_SCRIPT="${TASK22_DATA_PREP_SCRIPT:-${REPO_ROOT}/benchmarks/task22_hybrid_async_text/prepare_task22_dataset.py}"
-TASK22_DATASET_REPO_ID="${TASK22_DATASET_REPO_ID:-AI-ModelScope/gsm8k}"
-TASK22_DATASET_SPLIT="${TASK22_DATASET_SPLIT:-main}"
-TASK22_DATASET_SUBSET_SIZE="${TASK22_DATASET_SUBSET_SIZE:-16}"
+PROMPT_DATA="${PROMPT_DATA:-}"
 TASK22_VARIANT="${TASK22_VARIANT:-baseline}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-20}"
 RUN_ID="${RUN_ID:-1}"
@@ -139,15 +135,10 @@ if [[ ! -s "${MODEL_PATH}/model.safetensors" ]]; then
     echo "Missing model checkpoint: ${MODEL_PATH}/model.safetensors" >&2
     exit 1
 fi
-if [[ ! -f "${TASK22_DATA_PREP_SCRIPT}" ]]; then
-    echo "Missing dataset prep script: ${TASK22_DATA_PREP_SCRIPT}" >&2
+if [[ -z "${PROMPT_DATA}" ]]; then
+    echo "PROMPT_DATA must point to a prepared JSONL dataset" >&2
     exit 1
 fi
-python "${TASK22_DATA_PREP_SCRIPT}" \
-    --repo-id "${TASK22_DATASET_REPO_ID}" \
-    --split "${TASK22_DATASET_SPLIT}" \
-    --limit "${TASK22_DATASET_SUBSET_SIZE}" \
-    --output "${PROMPT_DATA}"
 if [[ ! -s "${PROMPT_DATA}" ]]; then
     echo "Missing prompt data: ${PROMPT_DATA}" >&2
     exit 1

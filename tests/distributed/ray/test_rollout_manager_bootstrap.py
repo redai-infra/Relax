@@ -7,11 +7,11 @@ from unittest.mock import Mock
 import pytest
 
 
-try:
-    from relax.distributed.ray import placement_group
-    from relax.distributed.ray import rollout as rollout_module
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"Relax Ray rollout dependencies unavailable: {_exc}", allow_module_level=True)
+pytest.importorskip("ray", reason="Ray is an optional test dependency")
+pytest.importorskip("megatron", reason="Megatron is an optional test dependency")
+
+from relax.distributed.ray import placement_group
+from relax.distributed.ray import rollout as rollout_module
 
 
 def test_create_rollout_manager_non_global_dataset_skips_epoch_query(monkeypatch) -> None:

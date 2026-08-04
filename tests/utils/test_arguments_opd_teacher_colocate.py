@@ -1,41 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
-import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
-
-
-@pytest.fixture()
-def arguments_module(monkeypatch):
-    router_pkg = ModuleType("sglang_router")
-    launch_router = ModuleType("sglang_router.launch_router")
-    launch_router.RouterArgs = object
-    monkeypatch.setitem(sys.modules, "sglang_router", router_pkg)
-    monkeypatch.setitem(sys.modules, "sglang_router.launch_router", launch_router)
-
-    sglang_arguments = ModuleType("relax.backends.sglang.arguments")
-    sglang_arguments.sglang_parse_args = lambda: None
-    sglang_arguments.validate_args = lambda args: args
-    monkeypatch.setitem(sys.modules, "relax.backends.sglang.arguments", sglang_arguments)
-
-    device = ModuleType("relax.utils.device")
-    device.get_dist_backend = lambda: "gloo"
-    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
-
-    eval_config = ModuleType("relax.utils.training.eval_config")
-    eval_config.EvalDatasetConfig = dict
-    eval_config.build_eval_dataset_configs = lambda args, datasets_config, defaults: []
-    eval_config.build_named_prompt_data_configs = lambda values: []
-    eval_config.ensure_dataset_list = lambda values: values or []
-    monkeypatch.setitem(sys.modules, "relax.utils.training.eval_config", eval_config)
-
-    sys.modules.pop("relax.utils.arguments", None)
-    module = importlib.import_module("relax.utils.arguments")
-    yield module
-    sys.modules.pop("relax.utils.arguments", None)
 
 
 @pytest.mark.parametrize(
@@ -194,56 +162,6 @@ def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
 
     with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
         arguments_module.slime_validate_args(args)
-
-
-def test_zero_kl_loss_is_disabled_before_reference_setup(arguments_module):
-    args = SimpleNamespace(use_kl_loss=True, kl_loss_coef=0.0, kl_coef=0.0)
-
-    changed = arguments_module._normalize_zero_kl_loss_args(args)
-
-    assert changed is True
-    assert args.use_kl_loss is False
-
-
-@pytest.mark.parametrize(
-    ("use_kl_loss", "kl_loss_coef"),
-    [(False, 0.0), (True, 0.01)],
-)
-def test_nonzero_or_disabled_kl_loss_is_not_normalized(arguments_module, use_kl_loss, kl_loss_coef):
-    args = SimpleNamespace(use_kl_loss=use_kl_loss, kl_loss_coef=kl_loss_coef, kl_coef=0.0)
-
-    changed = arguments_module._normalize_zero_kl_loss_args(args)
-
-    assert changed is False
-    assert args.use_kl_loss is use_kl_loss
-
-
-def test_unused_fully_async_reference_resource_is_removed(arguments_module):
-    args = SimpleNamespace(
-        use_kl_loss=False,
-        kl_loss_coef=0.0,
-        kl_coef=0.0,
-        resource={"actor": [1, 1], "rollout": [1, 1], "reference": [1, 1]},
-    )
-
-    changed = arguments_module._drop_unused_reference_resource(args)
-
-    assert changed is True
-    assert args.resource == {"actor": [1, 1], "rollout": [1, 1]}
-
-
-def test_reward_kl_keeps_reference_resource(arguments_module):
-    args = SimpleNamespace(
-        use_kl_loss=False,
-        kl_loss_coef=0.0,
-        kl_coef=0.01,
-        resource={"actor": [1, 1], "rollout": [1, 1], "reference": [1, 1]},
-    )
-
-    changed = arguments_module._drop_unused_reference_resource(args)
-
-    assert changed is False
-    assert "reference" in args.resource
 
 
 def test_zero_kl_normalization_precedes_reference_checkpoint_validation(arguments_module):

@@ -7,11 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 
-try:
-    from relax.components.base import Base
-    from relax.components.rollout import Rollout
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"relax.components.rollout unavailable: {_exc}", allow_module_level=True)
+pytest.importorskip("ray", reason="Ray is an optional test dependency")
+
+from relax.components.base import Base  # noqa: E402, I001
+from relax.components.rollout import Rollout
 
 RolloutClass = Rollout.func_or_class
 
