@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,6 +19,15 @@ with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
     from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 
 from relax.utils.training.p3o_utils import P3OSufficientStats
+
+
+@pytest.fixture(autouse=True)
+def _stub_cp_world_size(monkeypatch):
+    monkeypatch.setattr(
+        cp_utils,
+        "mpu",
+        SimpleNamespace(get_context_parallel_world_size=lambda: 1),
+    )
 
 
 def _stats(values: tuple[float, float, float]) -> P3OSufficientStats:
