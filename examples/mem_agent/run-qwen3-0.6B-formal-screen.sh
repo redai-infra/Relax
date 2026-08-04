@@ -16,10 +16,13 @@ SERVE_PORT="${SERVE_PORT:-30000}"
 SAMPLES_PER_ITEM="${SAMPLES_PER_ITEM:-8}"
 TRAIN_COUNT="${TRAIN_COUNT:-1000}"
 CONCURRENCY="${CONCURRENCY:-32}"
+HELDOUT_SAMPLES_PER_ITEM="${HELDOUT_SAMPLES_PER_ITEM:-1}"
 TRAIN_CANDIDATES="${DATA_DIR}/formal-train-candidates.jsonl"
+HELDOUT_DATA="${DATA_DIR}/formal-heldout.jsonl"
 STATIC_MANIFEST="${DATA_DIR}/formal-static-splits.manifest.json"
 
 [[ -f "${TRAIN_CANDIDATES}" ]] || { echo "Missing ${TRAIN_CANDIDATES}" >&2; exit 1; }
+[[ -f "${HELDOUT_DATA}" ]] || { echo "Missing ${HELDOUT_DATA}" >&2; exit 1; }
 [[ -f "${STATIC_MANIFEST}" ]] || { echo "Missing ${STATIC_MANIFEST}" >&2; exit 1; }
 mkdir -p "${RESULTS_DIR}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
@@ -100,4 +103,30 @@ python3 "${SCRIPT_DIR}/prepare_pilot_data.py" select \
   echo "Formal training row count did not match ${TRAIN_COUNT}." >&2
   exit 1
 }
+
+# Measure the already-frozen held-out split once while the untrained server is
+# resident. These outcomes never feed selection; the trained checkpoint later
+# uses this same file, seed and sampling count for a paired pilot comparison.
+python3 "${SCRIPT_DIR}/eval_ruler_hqa.py" \
+  --data-file "${HELDOUT_DATA}" \
+  --model "${MODEL_PATH}" \
+  --tokenizer "${TOKENIZER_PATH}" \
+  --output-dir "${RESULTS_DIR}" \
+  --run-name qwen3-0.6b-formal-heldout-baseline \
+  --mode recurrent \
+  --base-url "http://127.0.0.1:${SERVE_PORT}/v1" \
+  --api-key EMPTY \
+  --samples-per-item "${HELDOUT_SAMPLES_PER_ITEM}" \
+  --seed 4242 \
+  --disable-thinking \
+  --temperature 1.0 \
+  --top-p 1.0 \
+  --chunk-tokens 512 \
+  --max-memory-tokens 128 \
+  --max-final-tokens 64 \
+  --max-chunks 4 \
+  --max-input-tokens 1472 \
+  --server-max-model-len 1536 \
+  --concurrency "${CONCURRENCY}"
+
 echo "Selected ${TRAIN_COUNT} independent training questions; diagnostic/held-out IDs remained outcome-independent."

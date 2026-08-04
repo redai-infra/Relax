@@ -85,7 +85,9 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert 'TRAIN_COUNT="${TRAIN_COUNT:-1000}"' in formal_screen
     assert 'CONCURRENCY="${CONCURRENCY:-32}"' in formal_screen
     assert "--eval-count 0" in formal_screen
-    assert "formal-heldout.jsonl" not in formal_screen
+    assert 'HELDOUT_DATA="${DATA_DIR}/formal-heldout.jsonl"' in formal_screen
+    assert "qwen3-0.6b-formal-heldout-baseline" in formal_screen
+    assert 'HELDOUT_SAMPLES_PER_ITEM="${HELDOUT_SAMPLES_PER_ITEM:-1}"' in formal_screen
 
 
 def test_reward_exposes_a_step_level_raw_reward_metric():
