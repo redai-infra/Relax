@@ -401,6 +401,43 @@ def test_report_redacts_structured_train_env_and_wandb_key():
     assert report.config["wandb_key"] == "<redacted>"
 
 
+def test_report_redacts_malformed_structured_train_env_without_config():
+    secret = "malformed-train-value"
+    malformed = f'{{"OPENAI_API_KEY":"{secret}"'
+
+    report = run_doctor(
+        argv=["--train-env-vars", malformed],
+        args=None,
+        parse_error=f"invalid train env: {malformed}",
+    )
+
+    for output in (render_json(report), render_text(report)):
+        assert secret not in output
+        assert malformed not in output
+    assert report.argv == ["--train-env-vars", "<redacted>"]
+    assert report.command[-2:] == report.argv
+
+
+def test_report_redacts_non_mapping_train_env_in_partial_config():
+    secret = "partial-train-value"
+    raw_value = f'["{secret}"]'
+    args = _namespace({"train_env_vars": [secret]})
+
+    report = run_doctor(
+        argv=["--train-env-vars", raw_value],
+        args=args,
+        parse_error=f"train_env_vars must be a mapping: {secret}",
+    )
+
+    for output in (render_json(report), render_text(report)):
+        assert secret not in output
+        assert raw_value not in output
+    assert report.config_state == "partial"
+    assert report.config["train_env_vars"] == "<redacted>"
+    assert report.argv == ["--train-env-vars", "<redacted>"]
+    assert report.command[-2:] == report.argv
+
+
 def test_zero_num_steps_returns_structured_batch_diagnostic():
     report = run_doctor(argv=[], args=_namespace({"num_steps_per_rollout": 0}))
 

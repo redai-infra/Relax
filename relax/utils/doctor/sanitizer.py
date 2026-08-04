@@ -115,9 +115,14 @@ def _sanitize_json_mapping(value: str, secret_values: set[str]) -> str:
     try:
         parsed = json.loads(value)
     except (TypeError, ValueError):
-        return sanitize_text(value, secret_values) or ""
+        if value:
+            secret_values.add(value)
+        return REDACTED
     if not isinstance(parsed, Mapping):
-        return sanitize_text(value, secret_values) or ""
+        _collect_scalar_secrets(parsed, secret_values)
+        if value:
+            secret_values.add(value)
+        return REDACTED
     sanitized = _sanitize_value(parsed, secret_values=secret_values)
     return json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -131,6 +136,9 @@ def _sanitize_value(value: Any, *, secret_values: set[str], key: str | None = No
             if secret:
                 secret_values.add(secret)
         return sanitized_items
+    if key is not None and _normalize_name(key) in _STRUCTURED_SECRET_OPTIONS and not isinstance(value, Mapping):
+        _collect_scalar_secrets(value, secret_values)
+        return REDACTED
     if key is not None and is_sensitive_name(key):
         _collect_scalar_secrets(value, secret_values)
         return REDACTED
