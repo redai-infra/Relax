@@ -171,6 +171,9 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 | `--n-samples-per-prompt`                     | 至少为 `2`                                            |
 | `rollout_batch_size × n_samples_per_prompt`  | 必须等于 `global_batch_size`                          |
 | `--num-steps-per-rollout`                    | 不设置或为 `1`                                        |
+| `--calculate-per-token-loss`                 | 必须开启，按全局有效 response token 数归一化          |
+| `--kl-coef`                                  | 必须为 `0`；配置 `--ref-load` 后使用直接 KL loss 路径 |
+| `--max-staleness`                            | 必须为 `0`                                            |
 | async、partial rollout、dynamic global batch | 不支持                                                |
 | `--normalize-advantages`                     | 不支持                                                |
 | `rollout/rloo/*`                             | 训练侧 baseline、advantage signal、空响应与异常组诊断 |

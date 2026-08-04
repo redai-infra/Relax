@@ -2856,6 +2856,14 @@ def slime_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
+    if not is_sft and args.advantage_estimator == "rloo" and args.kl_coef != 0:
+        raise ValueError(
+            "--advantage-estimator rloo does not support nonzero --kl-coef: reward-side KL shaping "
+            "is not implemented for the completion-level leave-one-out signal. Set --kl-coef 0; "
+            "for a supported direct KL penalty, provide --ref-load and use --use-kl-loss with "
+            "--kl-loss-coef."
+        )
+
     if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
         if not os.path.exists(args.ref_load):
             raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
@@ -2939,9 +2947,9 @@ def slime_validate_args(args):
             raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
         if args.n_samples_per_prompt <= 0:
             raise ValueError("--n-samples-per-prompt must be positive when deriving --rollout-batch-size.")
-        if args.global_batch_size % args.n_samples_per_prompt != 0:
+        if args.advantage_estimator == "rloo" and args.global_batch_size % args.n_samples_per_prompt != 0:
             raise ValueError(
-                "--global-batch-size must be divisible by --n-samples-per-prompt when "
+                "--global-batch-size must be divisible by --n-samples-per-prompt for RLOO when "
                 "--rollout-batch-size is omitted, got "
                 f"{args.global_batch_size} % {args.n_samples_per_prompt} != 0."
             )
@@ -3344,6 +3352,17 @@ def slime_validate_args(args):
             raise ValueError(
                 "--advantage-estimator rloo only supports synchronous (colocate) training. "
                 "Please remove --fully-async / --hybrid."
+            )
+        if not args.calculate_per_token_loss:
+            raise ValueError(
+                "--advantage-estimator rloo requires --calculate-per-token-loss so policy loss is "
+                "normalized by the global number of valid response tokens. The per-sample token-mean "
+                "reducer would reweight unequal-length responses by 1 / response_length."
+            )
+        if args.max_staleness != 0:
+            raise ValueError(
+                "--advantage-estimator rloo requires --max-staleness 0: the unclipped objective has no "
+                "importance-ratio correction for stale rollout data."
             )
         if not args.rewards_normalization:
             raise ValueError(

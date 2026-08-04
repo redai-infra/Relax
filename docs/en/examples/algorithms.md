@@ -63,7 +63,11 @@ Unlike GRPO, RLOO does not divide by the group standard deviation. The token los
 
 $$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$$
 
-Each sample's scalar advantage is broadcast to its response tokens and reduced with the existing loss mask. `train/pg_clipfrac` is therefore always `0` for RLOO.
+Each sample's scalar advantage is broadcast to its response tokens. Relax masks padding and normalizes the summed loss by the global number of valid response tokens $N_{\mathrm{eff}}$:
+
+$$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
+
+This global-token reduction does not apply a separate $1/T_i$ weight to each response. An empty or fully masked response still participates in its prompt group's leave-one-out reward baseline, but contributes zero policy-loss tokens and zero to $N_{\mathrm{eff}}$. If the entire global batch has no effective tokens, it is treated as a no-signal step and reports zero loss metrics rather than dividing by zero. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
 
 ### Requirements and Parameters
 
@@ -73,6 +77,9 @@ Each sample's scalar advantage is broadcast to its response tokens and reduced w
 | `--n-samples-per-prompt` | at least `2` | Group size $G$; larger groups provide a more stable LOO baseline at higher rollout cost |
 | `--rollout-batch-size × --n-samples-per-prompt` | equals `--global-batch-size` | Exactly one optimizer update per rollout |
 | `--num-steps-per-rollout` | unset or `1` | Reusing the same rollout for multiple unclipped updates is rejected |
+| `--calculate-per-token-loss` | enabled | Use global valid-token normalization; per-response token means would reweight unequal-length responses by $1/T_i$ |
+| `--kl-coef` | `0` | Reward-side KL shaping is not implemented for RLOO; with a valid `--ref-load <checkpoint>`, use `--use-kl-loss --kl-loss-coef <value>` for the supported direct KL penalty |
+| `--max-staleness` | `0` | Stale rollouts are rejected because the unclipped objective has no importance-ratio correction |
 | reward normalization | enabled | RLOO's group transformation runs in the normalized-reward path |
 | `--normalize-advantages` | disabled | Post-DP whitening would change RLOO semantics and make results partition-dependent |
 | `--fully-async`, `--hybrid`, `--partial-rollout`, `--use-dynamic-global-batch-size` | disabled | RLOO currently requires synchronous, fixed-size rollout batches |

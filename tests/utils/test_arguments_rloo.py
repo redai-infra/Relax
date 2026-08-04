@@ -36,6 +36,9 @@ def _rloo_args(**overrides) -> SimpleNamespace:
         "normalize_advantages": False,
         "partial_rollout": False,
         "use_dynamic_global_batch_size": False,
+        "calculate_per_token_loss": True,
+        "kl_coef": 0.0,
+        "max_staleness": 0,
         "grpo_std_normalization": False,
     }
     defaults.update(overrides)
@@ -76,11 +79,12 @@ def test_fully_async_non_rloo_can_derive_rollout_batch_size(arguments_module):
         arguments_module,
         advantage_estimator="grpo",
         rollout_batch_size=None,
-        global_batch_size=128,
+        global_batch_size=127,
         fully_async=True,
+        resource={"actor": [0], "rollout": [0], "actor_fwd": [0], "teacher": [0]},
     )
-    assert args.rollout_batch_size == 16
-    assert args.true_on_policy_mode is True
+    assert args.rollout_batch_size == 15
+    assert args.true_on_policy_mode is False
 
 
 def test_rloo_requires_n_samples_ge_2(arguments_module):
@@ -102,6 +106,27 @@ def test_rloo_requires_rewards_normalization(arguments_module):
 def test_rloo_rejects_normalize_advantages(arguments_module):
     with pytest.raises(ValueError, match="normalize-advantages"):
         _validate(arguments_module, normalize_advantages=True)
+
+
+def test_rloo_requires_global_token_loss_reduction(arguments_module):
+    with pytest.raises(ValueError, match="calculate-per-token-loss"):
+        _validate(arguments_module, calculate_per_token_loss=False)
+
+
+def test_rloo_rejects_reward_side_kl(arguments_module):
+    with pytest.raises(ValueError, match="does not support nonzero --kl-coef"):
+        _validate(arguments_module, kl_coef=0.01)
+
+
+def test_rloo_rejects_stale_rollouts(arguments_module):
+    with pytest.raises(ValueError, match="max-staleness 0"):
+        _validate(arguments_module, max_staleness=1)
+
+
+def test_rloo_allows_direct_kl_loss(arguments_module):
+    args = _validate(arguments_module, use_kl_loss=True, kl_loss_coef=0.01, ref_load="/")
+    assert args.use_kl_loss is True
+    assert args.kl_loss_coef == 0.01
 
 
 def test_rloo_requires_matching_global_batch_size(arguments_module):
@@ -131,6 +156,10 @@ def test_non_rloo_path_does_not_apply_rloo_guards(arguments_module):
         normalize_advantages=True,
         partial_rollout=True,
         use_dynamic_global_batch_size=True,
+        calculate_per_token_loss=False,
+        kl_coef=0.01,
+        max_staleness=1,
+        ref_load="/",
     )
     assert args.advantage_estimator == "grpo"
 

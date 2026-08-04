@@ -10,6 +10,8 @@
 #
 # RLOO: leave-one-out baseline, unclipped REINFORCE loss (sync only).
 #   --eps-clip is ineffective for rloo (train/pg_clipfrac is always 0).
+#   Global valid-token normalization and max-staleness=0 are required.
+#   Reward-side --kl-coef is unsupported; this recipe pins it to 0.
 #
 # train_iters = NUM_ROLLOUT × ROLLOUT_BATCH_SIZE × N_SAMPLES / GLOBAL_BATCH_SIZE
 # RLOO requires ROLLOUT_BATCH_SIZE × N_SAMPLES == GLOBAL_BATCH_SIZE, so each
@@ -164,6 +166,7 @@ PERF_ARGS=(
 # fair comparison (see script header comment).
 ALGO_ARGS=(
     --advantage-estimator ${ADVANTAGE_ESTIMATOR}
+    --kl-coef 0
     --entropy-coef 0.00
     --use-rollout-logprobs
     --clip-grad 0

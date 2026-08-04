@@ -60,7 +60,11 @@ $$b_i = \frac{1}{G-1}\sum_{j\ne i}r_j, \qquad A_i = r_i-b_i = \frac{G}{G-1}(r_i-
 
 $$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$$
 
-每条样本的标量 advantage 会广播到 response token，并通过现有 loss mask 归约。因此 RLOO 的 `train/pg_clipfrac` 始终为 `0`。
+每条样本的标量 advantage 会广播到 response token。Relax 会屏蔽 padding，并按全局有效 response token 数 $N_{\mathrm{eff}}$ 归一化 token loss 之和：
+
+$$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
+
+这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。空 response 或全 mask response 仍参与所属 prompt group 的 leave-one-out reward baseline，但贡献零个 policy-loss token，且不会计入 $N_{\mathrm{eff}}$。如果整个 global batch 都没有有效 token，则将其作为 no-signal step 并报告零 loss 指标，而不是执行除零。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
 
 ### 约束与参数
 
@@ -70,6 +74,9 @@ $$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$
 | `--n-samples-per-prompt` | 至少为 `2` | 组大小 $G$；更大的组可提高 LOO 基线稳定性，但增加 rollout 成本 |
 | `--rollout-batch-size × --n-samples-per-prompt` | 等于 `--global-batch-size` | 每个 rollout 恰好执行一次 optimizer update |
 | `--num-steps-per-rollout` | 不设置或为 `1` | 禁止对同一 rollout 重复执行未经 ratio 校正的更新 |
+| `--calculate-per-token-loss` | 开启 | 使用全局有效 token 归一化；per-response token mean 会按 $1/T_i$ 重新加权不等长 response |
+| `--kl-coef` | `0` | RLOO 尚未实现 reward-side KL shaping；提供有效的 `--ref-load <checkpoint>` 后，可使用受支持的 `--use-kl-loss --kl-loss-coef <value>` 直接 KL loss |
+| `--max-staleness` | `0` | 非裁剪目标没有 importance-ratio correction，因此拒绝 stale rollout |
 | reward normalization | 开启 | RLOO 的组变换位于 normalized-reward 路径 |
 | `--normalize-advantages` | 关闭 | DP 切分后的再次白化会改变 RLOO 语义，并使结果依赖分区 |
 | `--fully-async`、`--hybrid`、`--partial-rollout`、`--use-dynamic-global-batch-size` | 关闭 | RLOO 当前要求同步、固定大小的 rollout batch |

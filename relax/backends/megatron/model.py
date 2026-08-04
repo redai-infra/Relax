@@ -44,7 +44,7 @@ from relax.utils.training.ppo_utils import (
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 
@@ -1244,16 +1244,17 @@ def train_one_step(
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
-        loss_reduced = {}
         values = values.tolist()
         num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:], strict=False):
-            # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
-            # token count (per-token) or sample count, so each token/sample is
-            # already counted once. A `* cp_size` here would over-weight metrics by
-            # CP degree under dynamic CP (and is a no-op under static CP, where the
-            # count previously carried the cancelling cp factor).
-            loss_reduced[key] = value / num_samples_or_tokens
+        if num_samples_or_tokens == 0:
+            logger.warning(
+                "Training step %d has zero effective loss tokens; reporting zero loss metrics for this no-signal step.",
+                step_id,
+            )
+        # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
+        # token count (per-token) or sample count, so each token/sample is already
+        # counted once. A `* cp_size` here would over-weight metrics by CP degree.
+        loss_reduced = normalize_reduced_loss_metrics(keys, values)
         return loss_reduced, grad_norm
     return {}, grad_norm
 

@@ -28,10 +28,10 @@ def _response_slices(total_length: int, response_length: int, rank: int, world_s
     return slices
 
 
-def _rloo_cp_worker(rank, world_size, init_file, calculate_per_token_loss):
+def _rloo_cp_worker(rank, world_size, init_file):
     import torch.distributed as dist
 
-    from relax.backends.megatron.cp_utils import get_sum_of_sample_mean
+    from relax.backends.megatron.cp_utils import get_cp_local_num_tokens, get_sum_of_sample_mean
     from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
 
     dist.init_process_group(
@@ -44,7 +44,7 @@ def _rloo_cp_worker(rank, world_size, init_file, calculate_per_token_loss):
     try:
         torch.manual_seed(0)
         base_length = 2 * world_size * 4
-        response_lengths = [base_length, base_length * 2, base_length * 3]
+        response_lengths = [base_length, base_length * 2, 0]
         prompt_lengths = [2 * world_size * (sample_index + 1) for sample_index in range(3)]
         total_lengths = [
             prompt_length + response_length
@@ -61,19 +61,18 @@ def _rloo_cp_worker(rank, world_size, init_file, calculate_per_token_loss):
             -(advantage * log_probs) for advantage, log_probs in zip(advantages, full_log_probs, strict=True)
         ]
 
-        if calculate_per_token_loss:
-            reference = sum((loss * mask).sum() for loss, mask in zip(full_losses, full_masks, strict=True))
-        else:
-            reference = sum(
-                (loss * mask).sum() / torch.clamp_min(mask.sum(), 1)
-                for loss, mask in zip(full_losses, full_masks, strict=True)
-            )
+        reference = sum((loss * mask).sum() for loss, mask in zip(full_losses, full_masks, strict=True))
+        sample_mean_reference = sum(
+            (loss * mask).sum() / torch.clamp_min(mask.sum(), 1)
+            for loss, mask in zip(full_losses, full_masks, strict=True)
+        )
 
         local_losses = []
         local_ownership = []
         for total_length, response_length, full_loss in zip(total_lengths, response_lengths, full_losses, strict=True):
             response_slices = _response_slices(total_length, response_length, rank, world_size)
-            local_losses.append(torch.cat([full_loss[response_slice] for response_slice in response_slices]))
+            local_parts = [full_loss[response_slice] for response_slice in response_slices]
+            local_losses.append(torch.cat(local_parts) if local_parts else full_loss.new_empty(0))
             ownership = torch.zeros(response_length, dtype=torch.int64)
             for response_slice in response_slices:
                 ownership[response_slice] += 1
@@ -83,16 +82,42 @@ def _rloo_cp_worker(rank, world_size, init_file, calculate_per_token_loss):
             total_lengths,
             response_lengths,
             full_masks,
-            calculate_per_token_loss=calculate_per_token_loss,
+            calculate_per_token_loss=True,
             dynamic_cp_size=world_size,
             dynamic_cp_rank=rank,
         )
         reduced = local_reducer(torch.cat(local_losses))
+        sample_mean_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            full_masks,
+            calculate_per_token_loss=False,
+            dynamic_cp_size=world_size,
+            dynamic_cp_rank=rank,
+        )
+        sample_mean_reduced = sample_mean_reducer(torch.cat(local_losses))
+        local_num_tokens = get_cp_local_num_tokens(
+            total_lengths,
+            response_lengths,
+            full_masks,
+            dynamic_cp_size=world_size,
+            dynamic_cp_rank=rank,
+        )
         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sample_mean_reduced, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_num_tokens, op=dist.ReduceOp.SUM)
 
+        reference_num_tokens = sum(mask.sum() for mask in full_masks)
         assert torch.allclose(reduced, reference, atol=1e-10), (
-            f"CP={world_size} rank={rank} per_token={calculate_per_token_loss}: "
-            f"reduced={reduced.item()} != reference={reference.item()}"
+            f"CP={world_size} rank={rank}: reduced={reduced.item()} != reference={reference.item()}"
+        )
+        assert torch.equal(local_num_tokens, reference_num_tokens), (
+            f"CP={world_size} rank={rank}: num_tokens={local_num_tokens.item()} "
+            f"!= reference_num_tokens={reference_num_tokens.item()}"
+        )
+        assert torch.allclose(sample_mean_reduced, sample_mean_reference, atol=1e-10), (
+            f"CP={world_size} rank={rank}: sample_mean={sample_mean_reduced.item()} "
+            f"!= sample_mean_reference={sample_mean_reference.item()}"
         )
 
         for ownership in local_ownership:
@@ -107,18 +132,13 @@ def _rloo_cp_worker(rank, world_size, init_file, calculate_per_token_loss):
     reason="torch.distributed with Gloo is required",
 )
 @pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-def test_rloo_cp_production_reducer_matches_unsplit(
-    tmp_path,
-    world_size,
-    calculate_per_token_loss,
-):
+def test_rloo_cp_production_reducer_matches_unsplit(tmp_path, world_size):
     import torch.multiprocessing as mp
 
-    init_file = tmp_path / f"gloo-{world_size}-{int(calculate_per_token_loss)}"
+    init_file = tmp_path / f"gloo-{world_size}"
     mp.spawn(
         _rloo_cp_worker,
-        args=(world_size, str(init_file), calculate_per_token_loss),
+        args=(world_size, str(init_file)),
         nprocs=world_size,
         join=True,
     )
