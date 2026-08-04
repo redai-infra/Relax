@@ -37,8 +37,22 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 FROM base as train
 
+# flash-linear-attention 0.4.2 (pulls fla-core 0.4.2) is the first release carrying
+# `fla.ops.cp`, which GDN chunkwise context parallel needs. Fail the build here if the
+# capability is missing, so a silent wheel/index change can never produce an image whose
+# GDN chunkwise path only breaks at training time. NOTE: `fla-core` depends on an
+# unpinned `torch`, so pip re-resolves torch's own looser `nvidia-cudnn-cu12` pin here;
+# the explicit `nvidia-cudnn-cu12==9.16.0.29` install further down runs after this layer
+# and is what the final image keeps.
 RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.1 && \
+    pip install --no-cache-dir flash-linear-attention==0.4.2 && \
+    python -c "import inspect; \
+from fla.ops.cp import build_cp_context; \
+from fla.modules.convolution import causal_conv1d; \
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule; \
+assert 'cp_context' in inspect.signature(causal_conv1d).parameters, 'causal_conv1d lacks cp_context'; \
+assert 'cp_context' in inspect.signature(chunk_gated_delta_rule).parameters, 'chunk_gated_delta_rule lacks cp_context'; \
+print('FLA chunkwise-CP capability OK')" && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
 # FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
@@ -135,6 +149,18 @@ RUN cd Megatron-LM && \
     exit 1; \
     fi && \
     rm megatron.patch && \
+    python -c "import inspect; \
+import megatron.core.context_parallel_layout as cpl; \
+from megatron.core.packed_seq_params import resolve_cp_group; \
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet; \
+from megatron.core.transformer.transformer_config import TransformerConfig; \
+assert hasattr(cpl, 'zigzag_to_contiguous_chunks') and hasattr(cpl, 'contiguous_to_zigzag_chunks'); \
+assert hasattr(cpl, 'get_thd_context_parallel_rank_indices'); \
+assert hasattr(GatedDeltaNet, '_resolve_cp_routing') and hasattr(GatedDeltaNet, '_build_chunkwise_cp_context'); \
+assert 'linear_cp_mode' not in inspect.signature(GatedDeltaNet.forward).parameters, \
+    'linear_cp_mode must be static config, not a per-forward argument'; \
+assert TransformerConfig.linear_cp_mode == 'headwise', TransformerConfig.linear_cp_mode; \
+print('MCore chunkwise-CP backport OK')" && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
