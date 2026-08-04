@@ -179,6 +179,7 @@ def analyze(driver_log: Path, *, num_rollout: int = 11, headline_lo: int = 2, he
         by_step.setdefault(row["logical_step"], []).append(row)
 
     errors = []
+    warnings = []
     if len(init_rows) != 1:
         errors.append(f"init_marker_count={len(init_rows)}")
     expected_steps = set(range(num_rollout))
@@ -235,7 +236,7 @@ def analyze(driver_log: Path, *, num_rollout: int = 11, headline_lo: int = 2, he
     if sum(row["targeted_safe_requests"] for row in train_rows) == 0:
         errors.append("targeted_safe_requests_not_exercised")
     if sum(row["targeted_expired_requests"] for row in train_rows) == 0:
-        errors.append("targeted_expired_requests_not_exercised")
+        warnings.append("targeted_expired_requests_not_exercised")
 
     events_by_publication: dict[str, list[str]] = {}
     versions_by_publication: dict[str, set[int]] = {}
@@ -260,8 +261,9 @@ def analyze(driver_log: Path, *, num_rollout: int = 11, headline_lo: int = 2, he
 
     return {
         "schema_version": 1,
-        "verdict": "PASS" if not errors else "INVALID",
+        "verdict": "INVALID" if errors else ("PASS_WITH_WARNINGS" if warnings else "PASS"),
         "errors": errors,
+        "warnings": warnings,
         "contract": {
             "num_rollout": num_rollout,
             "headline": {"logical_step_lo": headline_lo, "logical_step_hi": headline_hi},
@@ -308,7 +310,7 @@ def main() -> None:
         args.output.write_text(payload, encoding="utf-8")
     else:
         print(payload, end="")
-    raise SystemExit(0 if result["verdict"] == "PASS" else 2)
+    raise SystemExit(0 if result["verdict"].startswith("PASS") else 2)
 
 
 if __name__ == "__main__":

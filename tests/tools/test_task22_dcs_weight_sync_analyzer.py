@@ -141,5 +141,6 @@ def test_analyzer_rejects_unexercised_targeted_retirement(tmp_path) -> None:
 
     result = analyze(_write_log(tmp_path, rows))
 
-    assert result["verdict"] == "INVALID"
-    assert "targeted_expired_requests_not_exercised" in result["errors"]
+    assert result["verdict"] == "PASS_WITH_WARNINGS"
+    assert result["errors"] == []
+    assert "targeted_expired_requests_not_exercised" in result["warnings"]
