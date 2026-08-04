@@ -17,6 +17,13 @@ permit logic can be unit-tested on CPU without constructing the heavy
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import NamedTuple
+
+
+class InferencePermitSnapshot(NamedTuple):
+    capacity: int
+    in_use: int
+    waiting: int
 
 
 class GenerationAborted(Exception):
@@ -49,6 +56,13 @@ class InferencePermitManager:
         # Public: GenerateState exposes it as ``self.semaphore`` (backward-compat
         # alias) and the session-lock dispatch path acquires it directly.
         self.semaphore = asyncio.Semaphore(capacity)
+
+    def snapshot(self) -> InferencePermitSnapshot:
+        """Observe pressure without replacing the production semaphore."""
+        available = self.semaphore._value
+        waiters = self.semaphore._waiters
+        waiting = sum(not waiter.done() for waiter in waiters) if waiters is not None else 0
+        return InferencePermitSnapshot(self.capacity, self.capacity - available, waiting)
 
     @asynccontextmanager
     async def permit(self, abort_check: Callable[[], bool] | None = None) -> AsyncIterator[None]:

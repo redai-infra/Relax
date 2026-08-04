@@ -1,0 +1,51 @@
+diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
+--- a/python/sglang/srt/observability/req_time_stats.py
++++ b/python/sglang/srt/observability/req_time_stats.py
+@@ -591,3 +591,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+         # send to detokenizer/tokenizer
+-        if not self.enable_metrics:
++        # The object crosses scheduler -> detokenizer -> tokenizer. The
++        # metrics collector is intentionally not pickled, so enable_metrics is
++        # false after the first hop. Keep a data-only forwarding marker.
++        # This preserves timing without serializing the metrics collector.
++        if not self.enable_metrics and not getattr(
++            self, "_relax_forward_timing_payload", False
++        ):
+             return {}
+@@ -584,2 +590,3 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+         state = {
++            "_relax_forward_timing_payload": True,
+             "wait_queue_entry_time": self.wait_queue_entry_time,
+diff --git a/python/sglang/srt/observability/scheduler_metrics_mixin.py b/python/sglang/srt/observability/scheduler_metrics_mixin.py
+--- a/python/sglang/srt/observability/scheduler_metrics_mixin.py
++++ b/python/sglang/srt/observability/scheduler_metrics_mixin.py
+@@ -504,3 +504,7 @@ class SchedulerMetricsMixin:
+             else self.forward_ct
+         )
++        # RELAX_REQUEST_SHAPE_OBSERVABILITY
++        if batch is not None and (status_logger := self.scheduler_status_logger):
++            status_logger.maybe_dump(batch, self.waiting_queue)
++
+         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+diff --git a/python/sglang/srt/utils/scheduler_status_logger.py b/python/sglang/srt/utils/scheduler_status_logger.py
+--- a/python/sglang/srt/utils/scheduler_status_logger.py
++++ b/python/sglang/srt/utils/scheduler_status_logger.py
+@@ -49,7 +49,18 @@ class SchedulerStatusLogger:
+             "scheduler.status",
+             {
+                 "rank": self.rank,
++                "forward_mode": str(running_batch.forward_mode),
+                 "running_rids": [r.rid for r in running_batch.reqs],
++                "running_seq_lens": [int(r.seqlen) for r in running_batch.reqs],
++                "running_origin_input_lens": [
++                    len(r.origin_input_ids) for r in running_batch.reqs
++                ],
++                "running_output_lens": [len(r.output_ids) for r in running_batch.reqs],
++                "decoding_rids": [
++                    r.rid for r in (running_batch.decoding_reqs or [])
++                ],
+                 "queued_rids": [r.rid for r in waiting_queue],
++                "queued_origin_input_lens": [len(r.origin_input_ids) for r in waiting_queue],
++                "queued_output_lens": [len(r.output_ids) for r in waiting_queue],
+             },
+         )

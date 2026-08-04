@@ -1,0 +1,109 @@
+diff --git a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+--- a/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
++++ b/python/sglang/srt/managers/scheduler_runtime_checker_mixin.py
+@@ -553,6 +553,11 @@ class SchedulerRuntimeCheckerMixin:
+         if not self.is_fully_idle():
+             return
+
++        # RELAX_SCHEDULER_IDLE_HEARTBEAT: default sleep_on_idle=False keeps
++        # calling on_idle, so the status logger emits rate-limited idle liveness.
++        if status_logger := self.scheduler_status_logger:
++            status_logger.maybe_dump(None, self.waiting_queue)
++
+         # memory leak check (skipped for hisparse — pool counters intentionally
+         # diverge during host-backup, see _get_swa_token_info clamp).
+         if not self.enable_hisparse:
+diff --git a/python/sglang/srt/observability/scheduler_metrics_mixin.py b/python/sglang/srt/observability/scheduler_metrics_mixin.py
+--- a/python/sglang/srt/observability/scheduler_metrics_mixin.py
++++ b/python/sglang/srt/observability/scheduler_metrics_mixin.py
+@@ -508,7 +508,12 @@ class SchedulerMetricsMixin:
+         )
+         # RELAX_REQUEST_SHAPE_OBSERVABILITY
+         if batch is not None and (status_logger := self.scheduler_status_logger):
+-            status_logger.maybe_dump(batch, self.waiting_queue)
++            status_logger.maybe_dump(
++                batch,
++                self.waiting_queue,
++                prefill_tokens=prefill_stats.log_input_tokens,
++                cached_tokens=prefill_stats.log_hit_tokens,
++            )
+
+         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+
+@@ -644,7 +649,7 @@ class SchedulerMetricsMixin:
+                 self._mfu_log_write_bytes += write_bytes
+
+             if x := self.scheduler_status_logger:
+-                x.maybe_dump(batch, self.waiting_queue)
++                x.maybe_dump(batch, self.waiting_queue, decode_tokens=decode_tokens)
+
+         # Periodic work: log + heavy metrics at decode_log_interval
+         if self.forward_ct_decode % self.server_args.decode_log_interval != 0:
+diff --git a/python/sglang/srt/utils/scheduler_status_logger.py b/python/sglang/srt/utils/scheduler_status_logger.py
+--- a/python/sglang/srt/utils/scheduler_status_logger.py
++++ b/python/sglang/srt/utils/scheduler_status_logger.py
+@@ -17,6 +17,10 @@ class SchedulerStatusLogger:
+         self.loggers = create_log_targets(targets=targets, name_prefix=__name__)
+         self.dump_interval = dump_interval
+         self.last_dump_time = 0.0
++        self.last_idle = None
++        self.decode_tokens_cumulative = 0
++        self.prefill_tokens_cumulative = 0
++        self.cached_tokens_cumulative = 0
+         self.rank = dist.get_rank() if dist.is_initialized() else 0
+
+     @staticmethod
+@@ -37,27 +41,45 @@ class SchedulerStatusLogger:
+         )
+
+     def maybe_dump(
+-        self, running_batch: "ScheduleBatch", waiting_queue: List["Req"]
++        self,
++        running_batch: Optional["ScheduleBatch"],
++        waiting_queue: List["Req"],
++        *,
++        decode_tokens: int = 0,
++        prefill_tokens: int = 0,
++        cached_tokens: int = 0,
+     ) -> None:
++        self.decode_tokens_cumulative += max(int(decode_tokens), 0)
++        self.prefill_tokens_cumulative += max(int(prefill_tokens), 0)
++        self.cached_tokens_cumulative += max(int(cached_tokens), 0)
+         now = time.time()
+-        if now - self.last_dump_time < self.dump_interval:
++        running_reqs = running_batch.reqs if running_batch is not None else []
++        idle = not running_reqs and not waiting_queue
++        state_changed = idle != self.last_idle
++        if not state_changed and now - self.last_dump_time < self.dump_interval:
+             return
+
+         self.last_dump_time = now
++        self.last_idle = idle
+         log_json(
+             self.loggers,
+             "scheduler.status",
+             {
+                 "rank": self.rank,
+-                "forward_mode": str(running_batch.forward_mode),
+-                "running_rids": [r.rid for r in running_batch.reqs],
+-                "running_seq_lens": [int(r.seqlen) for r in running_batch.reqs],
++                "timestamp_epoch": now,
++                "idle": idle,
++                "decode_tokens_cumulative": self.decode_tokens_cumulative,
++                "prefill_tokens_cumulative": self.prefill_tokens_cumulative,
++                "cached_tokens_cumulative": self.cached_tokens_cumulative,
++                "forward_mode": str(running_batch.forward_mode) if running_batch is not None else "IDLE",
++                "running_rids": [r.rid for r in running_reqs],
++                "running_seq_lens": [int(r.seqlen) for r in running_reqs],
+                 "running_origin_input_lens": [
+-                    len(r.origin_input_ids) for r in running_batch.reqs
++                    len(r.origin_input_ids) for r in running_reqs
+                 ],
+-                "running_output_lens": [len(r.output_ids) for r in running_batch.reqs],
++                "running_output_lens": [len(r.output_ids) for r in running_reqs],
+                 "decoding_rids": [
+-                    r.rid for r in (running_batch.decoding_reqs or [])
++                    r.rid for r in ((running_batch.decoding_reqs or []) if running_batch is not None else [])
+                 ],
+                 "queued_rids": [r.rid for r in waiting_queue],
+                 "queued_origin_input_lens": [len(r.origin_input_ids) for r in waiting_queue],

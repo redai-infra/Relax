@@ -1,0 +1,54 @@
+diff --git a/python/sglang/srt/utils/request_logger.py b/python/sglang/srt/utils/request_logger.py
+--- a/python/sglang/srt/utils/request_logger.py
++++ b/python/sglang/srt/utils/request_logger.py
+@@ -16,3 +16,4 @@
+ import dataclasses
+ import logging
++import os
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+@@ -97,10 +98,15 @@ class RequestLogger:
+         max_length, skip_names, _ = self.metadata
+         headers = _extract_whitelisted_headers(request)
+         if self.log_requests_format == "json":
+-            log_data = {
+-                "rid": obj.rid,
+-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+-            }
++            # RELAX_RID_ONLY_REQUEST_LOGGING: exact request-to-engine mapping
++            # without serializing prompt, response, token IDs, or logprobs.
++            if os.getenv("RELAX_RID_ONLY_REQUEST_LOGGING") == "1":
++                log_data = {"rid": obj.rid}
++            else:
++                log_data = {
++                    "rid": obj.rid,
++                    "obj": _transform_data_for_logging(obj, max_length, skip_names),
++                }
+             if headers:
+                 log_data["headers"] = headers
+             log_json(self.targets, "request.received", log_data)
+@@ -172,15 +176,18 @@ class RequestLogger:
+         max_length, skip_names, out_skip_names = self.metadata
+         headers = _extract_whitelisted_headers(request)
+         if self.log_requests_format == "json":
+-            log_data = {
+-                "rid": obj.rid,
+-                "obj": _transform_data_for_logging(obj, max_length, skip_names),
+-            }
++            if os.getenv("RELAX_RID_ONLY_REQUEST_LOGGING") == "1":
++                log_data = {"rid": obj.rid}
++            else:
++                log_data = {
++                    "rid": obj.rid,
++                    "obj": _transform_data_for_logging(obj, max_length, skip_names),
++                }
++                log_data["out"] = _transform_data_for_logging(
++                    out, max_length, out_skip_names
++                )
+             if headers:
+                 log_data["headers"] = headers
+-            log_data["out"] = _transform_data_for_logging(
+-                out, max_length, out_skip_names
+-            )
+             log_json(self.targets, "request.finished", log_data)
+         else:
+             obj_str = _dataclass_to_string_truncated(

@@ -24,6 +24,28 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.permit_observability import (
+    CALIBRATION_ENGINE_REQUEST_STARTED_METADATA_KEY,
+    CALIBRATION_RID_METADATA_KEY,
+    CALIBRATION_TIMING_METADATA_KEY,
+    capture_sglang_timing,
+    mark_engine_request_started,
+)
+from relax.engine.rollout.permit_observability import (
+    begin_wait as begin_permit_wait,
+)
+from relax.engine.rollout.permit_observability import (
+    export_rows as export_permit_wait_rows,
+)
+from relax.engine.rollout.permit_observability import (
+    mark_granted as mark_permit_granted,
+)
+from relax.engine.rollout.permit_observability import (
+    mark_terminal as mark_permit_terminal,
+)
+from relax.engine.rollout.permit_observability import (
+    output_dir as permit_observability_dir,
+)
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.engine.rollout.sync_intent import (
     plan_dp_aligned_extra_groups,
@@ -75,6 +97,14 @@ def _ensure_not_holding_session_lock() -> None:
             "non-reentrant semaphore) and acquiring a permit would deadlock. "
             "See docs/{zh,en}/guide/customize-training.md."
         )
+
+
+def _permit_snapshot(state: Any) -> dict[str, int] | None:
+    manager = getattr(state, "permit_manager", None)
+    if manager is None or getattr(manager, "semaphore", None) is not state.semaphore:
+        return None
+    snapshot = manager.snapshot()
+    return {"capacity": snapshot.capacity, "in_use": snapshot.in_use, "waiting": snapshot.waiting}
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -400,6 +430,15 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
+    sample_metadata = getattr(sample, "metadata", None)
+    calibration_rid = (
+        sample_metadata.get(CALIBRATION_RID_METADATA_KEY)
+        if permit_observability_dir() is not None and isinstance(sample_metadata, dict)
+        else None
+    )
+    if calibration_rid is not None:
+        payload["rid"] = str(calibration_rid)
+
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
@@ -410,9 +449,13 @@ async def generate(
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
+    if calibration_rid is not None:
+        mark_engine_request_started(sample)
     _t_generate_start = monotonic()
     output = await post(url, payload, headers=headers)
     _t_generate = monotonic() - _t_generate_start
+    if calibration_rid is not None:
+        capture_sglang_timing(sample, output.get("meta_info", {}))
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -539,6 +582,8 @@ async def _dispatch_generate(
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
     manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
+    observe_permit = permit_observability_dir() is not None and not evaluation and not manages_permit
+    wait_row: dict[str, Any] | None = None
 
     async def _run() -> Sample | list[Sample]:
         if state.aborted:
@@ -557,17 +602,44 @@ async def _dispatch_generate(
             if dispatch_started_event is not None:
                 dispatch_started_event.set()
             return await _run()
+        if observe_permit:
+            wait_row = begin_permit_wait(
+                sample,
+                physical_rollout_id=getattr(state, "current_rollout_id", None),
+                permit_snapshot=_permit_snapshot(state),
+            )
+            state.permit_observability_rows.append(wait_row)
+            sample_metadata = getattr(sample, "metadata", None)
+            if isinstance(sample_metadata, dict):
+                sample_metadata[CALIBRATION_RID_METADATA_KEY] = wait_row["permit_wait_id"]
         async with state.semaphore:
+            if wait_row is not None:
+                mark_permit_granted(wait_row, _permit_snapshot(state))
             if dispatch_started_event is not None:
                 dispatch_started_event.set()
             token = _holding_session_lock.set(True)
             try:
-                return await _run()
+                result = await _run()
+                if wait_row is not None:
+                    mark_permit_terminal(wait_row, sample)
+                return result
             finally:
                 _holding_session_lock.reset(token)
     except GenerationAborted:
         sample.status = Sample.Status.ABORTED
+        if wait_row is not None:
+            mark_permit_terminal(wait_row, sample)
         return sample
+    except BaseException as error:
+        if wait_row is not None:
+            mark_permit_terminal(wait_row, sample, error)
+        raise
+    finally:
+        sample_metadata = getattr(sample, "metadata", None)
+        if wait_row is not None and isinstance(sample_metadata, dict):
+            sample_metadata.pop(CALIBRATION_RID_METADATA_KEY, None)
+            sample_metadata.pop(CALIBRATION_TIMING_METADATA_KEY, None)
+            sample_metadata.pop(CALIBRATION_ENGINE_REQUEST_STARTED_METADATA_KEY, None)
 
 
 async def generate_and_rm(
@@ -914,6 +986,8 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+    state.current_rollout_id = rollout_id
+    state.permit_observability_rows = []
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1019,9 +1093,20 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
-                )
+                if permit_observability_dir() is not None:
+                    logger.info(
+                        "First rollout sample: prompt_response_redacted=true response_tokens=%s "
+                        "group_index=%s sample_index=%s status=%s",
+                        sample.response_length,
+                        sample.group_index,
+                        sample.index,
+                        sample.status,
+                    )
+                else:
+                    logger.info(
+                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                        f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    )
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
@@ -1177,9 +1262,18 @@ async def generate_rollout_async(
     await stop_sglang_profile(args, rollout_id)
 
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-    logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
-    )
+    if permit_observability_dir() is not None:
+        logger.info(
+            "Finish rollout: prompt_response_redacted=true response_tokens=%s group_index=%s sample_index=%s",
+            sample.response_length,
+            sample.group_index,
+            sample.index,
+        )
+    else:
+        logger.info(
+            f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+            f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        )
 
     rollout_time = timer.end("rollout")
 
@@ -1191,6 +1285,19 @@ async def generate_rollout_async(
     new_aborted, completed_protected = await abort(args, rollout_id)
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
+    calibration_directory = permit_observability_dir()
+    if calibration_directory is not None:
+        permit_path = export_permit_wait_rows(
+            state.permit_observability_rows,
+            directory=calibration_directory,
+            physical_rollout_id=rollout_id,
+        )
+        logger.info(
+            "TASK22_CALIBRATION_PERMIT rollout_id=%s rows=%s path=%s",
+            rollout_id,
+            len(state.permit_observability_rows),
+            permit_path,
+        )
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."
@@ -1378,11 +1485,20 @@ async def eval_rollout_single_dataset(
             group = await coro
             if do_print:
                 sample = group[0]
-                logger.info(
-                    "eval_rollout_single_dataset example data: "
-                    f"{[str(sample.prompt) + sample.response]} "
-                    f"reward={sample.reward}"
-                )
+                if permit_observability_dir() is not None:
+                    logger.info(
+                        "eval_rollout_single_dataset example data: prompt_response_redacted=true "
+                        "response_tokens=%s sample_index=%s status=%s",
+                        sample.response_length,
+                        sample.index,
+                        sample.status,
+                    )
+                else:
+                    logger.info(
+                        "eval_rollout_single_dataset example data: "
+                        f"{[str(sample.prompt) + sample.response]} "
+                        f"reward={sample.reward}"
+                    )
                 do_print = False
             data.extend(group)
             pbar.update(1)
@@ -1412,11 +1528,20 @@ async def eval_rollout_single_dataset(
         for coro in asyncio.as_completed(tasks):
             sample = await coro
             if do_print:
-                logger.info(
-                    "eval_rollout_single_dataset example data: "
-                    f"{[str(sample.prompt) + sample.response]} "
-                    f"reward={sample.reward}"
-                )
+                if permit_observability_dir() is not None:
+                    logger.info(
+                        "eval_rollout_single_dataset example data: prompt_response_redacted=true "
+                        "response_tokens=%s sample_index=%s status=%s",
+                        sample.response_length,
+                        sample.index,
+                        sample.status,
+                    )
+                else:
+                    logger.info(
+                        "eval_rollout_single_dataset example data: "
+                        f"{[str(sample.prompt) + sample.response]} "
+                        f"reward={sample.reward}"
+                    )
                 do_print = False
             if isinstance(sample, list):
                 data.extend(sample)
