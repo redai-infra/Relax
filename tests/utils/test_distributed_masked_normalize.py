@@ -120,7 +120,7 @@ def _distributed_worker(rank: int, world_size: int, init_method: str) -> None:
         torch.testing.assert_close(variance, torch.tensor(1e-4, dtype=torch.float64), atol=1e-12, rtol=1e-12)
         torch.testing.assert_close(count, torch.tensor(2.0, dtype=torch.float64), atol=0, rtol=0)
 
-        with pytest.raises(ValueError, match="global mask sum"):
+        with pytest.raises(RuntimeError, match="global mask sum"):
             distributed_masked_normalize(torch.tensor([float(rank)]), torch.zeros(1))
     finally:
         dist.destroy_process_group()
@@ -136,3 +136,17 @@ def test_population_normalize_validates_inputs():
         distributed_masked_normalize(torch.ones(2), torch.ones(3))
     with pytest.raises(ValueError, match="variance_floor must be positive"):
         distributed_masked_normalize(torch.ones(2), torch.ones(2), variance_floor=0.0)
+
+
+def test_population_normalize_does_not_extract_host_scalar():
+    import ast
+    import inspect
+    import textwrap
+
+    source = inspect.getsource(distributed_masked_normalize)
+    tree = ast.parse(textwrap.dedent(source))
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "item"
+        for node in ast.walk(tree)
+    )
+    assert "torch._assert_async" in source

@@ -783,6 +783,26 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _get_reinforce_plus_plus_mask_safe_reducer(
+    reducer: Callable[[torch.Tensor], torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Exclude masked non-finite values before a REINFORCE++ reduction."""
+    flat_valid_mask = torch.cat([mask.reshape(-1) != 0 for mask in loss_masks], dim=0)
+
+    def reduce_valid_tokens(values: torch.Tensor) -> torch.Tensor:
+        valid_mask = flat_valid_mask.to(device=values.device)
+        if values.shape[0] != valid_mask.numel():
+            raise ValueError(
+                "REINFORCE++ reducer expected one value per response token, "
+                f"got {values.shape[0]} values for {valid_mask.numel()} mask elements."
+            )
+        safe_values = torch.where(valid_mask, values, torch.zeros_like(values))
+        return reducer(safe_values)
+
+    return reduce_valid_tokens
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -817,6 +837,14 @@ def policy_loss_function(
         advantages = torch.cat(batch["advantages"], dim=0)
     else:
         advantages = batch["advantages"]
+
+    is_reinforce_plus_plus = args.advantage_estimator in {
+        "reinforce_plus_plus",
+        "reinforce_plus_plus_baseline",
+    }
+
+    if is_reinforce_plus_plus:
+        sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
 
     true_on_policy = getattr(args, "true_on_policy_mode", False)
     # In true on-policy mode, actor_fwd is absent so batch["log_probs"] is missing;
@@ -997,6 +1025,10 @@ def policy_loss_function(
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
+        if is_reinforce_plus_plus:
+            sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
+                sum_of_sample_mean, modified_response_masks
+            )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
@@ -1006,6 +1038,8 @@ def policy_loss_function(
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
+        if is_reinforce_plus_plus:
+            pg_loss_reducer = _get_reinforce_plus_plus_mask_safe_reducer(pg_loss_reducer, pg_loss_masks)
     else:
         pg_loss_reducer = sum_of_sample_mean
 

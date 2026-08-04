@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from types import SimpleNamespace
+import importlib
+import sys
+from types import ModuleType, SimpleNamespace
 
 import torch
 
@@ -67,7 +69,7 @@ def test_masked_tokens_cannot_change_reduced_loss(monkeypatch):
     torch.testing.assert_close(reducer(base), reducer(changed), atol=0, rtol=0)
 
 
-def test_nonfinite_masked_tokens_cannot_change_reduced_loss(monkeypatch):
+def test_nonfinite_masked_tokens_are_scoped_to_reinforce_plus_plus(monkeypatch):
     monkeypatch.setattr(cp_utils, "mpu", SimpleNamespace(get_context_parallel_world_size=lambda: 1))
     masks = [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 1.0, 0.0])]
     values = torch.tensor([1.0, float("nan"), 3.0, 4.0, float("inf")])
@@ -75,5 +77,22 @@ def test_nonfinite_masked_tokens_cannot_change_reduced_loss(monkeypatch):
     response_mean = cp_utils.get_sum_of_sample_mean([2, 3], [2, 3], masks)
     token_sum = cp_utils.get_sum_of_sample_mean([2, 3], [2, 3], masks, calculate_per_token_loss=True)
 
-    torch.testing.assert_close(response_mean(values), torch.tensor(4.5), atol=0, rtol=0)
-    torch.testing.assert_close(token_sum(values), torch.tensor(8.0), atol=0, rtol=0)
+    # The shared reducers retain their upstream behavior for GRPO/GSPO/SAPO.
+    assert torch.isnan(response_mean(values))
+    assert torch.isnan(token_sum(values))
+
+    try:
+        import megatron  # noqa: F401
+    except ModuleNotFoundError:
+        megatron = ModuleType("megatron")
+        megatron_core = ModuleType("megatron.core")
+        megatron_core.mpu = SimpleNamespace()
+        megatron.core = megatron_core
+        monkeypatch.setitem(sys.modules, "megatron", megatron)
+        monkeypatch.setitem(sys.modules, "megatron.core", megatron_core)
+    loss_module = importlib.import_module("relax.backends.megatron.loss")
+
+    safe_response_mean = loss_module._get_reinforce_plus_plus_mask_safe_reducer(response_mean, masks)
+    safe_token_sum = loss_module._get_reinforce_plus_plus_mask_safe_reducer(token_sum, masks)
+    torch.testing.assert_close(safe_response_mean(values), torch.tensor(4.5), atol=0, rtol=0)
+    torch.testing.assert_close(safe_token_sum(values), torch.tensor(8.0), atol=0, rtol=0)

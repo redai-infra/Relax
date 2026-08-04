@@ -190,14 +190,19 @@ def distributed_masked_normalize(
     dist.all_reduce(mean_stats, group=process_group)
     global_sum, global_count = mean_stats.unbind()
 
-    if global_count.item() == 0:
-        raise ValueError("The global mask sum across all participating ranks is zero.")
+    # Keep the empty-global-batch invariant on device. Calling ``.item()`` here
+    # would synchronize every CUDA training batch with the host.
+    torch._assert_async(
+        global_count > 0,
+        "The global mask sum across all participating ranks is zero.",
+    )
+    safe_global_count = global_count.clamp_min(1)
 
-    global_mean = global_sum / global_count
+    global_mean = global_sum / safe_global_count
     centered = torch.where(valid_mask, working_values - global_mean, torch.zeros_like(working_values))
     centered_sum_sq = centered.square().sum()
     dist.all_reduce(centered_sum_sq, group=process_group)
-    global_variance = (centered_sum_sq / global_count).clamp_min(0.0)
+    global_variance = (centered_sum_sq / safe_global_count).clamp_min(0.0)
     inverse_std = torch.rsqrt(global_variance.clamp_min(variance_floor))
     normalized = torch.where(
         valid_mask,
