@@ -178,6 +178,7 @@ ray job list >"${RUN_ROOT}/logs/${RUN_NAME}-${NOW}-ray-job-list.txt" 2>&1
 # together. Missing/duplicated/conflicting rollout ids make this step fail.
 python3 "${SCRIPT_DIR}/summarize_reward.py" \
   --log-file "${LOG_FILE}" \
+  --rollout-result-dir "${SAVE_DIR}/rollout_result/train" \
   --output "${RUN_ROOT}/training-reward.summary.json" \
   --csv-output "${RUN_ROOT}/training-reward.csv" \
   --svg-output "${RUN_ROOT}/training-reward.svg" \

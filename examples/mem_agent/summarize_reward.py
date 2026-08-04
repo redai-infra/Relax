@@ -16,6 +16,7 @@ from typing import Any
 
 
 DEFAULT_METRIC = "rollout/mem_agent_raw_reward/mean"
+DEFAULT_ROLLOUT_RESULT_REWARD_KEY = "mem_agent_raw_reward"
 SCHEMA_VERSION = "mem-agent-reward-summary-v1"
 _PERF_LINE = re.compile(r"\bperf\s+(\d+):\s+(\{.*\})")
 
@@ -55,6 +56,55 @@ def extract_reward_points(lines: Iterable[str], metric: str = DEFAULT_METRIC) ->
         by_rollout[rollout_id] = value
 
     return sorted(by_rollout.items())
+
+
+def extract_reward_points_from_rollout_results(
+    directory: Path,
+    *,
+    reward_key: str = DEFAULT_ROLLOUT_RESULT_REWARD_KEY,
+    expected_rollout_ids: Iterable[int] | None = None,
+) -> list[tuple[int, float]]:
+    """Read trajectory-level reward means from ReLax rollout JSONL dumps.
+
+    The actor log's ``rollout/raw_reward`` is computed after MemAgent expands
+    each trajectory into turns, so documents with more chunks can receive more
+    weight. Rollout-result JSONL keeps exactly one record per trajectory and is
+    also immune to Ray log de-duplication, making it the authoritative source
+    for the reward curve when available.
+    """
+    if expected_rollout_ids is None:
+        rollout_ids = sorted(int(path.stem) for path in directory.glob("*.jsonl") if path.stem.isdigit())
+    else:
+        rollout_ids = list(expected_rollout_ids)
+    points: list[tuple[int, float]] = []
+    for rollout_id in rollout_ids:
+        path = directory / f"{rollout_id}.jsonl"
+        if not path.is_file():
+            raise ValueError(f"Missing rollout result for rollout {rollout_id}: {path}")
+        values: list[float] = []
+        with path.open(encoding="utf-8") as source:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                reward = record.get("reward")
+                raw_value = reward.get(reward_key) if isinstance(reward, dict) else reward
+                if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                    raise ValueError(
+                        f"Reward {reward_key!r} at rollout {rollout_id}, line {line_number} "
+                        f"is not numeric: {raw_value!r}."
+                    )
+                value = float(raw_value)
+                if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ValueError(
+                        f"Reward {reward_key!r} at rollout {rollout_id}, line {line_number} "
+                        f"is outside [0, 1]: {value!r}."
+                    )
+                values.append(value)
+        if not values:
+            raise ValueError(f"Rollout result {path} contains no reward records.")
+        points.append((rollout_id, fmean(values)))
+    return points
 
 
 def summarize_reward_points(
@@ -172,6 +222,12 @@ def main() -> None:
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metric", default=DEFAULT_METRIC)
+    parser.add_argument(
+        "--rollout-result-dir",
+        type=Path,
+        help="Prefer one-record-per-trajectory rollout JSONL files over potentially de-duplicated log metrics.",
+    )
+    parser.add_argument("--rollout-result-reward-key", default=DEFAULT_ROLLOUT_RESULT_REWARD_KEY)
     parser.add_argument("--expected-steps", type=int)
     parser.add_argument(
         "--expected-start",
@@ -184,16 +240,30 @@ def main() -> None:
     parser.add_argument("--svg-output", type=Path)
     args = parser.parse_args()
 
-    with args.log_file.open(encoding="utf-8", errors="replace") as source:
-        points = extract_reward_points(source, metric=args.metric)
+    expected_rollout_ids = None
+    if args.expected_steps is not None:
+        expected_rollout_ids = range(args.expected_start, args.expected_start + args.expected_steps)
+    summary_metric = args.metric
+    if args.rollout_result_dir is not None:
+        points = extract_reward_points_from_rollout_results(
+            args.rollout_result_dir,
+            reward_key=args.rollout_result_reward_key,
+            expected_rollout_ids=expected_rollout_ids,
+        )
+        summary_metric = f"rollout_result/reward/{args.rollout_result_reward_key}/mean"
+    else:
+        with args.log_file.open(encoding="utf-8", errors="replace") as source:
+            points = extract_reward_points(source, metric=args.metric)
     summary = summarize_reward_points(
         points,
         expected_steps=args.expected_steps,
         expected_start=args.expected_start,
         window_size=args.window_size,
-        metric=args.metric,
+        metric=summary_metric,
     )
     summary["log_file"] = str(args.log_file.resolve())
+    if args.rollout_result_dir is not None:
+        summary["rollout_result_dir"] = str(args.rollout_result_dir.resolve())
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as destination:
         json.dump(summary, destination, ensure_ascii=False, indent=2)
