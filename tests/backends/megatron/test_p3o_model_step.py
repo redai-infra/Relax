@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import ast
+import sys
 from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -16,7 +18,13 @@ from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 MODEL_PATH = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "model.py"
 
-with stubbed_megatron_modules(("megatron", "ray", "tensordict", "transfer_queue", "pybase64")):
+stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
+stream_dataloader.StreamingTQIterator = object
+
+with (
+    patch.dict(sys.modules, {"relax.utils.data.stream_dataloader": stream_dataloader}),
+    stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
+):
     from relax.backends.megatron.model import _preserved_dynamic_cp_group
 
 
