@@ -27,6 +27,7 @@ ENGINE_PID_RE = re.compile(r"\(SGLangEngine pid=(\d+)\)")
 PERMIT_FILENAME_RE = re.compile(r"^permit_wait_rollout_(\d+)\.jsonl$")
 GATE_MARKER = "TASK22_CALIBRATION_GATE"
 ACTOR_MARKER = "TASK22_CALIBRATION_ACTOR"
+PERMIT_MARKER = "TASK22_CALIBRATION_PERMIT"
 FINAL_WAIT_STATUSES = {"terminal", "cancelled_before_grant", "ended_before_grant"}
 SCHEDULER_HEALTH_FLOOR_SECONDS = 5.0
 HEADLINE_RID_MATCH_MIN_COVERAGE = 1.0
@@ -777,11 +778,36 @@ def _read_permit_rows(directory: Path) -> tuple[list[Path], list[dict[str, Any]]
     return paths, rows
 
 
+def _zero_dispatch_permit_rollout_ids(driver_log: Path) -> set[int]:
+    terminal_counts: dict[int, list[int]] = {}
+    for row in _structured_rows(driver_log, PERMIT_MARKER):
+        try:
+            rollout_id = int(row.get("rollout_id", ""))
+            terminal_rows = int(row.get("terminal_rows", ""))
+        except ValueError as exc:
+            raise CalibrationInputError(
+                f"malformed_permit_terminal_marker:line_{row['_line']}:"
+                f"rollout_id={row.get('rollout_id')!r}:terminal_rows={row.get('terminal_rows')!r}"
+            ) from exc
+        if rollout_id < 0 or terminal_rows < 0:
+            raise CalibrationInputError(
+                f"invalid_permit_terminal_marker:line_{row['_line']}:"
+                f"rollout_id={rollout_id}:terminal_rows={terminal_rows}"
+            )
+        terminal_counts.setdefault(rollout_id, []).append(terminal_rows)
+    return {
+        rollout_id
+        for rollout_id, counts in terminal_counts.items()
+        if counts and all(count == 0 for count in counts)
+    }
+
+
 def _validate_permit_rollout_coverage(
     paths: list[Path],
     rows: list[dict[str, Any]],
     *,
     num_rollout: int,
+    zero_dispatch_rollout_ids: set[int],
 ) -> dict[str, Any]:
     rollout_ids = []
     for path in paths:
@@ -792,19 +818,24 @@ def _validate_permit_rollout_coverage(
     observed = set(rollout_ids)
     required = set(range(num_rollout))
     allowed = required | {num_rollout}
-    missing = sorted(required - observed)
+    missing = required - observed
+    unproven_missing = sorted(missing - zero_dispatch_rollout_ids)
+    proven_zero_dispatch = sorted(missing & zero_dispatch_rollout_ids)
     unexpected = sorted(observed - allowed)
     row_counts = Counter(row["physical_rollout_id"] for row in rows)
     empty = sorted(rollout_id for rollout_id in observed if row_counts[rollout_id] == 0)
-    if missing or unexpected or empty:
+    if unproven_missing or unexpected or empty:
         raise CalibrationInputError(
-            f"invalid_permit_physical_rollout_coverage:missing={missing}:unexpected={unexpected}:empty={empty}:"
+            "invalid_permit_physical_rollout_coverage:"
+            f"missing={unproven_missing}:zero_dispatch={proven_zero_dispatch}:"
+            f"unexpected={unexpected}:empty={empty}:"
             f"required=0..{num_rollout - 1}:optional_final_backfill={num_rollout}"
         )
     return {
         "required_physical_rollout_ids": list(range(num_rollout)),
         "optional_final_backfill_physical_rollout_id": num_rollout,
         "observed_physical_rollout_ids": sorted(observed),
+        "zero_dispatch_physical_rollout_ids": proven_zero_dispatch,
         "per_physical_rollout_row_counts": {
             str(rollout_id): row_counts[rollout_id] for rollout_id in sorted(observed)
         },
@@ -1634,6 +1665,7 @@ def analyze(
             permit_paths,
             permit_rows,
             num_rollout=run_artifacts["run_contract"]["num_rollout"],
+            zero_dispatch_rollout_ids=_zero_dispatch_permit_rollout_ids(driver_log),
         )
         waits = _validate_permit_rows(permit_rows)
         snapshots_by_engine = _scheduler_snapshots(driver_log)

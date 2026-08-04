@@ -219,6 +219,17 @@ class SlimeRouter:
                 if response is not None:
                     await response.aclose()
 
+        except httpx.TransportError as exc:
+            logger.warning(
+                "Upstream transport failed for %s %s; returning retryable 502: %s",
+                request.method,
+                path,
+                type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": "upstream transport failure", "retryable": True},
+            )
         finally:
             elapsed_seconds = time.monotonic() - request_started_at
             self._finish_url(

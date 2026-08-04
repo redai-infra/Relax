@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
 from types import SimpleNamespace
 
 import httpx
-import pytest
 from starlette.requests import Request
 
 from relax.engine.router.router import SlimeRouter
@@ -51,20 +51,24 @@ def _request(*, estimated_tokens: str = "4096") -> Request:
     )
 
 
-async def test_proxy_releases_work_reservation_after_downstream_failure() -> None:
+async def test_proxy_returns_retryable_502_and_releases_work_after_downstream_failure() -> None:
     router = SlimeRouter(_args())
     router.work_ledger.add_worker("http://engine-a")
 
     async def fail(*_args, **_kwargs):
-        raise httpx.ConnectError("downstream failed")
+        raise httpx.ReadError("downstream aborted request")
 
     router.client.request = fail
     try:
-        with pytest.raises(httpx.ConnectError):
-            await router.proxy(_request(), "generate")
+        response = await router.proxy(_request(), "generate")
     finally:
         await router.client.aclose()
 
+    assert response.status_code == 502
+    assert json.loads(response.body) == {
+        "error": "upstream transport failure",
+        "retryable": True,
+    }
     assert router.work_ledger.snapshot()["http://engine-a"] == {
         "active_requests": 0,
         "reserved_tokens": 0,

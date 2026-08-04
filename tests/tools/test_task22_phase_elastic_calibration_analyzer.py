@@ -1072,6 +1072,50 @@ def test_analyzer_enforces_permit_physical_rollout_coverage(tmp_path, rollout_id
         assert "invalid_permit_physical_rollout_coverage" in result["errors"][0]
 
 
+def test_analyzer_accepts_proven_zero_dispatch_permit_rollout_gaps(tmp_path) -> None:
+    row = _wait("wait", begin=99.0, wait_end=102.0)
+    zero_dispatch = {1, 9}
+    driver, calibration = _write_inputs(
+        tmp_path,
+        waits=[row],
+        permit_rollout_ids=[rollout_id for rollout_id in range(16) if rollout_id not in zero_dispatch],
+    )
+    with driver.open("a", encoding="utf-8") as output:
+        for rollout_id in sorted(zero_dispatch):
+            output.write(
+                f"prefix TASK22_CALIBRATION_PERMIT rollout_id={rollout_id} "
+                "terminal_rows=0 exported={0: 128}\n"
+            )
+    _write_manifest(calibration)
+
+    result = analyze(driver, calibration)
+
+    assert result["verdict"] == "RECALIBRATE_REQUIRED"
+    coverage = result["inputs"]["permit_physical_rollout_coverage"]
+    assert coverage["zero_dispatch_physical_rollout_ids"] == [1, 9]
+    assert coverage["observed_physical_rollout_ids"] == [
+        rollout_id for rollout_id in range(16) if rollout_id not in zero_dispatch
+    ]
+
+
+def test_analyzer_rejects_unproven_zero_dispatch_permit_rollout_gap(tmp_path) -> None:
+    row = _wait("wait", begin=99.0, wait_end=102.0)
+    driver, calibration = _write_inputs(
+        tmp_path,
+        waits=[row],
+        permit_rollout_ids=list(range(1, 16)),
+    )
+    with driver.open("a", encoding="utf-8") as output:
+        output.write("prefix TASK22_CALIBRATION_PERMIT rollout_id=0 terminal_rows=1 exported={}\n")
+    _write_manifest(calibration)
+
+    result = analyze(driver, calibration)
+
+    assert result["verdict"] == "INVALID_INPUT"
+    assert "missing=[0]" in result["errors"][0]
+    assert "zero_dispatch=[]" in result["errors"][0]
+
+
 def test_analyzer_rejects_empty_optional_final_backfill_artifact(tmp_path) -> None:
     row = _wait("wait", begin=99.0, wait_end=102.0)
     driver, calibration = _write_inputs(tmp_path, waits=[row], permit_rollout_ids=list(range(17)))
