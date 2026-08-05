@@ -284,7 +284,7 @@ stability table (`0.006048 ± 0.002002` over steps 40--49). The released
 expanded commands and raw logs allow both checks to be recomputed without
 access to the cluster.
 
-![Training reward curves](/reinforce-plus-plus/training_reward_curve.svg)
+![Training reward curves](../../public/reinforce-plus-plus/training_reward_curve.svg)
 
 `train/loss`, `rollout/rewards`, and processed advantage magnitudes do not
 have a common cross-algorithm meaning. In particular, REINFORCE++ has no
@@ -292,9 +292,9 @@ independent KL-loss term, whereas the GRPO and baseline total losses include
 one. The next two figures are therefore optimization diagnostics rather than
 algorithm-ranking metrics.
 
-![Training total-loss curves](/reinforce-plus-plus/training_loss_curve.svg)
+![Training total-loss curves](../../public/reinforce-plus-plus/training_loss_curve.svg)
 
-![Independent k2 KL-loss curves](/reinforce-plus-plus/training_kl_loss_curve.svg)
+![Independent k2 KL-loss curves](../../public/reinforce-plus-plus/training_kl_loss_curve.svg)
 
 The normalized-advantage standard deviation was exactly 1 at all 150
 REINFORCE++ steps. The baseline variant produced finite zero advantages on 7
@@ -302,7 +302,7 @@ of 150 steps where the global raw advantage population had zero variance; its
 other steps had standard deviation 1. This is the intended degenerate-input
 behavior, not a NaN or silent sample loss.
 
-![Normalized advantage standard deviation](/reinforce-plus-plus/training_advantage_std_curve.svg)
+![Normalized advantage standard deviation](../../public/reinforce-plus-plus/training_advantage_std_curve.svg)
 
 ## Length, truncation, and efficiency
 
@@ -319,11 +319,11 @@ REINFORCE++, and 65.7 minutes for the baseline variant. Throughput, elapsed
 time, and peak memory are close; this experiment does not indicate a material
 systems-cost difference among the algorithms.
 
-![Mean response-length curves](/reinforce-plus-plus/training_response_length_curve.svg)
+![Mean response-length curves](../../public/reinforce-plus-plus/training_response_length_curve.svg)
 
-![Truncation curves](/reinforce-plus-plus/training_truncation_curve.svg)
+![Truncation curves](../../public/reinforce-plus-plus/training_truncation_curve.svg)
 
-![Response-token throughput curves](/reinforce-plus-plus/training_throughput_curve.svg)
+![Response-token throughput curves](../../public/reinforce-plus-plus/training_throughput_curve.svg)
 
 The response cap is an important limitation: roughly 54--56% of training
 responses and 40--44% of evaluation responses were truncated. Length behavior
@@ -356,7 +356,7 @@ Aggregate results:
 | REINFORCE++ | 0.5866 ± 0.0135 | 0.7007 ± 0.0112 | 0.7734 ± 0.0078 | 0.4382 ± 0.0064 |
 | REINFORCE++-baseline | 0.6042 ± 0.0215 | 0.7077 ± 0.0276 | 0.7891 ± 0.0273 | 0.4209 ± 0.0547 |
 
-![Final-checkpoint evaluation reward](/reinforce-plus-plus/evaluation_reward.svg)
+![Final-checkpoint evaluation reward](../../public/reinforce-plus-plus/evaluation_reward.svg)
 
 The paired reward differences by training seed are:
 

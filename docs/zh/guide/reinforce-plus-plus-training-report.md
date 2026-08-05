@@ -173,17 +173,17 @@ review 修复验证结果为：
 
 baseline 单独优化的 k2 loss 也可在稳定性表中独立观察到（step 40--49 为 `0.006048 ± 0.002002`）。公开的展开命令和原始日志允许在不访问集群的情况下重新计算两项检查。
 
-![训练 reward 曲线](/reinforce-plus-plus/training_reward_curve.svg)
+![训练 reward 曲线](../../public/reinforce-plus-plus/training_reward_curve.svg)
 
 `train/loss`、`rollout/rewards` 和处理后的 advantage 幅值在不同算法间没有统一含义。特别是 REINFORCE++ 没有独立 KL-loss，而 GRPO 和 baseline 总 loss 包含该项。因此下面两张图是优化诊断，而非算法排名指标。
 
-![训练 total-loss 曲线](/reinforce-plus-plus/training_loss_curve.svg)
+![训练 total-loss 曲线](../../public/reinforce-plus-plus/training_loss_curve.svg)
 
-![独立 k2 KL-loss 曲线](/reinforce-plus-plus/training_kl_loss_curve.svg)
+![独立 k2 KL-loss 曲线](../../public/reinforce-plus-plus/training_kl_loss_curve.svg)
 
 REINFORCE++ 的 150 个 step 中 normalized-advantage 标准差始终精确为 1。baseline 在 150 个 step 中有 7 个 step 的 global raw advantage population 方差为零，并产生有限的零 advantage；其余 step 标准差为 1。这是预期的退化输入行为，不是 NaN 或静默丢样本。
 
-![归一化 advantage 标准差](/reinforce-plus-plus/training_advantage_std_curve.svg)
+![归一化 advantage 标准差](../../public/reinforce-plus-plus/training_advantage_std_curve.svg)
 
 ## 长度、截断与效率
 
@@ -197,11 +197,11 @@ REINFORCE++ 的 150 个 step 中 normalized-advantage 标准差始终精确为 1
 
 GRPO、REINFORCE++ 和 baseline 的平均 Slurm 耗时分别为 65.6、66.9 和 65.7 分钟。吞吐、耗时和峰值显存接近；该实验没有显示算法间存在实质系统成本差异。
 
-![平均 response 长度曲线](/reinforce-plus-plus/training_response_length_curve.svg)
+![平均 response 长度曲线](../../public/reinforce-plus-plus/training_response_length_curve.svg)
 
-![截断曲线](/reinforce-plus-plus/training_truncation_curve.svg)
+![截断曲线](../../public/reinforce-plus-plus/training_truncation_curve.svg)
 
-![Response-token 吞吐曲线](/reinforce-plus-plus/training_throughput_curve.svg)
+![Response-token 吞吐曲线](../../public/reinforce-plus-plus/training_throughput_curve.svg)
 
 response cap 是一个重要限制：约 54--56% 的训练 response 和 40--44% 的评测 response 被截断。长度行为可能影响观测到的质量排序，不能只报告准确率而隐藏这一点。
 
@@ -229,7 +229,7 @@ response cap 是一个重要限制：约 54--56% 的训练 response 和 40--44% 
 | REINFORCE++ | 0.5866 ± 0.0135 | 0.7007 ± 0.0112 | 0.7734 ± 0.0078 | 0.4382 ± 0.0064 |
 | REINFORCE++-baseline | 0.6042 ± 0.0215 | 0.7077 ± 0.0276 | 0.7891 ± 0.0273 | 0.4209 ± 0.0547 |
 
-![最终 checkpoint 评测 reward](/reinforce-plus-plus/evaluation_reward.svg)
+![最终 checkpoint 评测 reward](../../public/reinforce-plus-plus/evaluation_reward.svg)
 
 按训练 seed 配对的 reward 差值为：
 
