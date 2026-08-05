@@ -19,6 +19,20 @@ _PIN_MEMORY = device_utils.use_pinned_host_memory()
 _MEGATRON_TP_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
 
 
+def _attach_tp_attrs(snapshot: torch.Tensor, param: torch.Tensor, backfill_defaults) -> None:
+    for attr in _MEGATRON_TP_ATTRS:
+        if hasattr(param, attr):
+            setattr(snapshot, attr, getattr(param, attr))
+    # Some params (e.g. this model's word_embeddings under bridge mode) aren't
+    # explicitly marked at model-construction time and only get backfilled
+    # with Megatron's own "not parallel" defaults later (see
+    # set_defaults_if_not_set_tensor_model_parallel_attributes callers) —
+    # apply the same backfill here so downstream TP-gather (e.g. DCS's
+    # all_gather_param) can rely on the attributes always being present, same
+    # contract Megatron itself guarantees for the live model.
+    backfill_defaults(snapshot)
+
+
 class TensorBackuper(ABC):
     @staticmethod
     def create(source_getter, single_tag):
@@ -76,23 +90,38 @@ class _TensorBackuperNormal(TensorBackuper):
         from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
 
         backup_dict = self._backups[tag]
-        for name, param in self._source_getter():
-            if name not in backup_dict:
-                target_device = param.device if on_device else torch.device("cpu")
-                snapshot = torch.empty_like(param, device=target_device, pin_memory=_PIN_MEMORY and not on_device)
-                for attr in _MEGATRON_TP_ATTRS:
-                    if hasattr(param, attr):
-                        setattr(snapshot, attr, getattr(param, attr))
-                # Some params (e.g. this model's word_embeddings under bridge
-                # mode) aren't explicitly marked at model-construction time and
-                # only get backfilled with Megatron's own "not parallel"
-                # defaults later (see set_defaults_if_not_set_tensor_model_parallel_attributes
-                # callers) — apply the same backfill here so downstream
-                # TP-gather (e.g. DCS's all_gather_param) can rely on the
-                # attributes always being present, same contract Megatron
-                # itself guarantees for the live model.
-                set_defaults_if_not_set_tensor_model_parallel_attributes(snapshot)
+        missing = [(name, param) for name, param in self._source_getter() if name not in backup_dict]
+        if on_device and missing:
+            # One cudaMalloc per parameter (hundreds for a real model) leaves
+            # the CUDA caching allocator holding hundreds of small, permanently
+            # non-reusable segments. That fragments the segment table the
+            # allocator has to search when satisfying the next dynamic-batch
+            # forward pass's activation requests (measured: ~190 segments held
+            # by this snapshot alone vs ~10 without it), which is what actually
+            # slows those forward passes down — not a lack of free memory.
+            # Allocate one contiguous buffer per dtype instead, and give every
+            # parameter a shape/stride view into it; each view is still a
+            # distinct Tensor object so it can carry its own TP attributes.
+            by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = defaultdict(list)
+            for name, param in missing:
+                by_dtype[param.dtype].append((name, param))
+            for dtype, entries in by_dtype.items():
+                device = entries[0][1].device
+                flat_buffer = torch.empty(sum(p.numel() for _, p in entries), dtype=dtype, device=device)
+                offset = 0
+                for name, param in entries:
+                    numel = param.numel()
+                    snapshot = flat_buffer[offset : offset + numel].view(param.shape)
+                    offset += numel
+                    _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
+                    backup_dict[name] = snapshot
+        else:
+            for name, param in missing:
+                snapshot = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
                 backup_dict[name] = snapshot
+
+        for name, param in self._source_getter():
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_utils.synchronize()
 

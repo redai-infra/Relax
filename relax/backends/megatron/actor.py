@@ -14,8 +14,9 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
-import transfer_queue as tq
 from megatron.core import mpu
+
+import transfer_queue as tq
 
 
 try:
@@ -287,33 +288,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
 
             if self.args.hybrid:
-                # Push actor->rollout weights via DCS instead of the CUDA-IPC
-                # UpdateWeightFromTensor path (see docs/en/guide/hybrid-training.md).
-                # Always synchronous: an earlier version overlapped this push with
-                # the next training iteration via a background ThreadPoolExecutor,
-                # but that thread's DCS collectives (TP all-gather, Gloo barrier,
-                # NCCL/GLOO broadcast) share the same Megatron process groups the
-                # main thread's next-iteration collectives use, with no ordering
-                # coordination between the two — a real cross-thread collective
-                # deadlock risk, not just a theoretical one, on top of measuring no
-                # faster than this synchronous push on 2xH20 (see
-                # exps/hybrid_async_perf_h20/README.md). Removed entirely rather
-                # than kept opt-in.
                 self.checkpoint_engine_client = self._create_checkpoint_engine_client(
                     role, weights_getter=lambda: self.weights_backuper.get("actor")
                 )
             else:
                 update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
-                # Push-side repack is decided by the HF config: an FP8 release auto-routes
-                # through quantize_params_fp8, a compressed-tensors release through
-                # quantize_params_compressed_tensors, an unquantized BF16 dir is passed
-                # through verbatim. The OPEN_TRAINING_INT4_FAKE_QAT_FLAG env var ONLY
-                # controls the training-side forward STE in the megatron patch — it is
-                # independent of push routing (matches slime/backends/megatron_utils/actor.py).
-                # K2.6 INT4 release ships an ignore list that omits vision_tower /
-                # mm_projector — without augment_compressed_tensors_ignore the bridge
-                # would try to INT4-pack those BF16 tensors and SGLang would reject
-                # them with "weight_packed not found in params_dict".
                 from relax.utils.quant_cast import augment_compressed_tensors_ignore
 
                 push_quant_config = augment_compressed_tensors_ignore(
