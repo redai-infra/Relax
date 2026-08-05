@@ -111,11 +111,17 @@ class TestCreateScaleInRequest:
             manager.create_scale_in_request(model_name="nope", engine_urls=["a:1"])
 
     def test_neither_replicas_nor_urls(self, patch_ray_get):
+        """Neither num_replicas>0 nor engine_urls given == target 0 < initial
+        count.
+
+        Returns a clean REJECTED instead of raising ValueError (which the HTTP
+        handler would map to 500). See create_scale_in_request.
+        """
         g = make_engine_group()
         srv = make_rollout_server(engine_groups=[g])
         manager = create_test_manager(servers={"default": srv})
-        with pytest.raises(ValueError, match="Either"):
-            manager.create_scale_in_request()
+        result = manager.create_scale_in_request()
+        assert result["status"] == "REJECTED"
 
     def test_by_engine_urls(self, patch_ray_get):
         initial = make_engine_group(engines=[make_mock_engine()])
@@ -279,7 +285,7 @@ class TestSelectEnginesForRemoval:
 
 class TestDrainEngines:
     @pytest.mark.asyncio
-    async def test_marks_all_engines_unhealthy(self):
+    async def test_removes_all_engines_from_router(self):
         e1 = make_mock_engine(url="http://a:1")
         e2 = make_mock_engine(url="http://b:2")
         g = make_engine_group(engines=[e1, e2], is_scaled_out=True)
@@ -288,8 +294,28 @@ class TestDrainEngines:
 
         engine_infos = [(g, 0), (g, 1)]
         # Use force=True to skip sleep
-        await manager._drain_engines(engine_infos, timeout=5, force=True)
-        # No assertion on side effects since router marking is best-effort
+        unregistered, failed = await manager._drain_engines(engine_infos, timeout=5, force=True)
+
+        assert unregistered == engine_infos
+        assert failed == []
+        e1.unregister_from_router.remote.assert_called_once_with(wait_for_removal=True, timeout=5.0)
+        e2.unregister_from_router.remote.assert_called_once_with(wait_for_removal=True, timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_router_removal_failure_is_reported(self):
+        engine = make_mock_engine()
+        engine.unregister_from_router.remote.return_value = AwaitableValue(False)
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+        monitor = MagicMock()
+        monitor._engine_group = group
+        manager._health_monitors.append(monitor)
+
+        unregistered, failed = await manager._drain_engines([(group, 0)], timeout=5, force=True)
+
+        assert unregistered == []
+        assert failed == ["group_0_engine_0"]
+        monitor.mark_intentionally_removed.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_force_skips_drain_wait(self):
@@ -303,6 +329,40 @@ class TestDrainEngines:
         await manager._drain_engines([(g, 0)], timeout=100, force=True)
         elapsed = time.monotonic() - start
         assert elapsed < 5  # force should skip the 100s wait
+
+
+# ========================= _scale_in =======================================
+
+
+class TestScaleInExecution:
+    @pytest.mark.asyncio
+    async def test_force_removes_only_engines_unregistered_from_router(self, patch_ray_get):
+        removable = make_mock_engine(url="http://a:1")
+        kept = make_mock_engine(url="http://b:2")
+        kept.unregister_from_router.remote.return_value = AwaitableValue(False)
+        group = make_engine_group(engines=[removable, kept], is_scaled_out=True)
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+        monitor = MagicMock()
+        monitor._engine_group = group
+        manager._health_monitors.append(monitor)
+        request = ScaleInRequest(
+            request_id="r1",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://a:1", "http://b:2"],
+            force=True,
+        )
+
+        await manager._scale_in(request)
+
+        assert request.status == ScaleInStatus.FAILED
+        assert request.removed_engines == ["group_0_engine_0"]
+        assert request.failed_engines == ["group_0_engine_1"]
+        assert group.all_engines[0] is None
+        assert group.all_engines[1] is kept
+        removable.shutdown.remote.assert_called_once()
+        kept.shutdown.remote.assert_not_called()
+        monitor.mark_intentionally_removed.assert_called_once_with(0)
 
 
 # ========================= _remove_engine ==================================

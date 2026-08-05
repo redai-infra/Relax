@@ -41,7 +41,7 @@ from relax.utils.data.processing_utils import (
     load_tokenizer,
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
-from relax.utils.http_utils import get, post
+from relax.utils.http_utils import get, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -827,6 +827,8 @@ async def abort(
     else:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
         urls = [worker["url"] for worker in response["workers"]]
+
+    urls = router_worker_base_urls(urls)
 
     abort_started_at = monotonic()
     abort_attempt = 0

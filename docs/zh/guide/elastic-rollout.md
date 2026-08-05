@@ -654,6 +654,10 @@ delta = min(max(usage_delta, queue_delta, 1), 4)
 | `scale_in_cooldown_secs`  | 300s   | 缩容后等待时间   |
 | `condition_window_secs`   | 60s    | 条件历史时间窗口 |
 
+条件必须持续满足 `condition_duration_secs`。指标缺失、覆盖率不足或观测间隔超过两倍评估周期时，持续时间会重置。
+扩容通过 `min_coverage_scale_out` 允许部分指标覆盖；缩容使用更严格的 `min_coverage_scale_in`，避免在部分引擎指标
+缺失时错误移除容量。Prometheus 直方图分位数落入 `+Inf` bucket 时按高延迟处理。
+
 ### 配置参数
 
 #### 启用 Autoscaler
@@ -666,6 +670,12 @@ ray job submit -- python3 relax/entrypoints/train.py \
     --autoscaler-config relax/utils/autoscaler/autoscaler.yaml \
     ... # 其他训练参数
 ```
+
+#### 基线节点组亲和性
+
+启用 autoscaler 配置后，Relax 会将 actor、critic、reference、rollout-seed 和 colocate 的基线 placement group
+固定到 `stable` worker group，弹性 rollout 引擎不受此约束。集群必须发布 `stable_gpu` 和 `stable_cpu` Ray
+自定义资源；资源不可用时 Relax 会快速失败。可通过 `--no-enable-affinity` 关闭该约束。
 
 #### 配置文件格式
 

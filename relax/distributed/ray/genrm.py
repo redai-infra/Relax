@@ -190,6 +190,9 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
             "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
             "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
             "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            # NOTE: disable custom all-reduce-v2, same as rollout.py — avoids
+            # custom_all_reduce.cuh:37: CUDA error: invalid argument during CUDA graph capture.
+            "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
         }
         if getattr(args, "fp16", False):
             env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"

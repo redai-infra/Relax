@@ -2,14 +2,15 @@
 
 import importlib
 import logging
-import os
 import sys
 from typing import Any
+
+from relax.utils.env import Envs
 
 
 def try_import_telemetry_hook(logger: Any = None) -> None:
     """Import the optional telemetry hook without affecting training."""
-    hook = os.environ.get("RELAX_TELEMETRY_HOOK")
+    hook = Envs.RELAX_TELEMETRY_HOOK
     if not hook:
         return
     # Skip if the hook (or its parent package) has already been imported by an

@@ -3,6 +3,8 @@
 import logging
 import os
 
+from relax.utils.env import Envs
+
 
 _LOGGER_CONFIGURED = False
 _CONFIGURED_PID = None
@@ -19,8 +21,6 @@ _LOG_COLORS = {
     logging.CRITICAL: "\033[35m",  # Magenta
 }
 _RESET_COLOR = "\033[0m"
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 try:
     import colorlog
@@ -94,9 +94,13 @@ def configure_logger(prefix: str = "") -> None:
     _CONFIGURED_PID = current_pid
 
     try:
+        # Read at configure time, not import time: logging is set up once per
+        # process, and by then a Ray worker has its runtime_env applied.
+        log_level = Envs.LOG_LEVEL.upper()
+
         # Get root logger
         root_logger = logging.getLogger()
-        root_logger.setLevel(LOG_LEVEL)
+        root_logger.setLevel(log_level)
 
         # Remove existing handlers to avoid duplicates
         for handler in root_logger.handlers[:]:
@@ -104,7 +108,7 @@ def configure_logger(prefix: str = "") -> None:
 
         # Create StreamHandler with colored formatter
         handler = logging.StreamHandler()
-        handler.setLevel(LOG_LEVEL)
+        handler.setLevel(log_level)
         handler.setFormatter(get_formatter(prefix))
         root_logger.addHandler(handler)
 

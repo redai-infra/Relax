@@ -2,7 +2,8 @@
 
 import importlib
 import logging
-import os
+
+from relax.utils.env import Envs
 
 
 try:
@@ -20,7 +21,7 @@ except BaseException as e:
 # ``RELAX_EXTRA_MODULES`` (comma-separated) are imported here for their
 # side effects — typically downstream packages registering Megatron-Bridge
 # converters, model providers, or family-token tables.
-for _mod in filter(None, (m.strip() for m in os.environ.get("RELAX_EXTRA_MODULES", "").split(","))):
+for _mod in filter(None, (m.strip() for m in Envs.RELAX_EXTRA_MODULES.split(","))):
     try:
         importlib.import_module(_mod)
     except BaseException as e:

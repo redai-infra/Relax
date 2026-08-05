@@ -1028,9 +1028,22 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        # Train/inference mismatch = |train-engine logprob - rollout-engine logprob| for
+        # the SAME tokens+weights. old_log_probs is the wrong reference under
+        # --use-rollout-logprobs: there old_log_probs IS rollout_log_probs (see the
+        # assignment above), so the diff would collapse to 0. Use the actor-fwd
+        # train-side recompute (batch["log_probs"], populated when --get-mismatch-metrics
+        # forces the extra forward) and fall back to this step's fresh forward log_probs
+        # otherwise (colocate on-policy: rollout weights == current weights).
+        if not args.use_rollout_logprobs:
+            train_side_log_probs = old_log_probs
+        elif batch.get("log_probs"):
+            train_side_log_probs = torch.cat(batch["log_probs"], dim=0)
+        else:
+            train_side_log_probs = log_probs.detach()
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((train_side_log_probs - rollout_log_probs).abs())
         train_rollout_prob_abs_diff = sum_of_sample_mean(
-            (torch.exp(old_log_probs) - torch.exp(rollout_log_probs)).abs()
+            (torch.exp(train_side_log_probs) - torch.exp(rollout_log_probs)).abs()
         )
 
     reported_loss = {

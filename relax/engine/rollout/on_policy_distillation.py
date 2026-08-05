@@ -68,7 +68,7 @@ def _round_robin(urls: list[str], key: str) -> str:
 def _pick_teacher_url(args, sample=None) -> str:
     routes_map = getattr(args, "opd_teacher_routes_map", None)
     if routes_map and sample is not None:
-        key_field = getattr(args, "opd_teacher_key", "data_source")
+        key_field = getattr(args, "opd_teacher_key", None) or "data_source"
         metadata = getattr(sample, "metadata", None) or {}
         routing_value = metadata.get(key_field)
         if routing_value is None:
