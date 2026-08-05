@@ -6,7 +6,6 @@ import random
 import socket
 import time
 from argparse import Namespace
-from contextlib import nullcontext
 from functools import partial
 from typing import Any, List
 
@@ -26,7 +25,6 @@ except ImportError:
     repatch = None
 
 from tensordict import TensorDict
-from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
@@ -51,6 +49,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.env import Envs
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import (
@@ -94,6 +93,7 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .weight_update.common import named_params_and_buffers
+from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
@@ -214,23 +214,6 @@ class MegatronTrainRayActor(TrainRayActor):
         }
         dist.barrier(group=get_gloo_group())
 
-        self._torch_memory_saver_enabled = False
-        if args.offload_train:
-            x = max(int(args.train_memory_margin_bytes), 0)
-            try:
-                torch_memory_saver.memory_margin_bytes = x
-                self._torch_memory_saver_enabled = True
-                if x > 0:
-                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-            except (RuntimeError, NotImplementedError) as e:
-                if "expandable_segments is not supported" in str(e) or "Only setter is supported" in str(e):
-                    logger.warning(
-                        "torch_memory_saver is unavailable in the current allocator mode; "
-                        "skip memory saver hooks and continue with offload_train."
-                    )
-                else:
-                    raise
-
         if role == "critic":
             self.args.load = self.args.critic_load
             self.args.save = self.args.critic_save
@@ -240,6 +223,11 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+
+        # Train-state offload for colocate sleep/wake. Picks torch_memory_saver
+        # (VMM pause) or manual selective CPU offload based on TMS availability;
+        # both implementations live in the offloader. No-op when offload_train is off.
+        self._train_state_offloader = MegatronTrainStateOffloader(self.model, self.optimizer, args)
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -358,8 +346,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        if self._torch_memory_saver_enabled:
-            torch_memory_saver.pause()
+        self._train_state_offloader.offload()
 
         print_memory("after offload model")
 
@@ -368,8 +355,7 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        if self._torch_memory_saver_enabled:
-            torch_memory_saver.resume()
+        self._train_state_offloader.reload()
 
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
@@ -593,15 +579,29 @@ class MegatronTrainRayActor(TrainRayActor):
         # (see Rollout._run_eval_with_mark), so we don't emit them here.
         if not has_rollout:
             return
+        rollout_serve_url = get_serve_url("rollout")
         try:
-            rollout_serve_url = get_serve_url("rollout")
+            # NOTE: /evaluate runs rollout-side inference and can legitimately
+            # take much longer than a short RPC, so it is intentionally left
+            # without an HTTP timeout -- a fixed timeout would falsely abort a
+            # long eval. This block's failure is non-fatal (logged, training
+            # continues).
             response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
             response.raise_for_status()
-            if end_update_weight:
-                response = requests.get(f"{rollout_serve_url}/end_update_weight")
-                response.raise_for_status()
         except Exception as e:
             logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
+        finally:
+            # Cleanup MUST run even if /evaluate failed, otherwise rollout + health
+            # monitoring stay paused forever. Short call -> keep the timeout;
+            # swallow its own errors independently.
+            if end_update_weight:
+                try:
+                    response = requests.get(
+                        f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
+                    )
+                    response.raise_for_status()
+                except Exception as e:
+                    logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
@@ -681,7 +681,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
-            empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
+            empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
@@ -1678,11 +1678,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        with (
-            torch_memory_saver.disable()
-            if self.args.offload_train and self._torch_memory_saver_enabled
-            else nullcontext()
-        ):
+        with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
@@ -1752,7 +1748,10 @@ class MegatronTrainRayActor(TrainRayActor):
             try:
                 rollout_serve_url = get_serve_url("rollout")
                 while True:
-                    response = requests.get(f"{rollout_serve_url}/can_do_update_weight_for_async")
+                    response = requests.get(
+                        f"{rollout_serve_url}/can_do_update_weight_for_async",
+                        timeout=self.args.rollout_http_timeout,
+                    )
                     response.raise_for_status()
                     res = response.json()
                     if res:
@@ -1777,7 +1776,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 try:
                     actor_fwd_serve_url = get_serve_url("actor_fwd")
-                    response = requests.get(f"{actor_fwd_serve_url}/get_step")
+                    response = requests.get(f"{actor_fwd_serve_url}/get_step", timeout=self.args.rollout_http_timeout)
                     response.raise_for_status()
                 except Exception as e:
                     logger.warning(

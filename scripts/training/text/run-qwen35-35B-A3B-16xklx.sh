@@ -305,6 +305,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --use-health-check \
+   --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

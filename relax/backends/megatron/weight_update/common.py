@@ -11,6 +11,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.backends.megatron.weight_update.train_offload import torch_memory_saver_preloaded
 from relax.utils.device import is_npu_available
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
@@ -207,11 +208,24 @@ def named_params_and_buffers(
     return ans
 
 
-def _maybe_get_cpu_backup(x: torch.Tensor):
-    from torch_memory_saver import torch_memory_saver
+def _maybe_get_cpu_backup(x: torch.Tensor) -> torch.Tensor:
+    # Selective offload (weight_update/train_offload.py): when the offloader
+    # frees a param's GPU storage via storage().resize_(0), it stashes the CPU copy
+    # on the tensor as ``_relax_cpu_offload_data``. If the GPU storage is empty, read
+    # from that CPU copy instead of touching the now-invalid CUDA storage.
+    if getattr(x, "_relax_cpu_offload_data", None) is not None and x.storage().size() == 0:
+        return x._relax_cpu_offload_data
 
-    if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
-        return cpu_tensor
+    # torch_memory_saver path: only usable when its LD_PRELOAD hook is active;
+    # otherwise get_cpu_backup() would assert on an uninitialized saver.
+    # NOTE: with --selective-offload, actor_group.py does NOT LD_PRELOAD the TMS hook,
+    # so torch_memory_saver_preloaded() is False here and this branch is skipped —
+    # i.e. LD_PRELOAD is the single source of truth for "TMS is the active mechanism".
+    if torch_memory_saver_preloaded():
+        from torch_memory_saver import torch_memory_saver
+
+        if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
+            return cpu_tensor
 
     return x
 

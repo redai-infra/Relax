@@ -138,6 +138,7 @@ def run_sft_eval(actor, rollout_id: int) -> None:
                     data_iterator,
                     num_microbatches,
                     store_prefix="",
+                    per_sample_output=False,
                 )
                 if mpu.is_pipeline_last_stage():
                     for sum_t in per_mb.get("sum_neg_log_prob", []):

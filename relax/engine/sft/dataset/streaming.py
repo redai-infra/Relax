@@ -17,7 +17,12 @@ from relax.engine.sft.dataset.multimodal import (
     preprocess_multimodal_async,
 )
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
-from relax.utils.data.data_utils import build_messages, resolve_path_plan
+from relax.utils.data.data_utils import (
+    build_messages,
+    collect_message_multimodal_data,
+    count_message_multimodal_items,
+    resolve_path_plan,
+)
 from relax.utils.data.streaming_dataset import CompositeStreamingReader, IndexManager, PrefetchBuffer, StreamingReader
 from relax.utils.logging_utils import get_logger
 
@@ -25,6 +30,10 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _LEARN_ROLES = {"assistant", "function_call"}
+
+
+class SFTMultimodalContractError(ValueError):
+    """A prompt's multimodal placeholders do not match its media fields."""
 
 
 @dataclass
@@ -46,6 +55,75 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _validate_multimodal_contract(
+    row: dict[str, Any],
+    prompt: str | list[Any],
+    *,
+    row_index: int,
+    multimodal_keys: dict[str, str] | None,
+    source_name: str,
+) -> None:
+    message_counts = count_message_multimodal_items(prompt)
+    inline_media = collect_message_multimodal_data(prompt)
+    mismatches = {}
+    for media_name, message_count in message_counts.items():
+        inline_count = len(inline_media[media_name])
+        top_level_required_count = message_count - inline_count
+        data_key = (multimodal_keys or {}).get(media_name)
+        top_level_count = len(_as_list(row.get(data_key))) if data_key else 0
+        if message_count > 0 and data_key is None:
+            mismatches[media_name] = {
+                "message_count": message_count,
+                "inline_count": inline_count,
+                "data_key": None,
+                "reason": f"configure {media_name!r} in --multimodal-keys",
+            }
+            continue
+        if top_level_required_count == top_level_count:
+            continue
+        if message_count == 0 and top_level_count == 0:
+            continue
+        mismatches[media_name] = {
+            "message_count": message_count,
+            "inline_count": inline_count,
+            "top_level_required_count": top_level_required_count,
+            "data_key": data_key,
+            "top_level_count": top_level_count,
+        }
+    if mismatches:
+        sample_id = row.get("_sample_id")
+        raise SFTMultimodalContractError(
+            f"SFT multimodal contract mismatch in {source_name!r} at sample idx={row_index}, "
+            f"sample_id={sample_id!r}: {mismatches}. Structured image/image_url/video/audio items with a valid "
+            "inline payload are self-contained; literal or payload-less placeholders require exactly one media "
+            "entry in the field configured by --multimodal-keys."
+        )
+
+
+def _validate_resolved_multimodal_contract(
+    messages: list[Any],
+    *,
+    row: dict[str, Any],
+    row_index: int,
+    source_name: str,
+) -> dict[str, list[Any]]:
+    message_counts = count_message_multimodal_items(messages)
+    media = collect_message_multimodal_data(messages)
+    mismatches = {
+        media_name: {"message_count": message_count, "resolved_source_count": len(media[media_name])}
+        for media_name, message_count in message_counts.items()
+        if message_count != len(media[media_name])
+    }
+    if mismatches:
+        sample_id = row.get("_sample_id")
+        raise SFTMultimodalContractError(
+            f"SFT multimodal source resolution failed in {source_name!r} at sample idx={row_index}, "
+            f"sample_id={sample_id!r}: {mismatches}. Each rendered media marker must resolve to exactly one "
+            "inline or top-level media source."
+        )
+    return media
 
 
 def _normalize_tools(value: Any) -> list[dict] | None:
@@ -148,6 +226,13 @@ def _build_canonical_sample_from_row(
             # mutate the reader's cache.
             prompt = _apply_conversation_key_map(prompt, conversation_key_map)
             row = {**row, prompt_key: prompt}
+        _validate_multimodal_contract(
+            row,
+            prompt,
+            row_index=row_index,
+            multimodal_keys=multimodal_keys,
+            source_name=source_name,
+        )
         raw_messages = build_messages(row, prompt_key, system_prompt, True, multimodal_keys)
     else:
         if not isinstance(prompt, str):
@@ -157,6 +242,13 @@ def _build_canonical_sample_from_row(
             )
         if row.get(label_key) is None:
             raise ValueError(f"SFT row missing label key {label_key!r}: available keys={list(row.keys())}")
+        _validate_multimodal_contract(
+            row,
+            prompt,
+            row_index=row_index,
+            multimodal_keys=multimodal_keys,
+            source_name=source_name,
+        )
         raw_messages = build_messages(row, prompt_key, system_prompt, True, multimodal_keys)
         raw_messages = list(raw_messages)
         raw_messages.append({"role": "assistant", "content": row[label_key], "learn": True})
@@ -171,9 +263,12 @@ def _build_canonical_sample_from_row(
     metadata.setdefault("source_dataset", source_name)
     metadata["row_index"] = row_index
 
-    media: dict[str, list[Any]] = {}
-    for media_type, data_key in (multimodal_keys or {}).items():
-        media[media_type] = _as_list(row.get(data_key))
+    media = _validate_resolved_multimodal_contract(
+        raw_messages,
+        row=row,
+        row_index=row_index,
+        source_name=source_name,
+    )
 
     return CanonicalSample(
         messages=_canonicalize_messages(raw_messages, require_response=require_response),
@@ -218,6 +313,7 @@ class SFTStreamingDataset:
         pad_token_ids: Iterable[int] | None = None,
         oversize_strategy: str = "keep",
         oversize_custom_fn: Callable[..., Optional[tuple[torch.Tensor, torch.Tensor]]] | None = None,
+        invalid_multimodal_strategy: str = "error",
         apply_chat_template_kwargs: dict | None = None,
     ) -> None:
         self.path = path
@@ -248,6 +344,14 @@ class SFTStreamingDataset:
             raise ValueError("oversize_strategy='custom' requires oversize_custom_fn to be provided")
         self._oversize_strategy = oversize_strategy
         self._oversize_custom_fn = oversize_custom_fn
+
+        valid_invalid_multimodal_strategies = {"error", "skip"}
+        if invalid_multimodal_strategy not in valid_invalid_multimodal_strategies:
+            raise ValueError(
+                "invalid_multimodal_strategy must be one of "
+                f"{sorted(valid_invalid_multimodal_strategies)}, got {invalid_multimodal_strategy!r}"
+            )
+        self._invalid_multimodal_strategy = invalid_multimodal_strategy
 
         # Fail-fast latch. Background prefetch threads can't propagate
         # exceptions to the asyncio producer, so the first error is recorded
@@ -462,7 +566,13 @@ class SFTStreamingDataset:
     def _render_one(self, idx: int) -> "_RenderedSample | None":
         if self.tokenizer is None:
             raise RuntimeError("SFTStreamingDataset: tokenizer is required for _render_one")
-        sample = self.get_canonical_sample(idx)
+        try:
+            sample = self.get_canonical_sample(idx)
+        except SFTMultimodalContractError as exc:
+            if self._invalid_multimodal_strategy == "error":
+                raise
+            logger.warning(f"SFTStreamingDataset[invalid-multimodal=skip]: {exc} Skipping.")
+            return None
         short_ids, short_mask = render_with_loss_mask(
             sample, tokenizer=self.tokenizer, apply_chat_template_kwargs=self.apply_chat_template_kwargs
         )

@@ -36,8 +36,6 @@ fi
 if [ -n "${WANDB_API_KEY:-}" ]; then
     export RUNTIME_ENV_JSON=$(echo "$RUNTIME_ENV_JSON" | jq --arg k "$WANDB_API_KEY" '.env_vars.WANDB_API_KEY = $k')
 fi
-# Exclude local caches / worktrees from working_dir upload (Ray dashboard caps at 100 MiB).
-export RUNTIME_ENV_JSON=$(echo "$RUNTIME_ENV_JSON" | jq '.excludes = [".claude", ".claude/**", ".mypy_cache", ".mypy_cache/**", ".pytest_cache", ".ruff_cache", ".codewiz", ".codewiz/**", ".opencode", ".git", ".git/**", "node_modules", "node_modules/**", "examples", "examples/**", "docs", "docs/**", "tests", "tests/**", "exps", "log", "*.log", "*.trace.json", "*.jsonl", "*.html", "tmp*"]')
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math-ppo}"

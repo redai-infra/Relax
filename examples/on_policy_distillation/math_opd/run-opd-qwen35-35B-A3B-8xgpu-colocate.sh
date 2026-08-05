@@ -93,7 +93,6 @@ OPD_ARGS=(
 
    --opd-teacher-timeout-s 6000
    --use-rollout-logprobs
-
    --opd-disable-rl-reward
 )
 

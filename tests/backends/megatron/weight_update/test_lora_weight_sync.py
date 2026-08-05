@@ -155,8 +155,8 @@ class TestCheckpointModeDetection:
     metadata."""
 
     def test_checkpoint_save_with_metadata(self):
-        # checkpoint.py imports megatron at module load; skip when unavailable (CPU-only CI).
-        pytest.importorskip("megatron")
+        # checkpoint.py imports megatron.training at module load; skip when unavailable (CPU-only CI).
+        pytest.importorskip("megatron.training.checkpointing")
 
         from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 
@@ -334,7 +334,12 @@ class TestMergeContract:
 
     def test_tp1_matches_real_loramerge(self):
         pytest.importorskip("megatron.bridge.peft.lora")
+        from inspect import signature
+
         from megatron.bridge.peft.lora import LoRAMerge
+
+        if "tp_size" not in signature(LoRAMerge().merge).parameters:
+            pytest.skip("installed megatron bridge LoRAMerge.merge lacks tp_size support")
 
         torch.manual_seed(0)
         base = torch.randn(6, 5)

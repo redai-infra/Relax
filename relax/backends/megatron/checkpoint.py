@@ -102,6 +102,27 @@ logger = get_logger(__name__)
 __all__ = ["save_checkpoint"]
 
 
+def _alias_renamed_transfer_queue_enum() -> None:
+    """Back-compat for checkpoints saved with transfer_queue < 0.1.10.dev0.
+
+    The streaming dataloader persists a ``ZMQServerInfo`` (with a ``Role`` enum
+    field) into Megatron's ``common.pt``. transfer_queue >= 0.1.10.dev0 (now the
+    minimum required version, see ``relax/utils/arguments.py``) renamed that enum
+    ``TransferQueueRole`` -> ``Role`` while keeping the member values identical.
+    Older checkpoints pickle the old class path, so ``torch.load`` raises
+    ``AttributeError: Can't get attribute 'TransferQueueRole'``. Re-expose the old
+    name as an alias so those checkpoints unpickle to the correct ``Role`` member.
+    The restored connection info is stale and gets re-initialized on resume, so
+    this only affects deserialization.
+    """
+    try:
+        from transfer_queue.utils import enum_utils
+    except ImportError:
+        return
+    if not hasattr(enum_utils, "TransferQueueRole") and hasattr(enum_utils, "Role"):
+        enum_utils.TransferQueueRole = enum_utils.Role
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
@@ -110,6 +131,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
     if exist and _is_megatron_checkpoint(load_path):
+        _alias_renamed_transfer_queue_enum()
         try:
             return _load_checkpoint_megatron(
                 ddp_model=ddp_model,

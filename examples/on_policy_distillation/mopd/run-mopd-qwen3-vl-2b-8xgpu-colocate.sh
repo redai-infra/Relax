@@ -18,7 +18,7 @@
 # Constraint (enforced): rollout_gpus + total_teacher_gpus == actor_gpus (4 + 4 == 8 ✓).
 #
 # Usage:
-#   bash run-mopd-qwen3-vl-2b-8xgpu-2replica-colocate.sh
+#   bash run-mopd-qwen3-vl-2b-8xgpu-colocate.sh
 
 set -ex
 set -o pipefail
