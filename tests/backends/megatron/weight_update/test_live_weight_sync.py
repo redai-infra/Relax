@@ -6,6 +6,7 @@ import torch
 from relax.backends.megatron.weight_update.live_weight_sync import (
     estimate_full_model_bytes,
     get_distributed_memory_status,
+    get_distributed_sync_success,
     required_live_weight_sync_bytes,
     run_live_weight_sync,
 )
@@ -60,17 +61,35 @@ def test_get_distributed_memory_status_uses_global_worst_case(monkeypatch):
     assert status.can_sync is False
 
 
+def test_get_distributed_sync_success_requires_every_rank(monkeypatch):
+    group = object()
+
+    def fake_all_reduce(value, *, op, group: object):
+        assert value.tolist() == [1]
+        assert op == torch.distributed.ReduceOp.MIN
+        assert group is not None
+        value[0] = 0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    assert get_distributed_sync_success(local_success=True, process_group=group) is False
+
+
 def test_run_live_weight_sync_orders_update_offload_sync_and_onload():
     calls = []
+
+    def synchronize(local_success):
+        calls.append(f"sync:{local_success}")
+        return local_success
 
     run_live_weight_sync(
         update_weights=lambda: calls.append("update"),
         offload_actor=lambda: calls.append("offload"),
-        synchronize_after_offload=lambda: calls.append("sync"),
+        synchronize_after_offload=synchronize,
         onload_rollout_kv=lambda: calls.append("onload_kv"),
     )
 
-    assert calls == ["update", "offload", "sync", "onload_kv"]
+    assert calls == ["update", "offload", "sync:True", "onload_kv"]
 
 
 def test_run_live_weight_sync_offloads_actor_when_update_fails():
@@ -80,21 +99,66 @@ def test_run_live_weight_sync_offloads_actor_when_update_fails():
         calls.append("update")
         raise RuntimeError("update failed")
 
+    def synchronize(local_success):
+        calls.append(f"sync:{local_success}")
+        return local_success
+
     with pytest.raises(RuntimeError, match="update failed"):
         run_live_weight_sync(
             update_weights=fail_update,
             offload_actor=lambda: calls.append("offload"),
-            synchronize_after_offload=lambda: calls.append("sync"),
+            synchronize_after_offload=synchronize,
             onload_rollout_kv=lambda: calls.append("onload_kv"),
         )
 
-    assert calls == ["update", "offload", "sync"]
+    assert calls == ["update", "offload"]
+
+
+def test_run_live_weight_sync_skips_onload_when_another_rank_offload_fails():
+    calls = []
+
+    def synchronize(local_success):
+        calls.append(f"sync:{local_success}")
+        return False
+
+    with pytest.raises(RuntimeError, match="offload failed on another rank"):
+        run_live_weight_sync(
+            update_weights=lambda: calls.append("update"),
+            offload_actor=lambda: calls.append("offload"),
+            synchronize_after_offload=synchronize,
+            onload_rollout_kv=lambda: calls.append("onload_kv"),
+        )
+
+    assert calls == ["update", "offload", "sync:True"]
+
+
+def test_run_live_weight_sync_synchronizes_when_offload_fails():
+    calls = []
+
+    def fail_offload():
+        calls.append("offload")
+        raise RuntimeError("offload failed")
+
+    def synchronize(local_success):
+        calls.append(f"sync:{local_success}")
+        return local_success
+
+    with pytest.raises(RuntimeError, match="offload failed"):
+        run_live_weight_sync(
+            update_weights=lambda: calls.append("update"),
+            offload_actor=fail_offload,
+            synchronize_after_offload=synchronize,
+            onload_rollout_kv=lambda: calls.append("onload_kv"),
+        )
+
+    assert calls == ["update", "offload", "sync:False"]
 
 
 def test_run_live_weight_sync_does_not_onload_kv_when_offload_sync_fails():
     calls = []
 
-    def fail_sync():
+    def fail_sync(local_success):
+        assert local_success is True
         calls.append("sync")
         raise RuntimeError("offload sync failed")
 

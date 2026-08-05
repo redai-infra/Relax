@@ -92,7 +92,11 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .weight_update.common import named_params_and_buffers
-from .weight_update.live_weight_sync import get_distributed_memory_status, run_live_weight_sync
+from .weight_update.live_weight_sync import (
+    get_distributed_memory_status,
+    get_distributed_sync_success,
+    run_live_weight_sync,
+)
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
@@ -1016,7 +1020,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     # groups. The dedicated Gloo group stays alive and keeps
                     # rank 0 from restoring KV while another rank still owns
                     # Actor memory.
-                    synchronize_after_offload=lambda: dist.barrier(group=get_gloo_group()),
+                    synchronize_after_offload=lambda local_success: get_distributed_sync_success(
+                        local_success=local_success,
+                        process_group=get_gloo_group(),
+                    ),
                     onload_rollout_kv=self._onload_rollout_after_weight_sync,
                 )
             else:

@@ -73,19 +73,48 @@ def get_distributed_memory_status(
     )
 
 
+def get_distributed_sync_success(*, local_success: bool, process_group) -> bool:
+    """Synchronize ranks and return whether every rank completed locally."""
+    value = torch.tensor([int(local_success)], dtype=torch.int64)
+    dist.all_reduce(value, op=dist.ReduceOp.MIN, group=process_group)
+    return bool(value[0].item())
+
+
 def run_live_weight_sync(
     *,
     update_weights: Callable[[], None],
     offload_actor: Callable[[], None],
-    synchronize_after_offload: Callable[[], None],
+    synchronize_after_offload: Callable[[bool], bool],
     onload_rollout_kv: Callable[[], None],
 ) -> None:
-    """Offload every Actor rank before restoring rollout KV memory."""
+    """Restore rollout KV only after every Actor rank offloads successfully."""
+    update_succeeded = False
     try:
         update_weights()
+        update_succeeded = True
     finally:
-        try:
+        # update_weights contains collectives on the same Gloo group. After a
+        # local update failure, entering another collective could mismatch a
+        # peer that is still inside the update sequence. Offload locally and
+        # let the worker fail instead; successful peers cannot reach onload.
+        if not update_succeeded:
             offload_actor()
-        finally:
-            synchronize_after_offload()
+
+    offload_failure: Exception | None = None
+    try:
+        offload_actor()
+    except Exception as exc:
+        offload_failure = exc
+
+    try:
+        global_success = synchronize_after_offload(offload_failure is None)
+    except Exception:
+        if offload_failure is not None:
+            raise offload_failure
+        raise
+
+    if offload_failure is not None:
+        raise offload_failure
+    if not global_success:
+        raise RuntimeError("live weight sync offload failed on another rank")
     onload_rollout_kv()
