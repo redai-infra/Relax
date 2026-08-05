@@ -21,6 +21,7 @@ from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import _maybe_pin_baseline_to_stable  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
+from relax.utils.manifest import collect_and_save_manifest, update_manifest_runtime  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
@@ -88,6 +89,9 @@ def main(args):
         runtime_env = yaml.safe_load(file)
 
     runtime_env = post_process_env(args, runtime_env)
+
+    # Persist provenance before Ray startup so initialization failures remain reproducible.
+    manifest_path = collect_and_save_manifest(args, runtime_env, include_runtime=False)
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env=runtime_env)
@@ -104,6 +108,9 @@ def main(args):
     # Serve for the /metrics endpoint) and before Controller() (wandb primary
     # writes wandb_run_id into args, which then propagates to remote actors).
     init_tracking(args)
+
+    # Add initialized Ray topology without changing the run identity.
+    update_manifest_runtime(manifest_path, args, runtime_env)
 
     _maybe_pin_baseline_to_stable(args)
 
