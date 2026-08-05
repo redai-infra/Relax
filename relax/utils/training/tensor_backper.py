@@ -92,13 +92,10 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         missing = [(name, param) for name, param in self._source_getter() if name not in backup_dict]
         if on_device and missing:
-            # One cudaMalloc per parameter (hundreds for a real model) leaves
-            # the CUDA caching allocator holding hundreds of small, permanently
-            # non-reusable segments. That fragments the segment table the
-            # allocator has to search when satisfying the next dynamic-batch
-            # forward pass's activation requests (measured: ~190 segments held
-            # by this snapshot alone vs ~10 without it), which is what actually
-            # slows those forward passes down — not a lack of free memory.
+            # One cudaMalloc per parameter (hundreds for a real model) leaves the
+            # CUDA caching allocator holding hundreds of small, permanently
+            # non-reusable segments, fragmenting the segment table that later
+            # dynamic-batch forward passes search when allocating activations.
             # Allocate one contiguous buffer per dtype instead, and give every
             # parameter a shape/stride view into it; each view is still a
             # distinct Tensor object so it can carry its own TP attributes.

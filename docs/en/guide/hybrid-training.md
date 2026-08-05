@@ -235,8 +235,8 @@ ______________________________________________________________________
 
 Planned follow-ups for hybrid mode:
 
-- ~~Integrate DCS for weight sync~~ — done: the actor->rollout weight push now goes through the Distributed Checkpoint Service (`checkpoint_engine_client.update_weights_for_rollout`), reading from a `TensorBackuper` CPU snapshot instead of the live model.
-- **Splitting the merged training step into multiple optimizer.step() calls was tried and reverted.** An earlier version of this code re-chunked the merged batch by `num_iters_per_train_update` and ran that many *separate* `train(...)` calls to bound training-side peak memory further. This was found to introduce real policy drift: chunk 2+ compute their PPO-style importance ratio against a policy that chunk 1's optimizer step had already moved away from `rollout_log_probs`/`log_probs`, a divergence not present anywhere else in the codebase at this granularity. The merged batch is trained as a single optimizer step again; peak memory is bounded purely by `--micro-batch-size`/`--max-tokens-per-gpu` microbatch chunking within that one step (gradients accumulate, no drift). Do not reintroduce per-chunk optimizer steps here without also addressing the drift this causes.
+- **Integrate DCS for weight sync** — replace the current synchronous `UpdateWeightFromTensor` path with the Distributed Checkpoint Service so weight broadcast to rollout can overlap with the next training iteration, closing the remaining sync gap at the end of every `train_hybrid` call.
+- **Split `train_actor` into `num_iters_per_train_update` iterations** — today `num_iters_per_train_update` only chunks the forward phase; the merged training step still runs once on the full global batch. Extend the actor train step to also iterate `num_iters_per_train_update` times so optimizer updates can be pipelined with TransferQueue consumption and peak training-side memory drops further.
 
 Related docs:
 
