@@ -88,7 +88,7 @@ def test_run_live_weight_sync_offloads_actor_when_update_fails():
             onload_rollout_kv=lambda: calls.append("onload_kv"),
         )
 
-    assert calls == ["update", "offload"]
+    assert calls == ["update", "offload", "sync"]
 
 
 def test_run_live_weight_sync_does_not_onload_kv_when_offload_sync_fails():

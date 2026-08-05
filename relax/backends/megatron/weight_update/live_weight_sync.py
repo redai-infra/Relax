@@ -84,6 +84,8 @@ def run_live_weight_sync(
     try:
         update_weights()
     finally:
-        offload_actor()
-    synchronize_after_offload()
+        try:
+            offload_actor()
+        finally:
+            synchronize_after_offload()
     onload_rollout_kv()
