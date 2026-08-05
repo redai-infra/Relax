@@ -29,10 +29,10 @@ import asyncio
 import random
 from typing import Any
 
+import transfer_queue as tq
 from ray import serve
 from transformers import AutoConfig, AutoTokenizer
 
-import transfer_queue as tq
 from relax.components.base import Base
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample

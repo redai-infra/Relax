@@ -8,10 +8,9 @@ from argparse import Namespace
 from typing import Any
 
 import ray
+import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
-
-import transfer_queue as tq
 from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
 
 

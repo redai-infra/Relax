@@ -6,11 +6,11 @@ from argparse import Namespace
 from typing import Any, Dict
 
 import torch
+import transfer_queue as tq
 from megatron.core import mpu
 from ray import serve
 from tensordict import TensorDict
 
-import transfer_queue as tq
 from relax.components.base import Base
 from relax.utils.async_utils import run as run_
 from relax.utils.opd.opd_utils import (

@@ -9,12 +9,12 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import ray
+import transfer_queue as tq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from ray import serve
 
-import transfer_queue as tq
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager

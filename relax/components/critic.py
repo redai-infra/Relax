@@ -7,10 +7,10 @@ from argparse import Namespace
 from typing import Any, Optional
 
 import ray
+import transfer_queue as tq
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
-import transfer_queue as tq
 from relax.components.base import Base
 from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
