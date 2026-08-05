@@ -1888,13 +1888,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "for this many seconds, bounding the map against unbounded routing-key cardinality. Scanned on "
                 "the SlimeRouter health-check cadence. Requires --slime-router-sticky.",
             )
-            parser.add_argument(
-                "--slime-router-work-aware",
-                action="store_true",
-                default=False,
-                help="Route non-sticky requests by per-worker reserved estimated response tokens instead of "
-                "active request count. Requires --use-slime-router.",
-            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -2742,17 +2735,6 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
-    if getattr(args, "slime_router_work_aware", False):
-        if not getattr(args, "use_slime_router", False):
-            raise ValueError("--slime-router-work-aware requires --use-slime-router.")
-        if not getattr(args, "enable_cross_version_kv_continuation", False):
-            raise ValueError("--slime-router-work-aware currently requires --enable-cross-version-kv-continuation.")
-        if getattr(args, "slime_router_sticky", False):
-            raise ValueError(
-                "--slime-router-work-aware cannot be combined with --slime-router-sticky; "
-                "cross-version KV continuation retains each carried request on its original engine "
-                "without router-level group pinning."
-            )
 
     if getattr(args, "lora_rank", 0) > 0:
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
@@ -3104,7 +3086,7 @@ def slime_validate_args(args):
             raise ValueError("--hybrid-dcs-weight-sync requires --hybrid.")
         if getattr(args, "enable_cross_version_kv_continuation", False):
             if not getattr(args, "use_slime_router", False):
-                raise ValueError("Joint Hybrid DCS and cross-version KV requires --use-slime-router.")
+                raise ValueError("Hybrid DCS with cross-version KV requires --use-slime-router.")
             if float(getattr(args, "targeted_retirement_timeout_seconds", 0.0)) <= 0:
                 raise ValueError("--targeted-retirement-timeout-seconds must be positive.")
         if getattr(args, "offload_train", False) or getattr(args, "offload_rollout", False):

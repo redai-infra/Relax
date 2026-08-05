@@ -839,20 +839,22 @@ class SGLangEngine(RayActor):
             },
         )
 
-    def pause_generation(self, mode: str = "abort"):
+    def pause_generation(self, mode: str = "abort", timeout: float | None = None):
         if mode not in {"abort", "retract", "in_place"}:
             raise ValueError(f"Unsupported pause mode: {mode}")
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/pause_generation",
             json={"mode": mode},
+            timeout=timeout,
         )
         response.raise_for_status()
         return response
 
-    def continue_generation(self, torch_empty_cache: bool = True):
+    def continue_generation(self, torch_empty_cache: bool = True, timeout: float | None = None):
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/continue_generation",
             json={"torch_empty_cache": torch_empty_cache},
+            timeout=timeout,
         )
         response.raise_for_status()
         return response

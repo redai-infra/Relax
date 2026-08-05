@@ -5,20 +5,32 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.cross_version_kv import (
-    clear_cross_version_kv_progress_hedge_marker,
     clear_cross_version_kv_task_markers,
-    count_cross_version_kv_progress_hedge_groups,
+    cross_version_kv_abort_retry_interval_seconds,
+    cross_version_kv_abort_timeout_seconds,
     cross_version_kv_group_ready_for_finalize,
     cross_version_kv_group_requires_strict_retry,
     cross_version_kv_pause_mode,
-    cross_version_kv_resident_cap,
+    cross_version_kv_protected_drain_timeout_seconds,
     cross_version_kv_strict_refresh,
-    estimate_cross_version_kv_group_remaining_tokens,
     mark_cross_version_kv_carry,
-    plan_cross_version_kv_progress_hedge,
-    plan_joint_carry_admission,
+    plan_baseline_window_fetch,
+    plan_carry_aware_oversampling_seed,
+    plan_dp_aligned_extra_groups,
     validate_cross_version_kv_args,
 )
+
+
+def test_cross_version_kv_abort_timeouts_preserve_experiment_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RELAX_CROSS_VERSION_KV_ABORT_RETRY_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("RELAX_CROSS_VERSION_KV_ABORT_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("RELAX_CROSS_VERSION_KV_PROTECTED_DRAIN_TIMEOUT_SECONDS", raising=False)
+
+    assert cross_version_kv_abort_retry_interval_seconds() == 0.5
+    assert cross_version_kv_abort_timeout_seconds() == 15
+    assert cross_version_kv_protected_drain_timeout_seconds() == 600
 
 
 def test_cross_version_kv_publication_cycle_bounds_gap_two() -> None:
@@ -98,433 +110,48 @@ def test_targeted_retirement_requires_strict_retry_before_carry_adoption() -> No
     assert not cross_version_kv_group_requires_strict_retry([ordinary])
 
 
-def test_progress_hedge_prevents_carried_fresh_from_freezing_current_work() -> None:
-    assert cross_version_kv_resident_cap(8) == 10
-    assert (
-        plan_cross_version_kv_progress_hedge(
-            adopted_groups=8,
-            adopted_debt_groups=0,
-            resident_groups=8,
-            remaining_fresh_groups=8,
-            rollout_batch_size=8,
-        )
-        == 2
-    )
-
-
-def test_remaining_token_estimate_uses_conditional_tail() -> None:
-    group = [SimpleNamespace(response_length=4000), SimpleNamespace(response_length=6000)]
-
-    estimated = estimate_cross_version_kv_group_remaining_tokens(
-        group,
-        recent_completed_response_lengths=[4500, 5000, 6200, 6500, 7000, 7500, 8000, 8192],
-        max_response_length=8192,
-    )
-
-    assert estimated == 3500
-
-
-def test_remaining_token_estimate_falls_back_to_safe_upper_bound() -> None:
-    group = [SimpleNamespace(response_length=7000)]
-
-    estimated = estimate_cross_version_kv_group_remaining_tokens(
-        group,
-        recent_completed_response_lengths=[1000, 2000, 3000],
-        max_response_length=8192,
-    )
-
-    assert estimated == 1192
-
-
-def test_remaining_token_estimate_ignores_completed_siblings() -> None:
-    group = [
-        SimpleNamespace(status="completed", response_length=1000),
-        SimpleNamespace(status="pending", response_length=7000),
-    ]
-
-    estimated = estimate_cross_version_kv_group_remaining_tokens(
-        group,
-        recent_completed_response_lengths=[],
-        max_response_length=8192,
-    )
-
-    assert estimated == 1192
-
-
-def test_carried_progress_hedge_rebuilds_inflight_accounting() -> None:
-    groups = [
-        [SimpleNamespace(metadata={"cross_version_kv_progress_hedge": True})],
-        [SimpleNamespace(metadata={})],
-        [
-            SimpleNamespace(metadata={}),
-            SimpleNamespace(metadata={"cross_version_kv_progress_hedge": True}),
-        ],
-    ]
-
-    assert count_cross_version_kv_progress_hedge_groups(groups) == 2
-
-
-def test_hedge_completion_preserves_carried_marker_until_fallback_classification() -> None:
-    sample = SimpleNamespace(
-        metadata={
-            "cross_version_kv_progress_hedge": True,
-            "cross_version_kv_carried": True,
-        }
-    )
-
-    assert clear_cross_version_kv_progress_hedge_marker([sample])
-    assert "cross_version_kv_progress_hedge" not in sample.metadata
-    assert sample.metadata["cross_version_kv_carried"] is True
-
-
 def test_abort_to_buffer_clears_all_task_lifetime_markers() -> None:
     sample = SimpleNamespace(
         metadata={
-            "cross_version_kv_progress_hedge": True,
             "cross_version_kv_carried": True,
             "cross_version_kv_carryovers": 2,
             "targeted_retirement_aborted": True,
         }
     )
 
-    assert clear_cross_version_kv_task_markers([sample])
-    assert "cross_version_kv_progress_hedge" not in sample.metadata
+    clear_cross_version_kv_task_markers([sample])
     assert "cross_version_kv_carried" not in sample.metadata
     assert "targeted_retirement_aborted" not in sample.metadata
     assert sample.metadata["cross_version_kv_carryovers"] == 2
 
 
 @pytest.mark.parametrize(
-    ("values", "expected"),
-    [
-        (
-            {
-                "adopted_groups": 4,
-                "adopted_debt_groups": 4,
-                "resident_groups": 4,
-                "remaining_fresh_groups": 8,
-                "rollout_batch_size": 8,
-            },
-            0,
-        ),
-        (
-            {
-                "adopted_groups": 10,
-                "adopted_debt_groups": 0,
-                "resident_groups": 10,
-                "remaining_fresh_groups": 8,
-                "rollout_batch_size": 8,
-            },
-            0,
-        ),
-        (
-            {
-                "adopted_groups": 8,
-                "adopted_debt_groups": 0,
-                "resident_groups": 9,
-                "remaining_fresh_groups": 8,
-                "rollout_batch_size": 8,
-            },
-            1,
-        ),
-        (
-            {
-                "adopted_groups": 8,
-                "adopted_debt_groups": 0,
-                "resident_groups": 8,
-                "remaining_fresh_groups": 1,
-                "rollout_batch_size": 8,
-            },
-            1,
-        ),
-        (
-            {
-                "adopted_groups": 8,
-                "adopted_debt_groups": 0,
-                "resident_groups": 8,
-                "remaining_fresh_groups": 8,
-                "rollout_batch_size": 8,
-                "strict_retry_pending": True,
-            },
-            0,
-        ),
-        (
-            {
-                "adopted_groups": 8,
-                "adopted_debt_groups": 0,
-                "resident_groups": 8,
-                "remaining_fresh_groups": 8,
-                "rollout_batch_size": 8,
-                "estimated_remaining_tokens": 8192,
-                "max_response_length": 8192,
-            },
-            1,
-        ),
-    ],
+    ("adopted_current_groups", "missing_debt_groups", "expected"),
+    [(0, 0, 16), (8, 0, 8), (16, 0, 0), (4, 2, 14), (16, 3, 3)],
 )
-def test_progress_hedge_is_bounded_and_skips_debt_or_strict_rebuild(values: dict, expected: int) -> None:
-    assert plan_cross_version_kv_progress_hedge(**values) == expected
-
-
-def _plan_joint_for_test(
-    *,
-    phase: str | None,
-    debt_target: int,
-    debt_committed: int,
-    debt_eligible_inflight: int,
-    carry_current_inflight: int,
-    current_target: int,
-    current_committed: int,
-    fresh_current_inflight: int,
-    resident_groups: int,
-    carry_remaining_tokens: list[int],
-    rollout_batch_size: int,
-    max_response_length: int,
-    strict_retry_pending: bool = False,
-    final_backfill: bool = False,
-):
-    carry_ids = [f"carry-{index}" for index in range(len(carry_remaining_tokens))]
-    debt_ids = carry_ids[:debt_eligible_inflight]
-    carry_current_ids = carry_ids[debt_eligible_inflight : debt_eligible_inflight + carry_current_inflight]
-    fresh_ids = [f"fresh-{index}" for index in range(fresh_current_inflight)]
-    known_ids = [*carry_ids, *fresh_ids]
-    if len(known_ids) > resident_groups:
-        raise ValueError("test resident count is smaller than the disjoint work sets")
-    resident_ids = [*known_ids, *(f"other-{index}" for index in range(resident_groups - len(known_ids)))]
-    return plan_joint_carry_admission(
-        phase=phase,
-        debt_target=debt_target,
-        debt_committed=debt_committed,
-        current_target=current_target,
-        current_committed=current_committed,
-        resident_group_ids=resident_ids,
-        carry_groups=list(zip(carry_ids, carry_remaining_tokens, strict=True)),
-        debt_eligible_group_ids=debt_ids,
-        carry_current_group_ids=carry_current_ids,
-        fresh_current_group_ids=fresh_ids,
-        rollout_batch_size=rollout_batch_size,
-        max_response_length=max_response_length,
-        strict_retry_pending=strict_retry_pending,
-        final_backfill=final_backfill,
-    )
-
-
-def test_joint_planner_admits_full_current_batch_without_carry() -> None:
-    plan = _plan_joint_for_test(
-        phase=None,
-        debt_target=0,
-        debt_committed=0,
-        debt_eligible_inflight=0,
-        carry_current_inflight=0,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=0,
-        carry_remaining_tokens=[],
-        rollout_batch_size=8,
-        max_response_length=8192,
-    )
-
-    assert plan.debt_admit_groups == 0
-    assert plan.fresh_admit_groups == 8
-    assert plan.resident_cap == 10
-
-
-def test_joint_planner_uses_only_bounded_reserve_behind_full_length_carry() -> None:
-    plan = _plan_joint_for_test(
-        phase=None,
-        debt_target=0,
-        debt_committed=0,
-        debt_eligible_inflight=0,
-        carry_current_inflight=0,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=8,
-        carry_remaining_tokens=[8192] * 8,
-        rollout_batch_size=8,
-        max_response_length=8192,
-    )
-
-    assert plan.carry_work_equivalents == 8
-    assert plan.current_reserve == 2
-    assert plan.fresh_admit_groups == 2
-    assert plan.work_overcommit_equivalents == 2
-
-
-def test_joint_planner_does_not_double_count_carried_current_work() -> None:
-    plan = _plan_joint_for_test(
-        phase=None,
-        debt_target=0,
-        debt_committed=0,
-        debt_eligible_inflight=0,
-        carry_current_inflight=2,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=8,
-        carry_remaining_tokens=[8192] * 8,
-        rollout_batch_size=8,
-        max_response_length=8192,
-    )
-
-    assert plan.current_deficit == 6
-    assert plan.fresh_admit_groups == 0
-    assert plan.work_overcommit_equivalents == 0
-
-
-def test_joint_planner_reports_existing_carry_overcommit_without_reserve() -> None:
-    plan = _plan_joint_for_test(
-        phase=None,
-        debt_target=0,
-        debt_committed=0,
-        debt_eligible_inflight=0,
-        carry_current_inflight=1,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=9,
-        carry_remaining_tokens=[8192] * 9,
-        rollout_batch_size=8,
-        max_response_length=8192,
-    )
-
-    assert plan.current_reserve == 0
-    assert plan.fresh_admit_groups == 0
-    assert plan.work_overcommit_equivalents == 1
-
-
-def test_joint_planner_rejects_overlapping_carry_and_fresh_resident_counts() -> None:
-    with pytest.raises(ValueError, match="must be disjoint"):
-        plan_joint_carry_admission(
-            phase=None,
-            debt_target=0,
-            debt_committed=0,
-            current_target=8,
-            current_committed=0,
-            resident_group_ids=["shared"],
-            carry_groups=[("shared", 8192)],
-            debt_eligible_group_ids=[],
-            carry_current_group_ids=[],
-            fresh_current_group_ids=["shared"],
-            rollout_batch_size=8,
-            max_response_length=8192,
-        )
-
-
-def test_joint_planner_does_not_recreate_static_filler_under_heavy_debt() -> None:
-    plan = _plan_joint_for_test(
-        phase=None,
-        debt_target=8,
-        debt_committed=0,
-        debt_eligible_inflight=7,
-        carry_current_inflight=0,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=7,
-        carry_remaining_tokens=[8192] * 7,
-        rollout_batch_size=8,
-        max_response_length=8192,
-    )
-
-    assert plan.debt_admit_groups == 1
-    assert plan.fresh_admit_groups == 2
-    assert plan.debt_admit_groups + plan.fresh_admit_groups <= 3
-
-
-def test_joint_planner_prioritizes_uncovered_debt_over_current() -> None:
-    plan = _plan_joint_for_test(
-        phase=None,
-        debt_target=8,
-        debt_committed=0,
-        debt_eligible_inflight=6,
-        carry_current_inflight=0,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=9,
-        carry_remaining_tokens=[8192] * 6,
-        rollout_batch_size=8,
-        max_response_length=8192,
-    )
-
-    assert plan.debt_admit_groups == 1
-    assert plan.fresh_admit_groups == 0
-    assert plan.reason == "debt_first"
-
-
-@pytest.mark.parametrize(
-    ("phase", "strict_retry_pending", "final_backfill", "expected_reason"),
-    [
-        ("quiesce", False, False, "phase:quiesce"),
-        ("weight_sync", False, False, "phase:weight_sync"),
-        (None, True, False, "strict_retry"),
-        (None, False, True, "final_backfill"),
-    ],
-)
-def test_joint_planner_blocks_current_admission_at_unsafe_boundaries(
-    phase: str | None,
-    strict_retry_pending: bool,
-    final_backfill: bool,
-    expected_reason: str,
+def test_carry_aware_seed_preserves_baseline_envelope(
+    adopted_current_groups: int,
+    missing_debt_groups: int,
+    expected: int,
 ) -> None:
-    plan = _plan_joint_for_test(
-        phase=phase,
-        debt_target=0,
-        debt_committed=0,
-        debt_eligible_inflight=0,
-        carry_current_inflight=0,
-        current_target=8,
-        current_committed=0,
-        fresh_current_inflight=0,
-        resident_groups=0,
-        carry_remaining_tokens=[],
-        rollout_batch_size=8,
-        max_response_length=8192,
-        strict_retry_pending=strict_retry_pending,
-        final_backfill=final_backfill,
+    assert (
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=16,
+            adopted_current_groups=adopted_current_groups,
+            missing_debt_groups=missing_debt_groups,
+        )
+        == expected
     )
 
-    assert plan.fresh_admit_groups == 0
-    assert plan.reason == expected_reason
+
+def test_baseline_window_keeps_fixed_batch_semantics() -> None:
+    assert plan_baseline_window_fetch(resident_groups=0, submit_target_groups=8, fetch_batch_groups=16) == 16
+    assert plan_baseline_window_fetch(resident_groups=8, submit_target_groups=8, fetch_batch_groups=16) == 0
 
 
-@pytest.mark.parametrize("remaining", [[-1], [8193], [1.5], [True]])
-def test_joint_planner_rejects_invalid_work_estimates(remaining: list[object]) -> None:
-    with pytest.raises(ValueError):
-        _plan_joint_for_test(
-            phase=None,
-            debt_target=0,
-            debt_committed=0,
-            debt_eligible_inflight=0,
-            carry_current_inflight=0,
-            current_target=8,
-            current_committed=0,
-            fresh_current_inflight=0,
-            resident_groups=1,
-            carry_remaining_tokens=remaining,
-            rollout_batch_size=8,
-            max_response_length=8192,
-        )
-
-
-def test_joint_planner_rejects_non_integer_counts() -> None:
-    with pytest.raises(ValueError, match="counts must be integers"):
-        plan_joint_carry_admission(
-            phase=None,
-            debt_target=0.5,
-            debt_committed=0,
-            current_target=8,
-            current_committed=0,
-            resident_group_ids=[],
-            carry_groups=[],
-            debt_eligible_group_ids=[],
-            carry_current_group_ids=[],
-            fresh_current_group_ids=[],
-            rollout_batch_size=8,
-            max_response_length=8192,
-        )
+def test_dp_aligned_extra_groups_never_returns_partial_dp_wave() -> None:
+    assert plan_dp_aligned_extra_groups(current_groups=1, available_extra_groups=7, dp_size=8) == 7
+    assert plan_dp_aligned_extra_groups(current_groups=1, available_extra_groups=5, dp_size=8) == 0
 
 
 def test_cross_version_kv_validation_accepts_task22_contract() -> None:

@@ -24,37 +24,13 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from relax.engine.rollout.permit_observability import (
-    CALIBRATION_ENGINE_REQUEST_STARTED_METADATA_KEY,
-    CALIBRATION_RID_METADATA_KEY,
-    CALIBRATION_TIMING_METADATA_KEY,
-    capture_sglang_timing,
-    mark_engine_request_started,
-)
-from relax.engine.rollout.permit_observability import (
-    begin_wait as begin_permit_wait,
-)
-from relax.engine.rollout.permit_observability import (
-    export_rows as export_permit_wait_rows,
-)
-from relax.engine.rollout.permit_observability import (
-    mark_granted as mark_permit_granted,
-)
-from relax.engine.rollout.permit_observability import (
-    mark_terminal as mark_permit_terminal,
-)
-from relax.engine.rollout.permit_observability import (
-    output_dir as permit_observability_dir,
-)
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
-from relax.engine.rollout.sync_intent import (
-    plan_dp_aligned_extra_groups,
-    resolve_partition_request_priority,
-    sync_intent_policy_enabled,
-)
-from relax.engine.router.work_accounting import build_work_routing_headers
 from relax.utils.async_utils import run
-from relax.utils.cross_version_kv import cross_version_kv_enabled, cross_version_kv_group_ready_for_finalize
+from relax.utils.cross_version_kv import (
+    cross_version_kv_enabled,
+    cross_version_kv_group_ready_for_finalize,
+    plan_dp_aligned_extra_groups,
+)
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
@@ -98,43 +74,6 @@ def _ensure_not_holding_session_lock() -> None:
             "non-reentrant semaphore) and acquiring a permit would deadlock. "
             "See docs/{zh,en}/guide/customize-training.md."
         )
-
-
-def _permit_snapshot(state: Any) -> dict[str, int] | None:
-    manager = getattr(state, "permit_manager", None)
-    if manager is None or getattr(manager, "semaphore", None) is not state.semaphore:
-        return None
-    snapshot = manager.snapshot()
-    return {"capacity": snapshot.capacity, "in_use": snapshot.in_use, "waiting": snapshot.waiting}
-
-
-def begin_permit_observability_rollout(state: Any, rollout_id: int) -> None:
-    state.current_rollout_id = rollout_id
-    if not hasattr(state, "permit_observability_rows"):
-        state.permit_observability_rows: list[dict[str, Any]] = []
-
-
-def export_terminal_permit_observability_rows(state: Any) -> dict[int, int]:
-    calibration_directory = permit_observability_dir()
-    if calibration_directory is None:
-        return {}
-    terminal_statuses = {"terminal", "cancelled_before_grant", "ended_before_grant"}
-    rows_by_rollout: dict[int, list[dict[str, Any]]] = {}
-    for row in state.permit_observability_rows:
-        rollout_id = row.get("physical_rollout_id")
-        if (
-            isinstance(rollout_id, int)
-            and not isinstance(rollout_id, bool)
-            and row.get("permit_wait_status") in terminal_statuses
-        ):
-            rows_by_rollout.setdefault(rollout_id, []).append(row)
-    for rollout_id, rows in rows_by_rollout.items():
-        export_permit_wait_rows(
-            rows,
-            directory=calibration_directory,
-            physical_rollout_id=rollout_id,
-        )
-    return {rollout_id: len(rows) for rollout_id, rows in rows_by_rollout.items()}
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -260,11 +199,6 @@ class GenerateState(metaclass=SingletonMeta):
             self.cross_version_kv_task_started_at: dict[asyncio.Task[Any], float] = {}
         if not hasattr(self, "cross_version_kv_protected_tasks"):
             self.cross_version_kv_protected_tasks: set[asyncio.Task[Any]] = set()
-        if not hasattr(self, "recent_completed_response_lengths"):
-            self.recent_completed_response_lengths: list[int] = []
-        if not hasattr(self, "recent_group_latency_seconds"):
-            self.recent_group_latency_seconds: list[float] = []
-
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
         for group in samples:
@@ -422,9 +356,6 @@ async def generate(
         "sampling_params": sampling_params,
         "return_logprob": not evaluation,
     }
-    request_priority = resolve_partition_request_priority(args, sample)
-    if request_priority is not None:
-        payload["priority"] = request_priority
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -464,17 +395,11 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
-    sample_metadata = getattr(sample, "metadata", None)
-    calibration_rid = (
-        sample_metadata.get(CALIBRATION_RID_METADATA_KEY)
-        if permit_observability_dir() is not None and isinstance(sample_metadata, dict)
-        else None
-    )
     targeted_publication = bool(
         getattr(args, "hybrid_dcs_weight_sync", False) and getattr(args, "enable_cross_version_kv_continuation", False)
     )
-    request_rid = calibration_rid
-    if targeted_publication and request_rid is None:
+    request_rid = None
+    if targeted_publication:
         if sample.session_id is None:
             raise RuntimeError("targeted publication requires a sample session_id")
         request_rid = f"relax:{sample.session_id}:attempt:{sample.abort_count}"
@@ -494,25 +419,10 @@ async def generate(
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
-    if getattr(args, "slime_router_work_aware", False):
-        assert args.use_slime_router, "--slime-router-work-aware requires --use-slime-router"
-        headers = dict(headers or {})
-        headers.update(
-            build_work_routing_headers(
-                sample,
-                request_key=str(request_rid or sample.index),
-                recent_completed_response_lengths=getattr(state, "recent_completed_response_lengths", []),
-                max_response_length=args.rollout_max_response_len,
-            )
-        )
 
-    if calibration_rid is not None:
-        mark_engine_request_started(sample)
     _t_generate_start = monotonic()
     output = await post(url, payload, headers=headers)
     _t_generate = monotonic() - _t_generate_start
-    if calibration_rid is not None:
-        capture_sglang_timing(sample, output.get("meta_info", {}))
 
     _t_post_generate_start = monotonic()
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
@@ -641,10 +551,6 @@ async def _dispatch_generate(
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
     manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
-    observe_permit = permit_observability_dir() is not None and not evaluation and not manages_permit
-    if observe_permit and not hasattr(state, "permit_observability_rows"):
-        state.permit_observability_rows = []
-    wait_row: dict[str, Any] | None = None
 
     async def _run() -> Sample | list[Sample]:
         if state.aborted:
@@ -663,44 +569,17 @@ async def _dispatch_generate(
             if dispatch_started_event is not None:
                 dispatch_started_event.set()
             return await _run()
-        if observe_permit:
-            wait_row = begin_permit_wait(
-                sample,
-                physical_rollout_id=getattr(state, "current_rollout_id", None),
-                permit_snapshot=_permit_snapshot(state),
-            )
-            state.permit_observability_rows.append(wait_row)
-            sample_metadata = getattr(sample, "metadata", None)
-            if isinstance(sample_metadata, dict):
-                sample_metadata[CALIBRATION_RID_METADATA_KEY] = wait_row["permit_wait_id"]
         async with state.semaphore:
-            if wait_row is not None:
-                mark_permit_granted(wait_row, _permit_snapshot(state))
             if dispatch_started_event is not None:
                 dispatch_started_event.set()
             token = _holding_session_lock.set(True)
             try:
-                result = await _run()
-                if wait_row is not None:
-                    mark_permit_terminal(wait_row, sample)
-                return result
+                return await _run()
             finally:
                 _holding_session_lock.reset(token)
     except GenerationAborted:
         sample.status = Sample.Status.ABORTED
-        if wait_row is not None:
-            mark_permit_terminal(wait_row, sample)
         return sample
-    except BaseException as error:
-        if wait_row is not None:
-            mark_permit_terminal(wait_row, sample, error)
-        raise
-    finally:
-        sample_metadata = getattr(sample, "metadata", None)
-        if wait_row is not None and isinstance(sample_metadata, dict):
-            sample_metadata.pop(CALIBRATION_RID_METADATA_KEY, None)
-            sample_metadata.pop(CALIBRATION_TIMING_METADATA_KEY, None)
-            sample_metadata.pop(CALIBRATION_ENGINE_REQUEST_STARTED_METADATA_KEY, None)
 
 
 async def generate_and_rm(
@@ -816,7 +695,7 @@ async def generate_and_rm_group(
         return group
 
     # Generate a unique session_id for each sample in the group
-    for sample in group:
+    for idx, sample in enumerate(group):
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
@@ -1047,7 +926,6 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
-    begin_permit_observability_rollout(state, rollout_id)
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1153,20 +1031,10 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
-                if permit_observability_dir() is not None:
-                    logger.info(
-                        "First rollout sample: prompt_response_redacted=true response_tokens=%s "
-                        "group_index=%s sample_index=%s status=%s",
-                        sample.response_length,
-                        sample.group_index,
-                        sample.index,
-                        sample.status,
-                    )
-                else:
-                    logger.info(
-                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
-                        f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
-                    )
+                logger.info(
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                    f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                )
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
@@ -1322,18 +1190,10 @@ async def generate_rollout_async(
     await stop_sglang_profile(args, rollout_id)
 
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
-    if permit_observability_dir() is not None:
-        logger.info(
-            "Finish rollout: prompt_response_redacted=true response_tokens=%s group_index=%s sample_index=%s",
-            sample.response_length,
-            sample.group_index,
-            sample.index,
-        )
-    else:
-        logger.info(
-            f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
-            f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
-        )
+    logger.info(
+        f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+        f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
+    )
 
     rollout_time = timer.end("rollout")
 
@@ -1345,14 +1205,6 @@ async def generate_rollout_async(
     new_aborted, completed_protected = await abort(args, rollout_id)
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
-    if permit_observability_dir() is not None:
-        exported_counts = export_terminal_permit_observability_rows(state)
-        logger.info(
-            "TASK22_CALIBRATION_PERMIT rollout_id=%s terminal_rows=%s exported=%s",
-            rollout_id,
-            exported_counts.get(rollout_id, 0),
-            exported_counts,
-        )
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."
@@ -1540,20 +1392,11 @@ async def eval_rollout_single_dataset(
             group = await coro
             if do_print:
                 sample = group[0]
-                if permit_observability_dir() is not None:
-                    logger.info(
-                        "eval_rollout_single_dataset example data: prompt_response_redacted=true "
-                        "response_tokens=%s sample_index=%s status=%s",
-                        sample.response_length,
-                        sample.index,
-                        sample.status,
-                    )
-                else:
-                    logger.info(
-                        "eval_rollout_single_dataset example data: "
-                        f"{[str(sample.prompt) + sample.response]} "
-                        f"reward={sample.reward}"
-                    )
+                logger.info(
+                    "eval_rollout_single_dataset example data: "
+                    f"{[str(sample.prompt) + sample.response]} "
+                    f"reward={sample.reward}"
+                )
                 do_print = False
             data.extend(group)
             pbar.update(1)
@@ -1583,20 +1426,11 @@ async def eval_rollout_single_dataset(
         for coro in asyncio.as_completed(tasks):
             sample = await coro
             if do_print:
-                if permit_observability_dir() is not None:
-                    logger.info(
-                        "eval_rollout_single_dataset example data: prompt_response_redacted=true "
-                        "response_tokens=%s sample_index=%s status=%s",
-                        sample.response_length,
-                        sample.index,
-                        sample.status,
-                    )
-                else:
-                    logger.info(
-                        "eval_rollout_single_dataset example data: "
-                        f"{[str(sample.prompt) + sample.response]} "
-                        f"reward={sample.reward}"
-                    )
+                logger.info(
+                    "eval_rollout_single_dataset example data: "
+                    f"{[str(sample.prompt) + sample.response]} "
+                    f"reward={sample.reward}"
+                )
                 do_print = False
             if isinstance(sample, list):
                 data.extend(sample)
@@ -1638,8 +1472,8 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    if sync_intent_policy_enabled() or cross_version_kv_enabled(args):
-        from relax.engine.rollout.sync_intent_rollout import generate_rollout_async_with_kv_continuation
+    if cross_version_kv_enabled(args):
+        from relax.engine.rollout.cross_version_kv_rollout import generate_rollout_async_with_kv_continuation
 
         output, aborted_samples = run(
             generate_rollout_async_with_kv_continuation(args, rollout_id, data_buffer, data_system_client)

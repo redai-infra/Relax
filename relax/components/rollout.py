@@ -341,7 +341,6 @@ class Rollout(Base):
         # Set by can_do_update_weight_for_async when it finishes; end_update_weight waits on it.
         self._weight_update_ready = asyncio.Event()
         self._weight_update_ready.set()
-        self._sync_intent_id: int | None = None
         self.eval_handler = None
         self.status = "running"
 
@@ -591,30 +590,6 @@ class Rollout(Base):
             return 1
         return 0
 
-    @app.post("/sync_intent")
-    async def sync_intent(self, sync_id: int, actor_rollout_id: int):
-        result = await self.rollout_manager.begin_sync_intent.remote(sync_id, actor_rollout_id)
-        if result.get("enabled"):
-            self._sync_intent_id = sync_id
-        return result
-
-    @app.get("/sync_intent")
-    async def sync_intent_status(self):
-        return await self.rollout_manager.get_sync_intent.remote()
-
-    @app.post("/sync_intent_phase")
-    async def sync_intent_phase(
-        self,
-        sync_id: int,
-        phase: str,
-        estimated_phase_seconds: float | None = None,
-    ):
-        return await self.rollout_manager.update_sync_intent_phase.remote(
-            sync_id,
-            phase,
-            estimated_phase_seconds,
-        )
-
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
         # During final backfill the rollout service may have stepped past
         # num_rollout while train_{num_rollout-1} is still being closed. Do not
@@ -659,12 +634,7 @@ class Rollout(Base):
         await self._weight_update_ready.wait()
 
         self.status = "running"
-        try:
-            await self.rollout_manager.set_weight_updating.remote(False)
-        finally:
-            if self._sync_intent_id is not None:
-                await self.rollout_manager.end_sync_intent.remote(self._sync_intent_id)
-                self._sync_intent_id = None
+        await self.rollout_manager.set_weight_updating.remote(False)
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):

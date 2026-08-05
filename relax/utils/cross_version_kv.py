@@ -2,177 +2,107 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
-from dataclasses import dataclass
-from math import floor
 from typing import Literal
 
 
 CrossVersionKVPauseMode = Literal["abort", "retract", "in_place"]
+CROSS_VERSION_KV_ABORT_RETRY_INTERVAL_ENV = "RELAX_CROSS_VERSION_KV_ABORT_RETRY_INTERVAL_SECONDS"
+CROSS_VERSION_KV_ABORT_TIMEOUT_ENV = "RELAX_CROSS_VERSION_KV_ABORT_TIMEOUT_SECONDS"
+CROSS_VERSION_KV_PROTECTED_DRAIN_TIMEOUT_ENV = "RELAX_CROSS_VERSION_KV_PROTECTED_DRAIN_TIMEOUT_SECONDS"
 
 
-@dataclass(frozen=True)
-class JointCarryAdmitPlan:
-    debt_remaining: int
-    debt_admit_groups: int
-    current_deficit: int
-    carry_work_equivalents: float
-    resident_cap: int
-    current_reserve: int
-    fresh_admit_groups: int
-    work_overcommit_equivalents: float
-    reason: str
+def _positive_float_env(name: str, default: str) -> float:
+    raw_value = os.environ.get(name, default)
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive number, got {raw_value!r}") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
 
 
-def plan_joint_carry_admission(
+def cross_version_kv_abort_retry_interval_seconds() -> float:
+    return _positive_float_env(CROSS_VERSION_KV_ABORT_RETRY_INTERVAL_ENV, "0.5")
+
+
+def cross_version_kv_abort_timeout_seconds() -> float:
+    return _positive_float_env(CROSS_VERSION_KV_ABORT_TIMEOUT_ENV, "15")
+
+
+def cross_version_kv_protected_drain_timeout_seconds() -> float:
+    return _positive_float_env(CROSS_VERSION_KV_PROTECTED_DRAIN_TIMEOUT_ENV, "600")
+
+
+def plan_dp_aligned_extra_groups(
     *,
-    phase: str | None,
-    debt_target: int,
-    debt_committed: int,
-    current_target: int,
-    current_committed: int,
-    resident_group_ids: Sequence[str],
-    carry_groups: Sequence[tuple[str, int]],
-    debt_eligible_group_ids: Sequence[str],
-    carry_current_group_ids: Sequence[str],
-    fresh_current_group_ids: Sequence[str],
-    rollout_batch_size: int,
-    max_response_length: int,
-    strict_retry_pending: bool = False,
-    final_backfill: bool = False,
-) -> JointCarryAdmitPlan:
-    """Plan debt and current admission from one shared resident/work budget."""
-    counts = (
-        debt_target,
-        debt_committed,
-        current_target,
-        current_committed,
-    )
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
-        raise ValueError("Joint carry-admit counts must be integers")
-    if min(counts) < 0:
-        raise ValueError("Joint carry-admit counts must be non-negative")
-    if (
-        isinstance(rollout_batch_size, bool)
-        or not isinstance(rollout_batch_size, int)
-        or isinstance(max_response_length, bool)
-        or not isinstance(max_response_length, int)
-    ):
-        raise ValueError("Joint carry-admit size limits must be integers")
-    if rollout_batch_size <= 0 or max_response_length <= 0:
-        raise ValueError("Joint carry-admit size limits must be positive")
-    if debt_committed > debt_target:
-        raise ValueError("debt_committed must not exceed debt_target")
-    id_sequences = (
-        resident_group_ids,
-        debt_eligible_group_ids,
-        carry_current_group_ids,
-        fresh_current_group_ids,
-    )
-    if any(any(not isinstance(group_id, str) or not group_id for group_id in ids) for ids in id_sequences):
-        raise ValueError("Joint carry-admit group IDs must be non-empty strings")
-    if any(len(set(ids)) != len(ids) for ids in id_sequences):
-        raise ValueError("Joint carry-admit group IDs must be unique within each set")
+    current_groups: int,
+    available_extra_groups: int,
+    dp_size: int,
+) -> int:
+    if min(current_groups, available_extra_groups) < 0:
+        raise ValueError("group counts must be non-negative")
+    if dp_size <= 0:
+        raise ValueError("dp_size must be positive")
+    aligned_total = ((current_groups + available_extra_groups) // dp_size) * dp_size
+    return max(aligned_total - current_groups, 0)
 
-    carry_ids: list[str] = []
-    normalized_remaining: list[int] = []
-    for group_id, value in carry_groups:
-        if not isinstance(group_id, str) or not group_id:
-            raise ValueError("Joint carry-admit carry IDs must be non-empty strings")
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("carry remaining-token estimates must be integers")
-        if value < 0 or value > max_response_length:
-            raise ValueError("carry remaining-token estimates must be within the response bound")
-        carry_ids.append(group_id)
-        normalized_remaining.append(value)
-    if len(set(carry_ids)) != len(carry_ids):
-        raise ValueError("Joint carry-admit carry IDs must be unique")
 
-    resident_set = set(resident_group_ids)
-    carry_set = set(carry_ids)
-    debt_set = set(debt_eligible_group_ids)
-    carry_current_set = set(carry_current_group_ids)
-    fresh_current_set = set(fresh_current_group_ids)
-    if not carry_set <= resident_set or not fresh_current_set <= resident_set:
-        raise ValueError("carry and fresh current groups must be resident")
-    if not debt_set <= carry_set or not carry_current_set <= carry_set:
-        raise ValueError("classified carry groups must be subsets of the carry set")
-    if debt_set & carry_current_set:
-        raise ValueError("debt-eligible and current carry groups must be disjoint")
-    if carry_set & fresh_current_set:
-        raise ValueError("carry and fresh current groups must be disjoint")
+def validate_disjoint_rollout_groups(
+    accepted_groups: list[list[object]],
+    buffered_groups: list[list[object]],
+) -> None:
+    accepted_ids = {id(sample) for group in accepted_groups for sample in group}
+    buffered_ids = {id(sample) for group in buffered_groups for sample in group}
+    overlap = accepted_ids & buffered_ids
+    if overlap:
+        raise RuntimeError(f"Rollout samples have dual accepted/buffer ownership: {len(overlap)} samples")
 
-    debt_eligible_inflight = len(debt_set)
-    carry_current_inflight = len(carry_current_set)
-    fresh_current_inflight = len(fresh_current_set)
-    resident_groups = len(resident_set)
-    useful_current_inflight = carry_current_inflight + fresh_current_inflight
-    if current_committed + useful_current_inflight > current_target:
-        raise ValueError("current committed and inflight work exceed current_target")
 
-    resident_cap = cross_version_kv_resident_cap(rollout_batch_size)
-    if resident_groups > resident_cap:
-        raise ValueError("resident_groups exceed the joint planner cap")
+def plan_baseline_window_fetch(
+    *,
+    resident_groups: int,
+    submit_target_groups: int,
+    fetch_batch_groups: int,
+) -> int:
+    """Mirror the ordinary rollout's fixed-batch oversampling behavior."""
+    if min(resident_groups, submit_target_groups) < 0:
+        raise ValueError("resident and submit target groups must be non-negative")
+    if fetch_batch_groups <= 0:
+        raise ValueError("fetch batch groups must be positive")
+    if submit_target_groups == 0 or resident_groups >= submit_target_groups:
+        return 0
+    return fetch_batch_groups
 
-    debt_remaining = debt_target - debt_committed
-    current_deficit = current_target - current_committed - useful_current_inflight
-    carry_work = sum(value / max_response_length for value in normalized_remaining)
-    free_slots = resident_cap - resident_groups
-    work_slots = floor(max(rollout_batch_size - carry_work - fresh_current_inflight, 0))
 
-    blocked_phase = phase in {"quiesce", "weight_sync"}
-    if blocked_phase:
-        debt_admit = 0
-        fresh_admit = 0
-        current_reserve = 0
-        reason = f"phase:{phase}"
-    else:
-        uncovered_debt = max(debt_remaining - debt_eligible_inflight, 0)
-        debt_admit = min(uncovered_debt, free_slots, work_slots)
-        free_after_debt = free_slots - debt_admit
-        work_after_debt = work_slots - debt_admit
+def plan_carry_aware_oversampling_seed(
+    *,
+    oversampling_envelope_groups: int,
+    adopted_current_groups: int,
+    missing_debt_groups: int,
+) -> int:
+    """Preserve the baseline oversampling envelope after adopting carry."""
+    if min(oversampling_envelope_groups, adopted_current_groups, missing_debt_groups) < 0:
+        raise ValueError("oversampling envelope, adopted current, and missing debt groups must be non-negative")
+    if oversampling_envelope_groups == 0:
+        raise ValueError("oversampling_envelope_groups must be positive")
+    return missing_debt_groups + max(oversampling_envelope_groups - adopted_current_groups, 0)
 
-        current_reserve = 0
-        if (
-            not final_backfill
-            and not strict_retry_pending
-            and uncovered_debt == debt_admit
-            and useful_current_inflight == 0
-            and current_deficit > 0
-        ):
-            reserve_cap = max(1, rollout_batch_size // 4)
-            current_reserve = min(reserve_cap, current_deficit, free_after_debt)
 
-        if final_backfill:
-            fresh_admit = 0
-            reason = "final_backfill"
-        elif strict_retry_pending:
-            fresh_admit = 0
-            reason = "strict_retry"
-        elif uncovered_debt > debt_admit:
-            fresh_admit = 0
-            reason = "debt_first"
-        else:
-            fresh_admit = min(
-                current_deficit,
-                free_after_debt,
-                max(work_after_debt, current_reserve),
-            )
-            reason = "joint_budget"
-
-    planned_work = carry_work + fresh_current_inflight + debt_admit + fresh_admit
-    work_overcommit = max(0.0, planned_work - rollout_batch_size)
-    return JointCarryAdmitPlan(
-        debt_remaining=debt_remaining,
-        debt_admit_groups=debt_admit,
-        current_deficit=current_deficit,
-        carry_work_equivalents=carry_work,
-        resident_cap=resident_cap,
-        current_reserve=current_reserve,
-        fresh_admit_groups=fresh_admit,
-        work_overcommit_equivalents=work_overcommit,
-        reason=reason,
-    )
+def mark_work_origin(
+    samples: list[list[object]],
+    old_debt_groups: int,
+) -> None:
+    for group_index, group in enumerate(samples):
+        origin = "old_debt" if group_index < old_debt_groups else "fresh"
+        for sample in group:
+            metadata = getattr(sample, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+                setattr(sample, "metadata", metadata)
+            metadata["work_origin"] = origin
 
 
 def cross_version_kv_enabled(args: object) -> bool:
@@ -242,110 +172,13 @@ def cross_version_kv_group_requires_strict_retry(group: Sequence[object]) -> boo
     )
 
 
-def cross_version_kv_resident_cap(rollout_batch_size: int) -> int:
-    if rollout_batch_size <= 0:
-        raise ValueError("rollout_batch_size must be positive")
-    return rollout_batch_size + max(1, rollout_batch_size // 4)
-
-
-def count_cross_version_kv_progress_hedge_groups(groups: Sequence[Sequence[object]]) -> int:
-    return sum(
-        any(bool(getattr(sample, "metadata", {}).get("cross_version_kv_progress_hedge")) for sample in group)
-        for group in groups
-    )
-
-
-def clear_cross_version_kv_progress_hedge_marker(group: Sequence[object]) -> bool:
-    was_hedge = False
-    for sample in group:
-        metadata = getattr(sample, "metadata", {})
-        was_hedge = bool(metadata.pop("cross_version_kv_progress_hedge", False)) or was_hedge
-    return was_hedge
-
-
 def clear_cross_version_kv_task_markers(group: Sequence[object]) -> bool:
     """Clear markers that are valid only while the original task is alive."""
-    was_hedge = clear_cross_version_kv_progress_hedge_marker(group)
     for sample in group:
         metadata = getattr(sample, "metadata", {})
         metadata.pop("targeted_retirement_aborted", None)
         metadata.pop("cross_version_kv_carried", None)
-    return was_hedge
-
-
-def estimate_cross_version_kv_group_remaining_tokens(
-    group: Sequence[object],
-    *,
-    recent_completed_response_lengths: Sequence[int],
-    max_response_length: int,
-) -> int:
-    """Estimate group tail from the conditional residual-length
-    distribution."""
-    if max_response_length <= 0:
-        raise ValueError("max_response_length must be positive")
-    history = sorted(
-        min(int(length), max_response_length) for length in recent_completed_response_lengths if int(length) >= 0
-    )
-    estimated_remaining = 0
-    for sample in group:
-        status = getattr(sample, "status", None)
-        status_value = getattr(status, "value", status)
-        if status_value in {"completed", "truncated"}:
-            continue
-        current_length = min(max(int(getattr(sample, "response_length", 0)), 0), max_response_length)
-        residuals = [length - current_length for length in history if length > current_length]
-        if len(residuals) >= 4:
-            # A bounded upper-middle estimate avoids treating surviving requests
-            # as nearly done while remaining robust to one extreme completion.
-            residuals.sort()
-            estimate = residuals[(3 * (len(residuals) - 1)) // 4]
-        else:
-            estimate = max_response_length - current_length
-        estimated_remaining = max(estimated_remaining, estimate)
-    return estimated_remaining
-
-
-def plan_cross_version_kv_progress_hedge(
-    *,
-    adopted_groups: int,
-    adopted_debt_groups: int,
-    resident_groups: int,
-    remaining_fresh_groups: int,
-    rollout_batch_size: int,
-    strict_retry_pending: bool = False,
-    estimated_remaining_tokens: int | None = None,
-    max_response_length: int | None = None,
-) -> int:
-    """Reserve bounded current-partition progress behind carried fresh work."""
-    values = (
-        adopted_groups,
-        adopted_debt_groups,
-        resident_groups,
-        remaining_fresh_groups,
-        rollout_batch_size,
-    )
-    if min(values) < 0:
-        raise ValueError("KV continuation progress hedge inputs must be non-negative")
-    if rollout_batch_size == 0:
-        raise ValueError("rollout_batch_size must be positive")
-    if adopted_debt_groups > adopted_groups:
-        raise ValueError("adopted_debt_groups must not exceed adopted_groups")
-    if estimated_remaining_tokens is not None and estimated_remaining_tokens < 0:
-        raise ValueError("estimated_remaining_tokens must be non-negative")
-    if estimated_remaining_tokens is not None and (max_response_length is None or max_response_length <= 0):
-        raise ValueError("max_response_length must be positive with an estimate")
-
-    adopted_fresh_groups = adopted_groups - adopted_debt_groups
-    if strict_retry_pending or adopted_fresh_groups == 0 or remaining_fresh_groups == 0:
-        return 0
-
-    max_resident_groups = cross_version_kv_resident_cap(rollout_batch_size)
-    hedge_cap = max_resident_groups - rollout_batch_size
-    if estimated_remaining_tokens is not None:
-        pressure_groups = (estimated_remaining_tokens + max_response_length - 1) // max_response_length
-        hedge_cap = min(hedge_cap, pressure_groups)
-    free_slots = max(max_resident_groups - resident_groups, 0)
-    return min(hedge_cap, adopted_fresh_groups, remaining_fresh_groups, free_slots)
+    return False
 
 
 def mark_cross_version_kv_carry(

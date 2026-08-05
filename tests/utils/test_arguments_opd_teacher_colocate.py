@@ -205,7 +205,7 @@ def test_hybrid_dcs_weight_sync_requires_hybrid(arguments_module):
         arguments_module.slime_validate_args(args)
 
 
-def test_hybrid_dcs_weight_sync_joint_mode_requires_slime_router(arguments_module):
+def test_hybrid_dcs_with_cross_version_kv_requires_slime_router(arguments_module):
     args = _opd_args()
     args.hybrid = True
     args.hybrid_dcs_weight_sync = True
@@ -216,7 +216,7 @@ def test_hybrid_dcs_weight_sync_joint_mode_requires_slime_router(arguments_modul
         arguments_module.slime_validate_args(args)
 
 
-def test_hybrid_dcs_weight_sync_joint_mode_accepts_default_least_loaded_router(
+def test_hybrid_dcs_with_cross_version_kv_accepts_default_router(
     arguments_module,
 ):
     args = _opd_args()
@@ -224,7 +224,6 @@ def test_hybrid_dcs_weight_sync_joint_mode_accepts_default_least_loaded_router(
     args.hybrid_dcs_weight_sync = True
     args.enable_cross_version_kv_continuation = True
     args.use_slime_router = True
-    args.slime_router_work_aware = False
     args.targeted_retirement_timeout_seconds = 15.0
     args.offload_train = False
     args.offload_rollout = False
@@ -237,7 +236,6 @@ def test_hybrid_dcs_weight_sync_joint_mode_accepts_default_least_loaded_router(
 
     arguments_module.slime_validate_args(args)
 
-    assert args.slime_router_work_aware is False
     assert args.use_slime_router is True
 
 

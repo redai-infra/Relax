@@ -165,12 +165,12 @@ async def test_group_rm_skips_mixed_terminal_group(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("a3_enabled", "evaluation"),
+    ("kv_continuation_enabled", "evaluation"),
     [(False, False), (True, True)],
 )
 async def test_group_rm_preserves_default_and_evaluation_behavior(
     monkeypatch,
-    a3_enabled: bool,
+    kv_continuation_enabled: bool,
     evaluation: bool,
 ) -> None:
     completed = _completed_sample()
@@ -190,7 +190,7 @@ async def test_group_rm_preserves_default_and_evaluation_behavior(
     monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
     monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_group_rm)
     args = SimpleNamespace(
-        enable_cross_version_kv_continuation=a3_enabled,
+        enable_cross_version_kv_continuation=kv_continuation_enabled,
         group_rm=True,
         sglang_enable_deterministic_inference=False,
     )
@@ -544,23 +544,6 @@ async def test_dispatch_optin_vs_legacy_lock_scope(monkeypatch) -> None:
     await _dispatch_generate(optin_state, _StubArgs("x"), _StubSample(), {})
     assert free_between_turns == [False, False]
     assert not optin_state.semaphore.locked()
-
-
-async def test_dispatch_lightweight_state_supports_calibration_observability(monkeypatch, tmp_path) -> None:
-    state = _StubState(capacity=1)
-
-    async def legacy_func(args, sample, sampling_params):
-        return sample
-
-    monkeypatch.setenv("TASK22_CALIBRATION_DIR", str(tmp_path))
-    monkeypatch.setattr(sglang_rollout, "load_function", lambda path: legacy_func)
-
-    sample = _StubSample()
-    await _dispatch_generate(state, _StubArgs("x"), sample, {})
-
-    assert len(state.permit_observability_rows) == 1
-    assert state.permit_observability_rows[0]["permit_wait_status"] == "terminal"
-    assert sample.metadata == {}
 
 
 async def test_group_dispatch_barrier_releases_for_completed_partial_samples() -> None:
