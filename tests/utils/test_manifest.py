@@ -3,6 +3,7 @@
 """Unit tests for the compact experiment manifest implementation."""
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -77,8 +78,18 @@ def test_sanitizer_covers_reviewed_secret_shapes() -> None:
     assert manifest.sanitize_value("ray-head", "node_address") == "<internal-host>"
     assert manifest.sanitize_value("ray-head", "NodeManagerAddress") == "<internal-host>"
     assert manifest.sanitize_value(["ray-head"], "host") == "<internal-host>"
+    assert manifest.sanitize_value("ray-head", "worker_hostname") == "<internal-host>"
+    assert manifest.sanitize_value(["ray-head:8000"], "rollout_external_engine_addrs") == "<internal-host>"
     assert manifest.sanitize_value("alice@example.com", "email_address") == "alice@example.com"
     manifest.verify_no_secrets(sanitized)
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_sanitizer_converts_non_finite_floats_to_standard_json(value: float) -> None:
+    sanitized = manifest.sanitize_value({"value": value})
+
+    assert sanitized["value"].startswith("<non-finite:")
+    json.dumps(sanitized, allow_nan=False)
 
 
 def test_sanitize_argv_understands_separate_and_inline_flags() -> None:
@@ -137,6 +148,24 @@ def test_normalize_accepts_future_v1_minor_and_legacy_cli_args() -> None:
 
     assert normalized["schema_version"] == "1.0"
     assert normalized["command"]["argv"] == ["python", "train.py"]
+
+
+@pytest.mark.parametrize("version", [None, 1, "1", "1.future", "v1.0"])
+def test_normalize_rejects_malformed_schema_versions(version: object) -> None:
+    with pytest.raises(manifest.ManifestError, match="Invalid schema version"):
+        manifest.normalize_manifest({"schema_version": version})
+
+
+def test_documented_schema_matches_runtime_v1_contract() -> None:
+    schema_path = Path(manifest.__file__).resolve().parents[2] / "docs/schema/experiment-manifest-v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    version_pattern = schema["properties"]["schema_version"]["pattern"]
+    assert re.fullmatch(version_pattern, manifest.SCHEMA_VERSION)
+    assert re.fullmatch(version_pattern, "1.7")
+    assert not re.fullmatch(version_pattern, "2.0")
+    assert set(schema["required"]) == {"schema_version", "run_id", "generated_at", "command"}
+    assert schema["additionalProperties"] is True
 
 
 @pytest.mark.parametrize(
@@ -208,6 +237,20 @@ def test_megatron_git_is_discovered_from_pythonpath(tmp_path: Path) -> None:
     assert code["megatron"]["path"] == str(tmp_path)
 
 
+def test_relax_git_is_discovered_from_source_outside_repository_cwd(tmp_path: Path) -> None:
+    source_root = Path(manifest.__file__).resolve().parents[2]
+
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch.object(manifest, "_git_repository", return_value={"commit": "source-commit"}) as repository,
+        patch("pathlib.Path.cwd", return_value=tmp_path),
+    ):
+        code = manifest._collect_code()
+
+    assert code["relax"] == {"commit": "source-commit"}
+    repository.assert_called_once_with(source_root)
+
+
 def test_environment_cuda_fallback_without_importing_torch() -> None:
     with (
         patch.dict(sys.modules, {"torch": None}),
@@ -240,6 +283,14 @@ def test_input_metadata_uses_one_bounded_probe_for_lists() -> None:
 def test_local_runtime_mode() -> None:
     with patch.dict(sys.modules, {"ray": None}):
         assert manifest._collect_runtime()["mode"] == "local"
+
+
+def test_ray_node_role_supports_current_ray_resource_marker() -> None:
+    head = {"Resources": {"CPU": 8, "node:head-marker": 1, "node:__internal_head__": 1}}
+    worker = {"Resources": {"CPU": 8, "node:worker-marker": 1}}
+
+    assert manifest._ray_node_role(head) == "head"
+    assert manifest._ray_node_role(worker) == "worker"
 
 
 def test_diff_ignores_run_identity() -> None:

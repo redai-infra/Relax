@@ -2,6 +2,7 @@
 
 """Integration checks for manifest collection and non-blocking persistence."""
 
+import ast
 import json
 import sys
 import time
@@ -62,3 +63,23 @@ def test_minimal_cpu_generate_check_and_confirmed_rerun(tmp_path: Path) -> None:
     assert not marker.exists()
     assert manifest.main(["rerun", str(manifest_path), "--confirm"]) == 0
     assert marker.exists()
+
+
+def test_training_entrypoint_collects_and_updates_manifest() -> None:
+    train_path = Path(manifest.__file__).resolve().parents[1] / "entrypoints/train.py"
+    tree = ast.parse(train_path.read_text(encoding="utf-8"))
+    main_function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = [node for node in ast.walk(main_function) if isinstance(node, ast.Call)]
+
+    def call_name(call: ast.Call) -> str:
+        return call.func.id if isinstance(call.func, ast.Name) else call.func.attr
+
+    calls_by_name = {call_name(call): call for call in calls}
+    collect_call = calls_by_name["collect_and_save_manifest"]
+
+    assert collect_call.lineno < calls_by_name["update_manifest_runtime"].lineno
+    assert calls_by_name["update_manifest_runtime"].lineno < calls_by_name["Controller"].lineno
+    assert any(
+        keyword.arg == "include_runtime" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+        for keyword in collect_call.keywords
+    )

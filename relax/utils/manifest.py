@@ -7,6 +7,7 @@ import hashlib
 import importlib.metadata
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
@@ -41,7 +42,8 @@ _SECRET_KEY = re.compile(
     re.IGNORECASE,
 )
 _LOCATION_KEY = re.compile(
-    r"(?:^address$|^host(?:name)?$|(?:^|_)(?:ray|master|head|node)(?:_manager)?_(?:address|addr|ip|host|node)(?:$|_)|"
+    r"(?:^address$|^host(?:name)?$|(?:^|_)(?:ray|master|head|node|worker|redis|gcs|dashboard|wandb|"
+    r"external_engine)(?:_manager)?_(?:address(?:es)?|addr(?:s)?|ip|host(?:name)?|node|name|url)(?:$|_)|"
     r"(?:^|_)nodelist(?:$|_))",
     re.IGNORECASE,
 )
@@ -132,7 +134,9 @@ def sanitize_value(value: Any, key: Optional[str] = None) -> Any:
         if value in (None, ""):
             return value
         return value if isinstance(value, str) and value in _SAFE_PLACEHOLDERS else "<internal-host>"
-    if value is None or isinstance(value, (bool, int, float)):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else f"<non-finite:{value}>"
+    if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, str):
         return _sanitize_string(value)
@@ -226,7 +230,8 @@ def _git_repository(path: Path) -> Dict[str, Any]:
 
 
 def _collect_code() -> Dict[str, Any]:
-    result = {"relax": _git_repository(Path.cwd())}
+    source_root = Path(__file__).resolve().parents[2]
+    result = {"relax": _git_repository(source_root) or _git_repository(Path.cwd())}
     candidates = [os.environ.get("MEGATRON_LM_PATH")]
     candidates.extend(os.environ.get("PYTHONPATH", "").split(os.pathsep))
     for candidate in candidates:
@@ -315,6 +320,15 @@ def _safe_resources(resources: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _ray_node_role(node: Mapping[str, Any]) -> str:
+    resources = node.get("Resources", {})
+    if node.get("IsHeadNode") is True or "node:__internal_head__" in resources:
+        return "head"
+    if node.get("IsHeadNode") is False or any(str(name).startswith("node:") for name in resources):
+        return "worker"
+    return "unknown"
+
+
 def _parallel_topology(args: Any) -> Dict[str, Any]:
     fields = {
         "tensor": "tensor_model_parallel_size",
@@ -352,11 +366,7 @@ def _collect_runtime(args: Any = None) -> Dict[str, Any]:
                     "node_count": len(nodes),
                     "nodes": [
                         {
-                            "role": "head"
-                            if node.get("IsHeadNode")
-                            else "worker"
-                            if "IsHeadNode" in node
-                            else "unknown",
+                            "role": _ray_node_role(node),
                             "resources": _safe_resources(node.get("Resources", {})),
                         }
                         for node in nodes
@@ -537,10 +547,10 @@ def normalize_manifest(raw: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise ManifestError("Manifest root must be an object")
     version = raw.get("schema_version")
-    try:
-        major = int(str(version).split(".", 1)[0])
-    except (TypeError, ValueError) as exc:
-        raise ManifestError(f"Invalid schema version: {version!r}") from exc
+    version_match = re.fullmatch(r"(\d+)\.(\d+)", str(version))
+    if not version_match:
+        raise ManifestError(f"Invalid schema version: {version!r}")
+    major = int(version_match.group(1))
     if major != 1:
         raise ManifestError(f"Unsupported schema major version: {major}")
     manifest = dict(raw)
@@ -613,7 +623,7 @@ def collect_and_save_manifest(
 
 
 def _write_manifest(destination: Path, manifest: Mapping[str, Any]) -> None:
-    payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    payload = json.dumps(manifest, allow_nan=False, indent=2, sort_keys=True).encode("utf-8")
     if len(payload) > MAX_MANIFEST_BYTES:
         raise ManifestError(f"Manifest is too large: {len(payload)} bytes")
     destination.parent.mkdir(parents=True, exist_ok=True)

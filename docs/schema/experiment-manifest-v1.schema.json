@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Relax Experiment Manifest v1",
+  "description": "A sanitized, best-effort record of one Relax experiment launch.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "generated_at",
+    "command"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$",
+      "description": "The reader compatibility boundary. Readers accept every 1.x minor version."
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "user": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hostname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "command": {
+      "$ref": "#/$defs/command"
+    },
+    "code": {
+      "$ref": "#/$defs/code"
+    },
+    "config": {
+      "$ref": "#/$defs/config"
+    },
+    "environment": {
+      "$ref": "#/$defs/environment"
+    },
+    "hardware": {
+      "$ref": "#/$defs/hardware"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtime"
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "training": {
+      "type": "object",
+      "properties": {
+        "parallel_topology": {
+          "$ref": "#/$defs/parallelTopology"
+        },
+        "global_batch_size": {
+          "$ref": "#/$defs/jsonValue"
+        },
+        "micro_batch_size": {
+          "$ref": "#/$defs/jsonValue"
+        },
+        "algorithm": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "jsonValue": {
+      "anyOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "integer",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        }
+      ]
+    },
+    "command": {
+      "type": "object",
+      "required": [
+        "argv",
+        "working_directory"
+      ],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "working_directory": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "repository": {
+      "type": "object",
+      "properties": {
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "tracked_dirty": {
+          "type": "boolean"
+        },
+        "untracked_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "code": {
+      "type": "object",
+      "properties": {
+        "relax": {
+          "$ref": "#/$defs/repository"
+        },
+        "megatron": {
+          "$ref": "#/$defs/repository"
+        }
+      },
+      "additionalProperties": true
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "arguments": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        "runtime_env": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "python_version": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "os_version": {
+          "type": "string"
+        },
+        "machine": {
+          "type": "string"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cuda_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nccl_version": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      },
+      "additionalProperties": true
+    },
+    "hardware": {
+      "type": "object",
+      "properties": {
+        "cpu_count": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cpu_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_gb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "numa_nodes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "gpu_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gpu_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gpu_memory_gb": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "driver_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gpus": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "parallelTopology": {
+      "type": "object",
+      "properties": {
+        "tensor": {
+          "type": "integer"
+        },
+        "pipeline": {
+          "type": "integer"
+        },
+        "context": {
+          "type": "integer"
+        },
+        "expert": {
+          "type": "integer"
+        },
+        "data": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": true
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/jsonValue"
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "local",
+            "ray_initialized_unknown",
+            "single_node_ray",
+            "multi_node_ray"
+          ]
+        },
+        "node_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": {
+                "enum": [
+                  "head",
+                  "worker",
+                  "unknown"
+                ]
+              },
+              "resources": {
+                "$ref": "#/$defs/resources"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "cluster_resources": {
+          "$ref": "#/$defs/resources"
+        },
+        "slurm": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        "parallel_topology": {
+          "$ref": "#/$defs/parallelTopology"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -275,6 +275,7 @@ export default defineConfig({
             {
               text: 'Best Practices',
               items: [
+                { text: 'Reproducibility Bundle', link: '/en/guide/reproducibility' },
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
                 { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
@@ -384,6 +385,7 @@ export default defineConfig({
             {
               text: '最佳实践',
               items: [
+                { text: '可复现实验清单', link: '/zh/guide/reproducibility' },
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
