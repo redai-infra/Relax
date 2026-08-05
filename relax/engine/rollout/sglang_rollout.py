@@ -311,7 +311,6 @@ async def generate(
     tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
     _t_image_processor: float | None = None
-    _image_processor_is_real_call: bool | None = None
     # K2.x ships a multimodal AutoProcessor even for text-only fine-tunes; the
     # data loader always populates multimodal_inputs with empty-list placeholders
     # in that case, so check for actual media content before routing through the
@@ -325,17 +324,13 @@ async def generate(
         if pre_encoded is not None:
             processor_prompt_ids, sample.multimodal_train_inputs = pre_encoded
             _t_image_processor = getattr(sample, "_pre_encoded_image_elapsed", 0.0)
-            _image_processor_is_real_call = getattr(sample, "_pre_encoded_image_is_real_call", False)
             del sample._pre_encoded_image
             if hasattr(sample, "_pre_encoded_image_elapsed"):
                 del sample._pre_encoded_image_elapsed
-            if hasattr(sample, "_pre_encoded_image_is_real_call"):
-                del sample._pre_encoded_image_is_real_call
         else:
             processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
                 state, args, sample.prompt, sample.multimodal_inputs
             )
-            _image_processor_is_real_call = True
     else:
         processor_prompt_ids = tokenizer_prompt_ids
 
@@ -497,7 +492,6 @@ async def generate(
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
     if _t_image_processor is not None:
         _timing["image_processor"] = _t_image_processor
-        _timing["image_processor_real_call"] = 1.0 if _image_processor_is_real_call else 0.0
     if _t_mm_encode is not None:
         _timing["mm_encode"] = _t_mm_encode
     sample.metadata["_timing"] = _timing
@@ -639,19 +633,6 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
         metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
         metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
 
-    # Anchor: image_processor_real_call marks which samples triggered an actual
-    # HF-processor invocation vs. reused a dedup'd group result (see generate_and_rm_group).
-    # total_real/calls-real/calls-deduped let dedup-multimodal-preprocess on/off runs be
-    # compared on true processor wall-clock spent, instead of image_processor_time/mean
-    # being inflated by len(group) copies of the same elapsed value when dedup is on.
-    image_processor_values = timing_data.get("image_processor", [])
-    real_call_flags = timing_data.get("image_processor_real_call", [])
-    if image_processor_values and real_call_flags:
-        real_times = [t for t, is_real in zip(image_processor_values, real_call_flags, strict=True) if is_real]
-        metrics["perf_detail/rollout/image_processor_time/total_real"] = sum(real_times)
-        metrics["perf_detail/rollout/image_processor_calls/real"] = float(len(real_times))
-        metrics["perf_detail/rollout/image_processor_calls/deduped"] = float(len(real_call_flags) - len(real_times))
-
     if get_samples_times:
         metrics["perf_detail/rollout/get_samples_time/total"] = sum(get_samples_times)
         metrics["perf_detail/rollout/get_samples_time/mean"] = sum(get_samples_times) / len(get_samples_times)
@@ -690,17 +671,12 @@ async def generate_and_rm_group(
             pre_prompt_ids, mm_train_inputs, t_img = await _run_image_processor(state, args, group[0].prompt, first_mm)
             pre_train_inputs = (pre_prompt_ids, mm_train_inputs)
 
-        for idx, sample in enumerate(group):
+        for sample in group:
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
             if pre_train_inputs is not None:
                 sample._pre_encoded_image = pre_train_inputs
                 sample._pre_encoded_image_elapsed = t_img
-                # Anchor: only the first sample "owns" the real HF-processor call for
-                # this group; the rest reuse its output. Lets perf_detail metrics count
-                # actual processor invocations instead of len(group) copies of one value,
-                # so dedup-multimodal-preprocess on/off runs can be compared apples-to-apples.
-                sample._pre_encoded_image_is_real_call = idx == 0
 
     tasks = []
     for idx, sample in enumerate(group):
