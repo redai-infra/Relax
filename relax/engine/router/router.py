@@ -182,7 +182,9 @@ class SlimeRouter:
                 return JSONResponse(status_code=400, content={"error": "targeted publication requires a JSON body"})
             rid = payload.get("rid") if isinstance(payload, dict) else None
             if not isinstance(rid, str) or not rid:
-                return JSONResponse(status_code=400, content={"error": "targeted publication requires a non-empty rid"})
+                return JSONResponse(
+                    status_code=400, content={"error": "targeted publication requires a non-empty rid"}
+                )
             try:
                 request_version = await self.request_version_ledger.register_selected(
                     rid,

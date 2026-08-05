@@ -199,6 +199,7 @@ class GenerateState(metaclass=SingletonMeta):
             self.cross_version_kv_task_started_at: dict[asyncio.Task[Any], float] = {}
         if not hasattr(self, "cross_version_kv_protected_tasks"):
             self.cross_version_kv_protected_tasks: set[asyncio.Task[Any]] = set()
+
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
         for group in samples:

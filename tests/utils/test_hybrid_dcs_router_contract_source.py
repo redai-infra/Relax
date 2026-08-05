@@ -6,9 +6,7 @@ from pathlib import Path
 
 ARGUMENTS_PATH = Path(__file__).resolve().parents[2] / "relax" / "utils" / "arguments.py"
 SGLANG_ROLLOUT_PATH = Path(__file__).resolve().parents[2] / "relax" / "engine" / "rollout" / "sglang_rollout.py"
-KV_ROLLOUT_PATH = (
-    Path(__file__).resolve().parents[2] / "relax" / "engine" / "rollout" / "cross_version_kv_rollout.py"
-)
+KV_ROLLOUT_PATH = Path(__file__).resolve().parents[2] / "relax" / "engine" / "rollout" / "cross_version_kv_rollout.py"
 ROUTER_PATH = Path(__file__).resolve().parents[2] / "relax" / "engine" / "router" / "router.py"
 
 

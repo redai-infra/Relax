@@ -582,9 +582,7 @@ class DeviceDirectBackend(CommBackend):
                 # may have pruned dead engines from it; storing the stale full
                 # signature would let the fast path reuse a group that is missing a
                 # since-recovered engine (orphaning it).
-                self._rollout_topology_signature = self._rollout_topology_signature_of(
-                    self._rollout_topology
-                )
+                self._rollout_topology_signature = self._rollout_topology_signature_of(self._rollout_topology)
             result["group_setup_seconds"] = time.monotonic() - started_at
             return result
 

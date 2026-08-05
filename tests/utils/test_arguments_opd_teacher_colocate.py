@@ -57,9 +57,7 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
 
 
 def test_hybrid_gpu_snapshot_aliases_share_one_destination(arguments_module):
-    arguments_module.RouterArgs = SimpleNamespace(
-        add_cli_args=lambda parser, **_kwargs: parser
-    )
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
 
@@ -69,7 +67,7 @@ def test_hybrid_gpu_snapshot_aliases_share_one_destination(arguments_module):
     assert canonical.hybrid_weights_backuper_on_gpu is True
     assert maintainer_spelling.hybrid_weights_backuper_on_gpu is True
 
-    
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
@@ -82,16 +80,14 @@ def test_sft_invalid_multimodal_strategy_option(
     argv,
     expected,
 ):
-    arguments_module.RouterArgs = SimpleNamespace(
-        add_cli_args=lambda parser, **_kwargs: parser
-    )
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
 
     args = parser.parse_args(argv)
 
     assert args.sft_invalid_multimodal_strategy == expected
-    
+
 
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
@@ -230,7 +226,7 @@ def test_hybrid_dcs_weight_sync_requires_hybrid(arguments_module):
     with pytest.raises(ValueError, match="requires --hybrid"):
         arguments_module.slime_validate_args(args)
 
-        
+
 def test_hybrid_dcs_with_cross_version_kv_requires_slime_router(arguments_module):
     args = _opd_args()
     args.hybrid = True
@@ -241,7 +237,7 @@ def test_hybrid_dcs_with_cross_version_kv_requires_slime_router(arguments_module
     with pytest.raises(ValueError, match="requires --use-slime-router"):
         arguments_module.slime_validate_args(args)
 
-        
+
 def test_hybrid_dcs_with_cross_version_kv_accepts_default_router(
     arguments_module,
 ):
@@ -250,6 +246,7 @@ def test_hybrid_dcs_with_cross_version_kv_accepts_default_router(
     args.hybrid_dcs_weight_sync = True
     args.enable_cross_version_kv_continuation = True
     args.use_slime_router = True
+    args.partial_rollout = True
     args.targeted_retirement_timeout_seconds = 15.0
     args.offload_train = False
     args.offload_rollout = False
@@ -264,7 +261,7 @@ def test_hybrid_dcs_with_cross_version_kv_accepts_default_router(
 
     assert args.use_slime_router is True
 
-    
+
 def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"

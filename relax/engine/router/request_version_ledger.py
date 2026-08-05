@@ -148,7 +148,7 @@ class RequestVersionLedger:
                             self._condition.wait_for(lambda: all(rid not in self.active for rid in plan.expired_rids)),
                             timeout=min(0.25, remaining),
                         )
-                    except TimeoutError:
+                    except (TimeoutError, asyncio.TimeoutError):
                         pass
         except BaseException as exc:
             async with self._condition:
