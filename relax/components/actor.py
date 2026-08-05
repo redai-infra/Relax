@@ -7,10 +7,10 @@ from argparse import Namespace
 from typing import Any, Dict, Optional
 
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI
 from ray import serve
 
+import transfer_queue as tq
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group

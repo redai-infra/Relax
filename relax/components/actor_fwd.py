@@ -6,10 +6,10 @@ from argparse import Namespace
 from typing import Any, Optional
 
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI
 from ray import serve
 
+import transfer_queue as tq
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
 
