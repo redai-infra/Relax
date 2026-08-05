@@ -55,6 +55,12 @@ def _shell():
     return shell
 
 
+def _patch_resume_collective(monkeypatch):
+    """Keep unit tests independent from an initialized distributed process."""
+    monkeypatch.setattr(actor_mod.dist, "all_reduce", lambda *_a, **_k: None)
+    monkeypatch.setattr(actor_mod, "get_gloo_group", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # _run_step_evaluation: /evaluate + /end_update_weight
 # ---------------------------------------------------------------------------
@@ -66,6 +72,7 @@ def test_run_step_evaluation_probes_carry_timeout(monkeypatch):
     monkeypatch.setattr(actor_mod.requests, "get", _record_get(calls))
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    _patch_resume_collective(monkeypatch)
 
     shell = _shell()
     shell.args = Namespace(rollout_http_timeout=17.0)
@@ -102,6 +109,7 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
     monkeypatch.setattr(actor_mod.requests, "get", _get)
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    _patch_resume_collective(monkeypatch)
 
     shell = _shell()
     shell.rollout_manager = object()  # non-None -> has_rollout
@@ -123,6 +131,7 @@ def test_run_step_evaluation_swallows_timeout(monkeypatch):
     monkeypatch.setattr(actor_mod.requests, "get", _timeout_get)
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    _patch_resume_collective(monkeypatch)
 
     shell = _shell()
     shell.rollout_manager = object()
@@ -168,7 +177,7 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
         assert "timeout" not in k
 
 
-def test_check_services_health_swallows_timeout(monkeypatch):
+def test_check_services_health_aborts_when_pause_resume_is_uncertain(monkeypatch):
     from argparse import Namespace
 
     def _timeout_get(*_a, **_k):
@@ -179,8 +188,8 @@ def test_check_services_health_swallows_timeout(monkeypatch):
     shell = _shell()
     shell.args = Namespace(true_on_policy_mode=False, hybrid=False, rollout_http_timeout=120.0)
 
-    # Timeout swallowed by the two ``except Exception`` blocks -> degrades to
-    # actor_fwd_only / rollout_only rather than crashing.
-    rollout_only, actor_fwd_only = shell._check_services_health()
-    assert actor_fwd_only is True
-    assert rollout_only is True
+    # A timeout after the pause request is sent leaves the rollout state
+    # uncertain. If the compensating resume also cannot be confirmed, the
+    # actor must abort rather than continue with a potentially paused rollout.
+    with pytest.raises(RuntimeError, match="Failed to resume Rollout"):
+        shell._check_services_health()
