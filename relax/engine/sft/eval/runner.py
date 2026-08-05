@@ -5,8 +5,7 @@
 Extracted from ``backends/megatron/actor.py`` so the actor file stays focused
 on the generic training loop. The runner is function-style: it takes the
 Megatron actor as a duck-typed handle (needs ``args``, ``model``,
-``data_system_client``, ``all_consumed``,
-``_get_consistent_data_from_transfer_queue``).
+``data_system_client``, ``all_consumed``, ``_get_data_from_transfer_queue``).
 
 Backend imports are done lazily inside ``run_sft_eval`` so importing this
 module never pulls in Megatron / NCCL — the controller-side bootstrap can
@@ -124,18 +123,12 @@ def run_sft_eval(actor, rollout_id: int) -> None:
             partition_id = f"sft_eval_{rollout_id}_n{n_chunks}_{chunk_idx}"
             _wait_for_eval_partition_present(actor, partition_id)
             batch_index = 0
-            while True:
-                rollout_data, _batch_meta = actor._get_consistent_data_from_transfer_queue(
-                    task_name,
-                    rollout_id,
-                    data_fields,
-                    batch_size,
-                    batch_index,
-                    partition_id=partition_id,
-                    log_prefix="sft_eval fetch loop",
+            while not actor.all_consumed(task_name, rollout_id, partition_id=partition_id):
+                rollout_data, _batch_meta = actor._get_data_from_transfer_queue(
+                    task_name, rollout_id, data_fields, batch_size, batch_index, partition_id=partition_id
                 )
                 if rollout_data is None:
-                    break
+                    continue
                 batch_index += 1
                 data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
                 per_mb = forward_only(

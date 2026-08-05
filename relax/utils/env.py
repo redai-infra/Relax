@@ -200,7 +200,6 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Device / Training -------------
     RELAX_DEVICE_TYPE = EnvProperty("RELAX_DEVICE_TYPE", str, "")
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
-    RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 6000)
 
     # ------------- LoRA -------------
     RELAX_LORA_LIVE_DIR = EnvProperty("RELAX_LORA_LIVE_DIR", str, None)

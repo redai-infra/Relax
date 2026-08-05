@@ -676,24 +676,29 @@ class MegatronTrainRayActor(TrainRayActor):
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
+            empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
-            while batch_index < num_rollout_minis:
+            fetch_iter = 0
+            while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
                 consumer = "critic" if self.role == "critic" else "actor"
                 data_fields = build_data_fields(self.args, consumer=consumer)
-                rollout_data, batch_meta = self._get_consistent_data_from_transfer_queue(
-                    task_name,
-                    rollout_id,
-                    data_fields,
-                    batch_size,
-                    batch_index,
-                    num_expected_batches=num_rollout_minis,
-                    log_prefix="fetch loop",
-                    timer_name="train_get_data",
-                )
+                with timer("train_get_data"):
+                    rollout_data, batch_meta = self._get_data_from_transfer_queue(
+                        task_name, rollout_id, data_fields, batch_size, batch_index
+                    )
                 if rollout_data is None:
-                    break
+                    if fetch_iter % 100 == 0:
+                        logger.info(
+                            f"[fetch loop] rollout_id={rollout_id} batch_index={batch_index}/"
+                            f"{num_rollout_minis} iter={fetch_iter} task={task_name} "
+                            f"fields={data_fields} — empty meta, retrying."
+                        )
+                    fetch_iter += 1
+                    if empty_poll_sleep_s > 0:
+                        time.sleep(empty_poll_sleep_s)
+                    continue
                 batch_index += 1
                 if is_sft_mode(self.args):
                     if self.role == "critic":
@@ -989,17 +994,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 // self.args.num_iters_per_train_update
             )
             batch_index = 0
-            while True:
-                data, batch_meta = self._get_consistent_data_from_transfer_queue(
-                    "ref_log_probs",
-                    rollout_id,
-                    data_fields,
-                    batch_size,
-                    batch_index,
-                    log_prefix="ref_log_probs fetch loop",
+            while not self.all_consumed("ref_log_probs", rollout_id):
+                data, batch_meta = self._get_data_from_transfer_queue(
+                    "ref_log_probs", rollout_id, data_fields, batch_size, batch_index
                 )
                 if data is None:
-                    break
+                    continue
                 batch_index += 1
                 logger.info(
                     f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob"
@@ -1044,17 +1044,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 // self.args.num_iters_per_train_update
             )
             batch_index = 0
-            while True:
-                data, batch_meta = self._get_consistent_data_from_transfer_queue(
-                    "actor_log_probs",
-                    rollout_id,
-                    data_fields,
-                    batch_size,
-                    batch_index,
-                    log_prefix="actor_log_probs fetch loop",
+            while not self.all_consumed("actor_log_probs", rollout_id):
+                data, batch_meta = self._get_data_from_transfer_queue(
+                    "actor_log_probs", rollout_id, data_fields, batch_size, batch_index
                 )
                 if data is None:
-                    break
+                    continue
                 batch_index += 1
                 logger.info(
                     f"Successfully got rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob"
@@ -1265,7 +1260,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
             batch_index = 0
-            while batch_index < plan.num_rollout_minis:
+            # Surface stuck-loop conditions: when the partition can never reach the
+            # requested batch_size (e.g. rollout dropped samples without refilling),
+            # `get_meta` keeps returning size=0 while `all_consumed` stays False,
+            # producing a silent infinite spin. Warn periodically so the failure mode
+            # is visible in logs instead of presenting as a totally silent hang.
+            loop_start = time.monotonic()
+            last_progress = loop_start
+            last_warn = loop_start
+            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id):
                 data_fields = [
                     "tokens",
                     "total_lengths",
@@ -1280,24 +1283,26 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
-                sub_batch, batch_meta = self._get_consistent_data_from_transfer_queue(
-                    "train",
-                    rollout_id,
-                    data_fields,
-                    batch_size,
-                    batch_index,
-                    num_expected_batches=plan.num_rollout_minis,
-                    log_prefix="train_hybrid fetch loop",
-                    timer_name="train_get_data",
-                    stall_warning_seconds=60.0,
-                    stall_warning_message=(
-                        f"train_hybrid({rollout_id}) batch_index={batch_index} has no data of size={batch_size} "
-                        "available while the partition is not drained. The rollout may have under-filled this "
-                        "partition."
-                    ),
-                )
+                with timer("train_get_data"):
+                    sub_batch, batch_meta = self._get_data_from_transfer_queue(
+                        "train", rollout_id, data_fields, batch_size, batch_index
+                    )
                 if sub_batch is None:
-                    break
+                    now = time.monotonic()
+                    stalled = now - last_progress
+                    if now - last_warn >= 60.0 and stalled >= 60.0:
+                        logger.warning(
+                            f"train_hybrid({rollout_id}) batch_index={batch_index} stalled for {stalled:.0f}s: "
+                            f"partition train_{rollout_id} has no data of size={batch_size} available but "
+                            f"all_consumed=False. Likely the rollout under-filled this partition."
+                        )
+                        last_warn = now
+                    # Throttle the spin so the controller is not hammered with metadata
+                    # polls while we wait for upstream data.
+                    time.sleep(0.1)
+                    continue
+                last_progress = time.monotonic()
+                last_warn = last_progress
                 batch_index += 1
 
                 # Forward passes on this sub-batch (small memory footprint)
@@ -1867,158 +1872,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
-
-    def _sync_fetch_data_state(self, has_data: bool) -> tuple[bool, bool]:
-        """Synchronize whether ranks have fetched data before branching.
-
-        Per-rank fetch skips the TP/PP object broadcasts in
-        get_data_from_transfer_queue(), so ranks can transiently observe
-        different TQ states. Reduce over every Megatron mesh axis before any
-        rank decides to enter train_actor() or all_consumed().
-        """
-        has_data_int = int(has_data)
-        device = device_utils.make_current_torch_device()
-        min_has_data = torch.tensor([has_data_int], dtype=torch.int, device=device)
-        max_has_data = torch.tensor([has_data_int], dtype=torch.int, device=device)
-        sync_groups = (
-            (mpu.get_context_parallel_world_size(), mpu.get_context_parallel_group()),
-            (mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()),
-            (mpu.get_pipeline_model_parallel_world_size(), mpu.get_pipeline_model_parallel_group()),
-            (
-                mpu.get_data_parallel_world_size(with_context_parallel=False),
-                mpu.get_data_parallel_group(with_context_parallel=False),
-            ),
-        )
-        for group_size, group in sync_groups:
-            if group_size <= 1:
-                continue
-            dist.all_reduce(min_has_data, op=dist.ReduceOp.MIN, group=group)
-            dist.all_reduce(max_has_data, op=dist.ReduceOp.MAX, group=group)
-
-        return bool(min_has_data.item()), bool(max_has_data.item())
-
-    def _get_consistent_data_from_transfer_queue(
-        self,
-        task_name: str,
-        rollout_id: int,
-        data_fields: list[str],
-        batch_size: int | None,
-        batch_index: int,
-        *,
-        partition_id: str | None = None,
-        num_expected_batches: int | None = None,
-        log_prefix: str = "fetch loop",
-        timer_name: str | None = None,
-        stall_warning_seconds: float | None = None,
-        stall_warning_message: str | None = None,
-    ) -> tuple[RolloutBatch | None, Any | None]:
-        """Fetch one TQ batch without letting per-rank fetch branch
-        collectives.
-
-        With ``--per-rank-fetch`` each rank can transiently observe a different
-        TQ state. Hold any locally fetched batch while empty ranks retry, and
-        only let callers branch once every rank agrees that data is present or
-        that the partition is drained.
-        """
-        empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
-        fetch_iter = 0
-        fetch_split_retries = 0
-        rollout_data = None
-        batch_meta = None
-        effective_partition_id = partition_id if partition_id is not None else sft_partition_id(self.args, rollout_id)
-        batch_label = f"{batch_index}/{num_expected_batches}" if num_expected_batches is not None else str(batch_index)
-        wait_start = time.monotonic()
-        last_stall_warning = wait_start
-
-        while True:
-            if rollout_data is None:
-                if timer_name is None:
-                    rollout_data, batch_meta = self._get_data_from_transfer_queue(
-                        task_name,
-                        rollout_id,
-                        data_fields,
-                        batch_size,
-                        batch_index,
-                        partition_id=effective_partition_id,
-                    )
-                else:
-                    with timer(timer_name):
-                        rollout_data, batch_meta = self._get_data_from_transfer_queue(
-                            task_name,
-                            rollout_id,
-                            data_fields,
-                            batch_size,
-                            batch_index,
-                            partition_id=effective_partition_id,
-                        )
-
-            per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
-            if per_rank_fetch:
-                all_have_data, any_have_data = self._sync_fetch_data_state(rollout_data is not None)
-            else:
-                all_have_data = rollout_data is not None
-                any_have_data = rollout_data is not None
-
-            if not any_have_data:
-                if fetch_iter % 100 == 0:
-                    logger.info(
-                        "[%s] rollout_id=%s batch_index=%s iter=%s task=%s partition=%s fields=%s "
-                        "empty meta on all ranks, checking drained state.",
-                        log_prefix,
-                        rollout_id,
-                        batch_label,
-                        fetch_iter,
-                        task_name,
-                        effective_partition_id,
-                        data_fields,
-                    )
-                fetch_iter += 1
-                if self.all_consumed(task_name, rollout_id, partition_id=effective_partition_id):
-                    return None, None
-                if stall_warning_seconds is not None:
-                    now = time.monotonic()
-                    stalled = now - wait_start
-                    if stalled >= stall_warning_seconds and now - last_stall_warning >= stall_warning_seconds:
-                        if stall_warning_message is None:
-                            stall_warning_message = (
-                                f"{log_prefix}: rollout_id={rollout_id} batch_index={batch_label} "
-                                f"task={task_name} partition={effective_partition_id} has no data available "
-                                "while the partition is not drained."
-                            )
-                        logger.warning("%s Stalled for %.0fs.", stall_warning_message, stalled)
-                        last_stall_warning = now
-                if empty_poll_sleep_s > 0:
-                    time.sleep(empty_poll_sleep_s)
-                continue
-
-            if not all_have_data:
-                if fetch_split_retries % 100 == 0:
-                    logger.warning(
-                        "[%s] rollout_id=%s batch_index=%s iter=%s task=%s partition=%s fields=%s "
-                        "split fetch state; local_has_data=%s. Data ranks will hold their batch while empty ranks "
-                        "retry.",
-                        log_prefix,
-                        rollout_id,
-                        batch_label,
-                        fetch_iter,
-                        task_name,
-                        effective_partition_id,
-                        data_fields,
-                        rollout_data is not None,
-                    )
-                fetch_split_retries += 1
-                fetch_iter += 1
-                if fetch_split_retries >= Envs.RELAX_FETCH_SPLIT_MAX_RETRIES:
-                    raise RuntimeError(
-                        "Inconsistent transfer queue fetch state across ranks did not converge: "
-                        f"rollout_id={rollout_id}, batch_index={batch_label}, task={task_name}, "
-                        f"partition={effective_partition_id}, max_retries={Envs.RELAX_FETCH_SPLIT_MAX_RETRIES}."
-                    )
-                if empty_poll_sleep_s > 0:
-                    time.sleep(empty_poll_sleep_s)
-                continue
-
-            return rollout_data, batch_meta
 
     def all_consumed(self, task_name, rollout_id, partition_id: str | None = None, streaming: bool = False):
         # Only (TP=0, PP=0, CP=0) queries the transfer queue; otherwise different cp_ranks
