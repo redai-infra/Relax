@@ -120,7 +120,7 @@ def test_hybrid_weight_publication_resumes_rollout_when_recovery_fails(monkeypat
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True)
+    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
     actor._end_rollout_weight_update = Mock()
 
     can_update_response = Mock()
@@ -141,14 +141,14 @@ def test_hybrid_weight_publication_resumes_rollout_when_recovery_fails(monkeypat
     assert actor_fwd_only is True
     actor._end_rollout_weight_update.assert_called_once_with("http://rollout", 7)
     assert request_get.call_args_list[0].kwargs["timeout"] == 30
-    assert request_get.call_args_list[1].kwargs["timeout"] == 30
+    assert "timeout" not in request_get.call_args_list[1].kwargs
 
 
 def test_hybrid_weight_publication_resumes_when_pause_result_is_uncertain(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True)
+    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
     actor._end_rollout_weight_update = Mock()
 
     can_update_response = Mock()
@@ -170,7 +170,7 @@ def test_hybrid_weight_publication_does_not_resume_before_pause_request(monkeypa
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True)
+    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
     actor._end_rollout_weight_update = Mock()
 
     monkeypatch.setattr(actor_module, "get_serve_url", Mock(side_effect=RuntimeError("url unavailable")))
@@ -188,6 +188,7 @@ def test_end_rollout_weight_update_retries_then_succeeds(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(rollout_http_timeout=30)
     failed_response = Mock()
     failed_response.raise_for_status.side_effect = RuntimeError("temporary failure")
     successful_response = Mock()
@@ -204,6 +205,7 @@ def test_end_rollout_weight_update_raises_after_retries(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(rollout_http_timeout=30)
     failed_response = Mock()
     failed_response.raise_for_status.side_effect = RuntimeError("persistent failure")
     monkeypatch.setattr(actor_module.requests, "get", Mock(return_value=failed_response))
@@ -217,6 +219,7 @@ def test_end_rollout_weight_update_retries_url_resolution(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(rollout_http_timeout=30)
     get_url = Mock(side_effect=[RuntimeError("discovery failed"), RuntimeError("discovery failed"), "http://rollout"])
     monkeypatch.setattr(actor_module, "get_serve_url", get_url)
     monkeypatch.setattr(actor_module.requests, "get", Mock(return_value=Mock()))
@@ -303,7 +306,7 @@ def test_hybrid_weight_publication_aborts_all_ranks_when_resume_fails(monkeypatc
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True)
+    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
     actor._end_rollout_weight_update = Mock(side_effect=RuntimeError("resume failed"))
 
     can_update_response = Mock()

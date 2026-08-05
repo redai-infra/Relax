@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +14,16 @@ from relax.utils.types import Sample
 
 
 logger = get_logger(__name__)
+
+
+# Minimum wall-clock gap between two `prepare_group_status` RPCs from
+# `refresh_ready_groups`. The resident dataflow pump ticks at ~20Hz and calls
+# refresh from two sites per tick, which otherwise fires 20-40 status RPCs/s per
+# rollout replica (flooding the Serve access log and burning serialization).
+# warming->ready is a sandbox-startup event on the seconds-to-minutes scale, so
+# polling it faster than ~0.5s buys nothing; refresh skips the RPC when the last
+# one was more recent than this and reuses the current warming set unchanged.
+_STATUS_POLL_THROTTLE_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -93,6 +104,9 @@ class PrepareDomain:
         self.prepare_groups_by_id: dict[str, Any] = {}
         self.warming_group_ids: deque[str] = deque()
         self.ready_group_ids: deque[str] = deque()
+        # Monotonic timestamp of the last prepare_group_status RPC issued by
+        # refresh_ready_groups; used to throttle it to _STATUS_POLL_THROTTLE_S.
+        self._last_status_fetch_monotonic: float = 0.0
         self.next_prepare_group_seq = 0
         self._ready_batches: deque[FetchBatch] = deque()
         self._fetch_task: asyncio.Task[None] | None = None
@@ -262,6 +276,15 @@ class PrepareDomain:
         self._raise_launch_error_if_any()
         if not self.warming_group_ids:
             return 0
+        # Throttle the status RPC: the pump calls this at ~20Hz from two sites,
+        # but warming->ready is a seconds-to-minutes sandbox-startup event, so
+        # polling faster than _STATUS_POLL_THROTTLE_S only floods the Serve
+        # access log. Skip this tick if the last fetch was too recent; warming
+        # groups stay queued and are re-checked on the next allowed refresh.
+        now = time.monotonic()
+        if now - self._last_status_fetch_monotonic < _STATUS_POLL_THROTTLE_S:
+            return 0
+        self._last_status_fetch_monotonic = now
         runtime_driver = self.runtime_driver
         if runtime_driver is None:
             raise RuntimeError("PrepareDomain cannot refresh warming groups before runtime driver is bound.")
@@ -289,22 +312,25 @@ class PrepareDomain:
                 ready_count += 1
                 continue
             if drop_completed_before_ready:
-                # Eval path: a managed session that finished without producing a
-                # chat IR (e.g. upstream LLM returned null content) must not crash
-                # the whole rollout service. Drop the group and keep going so the
-                # eval loop can converge — at worst eval loses a few samples.
+                # A managed session that finished without producing a chat IR
+                # (e.g. an apptainer instance that failed to start, or an
+                # upstream LLM that returned null content) must not crash the
+                # whole rollout service. Drop the group and keep going; the
+                # over-sampling prepare pool + transfer quota gate refill the
+                # dropped group, so the committed batch size is preserved. Used
+                # by both the train and eval rollout loops.
                 completed_requests = runtime_driver.prepare_group_completed_before_ready(group_state=group_state)
                 if completed_requests:
                     logger.warning(
                         "Prepare-owned managed agent session completed before producing a chat IR; "
-                        "dropping group (eval): "
+                        "dropping group (will be refilled by the over-sampling pool): "
                         f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "
                         f"expected_sessions={expected_sessions}, total_sessions={total_sessions}, "
                         f"ready_sessions={ready_sessions}, completed_requests={completed_requests[:8]}."
                     )
                     await runtime_driver.discard_prepare_group(group_state=group_state)
                     self._forget_prepare_group(group_state)
-                    # Do NOT re-queue: leaving it warming would deadlock the eval loop.
+                    # Do NOT re-queue: leaving it warming would deadlock the loop.
                     continue
             else:
                 runtime_driver.raise_if_prepare_group_completed_before_ready(

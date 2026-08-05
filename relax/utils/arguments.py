@@ -12,6 +12,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
@@ -358,6 +359,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
             )
             parser.add_argument(
+                "--selective-offload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Offload the training actor to CPU during colocate sleep/wake by copying only the "
+                    "live train state (weights + optimizer state) instead of torch_memory_saver's "
+                    "whole-pool pause. Default is torch_memory_saver; use this on backends where "
+                    "its VMM pause() is unavailable/unsafe (e.g. Kunlunxin P800)."
+                ),
+            )
+            parser.add_argument(
                 "--disable-weights-backuper",
                 action="store_false",
                 dest="enable_weights_backuper",
@@ -466,9 +478,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
                 "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
-                "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
-                "when --enable-mtp-training is set (MTP head needs the real output_layer; "
-                "bypass would break it) or when embeddings are tied "
+                "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
+                "continue to use the real output_layer before the main head is deferred. "
+                "Incompatible when embeddings are tied "
                 "(--untie-embeddings-and-output-weights not set: output_layer is built with "
                 "skip_weight_param_allocation=True so output_layer.weight is None and the "
                 "chunked path's lm_head matmul has nothing to multiply against; tied models "
@@ -600,6 +612,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Required when --sft-oversize-strategy custom. Importable path to a function with "
                     "signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) | None`. "
                     "Returning None is treated as skip."
+                ),
+            )
+            parser.add_argument(
+                "--sft-invalid-multimodal-strategy",
+                type=str,
+                default="error",
+                choices=["error", "skip"],
+                help=(
+                    "How to handle SFT samples where a rendered image/video/audio marker cannot resolve to "
+                    "exactly one inline or top-level media source, or duplicate sources are supplied. "
+                    "`error` (default) fails before model forward; `skip` emits a WARNING and refills the batch."
                 ),
             )
             parser.add_argument(
@@ -944,6 +967,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=30.0,
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
+            )
+            parser.add_argument(
+                "--rollout-http-timeout",
+                type=float,
+                default=120.0,
+                help="Timeout in seconds for actor HTTP probes to rollout and actor_fwd services.",
             )
             parser.add_argument(
                 "--rollout-health-check-first-wait",
@@ -2404,6 +2433,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: --autoscaler-config relax/utils/autoscaler/autoscaler.yaml"
                 ),
             )
+            parser.add_argument(
+                "--enable-affinity",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether baseline roles (actor / rollout-seed / colocate shared PG) require the "
+                    "'stable' worker-group node-group affinity markers, keeping elastic "
+                    "(autoscaler-enabled) jobs' baseline off elastic workers (which get reclaimed -> "
+                    "whole-job restart). Defaults to True. This flag is forwarded to "
+                    "create_placement_group(node_group_affinity=...); passing --no-enable-affinity "
+                    "opts every baseline placement group out of the marker requirement (escape valve) "
+                    "-- use it on plain/local clusters that don't declare the "
+                    "'{group}_gpu'/'{group}_cpu' custom resources so placement stays unconstrained "
+                    "and never hangs waiting for the markers. (Whether the job is elastic at all is "
+                    "gated separately by --autoscaler-config + its YAML 'enabled'.)"
+                ),
+            )
             return parser
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
@@ -2667,13 +2713,6 @@ def slime_validate_args(args):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
-    if is_sft and getattr(args, "dynamic_context_parallel", False) and args.eval_interval is not None:
-        raise ValueError(
-            "--dynamic-context-parallel cannot be used with SFT eval (--eval-interval) yet: "
-            "this combination can hang and has not been fixed. "
-            "Disable --eval-interval or --dynamic-context-parallel."
-        )
-
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
         # `--disable-compute-advantages-and-returns` and friends.
@@ -2723,27 +2762,31 @@ def slime_validate_args(args):
             )
             args.lora_merge_mode = True
 
-    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
-    # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
-    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
-    # response_length=1 for every sample and training silently degenerates.
-    if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
+    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding on SGLang <= 0.5.9.
+    # There, spec_v2 routes requests through EAGLEWorkerV2.verify(), which does
+    # not populate output_token_logprobs — rollout sees response_length=1 for
+    # every sample and training silently degenerates. Fixed after 0.5.9, so
+    # newer builds may combine the two freely.
+    if getattr(args, "sglang_speculative_algorithm", None) and Envs.SGLANG_ENABLE_SPEC_V2.lower() in (
         "1",
         "true",
         "yes",
         "y",
     ):
-        raise ValueError(
-            "SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
-            "--sglang-speculative-algorithm in this build: spec_v2 EAGLE worker "
-            "does not populate output_token_logprobs, which collapses rollout "
-            "response_length to 1 and silently breaks training. "
-            "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
-            "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
-            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
-            "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
-            "spec_v2."
-        )
+        import sglang
+        from packaging.version import parse
+
+        if parse(sglang.__version__) <= parse("0.5.9"):
+            raise ValueError(
+                f"SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
+                f"--sglang-speculative-algorithm on sglang {sglang.__version__}: the spec_v2 "
+                f"EAGLE worker does not populate output_token_logprobs, which collapses "
+                f"rollout response_length to 1 and silently breaks training. Unset "
+                f"SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the spec_v1 EAGLE "
+                f"worker, or upgrade past 0.5.9. For Qwen3.5-MoE-style hybrid models, keep "
+                f"--sglang-mamba-scheduler-strategy extra_buffer — that flag alone satisfies "
+                f"SGLang's mamba radix-cache check and does NOT auto-enable spec_v2."
+            )
 
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
@@ -3142,6 +3185,27 @@ def slime_validate_args(args):
     if args.use_critic:
         args.offload_train = True
 
+    # expandable_segments cannot coexist with torch_memory_saver, the default mechanism
+    # behind --offload-train. TMS's hook is armed from TMS_INIT_ENABLE inside the
+    # LD_PRELOAD'ed .so before any Python runs, so neither its own sanity check nor any
+    # in-process guard can intervene — the actor just dies with a bare
+    # "CUresult error: 1 (invalid argument)" from cu_mem_create. Fail here instead, while
+    # the message can still be read. Only the CUDA variable names are checked on purpose:
+    # NPU uses a different torch_memory_saver build and its scripts already combine
+    # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True with offload successfully.
+    if args.offload_train and not getattr(args, "selective_offload", False):
+        alloc_conf_sources = {
+            **{name: os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
+            **{key: str(value) for key, value in getattr(args, "train_env_vars", {}).items()},
+        }
+        for name, value in alloc_conf_sources.items():
+            if "expandable_segments:True" in value:
+                raise ValueError(
+                    f"{name} enables expandable_segments, which torch_memory_saver cannot track. "
+                    "Add --selective-offload to use the application-level offload instead, "
+                    "or drop expandable_segments."
+                )
+
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
@@ -3202,10 +3266,10 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. All three are flagged here so
+    # --sft-chunked-logits incompatibilities. Both are flagged here so
     # downstream (model.py _should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # Both are hard asserts — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
         # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
@@ -3222,14 +3286,7 @@ def slime_validate_args(args):
             "multiply against). Remove --sft-chunked-logits; the chunked "
             "memory win is marginal on tied-weight models."
         )
-        # 2) MTP. MTP's _postprocess reaches for self.output_layer directly;
-        #    _bypass_output_layer's passthrough would break the MTP head.
-        assert not getattr(args, "enable_mtp_training", False), (
-            "--sft-chunked-logits is incompatible with --enable-mtp-training "
-            "(MTP head needs the real output_layer; the chunked path's "
-            "passthrough would break it). Remove one of the two flags."
-        )
-        # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.

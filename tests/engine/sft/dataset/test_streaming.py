@@ -2,6 +2,7 @@
 
 """Unit tests for the prompt-data based SFT streaming dataset."""
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import torch
 
 from relax.engine.sft.dataset.streaming import (
     ProcessedSample,
+    SFTMultimodalContractError,
     SFTStreamingDataset,
     _canonicalize_messages,
     _expand_loss_mask_via_alignment,
@@ -234,6 +236,343 @@ def test_streaming_dataset_rejects_prompt_string_without_label_key(tmp_path: Pat
 
     with pytest.raises(TypeError, match="--label-key is not set"):
         ds.get_canonical_sample(0)
+    ds.stop()
+
+
+def test_streaming_dataset_collects_inline_structured_image_url(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "_sample_id": "inline-image-url",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the image."},
+                            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": [],
+            }
+        ],
+    )
+
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+    )
+
+    sample = ds.get_canonical_sample(0)
+
+    assert sample.images == ["https://example.test/image.png"]
+    assert sample.messages[0].content[1] == {
+        "type": "image",
+        "image": "https://example.test/image.png",
+    }
+    ds.stop()
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_images"),
+    [
+        (
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.test/inline.png"}},
+                    ],
+                },
+                {"role": "user", "content": "<image>\nDescribe both images."},
+                {"role": "assistant", "content": "Answer"},
+            ],
+            ["https://example.test/inline.png", "/data/top-level.png"],
+        ),
+        (
+            [
+                {"role": "user", "content": "<image>\nFirst image."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.test/inline.png"}},
+                    ],
+                },
+                {"role": "assistant", "content": "Answer"},
+            ],
+            ["/data/top-level.png", "https://example.test/inline.png"],
+        ),
+    ],
+)
+def test_streaming_dataset_preserves_mixed_inline_and_top_level_image_order(
+    tmp_path: Path,
+    messages: list[dict],
+    expected_images: list[str],
+):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": messages, "images": ["/data/top-level.png"]}])
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+    )
+
+    sample = ds.get_canonical_sample(0)
+
+    assert sample.images == expected_images
+    ds.stop()
+
+
+def test_streaming_dataset_preserves_repeated_inline_image_url(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    image_url = "https://example.test/repeated.png"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": [],
+            }
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+    )
+
+    sample = ds.get_canonical_sample(0)
+
+    assert sample.images == [image_url, image_url]
+    ds.stop()
+
+
+@pytest.mark.parametrize("image_url", [{"url": 123}, {"url": ""}, ""])
+def test_streaming_dataset_rejects_malformed_inline_image_url(tmp_path: Path, image_url):
+    path = tmp_path / "train.jsonl"
+    rows = _invalid_image_url_rows()
+    rows[0]["messages"][0]["content"][1]["image_url"] = image_url
+    _write_jsonl(path, rows[:1])
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+    )
+
+    with pytest.raises(SFTMultimodalContractError, match="top_level_required_count"):
+        ds.get_canonical_sample(0)
+    ds.stop()
+
+
+def _invalid_image_url_rows() -> list[dict]:
+    return [
+        {
+            "_sample_id": "invalid-image-url",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the image."},
+                        {"type": "image_url", "image_url": {}},
+                    ],
+                },
+                {"role": "assistant", "content": "Bad sample"},
+            ],
+            "images": [],
+        },
+        {
+            "_sample_id": "text-only",
+            "messages": [
+                {"role": "user", "content": "Text question"},
+                {"role": "assistant", "content": "Good sample"},
+            ],
+            "images": [],
+        },
+    ]
+
+
+def test_streaming_dataset_invalid_multimodal_defaults_to_error(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, _invalid_image_url_rows()[:1])
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=0,
+        prefetch_max_cached=0,
+    )
+    ds.shuffle(0)
+
+    try:
+        with pytest.raises(SFTMultimodalContractError, match="sample idx=0, sample_id='invalid-image-url'"):
+            ds.get_batch(1)
+    finally:
+        ds.stop()
+
+
+@pytest.mark.parametrize("batch_mode", ["inline", "async", "prefetch"])
+def test_streaming_dataset_invalid_multimodal_skip_refills_batch(tmp_path: Path, caplog, batch_mode: str):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, _invalid_image_url_rows())
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=0,
+        prefetch_max_cached=4 if batch_mode == "prefetch" else 0,
+        prefetch_chunk_size=1,
+        prefetch_num_workers=1,
+        invalid_multimodal_strategy="skip",
+    )
+    ds.shuffle(0)
+
+    try:
+        if batch_mode == "async":
+            samples, _ = asyncio.run(ds.get_batch_async(1))
+        else:
+            samples, _ = ds.get_batch(1)
+        assert [sample.source_idx for sample in samples] == [1]
+        assert "SFTStreamingDataset[invalid-multimodal=skip]" in caplog.text
+        assert "sample idx=0, sample_id='invalid-image-url'" in caplog.text
+    finally:
+        ds.stop()
+
+
+def test_streaming_dataset_rejects_unknown_invalid_multimodal_strategy(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, _invalid_image_url_rows())
+
+    with pytest.raises(ValueError, match="invalid_multimodal_strategy must be one of"):
+        SFTStreamingDataset(
+            path=str(path),
+            tokenizer=_FakeTokenizer(),
+            processor_pool=None,
+            capacity=None,
+            prompt_key="messages",
+            label_key=None,
+            multimodal_keys={"image": "images"},
+            prefetch_max_cached=0,
+            invalid_multimodal_strategy="ignore",
+        )
+
+
+def test_streaming_dataset_rejects_duplicate_inline_and_top_level_image_sources(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the image."},
+                            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                        ],
+                    },
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": ["/data/image.png"],
+            }
+        ],
+    )
+
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+    )
+
+    with pytest.raises(
+        SFTMultimodalContractError,
+        match=r"'inline_count': 1, 'top_level_required_count': 0.*'top_level_count': 1",
+    ):
+        ds.get_canonical_sample(0)
+    ds.stop()
+
+
+def test_streaming_dataset_accepts_literal_image_placeholder_with_matching_top_level_image(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "<image>\nDescribe the image."},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": ["/data/image.png"],
+            }
+        ],
+    )
+
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+    )
+
+    sample = ds.get_canonical_sample(0)
+
+    assert sample.images == ["/data/image.png"]
+    assert sample.messages[0].content[0] == {"type": "image", "image": "/data/image.png"}
     ds.stop()
 
 

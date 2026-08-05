@@ -58,6 +58,8 @@ from relax.utils.types import Sample
 logger = get_logger(__name__)
 
 _AGENTIC_SERVICE_CLIENT: "_ServeHandleChatControlClient | None" = None
+_MANAGED_TERMINATION_WAIT_TIMEOUT_S = 5.0
+_MANAGED_FORCE_TERMINATION_WAIT_TIMEOUT_S = 5.0
 
 
 @dataclass
@@ -594,6 +596,50 @@ class ManagedSessionRunner:
         self._launcher_handle_by_session_handle.pop(session_handle, None)
         self._timed_out_session_handles.discard(session_handle)
 
+    async def _kill_launcher_handle(
+        self,
+        *,
+        launcher_handle: str,
+        signal_value: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        try:
+            response = await self._launcher_client.kill(
+                handle=launcher_handle,
+                signal_value=signal_value,
+                forget=True,
+                wait=True,
+                force=True,
+                wait_timeout_s=_MANAGED_TERMINATION_WAIT_TIMEOUT_S,
+                force_signal_value=signal.SIGKILL,
+                force_wait_timeout_s=_MANAGED_FORCE_TERMINATION_WAIT_TIMEOUT_S,
+            )
+        except Exception as exc:
+            # An unknown handle means the process is already gone; releasing it is
+            # therefore already satisfied. Treat as idempotent success so a stale
+            # handle does not surface as a release failure and trigger a Global
+            # Restart. (Handles daemons that predate the daemon-side fix.)
+            if "Unknown launcher handle" in str(exc):
+                logger.warning(
+                    "Managed launcher handle already terminated; treating release as success: "
+                    "runner_id=%s handle=%s reason=%s",
+                    self._runner_id,
+                    launcher_handle,
+                    reason,
+                )
+                self._active_launcher_handles.discard(launcher_handle)
+                return {"handle": launcher_handle, "killed": False, "already_gone": True}
+            logger.error(
+                "Failed to confirm managed launcher process termination: runner_id=%s handle=%s reason=%s error=%s",
+                self._runner_id,
+                launcher_handle,
+                reason,
+                exc,
+            )
+            raise
+        self._active_launcher_handles.discard(launcher_handle)
+        return response
+
     async def _terminate_session_on_timeout(self, *, session_handle: str, delay_s: float) -> None:
         await asyncio.sleep(delay_s)
         if session_handle not in self._timeout_active_started_at_by_handle:
@@ -612,10 +658,16 @@ class ManagedSessionRunner:
             self._timeout_remaining_s_by_handle.get(session_handle, 0.0),
         )
         self._timed_out_session_handles.add(session_handle)
-        await self._launcher_client.kill(handle=launcher_handle, signal_value=signal.SIGTERM, forget=True)
-        task = self._tasks_by_handle.get(session_handle)
-        if task is not None and not task.done():
-            task.cancel()
+        try:
+            await self._kill_launcher_handle(
+                launcher_handle=launcher_handle,
+                signal_value=signal.SIGTERM,
+                reason="timeout",
+            )
+        finally:
+            task = self._tasks_by_handle.get(session_handle)
+            if task is not None and not task.done():
+                task.cancel()
 
     async def set_session_timeouts_active(self, *, session_handles: list[str], active: bool) -> int:
         changed_count = 0
@@ -864,19 +916,48 @@ class ManagedSessionRunner:
         if not unique_handles:
             return 0
         tasks = [self._tasks_by_handle[session_handle] for session_handle in unique_handles]
+        launcher_handles_by_session_handle = {
+            session_handle: self._launcher_handle_by_session_handle.get(session_handle)
+            for session_handle in unique_handles
+        }
         if signal_before_wait is not None:
+            kill_tasks = []
             for session_handle in unique_handles:
                 task = self._tasks_by_handle[session_handle]
                 if task.done():
                     continue
-                launcher_handle = self._launcher_handle_by_session_handle.get(session_handle)
+                launcher_handle = launcher_handles_by_session_handle.get(session_handle)
                 if launcher_handle:
-                    await self._launcher_client.kill(
-                        handle=launcher_handle,
-                        signal_value=signal_before_wait,
-                        forget=True,
+                    kill_tasks.append(
+                        self._kill_launcher_handle(
+                            launcher_handle=launcher_handle,
+                            signal_value=signal_before_wait,
+                            reason="release_sessions",
+                        )
                     )
-                task.cancel()
+            if kill_tasks:
+                kill_results = await asyncio.gather(*kill_tasks, return_exceptions=True)
+                kill_failures = [result for result in kill_results if isinstance(result, BaseException)]
+                if kill_failures:
+                    # A launcher that cannot be confirmed-killed (e.g. a
+                    # descendant wedged in D-state on slow shared storage, so
+                    # even SIGKILL is only pending) must NOT fail the whole
+                    # release: raising here marks the rollout service unhealthy
+                    # and escalates to a Controller global restart that tears
+                    # down the actor + inference engine mid-step. Log and
+                    # continue best-effort -- the session tasks are cancelled
+                    # below regardless, and the doomed process is reaped once
+                    # its blocking syscall returns.
+                    logger.warning(
+                        "release_sessions: %d managed launcher process(es) not confirmed terminated; "
+                        "continuing best-effort (first error: %s)",
+                        len(kill_failures),
+                        kill_failures[0],
+                    )
+            for session_handle in unique_handles:
+                task = self._tasks_by_handle[session_handle]
+                if not task.done():
+                    task.cancel()
         for session_handle in unique_handles:
             self._clear_session_timeout_clock(session_handle)
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -921,8 +1002,19 @@ class ManagedSessionRunner:
         self._shutdown_requested = True
         tasks = list(self._tasks_by_handle.values())
         active_launcher_handles = list(self._active_launcher_handles)
-        for handle in active_launcher_handles:
-            await self._launcher_client.kill(handle=handle, signal_value=signal.SIGTERM, forget=True)
+        kill_tasks = [
+            self._kill_launcher_handle(
+                launcher_handle=handle,
+                signal_value=signal.SIGTERM,
+                reason="shutdown",
+            )
+            for handle in active_launcher_handles
+        ]
+        if kill_tasks:
+            kill_results = await asyncio.gather(*kill_tasks, return_exceptions=True)
+            for result in kill_results:
+                if isinstance(result, BaseException):
+                    logger.warning("Managed launcher process termination failed during shutdown: %s", result)
         for task in tasks:
             if not task.done():
                 task.cancel()

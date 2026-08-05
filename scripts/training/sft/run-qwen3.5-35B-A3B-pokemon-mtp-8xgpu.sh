@@ -98,6 +98,9 @@ PERF_ARGS=(
    --no-rope-fusion
 
    --colocate
+   --cross-entropy-loss-fusion
+   --sft-chunked-logits
+   --sft-logits-chunk-size ${SFT_LOGITS_CHUNK_SIZE:-2048}
 )
 
 OPTIMIZER_ARGS=(

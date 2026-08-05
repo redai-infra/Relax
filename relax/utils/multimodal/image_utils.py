@@ -3,6 +3,7 @@
 import base64
 import math
 import os
+import time
 import urllib.parse
 from io import BytesIO
 from typing import Any, ByteString, Dict, Optional, Tuple, Union
@@ -11,10 +12,13 @@ import numpy as np
 import requests
 from PIL import Image
 
+from relax.utils.env import Envs
+
 from .config import MultimodalConfig, get_image_max_token_num, get_image_min_token_num, get_image_resize_scale_factor
 
 
 SPATIAL_MERGE_SIZE = 2
+
 
 ImageInput = Union[
     Image.Image,
@@ -143,11 +147,26 @@ def load_image_from_path(image: str, **kwargs: Any) -> Image.Image:
         return image_obj
 
     if image.startswith(("http://", "https://")):
-        with requests.get(image, stream=True) as response:
-            response.raise_for_status()
-            with BytesIO(response.content) as bio:
-                image_obj = Image.open(bio)
-                image_obj.load()
+        # Read per call rather than at import: a Ray worker's runtime_env is
+        # applied to the process, and reading here keeps the knob tunable
+        # regardless of when this module first got imported.
+        attempts = max(1, Envs.ROLLOUT_IMAGE_FETCH_ATTEMPTS)
+        backoff = Envs.ROLLOUT_IMAGE_FETCH_BACKOFF_S
+        last_exc: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                with requests.get(image, stream=True, timeout=Envs.ROLLOUT_IMAGE_FETCH_TIMEOUT_S) as response:
+                    response.raise_for_status()
+                    with BytesIO(response.content) as bio:
+                        image_obj = Image.open(bio)
+                        image_obj.load()  # force pixel read before bio/response close (Image.open is lazy)
+                break
+            except Exception as exc:  # transient network / HTTP — retry with backoff
+                last_exc = exc
+                if attempt + 1 < attempts:
+                    time.sleep(backoff * (attempt + 1))
+        else:
+            raise last_exc
     else:
         if image.startswith("file://"):
             image = image[7:]
