@@ -112,7 +112,12 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
     if not isinstance(env, dict) or not all(isinstance(key, str) for key in env):
         raise ContractError("runtime env lacks a string-keyed env_vars object")
     arm = env.get("TASK22_EXPERIMENT_ARM", "baseline")
-    if arm not in {"baseline", "a3_workaware_on", "dcs_joint_on"}:
+    if arm not in {
+        "baseline",
+        "a3_workaware_on",
+        "dcs_joint_on",
+        "dcs_carry_aware_kv_continuation_on",
+    }:
         raise ContractError(f"unknown TASK22_EXPERIMENT_ARM: {arm!r}")
 
     for flag in COMMON_FORBIDDEN_FLAGS:
@@ -145,7 +150,7 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
             "--cross-version-kv-max-gap": "2",
             "--sglang-default-priority-value": "0",
         }
-    else:
+    elif arm == "dcs_joint_on":
         arm_forbidden_flags = ()
         arm_required_flags = (
             "--enable-cross-version-kv-continuation",
@@ -159,6 +164,24 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         arm_expected_values = {
             "--cross-version-kv-max-gap": "2",
             "--sglang-default-priority-value": "0",
+            "--checkpoint-engine-backend": "nccl",
+            "--targeted-retirement-timeout-seconds": "15",
+        }
+    else:
+        arm_forbidden_flags = (
+            "--slime-router-work-aware",
+            "--sglang-enable-priority-scheduling",
+            "--sglang-disable-priority-preemption",
+            "--sglang-default-priority-value",
+        )
+        arm_required_flags = (
+            "--enable-cross-version-kv-continuation",
+            "--use-slime-router",
+            "--hybrid-dcs-weight-sync",
+            "--hybrid-weights-backuper-on-gpu",
+        )
+        arm_expected_values = {
+            "--cross-version-kv-max-gap": "2",
             "--checkpoint-engine-backend": "nccl",
             "--targeted-retirement-timeout-seconds": "15",
         }
@@ -196,7 +219,9 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
 
     policy_value = str(env.get("RELAX_SYNC_INTENT_POLICY", "0")).strip().lower()
     policy_enabled = arm in {"a3_workaware_on", "dcs_joint_on"}
-    if not policy_enabled:
+    kv_continuation_enabled = policy_enabled or arm == "dcs_carry_aware_kv_continuation_on"
+    admission_policy_enabled = arm in {"a3_workaware_on", "dcs_joint_on"}
+    if not kv_continuation_enabled:
         if policy_value not in DISABLED_VALUES:
             raise ContractError("RELAX_SYNC_INTENT_POLICY must be disabled")
         forbidden_env = sorted(
@@ -208,17 +233,45 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         if forbidden_env:
             raise ContractError(f"optimization environment must be absent: {forbidden_env}")
     else:
-        if policy_value not in {"1", "true", "yes", "on"}:
+        if policy_enabled and policy_value not in {"1", "true", "yes", "on"}:
             raise ContractError("RELAX_SYNC_INTENT_POLICY must be enabled")
+        if not policy_enabled and policy_value not in DISABLED_VALUES:
+            raise ContractError("RELAX_SYNC_INTENT_POLICY must be disabled for carry-aware KV continuation")
+        expected_admission = "1" if admission_policy_enabled else "0"
+        if env.get("RELAX_SYNC_INTENT_ADMISSION_POLICY") != expected_admission:
+            raise ContractError(
+                "RELAX_SYNC_INTENT_ADMISSION_POLICY mismatch: "
+                f"{env.get('RELAX_SYNC_INTENT_ADMISSION_POLICY')!r} != {expected_admission!r}"
+            )
         required_sync_env = {
-            "RELAX_SYNC_INTENT_TTL_SECONDS": "600",
-            "RELAX_SYNC_INTENT_WINDOW_GROUPS": "16",
-            "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER": "1.25",
-            "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS": "2.0",
             "RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS": "0.5",
             "RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS": "15",
             "RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS": "600",
         }
+        if admission_policy_enabled:
+            required_sync_env.update(
+                {
+                    "RELAX_SYNC_INTENT_TTL_SECONDS": "600",
+                    "RELAX_SYNC_INTENT_WINDOW_GROUPS": "16",
+                    "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER": "1.25",
+                    "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS": "2.0",
+                }
+            )
+        else:
+            forbidden_admission_env = sorted(
+                key
+                for key in (
+                    "RELAX_SYNC_INTENT_TTL_SECONDS",
+                    "RELAX_SYNC_INTENT_WINDOW_GROUPS",
+                    "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER",
+                    "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS",
+                )
+                if key in env
+            )
+            if forbidden_admission_env:
+                raise ContractError(
+                    f"carry-aware KV continuation admission environment must be absent: {forbidden_admission_env}"
+                )
         for key, expected in required_sync_env.items():
             if env.get(key) != expected:
                 raise ContractError(f"{key} mismatch: {env.get(key)!r} != {expected!r}")
@@ -233,12 +286,14 @@ def validate_contract(runtime: Any, argv: Any) -> dict[str, Any]:
         "max_response_tokens": 8192,
         "zero_kl_reference_forward": False,
         "sync_intent_policy": policy_enabled,
-        "cross_version_kv_continuation": policy_enabled,
-        "priority_scheduling": policy_enabled,
-        "slime_router_work_aware": policy_enabled,
-        "hybrid_dcs_weight_sync": arm == "dcs_joint_on",
-        "hybrid_weights_backuper_on_gpu": arm == "dcs_joint_on",
-        "targeted_retirement": arm == "dcs_joint_on",
+        "admission_policy": admission_policy_enabled,
+        "cross_version_kv_continuation": kv_continuation_enabled,
+        "priority_scheduling": admission_policy_enabled,
+        "slime_router_work_aware": admission_policy_enabled,
+        "slime_router_default_least_loaded": arm == "dcs_carry_aware_kv_continuation_on",
+        "hybrid_dcs_weight_sync": arm in {"dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
+        "hybrid_weights_backuper_on_gpu": arm in {"dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
+        "targeted_retirement": arm in {"dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
         "update_weights_interval": 1,
     }
 

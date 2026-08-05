@@ -216,6 +216,31 @@ def test_hybrid_dcs_weight_sync_joint_mode_requires_slime_router(arguments_modul
         arguments_module.slime_validate_args(args)
 
 
+def test_hybrid_dcs_weight_sync_joint_mode_accepts_default_least_loaded_router(
+    arguments_module,
+):
+    args = _opd_args()
+    args.hybrid = True
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    args.use_slime_router = True
+    args.slime_router_work_aware = False
+    args.targeted_retirement_timeout_seconds = 15.0
+    args.offload_train = False
+    args.offload_rollout = False
+    args.pipeline_model_parallel_size = 1
+    args.expert_model_parallel_size = 1
+    args.hybrid_weights_backuper_on_gpu = False
+    args.update_weights_interval = 1
+    args.cross_version_kv_max_gap = 2
+    args.max_staleness = 2
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.slime_router_work_aware is False
+    assert args.use_slime_router is True
+
+
 def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"

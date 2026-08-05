@@ -303,8 +303,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--driver-log", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--num-rollout", type=int, default=11)
+    parser.add_argument("--headline-lo", type=int, default=2)
+    parser.add_argument("--headline-hi", type=int, default=9)
     args = parser.parse_args()
-    result = analyze(args.driver_log)
+    if args.num_rollout <= 0:
+        parser.error("--num-rollout must be positive")
+    if not 0 <= args.headline_lo <= args.headline_hi < args.num_rollout:
+        parser.error("--headline range must satisfy 0 <= headline-lo <= headline-hi < num-rollout")
+    result = analyze(
+        args.driver_log,
+        num_rollout=args.num_rollout,
+        headline_lo=args.headline_lo,
+        headline_hi=args.headline_hi,
+    )
     payload = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(payload, encoding="utf-8")

@@ -1638,11 +1638,11 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    if sync_intent_policy_enabled():
-        from relax.engine.rollout.sync_intent_rollout import generate_rollout_async_with_sync_intent
+    if sync_intent_policy_enabled() or cross_version_kv_enabled(args):
+        from relax.engine.rollout.sync_intent_rollout import generate_rollout_async_with_kv_continuation
 
         output, aborted_samples = run(
-            generate_rollout_async_with_sync_intent(args, rollout_id, data_buffer, data_system_client)
+            generate_rollout_async_with_kv_continuation(args, rollout_id, data_buffer, data_system_client)
         )
     else:
         output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))

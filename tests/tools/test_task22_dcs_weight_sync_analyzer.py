@@ -1,6 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -144,3 +147,41 @@ def test_analyzer_rejects_unexercised_targeted_retirement(tmp_path) -> None:
     assert result["verdict"] == "PASS_WITH_WARNINGS"
     assert result["errors"] == []
     assert "targeted_expired_requests_not_exercised" in result["warnings"]
+
+
+def test_analyzer_cli_accepts_explicit_21_step_contract(tmp_path) -> None:
+    rows = [_snapshot(-1), *_retirement(-1), _marker(-1, reused=False)]
+    for step in range(21):
+        rows.extend([_snapshot(step), *_retirement(step), _marker(step)])
+    output = tmp_path / "analysis.json"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--driver-log",
+            str(_write_log(tmp_path, rows)),
+            "--output",
+            str(output),
+            "--num-rollout",
+            "21",
+            "--headline-lo",
+            "2",
+            "--headline-hi",
+            "19",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["verdict"] == "PASS"
+    assert result["errors"] == []
+    assert result["contract"]["num_rollout"] == 21
+    assert result["contract"]["headline"] == {
+        "logical_step_lo": 2,
+        "logical_step_hi": 19,
+    }
+    assert result["headline_summary"]["client_total_seconds"]["count"] == 18

@@ -2750,7 +2750,8 @@ def slime_validate_args(args):
         if getattr(args, "slime_router_sticky", False):
             raise ValueError(
                 "--slime-router-work-aware cannot be combined with --slime-router-sticky; "
-                "A3 carried tasks retain their original engine without router-level group pinning."
+                "cross-version KV continuation retains each carried request on its original engine "
+                "without router-level group pinning."
             )
 
     if getattr(args, "lora_rank", 0) > 0:
@@ -3104,8 +3105,6 @@ def slime_validate_args(args):
         if getattr(args, "enable_cross_version_kv_continuation", False):
             if not getattr(args, "use_slime_router", False):
                 raise ValueError("Joint Hybrid DCS and cross-version KV requires --use-slime-router.")
-            if not getattr(args, "slime_router_work_aware", False):
-                raise ValueError("Joint Hybrid DCS and cross-version KV requires --slime-router-work-aware.")
             if float(getattr(args, "targeted_retirement_timeout_seconds", 0.0)) <= 0:
                 raise ValueError("--targeted-retirement-timeout-seconds must be positive.")
         if getattr(args, "offload_train", False) or getattr(args, "offload_rollout", False):
@@ -3122,11 +3121,7 @@ def slime_validate_args(args):
 
     # Cross-version KV continuation depends on Hybrid's normalized execution
     # flags, so validate only after --hybrid has enabled fully_async+colocate.
-    validate_cross_version_kv_args(
-        args,
-        sync_intent_enabled=os.environ.get("RELAX_SYNC_INTENT_POLICY", "0").strip().lower()
-        in {"1", "true", "yes", "on"},
-    )
+    validate_cross_version_kv_args(args)
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."

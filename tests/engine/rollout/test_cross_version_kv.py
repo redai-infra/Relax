@@ -153,11 +153,11 @@ def test_remaining_token_estimate_ignores_completed_siblings() -> None:
 
 def test_carried_progress_hedge_rebuilds_inflight_accounting() -> None:
     groups = [
-        [SimpleNamespace(metadata={"a3_progress_hedge": True})],
+        [SimpleNamespace(metadata={"cross_version_kv_progress_hedge": True})],
         [SimpleNamespace(metadata={})],
         [
             SimpleNamespace(metadata={}),
-            SimpleNamespace(metadata={"a3_progress_hedge": True}),
+            SimpleNamespace(metadata={"cross_version_kv_progress_hedge": True}),
         ],
     ]
 
@@ -167,20 +167,20 @@ def test_carried_progress_hedge_rebuilds_inflight_accounting() -> None:
 def test_hedge_completion_preserves_carried_marker_until_fallback_classification() -> None:
     sample = SimpleNamespace(
         metadata={
-            "a3_progress_hedge": True,
+            "cross_version_kv_progress_hedge": True,
             "cross_version_kv_carried": True,
         }
     )
 
     assert clear_cross_version_kv_progress_hedge_marker([sample])
-    assert "a3_progress_hedge" not in sample.metadata
+    assert "cross_version_kv_progress_hedge" not in sample.metadata
     assert sample.metadata["cross_version_kv_carried"] is True
 
 
 def test_abort_to_buffer_clears_all_task_lifetime_markers() -> None:
     sample = SimpleNamespace(
         metadata={
-            "a3_progress_hedge": True,
+            "cross_version_kv_progress_hedge": True,
             "cross_version_kv_carried": True,
             "cross_version_kv_carryovers": 2,
             "targeted_retirement_aborted": True,
@@ -188,7 +188,7 @@ def test_abort_to_buffer_clears_all_task_lifetime_markers() -> None:
     )
 
     assert clear_cross_version_kv_task_markers([sample])
-    assert "a3_progress_hedge" not in sample.metadata
+    assert "cross_version_kv_progress_hedge" not in sample.metadata
     assert "cross_version_kv_carried" not in sample.metadata
     assert "targeted_retirement_aborted" not in sample.metadata
     assert sample.metadata["cross_version_kv_carryovers"] == 2
@@ -543,7 +543,23 @@ def test_cross_version_kv_validation_accepts_task22_contract() -> None:
     # slime_validate_args normalizes --hybrid before invoking the helper.
     args.fully_async = True
     args.colocate = True
-    validate_cross_version_kv_args(args, sync_intent_enabled=True)
+    validate_cross_version_kv_args(args)
+
+
+def test_cross_version_kv_validation_does_not_require_admission_control() -> None:
+    args = SimpleNamespace(
+        enable_cross_version_kv_continuation=True,
+        hybrid=True,
+        fully_async=True,
+        partial_rollout=True,
+        colocate=True,
+        offload_rollout=False,
+        update_weights_interval=1,
+        cross_version_kv_max_gap=2,
+        max_staleness=2,
+    )
+
+    validate_cross_version_kv_args(args)
 
 
 @pytest.mark.parametrize(
@@ -569,4 +585,4 @@ def test_cross_version_kv_validation_rejects_unsafe_contracts(override: dict, me
     values.update(override)
 
     with pytest.raises(ValueError, match=message):
-        validate_cross_version_kv_args(SimpleNamespace(**values), sync_intent_enabled=True)
+        validate_cross_version_kv_args(SimpleNamespace(**values))

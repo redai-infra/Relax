@@ -178,6 +178,7 @@ export SGLANG_LOG_SCHEDULER_STATUS_INTERVAL="1.0"
 export RELAX_RID_ONLY_REQUEST_LOGGING="1"
 TASK22_EXPERIMENT_ARM="${TASK22_EXPERIMENT_ARM:-baseline}"
 export TASK22_EXPERIMENT_ARM
+unset RELAX_SYNC_INTENT_ADMISSION_POLICY
 unset RELAX_SYNC_INTENT_TTL_SECONDS
 unset RELAX_SYNC_INTENT_WINDOW_GROUPS
 unset RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER
@@ -191,6 +192,7 @@ case "$TASK22_EXPERIMENT_ARM" in
         ;;
     a3_workaware_on)
         export RELAX_SYNC_INTENT_POLICY="1"
+        export RELAX_SYNC_INTENT_ADMISSION_POLICY="1"
         export RELAX_SYNC_INTENT_TTL_SECONDS="600"
         export RELAX_SYNC_INTENT_WINDOW_GROUPS="16"
         export RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER="1.25"
@@ -201,10 +203,18 @@ case "$TASK22_EXPERIMENT_ARM" in
         ;;
     dcs_joint_on)
         export RELAX_SYNC_INTENT_POLICY="1"
+        export RELAX_SYNC_INTENT_ADMISSION_POLICY="1"
         export RELAX_SYNC_INTENT_TTL_SECONDS="600"
         export RELAX_SYNC_INTENT_WINDOW_GROUPS="16"
         export RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER="1.25"
         export RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS="2.0"
+        export RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS="0.5"
+        export RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS="15"
+        export RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS="600"
+        ;;
+    dcs_carry_aware_kv_continuation_on)
+        export RELAX_SYNC_INTENT_POLICY="0"
+        export RELAX_SYNC_INTENT_ADMISSION_POLICY="0"
         export RELAX_SYNC_INTENT_ABORT_RETRY_INTERVAL_SECONDS="0.5"
         export RELAX_SYNC_INTENT_ABORT_TIMEOUT_SECONDS="15"
         export RELAX_SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_SECONDS="600"
@@ -255,6 +265,7 @@ for name in (
     "RAY_DEDUP_LOGS",
     "RELAX_RID_ONLY_REQUEST_LOGGING",
     "RELAX_SYNC_INTENT_POLICY",
+    "RELAX_SYNC_INTENT_ADMISSION_POLICY",
     "RELAX_SYNC_INTENT_TTL_SECONDS",
     "RELAX_SYNC_INTENT_WINDOW_GROUPS",
     "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER",
@@ -343,6 +354,10 @@ if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" || "$TASK22_EXPERIMENT_ARM" 
         --sglang-disable-priority-preemption
         --sglang-default-priority-value 0
     )
+elif [[ "$TASK22_EXPERIMENT_ARM" == "dcs_carry_aware_kv_continuation_on" ]]; then
+    SGLANG_ARGS+=(
+        --use-slime-router
+    )
 fi
 METRIC_ARGS=(
     --use-clearml
@@ -377,13 +392,13 @@ TRAIN_ARGS=(
     "${SGLANG_ARGS[@]}"
     "${MISC_ARGS[@]}"
 )
-if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
+if [[ "$TASK22_EXPERIMENT_ARM" == "a3_workaware_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_carry_aware_kv_continuation_on" ]]; then
     TRAIN_ARGS+=(
         --enable-cross-version-kv-continuation
         --cross-version-kv-max-gap 2
     )
 fi
-if [[ "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
+if [[ "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_carry_aware_kv_continuation_on" ]]; then
     TRAIN_ARGS+=(
         --hybrid-dcs-weight-sync
         --hybrid-weights-backuper-on-gpu
@@ -476,9 +491,15 @@ payload = {
             "zero-KL A3 work-aware ON"
             if os.environ["TASK22_EXPERIMENT_ARM"] == "a3_workaware_on"
             else (
-                "zero-KL Admission + A3 + targeted retirement + in-place Hybrid DCS ON"
-                if os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on"
-                else "zero-KL instrumented baseline bottleneck calibration"
+                "zero-KL Carry-Aware Cross-Version KV Continuation + targeted retirement "
+                "+ in-place Hybrid DCS ON; default least-loaded routing without Admission, "
+                "priority, or work-aware placement"
+                if os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_carry_aware_kv_continuation_on"
+                else (
+                    "zero-KL Admission + A3 + targeted retirement + in-place Hybrid DCS ON"
+                    if os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on"
+                    else "zero-KL instrumented baseline bottleneck calibration"
+                )
             )
         ),
         "historical_wall_directly_comparable": False,
@@ -506,14 +527,20 @@ payload = {
         "over_sampling_batch_size_groups": 16,
         "update_weights_interval": 1,
         "zero_kl_reference_forward": False,
-        "sync_intent_policy": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
+        "sync_intent_control": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
+        "admission_policy": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
         "cross_version_kv_continuation": os.environ["TASK22_EXPERIMENT_ARM"]
-        in {"a3_workaware_on", "dcs_joint_on"},
+        in {"a3_workaware_on", "dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
         "priority_scheduling": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
         "slime_router_work_aware": os.environ["TASK22_EXPERIMENT_ARM"] in {"a3_workaware_on", "dcs_joint_on"},
-        "hybrid_dcs_weight_sync": os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on",
-        "hybrid_weights_backuper_on_gpu": os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on",
-        "targeted_retirement": os.environ["TASK22_EXPERIMENT_ARM"] == "dcs_joint_on",
+        "slime_router_default_least_loaded": os.environ["TASK22_EXPERIMENT_ARM"]
+        == "dcs_carry_aware_kv_continuation_on",
+        "hybrid_dcs_weight_sync": os.environ["TASK22_EXPERIMENT_ARM"]
+        in {"dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
+        "hybrid_weights_backuper_on_gpu": os.environ["TASK22_EXPERIMENT_ARM"]
+        in {"dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
+        "targeted_retirement": os.environ["TASK22_EXPERIMENT_ARM"]
+        in {"dcs_joint_on", "dcs_carry_aware_kv_continuation_on"},
         "rollout_seed": 42,
         "train_seed": 1234,
     },
@@ -543,6 +570,9 @@ source_paths = {
     "relax_router_request_version_ledger": repo / "relax/engine/router/request_version_ledger.py",
     "relax_router_work_accounting": repo / "relax/engine/router/work_accounting.py",
     "relax_sglang_rollout": repo / "relax/engine/rollout/sglang_rollout.py",
+    "relax_sync_intent": repo / "relax/engine/rollout/sync_intent.py",
+    "relax_sync_intent_rollout": repo / "relax/engine/rollout/sync_intent_rollout.py",
+    "relax_cross_version_kv": repo / "relax/utils/cross_version_kv.py",
     "relax_tensor_backuper": repo / "relax/utils/training/tensor_backper.py",
 }
 try:
@@ -593,8 +623,11 @@ PY
     -- "$PYTHON_BIN" -m relax.entrypoints.train \
     "${TRAIN_ARGS[@]}" 2>&1 | tee "$DRIVER_LOG_PATH"
 
-if [[ "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" ]]; then
+if [[ "$TASK22_EXPERIMENT_ARM" == "dcs_joint_on" || "$TASK22_EXPERIMENT_ARM" == "dcs_carry_aware_kv_continuation_on" ]]; then
     "$PYTHON_BIN" "$REPO/scripts/task22/analyze_dcs_weight_sync.py" \
         --driver-log "$DRIVER_LOG_PATH" \
-        --output "$TASK22_LOCAL_RUN_DIR/analysis_dcs_weight_sync.json"
+        --output "$TASK22_LOCAL_RUN_DIR/analysis_dcs_weight_sync.json" \
+        --num-rollout "$NUM_ROLLOUT" \
+        --headline-lo 2 \
+        --headline-hi "$((NUM_ROLLOUT - 2))"
 fi

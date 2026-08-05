@@ -59,6 +59,7 @@ if [[ "${TASK22_FAST_PREFLIGHT:-0}" != "1" ]]; then
         tests/tools/test_task22_dcs_weight_sync_analyzer.py \
         tests/tools/test_task22_phase_elastic_calibration_analyzer.py \
         tests/tools/test_task22_zero_kl_baseline_contract.py \
+        tests/utils/test_hybrid_dcs_router_contract_source.py \
         tests/utils/test_tensor_backuper_gpu_snapshot.py
 else
     echo "TASK22_ZERO_KL_PREFLIGHT tests=SKIPPED_LOCAL_VERIFIED"
@@ -94,7 +95,7 @@ PY
 
 TASK22_PYTHON="$PYTHON_BIN" scripts/task22/prepare_sglang_calibration.sh
 
-if [[ "${TASK22_EXPERIMENT_ARM:-baseline}" == "dcs_joint_on" ]]; then
+if [[ "${TASK22_EXPERIMENT_ARM:-baseline}" == "dcs_joint_on" || "${TASK22_EXPERIMENT_ARM:-baseline}" == "dcs_carry_aware_kv_continuation_on" ]]; then
     "$PYTHON_BIN" - <<'PY'
 from sglang.srt.managers.io_struct import GenerateReqInput
 

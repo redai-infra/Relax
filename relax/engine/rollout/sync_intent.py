@@ -12,6 +12,7 @@ from typing import Literal
 
 
 SYNC_INTENT_POLICY_ENV = "RELAX_SYNC_INTENT_POLICY"
+SYNC_INTENT_ADMISSION_POLICY_ENV = "RELAX_SYNC_INTENT_ADMISSION_POLICY"
 SYNC_INTENT_TTL_ENV = "RELAX_SYNC_INTENT_TTL_SECONDS"
 SYNC_INTENT_WINDOW_GROUPS_ENV = "RELAX_SYNC_INTENT_WINDOW_GROUPS"
 SYNC_INTENT_QUIESCE_MULTIPLIER_ENV = "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER"
@@ -33,6 +34,18 @@ _PHASE_ORDER: dict[SyncIntentPhase, int] = {
 
 def sync_intent_policy_enabled() -> bool:
     return os.environ.get(SYNC_INTENT_POLICY_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def sync_intent_admission_policy_enabled() -> bool:
+    raw_value = os.environ.get(SYNC_INTENT_ADMISSION_POLICY_ENV)
+    if raw_value is None:
+        return sync_intent_policy_enabled()
+    raw_value = raw_value.strip().lower()
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{SYNC_INTENT_ADMISSION_POLICY_ENV} must be a boolean, got {raw_value!r}")
 
 
 def sync_intent_ttl_seconds() -> float:
@@ -355,6 +368,39 @@ def plan_adaptive_window_fetch(
         bounded_hedge = min(hedge_groups, fresh_shortfall)
         desired_window = min(maximum_window, remaining_commit_groups + bounded_hedge)
     return max(desired_window - resident_groups, 0)
+
+
+def plan_baseline_window_fetch(
+    *,
+    resident_groups: int,
+    submit_target_groups: int,
+    fetch_batch_groups: int,
+) -> int:
+    """Mirror the ordinary rollout's fixed-batch oversampling admission."""
+
+    if min(resident_groups, submit_target_groups) < 0:
+        raise ValueError("resident and submit target groups must be non-negative")
+    if fetch_batch_groups <= 0:
+        raise ValueError("fetch batch groups must be positive")
+    if submit_target_groups == 0 or resident_groups >= submit_target_groups:
+        return 0
+    return fetch_batch_groups
+
+
+def plan_carry_aware_oversampling_seed(
+    *,
+    oversampling_envelope_groups: int,
+    adopted_current_groups: int,
+    missing_debt_groups: int,
+) -> int:
+    """Seed missing debt plus the unoccupied part of the current candidate
+    envelope."""
+
+    if min(oversampling_envelope_groups, adopted_current_groups, missing_debt_groups) < 0:
+        raise ValueError("oversampling envelope, adopted current, and missing debt groups must be non-negative")
+    if oversampling_envelope_groups == 0:
+        raise ValueError("oversampling_envelope_groups must be positive")
+    return missing_debt_groups + max(oversampling_envelope_groups - adopted_current_groups, 0)
 
 
 def mark_work_origin(

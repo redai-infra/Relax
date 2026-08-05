@@ -8,6 +8,7 @@ from relax.engine.rollout.sync_intent import (
     CARRYOVER_RESUME_REQUEST_PRIORITY,
     DEFAULT_ROLLOUT_REQUEST_PRIORITY,
     OLD_DEBT_REQUEST_PRIORITY,
+    SYNC_INTENT_ADMISSION_POLICY_ENV,
     SYNC_INTENT_POLICY_ENV,
     SYNC_INTENT_PROTECTED_DRAIN_TIMEOUT_ENV,
     SYNC_INTENT_QUIESCE_FLOOR_ENV,
@@ -18,10 +19,13 @@ from relax.engine.rollout.sync_intent import (
     SyncIntentSnapshot,
     mark_work_origin,
     plan_adaptive_window_fetch,
+    plan_baseline_window_fetch,
+    plan_carry_aware_oversampling_seed,
     plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
     resolve_partition_request_priority,
     should_admit_fresh,
+    sync_intent_admission_policy_enabled,
     sync_intent_policy_enabled,
     sync_intent_protected_drain_timeout_seconds,
     validate_disjoint_rollout_groups,
@@ -41,6 +45,22 @@ def test_policy_enable_values(monkeypatch: pytest.MonkeyPatch) -> None:
     for value in ("1", "true", "yes", "on"):
         monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, value)
         assert sync_intent_policy_enabled()
+
+
+def test_admission_policy_defaults_to_sync_intent_and_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(SYNC_INTENT_ADMISSION_POLICY_ENV, raising=False)
+    monkeypatch.delenv(SYNC_INTENT_POLICY_ENV, raising=False)
+    assert not sync_intent_admission_policy_enabled()
+
+    monkeypatch.setenv(SYNC_INTENT_POLICY_ENV, "1")
+    assert sync_intent_admission_policy_enabled()
+
+    monkeypatch.setenv(SYNC_INTENT_ADMISSION_POLICY_ENV, "0")
+    assert not sync_intent_admission_policy_enabled()
+
+    monkeypatch.setenv(SYNC_INTENT_ADMISSION_POLICY_ENV, "invalid")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        sync_intent_admission_policy_enabled()
 
 
 @pytest.mark.parametrize(
@@ -235,6 +255,75 @@ def test_adaptive_window_consumes_carryover_before_fresh_hedge(
         )
         == expected_fetch_groups
     )
+
+
+@pytest.mark.parametrize(
+    ("resident_groups", "submit_target_groups", "expected_fetch_groups"),
+    (
+        (0, 8, 16),
+        (7, 8, 16),
+        (8, 8, 0),
+        (20, 8, 0),
+        (0, 0, 0),
+    ),
+)
+def test_baseline_window_matches_fixed_batch_oversampling(
+    resident_groups: int,
+    submit_target_groups: int,
+    expected_fetch_groups: int,
+) -> None:
+    assert (
+        plan_baseline_window_fetch(
+            resident_groups=resident_groups,
+            submit_target_groups=submit_target_groups,
+            fetch_batch_groups=16,
+        )
+        == expected_fetch_groups
+    )
+
+
+@pytest.mark.parametrize(
+    ("adopted_current_groups", "missing_debt_groups", "expected_seed"),
+    (
+        (0, 0, 16),
+        (2, 0, 14),
+        (8, 0, 8),
+        (12, 0, 4),
+        (16, 0, 0),
+        (20, 0, 0),
+        (4, 2, 14),
+        (8, 1, 9),
+        (16, 3, 3),
+    ),
+)
+def test_carry_aware_oversampling_preserves_baseline_envelope(
+    adopted_current_groups: int,
+    missing_debt_groups: int,
+    expected_seed: int,
+) -> None:
+    assert (
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=16,
+            adopted_current_groups=adopted_current_groups,
+            missing_debt_groups=missing_debt_groups,
+        )
+        == expected_seed
+    )
+
+
+def test_carry_aware_oversampling_rejects_invalid_counts() -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=16,
+            adopted_current_groups=-1,
+            missing_debt_groups=0,
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        plan_carry_aware_oversampling_seed(
+            oversampling_envelope_groups=0,
+            adopted_current_groups=0,
+            missing_debt_groups=0,
+        )
 
 
 def test_old_debt_priority_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:

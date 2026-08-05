@@ -44,6 +44,7 @@ def _valid_on_runtime():
         {
             "TASK22_EXPERIMENT_ARM": "a3_workaware_on",
             "RELAX_SYNC_INTENT_POLICY": "1",
+            "RELAX_SYNC_INTENT_ADMISSION_POLICY": "1",
             "RELAX_SYNC_INTENT_TTL_SECONDS": "600",
             "RELAX_SYNC_INTENT_WINDOW_GROUPS": "16",
             "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER": "1.25",
@@ -89,6 +90,34 @@ def _valid_dcs_argv():
     ]
 
 
+def _valid_carry_aware_kv_continuation_runtime():
+    runtime = _valid_dcs_runtime()
+    runtime["env_vars"]["TASK22_EXPERIMENT_ARM"] = "dcs_carry_aware_kv_continuation_on"
+    runtime["env_vars"]["RELAX_SYNC_INTENT_POLICY"] = "0"
+    runtime["env_vars"]["RELAX_SYNC_INTENT_ADMISSION_POLICY"] = "0"
+    for key in (
+        "RELAX_SYNC_INTENT_TTL_SECONDS",
+        "RELAX_SYNC_INTENT_WINDOW_GROUPS",
+        "RELAX_SYNC_INTENT_QUIESCE_MULTIPLIER",
+        "RELAX_SYNC_INTENT_QUIESCE_FLOOR_SECONDS",
+    ):
+        runtime["env_vars"].pop(key)
+    return runtime
+
+
+def _valid_carry_aware_kv_continuation_argv():
+    argv = _valid_dcs_argv()
+    for flag in (
+        "--slime-router-work-aware",
+        "--sglang-enable-priority-scheduling",
+        "--sglang-disable-priority-preemption",
+        "--sglang-default-priority-value",
+    ):
+        index = argv.index(flag)
+        del argv[index : index + (2 if flag == "--sglang-default-priority-value" else 1)]
+    return argv
+
+
 def test_contract_accepts_short_instrumented_zero_kl_baseline() -> None:
     summary = validate_contract(_valid_runtime(), _valid_argv())
 
@@ -123,6 +152,53 @@ def test_contract_accepts_joint_dcs_weight_sync_on() -> None:
     assert summary["priority_scheduling"] is True
     assert summary["slime_router_work_aware"] is True
     assert summary["targeted_retirement"] is True
+
+
+def test_contract_accepts_dcs_carry_aware_kv_continuation_on() -> None:
+    summary = validate_contract(
+        _valid_carry_aware_kv_continuation_runtime(),
+        _valid_carry_aware_kv_continuation_argv(),
+    )
+
+    assert summary["experiment_arm"] == "dcs_carry_aware_kv_continuation_on"
+    assert summary["sync_intent_policy"] is False
+    assert summary["admission_policy"] is False
+    assert summary["cross_version_kv_continuation"] is True
+    assert summary["priority_scheduling"] is False
+    assert summary["slime_router_work_aware"] is False
+    assert summary["slime_router_default_least_loaded"] is True
+    assert summary["hybrid_dcs_weight_sync"] is True
+    assert summary["targeted_retirement"] is True
+
+
+@pytest.mark.parametrize(
+    "flag",
+    (
+        "--slime-router-work-aware",
+        "--sglang-enable-priority-scheduling",
+        "--sglang-disable-priority-preemption",
+        "--sglang-default-priority-value",
+    ),
+)
+def test_carry_aware_kv_continuation_contract_rejects_disabled_policy_flags(flag) -> None:
+    argv = _valid_carry_aware_kv_continuation_argv()
+    argv.append(flag)
+    if flag == "--sglang-default-priority-value":
+        argv.append("0")
+
+    with pytest.raises(ContractError, match="forbidden dcs_carry_aware_kv_continuation_on flag"):
+        validate_contract(_valid_carry_aware_kv_continuation_runtime(), argv)
+
+
+def test_carry_aware_kv_continuation_contract_rejects_admission_env() -> None:
+    runtime = _valid_carry_aware_kv_continuation_runtime()
+    runtime["env_vars"]["RELAX_SYNC_INTENT_WINDOW_GROUPS"] = "16"
+
+    with pytest.raises(
+        ContractError,
+        match="carry-aware KV continuation admission environment must be absent",
+    ):
+        validate_contract(runtime, _valid_carry_aware_kv_continuation_argv())
 
 
 @pytest.mark.parametrize(

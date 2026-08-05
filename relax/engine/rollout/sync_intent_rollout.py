@@ -31,10 +31,13 @@ from relax.engine.rollout.sync_intent import (
     get_sync_intent,
     mark_work_origin,
     plan_adaptive_window_fetch,
+    plan_baseline_window_fetch,
+    plan_carry_aware_oversampling_seed,
     plan_dp_aligned_extra_groups,
     plan_intent_guard_fetch,
     sync_intent_abort_retry_interval_seconds,
     sync_intent_abort_timeout_seconds,
+    sync_intent_admission_policy_enabled,
     sync_intent_protected_drain_timeout_seconds,
     validate_disjoint_rollout_groups,
     wait_for_sync_intent_end,
@@ -145,7 +148,7 @@ def _adopt_cross_version_tasks(
     state.remaining_batch_size += len(tasks)
     if tasks:
         logger.info(
-            "TASK22_A3 event=adopt carried_groups=%s debt_groups=%s fresh_groups=%s",
+            "TASK22_KV_CONTINUATION event=adopt carried_groups=%s debt_groups=%s fresh_groups=%s",
             len(tasks),
             adopted_debt,
             len(tasks) - adopted_debt,
@@ -167,7 +170,7 @@ def _persist_cross_version_tasks(
     return len(ordered_tasks)
 
 
-async def generate_rollout_async_with_sync_intent(
+async def generate_rollout_async_with_kv_continuation(
     args: Namespace,
     rollout_id: int,
     data_source: Callable[[int], list[list[Sample]]],
@@ -218,9 +221,9 @@ async def generate_rollout_async_with_sync_intent(
     strict_fallback_groups = 0
     strict_fallback_prefix_tokens = 0
     completed_cross_version_groups = 0
-    a3_progress_hedge_inflight = 0
-    a3_progress_hedge_groups = 0
-    a3_estimated_remaining_tokens = 0
+    kv_continuation_progress_hedge_inflight = 0
+    kv_continuation_progress_hedge_groups = 0
+    kv_continuation_estimated_remaining_tokens = 0
     strict_retry_pending = False
     if cross_version_kv_enabled(args):
         adopted_debt_groups = _adopt_cross_version_tasks(
@@ -231,14 +234,14 @@ async def generate_rollout_async_with_sync_intent(
             task_groups,
         )
         adopted_cross_version_groups = len(task_groups)
-        a3_progress_hedge_inflight = count_cross_version_kv_progress_hedge_groups(task_groups.values())
+        kv_continuation_progress_hedge_inflight = count_cross_version_kv_progress_hedge_groups(task_groups.values())
         intent_debt_groups_inflight = adopted_debt_groups
         candidate_window_initialized = bool(task_groups)
         strict_retry_pending = any(
             sample.status == Sample.Status.ABORTED for group in task_groups.values() for sample in group
         )
         adopted_fresh_groups = list(task_groups.values())[adopted_debt_groups:]
-        a3_estimated_remaining_tokens = sum(
+        kv_continuation_estimated_remaining_tokens = sum(
             estimate_cross_version_kv_group_remaining_tokens(
                 group,
                 recent_completed_response_lengths=state.recent_completed_response_lengths,
@@ -250,12 +253,41 @@ async def generate_rollout_async_with_sync_intent(
     prev_target = num_old_samples
     curr_target = 0 if is_final_backfill else args.rollout_batch_size
     loop = asyncio.get_running_loop()
-    completed_buffer_groups = await loop.run_in_executor(
-        None,
-        ray.get,
-        data_source.get_completed_buffer_group_count.remote(target_data_size),
-    )
-    completed_buffer_groups = int(completed_buffer_groups)
+    admission_policy_enabled = sync_intent_admission_policy_enabled()
+    completed_buffer_groups = 0
+    if admission_policy_enabled:
+        completed_buffer_groups = await loop.run_in_executor(
+            None,
+            ray.get,
+            data_source.get_completed_buffer_group_count.remote(target_data_size),
+        )
+        completed_buffer_groups = int(completed_buffer_groups)
+    if not admission_policy_enabled:
+        adopted_current_groups = adopted_cross_version_groups - adopted_debt_groups
+        carry_aware_envelope_seed_pending = cross_version_kv_enabled(args) and not is_final_backfill
+        initial_current_fresh_groups = max(args.over_sampling_batch_size - adopted_current_groups, 0)
+        logger.info(
+            "TASK22_KV_CONTINUATION event=carry_aware_mode rollout_id=%s admission_policy=false "
+            "progress_hedge=false priority=%s work_aware=%s",
+            rollout_id,
+            bool(getattr(args, "sglang_enable_priority_scheduling", False)),
+            bool(getattr(args, "slime_router_work_aware", False)),
+        )
+        if cross_version_kv_enabled(args) and not is_final_backfill:
+            logger.info(
+                "TASK22_KV_CONTINUATION event=carry_aware_envelope rollout_id=%s envelope_groups=%s "
+                "adopted_groups=%s adopted_debt_groups=%s adopted_current_groups=%s "
+                "fresh_batch_groups=%s resident_groups=%s",
+                rollout_id,
+                args.over_sampling_batch_size,
+                adopted_cross_version_groups,
+                adopted_debt_groups,
+                adopted_current_groups,
+                initial_current_fresh_groups,
+                state.remaining_batch_size,
+            )
+    else:
+        carry_aware_envelope_seed_pending = False
 
     if is_final_backfill:
         logger.info(f"Starting final rollout backfill step {rollout_id}: target(prev)={target_data_size}")
@@ -271,7 +303,6 @@ async def generate_rollout_async_with_sync_intent(
 
     while not target_reached():
         while True:
-            intent_snapshot = get_sync_intent()
             baseline_fetch_groups = args.over_sampling_batch_size + num_old_samples
             remaining_commit_groups = max(prev_target - accepted_debt_groups, 0) + max(
                 curr_target - progressed_fresh_groups,
@@ -281,17 +312,32 @@ async def generate_rollout_async_with_sync_intent(
                 num_old_samples - accepted_debt_groups - intent_debt_groups_inflight,
                 0,
             )
-            default_fetch_groups = plan_adaptive_window_fetch(
-                resident_groups=state.remaining_batch_size,
-                baseline_fetch_groups=baseline_fetch_groups,
-                remaining_commit_groups=remaining_commit_groups,
-                hedge_groups=original_hedge_groups,
-                window_initialized=candidate_window_initialized,
-                completed_buffer_groups=completed_buffer_groups,
-            )
+            if admission_policy_enabled:
+                default_fetch_groups = plan_adaptive_window_fetch(
+                    resident_groups=state.remaining_batch_size,
+                    baseline_fetch_groups=baseline_fetch_groups,
+                    remaining_commit_groups=remaining_commit_groups,
+                    hedge_groups=original_hedge_groups,
+                    window_initialized=candidate_window_initialized,
+                    completed_buffer_groups=completed_buffer_groups,
+                )
+            else:
+                if carry_aware_envelope_seed_pending:
+                    default_fetch_groups = plan_carry_aware_oversampling_seed(
+                        oversampling_envelope_groups=args.over_sampling_batch_size,
+                        adopted_current_groups=adopted_current_groups,
+                        missing_debt_groups=missing_debt_groups,
+                    )
+                    carry_aware_envelope_seed_pending = False
+                else:
+                    default_fetch_groups = plan_baseline_window_fetch(
+                        resident_groups=state.remaining_batch_size,
+                        submit_target_groups=target_data_size,
+                        fetch_batch_groups=baseline_fetch_groups,
+                    )
             default_fetch_groups = max(default_fetch_groups, missing_debt_groups)
-            using_a3_progress_hedge = False
-            if default_fetch_groups == 0 and missing_debt_groups == 0:
+            using_kv_continuation_progress_hedge = False
+            if admission_policy_enabled and default_fetch_groups == 0 and missing_debt_groups == 0:
                 live_hedge = plan_cross_version_kv_progress_hedge(
                     adopted_groups=adopted_cross_version_groups,
                     adopted_debt_groups=adopted_debt_groups,
@@ -299,32 +345,38 @@ async def generate_rollout_async_with_sync_intent(
                     remaining_fresh_groups=max(curr_target - progressed_fresh_groups, 0),
                     rollout_batch_size=args.rollout_batch_size,
                     strict_retry_pending=strict_retry_pending,
-                    estimated_remaining_tokens=a3_estimated_remaining_tokens,
+                    estimated_remaining_tokens=kv_continuation_estimated_remaining_tokens,
                     max_response_length=args.rollout_max_response_len,
                 )
                 default_fetch_groups = live_hedge
-                using_a3_progress_hedge = default_fetch_groups > 0
+                using_kv_continuation_progress_hedge = default_fetch_groups > 0
             if default_fetch_groups == 0:
                 break
 
-            observed_group_latency_seconds = (
-                statistics.median(state.recent_group_latency_seconds) if state.recent_group_latency_seconds else None
-            )
-            fetch_groups = plan_intent_guard_fetch(
-                snapshot=intent_snapshot,
-                physical_rollout_id=rollout_id,
-                old_debt_groups=num_old_samples,
-                completed_debt_groups=accepted_debt_groups,
-                inflight_debt_groups=intent_debt_groups_inflight,
-                observed_group_latency_seconds=observed_group_latency_seconds,
-                default_fetch_groups=default_fetch_groups,
-            )
-            if fetch_groups == 0:
-                if state.pendings or state.protected_pendings:
-                    break
-                assert intent_snapshot.sync_id is not None
-                await asyncio.to_thread(wait_for_sync_intent_end, intent_snapshot.sync_id)
-                continue
+            if admission_policy_enabled:
+                intent_snapshot = get_sync_intent()
+                observed_group_latency_seconds = (
+                    statistics.median(state.recent_group_latency_seconds)
+                    if state.recent_group_latency_seconds
+                    else None
+                )
+                fetch_groups = plan_intent_guard_fetch(
+                    snapshot=intent_snapshot,
+                    physical_rollout_id=rollout_id,
+                    old_debt_groups=num_old_samples,
+                    completed_debt_groups=accepted_debt_groups,
+                    inflight_debt_groups=intent_debt_groups_inflight,
+                    observed_group_latency_seconds=observed_group_latency_seconds,
+                    default_fetch_groups=default_fetch_groups,
+                )
+                if fetch_groups == 0:
+                    if state.pendings or state.protected_pendings:
+                        break
+                    assert intent_snapshot.sync_id is not None
+                    await asyncio.to_thread(wait_for_sync_intent_end, intent_snapshot.sync_id)
+                    continue
+            else:
+                fetch_groups = default_fetch_groups
             get_samples_started_at = monotonic()
             use_prefetched = state.prefetched_samples_ref is not None and fetch_groups == default_fetch_groups
             if use_prefetched:
@@ -335,14 +387,14 @@ async def generate_rollout_async_with_sync_intent(
                 ref = data_source.get_samples.remote(fetch_groups)
             samples = await loop.run_in_executor(None, ray.get, ref)
             get_samples_times.append(monotonic() - get_samples_started_at)
-            if using_a3_progress_hedge:
+            if using_kv_continuation_progress_hedge:
                 for group in samples:
                     for sample in group:
-                        sample.metadata["a3_progress_hedge"] = True
-                a3_progress_hedge_inflight += len(samples)
-                a3_progress_hedge_groups += len(samples)
+                        sample.metadata["cross_version_kv_progress_hedge"] = True
+                kv_continuation_progress_hedge_inflight += len(samples)
+                kv_continuation_progress_hedge_groups += len(samples)
                 logger.info(
-                    "TASK22_A3 event=progress_hedge rollout_id=%s groups=%s "
+                    "TASK22_KV_CONTINUATION event=progress_hedge rollout_id=%s groups=%s "
                     "resident_groups=%s remaining_fresh_groups=%s",
                     rollout_id,
                     len(samples),
@@ -350,9 +402,11 @@ async def generate_rollout_async_with_sync_intent(
                     max(curr_target - progressed_fresh_groups, 0),
                 )
 
-            active_guard = intent_snapshot.active and (
-                intent_snapshot.actor_rollout_id is None or rollout_id > intent_snapshot.actor_rollout_id
-            )
+            active_guard = False
+            if admission_policy_enabled:
+                active_guard = intent_snapshot.active and (
+                    intent_snapshot.actor_rollout_id is None or rollout_id > intent_snapshot.actor_rollout_id
+                )
             old_debt_in_fetch = min(missing_debt_groups, len(samples)) if num_old_samples > 0 else 0
             speculative_groups_in_fetch = len(samples) - old_debt_in_fetch if num_old_samples and active_guard else 0
             mark_work_origin(
@@ -361,14 +415,17 @@ async def generate_rollout_async_with_sync_intent(
                 fresh_origin="speculative_fresh" if speculative_groups_in_fetch else "fresh",
             )
             intent_debt_groups_inflight += old_debt_in_fetch
-            await _submit_generate_tasks_debt_first(
-                state,
-                args,
-                samples,
-                old_debt_in_fetch,
-                task_started_at,
-                task_groups,
-            )
+            if admission_policy_enabled:
+                await _submit_generate_tasks_debt_first(
+                    state,
+                    args,
+                    samples,
+                    old_debt_in_fetch,
+                    task_started_at,
+                    task_groups,
+                )
+            else:
+                _submit_generate_tasks(state, args, samples, task_started_at, task_groups)
             candidate_window_initialized = True
 
         all_pendings = state.pendings | state.protected_pendings
@@ -386,9 +443,9 @@ async def generate_rollout_async_with_sync_intent(
                 source_group
             )
             if source_group_is_hedge:
-                a3_progress_hedge_inflight -= 1
-                if a3_progress_hedge_inflight < 0:
-                    raise RuntimeError("A3 progress hedge inflight accounting became negative")
+                kv_continuation_progress_hedge_inflight -= 1
+                if kv_continuation_progress_hedge_inflight < 0:
+                    raise RuntimeError("KV continuation progress hedge inflight accounting became negative")
             if source_group is not None and (
                 len(group) != len(source_group)
                 or any(result is not source for result, source in zip(group, source_group, strict=True))
@@ -452,7 +509,8 @@ async def generate_rollout_async_with_sync_intent(
                 if group_is_debt:
                     intent_debt_groups_inflight += 1
                 logger.info(
-                    "TASK22_A3 event=strict_fallback rollout_id=%s origin=%s groups=1 retained_prefix_tokens=%s",
+                    "TASK22_KV_CONTINUATION event=strict_fallback rollout_id=%s "
+                    "origin=%s groups=1 retained_prefix_tokens=%s",
                     rollout_id,
                     "old_debt" if group_is_debt else "fresh",
                     prefix_tokens,
@@ -611,7 +669,7 @@ async def generate_rollout_async_with_sync_intent(
     if can_carry_tasks:
         carried_groups = _persist_cross_version_tasks(state, task_started_at, task_groups)
         logger.info(
-            "TASK22_A3 event=carry rollout_id=%s carried_groups=%s current_weight_version=%s max_gap=%s",
+            "TASK22_KV_CONTINUATION event=carry rollout_id=%s carried_groups=%s current_weight_version=%s max_gap=%s",
             rollout_id,
             carried_groups,
             getattr(args, "cross_version_kv_weight_version", "actor-managed"),
@@ -653,14 +711,14 @@ async def generate_rollout_async_with_sync_intent(
         )
     timing_metrics.update(
         {
-            "rollout/a3/adopted_groups": adopted_cross_version_groups,
-            "rollout/a3/adopted_debt_groups": adopted_debt_groups,
-            "rollout/a3/completed_groups": completed_cross_version_groups,
-            "rollout/a3/carried_groups": carried_groups,
-            "rollout/a3/estimated_remaining_tokens": a3_estimated_remaining_tokens,
-            "rollout/a3/progress_hedge_groups": a3_progress_hedge_groups,
-            "rollout/a3/strict_fallback_groups": strict_fallback_groups,
-            "rollout/a3/strict_fallback_prefix_tokens": strict_fallback_prefix_tokens,
+            "rollout/kv_continuation/adopted_groups": adopted_cross_version_groups,
+            "rollout/kv_continuation/adopted_debt_groups": adopted_debt_groups,
+            "rollout/kv_continuation/completed_groups": completed_cross_version_groups,
+            "rollout/kv_continuation/carried_groups": carried_groups,
+            "rollout/kv_continuation/estimated_remaining_tokens": (kv_continuation_estimated_remaining_tokens),
+            "rollout/kv_continuation/progress_hedge_groups": kv_continuation_progress_hedge_groups,
+            "rollout/kv_continuation/strict_fallback_groups": strict_fallback_groups,
+            "rollout/kv_continuation/strict_fallback_prefix_tokens": strict_fallback_prefix_tokens,
         }
     )
 

@@ -136,3 +136,21 @@ async def test_targeted_publication_namespaces_cache_by_request_and_weight_epoch
     assert captured["payload"]["extra_key"] == ":weight-version:3"
     assert "content-length" not in captured["headers"]
     assert (await router.request_version_ledger.snapshot())["active"] == {}
+
+
+def test_default_router_uses_active_request_least_loaded_without_token_estimate() -> None:
+    args = _args()
+    args.slime_router_work_aware = False
+    router = SlimeRouter(args)
+    router.work_ledger.add_worker("http://engine-a")
+    router.work_ledger.add_worker("http://engine-b")
+    router.work_ledger.reserve("http://engine-a", 100_000)
+
+    selected = router._use_url(estimated_tokens=0, use_work_aware=False)
+
+    try:
+        assert selected == "http://engine-b"
+        assert router.work_ledger.snapshot()["http://engine-b"]["reserved_tokens"] == 0
+    finally:
+        router._finish_url(selected)
+        router.work_ledger.release("http://engine-a", 100_000)

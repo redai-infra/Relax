@@ -179,7 +179,7 @@ def cross_version_kv_enabled(args: object) -> bool:
     return bool(getattr(args, "enable_cross_version_kv_continuation", False))
 
 
-def validate_cross_version_kv_args(args: object, *, sync_intent_enabled: bool) -> None:
+def validate_cross_version_kv_args(args: object) -> None:
     if not cross_version_kv_enabled(args):
         return
     if not getattr(args, "hybrid", False):
@@ -203,8 +203,6 @@ def validate_cross_version_kv_args(args: object, *, sync_intent_enabled: bool) -
     max_staleness = int(getattr(args, "max_staleness"))
     if max_gap > max_staleness:
         raise ValueError(f"--cross-version-kv-max-gap must not exceed --max-staleness ({max_gap} > {max_staleness}).")
-    if not sync_intent_enabled:
-        raise ValueError("--enable-cross-version-kv-continuation currently requires RELAX_SYNC_INTENT_POLICY=1.")
 
 
 def cross_version_kv_strict_refresh(weight_version: int, max_gap: int) -> bool:
@@ -252,7 +250,8 @@ def cross_version_kv_resident_cap(rollout_batch_size: int) -> int:
 
 def count_cross_version_kv_progress_hedge_groups(groups: Sequence[Sequence[object]]) -> int:
     return sum(
-        any(bool(getattr(sample, "metadata", {}).get("a3_progress_hedge")) for sample in group) for group in groups
+        any(bool(getattr(sample, "metadata", {}).get("cross_version_kv_progress_hedge")) for sample in group)
+        for group in groups
     )
 
 
@@ -260,7 +259,7 @@ def clear_cross_version_kv_progress_hedge_marker(group: Sequence[object]) -> boo
     was_hedge = False
     for sample in group:
         metadata = getattr(sample, "metadata", {})
-        was_hedge = bool(metadata.pop("a3_progress_hedge", False)) or was_hedge
+        was_hedge = bool(metadata.pop("cross_version_kv_progress_hedge", False)) or was_hedge
     return was_hedge
 
 
@@ -280,7 +279,8 @@ def estimate_cross_version_kv_group_remaining_tokens(
     recent_completed_response_lengths: Sequence[int],
     max_response_length: int,
 ) -> int:
-    """Estimate group tail from the conditional residual-length distribution."""
+    """Estimate group tail from the conditional residual-length
+    distribution."""
     if max_response_length <= 0:
         raise ValueError("max_response_length must be positive")
     history = sorted(
@@ -325,7 +325,7 @@ def plan_cross_version_kv_progress_hedge(
         rollout_batch_size,
     )
     if min(values) < 0:
-        raise ValueError("A3 progress hedge inputs must be non-negative")
+        raise ValueError("KV continuation progress hedge inputs must be non-negative")
     if rollout_batch_size == 0:
         raise ValueError("rollout_batch_size must be positive")
     if adopted_debt_groups > adopted_groups:
