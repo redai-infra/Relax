@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Scheduling helpers for fixed-lag rollout policy snapshots."""
+"""Scheduling helpers for periodic rollout policy snapshots."""
 
 from typing import Protocol
 
@@ -27,7 +27,10 @@ def rollout_weights_tag(update_weights_interval: int) -> str:
     return ROLLOUT_POLICY_TAG if interval > 1 else "actor"
 
 
-def compute_rollout_policy_lag_steps(current_optimizer_step: int, rollout_policy_snapshot_step: int) -> int:
+def compute_rollout_policy_age_rollouts(
+    current_rollout_id: int,
+    snapshot_rollout_id: int,
+) -> int:
     """Return the age of the behavior snapshot used by a training batch.
 
     The metric is emitted before the post-batch rollout snapshot refresh. At a
@@ -35,11 +38,36 @@ def compute_rollout_policy_lag_steps(current_optimizer_step: int, rollout_policy
     the snapshot that generated it; the next batch observes the refreshed
     snapshot.
     """
-    if rollout_policy_snapshot_step < 0:
-        raise ValueError("rollout_policy_snapshot_step must be non-negative")
-    if current_optimizer_step < rollout_policy_snapshot_step:
-        raise ValueError("current_optimizer_step cannot precede the rollout policy snapshot")
-    return current_optimizer_step - rollout_policy_snapshot_step
+    if current_rollout_id < 0:
+        raise ValueError("current_rollout_id must be non-negative")
+    if snapshot_rollout_id < 0:
+        raise ValueError("snapshot_rollout_id must be non-negative")
+    if current_rollout_id < snapshot_rollout_id:
+        raise ValueError("current_rollout_id cannot precede snapshot_rollout_id")
+    return current_rollout_id - snapshot_rollout_id
+
+
+def initial_rollout_policy_snapshot_rollout(start_rollout_id: int) -> int:
+    """Return the snapshot version aligned with a fresh or resumed run."""
+    if start_rollout_id < 0:
+        raise ValueError("start_rollout_id must be non-negative")
+    return start_rollout_id
+
+
+def build_rollout_policy_age_metrics(
+    *,
+    current_rollout_id: int,
+    rollout_policy_snapshot_rollout: int,
+) -> dict[str, int]:
+    """Build rollout-unit policy-age metrics for one training batch."""
+    return {
+        "train/current_rollout_id": current_rollout_id,
+        "train/rollout_policy_snapshot_rollout": rollout_policy_snapshot_rollout,
+        "train/p3o/rollout_policy_age_rollouts": compute_rollout_policy_age_rollouts(
+            current_rollout_id,
+            rollout_policy_snapshot_rollout,
+        ),
+    }
 
 
 def should_refresh_rollout_policy(

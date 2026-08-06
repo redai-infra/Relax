@@ -9,7 +9,7 @@ have seen -- same tokens, same RNG stream. They are deliberately free of any
 Megatron import so the invariants can be tested on CPU.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -17,7 +17,7 @@ import torch
 
 
 @contextmanager
-def preserved_rng_state():
+def preserved_rng_state() -> Iterator[None]:
     """Snapshot and restore CPU / CUDA / Megatron RNG around the stats pass.
 
     The train pass must see exactly the RNG stream it would have seen without a
@@ -50,7 +50,7 @@ def preserved_rng_state():
 
 
 @contextmanager
-def preserved_iterator_positions(data_iterator: Sequence[Any] | Any):
+def preserved_iterator_positions(data_iterator: Sequence[Any] | Any) -> Iterator[None]:
     """Snapshot and restore data-iterator offsets, deduplicated by identity.
 
     Under virtual pipeline parallelism the same iterator instance is passed once

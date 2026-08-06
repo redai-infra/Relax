@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import ast
+import sys
 from argparse import Namespace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -16,21 +18,16 @@ from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 MODEL_PATH = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "model.py"
 
-# model.py pulls in the full Megatron training stack plus transfer_queue. Under the
-# megatron stub most of that resolves, but transfer_queue is a flat CI stub with no
-# submodules, so the import can still fail. Only the runtime test below needs the
-# import; the AST guard test must run everywhere, hence the deferred skip rather
-# than allow_module_level=True.
-try:
-    with stubbed_megatron_modules():
-        from relax.backends.megatron.model import _preserved_dynamic_cp_group
+stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
+stream_dataloader.StreamingTQIterator = object
 
-    _IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - depends on CI dependency set
-    _IMPORT_ERROR = exc
+with (
+    patch.dict(sys.modules, {"relax.utils.data.stream_dataloader": stream_dataloader}),
+    stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
+):
+    from relax.backends.megatron.model import _preserved_dynamic_cp_group
 
 
-@pytest.mark.skipif(_IMPORT_ERROR is not None, reason=f"relax.backends.megatron.model unavailable: {_IMPORT_ERROR}")
 def test_p3o_model_step_restores_dynamic_cp_group_after_error():
     original_group = object()
     dynamic_group = object()

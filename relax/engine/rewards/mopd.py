@@ -4,7 +4,7 @@ import re
 
 from .math_dapo_utils import compute_score as compute_score_dapo
 from .math_dapo_utils import normalize_final_answer
-from .math_utils import extract_boxed_answer, grade_answer_verl
+from .math_utils import grade_answer_verl
 from .openr1mm import get_openr1mm_rule_based_reward
 
 
@@ -38,11 +38,10 @@ def _is_correct_gsm8k(solution_str: str, gt: str) -> tuple[bool, str]:
     Comparison uses exact string match, then numeric fallback, then
     unit-suffix fallback ("852 BC" → 852, "100 miles" → 100).
     """
-    boxed_answer = extract_boxed_answer(solution_str) if "\\boxed" in solution_str else None
     match = _MINERVA_PATTERN.findall(solution_str)
     if not match:
         match = _GSM8K_PATTERN.findall(solution_str)
-    extracted = boxed_answer or (match[-1].strip() if match else "[INVALID]")
+    extracted = match[-1].strip() if match else "[INVALID]"
     pred = normalize_final_answer(extracted)
 
     gt_norm = normalize_final_answer(gt)
@@ -79,9 +78,6 @@ def _compute_gsm8k_score(response: str, label) -> float:
       - Handles decimal ground-truth labels and unit-suffix predictions
     """
     gt = str(label.get("ground_truth") or label.get("answer", "") if isinstance(label, dict) else label)
-    gt_matches = _GSM8K_PATTERN.findall(gt)
-    if gt_matches:
-        gt = gt_matches[-1]
 
     response = _strip_eos(response)
 
@@ -99,15 +95,17 @@ def get_mopd_reward(response: str, label, metadata: dict | None = None) -> float
     """Per-data-source reward routing for MOPD.
 
     Routes each sample to its domain-appropriate scorer based on ``data_source``
-    in metadata, always returning a scalar (rm_type="mopd" carries no reward_key):
-      - geometry3k / geo3k         : grade_answer_verl (flexible LaTeX matching, -1/1)
+    in metadata, always returning a scalar (rm_type="mopd" carries no reward_key).
+    Each source delegates to the same integrated reward the standalone rm_type
+    would use, so MOPD scoring matches single-source training:
+      - geometry3k / geo3k         : rm_type="math" scorer (grade_answer_verl, {0,1})
       - multimodal-open-r1 / openr1mm : openr1mm rule-based scorer
-      - dapo-math                  : DAPO scorer's scalar "score"
+      - dapo-math                  : DAPO scorer's scalar "score" (dict → scalar)
       - all others                 : GSM8K scorer with EOS/repeat hardening (-1/1)
     """
     data_source = (metadata or {}).get("data_source", "").lower()
     if "geometry3k" in data_source or "geo3k" in data_source:
-        return 1.0 if grade_answer_verl(response, label) else -1.0
+        return 1.0 if grade_answer_verl(response, label) else 0.0
     if "multimodal-open-r1" in data_source or "openr1mm" in data_source:
         return get_openr1mm_rule_based_reward(response, label)
     if "dapo" in data_source:

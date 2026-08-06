@@ -6,13 +6,14 @@
 
 ## 模型支持
 
-| 模型            | 训练场景   | Sync | 训练所需最小卡数 | 参考脚本                                                  |
-| --------------- | ---------- | ---- | ---------------- | --------------------------------------------------------- |
-| Qwen3-4B        | DAPO       | √    | P800 8 卡        | `scripts/training/text/run-qwen3-4B-8xklx.sh`             |
-| Qwen3.5-9B      | DAPO       | √    | P800 8 卡        | `scripts/training/text/run-qwen35-9B-8xklx.sh`            |
-| Qwen3.5-35B-A3B | DAPO       | √    | P800 16 卡       | `scripts/training/text/run-qwen35-35B-A3B-16xklx.sh`      |
-| Qwen3.6-35B-A3B | DAPO       | √    | P800 8 卡        | `scripts/training/text/run-qwen36-35B-A3B-8xklx.sh`       |
-| Qwen3.5-35B-A3B | multimodal | √    | P800 8 卡        | `scripts/training/multimodal/run-qwen35-35B-A3B-8xklx.sh` |
+| 模型            | 训练场景   | Sync | 训练所需最小卡数 | 参考脚本                                                           |
+| --------------- | ---------- | ---- | ---------------- | ------------------------------------------------------------------ |
+| Qwen3-4B        | DAPO       | √    | P800 8 卡        | `scripts/training/text/run-qwen3-4B-8xklx.sh`                      |
+| Qwen3.5-9B      | DAPO       | √    | P800 8 卡        | `scripts/training/text/run-qwen35-9B-8xklx.sh`                     |
+| Qwen3.5-35B-A3B | DAPO       | √    | P800 16 卡       | `scripts/training/text/run-qwen35-35B-A3B-16xklx.sh`               |
+| Qwen3.6-35B-A3B | DAPO       | √    | P800 8 卡        | `scripts/training/text/run-qwen36-35B-A3B-8xklx.sh`                |
+| Qwen3.5-35B-A3B | multimodal | √    | P800 8 卡        | `scripts/training/multimodal/run-qwen35-35B-A3B-8xklx.sh`          |
+| Qwen3.5-9B      | multimodal | √    | P800 8 卡        | `scripts/training/multimodal/run-qwen35-9B-8xklx-openr1mm-sync.sh` |
 
 ## 环境准备
 

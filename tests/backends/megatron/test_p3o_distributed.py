@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 
-with stubbed_megatron_modules():
+with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
     from relax.backends.megatron import p3o_step
     from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 
@@ -54,7 +54,13 @@ def _nonfinite_worker(rank: int, world_size: int, port: int) -> None:
         invalid_count = torch.tensor(float(rank == 0), dtype=torch.float64)
 
         try:
-            synchronize_p3o_stats(stats, invalid_count)
+            synchronize_p3o_stats(
+                stats,
+                invalid_count,
+                dp_cp_group=dist.group.WORLD,
+                pp_group=None,
+                is_pipeline_last_stage=True,
+            )
         except ValueError as error:
             assert "non-finite importance ratio" in str(error)
         else:
@@ -79,7 +85,13 @@ def _pipeline_worker(rank: int, world_size: int, port: int) -> None:
         expected = torch.tensor([7.5, 21.25, 4.0], dtype=torch.float64)
         stats = P3OSufficientStats.from_vector(expected) if rank == world_size - 1 else P3OSufficientStats.zeros()
 
-        synchronized = synchronize_p3o_stats(stats, torch.zeros((), dtype=torch.float64))
+        synchronized = synchronize_p3o_stats(
+            stats,
+            torch.zeros((), dtype=torch.float64),
+            dp_cp_group=dp_groups[rank] if rank == world_size - 1 else None,
+            pp_group=dist.group.WORLD,
+            is_pipeline_last_stage=rank == world_size - 1,
+        )
 
         torch.testing.assert_close(synchronized.as_vector(), expected, rtol=0.0, atol=0.0)
     finally:
@@ -129,7 +141,13 @@ def _partition_worker(rank: int, world_size: int, port: int) -> None:
                         behavior[shard],
                         valid_mask[shard],
                     )
-            synchronized = synchronize_p3o_stats(local_stats, torch.zeros((), dtype=torch.float64))
+            synchronized = synchronize_p3o_stats(
+                local_stats,
+                torch.zeros((), dtype=torch.float64),
+                dp_cp_group=process_group,
+                pp_group=None,
+                is_pipeline_last_stage=True,
+            )
             context = finalize_p3o_step_context(synchronized)
             torch.testing.assert_close(context.normalized_ess, oracle_context.normalized_ess)
 

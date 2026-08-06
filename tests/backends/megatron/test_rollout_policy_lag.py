@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tests for fixed-lag rollout policy snapshot scheduling."""
+"""Tests for periodic rollout policy snapshot scheduling."""
 
 import pytest
 

@@ -15,7 +15,7 @@ import torch
 from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 
-with stubbed_megatron_modules():
+with stubbed_megatron_modules(("megatron", "ray")):
     from relax.backends.megatron import loss as loss_module
 
 from relax.utils.training.p3o_utils import P3OStepContext
@@ -82,3 +82,38 @@ def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
     assert REQUIRED_P3O_METRICS <= metrics.keys()
     assert torch.equal(metrics["p3o/reference_kl"], torch.zeros(()))
     assert not metrics["p3o/reference_kl"].requires_grad
+
+
+def test_p3o_loss_function_normalizes_by_true_valid_tokens(monkeypatch):
+    """All-masked samples must not add phantom tokens to P3O's normalizer."""
+    args = Namespace(
+        advantage_estimator="p3o",
+        allgather_cp=False,
+        calculate_per_token_loss=True,
+        global_batch_size=2,
+        loss_type="policy_loss",
+        qkv_format="thd",
+        recompute_loss_function=False,
+    )
+    batch = {
+        "loss_masks": [torch.zeros(2), torch.tensor([1.0, 0.0])],
+        "response_lengths": [2, 2],
+        "total_lengths": [3, 3],
+    }
+    monkeypatch.setattr(loss_module, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(2.0))
+    monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", lambda *args, **kwargs: torch.tensor(0.0))
+    monkeypatch.setattr(
+        loss_module,
+        "get_cp_local_valid_mask",
+        lambda *args, **kwargs: torch.tensor([False, False, True, False]),
+    )
+    monkeypatch.setattr(
+        loss_module,
+        "p3o_loss_function",
+        lambda *args, **kwargs: (torch.tensor(3.0, requires_grad=True), {"loss": torch.tensor(3.0)}),
+    )
+
+    _, normalizer, logging_dict = loss_module.loss_function(args, batch, 1, torch.zeros(1))
+
+    assert normalizer.item() == 1
+    assert logging_dict["values"][0].item() == 1

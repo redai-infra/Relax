@@ -1,55 +1,57 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tests for the Task40 behavior-only temperature wrapper."""
+"""Tests for the P3O behavior-only temperature wrapper."""
 
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-
-REPO_ROOT = Path(__file__).resolve().parents[4]
-sys.path.insert(0, str(REPO_ROOT))
-
-# ``examples.algorithms.p3o.rollout`` imports ``relax.engine.rollout.sglang_rollout``,
-# which transitively reaches ``megatron.core`` via the checkpoint-service backend.
-# CI installs no megatron, so the import is done under the shared stub to keep this
-# module collectable; the tested wrapper itself is pure dict/await logic.
-sys.path.insert(0, str(REPO_ROOT / "tests" / "backends" / "megatron"))
-
-from _megatron_stub import stubbed_megatron_modules  # noqa: E402
+from examples.algorithms.p3o import rollout
 
 
-with stubbed_megatron_modules():
-    from examples.algorithms.p3o import rollout  # noqa: E402
-
-
-def test_behavior_sampling_params_overrides_training_copy_only():
+def test_behavior_sampling_params_overrides_only_temperature(monkeypatch):
+    monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", "0.6")
     original = {"temperature": 1.0, "top_p": 0.9, "max_new_tokens": 64}
 
     updated = rollout.behavior_sampling_params(original, evaluation=False)
 
-    assert updated == {"temperature": 1.2, "top_p": 1.0, "max_new_tokens": 64}
+    assert updated == {"temperature": 0.6, "top_p": 0.9, "max_new_tokens": 64}
     assert original == {"temperature": 1.0, "top_p": 0.9, "max_new_tokens": 64}
 
 
-def test_behavior_sampling_params_accepts_runtime_temperature(monkeypatch):
-    monkeypatch.setenv("TASK40_BEHAVIOR_TEMPERATURE", "2.0")
+@pytest.mark.parametrize(("raw_value", "expected"), [("0.6", 0.6), ("1.2", 1.2), ("2.0", 2.0)])
+def test_behavior_sampling_params_accepts_runtime_temperature(monkeypatch, raw_value, expected):
+    monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", raw_value)
 
     updated = rollout.behavior_sampling_params({"temperature": 1.0}, evaluation=False)
 
-    assert updated["temperature"] == 2.0
+    assert updated["temperature"] == expected
 
 
-def test_behavior_sampling_params_rejects_invalid_runtime_temperature(monkeypatch):
-    monkeypatch.setenv("TASK40_BEHAVIOR_TEMPERATURE", "nan")
+def test_behavior_sampling_params_requires_runtime_temperature(monkeypatch):
+    monkeypatch.delenv("P3O_BEHAVIOR_TEMPERATURE", raising=False)
 
-    with pytest.raises(ValueError, match="finite and positive"):
+    with pytest.raises(ValueError, match="must be set"):
         rollout.behavior_sampling_params({"temperature": 1.0}, evaluation=False)
 
 
-def test_behavior_sampling_params_preserves_evaluation():
+@pytest.mark.parametrize("raw_value", ["0", "0.0", "-1", "nan", "inf", "-inf"])
+def test_behavior_sampling_params_rejects_non_positive_or_nonfinite_temperature(monkeypatch, raw_value):
+    monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", raw_value)
+
+    with pytest.raises(ValueError, match="finite and greater than zero"):
+        rollout.behavior_sampling_params({"temperature": 1.0}, evaluation=False)
+
+
+def test_behavior_sampling_params_rejects_nonnumeric_temperature(monkeypatch):
+    monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", "warm")
+
+    with pytest.raises(ValueError, match="must be numeric"):
+        rollout.behavior_sampling_params({"temperature": 1.0}, evaluation=False)
+
+
+def test_behavior_sampling_params_preserves_evaluation_without_temperature_env(monkeypatch):
+    monkeypatch.delenv("P3O_BEHAVIOR_TEMPERATURE", raising=False)
     original = {"temperature": 0.0, "top_p": 0.7, "max_new_tokens": 128}
 
     updated = rollout.behavior_sampling_params(original, evaluation=True)
@@ -59,6 +61,7 @@ def test_behavior_sampling_params_preserves_evaluation():
 
 
 async def test_generate_delegates_with_isolated_behavior_params(monkeypatch):
+    monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", "1.2")
     captured = {}
     expected = object()
 
@@ -82,7 +85,7 @@ async def test_generate_delegates_with_isolated_behavior_params(monkeypatch):
     assert captured == {
         "args": args,
         "sample": sample,
-        "sampling_params": {"temperature": 1.2, "top_p": 1.0, "max_new_tokens": 32},
+        "sampling_params": {"temperature": 1.2, "top_p": 0.95, "max_new_tokens": 32},
         "evaluation": False,
     }
     assert original == {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 32}

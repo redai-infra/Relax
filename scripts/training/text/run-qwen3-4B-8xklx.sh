@@ -267,7 +267,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
-    --use-health-check \
+   --use-health-check \
+   --selective-offload \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \

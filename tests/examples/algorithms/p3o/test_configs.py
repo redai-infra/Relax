@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Static comparability tests for the Task40 A100x4 launch scripts."""
+"""Static comparability tests for the P3O A100x4 launch scripts."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -22,10 +23,11 @@ LOW_TEMPERATURE_SCRIPTS = {
     "p3o_temperature_0p6": SCRIPT_DIR / "run_p3o_temperature_0p6_a100x4.sh",
     "grpo_temperature_0p6": SCRIPT_DIR / "run_grpo_temperature_0p6_a100x4.sh",
 }
-FIXED_LAG_SCRIPTS = {
-    "p3o_fixed_lag_2_mismatch": SCRIPT_DIR / "run_p3o_fixed_lag_2_mismatch_a100x4.sh",
-    "grpo_fixed_lag_2_mismatch": SCRIPT_DIR / "run_grpo_fixed_lag_2_mismatch_a100x4.sh",
+PERIODIC_SYNC_SCRIPTS = {
+    "p3o_periodic_sync_interval_3": SCRIPT_DIR / "run_p3o_periodic_sync_interval_3_a100x4.sh",
+    "grpo_periodic_sync_interval_3": SCRIPT_DIR / "run_grpo_periodic_sync_interval_3_a100x4.sh",
 }
+ALL_SCENARIO_SCRIPTS = {**FORMAL_SCRIPTS, **LOW_TEMPERATURE_SCRIPTS, **PERIODIC_SYNC_SCRIPTS}
 
 
 def _bash_executable() -> str:
@@ -37,27 +39,46 @@ def _bash_executable() -> str:
     cannot open a ``D:\\...`` script path. Prefer an explicit Git-for-Windows
     bash, and skip rather than fail when no usable POSIX shell exists.
     """
-    for candidate in (
-        shutil.which("bash", path=os.environ.get("GIT_BASH_DIR")),
-        r"C:\Program Files\Git\usr\bin\bash.exe",
-        "/bin/bash",
-        "/usr/bin/bash",
-    ):
+    explicit_bash_dir = os.environ.get("GIT_BASH_DIR")
+    candidates = []
+    if explicit_bash_dir:
+        candidates.append(shutil.which("bash", path=explicit_bash_dir))
+    if os.name == "nt":
+        candidates.extend(
+            [
+                r"C:\Program Files\Git\usr\bin\bash.exe",
+                r"C:\Program Files\Git\bin\bash.exe",
+            ]
+        )
+    else:
+        candidates.extend(["/bin/bash", "/usr/bin/bash", shutil.which("bash")])
+
+    for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
-    resolved = shutil.which("bash")
-    if resolved and os.name != "nt":
-        return resolved
     pytest.skip("no POSIX bash available to dry-run the launch scripts")
+
+
+def _shell_path(path: Path, bash: str) -> str:
+    """Translate a Windows path for Git Bash; POSIX paths pass through."""
+    if os.name != "nt":
+        return str(path)
+    del bash
+    normalized = path.resolve().as_posix()
+    return f"/{normalized[0].lower()}{normalized[2:]}"
 
 
 def _dry_run(script: Path, *extra_args: str, env_overrides: dict[str, str] | None = None) -> list[str]:
     env = os.environ.copy()
-    env["TASK40_DRY_RUN"] = "1"
+    env["P3O_DRY_RUN"] = "1"
+    env["P3O_RAY_DASHBOARD"] = "http://example.invalid:8265"
     if env_overrides is not None:
         env.update(env_overrides)
+    bash = _bash_executable()
+    if os.name == "nt":
+        env["PATH"] = f"{Path(bash).parent}{os.pathsep}{env.get('PATH', '')}"
     result = subprocess.run(
-        [_bash_executable(), str(script), *extra_args],
+        [bash, str(script), *extra_args],
         cwd=REPO_ROOT,
         env=env,
         check=True,
@@ -69,6 +90,104 @@ def _dry_run(script: Path, *extra_args: str, env_overrides: dict[str, str] | Non
     return result.stdout.splitlines()
 
 
+def _run_fake_ray(
+    tmp_path: Path,
+    script: Path,
+    *,
+    submit_exit_code: int = 0,
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    """Run a real launcher path against a recording fake Ray executable."""
+    bash = _bash_executable()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ray = fake_bin / "ray"
+    fake_ray.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$@" >>"${FAKE_RAY_CALLS}"\n'
+        'if [[ "$1 $2" == "job submit" ]]; then\n'
+        '  exit "${FAKE_RAY_SUBMIT_EXIT}"\n'
+        "fi\n"
+        'if [[ "$1 $2" == "job status" ]]; then\n'
+        "  echo TERMINAL\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    fake_ray.chmod(0o755)
+
+    model_dir = tmp_path / "model"
+    megatron_dir = tmp_path / "megatron"
+    model_dir.mkdir()
+    megatron_dir.mkdir()
+    train_data = tmp_path / "train.jsonl"
+    train_data.write_text("{}\n", encoding="utf-8")
+    output_root = tmp_path / "output"
+    ray_calls = tmp_path / "ray_calls.txt"
+
+    env = os.environ.copy()
+    for name in (
+        "P3O_ALGORITHM",
+        "P3O_BEHAVIOR_TEMPERATURE",
+        "P3O_ENABLE_TEMPERATURE_OVERRIDE",
+        "P3O_NCCL_DEBUG",
+        "P3O_TORCH_DISTRIBUTED_DEBUG",
+        "P3O_UPDATE_WEIGHTS_INTERVAL",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "FAKE_RAY_CALLS": str(ray_calls),
+            "FAKE_RAY_SUBMIT_EXIT": str(submit_exit_code),
+            "P3O_DRY_RUN": "0",
+            "P3O_MEGATRON_DIR": str(megatron_dir),
+            "P3O_MODE": "smoke",
+            "P3O_MODEL_DIR": str(model_dir),
+            "P3O_OUTPUT_ROOT": str(output_root),
+            "P3O_RAY_DASHBOARD": "http://example.invalid:8265",
+            "P3O_RUN_ID": "integration",
+            "P3O_TRAIN_DATA": str(train_data),
+        }
+    )
+    if env_overrides is not None:
+        env.update(env_overrides)
+    if os.name == "nt":
+        env["PATH"] = f"{Path(bash).parent}{os.pathsep}{env.get('PATH', '')}"
+    for name in (
+        "FAKE_RAY_CALLS",
+        "P3O_EVAL_DATA",
+        "P3O_MEGATRON_DIR",
+        "P3O_MODEL_DIR",
+        "P3O_OUTPUT_ROOT",
+        "P3O_TRAIN_DATA",
+    ):
+        if name in env:
+            env[name] = _shell_path(Path(env[name]), bash)
+
+    result = subprocess.run(
+        [
+            bash,
+            "-c",
+            'export PATH="$1:$PATH"; exec "$2"',
+            "p3o-runner",
+            _shell_path(fake_bin, bash),
+            _shell_path(script, bash),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    config_name = script.stem.removeprefix("run_").removesuffix("_a100x4")
+    run_dir = output_root / config_name / "seed_42" / "integration"
+    calls = ray_calls.read_text(encoding="utf-8").splitlines() if ray_calls.exists() else []
+    return result, run_dir, calls
+
+
 def _option_value(args: list[str], option: str) -> str:
     return args[args.index(option) + 1]
 
@@ -78,7 +197,6 @@ def _comparable_args(args: list[str]) -> list[str]:
         "--advantage-estimator",
         "--eps-clip",
         "--eps-clip-high",
-        "--custom-generate-function-path",
         "--tb-experiment-name",
     }
     normalized = []
@@ -121,11 +239,10 @@ def test_p3o_configs_freeze_required_formal_values():
         assert int(_option_value(args, "--rollout-batch-size")) % 4 == 0
 
 
-def test_p3o_configs_are_comparable_except_algorithm_and_behavior():
+def test_p3o_configs_are_comparable_within_each_scenario():
     resolved = {name: _dry_run(script) for name, script in FORMAL_SCRIPTS.items()}
-    expected = _comparable_args(resolved["p3o_on_policy"])
-    for args in resolved.values():
-        assert _comparable_args(args) == expected
+    assert _comparable_args(resolved["p3o_on_policy"]) == _comparable_args(resolved["grpo_on_policy"])
+    assert _comparable_args(resolved["p3o_temperature_1p2"]) == _comparable_args(resolved["grpo_temperature_1p2"])
 
     assert "--custom-generate-function-path" not in resolved["p3o_on_policy"]
     assert "--custom-generate-function-path" not in resolved["grpo_on_policy"]
@@ -158,34 +275,26 @@ def test_p3o_low_temperature_configs_are_matched_and_named_from_temperature():
     assert _option_value(smoke_args, "--tb-experiment-name") == "p3o_temperature_0p6-seed-42"
 
 
-def test_p3o_fixed_lag_configs_are_matched_and_parameterized():
-    resolved = {name: _dry_run(script) for name, script in FIXED_LAG_SCRIPTS.items()}
+def test_p3o_periodic_sync_configs_are_matched_and_parameterized():
+    resolved = {name: _dry_run(script) for name, script in PERIODIC_SYNC_SCRIPTS.items()}
 
-    p3o_args = resolved["p3o_fixed_lag_2_mismatch"]
-    grpo_args = resolved["grpo_fixed_lag_2_mismatch"]
+    p3o_args = resolved["p3o_periodic_sync_interval_3"]
+    grpo_args = resolved["grpo_periodic_sync_interval_3"]
     assert _option_value(p3o_args, "--max-staleness") == "0"
     assert _option_value(grpo_args, "--max-staleness") == "0"
     assert _option_value(p3o_args, "--update-weights-interval") == "3"
     assert _option_value(grpo_args, "--update-weights-interval") == "3"
-    assert _option_value(p3o_args, "--tb-experiment-name") == "p3o_fixed_lag_2_mismatch-seed-42"
-    assert _option_value(grpo_args, "--tb-experiment-name") == "grpo_fixed_lag_2_mismatch-seed-42"
+    assert _option_value(p3o_args, "--tb-experiment-name") == "p3o_periodic_sync_interval_3-seed-42"
+    assert _option_value(grpo_args, "--tb-experiment-name") == "grpo_periodic_sync_interval_3-seed-42"
     assert _comparable_args(p3o_args) == _comparable_args(grpo_args)
 
     overridden = _dry_run(
-        FIXED_LAG_SCRIPTS["p3o_fixed_lag_2_mismatch"],
-        env_overrides={"TASK40_UPDATE_WEIGHTS_INTERVAL": "4"},
+        PERIODIC_SYNC_SCRIPTS["p3o_periodic_sync_interval_3"],
+        env_overrides={"P3O_UPDATE_WEIGHTS_INTERVAL": "5"},
     )
     assert _option_value(overridden, "--max-staleness") == "0"
-    assert _option_value(overridden, "--update-weights-interval") == "4"
-    assert _option_value(overridden, "--tb-experiment-name") == "p3o_fixed_lag_3_mismatch-seed-42"
-
-    adjusted_temperature = _dry_run(
-        FIXED_LAG_SCRIPTS["p3o_fixed_lag_2_mismatch"],
-        env_overrides={"TASK40_UPDATE_WEIGHTS_INTERVAL": "11", "TASK40_BEHAVIOR_TEMPERATURE": "2.0"},
-    )
-    assert _option_value(adjusted_temperature, "--tb-experiment-name") == (
-        "p3o_fixed_lag_10_temperature_2p0_mismatch-seed-42"
-    )
+    assert _option_value(overridden, "--update-weights-interval") == "5"
+    assert _option_value(overridden, "--tb-experiment-name") == "p3o_periodic_sync_interval_5-seed-42"
 
 
 def test_p3o_smoke_uses_one_small_optimizer_step():
@@ -204,7 +313,7 @@ def test_p3o_smoke_can_select_pipeline_parallel_size_two():
     args = _dry_run(
         SCRIPT_DIR / "run_p3o_smoke.sh",
         "p3o_on_policy",
-        env_overrides={"TASK40_PIPELINE_MODEL_PARALLEL_SIZE": "2", "TASK40_NUM_ROLLOUT": "3"},
+        env_overrides={"P3O_PIPELINE_MODEL_PARALLEL_SIZE": "2", "P3O_NUM_ROLLOUT": "3"},
     )
 
     assert _option_value(args, "--pipeline-model-parallel-size") == "2"
@@ -212,50 +321,187 @@ def test_p3o_smoke_can_select_pipeline_parallel_size_two():
     assert _option_value(args, "--tb-experiment-name") == "p3o_on_policy_pp2-seed-42"
 
 
-def test_p3o_runtime_env_allows_ray_job_driver_merge():
-    common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
-
-    assert '"RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"' in common_script
-    assert '"TASK40_BEHAVIOR_TEMPERATURE": os.environ["TASK40_RUNTIME_BEHAVIOR_TEMPERATURE"]' in common_script
-    assert '"NCCL_DEBUG": os.environ["TASK40_RUNTIME_NCCL_DEBUG"]' in common_script
-    assert '"TORCH_DISTRIBUTED_DEBUG": os.environ["TASK40_RUNTIME_TORCH_DISTRIBUTED_DEBUG"]' in common_script
-
-
-def test_p3o_runtime_env_bypasses_proxy_for_colocated_services():
-    common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
-
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-        assert f'"{name}": ""' in common_script
-    for name in ("NO_PROXY", "no_proxy"):
-        assert f'"{name}": "*"' in common_script
-
-
-def test_p3o_runner_records_failed_job_exit_code_before_returning():
-    common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
-    job_pipeline = '"${TASK40_COMMAND[@]}" 2>&1 | tee "${TASK40_RUN_DIR}/stdout_stderr.log"'
-    pipeline_index = common_script.index(job_pipeline)
-    capture_index = common_script.index("TASK40_EXIT_CODE=${PIPESTATUS[0]}", pipeline_index)
-
-    assert common_script.rfind("set +e", 0, pipeline_index) != -1
-    assert common_script.index("set -e", capture_index) < common_script.index(
-        'echo "${TASK40_EXIT_CODE}" >"${TASK40_RUN_DIR}/exit_code.txt"',
-        capture_index,
+def test_p3o_runner_requires_explicit_ray_dashboard():
+    env = os.environ.copy()
+    env.pop("P3O_RAY_DASHBOARD", None)
+    env["P3O_DRY_RUN"] = "1"
+    bash = _bash_executable()
+    if os.name == "nt":
+        env["PATH"] = f"{Path(bash).parent}{os.pathsep}{env.get('PATH', '')}"
+    result = subprocess.run(
+        [bash, str(FORMAL_SCRIPTS["p3o_on_policy"])],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
-
-def test_p3o_runner_records_explicit_ray_job_identity_and_terminal_status():
-    common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
-
-    assert "--submission-id" in common_script
-    assert 'TASK40_JOB_ID="${TASK40_CONFIG_NAME}-seed-${TASK40_SEED}-${TASK40_RUN_ID}"' in common_script
-    assert '"${TASK40_RUN_DIR}/job_status.txt"' in common_script
+    assert result.returncode != 0
+    assert "P3O_RAY_DASHBOARD must be set" in result.stderr
 
 
-def test_p3o_runner_records_git_identity():
-    common_script = (SCRIPT_DIR / "common_a100x4.sh").read_text()
+@pytest.mark.parametrize(
+    ("scenario", "expected_algorithm", "expected_interval", "expected_temperature"),
+    [
+        ("p3o_on_policy", "p3o", "1", None),
+        ("grpo_on_policy", "grpo", "1", None),
+        ("p3o_periodic_sync_interval_3", "p3o", "3", None),
+        ("grpo_periodic_sync_interval_3", "grpo", "3", None),
+        ("p3o_temperature_0p6", "p3o", "1", "0.6"),
+        ("grpo_temperature_0p6", "grpo", "1", "0.6"),
+        ("p3o_temperature_1p2", "p3o", "1", "1.2"),
+        ("grpo_temperature_1p2", "grpo", "1", "1.2"),
+    ],
+)
+def test_p3o_runner_executes_all_scenarios_with_fake_ray(
+    tmp_path,
+    scenario,
+    expected_algorithm,
+    expected_interval,
+    expected_temperature,
+):
+    result, run_dir, ray_calls = _run_fake_ray(tmp_path, ALL_SCENARIO_SCRIPTS[scenario])
 
-    assert 'TASK40_GIT_COMMIT="$(git -C "${TASK40_REPO_ROOT}" rev-parse HEAD)"' in common_script
-    assert 'TASK40_GIT_BRANCH="$(git -C "${TASK40_REPO_ROOT}" symbolic-ref --short -q HEAD || true)"' in common_script
-    assert 'echo "GIT_COMMIT=${TASK40_GIT_COMMIT}"' in common_script
-    assert 'echo "GIT_BRANCH=${TASK40_GIT_BRANCH:-DETACHED}"' in common_script
-    assert 'echo "GIT_DIRTY=${TASK40_GIT_DIRTY}"' in common_script
+    assert result.returncode == 0, result.stderr
+    resolved_args = (run_dir / "resolved_args.txt").read_text(encoding="utf-8").splitlines()
+    runtime_env = json.loads(_option_value(ray_calls, "--runtime-env-json"))["env_vars"]
+    identity = dict(
+        line.split("=", 1)
+        for line in (run_dir / "run_identity.env").read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    assert _option_value(resolved_args, "--advantage-estimator") == expected_algorithm
+    assert _option_value(resolved_args, "--update-weights-interval") == expected_interval
+    assert _option_value(ray_calls, "--submission-id") == f"{scenario}-seed-42-integration"
+    assert runtime_env["NCCL_DEBUG"] == "WARN"
+    assert runtime_env["TORCH_DISTRIBUTED_DEBUG"] == "OFF"
+    assert runtime_env["RAY_OVERRIDE_JOB_RUNTIME_ENV"] == "1"
+    for proxy_name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        assert proxy_name not in runtime_env
+    assert {"GIT_COMMIT", "GIT_BRANCH", "GIT_DIRTY", "started_utc", "ended_utc"} <= identity.keys()
+    assert identity["config"] == scenario
+    assert identity["ray_job_id"] == f"{scenario}-seed-42-integration"
+    if expected_temperature is None:
+        assert "--custom-generate-function-path" not in resolved_args
+        assert "P3O_BEHAVIOR_TEMPERATURE" not in runtime_env
+    else:
+        assert _option_value(resolved_args, "--custom-generate-function-path") == (
+            "examples.algorithms.p3o.rollout.generate"
+        )
+        assert runtime_env["P3O_BEHAVIOR_TEMPERATURE"] == expected_temperature
+    assert (run_dir / "exit_code.txt").read_text(encoding="utf-8").strip() == "0"
+    assert (run_dir / "job_status.txt").read_text(encoding="utf-8").strip() == "TERMINAL"
+
+
+def test_p3o_runner_preserves_debug_overrides(tmp_path):
+    result, _, ray_calls = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={"P3O_NCCL_DEBUG": "INFO", "P3O_TORCH_DISTRIBUTED_DEBUG": "DETAIL"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtime_env = json.loads(_option_value(ray_calls, "--runtime-env-json"))["env_vars"]
+    assert runtime_env["NCCL_DEBUG"] == "INFO"
+    assert runtime_env["TORCH_DISTRIBUTED_DEBUG"] == "DETAIL"
+
+
+def test_p3o_runner_preserves_failed_ray_exit_code(tmp_path):
+    result, run_dir, _ = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        submit_exit_code=17,
+    )
+
+    assert result.returncode == 17
+    assert (run_dir / "exit_code.txt").read_text(encoding="utf-8").strip() == "17"
+    assert (run_dir / "job_status.txt").read_text(encoding="utf-8").strip() == "TERMINAL"
+
+
+def test_p3o_smoke_runner_does_not_require_eval_data(tmp_path):
+    result, _, _ = _run_fake_ray(tmp_path, FORMAL_SCRIPTS["p3o_on_policy"])
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_p3o_formal_runner_requires_eval_data(tmp_path):
+    result, _, ray_calls = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={"P3O_MODE": "formal"},
+    )
+
+    assert result.returncode == 1
+    assert "P3O_EVAL_DATA must be set in formal mode" in result.stderr
+    assert ray_calls == []
+
+
+def test_p3o_formal_runner_accepts_existing_eval_data(tmp_path):
+    eval_data = tmp_path / "eval.jsonl"
+    eval_data.write_text("{}\n", encoding="utf-8")
+
+    result, run_dir, _ = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={"P3O_MODE": "formal", "P3O_EVAL_DATA": str(eval_data)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    resolved_args = (run_dir / "resolved_args.txt").read_text(encoding="utf-8").splitlines()
+    assert _option_value(resolved_args, "--eval-prompt-data") == "gsm8k"
+    assert str(eval_data.name) in resolved_args[resolved_args.index("--eval-prompt-data") + 2]
+
+
+def test_p3o_runner_validates_megatron_directory_before_ray(tmp_path):
+    missing_megatron = tmp_path / "missing-megatron"
+    result, _, ray_calls = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={"P3O_MEGATRON_DIR": str(missing_megatron)},
+    )
+
+    assert result.returncode == 2
+    assert missing_megatron.name in result.stderr
+    assert ray_calls == []
+
+
+@pytest.mark.parametrize("raw_value", ["", "0", "0.0", "-1", "NaN", "Inf", "warm"])
+def test_p3o_shell_rejects_invalid_behavior_temperature(raw_value):
+    env = os.environ.copy()
+    env.update(
+        {
+            "P3O_ALGORITHM": "p3o",
+            "P3O_BEHAVIOR_TEMPERATURE": raw_value,
+            "P3O_DRY_RUN": "1",
+            "P3O_ENABLE_TEMPERATURE_OVERRIDE": "1",
+            "P3O_RAY_DASHBOARD": "http://example.invalid:8265",
+        }
+    )
+    bash = _bash_executable()
+    if os.name == "nt":
+        env["PATH"] = f"{Path(bash).parent}{os.pathsep}{env.get('PATH', '')}"
+    result = subprocess.run(
+        [bash, "-c", 'source "$1"; P3O_run', "p3o-test", str(SCRIPT_DIR / "common_a100x4.sh")],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode != 0
+    assert "P3O_BEHAVIOR_TEMPERATURE" in result.stderr

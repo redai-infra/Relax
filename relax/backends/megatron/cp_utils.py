@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,14 @@ except ModuleNotFoundError as exc:
     if exc.name not in {"megatron", "megatron.core"}:
         raise
     mpu = None
+
+
+def _validate_metadata_lengths(**metadata: Sequence[object] | None) -> None:
+    """Reject CP metadata lists that would otherwise be silently truncated."""
+    lengths = {name: len(values) for name, values in metadata.items() if values is not None}
+    if len(set(lengths.values())) > 1:
+        formatted = ", ".join(f"{name}={length}" for name, length in lengths.items())
+        raise ValueError(f"CP metadata lengths must match; got {formatted}")
 
 
 def maybe_padded_total_lengths(
@@ -48,19 +56,20 @@ def get_logits_and_tokens_offset_with_cp(
     """All offsets start from the begining of the prompt."""
     cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-    assert cp_size > 1
+    if cp_size <= 1:
+        raise ValueError(f"Context parallel size must be > 1, got {cp_size}")
 
     prompt_length = total_length - response_length
     if padded_total_length is not None:
         # Bridge VL+CP+thd: per-sample padded length is already aligned to tp*cp*2.
-        assert padded_total_length % (2 * cp_size) == 0, (
-            f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}"
-        )
+        if padded_total_length % (2 * cp_size) != 0:
+            raise ValueError(f"padded_total_length={padded_total_length} not divisible by 2*cp={2 * cp_size}")
         chunk_size = padded_total_length // (2 * cp_size)
     elif qkv_format == "thd":
         chunk_size = (total_length + 2 * cp_size - 1) // (2 * cp_size)
     else:
-        assert max_seq_len is not None, "max_seq_len must be provided for qkv_format=bshd"
+        if max_seq_len is None:
+            raise ValueError("max_seq_len must be provided for qkv_format=bshd")
         chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
 
     # the offset of 2 chunks
@@ -99,6 +108,13 @@ def get_sum_of_sample_mean(
     dynamic_cp_rank: int | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
+    _validate_metadata_lengths(
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        loss_masks=loss_masks,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
@@ -106,7 +122,7 @@ def get_sum_of_sample_mean(
             return sum(
                 [
                     (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=True)
                 ]
             )
 
@@ -114,7 +130,7 @@ def get_sum_of_sample_mean(
             return sum(
                 [
                     (x_i * loss_mask_i).sum()
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=True)
                 ]
             )
 
@@ -123,7 +139,7 @@ def get_sum_of_sample_mean(
         chunked_loss_masks: list[torch.Tensor] = []
 
         for i, (total_length, response_length, loss_mask) in enumerate(
-            zip(total_lengths, response_lengths, loss_masks, strict=False)
+            zip(total_lengths, response_lengths, loss_masks, strict=True)
         ):
             max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
@@ -147,7 +163,7 @@ def get_sum_of_sample_mean(
                 [
                     (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
                     for x_i, chunked_loss_mask, loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=True
                     )
                 ]
             )
@@ -157,7 +173,7 @@ def get_sum_of_sample_mean(
                 [
                     (x_i * chunked_loss_mask).sum()
                     for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=False
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=True
                     )
                 ]
             )
@@ -192,6 +208,13 @@ def get_cp_local_num_tokens(
     For ``cp_size == 1`` this reduces to the total number of unmasked tokens
     (preserving the historical per-sample ``clamp_min(., 1)``).
     """
+    _validate_metadata_lengths(
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        loss_masks=loss_masks,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
         return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
@@ -200,7 +223,7 @@ def get_cp_local_num_tokens(
     # counted tokens exactly match the ones sum_of_token contributes on this rank.
     total: torch.Tensor | None = None
     for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
+        zip(total_lengths, response_lengths, loss_masks, strict=True)
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
         padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
@@ -245,13 +268,20 @@ def get_cp_local_valid_mask(
 
     For ``cp_size == 1`` this is just the concatenation of ``loss_masks``.
     """
+    _validate_metadata_lengths(
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        loss_masks=loss_masks,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
         return torch.cat([loss_mask.bool() for loss_mask in loss_masks], dim=0)
 
     chunks: list[torch.Tensor] = []
     for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
+        zip(total_lengths, response_lengths, loss_masks, strict=True)
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
         padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
@@ -314,7 +344,9 @@ def all_gather_with_cp(
 
     chunk_0 = tensor[: logits_offset[0][1] - logits_offset[0][0]]
     chunk_1 = tensor[logits_offset[0][1] - logits_offset[0][0] :]
-    assert chunk_1.shape[0] == logits_offset[1][1] - logits_offset[1][0]
+    expected_chunk_1_len = logits_offset[1][1] - logits_offset[1][0]
+    if chunk_1.shape[0] != expected_chunk_1_len:
+        raise ValueError(f"chunk_1 length {chunk_1.shape[0]} != expected {expected_chunk_1_len}")
 
     def zero(len: int) -> torch.Tensor:
         return torch.zeros(
@@ -344,7 +376,8 @@ def all_gather_with_cp(
         right = zero(total_length - 1 - logits_offset[1][1])
         full_tensor = torch.cat([left, chunk_0, mid, chunk_1, right], dim=0)
 
-    assert full_tensor.shape[0] == response_length, f"Expected {response_length}, got {full_tensor.shape}"
+    if full_tensor.shape[0] != response_length:
+        raise ValueError(f"Expected response_length={response_length}, got shape {full_tensor.shape}")
     full_tensor = dist.nn.all_reduce(full_tensor, group=cp_group)
     return full_tensor
 
@@ -361,7 +394,8 @@ def slice_with_cp(
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
     if qkv_format == "bshd":
-        assert max_seq_len is not None
+        if max_seq_len is None:
+            raise ValueError("max_seq_len is required when qkv_format=bshd")
 
     def pad_tokens(tokens, pad):
         if isinstance(pad_value, Callable):
@@ -405,10 +439,11 @@ def slice_log_prob_with_cp(
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
 ) -> list[float] | torch.Tensor:
-    assert len(log_prob) == response_length, (
-        f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
-        f"response_length={response_length}, total_length={total_length}"
-    )
+    if len(log_prob) != response_length:
+        raise ValueError(
+            f"log_prob length mismatch: len(log_prob)={len(log_prob)}, "
+            f"response_length={response_length}, total_length={total_length}"
+        )
 
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
 
@@ -531,7 +566,8 @@ def _nccl_all_gather_variable_tensors(
     Every rank in ``group`` must call this with a non-empty ``values`` so the
     collective is symmetric and a device/dtype is available.
     """
-    assert values, "_nccl_all_gather_variable_tensors requires a non-empty values list on every rank"
+    if not values:
+        raise ValueError("_nccl_all_gather_variable_tensors requires a non-empty values list on every rank")
     local_sizes = torch.tensor([v.shape[0] for v in values], dtype=torch.long, device=values[0].device)
     num_samples = torch.tensor([len(values)], dtype=torch.long, device=values[0].device)
 
@@ -612,6 +648,12 @@ def dynamic_cp_merge_output(
             if dynamic_cp_size > 1:
                 dynamic_cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
                 ptls = padded_total_lengths if padded_total_lengths is not None else [None] * len(values)
+                _validate_metadata_lengths(
+                    values=values,
+                    total_lengths=total_lengths,
+                    response_lengths=response_lengths,
+                    padded_total_lengths=ptls,
+                )
                 values = [
                     all_gather_with_cp(
                         v,
@@ -622,7 +664,7 @@ def dynamic_cp_merge_output(
                         dynamic_cp_rank=dynamic_cp_rank,
                         dynamic_cp_group=dynamic_cp_group,
                     )
-                    for v, tl, rl, ptl in zip(values, total_lengths, response_lengths, ptls, strict=False)
+                    for v, tl, rl, ptl in zip(values, total_lengths, response_lengths, ptls, strict=True)
                 ]
 
             # 2. collect all sub-groups' samples across the static CP group and reorder.
@@ -635,10 +677,11 @@ def dynamic_cp_merge_output(
                 # A subdivided mb always carries a partition order; reorder back to the
                 # original mb sample order so the write-back aligns with micro_batch_indices.
                 # Fail loud (not a silent wrong order) if the invariant ever breaks.
-                assert partition_order is not None and len(partition_order) == len(values), (
-                    "dynamic-CP merge: partition_order missing or length mismatch "
-                    f"(order={None if partition_order is None else len(partition_order)}, values={len(values)})"
-                )
+                if partition_order is None or len(partition_order) != len(values):
+                    raise ValueError(
+                        "dynamic-CP merge: partition_order missing or length mismatch "
+                        f"(order={None if partition_order is None else len(partition_order)}, values={len(values)})"
+                    )
                 reordered: list = [None] * len(values)
                 for new_pos, orig_pos in enumerate(partition_order):
                     reordered[orig_pos] = values[new_pos]

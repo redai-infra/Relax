@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import os
 import socket
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from relax.utils.device import ray_get_device_ids
+from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
 
@@ -19,12 +19,12 @@ logger = get_logger(__name__)
 def _get_head_node_id():
     """Get the head node ID based on the head node IP.
 
-    The head node IP is determined from environment variable SLIME_HOST_IP_ENV
-    or from get_host_info(). Returns the Ray NodeID (hex string) for use with
+    The head node IP is determined from environment variable SLIME_HOST_IP or
+    from get_host_info(). Returns the Ray NodeID (hex string) for use with
     NodeAffinitySchedulingStrategy.
     """
     # Get the target head IP from environment or auto-detect
-    head_ip = os.getenv("SLIME_HOST_IP")
+    head_ip = Envs.SLIME_HOST_IP
     if not head_ip:
         _, head_ip = get_host_info()
 
@@ -85,7 +85,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     from .rollout import RolloutManager
 
     # Get the head node ID to ensure RolloutManager runs on the head node
-    # This is critical because the Router binds to the SLIME_HOST_IP_ENV address,
+    # This is critical because the Router binds to the SLIME_HOST_IP address,
     # and other components expect the router to be accessible at the head node's IP
     head_node_id = _get_head_node_id()
     logger.info(f"Scheduling RolloutManager on head node: {head_node_id}")

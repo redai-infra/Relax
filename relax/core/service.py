@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import threading
 import time
 from argparse import Namespace
@@ -63,7 +64,10 @@ class Service:
         elif num_gpus == 0:
             pgs = None
         else:
-            pgs = create_placement_group(num_gpus=num_gpus)
+            pgs = create_placement_group(
+                num_gpus=num_gpus,
+                node_group_affinity=self.config.enable_affinity,
+            )
         self.pgs = pgs
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 
@@ -290,17 +294,54 @@ class Service:
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to remove old placement group: {e}")
 
-        # Rebuild
-        new_pgs = create_placement_group(num_gpus=self.num_gpus)
+        # Keep recovered baseline roles on the stable worker group.
+        new_pgs = create_placement_group(
+            num_gpus=self.num_gpus,
+            node_group_affinity=self.config.enable_affinity,
+        )
         self.pgs = new_pgs
         logger.info(f"[{self.role}] New placement group created")
         return new_pgs
 
 
-def create_placement_group(num_gpus):
-    """Create a placement group with the specified number of GPUs."""
+def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: float = 2.0) -> None:
+    """Raise if the node-group marker resources remain unavailable."""
+    required = {f"{node_group}_gpu", f"{node_group}_cpu"}
+    last_available: dict = {}
+    for attempt in range(retries):
+        cluster_resources = ray.cluster_resources()
+        last_available = cluster_resources
+        missing = {r for r in required if cluster_resources.get(r, 0) <= 0}
+        if not missing:
+            return
+        if attempt < retries - 1:
+            logger.warning(
+                f"[Affinity] Node-group marker resources {sorted(missing)} not yet present "
+                f"(attempt {attempt + 1}/{retries}); retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+
+    missing = sorted(r for r in required if last_available.get(r, 0) <= 0)
+    raise RuntimeError(
+        f"Node-group affinity is enabled (RELAX_INITIAL_NODE_GROUP='{node_group}'), but the "
+        f"required custom marker resources {missing} are not declared anywhere in this cluster. "
+        f"Baseline placement groups would hang forever waiting for them. This usually means the "
+        f"cluster has no '{node_group}' worker-group declaring '{node_group}_gpu'/'{node_group}_cpu' "
+        f"custom resources. Please check your cluster environment; if this cluster intentionally has "
+        f"no such marker resources, disable affinity by passing --no-enable-affinity."
+    )
+
+
+def create_placement_group(num_gpus, node_group_affinity=True):
+    """Create a packed GPU placement group with optional node-group
+    affinity."""
     accel_resource = device_utils.get_ray_accelerator_name()
-    bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
+    base_bundle = {accel_resource: 1, "CPU": 1}
+    node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
+    if node_group_affinity and node_group:
+        _require_node_group_markers(node_group)
+        base_bundle = {**base_bundle, f"{node_group}_gpu": 1, f"{node_group}_cpu": 1}
+    bundles = [dict(base_bundle) for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
     ray.get(pg.ready())

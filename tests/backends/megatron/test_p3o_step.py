@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,6 +21,15 @@ with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
 from relax.utils.training.p3o_utils import P3OSufficientStats
 
 
+@pytest.fixture(autouse=True)
+def _stub_cp_world_size(monkeypatch):
+    monkeypatch.setattr(
+        cp_utils,
+        "mpu",
+        SimpleNamespace(get_context_parallel_world_size=lambda: 1),
+    )
+
+
 def _stats(values: tuple[float, float, float]) -> P3OSufficientStats:
     vector = torch.tensor(values, dtype=torch.float64)
     return P3OSufficientStats.from_vector(vector)
@@ -29,7 +39,13 @@ def test_p3o_step_single_pipeline_stage_preserves_stats(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_available", lambda: False)
     stats = _stats((7.5, 21.25, 4.0))
 
-    synchronized = synchronize_p3o_stats(stats, torch.zeros((), dtype=torch.float64))
+    synchronized = synchronize_p3o_stats(
+        stats,
+        torch.zeros((), dtype=torch.float64),
+        dp_cp_group=None,
+        pp_group=None,
+        is_pipeline_last_stage=True,
+    )
 
     torch.testing.assert_close(synchronized.as_vector(), stats.as_vector(), rtol=0.0, atol=0.0)
 
@@ -40,9 +56,7 @@ def test_p3o_step_non_last_stage_receives_pipeline_last_stats(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(p3o_step.mpu, "is_pipeline_last_stage", lambda ignore_virtual=True: False)
-    monkeypatch.setattr(p3o_step.mpu, "get_pipeline_model_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(p3o_step.mpu, "get_pipeline_model_parallel_group", lambda: pp_group)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
 
     def fail_if_reduced(*args, **kwargs):
         raise AssertionError("a non-last PP stage must not reduce token stats over DP x CP")
@@ -58,6 +72,9 @@ def test_p3o_step_non_last_stage_receives_pipeline_last_stats(monkeypatch):
     synchronized = synchronize_p3o_stats(
         P3OSufficientStats.zeros(),
         torch.zeros((), dtype=torch.float64),
+        dp_cp_group=None,
+        pp_group=pp_group,
+        is_pipeline_last_stage=False,
     )
 
     torch.testing.assert_close(synchronized.as_vector(), expected[:3], rtol=0.0, atol=0.0)
@@ -66,9 +83,7 @@ def test_p3o_step_non_last_stage_receives_pipeline_last_stats(monkeypatch):
 def test_p3o_step_raises_only_after_global_invalid_flag_is_visible(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(p3o_step.mpu, "is_pipeline_last_stage", lambda ignore_virtual=True: True)
-    monkeypatch.setattr(p3o_step.mpu, "get_data_parallel_group", lambda with_context_parallel=True: object())
-    monkeypatch.setattr(p3o_step.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    dp_cp_group = object()
 
     def all_reduce(vector, *, op, group):
         vector[3] = 1.0
@@ -76,7 +91,13 @@ def test_p3o_step_raises_only_after_global_invalid_flag_is_visible(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
     with pytest.raises(ValueError, match="non-finite importance ratio"):
-        synchronize_p3o_stats(_stats((1.0, 1.0, 1.0)), torch.zeros((), dtype=torch.float64))
+        synchronize_p3o_stats(
+            _stats((1.0, 1.0, 1.0)),
+            torch.zeros((), dtype=torch.float64),
+            dp_cp_group=dp_cp_group,
+            pp_group=None,
+            is_pipeline_last_stage=True,
+        )
 
 
 def test_compute_p3o_step_context_plain_text_forward_kwargs(monkeypatch):
@@ -111,7 +132,7 @@ def test_compute_p3o_step_context_plain_text_forward_kwargs(monkeypatch):
     # by ensuring the forward_backward func never calls the collect callback
     monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
     monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
-    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_, **__: _stats((7.5, 21.25, 4.0)))
     monkeypatch.setattr(
         p3o_step,
         "finalize_p3o_step_context",
@@ -177,7 +198,7 @@ def test_compute_p3o_step_context_vl_unsplit_forward_kwargs(monkeypatch):
 
     monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
     monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
-    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_, **__: _stats((7.5, 21.25, 4.0)))
     monkeypatch.setattr(
         p3o_step,
         "finalize_p3o_step_context",
@@ -247,7 +268,7 @@ def test_compute_p3o_step_context_vl_thd_bridge_forward_kwargs(monkeypatch):
 
     monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
     monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
-    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_, **__: _stats((7.5, 21.25, 4.0)))
     monkeypatch.setattr(
         p3o_step,
         "finalize_p3o_step_context",
@@ -332,7 +353,7 @@ def test_compute_p3o_step_context_dynamic_cp_group_switching(monkeypatch):
     monkeypatch.setattr(p3o_step.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: dynamic_cp_group)
     monkeypatch.setattr(p3o_step, "get_batch", fake_get_batch)
     monkeypatch.setattr(p3o_step, "get_forward_backward_func", lambda: fake_forward_backward)
-    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_: _stats((7.5, 21.25, 4.0)))
+    monkeypatch.setattr(p3o_step, "synchronize_p3o_stats", lambda *_, **__: _stats((7.5, 21.25, 4.0)))
     monkeypatch.setattr(
         p3o_step,
         "finalize_p3o_step_context",
