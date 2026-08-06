@@ -116,6 +116,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         n_avail = len(dataset)
@@ -143,6 +144,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         start, n_eval = 0, len(dataset)

@@ -141,6 +141,7 @@ ROLLOUT_ARGS=(
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
     --micro-batch-size 1
     --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT:-8}
+    --rollout-max-context-len 16384
     --rollout-max-response-len 4096
     --rollout-max-prompt-len 4096
     --rollout-temperature 1
@@ -202,17 +203,8 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 2
-    # Qwen3.6-35B-A3B hybrid mamba path — see memory f6e5bfaa.
-    # cuda-graph strategy: enable but cap batch size. Prior runs showed
-    # IMA at `#running-req: 16` with cuda-graph fully enabled; capping
-    # capture at bs<=8 keeps small-batch decode fast (graph replay path)
-    # while large batches fall back to non-graph execution. If IMA still
-    # triggers, drop to --sglang-disable-cuda-graph.
-    --sglang-mem-fraction-static 0.6
-    --sglang-mamba-scheduler-strategy no_buffer
-    --sglang-disable-overlap-schedule
-    --sglang-disable-radix-cache
-    --sglang-cuda-graph-max-bs 8
+    --sglang-mem-fraction-static 0.8
+    --sglang-mamba-scheduler-strategy extra_buffer
 )
 
 ###############################################################################
@@ -240,7 +232,7 @@ MEGATRON_ARGS=(
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
-    --max-tokens-per-gpu 8192
+    --max-tokens-per-gpu 16384
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
@@ -257,7 +249,7 @@ RAY_RESOURCE_ARGS=(
     --resource '{"actor": [1, 8], "rollout": [1, 8]}'
     --max-staleness 0
     --num-data-storage-units 1
-    --use-health-check
+    # --use-health-check
     --colocate
 )
 

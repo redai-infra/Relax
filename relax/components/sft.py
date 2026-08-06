@@ -112,6 +112,7 @@ class SFT(Base):
         seed = getattr(self.config, "seed", 42)
 
         oversize_strategy = getattr(self.config, "sft_oversize_strategy", "keep")
+        invalid_multimodal_strategy = getattr(self.config, "sft_invalid_multimodal_strategy", "error")
         oversize_custom_path = getattr(self.config, "sft_oversize_custom_function_path", None)
         oversize_custom_fn = None
         if oversize_strategy == "custom":
@@ -121,6 +122,7 @@ class SFT(Base):
             self._logger.info(f"SFT oversize strategy: custom (loaded {oversize_custom_path})")
         else:
             self._logger.info(f"SFT oversize strategy: {oversize_strategy}")
+        self._logger.info(f"SFT invalid multimodal strategy: {invalid_multimodal_strategy}")
 
         dataset_cls = _load_custom_dataset_class(getattr(self.config, "custom_dataset_class_path", None))
         if dataset_cls is None:
@@ -143,6 +145,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 oversize_strategy=oversize_strategy,
                 oversize_custom_fn=oversize_custom_fn,
+                invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
             )
         else:
@@ -202,6 +205,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 oversize_strategy=oversize_strategy,
                 oversize_custom_fn=oversize_custom_fn,
+                invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
             )
 
@@ -320,10 +324,12 @@ class SFT(Base):
         # path (already parallel via background threads). When prefetch is off,
         # it parallelises multimodal preprocess via asyncio.gather over the pool.
         samples, crossed_epoch = await self._dataset.get_batch_async(self.config.global_batch_size)
-        if not samples:
-            self._logger.warning(f"SFT step {self.step}: get_batch returned 0 samples; skipping push.")
-            self.step += 1
-            return
+        if len(samples) != self.config.global_batch_size:
+            raise RuntimeError(
+                f"SFT step {self.step}: dataset returned {len(samples)}/{self.config.global_batch_size} samples "
+                "after bounded refill attempts. Refusing to push a partial TQ partition because the Megatron "
+                "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
+            )
         self._maybe_print_first_sample(samples)
         backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
         assert backend_batch is not None
@@ -370,8 +376,11 @@ class SFT(Base):
         if samples is None:
             return
         if not samples:
-            self._logger.warning("Eval source produced 0 valid samples; skipping eval push.")
-            return
+            raise RuntimeError(
+                f"Eval @ step {self.step}: source produced 0 valid samples. Refusing to skip the eval push because "
+                "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
+                "skip warnings."
+            )
 
         # Pad sub-gbs eval pools with random resamples so the eval set always
         # forms at least one full ``global_batch_size`` chunk. Without this the
@@ -411,11 +420,10 @@ class SFT(Base):
         n_chunks = n_samples // chunk_size
         n_dropped = n_samples - n_chunks * chunk_size
         if n_chunks == 0:
-            self._logger.warning(
+            raise RuntimeError(
                 f"Eval @ step {self.step}: eval pool of {n_samples} samples is smaller than "
-                f"global_batch_size ({chunk_size}); cannot push any chunk, skipping eval."
+                f"global_batch_size ({chunk_size}); cannot push the full partition expected by the consumer."
             )
-            return
         if n_dropped > 0:
             self._logger.warning(
                 f"Eval @ step {self.step}: dropping {n_dropped} trailing sample(s) so eval "

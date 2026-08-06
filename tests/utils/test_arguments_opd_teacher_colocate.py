@@ -57,6 +57,23 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], "error"),
+        (["--sft-invalid-multimodal-strategy", "skip"], "skip"),
+    ],
+)
+def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args(argv)
+
+    assert args.sft_invalid_multimodal_strategy == expected
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
@@ -69,6 +86,7 @@ def _opd_args() -> SimpleNamespace:
         use_agentic_rollout=False,
         partial_rollout=False,
         use_rollout_routing_replay=False,
+        distributed_timeout_minutes=30,
         kl_coef=0.0,
         kl_loss_coef=0.0,
         use_kl_loss=False,
@@ -194,6 +212,10 @@ def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monk
     args = _opd_args()
     args.fp16 = False
     args.bf16 = True
+    args.initial_loss_scale = None
+    args.min_loss_scale = None
+    args.use_precision_aware_optimizer = None
+    args.store_param_remainders = None
     args.custom_config_path = str(config_path)
 
     arguments_module.slime_validate_args(args)
@@ -272,6 +294,54 @@ def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tm
         arguments_module.slime_validate_args(args)
 
 
+def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(arguments_module, monkeypatch, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\nloss_scale: 1024\n")
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = False
+    args.bf16 = True
+    args.initial_loss_scale = None
+    args.min_loss_scale = None
+    args.use_precision_aware_optimizer = None
+    args.store_param_remainders = None
+    args.custom_config_path = str(config_path)
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.fp16 is True
+    assert args.bf16 is False
+    assert args.loss_scale == 1024
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+    assert args.use_precision_aware_optimizer is True
+    assert args.store_param_remainders is False
+    warning.assert_called_once()
+    warning_text = " ".join(str(value) for value in warning.call_args.args)
+    assert "--initial-loss-scale" not in warning_text
+    assert "--min-loss-scale" not in warning_text
+
+
+@pytest.mark.parametrize(
+    ("config", "option"),
+    [
+        ("fp16: true\nuse_precision_aware_optimizer: 1\n", "--use-precision-aware-optimizer"),
+        ('fp16: true\nuse_precision_aware_optimizer: "true"\n', "--use-precision-aware-optimizer"),
+        ("fp16: true\nstore_param_remainders: 0\n", "--store-param-remainders"),
+        ('fp16: true\nstore_param_remainders: "false"\n', "--store-param-remainders"),
+    ],
+)
+def test_custom_config_fp16_rejects_non_boolean_optimizer_values(arguments_module, tmp_path, config, option):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text(config)
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match=option):
+        arguments_module.slime_validate_args(args)
+
+
 def test_kl_loss_requires_existing_ref_load(arguments_module, tmp_path):
     args = _opd_args()
     args.use_kl_loss = True
@@ -281,12 +351,21 @@ def test_kl_loss_requires_existing_ref_load(arguments_module, tmp_path):
         arguments_module.slime_validate_args(args)
 
 
-def test_arguments_dynamic_context_parallel_rejects_sft_eval(arguments_module):
+def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"
     args.dynamic_context_parallel = True
     args.eval_interval = 10
     args.eval_size = 0.1
+    args.prompt_data = ["/train.jsonl"]
+    args.sft_oversize_strategy = "drop"
+    args.sft_oversize_custom_function_path = None
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    args.rollout_max_context_len = 4096
 
-    with pytest.raises(ValueError, match="this combination can hang and has not been fixed"):
-        arguments_module.slime_validate_args(args)
+    arguments_module.slime_validate_args(args)
+
+    assert args.dynamic_context_parallel is True
+    assert args.eval_interval == 10
+    assert args.eval_size == 0.1

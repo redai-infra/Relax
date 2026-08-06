@@ -39,6 +39,48 @@ def arguments_module(monkeypatch):
     sys.modules.pop("relax.utils.arguments", None)
 
 
+@pytest.fixture()
+def megatron_arguments_module(monkeypatch):
+    class OptimizerConfig:
+        def __init__(self):
+            self.initial_loss_scale = 2**32
+            self.min_loss_scale = 1.0
+            self.use_precision_aware_optimizer = False
+            self.store_param_remainders = True
+
+    megatron = ModuleType("megatron")
+    megatron.__path__ = []
+    megatron_core = ModuleType("megatron.core")
+    megatron_core.__path__ = []
+    optimizer = ModuleType("megatron.core.optimizer")
+    optimizer.OptimizerConfig = OptimizerConfig
+    megatron_training = ModuleType("megatron.training")
+    megatron_training.__path__ = []
+    megatron_training_arguments = ModuleType("megatron.training.arguments")
+    megatron_training_arguments.parse_args = lambda **_kwargs: None
+    megatron_training_arguments.validate_args = lambda args: args
+    megatron_tokenizer = ModuleType("megatron.training.tokenizer")
+    megatron_tokenizer.__path__ = []
+    megatron_tokenizer_impl = ModuleType("megatron.training.tokenizer.tokenizer")
+    megatron_tokenizer_impl._vocab_size_with_padding = lambda vocab_size, _args: vocab_size
+    transformers = ModuleType("transformers")
+    transformers.AutoConfig = SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: None)
+
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", megatron_core)
+    monkeypatch.setitem(sys.modules, "megatron.core.optimizer", optimizer)
+    monkeypatch.setitem(sys.modules, "megatron.training", megatron_training)
+    monkeypatch.setitem(sys.modules, "megatron.training.arguments", megatron_training_arguments)
+    monkeypatch.setitem(sys.modules, "megatron.training.tokenizer", megatron_tokenizer)
+    monkeypatch.setitem(sys.modules, "megatron.training.tokenizer.tokenizer", megatron_tokenizer_impl)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    sys.modules.pop("relax.backends.megatron.arguments", None)
+    module = importlib.import_module("relax.backends.megatron.arguments")
+    yield module
+    sys.modules.pop("relax.backends.megatron.arguments", None)
+
+
 def _build_parser(arguments_module) -> argparse.ArgumentParser:
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
@@ -206,6 +248,118 @@ def test_fp16_partial_omission_warns_once_with_only_missing_fallbacks(arguments_
     assert "--use-precision-aware-optimizer" not in warning_text
     assert "--min-loss-scale=1.0" in warning_text
     assert "--store-param-remainders=False" in warning_text
+
+
+def test_static_loss_scale_skips_dynamic_fallbacks(arguments_module, monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _precision_args(loss_scale=1024.0)
+
+    arguments_module._normalize_precision_optimizer_args(args)
+
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+    assert args.use_precision_aware_optimizer is True
+    assert args.store_param_remainders is False
+    warning.assert_called_once()
+    warning_text = " ".join(str(value) for value in warning.call_args.args)
+    assert "--initial-loss-scale" not in warning_text
+    assert "--min-loss-scale" not in warning_text
+    assert "--use-precision-aware-optimizer=True" in warning_text
+    assert "--store-param-remainders=False" in warning_text
+
+
+def test_non_fp16_static_loss_scale_preserves_native_boolean_defaults(arguments_module, monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    args = _precision_args(fp16=False, bf16=True, loss_scale=1024.0)
+
+    arguments_module._normalize_precision_optimizer_args(args)
+
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+    assert args.use_precision_aware_optimizer is False
+    assert args.store_param_remainders is True
+    warning.assert_not_called()
+
+
+def test_static_loss_scale_clears_dynamic_values(arguments_module):
+    args = _precision_args(
+        loss_scale=1024.0,
+        initial_loss_scale=0.0,
+        min_loss_scale=float("nan"),
+        use_precision_aware_optimizer=True,
+        store_param_remainders=False,
+    )
+
+    arguments_module._normalize_precision_optimizer_args(args)
+
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "option"),
+    [
+        ("use_precision_aware_optimizer", 1, "--use-precision-aware-optimizer"),
+        ("use_precision_aware_optimizer", "true", "--use-precision-aware-optimizer"),
+        ("store_param_remainders", 0, "--store-param-remainders"),
+        ("store_param_remainders", "false", "--store-param-remainders"),
+    ],
+)
+def test_precision_optimizer_booleans_reject_non_boolean_values(arguments_module, field, value, option):
+    args = _precision_args(
+        initial_loss_scale=32768.0,
+        min_loss_scale=1.0,
+        use_precision_aware_optimizer=True,
+        store_param_remainders=False,
+    )
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=option):
+        arguments_module._normalize_precision_optimizer_args(args)
+
+
+def test_custom_config_defers_precision_defaults_until_yaml_is_loaded(megatron_arguments_module):
+    args = _precision_args(
+        fp16=False,
+        bf16=True,
+        loss_scale=None,
+        custom_config_path="custom-config.yaml",
+    )
+    args.seq_length = 4096
+    args.vocab_size = None
+    args.padded_vocab_size = None
+    args.tokenizer_model = "tokenizer"
+    args.tokenizer_type = None
+
+    megatron_arguments_module._set_default_megatron_args(args)
+
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+    assert args.use_precision_aware_optimizer is None
+    assert args.store_param_remainders is None
+
+
+def test_without_custom_config_resolves_precision_defaults_immediately(megatron_arguments_module):
+    args = _precision_args(
+        fp16=False,
+        bf16=True,
+        loss_scale=None,
+        custom_config_path=None,
+    )
+    args.seq_length = 4096
+    args.vocab_size = None
+    args.padded_vocab_size = None
+    args.tokenizer_model = "tokenizer"
+    args.tokenizer_type = None
+
+    megatron_arguments_module._set_default_megatron_args(args)
+
+    assert args.initial_loss_scale == 2**32
+    assert args.min_loss_scale == 1.0
+    assert args.use_precision_aware_optimizer is False
+    assert args.store_param_remainders is True
 
 
 def test_fp16_explicit_values_are_not_overwritten_or_warned(arguments_module, monkeypatch):

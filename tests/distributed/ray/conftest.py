@@ -94,6 +94,7 @@ def make_mock_engine(
     engine.register_dcs.remote.return_value = AwaitableValue(None)
     engine.unregister_dcs.remote.return_value = AwaitableValue(None)
     engine.register_to_router.remote.return_value = AwaitableValue(True)
+    engine.unregister_from_router.remote.return_value = AwaitableValue(True)
     engine.shutdown.remote.return_value = AwaitableValue(None)
     engine.pause_generation.remote.return_value = AwaitableValue(None)
     engine.continue_generation.remote.return_value = AwaitableValue(None)

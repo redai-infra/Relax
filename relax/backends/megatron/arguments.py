@@ -266,7 +266,8 @@ def _set_default_megatron_args(args):
     args.use_distributed_optimizer = True
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
-    _resolve_optimizer_precision_args(args)
+    if not getattr(args, "custom_config_path", None):
+        _resolve_optimizer_precision_args(args)
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096

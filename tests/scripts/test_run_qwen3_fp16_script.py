@@ -104,7 +104,7 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
     assert config.bf16 is False
 
 
-def test_custom_config_only_fp16_reaches_validated_optimizer_config(tmp_path: Path, monkeypatch) -> None:
+def test_custom_config_only_fp16_reaches_optimizer_kwargs(tmp_path: Path, monkeypatch) -> None:
     custom_config = tmp_path / "custom-config.yaml"
     custom_config.write_text("fp16: true\n", encoding="utf-8")
     argv = _run_and_capture_argv(
@@ -121,6 +121,11 @@ def test_custom_config_only_fp16_reaches_validated_optimizer_config(tmp_path: Pa
     command_separator = argv.index("--")
     training_args = argv[command_separator + 4 :]
     training_args.remove("--fp16")
+    training_args.remove("--use-precision-aware-optimizer")
+    training_args.remove("--no-store-param-remainders")
+    for option in ("--initial-loss-scale", "--min-loss-scale"):
+        option_index = training_args.index(option)
+        del training_args[option_index : option_index + 2]
 
     pytest.importorskip("megatron.core")
 
@@ -133,11 +138,46 @@ def test_custom_config_only_fp16_reaches_validated_optimizer_config(tmp_path: Pa
     assert args.fp16 is True
     assert args.bf16 is False
 
+    config_kwargs = model._build_optimizer_config_kwargs(args)
+
+    assert config_kwargs["fp16"] is True
+    assert config_kwargs["bf16"] is False
+    assert config_kwargs["initial_loss_scale"] == 32768.0
+    assert config_kwargs["min_loss_scale"] == 1.0
+    assert config_kwargs["use_precision_aware_optimizer"] is True
+    assert config_kwargs["store_param_remainders"] is False
+
+
+def test_static_loss_scale_reaches_optimizer_without_dynamic_scales(tmp_path: Path, monkeypatch) -> None:
+    argv = _run_and_capture_argv(
+        tmp_path,
+        [
+            "--loss-scale",
+            "1024",
+            "--no-use-precision-aware-optimizer",
+            "--ref-load",
+            str(tmp_path),
+            "--skip-hf-validate",
+            "--debug-train-only",
+        ],
+    )
+    command_separator = argv.index("--")
+    training_args = argv[command_separator + 4 :]
+
+    pytest.importorskip("megatron.core")
+
+    from relax.backends.megatron import model
+    from relax.utils.arguments import parse_args
+
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    monkeypatch.setattr(sys, "argv", ["probe", *training_args])
+    args = parse_args()
     config = model.OptimizerConfig(**model._build_optimizer_config_kwargs(args))
 
-    assert config.fp16 is True
-    assert config.bf16 is False
-    assert config.initial_loss_scale == 32768.0
-    assert config.min_loss_scale == 1.0
-    assert config.use_precision_aware_optimizer is True
-    assert config.store_param_remainders is False
+    assert args.loss_scale == 1024.0
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+    assert config.loss_scale == 1024.0
+    assert config.initial_loss_scale is None
+    assert config.min_loss_scale is None
+    assert config.use_precision_aware_optimizer is False

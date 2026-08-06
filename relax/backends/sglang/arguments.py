@@ -5,6 +5,10 @@ import argparse
 from sglang.srt.server_args import ServerArgs
 
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _router_passthrough_skip_fields() -> set[str]:
@@ -312,6 +316,13 @@ def validate_args(args):
 
     if args.sglang_dp_size > 1:
         assert args.sglang_enable_dp_attention
+
+    if args.sglang_enable_dp_attention and not args.router_dp_aware:
+        logger.warning(
+            "sglang_enable_dp_attention=True requires router_dp_aware=True; "
+            "overriding router_dp_aware=False with True."
+        )
+        args.router_dp_aware = True
 
     if getattr(args, "sglang_router_ip", None):
         args.sglang_router_ip = _wrap_ipv6(args.sglang_router_ip)

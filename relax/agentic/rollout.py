@@ -273,7 +273,15 @@ class AgenticResidentPipeline:
             or prepare_domain.has_warming_groups()
         )
         if should_refresh_prepare:
-            if await prepare_domain.refresh_ready_groups(status_fetcher=runtime_domain.prepare_group_status):
+            # Drop (do not crash on) a prepare group whose managed session
+            # finished before producing a chat IR — e.g. an apptainer instance
+            # that failed to start. The over-sampling prepare pool + transfer
+            # quota gate refill the dropped group, so batch size is preserved;
+            # crashing here would instead trigger a full global restart.
+            if await prepare_domain.refresh_ready_groups(
+                status_fetcher=runtime_domain.prepare_group_status,
+                drop_completed_before_ready=True,
+            ):
                 progressed = True
         if prepare_domain.has_pending_prepare():
             if await prepare_domain.launch_pending():
@@ -306,7 +314,12 @@ class AgenticResidentPipeline:
         if self._step_get_samples_wait_started_at is None:
             self._step_get_samples_wait_started_at = time.monotonic()
         if prepare_domain.has_warming_groups():
-            await prepare_domain.refresh_ready_groups(status_fetcher=runtime_domain.prepare_group_status)
+            # See _pump_prepare_once: drop groups that completed before ready
+            # instead of crashing; the over-sampling pool refills them.
+            await prepare_domain.refresh_ready_groups(
+                status_fetcher=runtime_domain.prepare_group_status,
+                drop_completed_before_ready=True,
+            )
         if not prepare_domain.has_ready_groups():
             return progressed
         batch_input = await prepare_domain.lease_ready_groups(

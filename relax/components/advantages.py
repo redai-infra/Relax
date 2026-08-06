@@ -210,7 +210,6 @@ class Advantages(Base):
                 rewards=rewards,
                 kl=kl,
                 loss_masks=loss_masks,
-                kl_coef=self.config.kl_coef,
             )
             returns = advantages
 
