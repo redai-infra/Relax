@@ -15,10 +15,6 @@ class PublicationError(RuntimeError):
     pass
 
 
-class PublicationFailed(PublicationError):
-    pass
-
-
 @dataclass(frozen=True)
 class ActiveRequestVersion:
     rid: str
@@ -57,6 +53,7 @@ class RequestVersionLedger:
         self.active: dict[str, ActiveRequestVersion] = {}
         self._condition = asyncio.Condition()
         self._publication: PublicationPlan | None = None
+        # Diagnostic only: publication failures never become a process-lifetime request gate.
         self._failed_reason: str | None = None
 
     async def register(self, rid: str, worker: str) -> ActiveRequestVersion:
@@ -70,9 +67,7 @@ class RequestVersionLedger:
         if not rid:
             raise ValueError("rid must be non-empty")
         async with self._condition:
-            await self._condition.wait_for(lambda: self._publication is None or self._failed_reason is not None)
-            if self._failed_reason is not None:
-                raise PublicationFailed(self._failed_reason)
+            await self._condition.wait_for(lambda: self._publication is None)
             if rid in self.active:
                 raise PublicationError(f"duplicate active rid: {rid}")
             worker = select_worker()
@@ -106,8 +101,6 @@ class RequestVersionLedger:
             raise ValueError("timeout_seconds must be positive")
 
         async with self._condition:
-            if self._failed_reason is not None:
-                raise PublicationFailed(self._failed_reason)
             if self._publication is not None:
                 raise PublicationError(f"publication already active: {self._publication.publication_id}")
             if target_version != self.current_version + 1:
@@ -138,7 +131,31 @@ class RequestVersionLedger:
                 if not pending_rids:
                     break
 
-                await asyncio.gather(*(abort_request(worker_by_rid[rid], rid) for rid in pending_rids))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"targeted retirement timed out with {len(pending_rids)} active request(s)")
+                try:
+                    abort_results = await asyncio.wait_for(
+                        asyncio.gather(
+                            *(abort_request(worker_by_rid[rid], rid) for rid in pending_rids),
+                            return_exceptions=True,
+                        ),
+                        timeout=remaining,
+                    )
+                except (TimeoutError, asyncio.TimeoutError) as exc:
+                    raise TimeoutError(
+                        f"targeted retirement timed out with {len(pending_rids)} active request(s)"
+                    ) from exc
+                failures = [
+                    (rid, result)
+                    for rid, result in zip(pending_rids, abort_results, strict=True)
+                    if isinstance(result, BaseException)
+                ]
+                if failures:
+                    rid, failure = failures[0]
+                    raise PublicationError(
+                        f"targeted retirement abort failed for rid={rid}: {type(failure).__name__}: {failure}"
+                    ) from failure
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"targeted retirement timed out with {len(pending_rids)} active request(s)")
@@ -164,6 +181,7 @@ class RequestVersionLedger:
             plan = self._require_publication(publication_id, target_version)
             self.current_version = target_version
             self._publication = None
+            self._failed_reason = None
             self._condition.notify_all()
             return plan
 

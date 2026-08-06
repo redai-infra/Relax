@@ -6,7 +6,6 @@ import pytest
 
 from relax.engine.router.request_version_ledger import (
     PublicationError,
-    PublicationFailed,
     RequestVersionLedger,
 )
 
@@ -96,7 +95,36 @@ async def test_publication_fence_blocks_new_registration_until_commit() -> None:
     assert request.kv_epoch_version == 2
 
 
-async def test_prepare_timeout_poison_fails_closed_without_advancing_version() -> None:
+async def test_prepare_surfaces_abort_failure_after_attempting_all_workers() -> None:
+    ledger = RequestVersionLedger(initial_version=0)
+    await ledger.register("expired-a", "engine-a")
+    await ledger.register("expired-b", "engine-b")
+    ledger.current_version = 1
+    attempted: list[str] = []
+
+    async def abort_request(_worker: str, rid: str) -> None:
+        attempted.append(rid)
+        if rid == "expired-a":
+            raise PermissionError("abort denied")
+        await ledger.unregister(rid)
+
+    with pytest.raises(
+        PublicationError,
+        match="targeted retirement abort failed for rid=expired-a: PermissionError: abort denied",
+    ):
+        await ledger.prepare(
+            target_version=2,
+            max_gap=1,
+            abort_request=abort_request,
+            timeout_seconds=1,
+        )
+
+    assert sorted(attempted) == ["expired-a", "expired-b"]
+    request = await ledger.register("new", "engine-a")
+    assert request.kv_epoch_version == 1
+
+
+async def test_prepare_timeout_rolls_back_without_advancing_version() -> None:
     ledger = RequestVersionLedger(initial_version=0)
     await ledger.register("expired", "engine-a")
     ledger.current_version = 1
@@ -112,14 +140,40 @@ async def test_prepare_timeout_poison_fails_closed_without_advancing_version() -
             timeout_seconds=0.01,
         )
 
-    with pytest.raises(PublicationFailed, match="targeted retirement failed"):
-        await ledger.register("new", "engine-a")
+    request = await ledger.register("new", "engine-a")
+    assert request.kv_epoch_version == 1
     state = await ledger.snapshot()
     assert state["current_version"] == 1
     assert state["publication"] is None
+    assert state["failed_reason"].startswith("targeted retirement failed: TimeoutError:")
 
 
-async def test_failed_publication_poison_fails_closed() -> None:
+async def test_prepare_timeout_bounds_stuck_abort_and_releases_fence() -> None:
+    ledger = RequestVersionLedger(initial_version=0)
+    await ledger.register("expired", "engine-a")
+    ledger.current_version = 1
+    abort_cancelled = asyncio.Event()
+
+    async def abort_request(_worker: str, _rid: str) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            abort_cancelled.set()
+
+    with pytest.raises(TimeoutError):
+        await ledger.prepare(
+            target_version=2,
+            max_gap=1,
+            abort_request=abort_request,
+            timeout_seconds=0.01,
+        )
+
+    assert abort_cancelled.is_set()
+    request = await ledger.register("new", "engine-a")
+    assert request.kv_epoch_version == 1
+
+
+async def test_failed_publication_ends_current_transaction_without_poisoning_router() -> None:
     ledger = RequestVersionLedger(initial_version=2)
 
     async def abort_request(_worker: str, _rid: str) -> None:
@@ -133,8 +187,12 @@ async def test_failed_publication_poison_fails_closed() -> None:
     )
     await ledger.fail(plan.publication_id, plan.target_version, "DCS broadcast failed")
 
-    with pytest.raises(PublicationFailed, match="DCS broadcast failed"):
-        await ledger.register("rid", "engine-a")
+    request = await ledger.register("rid", "engine-a")
+    assert request.kv_epoch_version == 2
+    failed_state = await ledger.snapshot()
+    assert failed_state["publication"] is None
+    assert failed_state["current_version"] == 2
+    assert failed_state["failed_reason"] == "DCS broadcast failed"
 
 
 async def test_publication_version_must_advance_exactly_once() -> None:
