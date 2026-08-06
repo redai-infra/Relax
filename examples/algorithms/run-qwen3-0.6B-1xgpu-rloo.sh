@@ -206,7 +206,7 @@ MISC_ARGS=(
 
 LOG_DIR="${RELAX_ARTIFACTS:-${RELAX_ROOT}/log}/logs"
 mkdir -p "${LOG_DIR}"
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.0.1:8265}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
     -- python3 -m relax.entrypoints.train \
