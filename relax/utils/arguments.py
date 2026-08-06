@@ -2960,47 +2960,6 @@ def slime_validate_args(args):
         )
 
     if not is_sft:
-        if args.advantage_estimator == "rloo":
-            if args.n_samples_per_prompt < 2:
-                raise ValueError(
-                    "--advantage-estimator rloo requires --n-samples-per-prompt >= 2 "
-                    "(the leave-one-out baseline divides by G-1; G=1 is undefined)."
-                )
-            if args.fully_async or getattr(args, "hybrid", False):
-                raise ValueError(
-                    "--advantage-estimator rloo only supports synchronous (colocate) training. "
-                    "Please remove --fully-async / --hybrid."
-                )
-            if not args.rewards_normalization:
-                raise ValueError(
-                    "--advantage-estimator rloo requires rewards normalization to be enabled "
-                    "(the leave-one-out baseline is computed inside the group-reward path that "
-                    "--disable-rewards-normalization skips). Please remove --disable-rewards-normalization."
-                )
-            if args.normalize_advantages:
-                raise ValueError(
-                    "--advantage-estimator rloo is incompatible with --normalize-advantages: "
-                    "the latter re-whitens advantages after DP sharding "
-                    "(distributed_masked_whiten in loss.py), which re-introduces the std "
-                    "normalization RLOO removes and makes the result depend on the DP partition. "
-                    "Please remove --normalize-advantages."
-                )
-            if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
-                raise ValueError(
-                    "--advantage-estimator rloo requires exactly one optimizer update per rollout "
-                    "(the unclipped objective has no ratio correction, so a second update on the "
-                    "same rollout is off-policy without correction). This means "
-                    "rollout_batch_size * n_samples_per_prompt must equal global_batch_size, "
-                    f"got {args.rollout_batch_size} * {args.n_samples_per_prompt} = "
-                    f"{args.rollout_batch_size * args.n_samples_per_prompt} != "
-                    f"{args.global_batch_size}."
-                )
-            if args.partial_rollout or args.use_dynamic_global_batch_size:
-                raise ValueError(
-                    "--advantage-estimator rloo is incompatible with --partial-rollout / "
-                    "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
-                    "at runtime, breaking the one-update-per-rollout guarantee."
-                )
         if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
             assert args.normalize_advantages, (
                 "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
