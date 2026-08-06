@@ -158,7 +158,7 @@ MISC_ARGS=(
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
-    \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
+    \"LD_LIBRARY_PATH\":\"${WORKDIR}/xhpc-ubuntu2004_x86_64/xpudnn/so:${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"OPENBLAS_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
     \"OMP_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
