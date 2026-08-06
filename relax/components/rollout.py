@@ -20,6 +20,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.misc import should_run_periodic_action
 
 
 app = FastAPI()
@@ -361,12 +362,13 @@ class Rollout(Base):
         if self.config.eval_interval is None or self.config.eval_prompt_data is None:
             return False
 
-        step = local_step + 1
-
-        should_eval = (step % self.config.eval_interval == 0) or (
-            self.num_rollout_per_epoch is not None and step % self.num_rollout_per_epoch == 0
+        should_eval = should_run_periodic_action(
+            local_step,
+            self.config.eval_interval,
+            self.num_rollout_per_epoch,
+            self.config.num_rollout,
         )
-        self._logger.info(f"Checking whether to evaluate rollout {step}, should_eval: {should_eval}")
+        self._logger.info(f"Checking whether to evaluate rollout {local_step + 1}, should_eval: {should_eval}")
         return should_eval
 
     async def run(self) -> None:

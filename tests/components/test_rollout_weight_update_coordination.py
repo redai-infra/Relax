@@ -15,6 +15,31 @@ from relax.components.rollout import Rollout
 RolloutClass = Rollout.func_or_class
 
 
+def test_rollout_evaluation_uses_periodic_and_epoch_boundaries() -> None:
+    rollout = RolloutClass.__new__(RolloutClass)
+    Base.__init__(rollout)
+    rollout.config = SimpleNamespace(
+        eval_interval=10,
+        eval_prompt_data=["aime", "/data/aime.jsonl"],
+        num_rollout=20,
+    )
+    rollout.num_rollout_per_epoch = 4
+
+    assert not rollout._should_eval(2)
+    assert rollout._should_eval(3)
+    assert rollout._should_eval(9)
+    assert rollout._should_eval(19)
+
+
+def test_rollout_evaluation_requires_complete_configuration() -> None:
+    rollout = RolloutClass.__new__(RolloutClass)
+    Base.__init__(rollout)
+    rollout.config = SimpleNamespace(eval_interval=10, eval_prompt_data=None, num_rollout=20)
+    rollout.num_rollout_per_epoch = 4
+
+    assert not rollout._should_eval(3)
+
+
 @pytest.mark.asyncio
 async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
     rollout = RolloutClass.__new__(RolloutClass)

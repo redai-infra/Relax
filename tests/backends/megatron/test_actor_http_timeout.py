@@ -177,11 +177,13 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
         assert "timeout" not in k
 
 
-def test_check_services_health_aborts_when_pause_resume_is_uncertain(monkeypatch):
+def test_check_services_health_degrades_when_pause_resume_is_uncertain(monkeypatch):
     from argparse import Namespace
 
-    def _timeout_get(*_a, **_k):
-        raise requests.exceptions.Timeout("boom")
+    def _timeout_get(url, *_a, **_k):
+        if url.endswith(("/can_do_update_weight_for_async", "/end_update_weight")):
+            raise requests.exceptions.Timeout("boom")
+        return _Resp()
 
     _patch_health_common(monkeypatch, _timeout_get)
 
@@ -189,7 +191,9 @@ def test_check_services_health_aborts_when_pause_resume_is_uncertain(monkeypatch
     shell.args = Namespace(true_on_policy_mode=False, hybrid=False, rollout_http_timeout=120.0)
 
     # A timeout after the pause request is sent leaves the rollout state
-    # uncertain. If the compensating resume also cannot be confirmed, the
-    # actor must abort rather than continue with a potentially paused rollout.
-    with pytest.raises(RuntimeError, match="Failed to resume Rollout"):
-        shell._check_services_health()
+    # uncertain. Attempt a compensating resume, but preserve fault-tolerant
+    # degradation when neither the pause nor resume can be confirmed.
+    rollout_only, actor_fwd_only = shell._check_services_health()
+
+    assert rollout_only is False
+    assert actor_fwd_only is True

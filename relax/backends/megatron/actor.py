@@ -25,6 +25,7 @@ except ImportError:
 
 from tensordict import TensorDict
 from transformers import AutoConfig, AutoTokenizer
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
@@ -51,6 +52,7 @@ from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.misc import should_run_periodic_action
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
@@ -105,6 +107,18 @@ logger = logging.getLogger(__name__)
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
 
 
+def _connection_error_proves_pause_request_was_not_sent(
+    error: requests.exceptions.ConnectionError,
+) -> bool:
+    if isinstance(error, requests.exceptions.ConnectTimeout):
+        return True
+
+    reason = error.args[0] if error.args else None
+    if isinstance(reason, MaxRetryError):
+        reason = reason.reason
+    return isinstance(reason, ConnectTimeoutError)
+
+
 def _should_publish_hybrid_weights(
     rollout_id: int,
     update_weights_interval: int,
@@ -113,48 +127,18 @@ def _should_publish_hybrid_weights(
     evaluation_configured: bool = False,
     eval_interval: int | None = None,
     num_rollout_per_epoch: int | None = None,
-    evaluation_at_epoch_boundary: bool = True,
 ) -> bool:
     if update_weights_interval <= 0:
         raise ValueError(f"update_weights_interval must be positive, got {update_weights_interval}")
 
-    step = rollout_id + 1
-    if step == num_rollout or step % update_weights_interval == 0:
+    if should_run_periodic_action(rollout_id, update_weights_interval, num_rollout=num_rollout):
         return True
-    if not evaluation_configured:
-        return False
-
-    if eval_interval is not None and step % eval_interval == 0:
-        return True
-    if not evaluation_at_epoch_boundary:
-        return False
-
-    # Global datasets also evaluate at epoch boundaries. When that epoch
-    # length is unavailable in this worker, publish conservatively every step.
-    if num_rollout_per_epoch is None:
-        return True
-    return step % num_rollout_per_epoch == 0
-
-
-def _warn_if_hybrid_publication_degraded(args: Any, already_warned: bool) -> bool:
-    evaluation_configured = args.eval_interval is not None and args.eval_prompt_data is not None
-    evaluation_at_epoch_boundary = getattr(args, "rollout_global_dataset", False)
-    epoch_length_unknown = getattr(args, "num_rollout_per_epoch", None) is None
-    if (
-        already_warned
-        or args.update_weights_interval == 1
-        or not evaluation_configured
-        or not evaluation_at_epoch_boundary
-        or not epoch_length_unknown
-    ):
-        return already_warned
-
-    logger.warning(
-        "Hybrid weight publication interval is disabled because evaluation is configured but "
-        "num_rollout_per_epoch is unavailable to the Actor. Publishing every step so epoch-boundary "
-        "evaluation cannot use stale weights."
+    return evaluation_configured and should_run_periodic_action(
+        rollout_id,
+        eval_interval,
+        num_rollout_per_epoch,
+        num_rollout,
     )
-    return True
 
 
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
@@ -671,7 +655,13 @@ class MegatronTrainRayActor(TrainRayActor):
         if bool(flag[0].item()):
             raise RuntimeError(f"Failed to resume Rollout after weight update at rollout_id {rollout_id}")
 
-    def _run_weight_update_with_resume_on_error(self, rollout_id: int, update_fn: Callable[[], None]) -> None:
+    def _run_weight_update_with_resume_on_error(
+        self,
+        rollout_id: int,
+        update_fn: Callable[[], None],
+        *,
+        rollout_needs_resume: bool = True,
+    ) -> None:
         update_error = None
         try:
             update_fn()
@@ -681,7 +671,8 @@ class MegatronTrainRayActor(TrainRayActor):
         flag = torch.tensor([int(update_error is not None)], dtype=torch.int32, device="cpu")
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
         if bool(flag[0].item()):
-            self._resume_rollout_weight_update(None, rollout_id)
+            if rollout_needs_resume:
+                self._resume_rollout_weight_update(None, rollout_id)
             raise RuntimeError(f"Weight update failed at rollout_id {rollout_id}") from update_error
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
@@ -1508,10 +1499,6 @@ class MegatronTrainRayActor(TrainRayActor):
             tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
             return
 
-        self._hybrid_publication_degraded_warned = _warn_if_hybrid_publication_degraded(
-            self.args,
-            getattr(self, "_hybrid_publication_degraded_warned", False),
-        )
         should_publish_weights = _should_publish_hybrid_weights(
             rollout_id,
             self.args.update_weights_interval,
@@ -1519,7 +1506,6 @@ class MegatronTrainRayActor(TrainRayActor):
             evaluation_configured=self.args.eval_interval is not None and self.args.eval_prompt_data is not None,
             eval_interval=self.args.eval_interval,
             num_rollout_per_epoch=getattr(self.args, "num_rollout_per_epoch", None),
-            evaluation_at_epoch_boundary=getattr(self.args, "rollout_global_dataset", False),
         )
         if should_publish_weights:
             # _check_services_health waits until the current partition has a
@@ -1628,9 +1614,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_only=rollout_only,
                     actor_fwd_only=actor_fwd_only,
                 ),
+                rollout_needs_resume=not actor_fwd_only,
             )
             dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(rollout_id, end_update_weight=True)
+            self._run_step_evaluation(rollout_id, end_update_weight=not actor_fwd_only)
             # On the final training step the rollout component has already
             # exited its main loop, so the eval just triggered above will not
             # be awaited anywhere. Block until it finishes; otherwise the
@@ -1832,33 +1819,46 @@ class MegatronTrainRayActor(TrainRayActor):
         if dist.get_rank() == 0:
             # Check rollout service
             rollout_serve_url = None
-            pause_requested = False
+            pause_may_have_succeeded = False
+            pause_confirmed = False
             try:
                 rollout_serve_url = get_serve_url("rollout")
                 while True:
-                    # Once this request is sent, a transport/decoding failure
-                    # cannot distinguish "not paused" from "paused but reply
-                    # lost". /end_update_weight is idempotent, so compensate.
-                    pause_requested = True
-                    response = requests.get(
-                        f"{rollout_serve_url}/can_do_update_weight_for_async",
-                        timeout=self.args.rollout_http_timeout,
-                    )
+                    pause_may_have_succeeded = True
+                    try:
+                        response = requests.get(
+                            f"{rollout_serve_url}/can_do_update_weight_for_async",
+                            timeout=self.args.rollout_http_timeout,
+                        )
+                    except requests.exceptions.ConnectionError as connection_error:
+                        # Only connection-establishment failures prove the
+                        # service could not have processed the pause request.
+                        if _connection_error_proves_pause_request_was_not_sent(connection_error):
+                            pause_may_have_succeeded = False
+                        raise
                     response.raise_for_status()
                     res = response.json()
                     if res:
+                        pause_confirmed = True
                         response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
                         response.raise_for_status()
                         break
                     else:
+                        pause_may_have_succeeded = False
                         time.sleep(1)
             except Exception as e:
-                if pause_requested:
+                if pause_may_have_succeeded:
                     try:
                         self._end_rollout_weight_update(rollout_serve_url, rollout_id)
                     except Exception as resume_error:
-                        rollout_resume_failed = True
-                        logger.error(f"Failed to restore Rollout after an uncertain pause result: {resume_error}")
+                        pause_state = "confirmed" if pause_confirmed else "uncertain"
+                        if pause_confirmed:
+                            rollout_resume_failed = True
+                            logger.error(f"Failed to restore Rollout after a {pause_state} pause: {resume_error}")
+                        else:
+                            logger.warning(
+                                f"Could not restore Rollout after an {pause_state} pause result: {resume_error}"
+                            )
                 logger.warning(
                     f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
                     "Will continue without rollout update for this step."
