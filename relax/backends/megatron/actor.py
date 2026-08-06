@@ -136,8 +136,8 @@ def _should_publish_hybrid_weights(
     return evaluation_configured and should_run_periodic_action(
         rollout_id,
         eval_interval,
-        num_rollout_per_epoch,
-        num_rollout,
+        num_rollout_per_epoch=num_rollout_per_epoch,
+        num_rollout=None,
     )
 
 
@@ -1047,9 +1047,9 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id)
 
         # On the final training step the rollout component has already exited
-        # its main loop, so nothing else awaits the eval handler. Block here
-        # until eval finishes; otherwise the controller's atexit shutdown
-        # races with eval and tears down the SGLang engines mid-flight.
+        # its main loop, so any evaluation scheduled above will not be awaited
+        # elsewhere. Block here until it finishes; otherwise the controller's
+        # atexit shutdown races with eval and tears down the SGLang engines mid-flight.
         if is_train_done:
             self._wait_for_previous_eval()
 
@@ -1529,9 +1529,9 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id, end_update_weight=should_publish_weights)
 
         # On the final training step the rollout component has already exited
-        # its main loop, so the eval just triggered above will not be awaited
-        # anywhere. Block until it finishes; otherwise the controller's atexit
-        # shutdown races with eval and tears down the SGLang engines mid-flight.
+        # its main loop, so any evaluation scheduled above will not be awaited
+        # elsewhere. Block here until it finishes; otherwise the controller's
+        # atexit shutdown races with eval and tears down the SGLang engines mid-flight.
         if is_train_done:
             self._wait_for_previous_eval()
 
@@ -1618,11 +1618,10 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             dist.barrier(group=get_gloo_group())
             self._run_step_evaluation(rollout_id, end_update_weight=not actor_fwd_only)
-            # On the final training step the rollout component has already
-            # exited its main loop, so the eval just triggered above will not
-            # be awaited anywhere. Block until it finishes; otherwise the
-            # controller's atexit shutdown races with eval and tears down the
-            # SGLang engines mid-flight.
+            # On the final training step the rollout component has already exited
+            # its main loop, so any evaluation scheduled above will not be awaited
+            # elsewhere. Block here until it finishes; otherwise the controller's
+            # atexit shutdown races with eval and tears down the SGLang engines mid-flight.
             if (rollout_id + 1) == self.args.num_rollout:
                 self._wait_for_previous_eval()
 

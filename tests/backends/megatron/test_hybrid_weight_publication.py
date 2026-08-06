@@ -73,18 +73,17 @@ def test_hybrid_weight_publication_rejects_nonpositive_interval() -> None:
         _should_publish_hybrid_weights(0, 0, 20)
 
 
-@pytest.mark.parametrize("rollout_id", range(20))
+@pytest.mark.parametrize("rollout_id", range(25))
 def test_hybrid_weight_publication_covers_every_evaluation_boundary(rollout_id: int) -> None:
     evaluation_due = should_run_periodic_action(
         rollout_id,
         interval=10,
         num_rollout_per_epoch=4,
-        num_rollout=20,
     )
     publication_due = _should_publish_hybrid_weights(
         rollout_id,
         update_weights_interval=7,
-        num_rollout=20,
+        num_rollout=25,
         evaluation_configured=True,
         eval_interval=10,
         num_rollout_per_epoch=4,

@@ -31,6 +31,21 @@ def test_rollout_evaluation_uses_periodic_and_epoch_boundaries() -> None:
     assert rollout._should_eval(19)
 
 
+def test_rollout_evaluation_does_not_force_final_step() -> None:
+    rollout = RolloutClass.__new__(RolloutClass)
+    Base.__init__(rollout)
+    rollout.config = SimpleNamespace(
+        eval_interval=10,
+        eval_prompt_data=["aime", "/data/aime.jsonl"],
+        num_rollout=25,
+    )
+    rollout.num_rollout_per_epoch = None
+
+    assert rollout._should_eval(9)
+    assert rollout._should_eval(19)
+    assert not rollout._should_eval(24)
+
+
 def test_rollout_evaluation_requires_complete_configuration() -> None:
     rollout = RolloutClass.__new__(RolloutClass)
     Base.__init__(rollout)

@@ -362,11 +362,13 @@ class Rollout(Base):
         if self.config.eval_interval is None or self.config.eval_prompt_data is None:
             return False
 
+        # RL evaluation remains interval/epoch-boundary only; passing num_rollout
+        # would also force an evaluation on the final training step.
         should_eval = should_run_periodic_action(
             local_step,
             self.config.eval_interval,
-            self.num_rollout_per_epoch,
-            self.config.num_rollout,
+            num_rollout_per_epoch=self.num_rollout_per_epoch,
+            num_rollout=None,
         )
         self._logger.info(f"Checking whether to evaluate rollout {local_step + 1}, should_eval: {should_eval}")
         return should_eval
