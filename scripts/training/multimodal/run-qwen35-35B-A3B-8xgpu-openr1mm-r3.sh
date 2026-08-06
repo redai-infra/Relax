@@ -4,7 +4,7 @@
 # Qwen3.5-35B-A3B 8xGPU colocate training script.
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen35-35B-A3B-8xgpu.sh
+#   bash scripts/training/multimodal/run-qwen35-35B-A3B-8xgpu-openr1mm-r3.sh
 
 set -ex
 set -o pipefail
@@ -115,7 +115,7 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name  ${PROJECT_NAME}
-   --tb-experiment-name qwen35-30B-A3B-${now}
+   --tb-experiment-name qwen35-35B-A3B-openr1mm-r3-${now}
 )
 
 MISC_ARGS=(
@@ -147,4 +147,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-30B-A3B-GRPO-gpu8-${now}.log
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-35B-A3B-openr1mm-r3-GRPO-gpu8-${now}.log

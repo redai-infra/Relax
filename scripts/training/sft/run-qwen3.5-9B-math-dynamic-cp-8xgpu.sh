@@ -68,8 +68,8 @@ SFT_ARGS=(
 
 EVAL_ARGS=(
     # NOTE: not supported yet
-    # --eval-size 0.01
-    # --eval-interval 1000
+    --eval-size 0.01
+    --eval-interval 20
 )
 
 PREDICT_ARGS=(
@@ -93,6 +93,9 @@ PERF_ARGS=(
    --no-rope-fusion
 
    --colocate
+   --cross-entropy-loss-fusion
+   --sft-chunked-logits
+   --sft-logits-chunk-size ${SFT_LOGITS_CHUNK_SIZE:-1024}
 )
 if [ -n "${CP}" ]; then
     PERF_ARGS+=(--context-parallel-size "${CP}")

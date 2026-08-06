@@ -48,6 +48,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
@@ -592,15 +593,29 @@ class MegatronTrainRayActor(TrainRayActor):
         # (see Rollout._run_eval_with_mark), so we don't emit them here.
         if not has_rollout:
             return
+        rollout_serve_url = get_serve_url("rollout")
         try:
-            rollout_serve_url = get_serve_url("rollout")
+            # NOTE: /evaluate runs rollout-side inference and can legitimately
+            # take much longer than a short RPC, so it is intentionally left
+            # without an HTTP timeout -- a fixed timeout would falsely abort a
+            # long eval. This block's failure is non-fatal (logged, training
+            # continues).
             response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
             response.raise_for_status()
-            if end_update_weight:
-                response = requests.get(f"{rollout_serve_url}/end_update_weight")
-                response.raise_for_status()
         except Exception as e:
             logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
+        finally:
+            # Cleanup MUST run even if /evaluate failed, otherwise rollout + health
+            # monitoring stay paused forever. Short call -> keep the timeout;
+            # swallow its own errors independently.
+            if end_update_weight:
+                try:
+                    response = requests.get(
+                        f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
+                    )
+                    response.raise_for_status()
+                except Exception as e:
+                    logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
@@ -680,7 +695,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
-            empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
+            empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
@@ -1777,7 +1792,10 @@ class MegatronTrainRayActor(TrainRayActor):
             try:
                 rollout_serve_url = get_serve_url("rollout")
                 while True:
-                    response = requests.get(f"{rollout_serve_url}/can_do_update_weight_for_async")
+                    response = requests.get(
+                        f"{rollout_serve_url}/can_do_update_weight_for_async",
+                        timeout=self.args.rollout_http_timeout,
+                    )
                     response.raise_for_status()
                     res = response.json()
                     if res:
@@ -1802,7 +1820,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 try:
                     actor_fwd_serve_url = get_serve_url("actor_fwd")
-                    response = requests.get(f"{actor_fwd_serve_url}/get_step")
+                    response = requests.get(f"{actor_fwd_serve_url}/get_step", timeout=self.args.rollout_http_timeout)
                     response.raise_for_status()
                 except Exception as e:
                     logger.warning(

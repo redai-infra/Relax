@@ -12,22 +12,27 @@ cd "${SCRIPT_DIR}"
 export OPENAI_BASE_URL="${RELAX_BASE_URL%/}"
 export OPENAI_API_KEY="${RELAX_SESSION_ID}"
 
-# Per-session stdout+stderr capture. Relax captures the subprocess streams
-# into a tmpdir/command.log and only surfaces it when the agent exits with
-# code != 0 (relax/agentic/pipeline/runtime.py:358); the tmpdir is then
-# cleaned up (runtime.py:397), so silent-success failures (subprocess exits
-# 0 but never produced a chat IR) leave no trace, and successful sessions
-# leave no trace either — both make hang/perf debugging impossible.
+# Per-session stdout+stderr capture, written DIRECTLY to a persistent
+# per-session file keyed by AGENT_DEBUG_LOG_DIR (set by the training launcher
+# to log/agent/${TIMESTAMP}). ALL logs are kept regardless of exit code — the
+# whole point, since Relax's own tmpdir capture (runtime.py:358/397) is
+# dropped on both silent-success and clean exit, making hang/perf debugging
+# impossible. A fresh ${TIMESTAMP} dir per run keeps logs from piling up.
 #
-# Mirrors nemo_gym_agentic/scripts/run_agent_app.sh: tee both streams to a
-# persistent per-session file keyed by AGENT_DEBUG_LOG_DIR (set by the
-# training launcher to log/agent/${TIMESTAMP}) and keep ALL logs regardless
-# of exit code. The training script picks a fresh ${TIMESTAMP} directory
-# per run so logs don't pile up across runs.
+# Do NOT reintroduce `tee` process substitution here (the old
+# `exec > >(tee ...) 2> >(tee ...)` form). Each session spawned two `tee`
+# children; because this shell then `exec`s into python, those tee's are
+# orphaned when python exits/is-killed and — since the container's PID 1 is a
+# non-reaping `sleep` — become permanent zombies, each holding a host PID
+# slot. That leak reached tens of thousands of zombies and fed host-level
+# PID/thread exhaustion, surfacing as `pthread_create`/`fork` EAGAIN crashes
+# across the job. A plain append redirect keeps full per-session logs with
+# ZERO extra processes. (Functional agent output goes to RELAX_OUTPUT_JSON,
+# not stdout, so nothing is lost by not mirroring to Relax's stream capture.)
 if [ -n "${AGENT_DEBUG_LOG_DIR:-}" ]; then
     mkdir -p "${AGENT_DEBUG_LOG_DIR}"
     AGENT_LOG_FILE="${AGENT_DEBUG_LOG_DIR}/${RELAX_SESSION_ID:-unknown}.log"
-    exec > >(tee -a "${AGENT_LOG_FILE}") 2> >(tee -a "${AGENT_LOG_FILE}" >&2)
+    exec >> "${AGENT_LOG_FILE}" 2>&1
 fi
 
 # Host-side jupyter_client is needed by apptainer_jupyter_backend.py:200
