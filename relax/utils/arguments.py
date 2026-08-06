@@ -2744,6 +2744,80 @@ def _validate_p3o_args(args) -> None:
         )
 
 
+def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
+    """Validate the frozen Task 29 REINFORCE++ algorithm contracts."""
+    if is_sft:
+        return
+
+    estimator = getattr(args, "advantage_estimator", None)
+    variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+    if estimator not in variants:
+        return
+
+    if not getattr(args, "normalize_advantages", False):
+        raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        raise ValueError(
+            f"--advantage-estimator {estimator} supports synchronous colocate training only; "
+            "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
+        )
+    if not getattr(args, "colocate", False):
+        raise ValueError(f"--advantage-estimator {estimator} currently requires --colocate.")
+    if getattr(args, "context_parallel_size", 1) != 1:
+        raise ValueError(f"--advantage-estimator {estimator} currently requires --context-parallel-size 1.")
+    if getattr(args, "calculate_per_token_loss", False):
+        raise ValueError(
+            f"--advantage-estimator {estimator} uses response-mean loss reduction; "
+            "--calculate-per-token-loss is not supported."
+        )
+
+    kl_coef = getattr(args, "kl_coef", 0.0)
+    kl_loss_coef = getattr(args, "kl_loss_coef", 0.0)
+    kl_loss_type = getattr(args, "kl_loss_type", "k1")
+    use_kl_loss = getattr(args, "use_kl_loss", False)
+
+    if estimator == "reinforce_plus_plus":
+        if kl_coef <= 0:
+            raise ValueError("reinforce_plus_plus requires --kl-coef > 0 for token-level KL reward shaping.")
+        if kl_loss_type != "k1":
+            raise ValueError("reinforce_plus_plus requires --kl-loss-type k1 for token-level KL reward shaping.")
+        if use_kl_loss or kl_loss_coef != 0:
+            raise ValueError(
+                "reinforce_plus_plus uses KL reward shaping and does not support a separate --use-kl-loss."
+            )
+        return
+
+    if getattr(args, "n_samples_per_prompt", 1) <= 1:
+        raise ValueError("reinforce_plus_plus_baseline requires --n-samples-per-prompt > 1.")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--custom-reward-post-process-path is not supported."
+        )
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--agentic-custom-advantage-path is not supported."
+        )
+    if not getattr(args, "rewards_normalization", True):
+        raise ValueError(
+            "reinforce_plus_plus_baseline requires group-mean centering; "
+            "--disable-rewards-normalization is not supported."
+        )
+    if kl_coef != 0:
+        raise ValueError("reinforce_plus_plus_baseline does not put token KL in the advantage; set --kl-coef 0.")
+    if not use_kl_loss or kl_loss_coef <= 0:
+        raise ValueError(
+            "reinforce_plus_plus_baseline requires an independent k2 penalty via --use-kl-loss and --kl-loss-coef > 0."
+        )
+    if kl_loss_type != "k2":
+        raise ValueError("reinforce_plus_plus_baseline requires --kl-loss-type k2.")
+    if getattr(args, "use_unbiased_kl", False):
+        raise ValueError(
+            "reinforce_plus_plus_baseline uses the plain k2 estimator; --use-unbiased-kl is not supported."
+        )
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -2927,13 +3001,9 @@ def slime_validate_args(args):
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
-    if not is_sft:
-        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
-            assert args.normalize_advantages, (
-                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
-                "require advantage normalization. Please add `--normalize-advantages` to your command."
-            )
+    _validate_reinforce_plus_plus_args(args, is_sft)
 
+    if not is_sft:
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
