@@ -25,10 +25,18 @@ def registry_module(monkeypatch):
         classes[class_name] = component_class
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
+    original_registry = sys.modules.get("relax.core.registry")
     sys.modules.pop("relax.core.registry", None)
     module = importlib.import_module("relax.core.registry")
     yield module, classes
     sys.modules.pop("relax.core.registry", None)
+    # Restore the pre-test registry module so later tests in the same process
+    # keep importing a single module instance. Popping without restoring made
+    # ``process_role`` (old instance) return a ``ROLES_COLOCATE`` that fails
+    # ``is`` comparison against the re-imported one in test_registry_sft.py /
+    # test_registry_rloo.py.
+    if original_registry is not None:
+        sys.modules["relax.core.registry"] = original_registry
 
 
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
