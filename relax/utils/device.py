@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -54,7 +55,7 @@ def _detect_accelerator() -> AcceleratorType:
     Environment variable ``RELAX_DEVICE_TYPE`` can override auto-detection.
     """
     # Allow explicit override via environment variable
-    override = os.environ.get("RELAX_DEVICE_TYPE", "").lower().strip()
+    override = Envs.RELAX_DEVICE_TYPE.lower().strip()
     if override:
         for accel in AcceleratorType:
             if override == accel.value:

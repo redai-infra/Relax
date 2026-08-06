@@ -28,6 +28,7 @@ from ray.serve.schema import LoggingConfig
 
 from relax.distributed.checkpoint_service.config import DCSConfig, RoleInfo, TopologyConfig
 from relax.distributed.checkpoint_service.coordinator.topology import TopologyManager
+from relax.utils.env import Envs
 from relax.utils.utils import get_serve_url
 
 
@@ -108,8 +109,12 @@ app = FastAPI(
 )
 
 
+DCS_SERVE_MAX_ONGOING_REQUESTS = Envs.DCS_SERVE_MAX_ONGOING_REQUESTS
+
+
 @serve.deployment(
     num_replicas=1,
+    max_ongoing_requests=DCS_SERVE_MAX_ONGOING_REQUESTS,
     ray_actor_options={"num_cpus": 1},
     logging_config=LoggingConfig(
         log_level="WARNING",
