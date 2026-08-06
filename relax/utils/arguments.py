@@ -27,6 +27,7 @@ from relax.utils.training.eval_config import (
     build_named_prompt_data_configs,
     ensure_dataset_list,
 )
+from relax.utils.training.ppo_utils import validate_rloo_args
 
 
 logger = get_logger(__name__)
@@ -1651,6 +1652,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "rloo",
                 ],
                 default="grpo",
                 help=(
@@ -3200,6 +3202,10 @@ def slime_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    # After the batch-size derivation above, so the RLOO guards can read the
+    # derived global_batch_size and num_steps_per_rollout.
+    validate_rloo_args(args)
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False

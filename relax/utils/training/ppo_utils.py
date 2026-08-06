@@ -35,6 +35,143 @@ def validate_ppo_config(config: Namespace) -> None:
     _validate_actor_critic_resume_consistency(config)
 
 
+def validate_rloo_args(args: Namespace) -> None:
+    """Reject RLOO configurations that would silently stop being RLOO.
+
+    Every guard here prevents a failure that is silent or late: a flag that
+    quietly changes the estimator, or a configuration that only reveals itself as
+    all-zero advantages several minutes into a run. Kept as a pure function on
+    ``args`` so production validation and the tests exercise the same code -- a
+    test that re-implements the guards would still pass if the production copy
+    were deleted.
+
+    Called from ``slime_validate_args`` after the batch-size derivation, because
+    the single-optimizer-step guard has to read the derived
+    ``global_batch_size``.
+
+    Args:
+        args: The parsed namespace. Nothing is mutated.
+
+    Raises:
+        AssertionError: With a message naming the flag to remove, matching how
+            the rest of ``slime_validate_args`` reports configuration errors.
+    """
+    if getattr(args, "advantage_estimator", None) != "rloo":
+        return
+
+    assert not args.fully_async and not args.hybrid, (
+        "RLOO is synchronous-only: run it with --colocate. Asynchronous RLOO is out of "
+        "scope for this estimator and has not been validated, so it is rejected rather "
+        "than silently allowed."
+    )
+    assert args.n_samples_per_prompt >= 2, (
+        f"RLOO needs at least 2 samples per prompt to form a leave-one-out baseline, got "
+        f"--n-samples-per-prompt {args.n_samples_per_prompt}. A group of one has no baseline "
+        f"and would train on all-zero advantages."
+    )
+    assert args.rewards_normalization, (
+        "RLOO's leave-one-out baseline is built in the reward-normalization step, so "
+        "--disable-rewards-normalization would degrade it to REINFORCE without a baseline. "
+        "Remove that flag, or pick a different --advantage-estimator."
+    )
+    assert not args.normalize_advantages, (
+        "--normalize-advantages re-whitens advantages across the data-parallel group "
+        "(distributed_masked_whiten in loss.py), which re-introduces exactly the "
+        "standard-deviation normalization RLOO omits -- and does so after the DP split, so "
+        "the resulting advantage depends on how the batch was partitioned. Remove the flag "
+        "to keep RLOO's estimator intact."
+    )
+
+    # RLOO's objective is completion-level: a per-sample token sum normalized by
+    # the sample count. `get_sum_of_sample_mean` only yields that token sum with
+    # --calculate-per-token-loss; without it the reduction is a per-sample *mean*,
+    # which re-weights samples by response length and is not the published
+    # estimator. `uses_completion_level_reduction` keys off the same flag, so
+    # omitting it would silently swap the objective rather than fail -- exactly the
+    # failure this whole function exists to prevent. Megatron only forces the flag
+    # when CP > 1 (backends/megatron/arguments.py), so CP == 1 needs it here.
+    assert getattr(args, "calculate_per_token_loss", False), (
+        "RLOO requires --calculate-per-token-loss. Its objective sums log-probabilities over "
+        "each completion and averages over samples; without that flag the reduction is a "
+        "per-sample mean, which re-weights samples by response length and is a different "
+        "estimator. Add --calculate-per-token-loss, or pick a different --advantage-estimator."
+    )
+
+    # Exactly one optimizer step per rollout is a correctness requirement, not a
+    # tuning choice. RLOO's loss carries no importance ratio, so a second step
+    # within the same rollout trains at updated weights against log-probabilities
+    # sampled from the old ones, and nothing corrects the gap -- PPO-Clip absorbs
+    # this through the ratio, RLOO cannot. The step count is
+    # ``num_steps_per_rollout`` when set, otherwise
+    # ``rollout_batch_size * n_samples_per_prompt // global_batch_size``
+    # (see get_rollout_mini_batch_plan in backends/megatron/data.py), so both
+    # forms are checked here.
+    num_steps_per_rollout = getattr(args, "num_steps_per_rollout", None)
+    assert num_steps_per_rollout in (None, 1), (
+        f"RLOO requires exactly one optimizer step per rollout, got --num-steps-per-rollout "
+        f"{num_steps_per_rollout}. Its loss has no importance-ratio correction, so every step after "
+        f"the first trains off-policy against uncorrected log-probabilities. Set "
+        f"--num-steps-per-rollout 1, or use a clipped estimator such as grpo for multi-step updates."
+    )
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if rollout_batch_size is not None and global_batch_size:
+        samples_per_rollout = rollout_batch_size * args.n_samples_per_prompt
+        assert samples_per_rollout == global_batch_size, (
+            f"RLOO requires exactly one optimizer step per rollout, so rollout_batch_size "
+            f"({rollout_batch_size}) * n_samples_per_prompt ({args.n_samples_per_prompt}) = "
+            f"{samples_per_rollout} must equal --global-batch-size ({global_batch_size}); this "
+            f"configuration yields {samples_per_rollout / global_batch_size:g} steps. Its loss has no "
+            f"importance-ratio correction, so every step after the first trains off-policy against "
+            f"uncorrected log-probabilities."
+        )
+
+    # --kl-coef shapes the reward before the advantage is formed. RLOO reuses
+    # get_grpo_returns, which takes only the *shape* of kl and drops its values,
+    # so a non-zero coefficient would pay for the reference forward and its
+    # communication while leaving the training objective bit-for-bit unchanged.
+    # (GRPO inherits the same property; fixing it there would change existing
+    # numerics, so it is out of scope here.) Reward-shaped KL for RLOO is a
+    # deliberate follow-up, so the flag is refused rather than silently ignored;
+    # --use-kl-loss is the supported route and is applied as an additive term in
+    # policy_loss_function.
+    assert getattr(args, "kl_coef", 0) == 0, (
+        f"--kl-coef {args.kl_coef} has no effect under RLOO: the advantage is built from "
+        f"get_grpo_returns, which uses only the shape of the reference KL and not its values, so "
+        f"the reference forward would be computed and discarded. Use --use-kl-loss (with "
+        f"--kl-loss-coef) to add a KL term to the loss, or set --kl-coef 0."
+    )
+
+    # Every hook below replaces or short-circuits the code that builds the
+    # leave-one-out baseline, so RLOO would degrade to baseline-free REINFORCE
+    # without any error -- the same failure --disable-rewards-normalization
+    # causes, reached through a different door. The first two return from
+    # post_process_rewards before the group-normalization branch; the third
+    # replaces convert_samples_to_train_data, which is what calls it at all.
+    for flag, attribute, reason in (
+        (
+            "--custom-reward-post-process-path",
+            "custom_reward_post_process_path",
+            "post_process_rewards returns that function's output before reaching the RLOO branch",
+        ),
+        (
+            "--agentic-custom-advantage-path",
+            "agentic_custom_advantage_path",
+            "post_process_rewards returns Sample.custom_advantage before reaching the RLOO branch",
+        ),
+        (
+            "--custom-convert-samples-to-train-data-path",
+            "custom_convert_samples_to_train_data_path",
+            "that function replaces convert_samples_to_train_data, which is what calls post_process_rewards",
+        ),
+    ):
+        assert getattr(args, attribute, None) is None, (
+            f"{flag} bypasses RLOO's leave-one-out baseline: {reason}, so training would silently "
+            f"run baseline-free REINFORCE. Compute the leave-one-out baseline inside your own "
+            f"function and pick a different --advantage-estimator, or drop {flag}."
+        )
+
+
 def _validate_actor_critic_resume_consistency(config: Namespace) -> None:
     """Keep actor and critic checkpoints in lockstep.
 
@@ -332,6 +469,93 @@ def compute_cispo_loss(
     return pg_loss, clipfrac
 
 
+def get_rloo_baseline(
+    raw_rewards: list[float] | torch.Tensor,
+    advantages: list[torch.Tensor],
+) -> torch.Tensor:
+    """Recover RLOO's leave-one-out baseline as a per-token tensor.
+
+    The baseline is never materialised -- the group-normalization step emits only
+    the advantage -- but it follows from the definition::
+
+        A_i = R_i - b_i   =>   b_i = R_i - A_i
+
+    so broadcasting each sample's scalar raw reward over that sample's advantage
+    tensor and subtracting recovers it.
+
+    The layout is taken from ``advantages`` rather than from ``response_lengths``,
+    and that is the whole point of this function: under CP>1 the advantages are
+    the rank-local shard while ``response_lengths`` stays full-length, so building
+    the broadcast from lengths produces a tensor of the wrong size (measured on
+    8xH100: 1536 against an advantage shard of 740). Following ``get_grpo_returns``
+    and using ``ones_like`` on each advantage keeps static CP, dynamic CP and CP=1
+    correct without branching.
+
+    Args:
+        raw_rewards: One scalar per sample, in the same order as ``advantages``.
+        advantages: Per-sample advantage tensors, already in whatever layout the
+            caller's reduction expects.
+
+    Returns:
+        The concatenated per-token baseline ``R_i - A_i``, same shape as
+        ``torch.cat(advantages)``.
+
+    Raises:
+        ValueError: If the two inputs disagree in length, which would otherwise
+            truncate silently and yield a baseline shorter than the advantages.
+    """
+    if len(raw_rewards) != len(advantages):
+        raise ValueError(
+            f"raw_rewards has {len(raw_rewards)} entries but advantages has {len(advantages)}; "
+            f"they must be one-to-one per sample."
+        )
+    per_sample = [torch.ones_like(a) * r - a for a, r in zip(advantages, raw_rewards, strict=True)]
+    return torch.cat(per_sample)
+
+
+def compute_rloo_loss(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes the RLOO policy-gradient loss: unclipped REINFORCE.
+
+    RLOO's objective is plain REINFORCE against a leave-one-out baseline, with no
+    trust region at all (https://arxiv.org/abs/2402.14740):
+
+        L_i = -stop_grad(A_i) * log pi_theta(y_i)
+
+    This is deliberately *not* PPO-Clip. Reusing the clipped objective would make
+    the estimator "GRPO with a leave-one-out baseline" rather than RLOO as
+    published, and the clipping would additionally bias an estimator whose whole
+    point is being unbiased.
+
+    Relationship to the neighbouring losses: this is ``compute_cispo_loss`` with
+    the importance-ratio coefficient fixed at 1, i.e. no clipping and no ratio
+    correction. Gradients flow ONLY through ``log_probs``.
+
+    Note on off-policy drift: with no ratio correction, RLOO assumes the sampling
+    policy equals the training policy. That holds only when a rollout yields a
+    single optimizer step, i.e. ``rollout_batch_size * n_samples_per_prompt ==
+    global_batch_size``. With more than one step the later steps train at updated
+    weights against log-probabilities sampled from the old ones and nothing
+    corrects the gap -- PPO-Clip absorbs this through the ratio, RLOO cannot.
+
+    Args:
+        log_probs: Current-policy log-probabilities (the only gradient source).
+            Shape: ``[total_tokens]``.
+        advantages: Advantage values, shape matches ``log_probs``.
+
+    Returns:
+        pg_loss: Element-wise loss (negative objective). NO reduction applied --
+            the caller's reduction decides whether this ends up sequence-mean or
+            token-weighted.
+        clipfrac: All zeros, since nothing is clipped. Returned only to keep the
+            call signature uniform with the other estimators' losses.
+    """
+    pg_loss = -(advantages.detach() * log_probs)
+    return pg_loss, torch.zeros_like(pg_loss)
+
+
 @torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
@@ -415,6 +639,66 @@ def get_grpo_returns(
     for i in range(len(rewards)):
         returns.append(torch.ones_like(kl[i]) * rewards[i])
     return returns
+
+
+def get_rloo_advantages(rewards: torch.Tensor) -> torch.Tensor:
+    """RLOO advantages: leave-one-out baseline, no std scaling.
+
+    Each sample is scored against the mean of the *other* ``k - 1`` samples, which
+    keeps the baseline independent of the sample it evaluates and therefore
+    unbiased (https://arxiv.org/abs/2402.14740)::
+
+        A_i = R_i - mean(R_j for j != i)
+
+    Args:
+        rewards: Raw (un-centered) rewards of a single group, shape ``[k]``.
+
+    Returns:
+        Advantages with the same shape as ``rewards``. Floating-point dtypes are
+        preserved; integer rewards are promoted by the division rather than
+        truncated. A group of one has no leave-one-out baseline, so its
+        advantage is zero.
+
+    Raises:
+        ValueError: If ``rewards`` is not 1-D. The baseline is a whole-group
+            reduction, so a 2-D input would silently be treated as one large
+            group and return wrong numbers rather than failing.
+    """
+    if rewards.dim() != 1:
+        raise ValueError(f"rewards must be 1-D (one group), got shape {tuple(rewards.shape)}.")
+    k = rewards.numel()
+    if k < 2:
+        return torch.zeros_like(rewards)
+    return (rewards * k - rewards.sum()) / (k - 1)
+
+
+def scale_centered_rewards_for_rloo(centered_rewards: torch.Tensor) -> torch.Tensor:
+    """Turn group-centered rewards into RLOO advantages.
+
+    ``A_i = R_i - mean(R_j for j != i)`` is algebraically ``k / (k - 1)`` times the
+    group-centered reward, so callers that already subtracted the group mean only
+    need this rescale instead of recomputing the baseline. Kept separate from
+    :func:`get_rloo_advantages` so both forms can be cross-checked in tests.
+
+    Args:
+        centered_rewards: Rewards of a single group after subtracting the group
+            mean, shape ``[k]``.
+
+    Returns:
+        Advantages with the same shape and dtype -- scaling by a Python float does
+        not upcast a float32 input. A group of one is zeroed, matching
+        :func:`get_rloo_advantages`.
+
+    Raises:
+        ValueError: If ``centered_rewards`` is not 1-D, for the same reason as
+            :func:`get_rloo_advantages`.
+    """
+    if centered_rewards.dim() != 1:
+        raise ValueError(f"centered_rewards must be 1-D (one group), got shape {tuple(centered_rewards.shape)}.")
+    k = centered_rewards.numel()
+    if k < 2:
+        return torch.zeros_like(centered_rewards)
+    return centered_rewards * (k / (k - 1))
 
 
 def get_reinforce_plus_plus_returns(

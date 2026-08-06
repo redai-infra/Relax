@@ -26,16 +26,19 @@ from relax.utils.training.ppo_utils import (
     compute_log_probs,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_rloo_loss,
     compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    get_rloo_baseline,
 )
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
     all_gather_with_cp,
+    get_cp_local_num_samples,
     get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
@@ -516,7 +519,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
+    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "rloo", "ppo", "reinforce_plus_plus",
     and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
@@ -566,7 +569,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
@@ -758,6 +761,41 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def uses_completion_level_reduction(args: Namespace) -> bool:
+    """Whether this estimator's objective is a per-sample token *sum*.
+
+    RLOO optimizes ``mean_i(-A_i * sum_t log pi(y_it))`` -- the log-probability is
+    summed over the whole completion and only then averaged over samples, with no
+    length normalization anywhere. Every other estimator optimizes a per-token
+    mean.
+
+    With ``--calculate-per-token-loss`` the reduction ``get_sum_of_sample_mean``
+    returns is already the per-sample token sum; what differs is the denominator
+    Megatron divides by, which is a token count rather than a sample count. So the
+    completion-level objective needs no third reduction mode -- only a different
+    normalizer, applied in ``get_batch_and_compute_loss``.
+
+    Keeping the predicate in one place so the loss scaling, the gradient
+    normalizer and the metric denominator cannot drift apart: all three key off
+    this function.
+
+    Args:
+        args: Parsed arguments; ``advantage_estimator`` and
+            ``calculate_per_token_loss`` are read.
+
+    Returns:
+        True when the loss must be normalized by sample count rather than token
+        count. False when ``--calculate-per-token-loss`` is off, since then the
+        reduction is a per-sample mean and the sample-count denominator would not
+        give the paper's objective either -- ``validate_rloo_args`` requires the
+        flag for RLOO, so this is unreachable rather than a silent fallback.
+    """
+    return (
+        getattr(args, "advantage_estimator", None) == "rloo"
+        and getattr(args, "calculate_per_token_loss", False) is True
+    )
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -908,6 +946,10 @@ def policy_loss_function(
         pg_loss, pg_clipfrac = compute_sapo_loss(
             ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg
         )
+    elif args.advantage_estimator == "rloo":
+        # RLOO is unclipped REINFORCE against a leave-one-out baseline; it must not
+        # go through PPO-Clip. See compute_rloo_loss for why.
+        pg_loss, pg_clipfrac = compute_rloo_loss(log_probs=log_probs, advantages=advantages)
     elif args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(
             log_probs=log_probs,
@@ -1060,6 +1102,37 @@ def policy_loss_function(
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if args.advantage_estimator == "rloo":
+        # RLOO-specific monitoring. The task asks for the estimator's own metrics,
+        # and the generic advantage mean is not informative here: leave-one-out
+        # advantages sum to zero per group, so their mean is ~0 by construction.
+        # What matters is the *magnitude* (does the signal survive?) and how much
+        # of the batch carries no signal at all.
+        with torch.no_grad():
+            abs_adv = sum_of_sample_mean(advantages.abs())
+            # Fraction of tokens whose advantage is exactly zero, and which
+            # therefore contribute no gradient. The dominant cause is a group that
+            # scored identically throughout -- all-correct or all-wrong -- so this
+            # tracks reward saturation long before the reward curve flattens. Note
+            # it is a per-token count, not a per-group one: for k >= 3 a single
+            # sample can sit exactly at the group mean (rewards 1, 0.5, 0 gives
+            # advantages 0.75, 0, -0.75) and is counted here too.
+            no_signal = sum_of_sample_mean((advantages == 0).to(advantages.dtype))
+            # The baseline itself, which the task names alongside advantage and
+            # loss. It is never materialised -- the group-norm step emits only the
+            # advantage -- but for RLOO it follows from the raw reward:
+            #     A_i = R_i - b_i  =>  b_i = R_i - A_i
+            # `raw_reward` is a per-sample scalar, so broadcast it over that
+            # sample's response tokens and subtract. Emitting it per token keeps it
+            # on exactly the same normalization path as pg_loss, which matters
+            # because every entry in reported_loss is an unnormalized sum that
+            # model.py divides by the global token/sample count.
+            adv_list = batch["advantages"] if isinstance(batch["advantages"], list) else [advantages]
+            baseline = sum_of_sample_mean(get_rloo_baseline(batch["raw_reward"], adv_list))
+        reported_loss["rloo_advantage_abs"] = abs_adv.clone().detach()
+        reported_loss["rloo_no_signal_fraction"] = no_signal.clone().detach()
+        reported_loss["rloo_baseline"] = baseline.clone().detach()
 
     reported_loss.update(opd_reported_loss)
 
@@ -1291,6 +1364,30 @@ def loss_function(
     )
     num_samples = len(batch["response_lengths"])
 
+    # RLOO's objective is completion-level: sum log-probabilities over each
+    # response, then average over samples. With --calculate-per-token-loss the
+    # reduction below already gives the per-sample token sum, so the only thing
+    # that differs is what the gradient is normalized by -- samples, not tokens.
+    # Counted so that it all-reduces to the true sample count across the CP group,
+    # the same property get_cp_local_num_tokens gives the token denominator.
+    #
+    # Deliberately separate from `num_tokens`, which stays the *metric*
+    # denominator: reported pg_loss / entropy_loss / ppo_kl remain per-token means
+    # and so remain comparable with the other estimators. Only the gradient
+    # normalization changes.
+    grad_num_tokens = num_tokens
+    if uses_completion_level_reduction(args):
+        grad_num_tokens = get_cp_local_num_samples(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            args.qkv_format,
+            batch.get("max_seq_lens", None),
+            batch.get("padded_total_lengths", None),
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
+
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -1377,6 +1474,9 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
+    # Gradient normalizer; equals effective_num_tokens except for completion-level
+    # estimators, where it is the CP-local sample count instead.
+    effective_grad_num_tokens = torch.zeros_like(grad_num_tokens) if is_dummy else grad_num_tokens
     log_values = torch.tensor(
         [
             num_samples if not args.calculate_per_token_loss else effective_num_tokens,
@@ -1390,7 +1490,7 @@ def loss_function(
 
     return (
         loss,
-        (effective_num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        (effective_grad_num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
         {
             "keys": list(log.keys()),
             "values": log_values,

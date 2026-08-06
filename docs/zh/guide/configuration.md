@@ -299,7 +299,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `ppo`, `sapo`, `cispo` | 优势估计器。OPD 独立于该选项，使用 `--use-opd` 及对应 KL/loss 系数启用 |
+| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `ppo`, `sapo`, `cispo`, `rloo` | 优势估计器。OPD 独立于该选项，使用 `--use-opd` 及对应 KL/loss 系数启用 |
 | `--normalize-advantages` | flag | False | - | 是否归一化优势 |
 | `--disable-grpo-std-normalization` | flag | - | - | 禁用 GRPO 标准差归一化（来自 [Dr.GRPO](https://arxiv.org/pdf/2503.20783)） |
 | `--disable-rewards-normalization` | flag | - | - | 禁用 reward 归一化 |

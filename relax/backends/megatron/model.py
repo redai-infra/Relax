@@ -1027,6 +1027,11 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "max_seq_lens",
+                    # RLOO reports the leave-one-out baseline, which is the raw
+                    # reward minus the advantage; DataIterator yields None for a
+                    # key the rollout side did not produce, so this is inert for
+                    # every other estimator.
+                    "raw_reward",
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
