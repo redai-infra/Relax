@@ -1582,7 +1582,7 @@ index 8df4df1..f39eff8 100644
 -                seq_len,
 +                seq_len_global,
                  "cu_seqlens_q",
-+                cp_size=cp_size_chunkwise,
++                cp_size=cp_size,
              )
              cu_seqlens_kv = self._resolve_cu_seqlens(
                  packed_seq_params.cu_seqlens_kv_padded,
@@ -1590,7 +1590,7 @@ index 8df4df1..f39eff8 100644
 -                seq_len,
 +                seq_len_global,
                  "cu_seqlens_kv",
-+                cp_size=cp_size_chunkwise,
++                cp_size=cp_size,
              )
              assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                  "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -1882,26 +1882,21 @@ index 8df4df1..f39eff8 100644
          """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
          if cu_seqlens_padded is not None:
              cu_seqlens = cu_seqlens_padded
-@@ -582,6 +761,18 @@ class GatedDeltaNet(MegatronModule):
+@@ -582,6 +761,13 @@ class GatedDeltaNet(MegatronModule):
                  f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
              )
  
-+        if cp_size > 1:
-+            # Chunkwise CP slices the packed buffer per sequence; a sequence whose padded
-+            # length is not a multiple of the CP size cannot be split evenly. (The zigzag
-+            # layout needs 2*cp; that stricter check lives in the layout conversion, which
-+            # reports the offending lengths.)
-+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-+            if (seq_lengths % cp_size != 0).any():
-+                raise ValueError(
-+                    f"GDN: all per-sequence lengths in {name} must be divisible by "
-+                    f"cp_size={cp_size}, but got lengths: {seq_lengths.tolist()}"
-+                )
++        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
++        if (seq_lengths % cp_size != 0).any():
++            raise ValueError(
++                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
++                f"but got lengths: {seq_lengths.tolist()}"
++            )
 +
          return cu_seqlens
  
      def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
-@@ -780,8 +971,10 @@ def get_parameter_local_cp(
+@@ -780,8 +966,10 @@ def get_parameter_local_cp(
          torch.Tensor: The local parameter for the current context parallel rank.
      """
  
@@ -1914,7 +1909,7 @@ index 8df4df1..f39eff8 100644
  
      # No need to split if CP size is 1.
      if cp_size == 1:
-@@ -800,7 +993,7 @@ def get_parameter_local_cp(
+@@ -800,7 +988,7 @@ def get_parameter_local_cp(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
@@ -1923,7 +1918,7 @@ index 8df4df1..f39eff8 100644
      return param
  
  
-@@ -935,7 +1128,8 @@ def torch_chunk_gated_delta_rule(
+@@ -935,7 +1123,8 @@ def torch_chunk_gated_delta_rule(
      initial_state=None,
      output_final_state=False,
      use_qk_l2norm_in_kernel=False,
@@ -1932,7 +1927,7 @@ index 8df4df1..f39eff8 100644
  ):
      # pylint: disable=line-too-long
      '''
-@@ -948,6 +1142,9 @@ def torch_chunk_gated_delta_rule(
+@@ -948,6 +1137,9 @@ def torch_chunk_gated_delta_rule(
      assert (
          cu_seqlens is None
      ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
