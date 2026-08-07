@@ -1262,20 +1262,20 @@ def dpo_loss_function(
     strict = reward_margin > 0
     correct = reward_margin > 1e-6
     metrics = {
-        "loss": pair_losses.detach().sum(),
-        "dpo_logps_chosen": policy_chosen.detach().sum(),
-        "dpo_logps_rejected": policy_rejected.detach().sum(),
-        "dpo_chosen_reward": chosen_rewards.detach().sum(),
-        "dpo_rejected_reward": rejected_rewards.detach().sum(),
-        "dpo_reward_margin": reward_margin.detach().sum(),
-        "dpo_strict_accuracy": strict.to(torch.float32).detach().sum(),
-        "dpo_tie_rate": tie.to(torch.float32).detach().sum(),
-        "dpo_tie_aware_accuracy": (correct.to(torch.float32) + 0.5 * tie.to(torch.float32)).detach().sum(),
+        "dpo/loss": pair_losses.detach().sum(),
+        "dpo/logps_chosen": policy_chosen.detach().sum(),
+        "dpo/logps_rejected": policy_rejected.detach().sum(),
+        "dpo/reward_chosen": chosen_rewards.detach().sum(),
+        "dpo/reward_rejected": rejected_rewards.detach().sum(),
+        "dpo/reward_margin": reward_margin.detach().sum(),
+        "dpo/strict_accuracy": strict.to(torch.float32).detach().sum(),
+        "dpo/tie_rate": tie.to(torch.float32).detach().sum(),
+        "dpo/tie_aware_accuracy": (correct.to(torch.float32) + 0.5 * tie.to(torch.float32)).detach().sum(),
     }
-    metrics["dpo_pair_accuracy"] = metrics["dpo_strict_accuracy"]
+    metrics["dpo/pair_accuracy"] = metrics["dpo/strict_accuracy"]
     if not reference_free:
-        metrics["dpo_ref_logps_chosen"] = reference_chosen.detach().sum()
-        metrics["dpo_ref_logps_rejected"] = reference_rejected.detach().sum()
+        metrics["dpo/ref_logps_chosen"] = reference_chosen.detach().sum()
+        metrics["dpo/ref_logps_rejected"] = reference_rejected.detach().sum()
     return loss, metrics
 
 

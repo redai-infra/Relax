@@ -55,12 +55,12 @@ def test_production_dpo_loss_matches_independent_reference_and_gradients(monkeyp
     expected.backward()
     torch.testing.assert_close(actual_grad, policy.grad)
     assert {
-        "dpo_logps_chosen",
-        "dpo_logps_rejected",
-        "dpo_ref_logps_chosen",
-        "dpo_ref_logps_rejected",
-        "dpo_tie_rate",
-        "dpo_tie_aware_accuracy",
+        "dpo/logps_chosen",
+        "dpo/logps_rejected",
+        "dpo/ref_logps_chosen",
+        "dpo/ref_logps_rejected",
+        "dpo/tie_rate",
+        "dpo/tie_aware_accuracy",
     }.issubset(metrics)
 
 
@@ -80,9 +80,9 @@ def test_tie_metrics_are_epsilon_aware(monkeypatch):
         [-1.0, -2.0, -0.5, -0.75],
         ref_values=[-1.0, -2.0, -0.5, -0.75],
     )
-    assert metrics["dpo_strict_accuracy"].item() == 0
-    assert metrics["dpo_tie_rate"].item() == 2
-    assert metrics["dpo_tie_aware_accuracy"].item() == 1
+    assert metrics["dpo/strict_accuracy"].item() == 0
+    assert metrics["dpo/tie_rate"].item() == 2
+    assert metrics["dpo/tie_aware_accuracy"].item() == 1
 
 
 def test_reference_free_partition_and_num_samples_do_not_change_pair_sum(monkeypatch):

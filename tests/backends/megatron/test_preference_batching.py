@@ -2,7 +2,10 @@
 
 """Preference-row atomicity and dynamic batching tests."""
 
+import hashlib
+import inspect
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 import torch
@@ -92,3 +95,58 @@ def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch):
 def test_oversize_error_names_pair_cost_and_capacity():
     with pytest.raises(ValueError, match=r"oversize preference pair 'pair-x'.*cost 11, capacity=10"):
         pack_preference_pair_indices([11], ["pair-x"], capacity=10)
+
+
+def test_pinned_seqlen_sampler_consumes_pair_costs_and_keeps_equal_dp_groups():
+    """Exercise the Docker-pinned TransferQueue sampler, not a local stand-
+    in."""
+    transfer_queue = pytest.importorskip("transfer_queue")
+    sampler_type = transfer_queue.SeqlenBalancedSampler
+    source_path = Path(inspect.getsourcefile(sampler_type) or "")
+    normalized_source = source_path.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(normalized_source).hexdigest() == (
+        "dc6c2db50df4b9448d4845ccacef67a400517db892b5cd55de2e22f6baf6888b"
+    )
+
+    class PairPartition:
+        def __init__(self, pair_rows):
+            self.requested_indexes = None
+            self.metadata = {
+                index: {"total_lengths": len(row["chosen_tokens"]) + len(row["rejected_tokens"])}
+                for index, row in enumerate(pair_rows)
+            }
+
+        def get_custom_meta(self, indexes):
+            self.requested_indexes = list(indexes)
+            return {index: self.metadata[index] for index in indexes}
+
+    rows = [
+        {"pair_id": 100, "chosen_tokens": list(range(60)), "rejected_tokens": list(range(40))},
+        {"pair_id": 101, "chosen_tokens": list(range(50)), "rejected_tokens": list(range(40))},
+        {"pair_id": 102, "chosen_tokens": list(range(6)), "rejected_tokens": list(range(4))},
+        {"pair_id": 103, "chosen_tokens": [0], "rejected_tokens": [1]},
+    ]
+    partition = PairPartition(rows)
+    sampler = sampler_type(n_samples_per_prompt=1, dp_size=2)
+    assignments = []
+    for rank in range(2):
+        sampled, consumed = sampler.sample(
+            [0, 1, 2, 3],
+            batch_size=2,
+            task_name="dpo",
+            partition_id="train_0",
+            dp_rank=rank,
+            batch_index=0,
+            partition=partition,
+        )
+        assert sampled == consumed
+        assert len(sampled) == 2
+        assignments.append(sampled)
+        for index in sampled:
+            assert rows[index]["pair_id"] == 100 + index
+            assert set(rows[index]) == {"pair_id", "chosen_tokens", "rejected_tokens"}
+
+    assert partition.requested_indexes == [0, 1, 2, 3]
+    assert sorted(index for rank_rows in assignments for index in rank_rows) == [0, 1, 2, 3]
+    rank_costs = [sum(partition.metadata[index]["total_lengths"] for index in rank_rows) for rank_rows in assignments]
+    assert sorted(rank_costs) == [100, 102]
