@@ -184,6 +184,13 @@ def _opd_args() -> SimpleNamespace:
     )
 
 
+def _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args) -> None:
+    """Mirror parse_args ordering: load custom YAML, then run the backend
+    resolver."""
+    arguments_module.slime_validate_args(args)
+    megatron_arguments_module._resolve_optimizer_precision_args(args)
+
+
 def test_opd_sampled_token_loss_is_accepted(arguments_module):
     args = _opd_args()
     args.opd_kl_coef = 0.0
@@ -204,11 +211,13 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     assert args.rollout_num_gpus == 4
 
 
-def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monkeypatch, tmp_path):
+def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text("fp16: true\n")
     warning = Mock()
-    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
     args = _opd_args()
     args.fp16 = False
     args.bf16 = True
@@ -218,7 +227,7 @@ def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monk
     args.store_param_remainders = None
     args.custom_config_path = str(config_path)
 
-    arguments_module.slime_validate_args(args)
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
     assert args.fp16 is True
     assert args.bf16 is False
@@ -229,17 +238,19 @@ def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(arguments_module, monk
     warning.assert_called_once()
 
 
-def test_custom_config_disabling_cli_fp16_preserves_fp32_baseline(arguments_module, monkeypatch, tmp_path):
+def test_custom_config_disabling_cli_fp16_preserves_fp32_baseline(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text("fp16: false\n")
     warning = Mock()
-    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
     args = _opd_args()
     args.fp16 = True
     args.bf16 = False
     args.custom_config_path = str(config_path)
 
-    arguments_module.slime_validate_args(args)
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
     assert args.fp16 is False
     assert args.bf16 is False
@@ -247,17 +258,19 @@ def test_custom_config_disabling_cli_fp16_preserves_fp32_baseline(arguments_modu
     warning.assert_not_called()
 
 
-def test_custom_config_fp16_false_preserves_existing_bf16(arguments_module, monkeypatch, tmp_path):
+def test_custom_config_fp16_false_preserves_existing_bf16(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text("fp16: false\n")
     warning = Mock()
-    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
     args = _opd_args()
     args.fp16 = False
     args.bf16 = True
     args.custom_config_path = str(config_path)
 
-    arguments_module.slime_validate_args(args)
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
     assert args.fp16 is False
     assert args.bf16 is True
@@ -284,21 +297,23 @@ def test_custom_config_precision_flags_require_booleans(arguments_module, tmp_pa
         arguments_module.slime_validate_args(args)
 
 
-def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, tmp_path):
+def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, megatron_arguments_module, tmp_path):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text("fp16: true\ninitial_loss_scale: 0\n")
     args = _opd_args()
     args.custom_config_path = str(config_path)
 
     with pytest.raises(ValueError, match="--initial-loss-scale"):
-        arguments_module.slime_validate_args(args)
+        _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
 
-def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(arguments_module, monkeypatch, tmp_path):
+def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text("fp16: true\nloss_scale: 1024\n")
     warning = Mock()
-    monkeypatch.setattr(arguments_module.logger, "warning", warning)
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
     args = _opd_args()
     args.fp16 = False
     args.bf16 = True
@@ -308,7 +323,7 @@ def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(arguments_m
     args.store_param_remainders = None
     args.custom_config_path = str(config_path)
 
-    arguments_module.slime_validate_args(args)
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
     assert args.fp16 is True
     assert args.bf16 is False
@@ -327,14 +342,16 @@ def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(arguments_m
     "loss_scale",
     ["true", '"1024"', ".nan", ".inf", "0", "-1"],
 )
-def test_custom_config_rejects_invalid_static_loss_scale(arguments_module, tmp_path, loss_scale):
+def test_custom_config_rejects_invalid_static_loss_scale(
+    arguments_module, megatron_arguments_module, tmp_path, loss_scale
+):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text(f"fp16: true\nloss_scale: {loss_scale}\n")
     args = _opd_args()
     args.custom_config_path = str(config_path)
 
     with pytest.raises(ValueError, match="--loss-scale"):
-        arguments_module.slime_validate_args(args)
+        _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
 
 @pytest.mark.parametrize(
@@ -350,14 +367,16 @@ def test_custom_config_rejects_invalid_static_loss_scale(arguments_module, tmp_p
         ('fp16: false\nbf16: false\nstore_param_remainders: "false"\n', "--store-param-remainders"),
     ],
 )
-def test_custom_config_rejects_non_boolean_optimizer_values(arguments_module, tmp_path, config, option):
+def test_custom_config_rejects_non_boolean_optimizer_values(
+    arguments_module, megatron_arguments_module, tmp_path, config, option
+):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text(config)
     args = _opd_args()
     args.custom_config_path = str(config_path)
 
     with pytest.raises(ValueError, match=option):
-        arguments_module.slime_validate_args(args)
+        _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
 
 
 def test_custom_config_rejects_simultaneous_fp16_and_bf16(arguments_module, tmp_path):

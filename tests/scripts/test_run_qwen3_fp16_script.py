@@ -82,10 +82,20 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
     pytest.importorskip("megatron.core")
     torch = pytest.importorskip("torch")
 
+    from relax.backends.megatron import arguments as megatron_arguments
     from relax.backends.megatron import model
     from relax.backends.megatron.arguments import megatron_parse_args
     from relax.backends.megatron.arguments import validate_args as megatron_validate_args
-    from relax.utils.arguments import _normalize_precision_optimizer_args, get_slime_extra_args_provider
+    from relax.utils.arguments import get_slime_extra_args_provider
+
+    resolver_calls = []
+    original_resolver = megatron_arguments._resolve_optimizer_precision_args
+
+    def counted_resolver(args):
+        resolver_calls.append(args)
+        return original_resolver(args)
+
+    monkeypatch.setattr(megatron_arguments, "_resolve_optimizer_precision_args", counted_resolver)
 
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     monkeypatch.setattr(sys, "argv", ["probe", *argv[command_separator + 4 :]])
@@ -93,10 +103,10 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
         extra_args_provider=get_slime_extra_args_provider(),
         skip_hf_validate=True,
     )
-    _normalize_precision_optimizer_args(args)
     args = megatron_validate_args(args)
     config = model.OptimizerConfig(**model._build_optimizer_config_kwargs(args))
 
+    assert resolver_calls == [args]
     assert config.initial_loss_scale == 65536.0
     assert config.min_loss_scale == 2.0
     assert config.use_precision_aware_optimizer is False
@@ -132,24 +142,44 @@ def test_custom_config_only_fp16_reaches_optimizer_kwargs(tmp_path: Path, monkey
     pytest.importorskip("megatron.core")
     torch = pytest.importorskip("torch")
 
+    from relax.backends.megatron import arguments as megatron_arguments
     from relax.backends.megatron import model
     from relax.utils.arguments import parse_args
+
+    canonical_fallbacks = {
+        "initial_loss_scale": 16384.0,
+        "min_loss_scale": 4.0,
+        "use_precision_aware_optimizer": False,
+        "store_param_remainders": True,
+    }
+    for name, value in canonical_fallbacks.items():
+        monkeypatch.setitem(megatron_arguments._FP16_OPTIMIZER_FALLBACKS, name, value)
+
+    resolver_calls = []
+    original_resolver = megatron_arguments._resolve_optimizer_precision_args
+
+    def counted_resolver(args):
+        resolver_calls.append(args)
+        return original_resolver(args)
+
+    monkeypatch.setattr(megatron_arguments, "_resolve_optimizer_precision_args", counted_resolver)
 
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     monkeypatch.setattr(sys, "argv", ["probe", *training_args])
     args = parse_args()
     assert args.fp16 is True
     assert args.bf16 is False
+    assert resolver_calls == [args]
 
     config_kwargs = model._build_optimizer_config_kwargs(args)
 
     assert config_kwargs["fp16"] is True
     assert config_kwargs["bf16"] is False
     assert config_kwargs["params_dtype"] is torch.float16
-    assert config_kwargs["initial_loss_scale"] == 32768.0
-    assert config_kwargs["min_loss_scale"] == 1.0
-    assert config_kwargs["use_precision_aware_optimizer"] is True
-    assert config_kwargs["store_param_remainders"] is False
+    assert config_kwargs["initial_loss_scale"] == canonical_fallbacks["initial_loss_scale"]
+    assert config_kwargs["min_loss_scale"] == canonical_fallbacks["min_loss_scale"]
+    assert config_kwargs["use_precision_aware_optimizer"] is canonical_fallbacks["use_precision_aware_optimizer"]
+    assert config_kwargs["store_param_remainders"] is canonical_fallbacks["store_param_remainders"]
 
 
 def test_static_loss_scale_reaches_optimizer_without_dynamic_scales(tmp_path: Path, monkeypatch) -> None:

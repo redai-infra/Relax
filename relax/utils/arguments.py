@@ -2,10 +2,8 @@
 
 import argparse
 import json
-import math
 import os
 import warnings
-from numbers import Real
 from typing import Any
 
 import yaml
@@ -2580,7 +2578,7 @@ def parse_args(add_custom_arguments=None):
     # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
     # are silently ignored by the megatron parser.
-    from relax.backends.megatron.arguments import megatron_parse_args
+    from relax.backends.megatron.arguments import _resolve_optimizer_precision_args, megatron_parse_args
     from relax.backends.megatron.arguments import validate_args as megatron_validate_args
 
     args = megatron_parse_args(
@@ -2602,6 +2600,13 @@ def parse_args(add_custom_arguments=None):
             setattr(args, key, value)
 
     slime_validate_args(args)
+
+    # _set_default_megatron_args resolves optimizer precision immediately for
+    # the normal CLI path. Custom YAML is deliberately loaded later by
+    # slime_validate_args, so resolve that deferred path exactly once here,
+    # after YAML values have replaced the parser namespace.
+    if args.custom_config_path:
+        _resolve_optimizer_precision_args(args)
 
     if not args.debug_rollout_only:
         args = megatron_validate_args(args)
@@ -2711,72 +2716,6 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-prepare-pool-size must be >= 0.")
     if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
-
-
-def _is_finite_positive_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        return False
-    try:
-        return value > 0 and math.isfinite(value)
-    except (OverflowError, TypeError, ValueError):
-        return False
-
-
-def _normalize_precision_optimizer_args(args) -> None:
-    fp16 = bool(getattr(args, "fp16", False))
-    loss_scale = getattr(args, "loss_scale", None)
-    dynamic_loss_scale = loss_scale is None
-    dynamic_loss_scale_fields = {"initial_loss_scale", "min_loss_scale"}
-    if not dynamic_loss_scale:
-        if not _is_finite_positive_number(loss_scale):
-            raise ValueError(f"--loss-scale must be a finite positive number, got {loss_scale!r}.")
-        for attr in dynamic_loss_scale_fields:
-            setattr(args, attr, None)
-    if fp16:
-        fallbacks = (
-            ("initial_loss_scale", "--initial-loss-scale", 32768.0),
-            ("min_loss_scale", "--min-loss-scale", 1.0),
-            ("use_precision_aware_optimizer", "--use-precision-aware-optimizer", True),
-            ("store_param_remainders", "--store-param-remainders", False),
-        )
-    else:
-        fallbacks = (
-            ("initial_loss_scale", "--initial-loss-scale", 2**32),
-            ("min_loss_scale", "--min-loss-scale", 1.0),
-            ("use_precision_aware_optimizer", "--use-precision-aware-optimizer", False),
-            ("store_param_remainders", "--store-param-remainders", True),
-        )
-
-    missing = []
-    for attr, option, fallback in fallbacks:
-        if not dynamic_loss_scale and attr in dynamic_loss_scale_fields:
-            continue
-        if getattr(args, attr, None) is None:
-            setattr(args, attr, fallback)
-            missing.append(f"{option}={fallback}")
-
-    if fp16 and missing:
-        logger.warning("FP16 optimizer arguments omitted; applying fallbacks: " + ", ".join(missing))
-
-    if fp16 and dynamic_loss_scale:
-        for attr, option in (
-            ("initial_loss_scale", "--initial-loss-scale"),
-            ("min_loss_scale", "--min-loss-scale"),
-        ):
-            value = getattr(args, attr)
-            if not _is_finite_positive_number(value):
-                raise ValueError(f"{option} must be a finite positive number, got {value!r}.")
-
-        if args.min_loss_scale > args.initial_loss_scale:
-            raise ValueError("--min-loss-scale must be less than or equal to --initial-loss-scale.")
-
-    for attr, option in (
-        ("use_precision_aware_optimizer", "--use-precision-aware-optimizer"),
-        ("store_param_remainders", "--store-param-remainders"),
-    ):
-        value = getattr(args, attr)
-        if not isinstance(value, bool):
-            raise ValueError(f"{option} must resolve to a boolean, got {value!r}.")
 
 
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
@@ -3464,8 +3403,6 @@ def slime_validate_args(args):
 
     if bool(getattr(args, "fp16", False)) and bool(getattr(args, "bf16", False)):
         raise ValueError("fp16 and bf16 cannot both be enabled")
-
-    _normalize_precision_optimizer_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(
