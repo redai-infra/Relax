@@ -66,6 +66,43 @@ def dpo_pair_loss(
     return -F.logsigmoid(logits)
 
 
+def build_preference_pair_indices(
+    branch_pair_ids: Sequence[int], branch_is_chosen: Sequence[bool]
+) -> tuple[list[int], list[int]]:
+    """Return chosen/rejected branch indices grouped by stable pair
+    identity."""
+    if len(branch_pair_ids) != len(branch_is_chosen):
+        raise ValueError(
+            "preference pair identity fields must be branch aligned: "
+            f"{len(branch_pair_ids)} vs {len(branch_is_chosen)}"
+        )
+    if not branch_pair_ids:
+        raise ValueError("DPO micro-batch must contain at least one preference pair")
+
+    pairs: dict[int, dict[bool, int]] = {}
+    order: list[int] = []
+    for index, (raw_pair_id, raw_is_chosen) in enumerate(zip(branch_pair_ids, branch_is_chosen, strict=True)):
+        pair_id = int(raw_pair_id)
+        is_chosen = bool(raw_is_chosen)
+        if pair_id not in pairs:
+            pairs[pair_id] = {}
+            order.append(pair_id)
+        if is_chosen in pairs[pair_id]:
+            branch = "chosen" if is_chosen else "rejected"
+            raise ValueError(f"preference pair {pair_id!r} contains duplicate {branch} branches")
+        pairs[pair_id][is_chosen] = index
+
+    chosen_indices: list[int] = []
+    rejected_indices: list[int] = []
+    for pair_id in order:
+        pair = pairs[pair_id]
+        if set(pair) != {False, True}:
+            raise ValueError(f"preference pair {pair_id!r} must contain exactly one chosen and one rejected branch")
+        chosen_indices.append(pair[True])
+        rejected_indices.append(pair[False])
+    return chosen_indices, rejected_indices
+
+
 def pack_preference_pair_indices(
     costs: Sequence[int],
     pair_ids: Sequence[str],
@@ -106,6 +143,7 @@ def pack_preference_pair_indices(
 
 
 __all__ = [
+    "build_preference_pair_indices",
     "build_causal_lm_labels",
     "dpo_pair_loss",
     "pack_preference_pair_indices",

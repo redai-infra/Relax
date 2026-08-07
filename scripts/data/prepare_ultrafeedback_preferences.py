@@ -13,6 +13,23 @@ from typing import Any
 DATASET_ID = "HuggingFaceH4/ultrafeedback_binarized"
 DATASET_REVISION = "3949bf5f8c17c394422ccfab0c31ea9c20bdeb85"
 ORDER_NAMESPACE = "task31-ultrafeedback-v1:"
+REJECTION_REASON_CODES = (
+    "schema",
+    "identical",
+    "post_truncation",
+    "prompt_mismatch",
+    "empty_completion",
+    "oversize",
+)
+
+
+def _reason_code(error: BaseException) -> str:
+    message = str(error).lower()
+    if "identical" in message:
+        return "identical"
+    if "strict shared prompt" in message:
+        return "prompt_mismatch"
+    return "schema"
 
 
 def _sha256(path: Path) -> str:
@@ -53,6 +70,7 @@ def _select(dataset, *, split: str, count: int) -> tuple[list[dict[str, Any]], l
                 {
                     "prompt_id": prompt_id,
                     "source_index": index,
+                    "reason_code": "schema",
                     "reason": f"duplicate prompt_id in {split}; retained first source occurrence",
                 }
             )
@@ -69,7 +87,14 @@ def _select(dataset, *, split: str, count: int) -> tuple[list[dict[str, Any]], l
         try:
             _validate_row(row, split=split, index=source_index)
         except ValueError as exc:
-            rejected.append({"prompt_id": prompt_id, "source_index": source_index, "reason": str(exc)})
+            rejected.append(
+                {
+                    "prompt_id": prompt_id,
+                    "source_index": source_index,
+                    "reason_code": _reason_code(exc),
+                    "reason": str(exc),
+                }
+            )
             continue
         selected.append(
             {
@@ -140,6 +165,13 @@ def main() -> None:
             "rejections": {
                 "train": train_rejections,
                 "eval": eval_rejections,
+            },
+            "rejection_counts": {
+                split: {
+                    reason_code: sum(item["reason_code"] == reason_code for item in rejections)
+                    for reason_code in REJECTION_REASON_CODES
+                }
+                for split, rejections in (("train", train_rejections), ("eval", eval_rejections))
             },
         },
         "schema": {

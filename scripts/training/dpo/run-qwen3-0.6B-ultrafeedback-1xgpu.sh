@@ -27,6 +27,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --loss-type sft \
     --sft-objective dpo \
     --dpo-beta 0.1 \
+    --dpo-reference-repository Qwen/Qwen3-0.6B \
+    --dpo-reference-revision "${MODEL_REVISION}" \
     --prompt-data "${PROMPT_DATA}" \
     --input-key prompt \
     --preference-pair-id-key prompt_id \
@@ -37,9 +39,10 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --hf-checkpoint "${HF_CHECKPOINT}" \
     --ref-load "${HF_CHECKPOINT}" \
     --megatron-to-hf-mode bridge \
+    --enable-weights-backuper \
     --save "${SAVE_DIR}/${EXP_NAME}" \
     --load "${SAVE_DIR}/${EXP_NAME}" \
-    --save-interval 50 \
+    --save-interval "${SAVE_INTERVAL:-50}" \
     --num-rollout "${NUM_ROLLOUT:-200}" \
     --global-batch-size "${GLOBAL_BATCH_SIZE:-8}" \
     --use-dynamic-batch-size \
@@ -51,6 +54,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --lr "${LR:-5e-7}" \
     --lr-decay-style cosine \
     --min-lr 0 \
+    ${OVERRIDE_OPT_PARAM_SCHEDULER:+--override-opt-param-scheduler} \
     --weight-decay 0.0 \
     --clip-grad 1.0 \
     --attention-dropout 0.0 \

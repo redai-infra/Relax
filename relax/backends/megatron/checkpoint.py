@@ -109,7 +109,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
-    if exist and _is_megatron_checkpoint(load_path):
+    if exist and is_megatron_checkpoint(load_path):
         try:
             return _load_checkpoint_megatron(
                 ddp_model=ddp_model,
@@ -168,7 +168,9 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
     )
 
 
-def _is_megatron_checkpoint(path: str | Path) -> bool:
+def is_megatron_checkpoint(path: str | Path | None) -> bool:
+    if path is None:
+        return False
     return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
         re.fullmatch(r"iter_\d{7}", Path(path).name)
     )

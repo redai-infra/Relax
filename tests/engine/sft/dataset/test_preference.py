@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from relax.engine.sft.dataset.preference import PreferenceStreamingDataset, pack_preference_pairs_for_tq
+from relax.engine.sft.dataset.preference import (
+    PreferenceDataError,
+    PreferenceStreamingDataset,
+    pack_preference_pairs_for_tq,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -113,6 +117,27 @@ def test_implicit_ultrafeedback_pair_extracts_strict_common_prefix(tmp_path: Pat
     assert pair.pair_id == "pair-1"
     assert pair.chosen_completion_length == 4
     assert pair.rejected_completion_length == 3
+
+
+def test_rejection_reason_is_classified_counted_and_still_fail_fast(tmp_path: Path):
+    path = tmp_path / "identical.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "prompt_id": "pair-identical",
+                "prompt": [{"role": "user", "content": "question"}],
+                "chosen": {"role": "assistant", "content": "same"},
+                "rejected": {"role": "assistant", "content": "same"},
+            }
+        ],
+    )
+    dataset = _dataset(path)
+    with pytest.raises(PreferenceDataError) as exc_info:
+        dataset.get_processed_pair(0)
+    assert exc_info.value.reason_code == "identical"
+    assert dataset.rejection_counts == {"identical": 1}
+    assert dataset.rejection_records[0]["pair_id"] == "pair-identical"
 
 
 @pytest.mark.parametrize(

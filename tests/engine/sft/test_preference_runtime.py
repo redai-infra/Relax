@@ -35,6 +35,8 @@ def _args(**overrides) -> Namespace:
         "eval_size": None,
         "dpo_beta": 0.1,
         "dpo_reference_free": False,
+        "dpo_reference_repository": "Qwen/Qwen3-0.6B",
+        "dpo_reference_revision": "fixed-revision",
         "ref_update_interval": None,
         "enable_weights_backuper": True,
         "preference_max_length": 1024,
@@ -75,3 +77,8 @@ def test_preference_validation_rejects_unsupported_configs(overrides: dict, matc
 
 def test_reference_free_dpo_does_not_require_ref_update_constraint():
     validate_preference_args(_args(dpo_reference_free=True, ref_update_interval=10))
+
+
+def test_standard_dpo_requires_explicit_reference_repository_and_revision():
+    with pytest.raises(ValueError, match="dpo-reference-repository"):
+        validate_preference_args(_args(dpo_reference_repository=None))

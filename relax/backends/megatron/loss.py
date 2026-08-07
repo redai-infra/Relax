@@ -32,7 +32,7 @@ from relax.utils.training.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from relax.utils.training.preference_utils import dpo_pair_loss
+from relax.utils.training.preference_utils import build_preference_pair_indices, dpo_pair_loss
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1185,8 +1185,7 @@ def dpo_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute a pair-summed DPO objective over adjacent chosen/rejected
-    branches."""
+    """Compute a pair-summed DPO objective using explicit pair identity."""
     if len(batch["response_lengths"]) % 2 != 0:
         raise ValueError("DPO micro-batch must contain an even number of chosen/rejected branches")
     _, values = get_log_probs_and_entropy(
@@ -1215,11 +1214,22 @@ def dpo_loss_function(
                     "DPO branch log-probability/mask shape mismatch: "
                     f"{tuple(branch_values.shape)} vs {tuple(branch_mask.shape)}"
                 )
+            if not bool(branch_mask.to(dtype=torch.bool).any()):
+                raise ValueError("DPO branch completion mask must contain at least one supervised token")
             sums.append((branch_values * branch_mask).sum())
         return torch.stack(sums)
 
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("DPO batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+
     policy_sums = sequence_sums(policy_token_log_probs)
-    policy_chosen, policy_rejected = policy_sums[0::2], policy_sums[1::2]
+    policy_chosen = policy_sums.index_select(0, chosen_index)
+    policy_rejected = policy_sums.index_select(0, rejected_index)
     reference_free = bool(args.dpo_reference_free)
     if reference_free:
         reference_chosen = reference_rejected = None
@@ -1230,7 +1240,8 @@ def dpo_loss_function(
         if reference_values is None:
             raise ValueError("standard DPO batch is missing frozen-reference log-probabilities")
         reference_sums = sequence_sums(reference_values)
-        reference_chosen, reference_rejected = reference_sums[0::2], reference_sums[1::2]
+        reference_chosen = reference_sums.index_select(0, chosen_index)
+        reference_rejected = reference_sums.index_select(0, rejected_index)
         ref_chosen_for_metrics = reference_chosen
         ref_rejected_for_metrics = reference_rejected
     pair_losses = dpo_pair_loss(
@@ -1246,13 +1257,26 @@ def dpo_loss_function(
     loss = pair_losses.sum()
     if pair_losses.numel() == 0:
         loss = loss + 0 * logits.sum()
-    return loss, {
+    reward_margin = chosen_rewards - rejected_rewards
+    tie = reward_margin.abs() <= 1e-6
+    strict = reward_margin > 0
+    correct = reward_margin > 1e-6
+    metrics = {
         "loss": pair_losses.detach().sum(),
+        "dpo_logps_chosen": policy_chosen.detach().sum(),
+        "dpo_logps_rejected": policy_rejected.detach().sum(),
         "dpo_chosen_reward": chosen_rewards.detach().sum(),
         "dpo_rejected_reward": rejected_rewards.detach().sum(),
-        "dpo_reward_margin": (chosen_rewards - rejected_rewards).detach().sum(),
-        "dpo_pair_accuracy": (chosen_rewards > rejected_rewards).to(torch.float32).detach().sum(),
+        "dpo_reward_margin": reward_margin.detach().sum(),
+        "dpo_strict_accuracy": strict.to(torch.float32).detach().sum(),
+        "dpo_tie_rate": tie.to(torch.float32).detach().sum(),
+        "dpo_tie_aware_accuracy": (correct.to(torch.float32) + 0.5 * tie.to(torch.float32)).detach().sum(),
     }
+    metrics["dpo_pair_accuracy"] = metrics["dpo_strict_accuracy"]
+    if not reference_free:
+        metrics["dpo_ref_logps_chosen"] = reference_chosen.detach().sum()
+        metrics["dpo_ref_logps_rejected"] = reference_rejected.detach().sum()
+    return loss, metrics
 
 
 def sft_loss_function_chunked(

@@ -84,6 +84,9 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
     if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
         raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
+    if not getattr(args, "dpo_reference_free", False):
+        if not getattr(args, "dpo_reference_repository", None) or not getattr(args, "dpo_reference_revision", None):
+            raise ValueError("standard DPO requires --dpo-reference-repository and --dpo-reference-revision")
 
 
 def sft_partition_id(args: Namespace, step: int) -> str:

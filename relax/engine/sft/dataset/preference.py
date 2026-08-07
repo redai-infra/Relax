@@ -4,6 +4,7 @@
 
 import hashlib
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,31 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+class PreferenceDataError(ValueError):
+    """Stable, classified preference-row rejection."""
+
+    def __init__(self, reason_code: str, message: str, *, source_idx: int, pair_id: str | None = None) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.source_idx = source_idx
+        self.pair_id = pair_id
+
+
+def _classify_preference_error(error: BaseException) -> str:
+    message = str(error).lower()
+    if "post-truncation identical" in message:
+        return "post_truncation"
+    if "must not be identical" in message:
+        return "identical"
+    if "prompt tokens differ" in message or "strict common prefix" in message:
+        return "prompt_mismatch"
+    if "empty completion" in message or "no supervised tokens" in message:
+        return "empty_completion"
+    if "capacity" in message or "exceeds max_length" in message:
+        return "oversize"
+    return "schema"
 
 
 @dataclass(frozen=True)
@@ -212,6 +238,9 @@ class PreferenceStreamingDataset:
         self.apply_chat_template_kwargs = apply_chat_template_kwargs
         self.expected_chat_template_sha256 = expected_chat_template_sha256
         self.require_no_generation_marker = require_no_generation_marker
+        self._rejection_counts: Counter[str] = Counter()
+        self._rejection_records: list[dict[str, Any]] = []
+        self._rejection_lock = threading.Lock()
         self._template_contract_validated = False
         self._template_contract_lock = threading.Lock()
         self._validate_unique_pair_ids()
@@ -234,9 +263,21 @@ class PreferenceStreamingDataset:
         for index in range(len(self.reader)):
             pair_id = self.reader[index].get(self.pair_id_key)
             if not isinstance(pair_id, str) or not pair_id:
-                raise ValueError(f"preference row {index} requires a non-empty {self.pair_id_key}")
+                message = f"preference row {index} requires a non-empty {self.pair_id_key}"
+                with self._rejection_lock:
+                    self._rejection_counts["schema"] += 1
+                    self._rejection_records.append(
+                        {"source_idx": index, "pair_id": None, "reason_code": "schema", "message": message}
+                    )
+                raise PreferenceDataError("schema", message, source_idx=index)
             if pair_id in seen:
-                raise ValueError(f"duplicate preference pair ID {pair_id!r} at row {index}")
+                message = f"duplicate preference pair ID {pair_id!r} at row {index}"
+                with self._rejection_lock:
+                    self._rejection_counts["schema"] += 1
+                    self._rejection_records.append(
+                        {"source_idx": index, "pair_id": pair_id, "reason_code": "schema", "message": message}
+                    )
+                raise PreferenceDataError("schema", message, source_idx=index, pair_id=pair_id)
             seen.add(pair_id)
 
     def shuffle(self, epoch_id: int, position: int = 0) -> None:
@@ -264,6 +305,34 @@ class PreferenceStreamingDataset:
         )
 
     def get_processed_pair(self, idx: int) -> ProcessedPreferencePair:
+        try:
+            return self._get_processed_pair(idx)
+        except PreferenceDataError:
+            raise
+        except Exception as exc:
+            pair_id = None
+            try:
+                raw_pair_id = self.reader[idx].get(self.pair_id_key)
+                pair_id = raw_pair_id if isinstance(raw_pair_id, str) else None
+            except Exception:
+                pass
+            reason_code = _classify_preference_error(exc)
+            error = PreferenceDataError(reason_code, str(exc), source_idx=idx, pair_id=pair_id)
+            with self._rejection_lock:
+                self._rejection_counts[reason_code] += 1
+                self._rejection_records.append(
+                    {"source_idx": idx, "pair_id": pair_id, "reason_code": reason_code, "message": str(exc)}
+                )
+            logger.error(
+                "Rejected preference pair source_idx=%s pair_id=%r reason_code=%s counts=%s",
+                idx,
+                pair_id,
+                reason_code,
+                dict(self.rejection_counts),
+            )
+            raise error from exc
+
+    def _get_processed_pair(self, idx: int) -> ProcessedPreferencePair:
         if self.tokenizer is None:
             raise RuntimeError("PreferenceStreamingDataset requires a tokenizer for processing")
         pair = self.get_canonical_pair(idx)
@@ -319,6 +388,18 @@ class PreferenceStreamingDataset:
             rejected_completion_length=rejected_completion.numel(),
             source_idx=idx,
         )
+
+    @property
+    def rejection_counts(self) -> dict[str, int]:
+        """Return a thread-safe snapshot of classified rejection counts."""
+        with self._rejection_lock:
+            return dict(self._rejection_counts)
+
+    @property
+    def rejection_records(self) -> list[dict[str, Any]]:
+        """Return row IDs and stable reason codes for evidence manifests."""
+        with self._rejection_lock:
+            return [dict(record) for record in self._rejection_records]
 
     def _validate_template_contract(self, sample: CanonicalSample) -> None:
         if self._template_contract_validated:
@@ -414,6 +495,7 @@ def pack_preference_pairs_for_tq(
 
 
 __all__ = [
+    "PreferenceDataError",
     "PreferencePair",
     "PreferenceStreamingDataset",
     "ProcessedPreferencePair",

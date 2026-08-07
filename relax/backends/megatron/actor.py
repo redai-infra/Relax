@@ -7,6 +7,7 @@ import socket
 import time
 from argparse import Namespace
 from contextlib import nullcontext
+from dataclasses import replace
 from functools import partial
 from typing import Any, List
 
@@ -78,7 +79,7 @@ from relax.utils.utils import (
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
-from .checkpoint import load_checkpoint
+from .checkpoint import is_megatron_checkpoint, load_checkpoint
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
@@ -94,6 +95,16 @@ from .data import (
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .reference_integrity import (
+    REFERENCE_LOADER_MODE,
+    DPOReferenceIdentity,
+    canonical_optimizer_sha256,
+    canonical_tensor_sha256,
+    read_reference_identity,
+    reference_identity_path,
+    reference_probe_sha256,
+    write_reference_identity,
+)
 from .weight_update.common import named_params_and_buffers
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
@@ -238,9 +249,13 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
 
+        resumed_from_megatron = is_megatron_checkpoint(args.load)
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        self._dpo_reference_identity: DPOReferenceIdentity | None = None
+        self._expected_dpo_reference_identity: DPOReferenceIdentity | None = None
+        self._dpo_reference_probe_verified = False
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -270,12 +285,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
             if with_ref:
                 if is_preference_mode(args) and args.sft_objective == "dpo":
-                    if loaded_rollout_id < 0:
+                    if not resumed_from_megatron:
                         self.weights_backuper.backup("ref")
+                        self._dpo_reference_identity = self._build_dpo_reference_identity()
                     else:
-                        self.load_other_checkpoint("ref", args.hf_checkpoint)
-                    self._active_model_tag = "ref"
-                    self._switch_model("actor")
+                        identity_path = reference_identity_path(args.load, loaded_rollout_id)
+                        self._expected_dpo_reference_identity = read_reference_identity(identity_path)
+                        self._rebuild_dpo_reference(args.hf_checkpoint)
                 else:
                     self.load_other_checkpoint("ref", args.ref_load)
 
@@ -435,6 +451,190 @@ class MegatronTrainRayActor(TrainRayActor):
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _is_standard_dpo(self) -> bool:
+        return is_preference_mode(self.args) and self.args.sft_objective == "dpo" and not self.args.dpo_reference_free
+
+    def _build_dpo_reference_identity(self, *, probe_sha256: str | None = None) -> DPOReferenceIdentity:
+        parameter_sha256 = canonical_tensor_sha256(self.weights_backuper.get("ref").items())
+        self._assert_dp_reference_digest_equal(parameter_sha256)
+        return DPOReferenceIdentity(
+            schema_version=1,
+            repository=self.args.dpo_reference_repository,
+            revision=self.args.dpo_reference_revision,
+            loader_mode=REFERENCE_LOADER_MODE,
+            parameter_sha256=parameter_sha256,
+            probe_sha256=probe_sha256,
+            probe_manifest=None,
+        )
+
+    def _assert_dp_reference_digest_equal(self, digest: str) -> None:
+        digests = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(digests, digest, group=get_gloo_group())
+        if len(set(digests)) != 1:
+            raise RuntimeError(f"DPO frozen-reference parameter digests differ across ranks: {digests}")
+
+    def _assert_dpo_reference_identity(self, actual: DPOReferenceIdentity) -> None:
+        expected = self._expected_dpo_reference_identity
+        if expected is None:
+            return
+        fields = ("repository", "revision", "loader_mode", "parameter_sha256")
+        mismatches = {
+            field: (getattr(expected, field), getattr(actual, field))
+            for field in fields
+            if getattr(expected, field) != getattr(actual, field)
+        }
+        if mismatches:
+            raise RuntimeError(f"DPO frozen-reference identity mismatch: {mismatches}")
+
+    def _rebuild_dpo_reference(self, path: str) -> None:
+        """Transactionally rebuild a frozen reference without touching
+        optimizer state."""
+        if self._active_model_tag != "actor" or "actor" not in self.weights_backuper.backup_tags:
+            raise RuntimeError("DPO reference rebuild requires an active actor backup")
+        optimizer_before = canonical_optimizer_sha256(self.optimizer)
+        old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
+        try:
+            self.args.load = path
+            self.args.no_load_optim = True
+            self.args.no_load_rng = True
+            self.args.finetune = True
+            self._active_model_tag = None
+            load_checkpoint(
+                self.model,
+                None,
+                None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+            candidate_sha256 = canonical_tensor_sha256(
+                named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                    translate_gpu_to_cpu=True,
+                )
+            )
+            self._assert_dp_reference_digest_equal(candidate_sha256)
+            candidate = DPOReferenceIdentity(
+                schema_version=1,
+                repository=self.args.dpo_reference_repository,
+                revision=self.args.dpo_reference_revision,
+                loader_mode=REFERENCE_LOADER_MODE,
+                parameter_sha256=candidate_sha256,
+                probe_sha256=None,
+                probe_manifest=None,
+            )
+            self._assert_dpo_reference_identity(candidate)
+            self.weights_backuper.backup("ref")
+            self._dpo_reference_identity = candidate
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            self._switch_model("actor")
+            optimizer_after = canonical_optimizer_sha256(self.optimizer)
+            if optimizer_after != optimizer_before:
+                raise RuntimeError(
+                    "DPO reference rebuild modified optimizer master parameters or state: "
+                    f"before={optimizer_before}, after={optimizer_after}"
+                )
+
+    def _validate_dpo_reference_probe(self, rollout_data: RolloutBatch) -> None:
+        if self._expected_dpo_reference_identity is not None:
+            if not self._dpo_reference_probe_verified:
+                raise RuntimeError("resumed DPO reference probe must be replayed before training data forward")
+            return
+        if self._dpo_reference_identity is not None and self._dpo_reference_identity.probe_sha256 is not None:
+            return
+        first_pair_id = int(rollout_data["preference_branch_pair_ids"][0])
+        indices = [
+            index
+            for index, pair_id in enumerate(rollout_data["preference_branch_pair_ids"])
+            if int(pair_id) == first_pair_id
+        ]
+        if len(indices) != 2:
+            raise RuntimeError(f"DPO reference probe pair {first_pair_id!r} is not atomic")
+        manifest = {
+            "pair_ids": [int(rollout_data["preference_branch_pair_ids"][index]) for index in indices],
+            "branch_is_chosen": [bool(rollout_data["preference_is_chosen"][index]) for index in indices],
+            "tokens": [torch.as_tensor(rollout_data["tokens"][index]).cpu().tolist() for index in indices],
+            "loss_masks": [torch.as_tensor(rollout_data["loss_masks"][index]).cpu().tolist() for index in indices],
+            "total_lengths": [int(rollout_data["total_lengths"][index]) for index in indices],
+            "response_lengths": [int(rollout_data["response_lengths"][index]) for index in indices],
+        }
+        if self._dpo_reference_identity is None:
+            raise RuntimeError("DPO frozen-reference identity was not initialized")
+        probe_sha256 = self._compute_dpo_reference_probe(manifest)
+        self._dpo_reference_identity = replace(
+            self._dpo_reference_identity, probe_sha256=probe_sha256, probe_manifest=manifest
+        )
+
+    def _compute_dpo_reference_probe(self, manifest: dict[str, Any]) -> str:
+        """Run the canonical single-pair probe without perturbing training
+        RNG."""
+        pair_ids = [int(value) for value in manifest["pair_ids"]]
+        branch_is_chosen = [bool(value) for value in manifest["branch_is_chosen"]]
+        if len(pair_ids) != 2 or set(branch_is_chosen) != {False, True} or len(set(pair_ids)) != 1:
+            raise RuntimeError("DPO reference probe manifest must contain one atomic preference pair")
+        device = device_utils.make_current_torch_device()
+        tokens = [torch.tensor(value, dtype=torch.long, device=device) for value in manifest["tokens"]]
+        loss_masks = [torch.tensor(value, dtype=torch.bool, device=device) for value in manifest["loss_masks"]]
+        total_lengths = [int(value) for value in manifest["total_lengths"]]
+        response_lengths = [int(value) for value in manifest["response_lengths"]]
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+        probe_data: RolloutBatch = {
+            "tokens": tokens,
+            "loss_masks": loss_masks,
+            "total_lengths": total_lengths,
+            "response_lengths": response_lengths,
+            "preference_branch_pair_ids": pair_ids,
+            "preference_is_chosen": branch_is_chosen,
+            "preference_pair_ids": [pair_ids[0]],
+            "preference_pair_costs": [sum(total_lengths)],
+            "dynamic_global_batch_size": dp_size,
+        }
+        probe_iterator, probe_microbatches = get_data_iterator(self.args, self.model, probe_data)
+        restore_tag = self._active_model_tag
+        if restore_tag is None:
+            raise RuntimeError("DPO reference probe requires an active model backup")
+        python_rng_state = random.getstate()
+        torch_rng_state = torch.get_rng_state()
+        cuda_rng_states = torch.cuda.get_rng_state_all()
+        try:
+            self._switch_model("ref")
+            output = self.compute_log_prob(probe_iterator, probe_microbatches, store_prefix="ref_")
+        finally:
+            self._switch_model(restore_tag)
+            random.setstate(python_rng_state)
+            torch.set_rng_state(torch_rng_state)
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        return reference_probe_sha256(
+            pair_ids,
+            branch_is_chosen,
+            tokens,
+            loss_masks,
+            output["ref_log_probs"],
+        )
+
+    def _replay_dpo_reference_probe(self) -> None:
+        expected = self._expected_dpo_reference_identity
+        if expected is None or self._dpo_reference_probe_verified:
+            return
+        manifest = expected.probe_manifest
+        if expected.probe_sha256 is None or manifest is None:
+            raise RuntimeError("resumed DPO checkpoint is missing frozen-reference probe metadata")
+        actual = self._compute_dpo_reference_probe(manifest)
+        if actual != expected.probe_sha256:
+            raise RuntimeError(
+                f"DPO frozen-reference probe mismatch: expected={expected.probe_sha256}, actual={actual}"
+            )
+        if self._dpo_reference_identity is None:
+            raise RuntimeError("DPO frozen-reference identity was not initialized")
+        self._dpo_reference_identity = replace(
+            self._dpo_reference_identity,
+            probe_sha256=expected.probe_sha256,
+            probe_manifest=manifest,
+        )
+        self._dpo_reference_probe_verified = True
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -805,6 +1005,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # Create data iterator for actor forward + routing replay + train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        if self._is_standard_dpo():
+            self._replay_dpo_reference_probe()
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
         if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
             data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
@@ -836,14 +1038,19 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("ref")
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator_logprobs,
-                            num_microbatches_logprobs,
-                            store_prefix="ref_",
+                    try:
+                        self._switch_model("ref")
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator_logprobs,
+                                num_microbatches_logprobs,
+                                store_prefix="ref_",
+                            )
                         )
-                    )
+                    finally:
+                        self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+                    if standard_dpo:
+                        self._validate_dpo_reference_probe(rollout_data)
 
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
                 if "teacher" in self.weights_backuper.backup_tags:
@@ -1605,8 +1812,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
         save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
 
-        if force_sync and self.args.async_save:
+        if (force_sync or self._is_standard_dpo()) and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
+
+        if self._is_standard_dpo():
+            identity = self._dpo_reference_identity
+            if identity is None or identity.probe_sha256 is None:
+                raise RuntimeError("cannot save standard DPO without a validated reference identity and probe")
+            actual_sha256 = canonical_tensor_sha256(self.weights_backuper.get("ref").items())
+            if actual_sha256 != identity.parameter_sha256:
+                raise RuntimeError(
+                    "DPO frozen-reference checksum changed before checkpoint: "
+                    f"expected={identity.parameter_sha256}, actual={actual_sha256}"
+                )
+            if dist.get_rank() == 0:
+                write_reference_identity(reference_identity_path(self.args.save, rollout_id), identity)
+            dist.barrier(group=get_gloo_group())
 
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model
