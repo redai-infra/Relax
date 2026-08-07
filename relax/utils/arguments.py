@@ -2713,11 +2713,23 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _is_finite_positive_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return False
+    try:
+        return value > 0 and math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 def _normalize_precision_optimizer_args(args) -> None:
     fp16 = bool(getattr(args, "fp16", False))
-    dynamic_loss_scale = getattr(args, "loss_scale", None) is None
+    loss_scale = getattr(args, "loss_scale", None)
+    dynamic_loss_scale = loss_scale is None
     dynamic_loss_scale_fields = {"initial_loss_scale", "min_loss_scale"}
     if not dynamic_loss_scale:
+        if not _is_finite_positive_number(loss_scale):
+            raise ValueError(f"--loss-scale must be a finite positive number, got {loss_scale!r}.")
         for attr in dynamic_loss_scale_fields:
             setattr(args, attr, None)
     if fp16:
@@ -2752,20 +2764,19 @@ def _normalize_precision_optimizer_args(args) -> None:
             ("min_loss_scale", "--min-loss-scale"),
         ):
             value = getattr(args, attr)
-            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+            if not _is_finite_positive_number(value):
                 raise ValueError(f"{option} must be a finite positive number, got {value!r}.")
 
         if args.min_loss_scale > args.initial_loss_scale:
             raise ValueError("--min-loss-scale must be less than or equal to --initial-loss-scale.")
 
-    if fp16:
-        for attr, option in (
-            ("use_precision_aware_optimizer", "--use-precision-aware-optimizer"),
-            ("store_param_remainders", "--store-param-remainders"),
-        ):
-            value = getattr(args, attr)
-            if not isinstance(value, bool):
-                raise ValueError(f"{option} must resolve to a boolean, got {value!r}.")
+    for attr, option in (
+        ("use_precision_aware_optimizer", "--use-precision-aware-optimizer"),
+        ("store_param_remainders", "--store-param-remainders"),
+    ):
+        value = getattr(args, attr)
+        if not isinstance(value, bool):
+            raise ValueError(f"{option} must resolve to a boolean, got {value!r}.")
 
 
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
@@ -3450,6 +3461,9 @@ def slime_validate_args(args):
             setattr(args, k, v)
         if data.get("fp16") is True and "bf16" not in data:
             args.bf16 = False
+
+    if bool(getattr(args, "fp16", False)) and bool(getattr(args, "bf16", False)):
+        raise ValueError("fp16 and bf16 cannot both be enabled")
 
     _normalize_precision_optimizer_args(args)
 

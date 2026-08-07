@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
-import math
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -187,7 +186,7 @@ def test_fp16_optimizer_fully_explicit_values_do_not_warn(monkeypatch):
     assert warnings == []
 
 
-def test_static_loss_scale_skips_dynamic_fallbacks_and_validation(monkeypatch):
+def test_static_loss_scale_clears_inactive_dynamic_values(monkeypatch):
     args = _optimizer_args(
         loss_scale=1024.0,
         initial_loss_scale=0,
@@ -197,8 +196,8 @@ def test_static_loss_scale_skips_dynamic_fallbacks_and_validation(monkeypatch):
 
     megatron_arguments._resolve_optimizer_precision_args(args)
 
-    assert args.initial_loss_scale == 0
-    assert math.isnan(args.min_loss_scale)
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
     assert args.use_precision_aware_optimizer is True
     assert args.store_param_remainders is False
     assert len(warnings) == 1
@@ -206,6 +205,17 @@ def test_static_loss_scale_skips_dynamic_fallbacks_and_validation(monkeypatch):
     assert "--min-loss-scale" not in warnings[0]
     assert "--use-precision-aware-optimizer" in warnings[0]
     assert "--no-store-param-remainders" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "loss_scale",
+    [True, "1024", float("nan"), float("inf"), pytest.param(10**500, id="too-large"), 0.0, -1.0],
+)
+def test_static_loss_scale_rejects_invalid_values(loss_scale):
+    args = _optimizer_args(loss_scale=loss_scale)
+
+    with pytest.raises(ValueError, match="--loss-scale"):
+        megatron_arguments._resolve_optimizer_precision_args(args)
 
 
 def test_static_loss_scale_leaves_unset_dynamic_values_alone(monkeypatch):
@@ -238,6 +248,11 @@ def test_static_loss_scale_leaves_unset_dynamic_values_alone(monkeypatch):
         ({"initial_loss_scale": -1}, "--initial-loss-scale"),
         ({"initial_loss_scale": float("nan")}, "--initial-loss-scale"),
         ({"initial_loss_scale": float("inf")}, "--initial-loss-scale"),
+        pytest.param(
+            {"initial_loss_scale": 10**500},
+            "--initial-loss-scale",
+            id="initial-loss-scale-too-large",
+        ),
         ({"initial_loss_scale": True}, "--initial-loss-scale"),
         ({"initial_loss_scale": "32768"}, "--initial-loss-scale"),
         ({"min_loss_scale": 0}, "--min-loss-scale"),
@@ -300,6 +315,25 @@ def test_non_fp16_explicit_values_are_preserved(monkeypatch):
     assert warnings == []
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "option"),
+    [
+        ("use_precision_aware_optimizer", "false", "--use-precision-aware-optimizer"),
+        ("store_param_remainders", 0, "--store-param-remainders"),
+    ],
+)
+def test_non_fp16_optimizer_booleans_reject_non_boolean_values(field, value, option):
+    args = _optimizer_args(
+        fp16=False,
+        use_precision_aware_optimizer=False,
+        store_param_remainders=True,
+    )
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=option):
+        megatron_arguments._resolve_optimizer_precision_args(args)
+
+
 def test_bf16_fallback_builds_valid_optimizer_config(monkeypatch):
     from megatron.core.optimizer import OptimizerConfig
 
@@ -326,6 +360,8 @@ def test_model_optimizer_kwargs_keep_explicit_fp16_values(monkeypatch):
     from relax.backends.megatron.model import _build_optimizer_config_kwargs
 
     args = _optimizer_args(
+        bf16=False,
+        params_dtype=torch.float16,
         initial_loss_scale=65536.0,
         min_loss_scale=2.0,
         use_precision_aware_optimizer=False,

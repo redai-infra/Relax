@@ -80,6 +80,7 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
     assert default_scale < len(argv) - len(user_args)
 
     pytest.importorskip("megatron.core")
+    torch = pytest.importorskip("torch")
 
     from relax.backends.megatron import model
     from relax.backends.megatron.arguments import megatron_parse_args
@@ -102,6 +103,7 @@ def test_user_arguments_reach_validated_optimizer_config(tmp_path: Path, monkeyp
     assert config.store_param_remainders is True
     assert config.fp16 is True
     assert config.bf16 is False
+    assert config.params_dtype is torch.float16
 
 
 def test_custom_config_only_fp16_reaches_optimizer_kwargs(tmp_path: Path, monkeypatch) -> None:
@@ -128,6 +130,7 @@ def test_custom_config_only_fp16_reaches_optimizer_kwargs(tmp_path: Path, monkey
         del training_args[option_index : option_index + 2]
 
     pytest.importorskip("megatron.core")
+    torch = pytest.importorskip("torch")
 
     from relax.backends.megatron import model
     from relax.utils.arguments import parse_args
@@ -142,6 +145,7 @@ def test_custom_config_only_fp16_reaches_optimizer_kwargs(tmp_path: Path, monkey
 
     assert config_kwargs["fp16"] is True
     assert config_kwargs["bf16"] is False
+    assert config_kwargs["params_dtype"] is torch.float16
     assert config_kwargs["initial_loss_scale"] == 32768.0
     assert config_kwargs["min_loss_scale"] == 1.0
     assert config_kwargs["use_precision_aware_optimizer"] is True
@@ -165,6 +169,7 @@ def test_static_loss_scale_reaches_optimizer_without_dynamic_scales(tmp_path: Pa
     training_args = argv[command_separator + 4 :]
 
     pytest.importorskip("megatron.core")
+    torch = pytest.importorskip("torch")
 
     from relax.backends.megatron import model
     from relax.utils.arguments import parse_args
@@ -181,3 +186,4 @@ def test_static_loss_scale_reaches_optimizer_without_dynamic_scales(tmp_path: Pa
     assert config.initial_loss_scale is None
     assert config.min_loss_scale is None
     assert config.use_precision_aware_optimizer is False
+    assert config.params_dtype is torch.float16

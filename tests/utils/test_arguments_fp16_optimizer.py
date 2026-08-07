@@ -299,6 +299,26 @@ def test_static_loss_scale_clears_dynamic_values(arguments_module):
 
 
 @pytest.mark.parametrize(
+    "loss_scale",
+    [
+        True,
+        "1024",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        pytest.param(10**500, id="too-large"),
+        0.0,
+        -1.0,
+    ],
+)
+def test_static_loss_scale_rejects_invalid_values(arguments_module, loss_scale):
+    args = _precision_args(loss_scale=loss_scale)
+
+    with pytest.raises(ValueError, match="--loss-scale"):
+        arguments_module._normalize_precision_optimizer_args(args)
+
+
+@pytest.mark.parametrize(
     ("field", "value", "option"),
     [
         ("use_precision_aware_optimizer", 1, "--use-precision-aware-optimizer"),
@@ -307,8 +327,11 @@ def test_static_loss_scale_clears_dynamic_values(arguments_module):
         ("store_param_remainders", "false", "--store-param-remainders"),
     ],
 )
-def test_precision_optimizer_booleans_reject_non_boolean_values(arguments_module, field, value, option):
+@pytest.mark.parametrize(("fp16", "bf16"), [(True, False), (False, True), (False, False)])
+def test_precision_optimizer_booleans_reject_non_boolean_values(arguments_module, field, value, option, fp16, bf16):
     args = _precision_args(
+        fp16=fp16,
+        bf16=bf16,
         initial_loss_scale=32768.0,
         min_loss_scale=1.0,
         use_precision_aware_optimizer=True,
@@ -360,6 +383,52 @@ def test_without_custom_config_resolves_precision_defaults_immediately(megatron_
     assert args.min_loss_scale == 1.0
     assert args.use_precision_aware_optimizer is False
     assert args.store_param_remainders is True
+
+
+def test_backend_static_loss_scale_clears_inactive_dynamic_values(megatron_arguments_module):
+    args = _precision_args(
+        loss_scale=1024.0,
+        initial_loss_scale=0.0,
+        min_loss_scale=float("nan"),
+    )
+
+    megatron_arguments_module._resolve_optimizer_precision_args(args)
+
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+
+
+@pytest.mark.parametrize(
+    "loss_scale",
+    [True, "1024", float("nan"), float("inf"), pytest.param(10**500, id="too-large"), 0.0, -1.0],
+)
+def test_backend_static_loss_scale_rejects_invalid_values(megatron_arguments_module, loss_scale):
+    args = _precision_args(loss_scale=loss_scale)
+
+    with pytest.raises(ValueError, match="--loss-scale"):
+        megatron_arguments_module._resolve_optimizer_precision_args(args)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "option"),
+    [
+        ("use_precision_aware_optimizer", "false", "--use-precision-aware-optimizer"),
+        ("store_param_remainders", 0, "--store-param-remainders"),
+    ],
+)
+def test_backend_non_fp16_optimizer_booleans_reject_non_boolean_values(
+    megatron_arguments_module, field, value, option
+):
+    args = _precision_args(
+        fp16=False,
+        bf16=True,
+        use_precision_aware_optimizer=False,
+        store_param_remainders=True,
+    )
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=option):
+        megatron_arguments_module._resolve_optimizer_precision_args(args)
 
 
 def test_fp16_explicit_values_are_not_overwritten_or_warned(arguments_module, monkeypatch):
@@ -443,6 +512,12 @@ def test_non_fp16_explicit_unused_scales_remain_compatible(arguments_module, mon
         ("initial_loss_scale", "32768", "--initial-loss-scale"),
         ("initial_loss_scale", float("nan"), "--initial-loss-scale"),
         ("initial_loss_scale", float("inf"), "--initial-loss-scale"),
+        pytest.param(
+            "initial_loss_scale",
+            10**500,
+            "--initial-loss-scale",
+            id="initial-loss-scale-too-large",
+        ),
         ("initial_loss_scale", 0.0, "--initial-loss-scale"),
         ("initial_loss_scale", -1.0, "--initial-loss-scale"),
         ("min_loss_scale", "1", "--min-loss-scale"),

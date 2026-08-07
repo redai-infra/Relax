@@ -324,21 +324,49 @@ def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(arguments_m
 
 
 @pytest.mark.parametrize(
+    "loss_scale",
+    ["true", '"1024"', ".nan", ".inf", "0", "-1"],
+)
+def test_custom_config_rejects_invalid_static_loss_scale(arguments_module, tmp_path, loss_scale):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text(f"fp16: true\nloss_scale: {loss_scale}\n")
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match="--loss-scale"):
+        arguments_module.slime_validate_args(args)
+
+
+@pytest.mark.parametrize(
     ("config", "option"),
     [
         ("fp16: true\nuse_precision_aware_optimizer: 1\n", "--use-precision-aware-optimizer"),
         ('fp16: true\nuse_precision_aware_optimizer: "true"\n', "--use-precision-aware-optimizer"),
         ("fp16: true\nstore_param_remainders: 0\n", "--store-param-remainders"),
         ('fp16: true\nstore_param_remainders: "false"\n', "--store-param-remainders"),
+        ('fp16: false\nbf16: true\nuse_precision_aware_optimizer: "false"\n', "--use-precision-aware-optimizer"),
+        ("fp16: false\nbf16: true\nstore_param_remainders: 0\n", "--store-param-remainders"),
+        ('fp16: false\nbf16: false\nuse_precision_aware_optimizer: "false"\n', "--use-precision-aware-optimizer"),
+        ('fp16: false\nbf16: false\nstore_param_remainders: "false"\n', "--store-param-remainders"),
     ],
 )
-def test_custom_config_fp16_rejects_non_boolean_optimizer_values(arguments_module, tmp_path, config, option):
+def test_custom_config_rejects_non_boolean_optimizer_values(arguments_module, tmp_path, config, option):
     config_path = tmp_path / "custom-config.yaml"
     config_path.write_text(config)
     args = _opd_args()
     args.custom_config_path = str(config_path)
 
     with pytest.raises(ValueError, match=option):
+        arguments_module.slime_validate_args(args)
+
+
+def test_custom_config_rejects_simultaneous_fp16_and_bf16(arguments_module, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\nbf16: true\n")
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match="fp16.*bf16"):
         arguments_module.slime_validate_args(args)
 
 
