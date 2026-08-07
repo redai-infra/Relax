@@ -34,8 +34,14 @@ from ray import serve
 from transformers import AutoConfig, AutoTokenizer
 
 from relax.components.base import Base
+from relax.engine.sft.dataset.preference import (
+    PreferenceStreamingDataset,
+    ProcessedPreferencePair,
+    pack_preference_pairs_for_tq,
+)
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample
+from relax.engine.sft.runtime import is_preference_mode
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
 from relax.utils.training.eval_config import build_named_prompt_data_configs
@@ -96,11 +102,12 @@ class SFT(Base):
         if self._dataset is not None:
             return
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
-        try:
-            self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
-        except Exception as exc:
-            self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
-            self._processor_pool = None
+        if not is_preference_mode(self.config):
+            try:
+                self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
+            except Exception as exc:
+                self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
+                self._processor_pool = None
         pad_token_ids = _resolve_pad_token_ids_from_config(self.config.hf_checkpoint)
         self._logger.info(f"Resolved multimodal pad token ids from model config: {sorted(pad_token_ids)}")
 
@@ -123,7 +130,27 @@ class SFT(Base):
             self._logger.info(f"SFT oversize strategy: {oversize_strategy}")
 
         dataset_cls = _load_custom_dataset_class(getattr(self.config, "custom_dataset_class_path", None))
-        if dataset_cls is None:
+        if is_preference_mode(self.config):
+            self._dataset = PreferenceStreamingDataset(
+                path=self.config.prompt_data,
+                tokenizer=self._tokenizer,
+                prompt_key=self.config.input_key,
+                chosen_key=self.config.preference_chosen_key,
+                rejected_key=self.config.preference_rejected_key,
+                pair_id_key=self.config.preference_pair_id_key,
+                metadata_key=self.config.metadata_key,
+                max_length=self.config.preference_max_length,
+                max_completion_length=self.config.preference_max_completion_length,
+                pair_capacity=capacity,
+                seed=seed,
+                prefetch_max_cached=prefetch_buffer_size,
+                prefetch_chunk_size=prefetch_chunk_size,
+                prefetch_num_workers=prefetch_num_workers,
+                apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                expected_chat_template_sha256=self.config.preference_chat_template_sha256,
+                require_no_generation_marker=self.config.preference_require_no_generation_marker,
+            )
+        elif dataset_cls is None:
             self._dataset = SFTStreamingDataset(
                 path=self.config.prompt_data,
                 tokenizer=self._tokenizer,
@@ -294,10 +321,16 @@ class SFT(Base):
             wait_count += 1
             await asyncio.sleep(1)
 
-    def _maybe_print_first_sample(self, samples: list[ProcessedSample]) -> None:
+    def _maybe_print_first_sample(self, samples: list[ProcessedSample] | list[ProcessedPreferencePair]) -> None:
         if self.step != 0 or not samples:
             return
         s = samples[0]
+        if isinstance(s, ProcessedPreferencePair):
+            self._logger.info(
+                f"First preference pair: pair_id={s.pair_id!r}, "
+                f"chosen_length={s.chosen_total_length}, rejected_length={s.rejected_total_length}"
+            )
+            return
         try:
             print_first_sample(
                 step=self.step,
@@ -325,12 +358,23 @@ class SFT(Base):
             self.step += 1
             return
         self._maybe_print_first_sample(samples)
-        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
-        assert backend_batch is not None
-        await self.data_system_client.async_put(
-            data=dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
-            partition_id=f"sft_{self.step}",
-        )
+        if is_preference_mode(self.config):
+            backend_batch, custom_meta = pack_preference_pairs_for_tq(samples)
+            batch_size = len(backend_batch["pair_ids"])
+            await self.data_system_client.async_put(
+                data=dict_to_tensordict(backend_batch, batch_size=batch_size),
+                partition_id=f"sft_{self.step}",
+                custom_meta=custom_meta,
+            )
+        else:
+            backend_batch = pack_samples_for_tq(
+                samples, force_multimodal_field=self.config.multimodal_keys is not None
+            )
+            assert backend_batch is not None
+            await self.data_system_client.async_put(
+                data=dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
+                partition_id=f"sft_{self.step}",
+            )
         if crossed_epoch:
             self._logger.info(
                 f"SFT step {self.step}: epoch boundary crossed (epoch={self._dataset.index_manager.current_epoch})"

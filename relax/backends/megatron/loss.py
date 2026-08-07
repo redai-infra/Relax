@@ -32,6 +32,7 @@ from relax.utils.training.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+from relax.utils.training.preference_utils import dpo_pair_loss
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1178,6 +1179,82 @@ def sft_loss_function(
     )
 
 
+def dpo_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute a pair-summed DPO objective over adjacent chosen/rejected
+    branches."""
+    if len(batch["response_lengths"]) % 2 != 0:
+        raise ValueError("DPO micro-batch must contain an even number of chosen/rejected branches")
+    _, values = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        with_entropy=False,
+        max_seq_lens=batch.get("max_seq_lens", None),
+        padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
+    policy_token_log_probs = values["log_probs"]
+
+    def sequence_sums(token_values) -> torch.Tensor:
+        if len(token_values) != len(batch["loss_masks"]):
+            raise ValueError("DPO token log-probabilities are not branch aligned")
+        sums = []
+        for branch_values, mask in zip(token_values, batch["loss_masks"], strict=True):
+            branch_values = torch.as_tensor(branch_values, device=logits.device)
+            branch_mask = mask.to(device=logits.device, dtype=branch_values.dtype)
+            if branch_values.shape != branch_mask.shape:
+                raise ValueError(
+                    "DPO branch log-probability/mask shape mismatch: "
+                    f"{tuple(branch_values.shape)} vs {tuple(branch_mask.shape)}"
+                )
+            sums.append((branch_values * branch_mask).sum())
+        return torch.stack(sums)
+
+    policy_sums = sequence_sums(policy_token_log_probs)
+    policy_chosen, policy_rejected = policy_sums[0::2], policy_sums[1::2]
+    reference_free = bool(args.dpo_reference_free)
+    if reference_free:
+        reference_chosen = reference_rejected = None
+        ref_chosen_for_metrics = torch.zeros_like(policy_chosen)
+        ref_rejected_for_metrics = torch.zeros_like(policy_rejected)
+    else:
+        reference_values = batch.get("ref_log_probs")
+        if reference_values is None:
+            raise ValueError("standard DPO batch is missing frozen-reference log-probabilities")
+        reference_sums = sequence_sums(reference_values)
+        reference_chosen, reference_rejected = reference_sums[0::2], reference_sums[1::2]
+        ref_chosen_for_metrics = reference_chosen
+        ref_rejected_for_metrics = reference_rejected
+    pair_losses = dpo_pair_loss(
+        policy_chosen,
+        policy_rejected,
+        reference_chosen=reference_chosen,
+        reference_rejected=reference_rejected,
+        beta=args.dpo_beta,
+        reference_free=reference_free,
+    )
+    chosen_rewards = args.dpo_beta * (policy_chosen - ref_chosen_for_metrics)
+    rejected_rewards = args.dpo_beta * (policy_rejected - ref_rejected_for_metrics)
+    loss = pair_losses.sum()
+    if pair_losses.numel() == 0:
+        loss = loss + 0 * logits.sum()
+    return loss, {
+        "loss": pair_losses.detach().sum(),
+        "dpo_chosen_reward": chosen_rewards.detach().sum(),
+        "dpo_rejected_reward": rejected_rewards.detach().sum(),
+        "dpo_reward_margin": (chosen_rewards - rejected_rewards).detach().sum(),
+        "dpo_pair_accuracy": (chosen_rewards > rejected_rewards).to(torch.float32).detach().sum(),
+    }
+
+
 def sft_loss_function_chunked(
     args: Namespace,
     batch: RolloutBatch,
@@ -1277,6 +1354,10 @@ def loss_function(
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
     num_samples = len(batch["response_lengths"])
+    if getattr(args, "loss_type", None) == "sft" and getattr(args, "sft_objective", "causal_lm") == "dpo":
+        if num_samples % 2 != 0:
+            raise ValueError("preference micro-batch contains an odd number of branches")
+        num_samples //= 2
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1296,7 +1377,9 @@ def loss_function(
         case "value_loss":
             func = value_loss_function
         case "sft":
-            if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+            if getattr(args, "sft_objective", "causal_lm") == "dpo":
+                func = dpo_loss_function
+            elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                 # Bind lm_head_forward so chunked path matches the standard
                 # inner-func signature; outer body (recompute, CP guard,
                 # Megatron scaling, return-tuple) is then shared with legacy.

@@ -33,6 +33,7 @@ from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
+    is_preference_mode,
     is_sft_mode,
     sft_partition_id,
     sft_task_name,
@@ -84,6 +85,7 @@ from .data import (
     DataIterator,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
+    expand_preference_rollout_data,
     get_data_iterator,
     log_perf_data,
     log_perf_data_fwd,
@@ -267,7 +269,15 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("actor")
 
             if with_ref:
-                self.load_other_checkpoint("ref", args.ref_load)
+                if is_preference_mode(args) and args.sft_objective == "dpo":
+                    if loaded_rollout_id < 0:
+                        self.weights_backuper.backup("ref")
+                    else:
+                        self.load_other_checkpoint("ref", args.hf_checkpoint)
+                    self._active_model_tag = "ref"
+                    self._switch_model("actor")
+                else:
+                    self.load_other_checkpoint("ref", args.ref_load)
 
             # Load teacher model for Megatron-based on-policy distillation
             if with_opd_teacher:
@@ -776,6 +786,9 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        if is_preference_mode(self.args):
+            rollout_data = expand_preference_rollout_data(rollout_data)
+
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
@@ -808,7 +821,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with inverse_timer("train_wait"), timer("train"):
             # All RL algorithms need ref/teacher/actor inline forwards to produce old_log_probs.
-            should_compute_old_log_probs = self.args.compute_advantages_and_returns
+            standard_dpo = (
+                is_preference_mode(self.args) and self.args.sft_objective == "dpo" and not self.args.dpo_reference_free
+            )
+            should_compute_old_log_probs = self.args.compute_advantages_and_returns or standard_dpo
             # PPO fully_async has a standalone Advantages service that produces
             # advantages/returns via TransferQueue; every other path (including
             # PPO colocate) computes GAE inline from critic's ``values``.
@@ -844,7 +860,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if not standard_dpo and (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics):
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -1846,30 +1862,31 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
-        self.args.load = path
-        self.args.no_load_optim = True
-        self.args.no_load_rng = True
-        self.args.finetune = True
-
         old_ckpt_step = None
-        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.ref_ckpt_step
-        elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
+        try:
+            self.args.load = path
+            self.args.no_load_optim = True
+            self.args.no_load_rng = True
+            self.args.finetune = True
 
-        _, _ = load_checkpoint(
-            self.model,
-            None,
-            None,
-            checkpointing_context={},
-            skip_load_to_model_and_opt=False,
-        )
-        self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+                old_ckpt_step = self.args.ckpt_step
+                self.args.ckpt_step = self.args.ref_ckpt_step
+            elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
+                old_ckpt_step = self.args.ckpt_step
+                self.args.ckpt_step = self.args.opd_teacher_ckpt_step
 
-        if old_ckpt_step is not None:
-            self.args.ckpt_step = old_ckpt_step
+            _, _ = load_checkpoint(
+                self.model,
+                None,
+                None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            if old_ckpt_step is not None:
+                self.args.ckpt_step = old_ckpt_step
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
