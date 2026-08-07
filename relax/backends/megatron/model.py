@@ -26,7 +26,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
@@ -39,6 +39,7 @@ from relax.utils.training.ppo_utils import (
     maybe_verify_critic_value_head_movement,
     release_critic_lm_heads,
     validate_critic_value_head_registration,
+    validate_reward_model_head_registration,
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -721,6 +722,7 @@ def forward_only(
                 "multimodal_train_inputs",
                 "total_lengths",
                 "response_lengths",
+                "score_positions",
                 "max_seq_lens",
             ],
             args.data_pad_size_multiplier,
@@ -801,6 +803,7 @@ def forward_only(
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
             loss_masks=batch.get("loss_masks", None),
+            score_positions=batch.get("score_positions", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
@@ -984,6 +987,7 @@ def train_one_step(
                     "values",
                     "advantages",
                     "returns",
+                    "score_positions",
                     "rollout_log_probs",
                     "max_seq_lens",
                     *_opd_keys,
@@ -1578,8 +1582,11 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     value_head_param_ids = ()
+    reward_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
+    elif is_preference_mode(args) and args.sft_objective == "reward_model":
+        reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -1595,6 +1602,12 @@ def initialize_model_and_optimizer(
             "critic value head parameter identities changed during checkpoint loading"
         )
         install_critic_value_head_runtime_check(model)
+    elif is_preference_mode(args) and args.sft_objective == "reward_model":
+        release_critic_lm_heads(model)
+        loaded_reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
+        assert loaded_reward_head_param_ids == reward_head_param_ids, (
+            "reward-model head parameter identities changed during checkpoint loading"
+        )
     clear_memory()
     if opt_param_scheduler is not None:
         opt_param_scheduler.step(increment=iteration * args.global_batch_size)

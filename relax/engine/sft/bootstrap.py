@@ -58,7 +58,7 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
 
     # Lazy import: pulling streaming dataset at module load would drag heavy
     # multimodal deps into every controller import.
-    if getattr(config, "sft_objective", "causal_lm") == "dpo":
+    if getattr(config, "sft_objective", "causal_lm") in {"dpo", "reward_model"}:
         from relax.engine.sft.dataset.preference import PreferenceStreamingDataset
 
         sizing_dataset = PreferenceStreamingDataset(

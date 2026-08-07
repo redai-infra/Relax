@@ -26,13 +26,14 @@ def sft_objective(args: Namespace) -> str:
 
 
 def is_preference_mode(args: Namespace) -> bool:
-    return is_sft_mode(args) and sft_objective(args) == "dpo"
+    return is_sft_mode(args) and sft_objective(args) in {"dpo", "reward_model"}
 
 
 def validate_preference_args(args: Namespace) -> None:
     """Reject unsupported preference configurations before Serve starts."""
     if not is_preference_mode(args):
         return
+    objective = sft_objective(args)
     if getattr(args, "custom_dataset_class_path", None):
         raise ValueError("preference objectives do not support --custom-dataset-class")
     if getattr(args, "multimodal_keys", None) is not None:
@@ -77,29 +78,32 @@ def validate_preference_args(args: Namespace) -> None:
     seq_length = int(getattr(args, "seq_length", max_length) or max_length)
     if max_length > seq_length:
         raise ValueError("--preference-max-length must not exceed --seq-length")
-    if bool(getattr(args, "eval_prompt_data", None)) or getattr(args, "eval_size", None) is not None:
-        raise ValueError("DPO held-out evaluation is delivered by the follow-up reward-modeling PR")
-    beta = float(getattr(args, "dpo_beta", 0.1))
-    if not math.isfinite(beta) or beta <= 0:
-        raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
-    likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
-    if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
-        raise ValueError(
-            "preference objectives require --rollout-temperature 1.0 so sampling temperature does not scale "
-            "policy/reference likelihood logits"
-        )
-    if getattr(args, "ref_load", None) is not None:
-        raise ValueError(
-            "preference objectives do not use --ref-load: standard DPO snapshots the frozen reference "
-            "from the pinned --dpo-reference-repository/--dpo-reference-revision snapshot"
-        )
-    if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
-        raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
-    if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
-        raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
-    if not getattr(args, "dpo_reference_free", False):
-        if not getattr(args, "dpo_reference_repository", None) or not getattr(args, "dpo_reference_revision", None):
-            raise ValueError("standard DPO requires --dpo-reference-repository and --dpo-reference-revision")
+    if objective != "dpo" and getattr(args, "dpo_reference_free", False):
+        raise ValueError("--dpo-reference-free is valid only with --sft-objective dpo")
+    if objective == "dpo":
+        beta = float(getattr(args, "dpo_beta", 0.1))
+        if not math.isfinite(beta) or beta <= 0:
+            raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
+        likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
+        if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
+            raise ValueError(
+                "DPO requires --rollout-temperature 1.0 so sampling temperature does not scale "
+                "policy/reference likelihood logits"
+            )
+        if getattr(args, "ref_load", None) is not None:
+            raise ValueError(
+                "DPO objectives do not use --ref-load: standard DPO snapshots the frozen reference "
+                "from the pinned --dpo-reference-repository/--dpo-reference-revision snapshot"
+            )
+        if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
+            raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
+        if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
+            raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
+        if not getattr(args, "dpo_reference_free", False):
+            if not getattr(args, "dpo_reference_repository", None) or not getattr(
+                args, "dpo_reference_revision", None
+            ):
+                raise ValueError("standard DPO requires --dpo-reference-repository and --dpo-reference-revision")
 
 
 def sft_partition_id(args: Namespace, step: int) -> str:

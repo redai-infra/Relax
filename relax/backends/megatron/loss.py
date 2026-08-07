@@ -37,6 +37,8 @@ from relax.utils.training.preference_utils import (
     build_preference_pair_indices,
     dpo_pair_loss,
     require_tensor_condition,
+    reward_model_pair_loss,
+    select_packed_sequence_scores,
 )
 from relax.utils.types import RolloutBatch
 
@@ -1286,6 +1288,35 @@ def dpo_loss_function(
     return loss, metrics
 
 
+def reward_model_loss_function(
+    args: Namespace,  # noqa: ARG001
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute pair-summed Bradley-Terry loss over adjacent chosen/rejected
+    branches."""
+    if len(batch["total_lengths"]) % 2 != 0:
+        raise ValueError("reward-model micro-batch must contain an even number of chosen/rejected branches")
+    score_positions = batch.get("score_positions")
+    if score_positions is None:
+        raise ValueError("reward-model batch is missing score_positions")
+    scores = select_packed_sequence_scores(logits, batch["total_lengths"], score_positions)
+    chosen_scores, rejected_scores = scores[0::2], scores[1::2]
+    pair_losses = reward_model_pair_loss(chosen_scores, rejected_scores)
+    margins = chosen_scores - rejected_scores
+    loss = pair_losses.sum()
+    if pair_losses.numel() == 0:
+        loss = loss + 0 * logits.sum()
+    return loss, {
+        "loss": pair_losses.detach().sum(),
+        "rm_chosen_score": chosen_scores.detach().sum(),
+        "rm_rejected_score": rejected_scores.detach().sum(),
+        "rm_margin": margins.detach().sum(),
+        "rm_pair_accuracy": (margins > 0).to(torch.float32).detach().sum(),
+    }
+
+
 def sft_loss_function_chunked(
     args: Namespace,
     batch: RolloutBatch,
@@ -1410,6 +1441,8 @@ def loss_function(
         case "sft":
             if getattr(args, "sft_objective", "causal_lm") == "dpo":
                 func = dpo_loss_function
+            elif getattr(args, "sft_objective", "causal_lm") == "reward_model":
+                func = reward_model_loss_function
             elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
                 # Bind lm_head_forward so chunked path matches the standard
                 # inner-func signature; outer body (recompute, CP guard,

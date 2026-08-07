@@ -27,6 +27,8 @@ def _pair_rows(count=2):
         "rejected_loss_masks": [[0, 1]] * count,
         "chosen_total_lengths": [2] * count,
         "rejected_total_lengths": [2] * count,
+        "chosen_score_positions": [1] * count,
+        "rejected_score_positions": [1] * count,
     }
 
 

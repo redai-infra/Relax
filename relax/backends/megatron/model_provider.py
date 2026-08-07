@@ -27,7 +27,10 @@ from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
 from relax.utils.misc import load_function
-from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
+from relax.utils.training.ppo_utils import (
+    install_critic_value_head_in_provider,
+    install_reward_model_head_in_provider,
+)
 
 from .conditional_branch_sync import install_conditional_branch_sync
 
@@ -197,6 +200,7 @@ def get_model_provider_func(
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_reward_model_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -327,6 +331,7 @@ def get_model_provider_func(
             model = original_provide(*p_args, **p_kwargs)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -440,6 +445,7 @@ def get_model_provider_func(
             model = GPTModel(**kwargs)
 
         install_critic_value_head_in_provider(model, role, post_process)
+        install_reward_model_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)

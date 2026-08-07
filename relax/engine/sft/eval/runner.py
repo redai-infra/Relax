@@ -98,6 +98,12 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     loss mask), and the final all-reduce below includes the CP group so
     each rank ends up with the full-sequence totals.
     """
+    from relax.engine.sft.runtime import is_preference_mode
+
+    if is_preference_mode(actor.args):
+        _run_preference_eval(actor, rollout_id)
+        return
+
     # Lazy imports: keep this module importable without Megatron initialized.
     from relax.backends.megatron.data import get_data_iterator
     from relax.backends.megatron.initialize import is_megatron_main_rank
@@ -181,3 +187,120 @@ def run_sft_eval(actor, rollout_id: int) -> None:
         # step) and never reach ClearML/W&B/TB.
         tracking_utils.flush_metrics(args, step)
         logger.info(f"SFT eval @ rollout_id={rollout_id}: {metrics}")
+
+
+def _run_preference_eval(actor, rollout_id: int) -> None:
+    """Evaluate DPO or RM on pair rows using the same TQ packing as
+    training."""
+    from relax.backends.megatron.data import expand_preference_rollout_data, get_data_iterator
+    from relax.backends.megatron.initialize import is_megatron_main_rank
+    from relax.backends.megatron.model import forward_only
+    from relax.engine.sft.eval.preference import (
+        compute_reward_model_eval_step,
+        finalize_pair_metrics,
+        pair_metric_sums,
+    )
+    from relax.utils.training.preference_utils import dpo_pair_loss, reward_model_pair_loss
+
+    args = actor.args
+    task_name = "sft_eval"
+    batch_size = args.global_batch_size // mpu.get_data_parallel_world_size(with_context_parallel=False)
+    data_fields = [
+        "pair_ids",
+        "chosen_tokens",
+        "rejected_tokens",
+        "chosen_loss_masks",
+        "rejected_loss_masks",
+        "chosen_total_lengths",
+        "rejected_total_lengths",
+        "chosen_score_positions",
+        "rejected_score_positions",
+    ]
+    n_chunks = _wait_for_eval_chunk_count(actor, rollout_id)
+    local = torch.zeros(7, device=device_utils.make_current_torch_device(), dtype=torch.float64)
+    started = time.monotonic()
+    with timer("preference_eval"):
+        for chunk_idx in range(n_chunks):
+            partition_id = f"sft_eval_{rollout_id}_n{n_chunks}_{chunk_idx}"
+            _wait_for_eval_partition_present(actor, partition_id)
+            batch_index = 0
+            while not actor.all_consumed(task_name, rollout_id, partition_id=partition_id):
+                pair_rows, _batch_meta = actor._get_data_from_transfer_queue(
+                    task_name, rollout_id, data_fields, batch_size, batch_index, partition_id=partition_id
+                )
+                if pair_rows is None:
+                    continue
+                batch_index += 1
+                rollout_data = expand_preference_rollout_data(pair_rows)
+                data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
+                if args.sft_objective == "dpo":
+                    if args.dpo_reference_free:
+                        reference_sums = None
+                    else:
+                        actor._switch_model("ref")
+                        reference = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")[
+                            "ref_log_probs"
+                        ]
+                        reference_sums = _masked_sequence_sums(reference, rollout_data["loss_masks"], local.device)
+                    actor._switch_model("actor")
+                    policy = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="")["log_probs"]
+                    policy_sums = _masked_sequence_sums(policy, rollout_data["loss_masks"], local.device)
+                    policy_chosen, policy_rejected = policy_sums[0::2], policy_sums[1::2]
+                    if reference_sums is None:
+                        reference_chosen = reference_rejected = None
+                        chosen_values = args.dpo_beta * policy_chosen
+                        rejected_values = args.dpo_beta * policy_rejected
+                    else:
+                        reference_chosen, reference_rejected = reference_sums[0::2], reference_sums[1::2]
+                        chosen_values = args.dpo_beta * (policy_chosen - reference_chosen)
+                        rejected_values = args.dpo_beta * (policy_rejected - reference_rejected)
+                    losses = dpo_pair_loss(
+                        policy_chosen,
+                        policy_rejected,
+                        reference_chosen=reference_chosen,
+                        reference_rejected=reference_rejected,
+                        beta=args.dpo_beta,
+                        reference_free=args.dpo_reference_free,
+                    )
+                    local += pair_metric_sums(chosen_values, rejected_values, losses)
+                else:
+                    outputs = forward_only(
+                        compute_reward_model_eval_step,
+                        args,
+                        actor.model,
+                        data_iterator,
+                        num_microbatches,
+                        store_prefix="",
+                    )
+                    if mpu.is_pipeline_last_stage():
+                        scores = torch.cat(outputs["scores"]).to(local.device)
+                        chosen_scores, rejected_scores = scores[0::2], scores[1::2]
+                        losses = reward_model_pair_loss(chosen_scores, rejected_scores)
+                        local += pair_metric_sums(chosen_scores, rejected_scores, losses)
+            dist.barrier(group=get_gloo_group())
+            if dist.get_rank() == 0:
+                run(actor.data_system_client.async_clear_partition(partition_id=partition_id))
+
+    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
+    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    metrics = finalize_pair_metrics(local, prefix="dpo" if args.sft_objective == "dpo" else "rm")
+    metrics["perf/preference_eval_time"] = time.monotonic() - started
+    if is_megatron_main_rank():
+        step = compute_rollout_step(args, rollout_id)
+        metrics["rollout/step"] = step
+        tracking_utils.log(args, metrics, step_key="rollout/step")
+        tracking_utils.flush_metrics(args, step)
+        logger.info(f"Preference eval @ rollout_id={rollout_id}: {metrics}")
+
+
+def _masked_sequence_sums(values, masks, device: torch.device) -> torch.Tensor:
+    if len(values) != len(masks):
+        raise ValueError("preference eval values/masks are not branch aligned")
+    sums = []
+    for value, mask in zip(values, masks, strict=True):
+        value = torch.as_tensor(value, device=device)
+        mask = torch.as_tensor(mask, device=device, dtype=value.dtype)
+        if value.shape != mask.shape:
+            raise ValueError(f"preference eval value/mask shape mismatch: {value.shape} vs {mask.shape}")
+        sums.append((value * mask).sum())
+    return torch.stack(sums)

@@ -59,6 +59,8 @@ def test_preference_data_fields_keep_pairs_atomic():
         "rejected_loss_masks",
         "chosen_total_lengths",
         "rejected_total_lengths",
+        "chosen_score_positions",
+        "rejected_score_positions",
     ]
 
 
@@ -73,6 +75,8 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
         "rejected_loss_masks": [[0, 1]],
         "chosen_total_lengths": [3],
         "rejected_total_lengths": [2],
+        "chosen_score_positions": [2],
+        "rejected_score_positions": [1],
     }
     args = Namespace(qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False)
     monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))

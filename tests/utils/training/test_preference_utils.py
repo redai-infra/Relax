@@ -13,6 +13,8 @@ from relax.utils.training.preference_utils import (
     dpo_pair_loss,
     pack_preference_pair_indices,
     require_tensor_condition,
+    reward_model_pair_loss,
+    select_packed_sequence_scores,
 )
 
 
@@ -81,6 +83,39 @@ def test_dpo_pair_loss_rejects_missing_reference_and_non_finite_values():
         dpo_pair_loss(finite, finite)
     with pytest.raises(ValueError, match="finite"):
         dpo_pair_loss(torch.tensor([float("nan")]), finite, reference_free=True)
+
+
+def test_reward_model_pair_loss_matches_independent_reference_and_gradient():
+    chosen = torch.tensor([1.0, -1.0, 0.0], requires_grad=True)
+    rejected = torch.tensor([0.0, 2.0, 0.0], requires_grad=True)
+
+    actual = reward_model_pair_loss(chosen, rejected)
+    expected = -F.logsigmoid(chosen - rejected)
+    assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+    actual.sum().backward()
+    actual_grad = chosen.grad.detach().clone()
+    chosen.grad = None
+    expected.sum().backward()
+    assert torch.allclose(actual_grad, chosen.grad, rtol=1e-6, atol=1e-6)
+
+
+def test_select_packed_sequence_scores_preserves_pair_order_and_gradient():
+    flat_logits = torch.arange(10, dtype=torch.float32, requires_grad=True)
+    logits = flat_logits.reshape(1, 10, 1)
+
+    scores = select_packed_sequence_scores(logits, [3, 2, 4], [2, 1, 3])
+
+    assert scores.tolist() == [2.0, 4.0, 8.0]
+    scores.sum().backward()
+    expected = torch.zeros(10)
+    expected[[2, 4, 8]] = 1
+    assert torch.equal(flat_logits.grad, expected)
+
+
+def test_select_packed_sequence_scores_rejects_invalid_position():
+    with pytest.raises(ValueError, match="outside"):
+        select_packed_sequence_scores(torch.zeros(1, 4, 1), [4], [4])
 
 
 def test_pair_packer_is_deterministic_complete_and_capacity_safe():

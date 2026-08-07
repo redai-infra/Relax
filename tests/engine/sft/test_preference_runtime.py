@@ -32,8 +32,6 @@ def _args(**overrides) -> Namespace:
         "attention_dropout": 0.0,
         "sft_predict_interval": None,
         "eval_interval": None,
-        "eval_prompt_data": None,
-        "eval_size": None,
         "dpo_beta": 0.1,
         "rollout_temperature": 1.0,
         "dpo_reference_free": False,
@@ -54,7 +52,6 @@ def test_preference_mode_is_nested_under_sft():
     assert is_preference_mode(_args())
     assert not is_preference_mode(_args(loss_type="policy_loss"))
     assert not is_preference_mode(_args(sft_objective="causal_lm"))
-    assert not is_preference_mode(_args(sft_objective="reward_model"))
 
 
 @pytest.mark.parametrize(
@@ -76,7 +73,6 @@ def test_preference_mode_is_nested_under_sft():
         ({"rollout_temperature": float("nan")}, "rollout-temperature 1.0"),
         ({"rollout_temperature": float("inf")}, "rollout-temperature 1.0"),
         ({"preference_max_completion_length": 2048}, "must not exceed"),
-        ({"eval_prompt_data": ["heldout", "eval.jsonl"]}, "follow-up reward-modeling PR"),
     ],
 )
 def test_preference_validation_rejects_unsupported_configs(overrides: dict, match: str):
@@ -91,3 +87,17 @@ def test_reference_free_dpo_does_not_require_ref_update_constraint():
 def test_standard_dpo_requires_explicit_reference_repository_and_revision():
     with pytest.raises(ValueError, match="dpo-reference-repository"):
         validate_preference_args(_args(dpo_reference_repository=None))
+
+
+def test_reward_model_accepts_hf_load_and_held_out_evaluation():
+    validate_preference_args(
+        _args(
+            sft_objective="reward_model",
+            ref_load="/models/Qwen3-0.6B",
+            eval_prompt_data=["task31", "heldout.parquet"],
+            rollout_temperature=0.8,
+            enable_weights_backuper=False,
+            dpo_reference_repository=None,
+            dpo_reference_revision=None,
+        )
+    )

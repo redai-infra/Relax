@@ -211,26 +211,46 @@ class SFT(Base):
             eval_tool_key = getattr(self.config, "eval_tool_key", None) or self.config.tool_key
             # Eval is small + runs every `eval_interval`; disable prefetch so
             # we don't consume worker threads idly between eval rounds.
-            self._eval_dataset = SFTStreamingDataset(
-                path=[d.path for d in eval_prompt_data],
-                tokenizer=self._tokenizer,
-                processor_pool=self._processor_pool,
-                capacity=capacity,
-                prompt_key=eval_input_key,
-                label_key=eval_label_key,
-                multimodal_keys=self.config.multimodal_keys,
-                conversation_key_map=getattr(self.config, "conversation_key_map", None),
-                metadata_key=self.config.metadata_key,
-                tool_key=eval_tool_key,
-                system_prompt=self.config.system_prompt,
-                source_name="+".join(d.name for d in eval_prompt_data),
-                seed=seed,
-                prefetch_max_cached=0,
-                pad_token_ids=pad_token_ids,
-                oversize_strategy=oversize_strategy,
-                oversize_custom_fn=oversize_custom_fn,
-                apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
-            )
+            if is_preference_mode(self.config):
+                self._eval_dataset = PreferenceStreamingDataset(
+                    path=[d.path for d in eval_prompt_data],
+                    tokenizer=self._tokenizer,
+                    prompt_key=eval_input_key,
+                    chosen_key=self.config.preference_chosen_key,
+                    rejected_key=self.config.preference_rejected_key,
+                    pair_id_key=self.config.preference_pair_id_key,
+                    metadata_key=self.config.metadata_key,
+                    source_name="+".join(d.name for d in eval_prompt_data),
+                    max_length=self.config.preference_max_length,
+                    max_completion_length=self.config.preference_max_completion_length,
+                    pair_capacity=capacity,
+                    seed=seed,
+                    prefetch_max_cached=0,
+                    apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                    expected_chat_template_sha256=self.config.preference_chat_template_sha256,
+                    require_no_generation_marker=self.config.preference_require_no_generation_marker,
+                )
+            else:
+                self._eval_dataset = SFTStreamingDataset(
+                    path=[d.path for d in eval_prompt_data],
+                    tokenizer=self._tokenizer,
+                    processor_pool=self._processor_pool,
+                    capacity=capacity,
+                    prompt_key=eval_input_key,
+                    label_key=eval_label_key,
+                    multimodal_keys=self.config.multimodal_keys,
+                    conversation_key_map=getattr(self.config, "conversation_key_map", None),
+                    metadata_key=self.config.metadata_key,
+                    tool_key=eval_tool_key,
+                    system_prompt=self.config.system_prompt,
+                    source_name="+".join(d.name for d in eval_prompt_data),
+                    seed=seed,
+                    prefetch_max_cached=0,
+                    pad_token_ids=pad_token_ids,
+                    oversize_strategy=oversize_strategy,
+                    oversize_custom_fn=oversize_custom_fn,
+                    apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                )
 
         # Resume: align IndexManager with `start_rollout_id` so a restart sees
         # the same shuffled order it would on a fresh run.
@@ -436,9 +456,16 @@ class SFT(Base):
                 f"interpret with caution."
             )
 
-        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
+        if is_preference_mode(self.config):
+            backend_batch, preference_custom_meta = pack_preference_pairs_for_tq(samples)
+        else:
+            backend_batch = pack_samples_for_tq(
+                samples, force_multimodal_field=self.config.multimodal_keys is not None
+            )
+            preference_custom_meta = None
         assert backend_batch is not None
-        n_samples = len(backend_batch["tokens"])
+        row_key = "pair_ids" if is_preference_mode(self.config) else "tokens"
+        n_samples = len(backend_batch[row_key])
 
         # Drain the current train partition so the eval chunks have the full
         # TQ capacity to themselves.
@@ -480,8 +507,9 @@ class SFT(Base):
             chunk = {k: v[s:e] for k, v in backend_batch.items()}
             partition_id = f"sft_eval_{self.step}_n{n_chunks}_{chunk_idx}"
             await self.data_system_client.async_put(
-                data=dict_to_tensordict(chunk, batch_size=len(chunk["tokens"])),
+                data=dict_to_tensordict(chunk, batch_size=len(chunk[row_key])),
                 partition_id=partition_id,
+                custom_meta=None if preference_custom_meta is None else preference_custom_meta[s:e],
             )
             drained = await self._wait_for_partition_drained(partition_id, timeout_sec=chunk_drain_timeout)
             if not drained:

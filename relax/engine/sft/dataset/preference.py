@@ -88,6 +88,8 @@ class ProcessedPreferencePair:
     rejected_prompt_length: int
     chosen_completion_length: int
     rejected_completion_length: int
+    chosen_score_position: int
+    rejected_score_position: int
     source_idx: int
 
     @property
@@ -417,6 +419,8 @@ class PreferenceStreamingDataset:
             rejected_prompt_length=prompt.numel(),
             chosen_completion_length=chosen_completion.numel(),
             rejected_completion_length=rejected_completion.numel(),
+            chosen_score_position=chosen_tokens.numel() - 1,
+            rejected_score_position=rejected_tokens.numel() - 1,
             source_idx=idx,
         )
 
@@ -518,6 +522,8 @@ def pack_preference_pairs_for_tq(
         "rejected_loss_masks": [pair.rejected_loss_mask.tolist() for pair in pairs],
         "chosen_total_lengths": [pair.chosen_total_length for pair in pairs],
         "rejected_total_lengths": [pair.rejected_total_length for pair in pairs],
+        "chosen_score_positions": [pair.chosen_score_position for pair in pairs],
+        "rejected_score_positions": [pair.rejected_score_position for pair in pairs],
     }
     custom_meta = [{"total_lengths": pair.pair_total_length} for pair in pairs]
     if len(custom_meta) != len(pairs):

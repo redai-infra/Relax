@@ -465,7 +465,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # ---- SFT / Predict ----
             parser.add_argument(
                 "--sft-objective",
-                choices=["causal_lm", "dpo"],
+                choices=["causal_lm", "dpo", "reward_model"],
                 default="causal_lm",
                 help="Offline objective under --loss-type sft. Defaults to the existing causal-LM behavior.",
             )

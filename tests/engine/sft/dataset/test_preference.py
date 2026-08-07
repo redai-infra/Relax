@@ -90,6 +90,8 @@ def test_explicit_pair_builds_identical_prompt_and_completion_only_masks(tmp_pat
     assert pair.rejected_loss_mask[: pair.rejected_prompt_length].sum().item() == 0
     assert pair.chosen_loss_mask[pair.chosen_prompt_length :].all()
     assert pair.rejected_loss_mask[pair.rejected_prompt_length :].all()
+    assert pair.chosen_score_position == pair.chosen_total_length - 1
+    assert pair.rejected_score_position == pair.rejected_total_length - 1
 
 
 def test_implicit_ultrafeedback_pair_extracts_strict_common_prefix(tmp_path: Path):

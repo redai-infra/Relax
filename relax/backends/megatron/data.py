@@ -717,6 +717,8 @@ def expand_preference_rollout_data(rollout_data: RolloutBatch) -> RolloutBatch:
         "rejected_loss_masks",
         "chosen_total_lengths",
         "rejected_total_lengths",
+        "chosen_score_positions",
+        "rejected_score_positions",
     )
     missing = [key for key in required if key not in rollout_data]
     if missing:
@@ -735,6 +737,7 @@ def expand_preference_rollout_data(rollout_data: RolloutBatch) -> RolloutBatch:
         "loss_masks": [],
         "total_lengths": [],
         "response_lengths": [],
+        "score_positions": [],
         "preference_branch_pair_ids": [],
         "preference_is_chosen": [],
     }
@@ -752,14 +755,18 @@ def expand_preference_rollout_data(rollout_data: RolloutBatch) -> RolloutBatch:
             tokens = rollout_data[f"{prefix}_tokens"][index]
             loss_mask = rollout_data[f"{prefix}_loss_masks"][index]
             total_length = int(rollout_data[f"{prefix}_total_lengths"][index])
+            score_position = int(rollout_data[f"{prefix}_score_positions"][index])
             if len(tokens) != total_length or len(loss_mask) != total_length:
                 raise ValueError(
                     f"preference pair row {index} {prefix} tensor length does not match declared total_length"
                 )
+            if not 0 <= score_position < total_length:
+                raise ValueError(f"preference pair row {index} {prefix} score position is out of range")
             flat["tokens"].append(tokens)
             flat["loss_masks"].append(loss_mask)
             flat["total_lengths"].append(total_length)
             flat["response_lengths"].append(total_length)
+            flat["score_positions"].append(score_position)
             flat["preference_branch_pair_ids"].append(pair_id)
             flat["preference_is_chosen"].append(is_chosen)
     flat["preference_pair_costs"] = pair_costs
@@ -1059,6 +1066,7 @@ def log_rollout_data(
                 "preference_pair_ids",
                 "preference_branch_pair_ids",
                 "preference_is_chosen",
+                "score_positions",
             ]:
                 continue
             if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:

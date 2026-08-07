@@ -1023,9 +1023,45 @@ def install_critic_value_head_in_provider(
     )
 
 
+def install_reward_model_head_in_provider(
+    model: torch.nn.Module,
+    args,
+    role: str,
+    post_process: bool,
+    *,
+    stash_lm_head: bool = False,
+) -> None:
+    """Install the offline reward-model scalar head before DDP/optimizer
+    construction."""
+    if (
+        role != "actor"
+        or not post_process
+        or getattr(args, "loss_type", None) != "sft"
+        or getattr(args, "sft_objective", "causal_lm") != "reward_model"
+    ):
+        return
+
+    owner = _find_output_layer_owner(model)
+    if owner is None:
+        return
+
+    output_layer = owner.output_layer
+    if isinstance(output_layer, LinearForLastLayer) and output_layer.out_features == 1:
+        return
+
+    if stash_lm_head:
+        object.__setattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR, output_layer)
+    owner.output_layer = LinearForLastLayer(
+        input_size=owner.config.hidden_size,
+        output_size=1,
+        config=owner.config,
+        bias=False,
+    )
+
+
 @contextlib.contextmanager
 def use_critic_lm_head_for_hf_load(model):
-    """Temporarily restore the stashed LM head for HF Bridge weight loading.
+    """Temporarily restore a stashed LM head for HF Bridge weight loading.
 
     Bridge can only convert HF weights against a vocab-sized ``output_layer``;
     the scalar value head is put back in ``finally`` (asserting the exact same
@@ -1052,9 +1088,9 @@ def use_critic_lm_head_for_hf_load(model):
         for owner, value_head, value_param_ids in reversed(restored_heads):
             owner.output_layer = value_head
             object.__delattr__(owner, _RELAX_HF_OUTPUT_LAYER_ATTR)
-            assert owner.output_layer is value_head, "critic value head object changed during HF checkpoint loading"
+            assert owner.output_layer is value_head, "scalar head object changed during HF checkpoint loading"
             assert tuple(id(param) for param in value_head.parameters()) == value_param_ids, (
-                "critic value head parameters changed during HF checkpoint loading"
+                "scalar head parameters changed during HF checkpoint loading"
             )
 
 
@@ -1116,6 +1152,30 @@ def validate_critic_value_head_registration(model, optimizer) -> tuple[int, ...]
             value_head_param_ids.append(id(param))
 
     return tuple(value_head_param_ids)
+
+
+def validate_reward_model_head_registration(model, optimizer) -> tuple[int, ...]:
+    """Validate RM scalar-head shape, bias contract, registration, and DDP
+    ownership."""
+    del optimizer
+    parameter_ids = []
+    for model_chunk in model:
+        owner = _find_output_layer_owner(model_chunk)
+        if owner is None:
+            continue
+        head = owner.output_layer
+        assert isinstance(head, LinearForLastLayer), (
+            f"reward-model output layer must be LinearForLastLayer, got {type(head).__name__}"
+        )
+        assert tuple(head.weight.shape) == (1, owner.config.hidden_size), (
+            f"reward-model head weight must have shape (1, {owner.config.hidden_size}), got {tuple(head.weight.shape)}"
+        )
+        assert head.bias is None, "reward-model scalar head must use bias=False"
+        registered_parameter_ids = {id(parameter) for parameter in model_chunk.parameters()}
+        assert id(head.weight) in registered_parameter_ids, "reward-model output_layer.weight is not registered"
+        assert _ddp_owns_param(model_chunk, head.weight), "DDP does not own reward-model output_layer.weight"
+        parameter_ids.append(id(head.weight))
+    return tuple(parameter_ids)
 
 
 def snapshot_critic_value_head_state(model) -> dict:
