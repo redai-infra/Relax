@@ -25,7 +25,7 @@ A headwise CP=2 run is included at every layer as a control: if headwise and
 chunkwise both drift the same way, the cause is shared plumbing, not the new
 code.
 
-Run with 2 visible GPUs:
+Most tests need 2 visible GPUs; the TP2/CP2 matrix test needs 4:
     pytest tests/backends/megatron/test_gdn_chunkwise_cp_gpu.py
 """
 
@@ -226,14 +226,16 @@ def _worker_fla_kernels(rank, world_size, dtype_name, _unused):
     q = l2norm(_mk(1, total, H, DK).contiguous())
     k = l2norm(_mk(1, total, H, DK).contiguous())
     v = _mk(1, total, H, DV)
-    g = -_mk(1, total, H, dtype=torch.float32).abs() * 0.1
-    beta = _mk(1, total, H, dtype=torch.float32).sigmoid()
+    g0 = -_mk(1, total, H, dtype=torch.float32).abs() * 0.1
+    beta0 = _mk(1, total, H, dtype=torch.float32).sigmoid()
 
     leaves_ref = [t.detach().clone().requires_grad_(True) for t in (q, k, v)]
+    g_ref = g0.detach().clone().requires_grad_(True)
+    beta_ref = beta0.detach().clone().requires_grad_(True)
     o_ref, _ = chunk_gated_delta_rule(
         *leaves_ref,
-        g=g,
-        beta=beta,
+        g=g_ref,
+        beta=beta_ref,
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=False,
@@ -243,11 +245,13 @@ def _worker_fla_kernels(rank, world_size, dtype_name, _unused):
     (o_ref.float() * o_grad.float()).sum().backward()
 
     leaves_cp = [t.detach()[:, lo:hi].clone().requires_grad_(True) for t in (q, k, v)]
+    g_cp = g0.detach()[:, lo:hi].clone().requires_grad_(True)
+    beta_cp = beta0.detach()[:, lo:hi].clone().requires_grad_(True)
     ctx2 = build_cp_context(cu_seqlens=cu, group=cp_group, conv1d_kernel_size=W)
     o_cp, _ = chunk_gated_delta_rule(
         *leaves_cp,
-        g=g[:, lo:hi],
-        beta=beta[:, lo:hi],
+        g=g_cp,
+        beta=beta_cp,
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=False,
@@ -258,6 +262,8 @@ def _worker_fla_kernels(rank, world_size, dtype_name, _unused):
     (o_cp.float() * o_grad[:, lo:hi].float()).sum().backward()
     for name, a, b in zip("qkv", leaves_cp, leaves_ref):
         _report_rms(f"{tag} gdr d{name}", a.grad, b.grad[:, lo:hi], gdn_ratio)
+    _report_rms(f"{tag} gdr dg", g_cp.grad, g_ref.grad[:, lo:hi], gdn_ratio)
+    _report_rms(f"{tag} gdr dbeta", beta_cp.grad, beta_ref.grad[:, lo:hi], gdn_ratio)
 
     dist.barrier()
     dist.destroy_process_group()
@@ -266,7 +272,15 @@ def _worker_fla_kernels(rank, world_size, dtype_name, _unused):
 # ---------------------------------------------------------------------------
 # worker: full MCore GatedDeltaNet
 # ---------------------------------------------------------------------------
-def _build_gdn(cp_size, linear_cp_mode, dtype, num_key_heads=4, num_value_heads=8):
+def _build_gdn(
+    cp_size,
+    linear_cp_mode,
+    dtype,
+    num_key_heads=4,
+    num_value_heads=8,
+    tp_size=1,
+    deterministic_mode=False,
+):
     import torch.nn.functional as F
     from megatron.core import parallel_state
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -288,8 +302,9 @@ def _build_gdn(cp_size, linear_cp_mode, dtype, num_key_heads=4, num_value_heads=
         layernorm_zero_centered_gamma=True,
         activation_func=F.silu,
         bf16=dtype is torch.bfloat16,
-        tensor_model_parallel_size=1,
+        tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
+        deterministic_mode=deterministic_mode,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
         linear_conv_kernel_dim=4,
@@ -318,11 +333,20 @@ def _build_gdn(cp_size, linear_cp_mode, dtype, num_key_heads=4, num_value_heads=
     return gdn.cuda().to(dtype), config
 
 
-def _run_gdn_once(gdn, hidden, psp, grad_out):
+def _run_gdn_once(gdn, hidden, psp, grad_out, *, recompute=False, **forward_kwargs):
     """One forward+backward; returns (out, d_hidden, {param: grad})."""
     gdn.zero_grad(set_to_none=True)
     h = hidden.clone().requires_grad_(True)
-    out, _ = gdn(h, None, packed_seq_params=psp)
+    if recompute:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(
+            lambda x: gdn(x, None, packed_seq_params=psp, **forward_kwargs)[0],
+            h,
+            use_reentrant=False,
+        )
+    else:
+        out, _ = gdn(h, None, packed_seq_params=psp, **forward_kwargs)
     (out.float() * grad_out).sum().backward()
     grads = {n: p.grad.detach().float().clone() for n, p in gdn.named_parameters()}
     return out.detach().clone(), h.grad.detach().clone(), grads
@@ -478,6 +502,249 @@ def _worker_gdn_module(rank, world_size, dtype_name, _unused):
     dist.destroy_process_group()
 
 
+def _worker_deterministic_reference(rank, world_size, _spec, _unused):
+    """The torch-native deterministic rule must accept cp_context=None and
+    preserve headwise CP correctness."""
+    _init_dist(rank, world_size)
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=world_size,
+    )
+    device = torch.device("cuda", rank)
+    cp_group = parallel_state.get_context_parallel_group()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    solo = [dist.new_group([r]) for r in range(world_size)][rank]
+
+    gdn, config = _build_gdn(
+        world_size,
+        "headwise",
+        torch.float32,
+        deterministic_mode=True,
+    )
+    assert gdn.gated_delta_rule.__name__ == "torch_chunk_gated_delta_rule"
+    for p in gdn.parameters():
+        dist.broadcast(p.data, src=0, group=cp_group)
+
+    total = 64
+    cu = torch.tensor([0, total], device=device, dtype=torch.int32)
+    gen = torch.Generator(device="cpu").manual_seed(17)
+    hidden_full = torch.randn(total, 1, config.hidden_size, generator=gen).to(device)
+    grad_full = torch.randn(total, 1, config.hidden_size, generator=gen).to(device)
+
+    solo_pg = ProcessGroupCollection(tp=tp_group, cp=solo)
+    out_ref, in_grad_ref, param_grads_ref = _run_gdn_once(
+        gdn,
+        hidden_full,
+        None,
+        grad_full,
+        pg_collection=solo_pg,
+    )
+
+    hidden_shard = _zigzag_shard(hidden_full, cu, world_size, rank)
+    grad_shard = _zigzag_shard(grad_full, cu, world_size, rank)
+    out_cp, in_grad_cp, param_grads_cp = _run_gdn_once(gdn, hidden_shard, None, grad_shard)
+
+    _report_rms(
+        f"[rank{rank}] deterministic out",
+        out_cp,
+        _zigzag_shard(out_ref, cu, world_size, rank),
+        RMS_RATIO_FP32,
+    )
+    _report_rms(
+        f"[rank{rank}] deterministic d_hidden",
+        in_grad_cp,
+        _zigzag_shard(in_grad_ref, cu, world_size, rank),
+        RMS_RATIO_FP32,
+    )
+    for name, grad in param_grads_cp.items():
+        summed = grad.clone()
+        dist.all_reduce(summed, group=cp_group)
+        _report_rms(
+            f"[rank{rank}] deterministic grad {name}",
+            summed,
+            param_grads_ref[name],
+            RMS_RATIO_FP32,
+        )
+
+    dist.barrier()
+    parallel_state.destroy_model_parallel()
+    dist.destroy_process_group()
+
+
+def _worker_recompute_parity(rank, world_size, _spec, _unused):
+    """External activation checkpointing must replay chunkwise collectives
+    without changing outputs or gradients."""
+    _init_dist(rank, world_size)
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=world_size,
+    )
+    device = torch.device("cuda", rank)
+    cp_group = parallel_state.get_context_parallel_group()
+
+    gdn, config = _build_gdn(world_size, "chunkwise", torch.float32)
+    for p in gdn.parameters():
+        dist.broadcast(p.data, src=0, group=cp_group)
+
+    seq_lens = [128, 64]
+    total = sum(seq_lens)
+    cu = torch.tensor([0, seq_lens[0], total], device=device, dtype=torch.int32)
+    psp = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        cu_seqlens_q_padded=cu,
+        cu_seqlens_kv_padded=cu,
+        max_seqlen_q=max(seq_lens),
+        max_seqlen_kv=max(seq_lens),
+        cp_group=cp_group,
+        local_cp_size=world_size,
+    )
+
+    gen = torch.Generator(device="cpu").manual_seed(29)
+    hidden_full = torch.randn(total, 1, config.hidden_size, generator=gen).to(device)
+    grad_full = torch.randn(total, 1, config.hidden_size, generator=gen).to(device)
+    hidden = _zigzag_shard(hidden_full, cu, world_size, rank)
+    grad = _zigzag_shard(grad_full, cu, world_size, rank)
+
+    out_eager, in_grad_eager, param_grads_eager = _run_gdn_once(gdn, hidden, psp, grad)
+    out_recompute, in_grad_recompute, param_grads_recompute = _run_gdn_once(
+        gdn,
+        hidden,
+        psp,
+        grad,
+        recompute=True,
+    )
+
+    _report_rms(f"[rank{rank}] recompute out", out_recompute, out_eager, KERNEL_RMS_RATIO_FP32)
+    _report_rms(
+        f"[rank{rank}] recompute d_hidden",
+        in_grad_recompute,
+        in_grad_eager,
+        KERNEL_RMS_RATIO_FP32,
+    )
+    assert set(param_grads_recompute) == set(param_grads_eager)
+    for name in param_grads_eager:
+        _report_rms(
+            f"[rank{rank}] recompute grad {name}",
+            param_grads_recompute[name],
+            param_grads_eager[name],
+            KERNEL_RMS_RATIO_FP32,
+        )
+
+    dist.barrier()
+    parallel_state.destroy_model_parallel()
+    dist.destroy_process_group()
+
+
+def _worker_tp2_cp2(rank, world_size, _spec, _unused):
+    """Exercise TP head sharding and CP routing together."""
+    assert world_size == 4
+    _init_dist(rank, world_size)
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+    )
+    device = torch.device("cuda", rank)
+    cp_group = parallel_state.get_context_parallel_group()
+    cp_rank = cp_group.rank()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    cp_source = dist.get_process_group_ranks(cp_group)[0]
+    solo = [dist.new_group([r]) for r in range(world_size)][rank]
+
+    modules = {}
+    headwise, config = _build_gdn(2, "headwise", torch.float32, tp_size=2)
+    for p in headwise.parameters():
+        dist.broadcast(p.data, src=cp_source, group=cp_group)
+    modules["headwise"] = headwise
+    modules["chunkwise"], _ = _build_gdn(2, "chunkwise", torch.float32, tp_size=2)
+    modules["chunkwise"].load_state_dict(headwise.state_dict())
+    sharded_signatures = {}
+    for mode, module in modules.items():
+        sharded_signatures[mode] = {
+            key: (
+                tuple(getattr(value, "global_shape", ())),
+                tuple(getattr(value, "local_shape", ())),
+                getattr(value, "axis_fragmentations", None),
+            )
+            for key, value in sorted(module.sharded_state_dict(prefix="mixer.").items())
+        }
+    assert sharded_signatures["headwise"] == sharded_signatures["chunkwise"]
+
+    seq_lens = [128, 64]
+    total = sum(seq_lens)
+    cu = torch.tensor([0, seq_lens[0], total], device=device, dtype=torch.int32)
+    gen = torch.Generator(device="cpu").manual_seed(41)
+    hidden_full = torch.randn(total, 1, config.hidden_size, generator=gen).to(device)
+    grad_full = torch.randn(total, 1, config.hidden_size, generator=gen).to(device)
+
+    def _psp(group, cp_size):
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            max_seqlen_q=max(seq_lens),
+            max_seqlen_kv=max(seq_lens),
+            cp_group=group,
+            local_cp_size=cp_size,
+        )
+
+    solo_pg = ProcessGroupCollection(tp=tp_group, cp=solo)
+    out_ref, in_grad_ref, param_grads_ref = _run_gdn_once(
+        headwise,
+        hidden_full,
+        _psp(solo, 1),
+        grad_full,
+        pg_collection=solo_pg,
+    )
+    hidden = _zigzag_shard(hidden_full, cu, 2, cp_rank)
+    grad = _zigzag_shard(grad_full, cu, 2, cp_rank)
+    out_want = _zigzag_shard(out_ref, cu, 2, cp_rank)
+    in_grad_want = _zigzag_shard(in_grad_ref, cu, 2, cp_rank)
+
+    for mode, module in modules.items():
+        out, in_grad, param_grads = _run_gdn_once(module, hidden, _psp(cp_group, 2), grad)
+        _report_rms(f"[rank{rank}][{mode}] TP2/CP2 out", out, out_want, RMS_RATIO_FP32)
+        _report_rms(
+            f"[rank{rank}][{mode}] TP2/CP2 d_hidden",
+            in_grad,
+            in_grad_want,
+            RMS_RATIO_FP32,
+        )
+        assert set(param_grads) == set(param_grads_ref)
+        for name, param_grad in param_grads.items():
+            summed = param_grad.clone()
+            dist.all_reduce(summed, group=cp_group)
+            _report_rms(
+                f"[rank{rank}][{mode}] TP2/CP2 grad {name}",
+                summed,
+                param_grads_ref[name],
+                RMS_RATIO_FP32,
+            )
+
+    dist.barrier()
+    parallel_state.destroy_model_parallel()
+    dist.destroy_process_group()
+
+
 def _worker_layout_round_trip(rank, world_size, _spec, _unused):
     """zigzag -> contiguous -> zigzag over a real CP group must be token-exact.
 
@@ -571,12 +838,13 @@ def _worker_illegal_modes_fail_fast(rank, world_size, _spec, _unused):
     # 2. ...but a CP=1 micro-batch is legal under any declared mode: it needs no CP
     #    communication at all, so the mode is never consulted.
     full = torch.randn(total, 1, config.hidden_size, device=device, dtype=torch.bfloat16)
-    gdn(full, None, packed_seq_params=_psp(solo, 1))
+    solo_psp = _psp(solo, 1)
+    gdn(full, None, packed_seq_params=solo_psp)
 
-    # 3. local_cp_size disagreeing with the group it selected means some collective would
-    #    run on the wrong group.
+    # 3. The final PackedSeqParams must describe the same runtime CP geometry
+    #    through both fields.
     gdn_hw, _ = _build_gdn(world_size, "headwise", torch.bfloat16)
-    with pytest.raises(ValueError, match="local_cp_size"):
+    with pytest.raises(ValueError, match="does not match cp_group.size"):
         gdn_hw(hidden, None, packed_seq_params=_psp(cp_group, world_size + 1))
 
     # 4. deterministic mode has no CP-context scan.
@@ -605,6 +873,8 @@ def _worker_state_dict_invariance(rank, world_size, _spec, _unused):
     """GDN weights must stay TP-only: same keys and shard dims in every CP
     mode."""
     _init_dist(rank, world_size)
+    import io
+
     import torch.distributed as dist
     from megatron.core import parallel_state
 
@@ -613,6 +883,7 @@ def _worker_state_dict_invariance(rank, world_size, _spec, _unused):
         pipeline_model_parallel_size=1,
         context_parallel_size=world_size,
     )
+    device = torch.device("cuda", rank)
 
     signatures = {}
     for cp_size, mode in ((1, "headwise"), (world_size, "headwise"), (world_size, "chunkwise")):
@@ -630,6 +901,20 @@ def _worker_state_dict_invariance(rank, world_size, _spec, _unused):
                 for k, v in sorted(sharded.items())
             },
         )
+
+        # Exercise real serialization and loading, not just key comparison.
+        checkpoint = io.BytesIO()
+        torch.save(sd, checkpoint)
+        checkpoint.seek(0)
+        loaded = torch.load(checkpoint, map_location=device, weights_only=True)
+        restored, _ = _build_gdn(cp_size, mode, torch.bfloat16)
+        restored.load_state_dict(loaded, strict=True)
+        for name, tensor in sd.items():
+            if torch.is_tensor(tensor):
+                assert torch.equal(restored.state_dict()[name], tensor), (
+                    f"state_dict round trip changed {name} for {(cp_size, mode)}"
+                )
+        del restored
         del gdn
 
     baseline = signatures[(1, "headwise")]
@@ -649,8 +934,17 @@ def _worker_state_dict_invariance(rank, world_size, _spec, _unused):
 # pytest entry points
 # ---------------------------------------------------------------------------
 def _spawn(fn, spec, port, extra=None):
+    _spawn_world(fn, WORLD_SIZE, spec, port, extra=extra)
+
+
+def _spawn_world(fn, world_size, spec, port, extra=None):
     os.environ["MASTER_PORT"] = str(port)
-    mp.spawn(fn, args=(WORLD_SIZE, extra if extra is not None else spec, None), nprocs=WORLD_SIZE, join=True)
+    mp.spawn(
+        fn,
+        args=(world_size, extra if extra is not None else spec, None),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 @needs_backport
@@ -666,6 +960,27 @@ def test_gdn_cp_matches_cp1(dtype_name, port):
     """RFC 3.4 item 3: CP=2 vs CP=1, forward and backward, both CP
     algorithms."""
     _spawn(_worker_gdn_module, dtype_name, port)
+
+
+@needs_backport
+def test_deterministic_headwise_cp_matches_cp1():
+    """The torch-native rule accepts cp_context=None and stays correct under
+    headwise CP."""
+    _spawn(_worker_deterministic_reference, "n/a", 29547)
+
+
+@needs_backport
+def test_chunkwise_recompute_matches_eager():
+    """Replaying chunkwise forward during backward preserves every tested
+    gradient."""
+    _spawn(_worker_recompute_parity, "n/a", 29548)
+
+
+@needs_backport
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 CUDA devices for TP2/CP2")
+def test_gdn_tp2_cp2_matches_cp1():
+    """TP2/CP2 exercises TP head shards and both CP algorithms together."""
+    _spawn_world(_worker_tp2_cp2, 4, "n/a", 29549)
 
 
 @needs_backport

@@ -2,19 +2,21 @@
 """Unit tests for the GDN chunkwise-CP layout backport (Task 32, phase 1).
 
 Covers the pure-tensor half of the backported MCore capability: the two THD CP
-partitions (``zigzag`` / ``contiguous``), the route tensors that implement the
-all-to-all between them, and the construction-time ``linear_cp_mode`` gate.
+partitions (``zigzag`` / ``contiguous``), their agreement with Relax's existing
+zigzag sharding, dynamic group resolution, and the construction-time
+``linear_cp_mode`` gate.
 
-Everything here runs on CPU with no process group: a CP all-to-all is emulated
-locally by decoding every rank's route and delivering the pieces by hand, which
-is exactly what NCCL would do and lets us assert token-level identity for CP
-sizes we do not have GPUs for.
+Everything here runs on CPU with no process group. It validates partition
+definitions only; the actual all-to-all round trip is exercised with NCCL in
+``test_gdn_chunkwise_cp_gpu.py``.
 
 The real-kernel / real-collective half lives in
 ``test_gdn_chunkwise_cp_gpu.py``.
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 import torch
@@ -104,14 +106,23 @@ def test_both_layouts_are_permutations_of_each_other(cp_size, lengths_factor):
     lengths = [2 * cp_size * f for f in lengths_factor]
     cu = _cu(lengths)
     total = int(cu[-1])
+    zig_by_rank = []
+    con_by_rank = []
     for rank in range(cp_size):
         zig = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "zigzag")
         con = cpl.get_thd_context_parallel_rank_indices(cu, cp_size, rank, "contiguous")
+        zig_by_rank.append(zig)
+        con_by_rank.append(con)
         assert zig.numel() == con.numel() == total // cp_size
         # contiguous is exactly this rank's span of the flattened buffer
         assert torch.equal(con, torch.arange(rank * (total // cp_size), (rank + 1) * (total // cp_size)))
-        # zigzag is two equal chunks per sequence, in local storage order
-        assert torch.equal(torch.sort(zig).values, torch.sort(zig).values)
+
+    # Across the whole CP group, both layouts are permutations of exactly the
+    # same global token rows.
+    assert torch.equal(
+        torch.cat(zig_by_rank).sort().values,
+        torch.cat(con_by_rank).sort().values,
+    )
 
 
 @pytest.mark.parametrize("cp_size", [2, 4])
@@ -124,6 +135,23 @@ def test_rank_indices_reject_lengths_not_divisible_by_two_cp(cp_size):
 def test_rank_indices_reject_unknown_layout():
     with pytest.raises(ValueError, match="Unsupported context-parallel layout"):
         cpl.get_thd_context_parallel_rank_indices(_cu([16, 16]), 2, 0, "contiguous_ish")
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_rank_indices_ignore_duplicate_boundaries(layout):
+    compact = torch.tensor([0, 16, 40], dtype=torch.int64)
+    padded = torch.tensor([0, 16, 40, 40, 40], dtype=torch.int64)
+    for rank in range(2):
+        assert torch.equal(
+            cpl.get_thd_context_parallel_rank_indices(compact, 2, rank, layout),
+            cpl.get_thd_context_parallel_rank_indices(padded, 2, rank, layout),
+        )
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_rank_indices_reject_decreasing_boundaries(layout):
+    with pytest.raises(ValueError, match="nondecreasing"):
+        cpl.get_thd_context_parallel_rank_indices(torch.tensor([0, 16, 8]), 2, 0, layout)
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +240,9 @@ def test_config_rejects_unresolved_and_unknown_linear_cp_mode():
             _gdn_config(context_parallel_size=2, linear_cp_mode=bad)
         with pytest.raises(AssertionError, match="linear_cp_mode"):
             _gdn_config(context_parallel_size=4, tensor_model_parallel_size=2, linear_cp_mode=bad)
+
+
+def test_gdn_forward_has_no_per_call_mode_override():
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    assert "linear_cp_mode" not in inspect.signature(GatedDeltaNet.forward).parameters
