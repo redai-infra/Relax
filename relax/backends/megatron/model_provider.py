@@ -480,7 +480,11 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             if is_mixture_lora_enabled(args):
-                from relax.backends.megatron.mixture_lora import build_mixture_lora_peft
+                from relax.backends.megatron.mixture_lora import (
+                    build_mixture_lora_peft,
+                    ensure_mixture_lora_recompute_inputs_grad,
+                    install_mixture_lora_checkpoint_context,
+                )
 
                 mixture_config = build_mixture_lora_config(args)
                 if mixture_config is None:
@@ -491,6 +495,8 @@ def wrap_model_provider_with_lora(original_provider, args):
             model = peft(model, training=True)
             mixture_parameter_counts = None
             if is_mixture_lora_enabled(args):
+                ensure_mixture_lora_recompute_inputs_grad(model)
+                install_mixture_lora_checkpoint_context()
                 mixture_parameter_counts = validate_and_count_mixture_lora_parameters(model)
             if dist.is_initialized() and dist.get_rank() == 0:
                 if is_mixture_lora_enabled(args):

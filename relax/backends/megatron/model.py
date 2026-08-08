@@ -7,7 +7,7 @@ import os
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -31,7 +31,7 @@ from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import is_lora_enabled
+from relax.utils.megatron_peft_utils import is_lora_enabled, is_mixture_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.timer import timer
@@ -45,10 +45,80 @@ from relax.utils.training.ppo_utils import (
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
+from .mixture_lora import (
+    MixtureLoRARoutingContext,
+    MixtureParallelLinearAdapter,
+    activate_mixture_lora_routing_context,
+    get_microbatch_objective_scale,
+)
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 
 logger = get_logger(__name__)
+
+
+def _get_global_mixture_lora_site_count(args: Namespace, model: Sequence[DDP]) -> int:
+    cached_count = getattr(args, "_mixture_lora_global_site_count", None)
+    if cached_count is not None:
+        return cached_count
+
+    local_site_ids = {
+        module.mixture_lora.site_id
+        for model_chunk in model
+        for module in model_chunk.modules()
+        if isinstance(module, MixtureParallelLinearAdapter)
+    }
+    site_count = torch.tensor(
+        len(local_site_ids),
+        dtype=torch.int64,
+        device=next(model[0].parameters()).device,
+    )
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        torch.distributed.all_reduce(site_count, group=mpu.get_pipeline_model_parallel_group())
+    global_site_count = int(site_count.item())
+    if global_site_count <= 0:
+        raise RuntimeError("Mixture-of-LoRA is enabled but the model contains no routed sites")
+    args._mixture_lora_global_site_count = global_site_count
+    return global_site_count
+
+
+def _build_mixture_lora_routing_context(
+    args: Namespace,
+    batch: dict,
+    model: GPTModel,
+    *,
+    optimizer_step: int,
+    microbatch_id: int,
+    num_microbatches: int,
+    num_sites: int,
+) -> MixtureLoRARoutingContext:
+    model_config = get_model_config(model)
+    loss_scale_input = torch.ones(1, device=batch["full_loss_masks"].device)
+    main_loss_backward_scale = (
+        model_config.grad_scale_func(loss_scale_input)
+        if model_config.grad_scale_func is not None
+        else loss_scale_input
+    )
+    objective_scale = get_microbatch_objective_scale(
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        is_dummy=batch.get("__is_dummy__", False),
+        explicit_loss_scale=batch.get("__loss_scale__", None),
+        num_microbatches=num_microbatches,
+        global_batch_size=batch.get("dynamic_global_batch_size", args.global_batch_size),
+        data_parallel_world_size_with_cp=mpu.get_data_parallel_world_size(with_context_parallel=True),
+    )
+    return MixtureLoRARoutingContext(
+        optimizer_step=optimizer_step,
+        microbatch_id=microbatch_id,
+        response_mask=batch["full_loss_masks"],
+        num_microbatches=num_microbatches,
+        num_sites=num_sites,
+        num_samples=len(batch["response_lengths"]),
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        objective_scale=objective_scale,
+        main_loss_backward_scale=main_loss_backward_scale.detach().clone(),
+        is_dummy=batch.get("__is_dummy__", False),
+    )
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -984,6 +1054,11 @@ def train_one_step(
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
     main_loss_has_tokens = False
+    mixture_lora_enabled = is_mixture_lora_enabled(args)
+    mixture_lora_num_sites = _get_global_mixture_lora_site_count(args, model) if mixture_lora_enabled else 0
+    # Checkpoint closures retain these contexts until their microbatch backward completes.
+    routing_contexts: list[MixtureLoRARoutingContext] = []
+    next_routing_microbatch_id = 0
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -1003,7 +1078,7 @@ def train_one_step(
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
 
-        nonlocal main_loss_has_tokens
+        nonlocal main_loss_has_tokens, next_routing_microbatch_id
         is_vl_model = getattr(args, "is_vl_model", False)
         sft_chunked = _should_use_sft_chunked(args)
         # Get the batch.
@@ -1037,6 +1112,25 @@ def train_one_step(
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
+        routing_context = None
+        if mixture_lora_enabled:
+            routing_context = _build_mixture_lora_routing_context(
+                args,
+                batch,
+                model,
+                optimizer_step=step_id,
+                microbatch_id=next_routing_microbatch_id,
+                num_microbatches=num_microbatches,
+                num_sites=mixture_lora_num_sites,
+            )
+            routing_contexts.append(routing_context)
+            next_routing_microbatch_id += 1
+
+        def routing_scope():
+            if routing_context is None:
+                return nullcontext()
+            return activate_mixture_lora_routing_context(routing_context)
+
         if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -1051,14 +1145,15 @@ def train_one_step(
             # chunked-logits incompatibility is enforced as a hard assert in
             # arguments.py.slime_validate_args, so sft_chunked is guaranteed
             # False here — no runtime fallback or advisory needed.
-            output_tensor = model.build_schedule_plan(
-                input_ids=batch["tokens"],
-                position_ids=None,
-                attention_mask=None,
-                labels=None,
-                packed_seq_params=batch["packed_seq_params"],
-                loss_mask=batch["full_loss_masks"],
-            )
+            with routing_scope():
+                output_tensor = model.build_schedule_plan(
+                    input_ids=batch["tokens"],
+                    position_ids=None,
+                    attention_mask=None,
+                    labels=None,
+                    packed_seq_params=batch["packed_seq_params"],
+                    loss_mask=batch["full_loss_masks"],
+                )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
             needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
@@ -1111,9 +1206,11 @@ def train_one_step(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
                 ) as lm_head_forward:
-                    output_tensor = model(**forward_kwargs)
+                    with routing_scope():
+                        output_tensor = model(**forward_kwargs)
             else:
-                output_tensor = model(**forward_kwargs)
+                with routing_scope():
+                    output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -1169,6 +1266,9 @@ def train_one_step(
 
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
+
+    # All checkpoint recomputation and aux backward work is complete here.
+    routing_contexts.clear()
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step

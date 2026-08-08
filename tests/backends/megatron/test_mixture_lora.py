@@ -11,10 +11,16 @@ import torch.nn.functional as F
 
 from relax.backends.megatron.mixture_lora import (
     MixtureLoRAAdapter,
+    MixtureLoRARoutingContext,
     MixtureParallelLinearAdapter,
+    activate_mixture_lora_routing_context,
     build_mixture_lora_peft,
+    ensure_mixture_lora_recompute_inputs_grad,
+    get_microbatch_objective_scale,
+    get_mixture_lora_routing_context,
+    install_mixture_lora_checkpoint_context,
 )
-from relax.utils.mixture_lora import MixtureLoraConfig
+from relax.utils.mixture_lora import MixtureLoraConfig, compute_routing_statistics
 
 
 def _config(*, num_experts=3, top_k=2, rank=2, alpha=4.0):
@@ -174,6 +180,209 @@ def test_mixture_lora_wrapper_keeps_base_state_keys_stable():
     }
 
 
+@pytest.mark.parametrize(
+    ("calculate_per_token_loss", "is_dummy", "explicit_loss_scale", "expected"),
+    [
+        (False, False, None, 0.125),
+        (False, False, 0.5, 0.125),
+        (True, False, None, 1.0),
+        (False, True, None, 0.0),
+        (True, True, None, 0.0),
+    ],
+)
+def test_microbatch_objective_scale_matches_training_modes(
+    calculate_per_token_loss, is_dummy, explicit_loss_scale, expected
+):
+    scale = get_microbatch_objective_scale(
+        calculate_per_token_loss=calculate_per_token_loss,
+        is_dummy=is_dummy,
+        explicit_loss_scale=explicit_loss_scale,
+        num_microbatches=4,
+        global_batch_size=32,
+        data_parallel_world_size_with_cp=4,
+    )
+
+    assert scale == expected
+
+
+def test_routing_context_aligns_batch_first_response_mask_and_records_site():
+    adapter = MixtureLoRAAdapter(
+        _config(),
+        "decoder.layers.0.self_attention.linear_qkv",
+        4,
+        5,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    response_mask = torch.tensor([[0, 1, 1], [1, 0, 0]], dtype=torch.bool)
+    context = MixtureLoRARoutingContext(
+        optimizer_step=7,
+        microbatch_id=2,
+        response_mask=response_mask,
+        num_microbatches=4,
+        num_sites=2,
+        num_samples=2,
+        calculate_per_token_loss=False,
+        objective_scale=0.25,
+        main_loss_backward_scale=torch.ones(1),
+    )
+    x = torch.randn(3, 2, 4)
+
+    with activate_mixture_lora_routing_context(context):
+        _, decision = adapter.forward_with_routing(x)
+
+    record = context.records[adapter.site_id]
+    expected_statistics = compute_routing_statistics(decision, response_mask.transpose(0, 1).reshape(-1))
+    assert record.key == (7, 2, adapter.site_id)
+    torch.testing.assert_close(record.statistics.valid_token_count, torch.tensor(3.0))
+    torch.testing.assert_close(record.balance_loss, expected_statistics.balance_loss)
+    torch.testing.assert_close(
+        record.aux_loss,
+        expected_statistics.balance_loss * adapter.config.aux_loss_coef / 2 * 2 * 0.25,
+    )
+    assert get_mixture_lora_routing_context() is None
+
+
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+def test_routing_context_attaches_expected_router_gradient(calculate_per_token_loss):
+    adapter = MixtureLoRAAdapter(
+        _config(),
+        "linear_qkv",
+        4,
+        5,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    response_mask = torch.tensor([[0, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    objective_scale = 1.0 if calculate_per_token_loss else 0.25
+    context = MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=0,
+        response_mask=response_mask,
+        num_microbatches=2,
+        num_sites=1,
+        num_samples=2,
+        calculate_per_token_loss=calculate_per_token_loss,
+        objective_scale=objective_scale,
+        main_loss_backward_scale=torch.ones(1),
+    )
+    x = torch.randn(3, 2, 4)
+
+    with activate_mixture_lora_routing_context(context):
+        output, decision = adapter.forward_with_routing(x)
+    statistics = compute_routing_statistics(decision, response_mask.transpose(0, 1).reshape(-1))
+    count_multiplier = statistics.valid_token_count if calculate_per_token_loss else context.num_samples
+    expected_objective = statistics.balance_loss * adapter.config.aux_loss_coef * count_multiplier * objective_scale
+    expected_router_grad = torch.autograd.grad(expected_objective, adapter.router.weight, retain_graph=True)[0]
+
+    output.sum().backward()
+
+    torch.testing.assert_close(adapter.router.weight.grad, expected_router_grad)
+
+
+def test_dummy_routing_context_records_zero_aux_loss():
+    adapter = MixtureLoRAAdapter(
+        _config(),
+        "linear_qkv",
+        4,
+        5,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    context = MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=1,
+        response_mask=torch.ones(1, 3),
+        num_microbatches=2,
+        num_sites=1,
+        num_samples=1,
+        calculate_per_token_loss=False,
+        objective_scale=0.0,
+        main_loss_backward_scale=torch.ones(1),
+        is_dummy=True,
+    )
+
+    with activate_mixture_lora_routing_context(context):
+        adapter(torch.randn(3, 1, 4))
+
+    record = context.records[adapter.site_id]
+    torch.testing.assert_close(record.statistics.valid_token_count, torch.tensor(0.0))
+    torch.testing.assert_close(record.balance_loss, torch.tensor(0.0))
+    torch.testing.assert_close(record.aux_loss, torch.tensor(0.0))
+
+
+def test_checkpoint_wrapper_restores_captured_routing_context(monkeypatch):
+    megatron_module = types.ModuleType("megatron")
+    core_module = types.ModuleType("megatron.core")
+    tensor_parallel_module = types.ModuleType("megatron.core.tensor_parallel")
+    captured_functions = []
+
+    def checkpoint(function, distribute_saved_activations, *args):
+        captured_functions.append(function)
+        return function(*args)
+
+    tensor_parallel_module.checkpoint = checkpoint
+    core_module.tensor_parallel = tensor_parallel_module
+    monkeypatch.setitem(sys.modules, "megatron", megatron_module)
+    monkeypatch.setitem(sys.modules, "megatron.core", core_module)
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel", tensor_parallel_module)
+    install_mixture_lora_checkpoint_context()
+    context = MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=0,
+        response_mask=torch.ones(1, 1),
+        num_microbatches=1,
+        num_sites=1,
+        num_samples=1,
+        calculate_per_token_loss=False,
+        objective_scale=1.0,
+        main_loss_backward_scale=torch.ones(1),
+    )
+    observed_contexts = []
+
+    def run(x):
+        observed_contexts.append(get_mixture_lora_routing_context())
+        return x
+
+    with activate_mixture_lora_routing_context(context):
+        tensor_parallel_module.checkpoint(run, False, torch.ones(1))
+    captured_function = captured_functions[0]
+    observed_contexts.clear()
+
+    captured_function(torch.ones(1))
+
+    assert observed_contexts == [context]
+
+
+def test_recompute_input_grad_patch_recognizes_mixture_adapter(monkeypatch):
+    transformer_block_module = types.ModuleType("megatron.core.transformer.transformer_block")
+    utils_module = types.ModuleType("megatron.core.utils")
+
+    class FakeTransformerBlock(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    transformer_block_module.TransformerBlock = FakeTransformerBlock
+    utils_module.unwrap_model = lambda model: model
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", types.ModuleType("megatron.core.transformer"))
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.transformer_block", transformer_block_module)
+    monkeypatch.setitem(sys.modules, "megatron.core.utils", utils_module)
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(recompute_method="uniform")
+    model.block = FakeTransformerBlock()
+
+    ensure_mixture_lora_recompute_inputs_grad(model)
+    patched_forward = model.block.forward
+    output = model.block(torch.ones(2, 3))
+    ensure_mixture_lora_recompute_inputs_grad(model)
+
+    assert output.requires_grad
+    assert model.block.forward is patched_forward
+
+
 def _install_fake_bridge(monkeypatch):
     megatron = types.ModuleType("megatron")
     bridge = types.ModuleType("megatron.bridge")
@@ -235,6 +444,76 @@ def test_mixture_lora_peft_uses_bridge_matcher_and_freezes_base(monkeypatch):
     assert transformed.linear_qkv.mixture_lora.site_id == "decoder.layers.0.self_attention.linear_qkv"
     assert all(not parameter.requires_grad for parameter in transformed.linear_qkv.to_wrap.parameters())
     assert all(parameter.requires_grad for parameter in transformed.linear_qkv.mixture_lora.parameters())
+
+
+def test_mixture_lora_peft_instantiates_with_real_bridge_when_available():
+    pytest.importorskip("megatron.bridge.peft.base")
+
+    peft = build_mixture_lora_peft(_config(), dropout=0.0)
+
+    assert peft.target_modules == ["linear_qkv", "linear_proj"]
+    assert peft.mixture_config == _config()
+
+
+def test_mixture_lora_peft_wraps_real_column_parallel_linear_when_available(tmp_path):
+    pytest.importorskip("megatron.bridge.peft.base")
+    from megatron.core import parallel_state
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    if torch.distributed.is_initialized():
+        pytest.skip("test requires ownership of the single-process distributed state")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'distributed_init'}",
+        rank=0,
+        world_size=1,
+    )
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        model = torch.nn.Module()
+        model.linear_qkv = ColumnParallelLinear(
+            4,
+            5,
+            config=transformer_config,
+            init_method=lambda weight: torch.nn.init.normal_(weight, mean=0.0, std=0.02),
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+        )
+
+        transformed = build_mixture_lora_peft(_config(), dropout=0.0)(model, training=True)
+        routing_context = MixtureLoRARoutingContext(
+            optimizer_step=0,
+            microbatch_id=0,
+            response_mask=torch.tensor([[0, 1, 1]], dtype=torch.bool),
+            num_microbatches=1,
+            num_sites=1,
+            num_samples=1,
+            calculate_per_token_loss=False,
+            objective_scale=1.0,
+            main_loss_backward_scale=torch.ones(1),
+        )
+        with activate_mixture_lora_routing_context(routing_context):
+            output, bias = transformed.linear_qkv(torch.randn(3, 1, 4))
+        output.sum().backward()
+
+        assert isinstance(transformed.linear_qkv, MixtureParallelLinearAdapter)
+        assert output.shape == (3, 1, 5)
+        assert bias is None
+        assert all(not parameter.requires_grad for parameter in transformed.linear_qkv.to_wrap.parameters())
+        assert all(parameter.requires_grad for parameter in transformed.linear_qkv.mixture_lora.parameters())
+        assert all(parameter.grad is None for parameter in transformed.linear_qkv.to_wrap.parameters())
+        assert torch.count_nonzero(transformed.linear_qkv.mixture_lora.router.weight.grad) > 0
+    finally:
+        parallel_state.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the forward profiler check")

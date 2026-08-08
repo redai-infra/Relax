@@ -263,6 +263,8 @@ def test_model_provider_uses_mixture_lora_for_multiple_experts(monkeypatch):
         return lambda received_model, training: received_model
 
     mixture_module.build_mixture_lora_peft = build_mixture_lora_peft
+    mixture_module.ensure_mixture_lora_recompute_inputs_grad = lambda model: None
+    mixture_module.install_mixture_lora_checkpoint_context = lambda: None
     monkeypatch.setitem(sys.modules, "relax.backends.megatron.mixture_lora", mixture_module)
     monkeypatch.setattr(module, "build_mixture_lora_config", lambda args: config)
     monkeypatch.setattr(module, "build_lora_peft", lambda args: pytest.fail("single LoRA factory was called"))
