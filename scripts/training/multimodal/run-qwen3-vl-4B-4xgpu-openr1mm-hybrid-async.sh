@@ -8,6 +8,9 @@
 # TP-gather path in DCS's actor->rollout weight push (all_gather_param);
 # rollout stays 1 GPU per SGLang engine (2 engine replicas).
 #
+# Always pushes weights via --hybrid-weight-sync-backend dcs (the opt-in DCS
+# path, not the cuda_ipc default) since that's what this script's TP-gather
+# validation and the benchmark below are about.
 # Set ENABLE_OPTIMIZED=1 to append both benchmark optimizations:
 # --hybrid-weights-backuper-on-gpu and --dedup-multimodal-preprocess.
 # ENABLE_DEDUP=1 remains available for testing dedup in isolation.
@@ -124,6 +127,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend auto
+   --hybrid-weight-sync-backend dcs
 )
 if [ "${ENABLE_OPTIMIZED:-0}" = "1" ]; then
     MISC_ARGS+=(--hybrid-weights-backuper-on-gpu)

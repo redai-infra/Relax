@@ -238,10 +238,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
         # Hybrid mode uses the TensorBackuper path: actor handles ref/actor_fwd
-        # internally via _switch_model, and pushes weights to rollout via DCS
-        # (relax.distributed.checkpoint_service), reading from the "actor"
-        # snapshot tag (host-pinned by default, or on-device with
-        # --hybrid-weights-backuper-on-gpu) instead of the live model directly.
+        # internally via _switch_model, and pushes weights to rollout reading
+        # from the "actor" snapshot tag (host-pinned by default, or on-device
+        # with --hybrid-weights-backuper-on-gpu) instead of the live model
+        # directly. --hybrid-weight-sync-backend selects the push mechanism:
+        # cuda_ipc (default, original behavior) or dcs (opt-in, see
+        # _create_checkpoint_engine_client).
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
@@ -254,10 +256,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
             self._active_model_tag: str | None = "actor"
-            # Only the "actor" tag (the DCS push source) ever goes on-device; ref/
-            # teacher/old_actor stay host-pinned regardless, see --hybrid-weights-
-            # backuper-on-gpu help text for the memory tradeoff.
-            self._weights_backup_on_device = self.args.hybrid and self.args.hybrid_weights_backuper_on_gpu
+            # Only the "actor" tag (the DCS push source) ever goes on-device, and only
+            # when the DCS backend is actually selected; ref/teacher/old_actor stay
+            # host-pinned regardless, see --hybrid-weights-backuper-on-gpu help text
+            # for the memory tradeoff.
+            self._use_dcs_hybrid_weight_sync = self.args.hybrid and self.args.hybrid_weight_sync_backend == "dcs"
+            self._weights_backup_on_device = (
+                self._use_dcs_hybrid_weight_sync and self.args.hybrid_weights_backuper_on_gpu
+            )
             self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
 
             if with_ref:
@@ -274,7 +280,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 if args.update_weights_interval == 1:
                     self.weights_backuper.backup("rollout_actor")
 
-            if self.args.hybrid:
+            if self._use_dcs_hybrid_weight_sync:
                 self.checkpoint_engine_client = self._create_checkpoint_engine_client(
                     role, weights_getter=lambda: self.weights_backuper.get("actor")
                 )
@@ -1452,12 +1458,19 @@ class MegatronTrainRayActor(TrainRayActor):
         self._wait_for_previous_eval()
         self._check_services_health()
 
-        # Push weights to rollout via DCS, reading the "actor" CPU snapshot tag
-        # (see _create_checkpoint_engine_client). Always synchronous — see the
-        # comment in __init__ on why overlapping this with the next training
-        # iteration on a background thread was tried and reverted (cross-thread
-        # collective deadlock risk against Megatron's own process groups).
-        run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+        # Push weights to rollout. --hybrid-weight-sync-backend selects the
+        # mechanism: cuda_ipc (default) goes through update_weights(), the same
+        # colocate-style path used before DCS support was added; dcs reads the
+        # "actor" snapshot tag via checkpoint_engine_client (see
+        # _create_checkpoint_engine_client). Both are always synchronous — see
+        # the comment in __init__ on why overlapping the dcs push with the next
+        # training iteration on a background thread was tried and reverted
+        # (cross-thread collective deadlock risk against Megatron's own process
+        # groups).
+        if self._use_dcs_hybrid_weight_sync:
+            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+        else:
+            self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)

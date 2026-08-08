@@ -178,17 +178,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--hybrid-weight-sync-backend",
+                type=str,
+                choices=["cuda_ipc", "dcs"],
+                default="cuda_ipc",
+                help=(
+                    "Hybrid mode only: which mechanism pushes actor weights to rollout. "
+                    "'cuda_ipc' (default) uses the same UpdateWeightFromTensor CUDA-IPC push "
+                    "colocate mode uses, unchanged from hybrid mode's original behavior. 'dcs' "
+                    "instead pushes via the Distributed Checkpoint Service (relax.distributed."
+                    "checkpoint_service), the same NCCL/GLOO device-direct broadcast pure "
+                    "fully-async uses for architectural unification; measured ~2%% slower "
+                    "step_time than cuda_ipc on 2xH20 (see exps/hybrid_async_perf_h20/README.md), "
+                    "so it is opt-in rather than the default."
+                ),
+            )
+            parser.add_argument(
                 "--hybrid-weights-backuper-on-gpu",
                 action="store_true",
                 default=False,
                 help=(
-                    "Hybrid mode only: keep the 'actor' TensorBackuper snapshot used for the "
-                    "DCS actor->rollout weight push on-device instead of host-pinned memory, "
-                    "trading a permanent extra device-resident copy of the model (full size at "
-                    "TP=1, sharded by TP degree otherwise) for skipping the D2H backup copy + "
-                    "H2D push-time copy (relax/distributed/checkpoint_service/backends/"
-                    "device_direct.py's _named_params_and_buffers). Off by default: raises peak "
-                    "GPU memory, so only enable if headroom is confirmed for the model being trained."
+                    "Only takes effect with --hybrid-weight-sync-backend=dcs. Keeps the 'actor' "
+                    "TensorBackuper snapshot used for the DCS actor->rollout weight push "
+                    "on-device instead of host-pinned memory, trading a permanent extra "
+                    "device-resident copy of the model (full size at TP=1, sharded by TP degree "
+                    "otherwise) for skipping the D2H backup copy + H2D push-time copy "
+                    "(relax/distributed/checkpoint_service/backends/device_direct.py's "
+                    "_named_params_and_buffers). Off by default: raises peak GPU memory, so only "
+                    "enable if headroom is confirmed for the model being trained."
                 ),
             )
             parser.add_argument(
