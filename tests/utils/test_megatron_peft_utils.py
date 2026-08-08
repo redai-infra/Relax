@@ -29,6 +29,8 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    is_mixture_lora_param,
+    validate_and_count_mixture_lora_parameters,
     write_hf_peft_adapter,
 )
 
@@ -93,6 +95,18 @@ class TestIsLoraAdapterParam:
         """
         assert is_lora_adapter_param("decoder.layers.0.mlp.lora_gate.weight") is False
         assert is_lora_adapter_param("decoder.layers.0.mlp.lora_Attention.weight") is False
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "decoder.layers.0.self_attention.linear_qkv.mixture_lora.experts.lora_A",
+            "decoder.layers.0.self_attention.linear_qkv.mixture_lora.experts.lora_B",
+            "decoder.layers.0.self_attention.linear_qkv.mixture_lora.router.weight",
+        ],
+    )
+    def test_is_mixture_lora_param_matches_stable_parameter_names(self, name):
+        assert is_mixture_lora_param(name) is True
+        assert is_lora_adapter_param(name) is True
 
 
 class TestWriteHfPeftAdapter:
@@ -211,6 +225,51 @@ class TestCountAdapterParameters:
         assert adapter_params == 0
         assert total_params == 4
         assert pct == 0
+
+
+class TestValidateAndCountMixtureLoraParameters:
+    @staticmethod
+    def _stub_unwrap_model(monkeypatch):
+        fake_utils = types.ModuleType("megatron.core.utils")
+        fake_utils.unwrap_model = lambda model: model
+        monkeypatch.setitem(sys.modules, "megatron", types.ModuleType("megatron"))
+        monkeypatch.setitem(sys.modules, "megatron.core", types.ModuleType("megatron.core"))
+        monkeypatch.setitem(sys.modules, "megatron.core.utils", fake_utils)
+
+    @staticmethod
+    def _model():
+        model = torch.nn.Module()
+        model.base_weight = torch.nn.Parameter(torch.zeros(5), requires_grad=False)
+        model.mixture_lora = torch.nn.Module()
+        model.mixture_lora.experts = torch.nn.Module()
+        model.mixture_lora.experts.lora_A = torch.nn.Parameter(torch.zeros(2, 3, 4))
+        model.mixture_lora.experts.lora_B = torch.nn.Parameter(torch.zeros(2, 5, 3))
+        model.mixture_lora.router = torch.nn.Module()
+        model.mixture_lora.router.weight = torch.nn.Parameter(torch.zeros(2, 4))
+        return model
+
+    def test_validate_and_count_mixture_lora_parameters(self, monkeypatch):
+        self._stub_unwrap_model(monkeypatch)
+
+        counts = validate_and_count_mixture_lora_parameters(self._model())
+
+        assert counts == (5, 54, 8, 67)
+
+    def test_validate_rejects_trainable_base_parameter(self, monkeypatch):
+        self._stub_unwrap_model(monkeypatch)
+        model = self._model()
+        model.base_weight.requires_grad = True
+
+        with pytest.raises(RuntimeError, match="Base parameters must be frozen"):
+            validate_and_count_mixture_lora_parameters(model)
+
+    def test_validate_rejects_frozen_router_parameter(self, monkeypatch):
+        self._stub_unwrap_model(monkeypatch)
+        model = self._model()
+        model.mixture_lora.router.weight.requires_grad = False
+
+        with pytest.raises(RuntimeError, match="must remain trainable"):
+            validate_and_count_mixture_lora_parameters(model)
 
 
 class TestBridgeParamPrefixes:

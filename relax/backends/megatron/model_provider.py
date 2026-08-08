@@ -25,7 +25,14 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from relax.utils.device import is_npu_available
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
+from relax.utils.megatron_peft_utils import (
+    build_lora_peft,
+    build_mixture_lora_config,
+    count_adapter_parameters,
+    is_lora_enabled,
+    is_mixture_lora_enabled,
+    validate_and_count_mixture_lora_parameters,
+)
 from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
 
@@ -472,17 +479,39 @@ def wrap_model_provider_with_lora(original_provider, args):
             model = original_provider(pre_process=pre_process, post_process=post_process)
 
         try:
-            peft = build_lora_peft(args)
+            if is_mixture_lora_enabled(args):
+                from relax.backends.megatron.mixture_lora import build_mixture_lora_peft
+
+                mixture_config = build_mixture_lora_config(args)
+                if mixture_config is None:
+                    raise RuntimeError("Mixture-of-LoRA is enabled but its validated configuration is missing")
+                peft = build_mixture_lora_peft(mixture_config, args.lora_dropout)
+            else:
+                peft = build_lora_peft(args)
             model = peft(model, training=True)
+            mixture_parameter_counts = None
+            if is_mixture_lora_enabled(args):
+                mixture_parameter_counts = validate_and_count_mixture_lora_parameters(model)
             if dist.is_initialized() and dist.get_rank() == 0:
-                adapter_params, total_params, percentage = count_adapter_parameters(model)
-                logger.info(
-                    f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
-                    f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
-                )
+                if is_mixture_lora_enabled(args):
+                    if mixture_parameter_counts is None:
+                        raise RuntimeError("Mixture-of-LoRA parameter validation did not run")
+                    base_params, expert_params, router_params, total_params = mixture_parameter_counts
+                    trainable_percentage = 100 * (expert_params + router_params) / total_params
+                    logger.info(
+                        f"Mixture-of-LoRA enabled: experts={args.lora_num_experts}, rank={args.lora_rank}, "
+                        f"top_k={args.lora_router_top_k}, base_params={base_params:,}, "
+                        f"expert_params={expert_params:,}, router_params={router_params:,}, "
+                        f"trainable={trainable_percentage:.2f}% of {total_params:,} total"
+                    )
+                else:
+                    adapter_params, total_params, percentage = count_adapter_parameters(model)
+                    logger.info(
+                        f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
+                        f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
+                    )
         except RuntimeError:
-            # build_lora_peft already raises a clear upgrade-hint message when the
-            # Megatron-Bridge image lacks PEFT support; don't shadow it.
+            # PEFT builders provide actionable configuration and dependency errors.
             raise
         except Exception as e:
             raise RuntimeError(
