@@ -80,6 +80,11 @@ def validate_preference_args(args: Namespace) -> None:
     beta = float(getattr(args, "dpo_beta", 0.1))
     if not math.isfinite(beta) or beta <= 0:
         raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
+    if getattr(args, "ref_load", None) is not None:
+        raise ValueError(
+            "preference objectives do not use --ref-load: standard DPO snapshots the frozen reference "
+            "from the initialized policy and rebuilds it from --hf-checkpoint on resume"
+        )
     if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
         raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
     if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):

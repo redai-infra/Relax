@@ -37,7 +37,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --preference-chat-template-sha256 56965952fc78cd889bcd1864d70e85271861eef93385410b879c0c4c2d40564d \
     --preference-require-no-generation-marker \
     --hf-checkpoint "${HF_CHECKPOINT}" \
-    --ref-load "${HF_CHECKPOINT}" \
     --megatron-to-hf-mode bridge \
     --enable-weights-backuper \
     --save "${SAVE_DIR}/${EXP_NAME}" \

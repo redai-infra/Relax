@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from relax.engine.sft.runtime import is_preference_mode
 from relax.utils.distributed_utils import distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -1378,7 +1379,7 @@ def loss_function(
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
     num_samples = len(batch["response_lengths"])
-    if getattr(args, "loss_type", None) == "sft" and getattr(args, "sft_objective", "causal_lm") == "dpo":
+    if is_preference_mode(args):
         if num_samples % 2 != 0:
             raise ValueError("preference micro-batch contains an odd number of branches")
         num_samples //= 2
