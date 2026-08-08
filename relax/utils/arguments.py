@@ -14,6 +14,7 @@ from relax.backends.sglang.arguments import validate_args as sglang_validate_arg
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import build_mixture_lora_config
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
     is_managed_opd_teacher_enabled,
@@ -1516,6 +1517,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="LoRA rank for parameter-efficient fine-tuning (0=disabled).",
             )
             parser.add_argument(
+                "--lora-num-experts",
+                type=int,
+                default=1,
+                help="Number of LoRA experts. Values greater than 1 enable token-level routing.",
+            )
+            parser.add_argument(
+                "--lora-router-top-k",
+                type=int,
+                default=None,
+                help="Number of experts selected for each token in Mixture-of-LoRA.",
+            )
+            parser.add_argument(
+                "--lora-router-temperature",
+                type=float,
+                default=None,
+                help="Softmax temperature for Mixture-of-LoRA router logits.",
+            )
+            parser.add_argument(
+                "--lora-router-aux-loss-coef",
+                type=float,
+                default=None,
+                help="Coefficient applied to the Mixture-of-LoRA balance loss.",
+            )
+            parser.add_argument(
                 "--lora-alpha",
                 type=int,
                 default=32,
@@ -2762,6 +2787,88 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _validate_lora_args(args) -> None:
+    """Validate Mixture settings before applying the legacy LoRA rollout
+    mode."""
+
+    num_experts = getattr(args, "lora_num_experts", 1)
+    if not isinstance(num_experts, int) or isinstance(num_experts, bool):
+        raise TypeError(f"--lora-num-experts must be an integer, got {type(num_experts).__name__}.")
+    if num_experts < 1:
+        raise ValueError(f"--lora-num-experts must be >= 1, got {num_experts}.")
+
+    mixture_fields = (
+        ("lora_router_top_k", "--lora-router-top-k"),
+        ("lora_router_temperature", "--lora-router-temperature"),
+        ("lora_router_aux_loss_coef", "--lora-router-aux-loss-coef"),
+    )
+    if num_experts == 1:
+        unexpected = [option for attribute, option in mixture_fields if getattr(args, attribute, None) is not None]
+        if unexpected:
+            raise ValueError(f"{', '.join(unexpected)} require --lora-num-experts greater than 1.")
+    else:
+        if getattr(args, "lora_rank", 0) <= 0:
+            raise ValueError("--lora-num-experts greater than 1 requires --lora-rank greater than 0.")
+        missing = [option for attribute, option in mixture_fields if getattr(args, attribute, None) is None]
+        if missing:
+            raise ValueError(
+                "--lora-num-experts greater than 1 requires explicit values for " + ", ".join(missing) + "."
+            )
+        if getattr(args, "lora_merge_mode", False) or getattr(args, "lora_adapter_mode", False):
+            raise ValueError("Mixture-of-LoRA does not support --lora-merge-mode or --lora-adapter-mode.")
+        if getattr(args, "fully_async", False):
+            raise ValueError("Mixture-of-LoRA does not support --fully-async.")
+        if not getattr(args, "colocate", False):
+            raise ValueError("Mixture-of-LoRA requires --colocate.")
+
+        dp_size = getattr(args, "sglang_dp_size", getattr(args, "sglang_data_parallel_size", 1))
+        if dp_size != 1:
+            raise ValueError(f"Mixture-of-LoRA requires SGLang DP size 1, got {dp_size}.")
+
+        tp_size = getattr(args, "sglang_tp_size", None)
+        if tp_size is None:
+            pp_size = getattr(args, "sglang_pipeline_parallel_size", getattr(args, "sglang_pp_size", 1))
+            gpus_per_engine = getattr(args, "rollout_num_gpus_per_engine", 1)
+            if pp_size < 1 or gpus_per_engine % pp_size != 0:
+                raise ValueError(
+                    "Mixture-of-LoRA requires --rollout-num-gpus-per-engine to be divisible by the SGLang PP size."
+                )
+            tp_size = gpus_per_engine // pp_size
+        if tp_size != 1:
+            raise ValueError(f"Mixture-of-LoRA requires SGLang TP size 1, got {tp_size}.")
+
+        target_modules = getattr(args, "lora_target_modules", ())
+        unsupported_targets = sorted(set(target_modules) - {"linear_qkv", "linear_proj"})
+        if unsupported_targets:
+            raise ValueError(
+                "Mixture-of-LoRA currently supports only linear_qkv and linear_proj; "
+                f"unsupported targets: {', '.join(unsupported_targets)}."
+            )
+
+        # Reuse the shared config validation for K, temperature, coefficient,
+        # alpha, rank, and duplicate target modules.
+        build_mixture_lora_config(args)
+        return
+
+    if getattr(args, "lora_rank", 0) <= 0:
+        return
+    if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+        raise ValueError(
+            "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
+        )
+    if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+        raise ValueError(
+            "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
+            "support dp_size > 1)."
+        )
+    if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+        logger.info(
+            "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
+            args.lora_rank,
+        )
+        args.lora_merge_mode = True
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -2800,22 +2907,7 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if getattr(args, "lora_rank", 0) > 0:
-        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
-            raise ValueError(
-                "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
-            )
-        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
-            raise ValueError(
-                "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
-                "support dp_size > 1)."
-            )
-        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
-            logger.info(
-                "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
-                args.lora_rank,
-            )
-            args.lora_merge_mode = True
+    _validate_lora_args(args)
 
     # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding on SGLang <= 0.5.9.
     # There, spec_v2 routes requests through EAGLEWorkerV2.verify(), which does

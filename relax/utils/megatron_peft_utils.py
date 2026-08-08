@@ -7,6 +7,8 @@ from typing import Tuple
 
 import torch
 
+from relax.utils.mixture_lora import MixtureLoraConfig
+
 
 # Fixed name under which the trained policy LoRA adapter is registered on the rollout
 # engines in adapter mode. Generation requests must pass ``lora_path=LORA_ADAPTER_NAME``
@@ -187,6 +189,26 @@ def is_lora_enabled(args) -> bool:
     return hasattr(args, "lora_rank") and args.lora_rank > 0
 
 
+def is_mixture_lora_enabled(args) -> bool:
+    """Return whether training uses more than one routed LoRA expert."""
+    return is_lora_enabled(args) and getattr(args, "lora_num_experts", 1) > 1
+
+
+def build_mixture_lora_config(args) -> MixtureLoraConfig | None:
+    """Build the shared Mixture-of-LoRA config from validated arguments."""
+    if not is_mixture_lora_enabled(args):
+        return None
+    return MixtureLoraConfig(
+        num_experts=args.lora_num_experts,
+        rank=args.lora_rank,
+        top_k=args.lora_router_top_k,
+        temperature=args.lora_router_temperature,
+        aux_loss_coef=args.lora_router_aux_loss_coef,
+        alpha=args.lora_alpha,
+        target_modules=tuple(args.lora_target_modules),
+    )
+
+
 def is_lora_merge_mode(args) -> bool:
     """Check if LoRA merge mode is enabled.
 
@@ -305,7 +327,9 @@ __all__ = [
     "write_hf_peft_adapter",
     "extract_lora_delta",
     "is_lora_enabled",
+    "is_mixture_lora_enabled",
     "is_lora_merge_mode",
     "is_lora_adapter_mode",
+    "build_mixture_lora_config",
     "build_lora_peft",
 ]
