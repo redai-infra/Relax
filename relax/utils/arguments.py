@@ -1258,7 +1258,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--mm-processor-pool-size",
                 type=int,
-                default=1024,
+                default=0,
                 help=(
                     "Size of the multimodal processor pool. "
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
