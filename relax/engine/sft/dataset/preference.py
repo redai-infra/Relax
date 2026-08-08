@@ -34,7 +34,20 @@ class PreferenceDataError(ValueError):
         self.pair_id = pair_id
 
 
+class _PreferenceRowError(ValueError):
+    """Internal row rejection that carries its stable reason code."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 def _classify_preference_error(error: BaseException) -> str:
+    # Prefer the reason code attached at the raise site; message matching is
+    # only a fallback for errors raised outside this module (e.g. tokenizer).
+    reason_code = getattr(error, "reason_code", None)
+    if isinstance(reason_code, str) and reason_code:
+        return reason_code
     message = str(error).lower()
     if "post-truncation identical" in message:
         return "post_truncation"
@@ -84,13 +97,13 @@ class ProcessedPreferencePair:
 
 def _message_from_raw(raw: Any, *, learn: bool, field: str) -> CanonicalMessage:
     if not isinstance(raw, dict):
-        raise ValueError(f"preference {field} must be a message object")
+        raise _PreferenceRowError("schema", f"preference {field} must be a message object")
     role = raw.get("role")
     content = raw.get("content")
     if role is None or content is None:
-        raise ValueError(f"preference {field} message requires role and content")
+        raise _PreferenceRowError("schema", f"preference {field} message requires role and content")
     if not isinstance(content, str):
-        raise ValueError(f"preference {field} must be pure text")
+        raise _PreferenceRowError("schema", f"preference {field} must be pure text")
     return CanonicalMessage(role=role, content=content, learn=learn, tool_calls=raw.get("tool_calls"))
 
 
@@ -107,14 +120,14 @@ def _normalize_pair_row(
 ) -> PreferencePair:
     pair_id = row.get(pair_id_key)
     if not isinstance(pair_id, str) or not pair_id:
-        raise ValueError(f"preference row requires a non-empty {pair_id_key}")
+        raise _PreferenceRowError("schema", f"preference row requires a non-empty {pair_id_key}")
     chosen_raw = row.get(chosen_key)
     rejected_raw = row.get(rejected_key)
     prompt_raw = row.get(prompt_key)
 
     if prompt_raw is None:
         if not isinstance(chosen_raw, list) or not isinstance(rejected_raw, list):
-            raise ValueError("implicit preference rows require chosen/rejected message lists")
+            raise _PreferenceRowError("schema", "implicit preference rows require chosen/rejected message lists")
         prefix_length = 0
         for chosen_message, rejected_message in zip(chosen_raw, rejected_raw, strict=False):
             if chosen_message != rejected_message:
@@ -123,24 +136,27 @@ def _normalize_pair_row(
         chosen_suffix = chosen_raw[prefix_length:]
         rejected_suffix = rejected_raw[prefix_length:]
         if len(chosen_suffix) != 1 or len(rejected_suffix) != 1:
-            raise ValueError("implicit preference rows require one assistant message after the strict common prefix")
+            raise _PreferenceRowError(
+                "prompt_mismatch",
+                "implicit preference rows require one assistant message after the strict common prefix",
+            )
         prompt_raw = chosen_raw[:prefix_length]
         chosen_raw = chosen_suffix[0]
         rejected_raw = rejected_suffix[0]
     elif not isinstance(prompt_raw, list):
-        raise ValueError(f"preference {prompt_key} must be a message list")
+        raise _PreferenceRowError("schema", f"preference {prompt_key} must be a message list")
 
     prompt = [_message_from_raw(message, learn=False, field=prompt_key) for message in prompt_raw]
     chosen = _message_from_raw(chosen_raw, learn=True, field=chosen_key)
     rejected = _message_from_raw(rejected_raw, learn=True, field=rejected_key)
     if chosen.role != "assistant" or rejected.role != "assistant":
-        raise ValueError("preference chosen/rejected messages must have role assistant")
+        raise _PreferenceRowError("schema", "preference chosen/rejected messages must have role assistant")
     if chosen.content == rejected.content:
-        raise ValueError("preference chosen/rejected responses must not be identical")
+        raise _PreferenceRowError("identical", "preference chosen/rejected responses must not be identical")
 
     metadata = row.get(metadata_key) or {}
     if not isinstance(metadata, dict):
-        raise ValueError(f"preference {metadata_key} must be an object")
+        raise _PreferenceRowError("schema", f"preference {metadata_key} must be an object")
     metadata = dict(metadata)
     metadata.update({"source_dataset": source_name, "row_index": row_index, "pair_id": pair_id})
     return PreferencePair(pair_id=pair_id, prompt=prompt, chosen=chosen, rejected=rejected, metadata=metadata)
@@ -150,13 +166,19 @@ def _split_branch(
     tokens: torch.Tensor, mask: torch.Tensor, *, pair_id: str, branch: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if tokens.ndim != 1 or mask.ndim != 1 or tokens.shape != mask.shape:
-        raise ValueError(f"preference pair {pair_id!r} {branch} tokens/mask must be aligned one-dimensional tensors")
+        raise _PreferenceRowError(
+            "schema", f"preference pair {pair_id!r} {branch} tokens/mask must be aligned one-dimensional tensors"
+        )
     supervised = torch.nonzero(mask, as_tuple=False).flatten()
     if supervised.numel() == 0:
-        raise ValueError(f"preference pair {pair_id!r} {branch} completion has no supervised tokens")
+        raise _PreferenceRowError(
+            "empty_completion", f"preference pair {pair_id!r} {branch} completion has no supervised tokens"
+        )
     first = int(supervised[0])
     if not bool(mask[first:].to(dtype=torch.bool).all()):
-        raise ValueError(f"preference pair {pair_id!r} {branch} completion mask must be one contiguous suffix")
+        raise _PreferenceRowError(
+            "schema", f"preference pair {pair_id!r} {branch} completion mask must be one contiguous suffix"
+        )
     return tokens[:first], tokens[first:]
 
 
@@ -173,10 +195,14 @@ def _truncate_pair(
     chosen_completion = chosen_completion[:max_completion_length]
     rejected_completion = rejected_completion[:max_completion_length]
     if chosen_completion.numel() == 0 or rejected_completion.numel() == 0:
-        raise ValueError(f"preference pair {pair_id!r} has an empty completion after truncation")
+        raise _PreferenceRowError(
+            "empty_completion", f"preference pair {pair_id!r} has an empty completion after truncation"
+        )
     prompt_budget = max_length - max(chosen_completion.numel(), rejected_completion.numel())
     if prompt_budget < 0:
-        raise ValueError(f"preference pair {pair_id!r} completion exceeds max_length={max_length}")
+        raise _PreferenceRowError(
+            "oversize", f"preference pair {pair_id!r} completion exceeds max_length={max_length}"
+        )
     prompt = prompt[-prompt_budget:] if prompt_budget else prompt[:0]
 
     def total() -> int:
@@ -190,8 +216,9 @@ def _truncate_pair(
         elif prompt.numel() > 0:
             prompt = prompt[1:]
         else:
-            raise ValueError(
-                f"preference pair {pair_id!r} cannot fit pair capacity {pair_capacity} while retaining both completions"
+            raise _PreferenceRowError(
+                "oversize",
+                f"preference pair {pair_id!r} cannot fit pair capacity {pair_capacity} while retaining both completions",
             )
     return prompt.contiguous(), chosen_completion.contiguous(), rejected_completion.contiguous()
 
@@ -358,7 +385,9 @@ class PreferenceStreamingDataset:
             rejected_tokens, rejected_mask, pair_id=pair.pair_id, branch="rejected"
         )
         if not torch.equal(chosen_prompt, rejected_prompt):
-            raise ValueError(f"preference pair {pair.pair_id!r} chosen/rejected prompt tokens differ")
+            raise _PreferenceRowError(
+                "prompt_mismatch", f"preference pair {pair.pair_id!r} chosen/rejected prompt tokens differ"
+            )
         prompt, chosen_completion, rejected_completion = _truncate_pair(
             chosen_prompt,
             chosen_completion,
@@ -371,7 +400,9 @@ class PreferenceStreamingDataset:
         chosen_tokens = torch.cat((prompt, chosen_completion))
         rejected_tokens = torch.cat((prompt, rejected_completion))
         if torch.equal(chosen_tokens, rejected_tokens) or torch.equal(chosen_completion, rejected_completion):
-            raise ValueError(f"preference pair {pair.pair_id!r} is post-truncation identical")
+            raise _PreferenceRowError(
+                "post_truncation", f"preference pair {pair.pair_id!r} is post-truncation identical"
+            )
         chosen_mask = torch.cat((torch.zeros_like(prompt), torch.ones_like(chosen_completion)))
         rejected_mask = torch.cat((torch.zeros_like(prompt), torch.ones_like(rejected_completion)))
         return ProcessedPreferencePair(

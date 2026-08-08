@@ -1255,9 +1255,9 @@ def dpo_loss_function(
     )
     chosen_rewards = args.dpo_beta * (policy_chosen - ref_chosen_for_metrics)
     rejected_rewards = args.dpo_beta * (policy_rejected - ref_rejected_for_metrics)
+    # pair_losses is never empty: build_preference_pair_indices raises on an
+    # empty micro-batch, so no gradient-safety fallback is needed here.
     loss = pair_losses.sum()
-    if pair_losses.numel() == 0:
-        loss = loss + 0 * logits.sum()
     reward_margin = chosen_rewards - rejected_rewards
     tie = reward_margin.abs() <= 1e-6
     strict = reward_margin > 0

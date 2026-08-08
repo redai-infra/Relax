@@ -41,6 +41,8 @@ The recipe defaults to 200 optimizer steps, 32 preference pairs per global batch
 
 Standard DPO reconstructs the frozen reference from the pinned repository revision. Checkpoints include a reference-identity sidecar containing canonical parameter and fixed-probe digests. A missing or mismatched sidecar fails before the next forward pass.
 
+The probe digest is a byte-exact SHA-256 over frozen-reference log-probabilities, so resume assumes the same GPU model, driver, image, and kernel stack as the original run. Resuming on different hardware or software fails the probe check by design — treat it as an environment mismatch, not data corruption.
+
 Use `--dpo-reference-free` only when reference-free DPO is intended; do not combine it with the standard reference identity arguments.
 
 ## Pair-aware batching

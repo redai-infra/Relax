@@ -41,6 +41,8 @@ recipe 默认运行 200 个 optimizer step，每个 global batch 为 32 个 pref
 
 标准 DPO 会从固定 repository revision 重建冻结 reference。checkpoint 带有 reference identity sidecar，其中保存 canonical parameter digest 和固定 probe digest；sidecar 缺失或不一致时，会在下一次 forward 前失败。
 
+probe digest 是对冻结 reference log-probability 的逐字节 SHA-256，因此 resume 假定 GPU 型号、驱动、镜像与内核栈与原运行完全一致。在不同硬件或软件环境上 resume 会按设计触发 probe 校验失败——这表示环境不匹配，而非数据损坏。
+
 只有明确需要 reference-free DPO 时才使用 `--dpo-reference-free`，不要同时传入标准 reference identity 参数。
 
 ## Pair-aware batching

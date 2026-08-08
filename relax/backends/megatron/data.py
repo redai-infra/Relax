@@ -792,17 +792,20 @@ def _get_preference_data_iterator(
     pair_costs = [int(cost) for cost in rollout_data["preference_pair_costs"]]
     pair_ids = [str(pair_id) for pair_id in rollout_data["preference_pair_ids"]]
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-    count_tensor = torch.tensor([len(pair_costs)], dtype=torch.int64, device=device_utils.make_current_torch_device())
-    count_min = count_tensor.clone()
-    count_max = count_tensor.clone()
-    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group())
-    dist.all_reduce(count_min, op=dist.ReduceOp.MIN, group=mpu.get_data_parallel_group())
-    dist.all_reduce(count_max, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group())
+    dp_group = mpu.get_data_parallel_group()
+    device = device_utils.make_current_torch_device()
+    count_tensor = torch.tensor([len(pair_costs)], dtype=torch.int64, device=device)
+    # MIN and MAX ride a single MAX all_reduce on [count, -count].
+    minmax_tensor = torch.tensor([len(pair_costs), -len(pair_costs)], dtype=torch.int64, device=device)
+    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM, group=dp_group)
+    dist.all_reduce(minmax_tensor, op=dist.ReduceOp.MAX, group=dp_group)
     step_global_pair_count = int(count_tensor.item())
-    if int(count_min.item()) != int(count_max.item()):
+    global_max = int(minmax_tensor[0].item())
+    global_min = -int(minmax_tensor[1].item())
+    if global_min != global_max:
         raise ValueError(
             "preference objectives require equal local pair rows on every DP rank: "
-            f"global_min={int(count_min.item())}, global_max={int(count_max.item())}"
+            f"global_min={global_min}, global_max={global_max}"
         )
     dynamic_count = rollout_data.get("dynamic_global_batch_size")
     if isinstance(dynamic_count, (list, tuple)):
@@ -820,8 +823,8 @@ def _get_preference_data_iterator(
     rollout_data["dynamic_global_batch_size"] = step_global_pair_count
     capacity = int(max_tokens_per_gpu or args.max_tokens_per_gpu)
     pair_bins = pack_preference_pair_indices(pair_costs, pair_ids, capacity=capacity)
-    bin_count = torch.tensor([len(pair_bins)], dtype=torch.int, device=device_utils.make_current_torch_device())
-    dist.all_reduce(bin_count, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group())
+    bin_count = torch.tensor([len(pair_bins)], dtype=torch.int, device=device)
+    dist.all_reduce(bin_count, op=dist.ReduceOp.MAX, group=dp_group)
     pair_bins = _split_preference_bins_to_count(pair_bins, int(bin_count.item()))
     if any(sum(pair_costs[index] for index in group) > capacity for group in pair_bins):
         raise RuntimeError("preference DP bin synchronization produced an over-capacity micro-batch")

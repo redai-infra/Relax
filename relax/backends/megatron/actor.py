@@ -449,6 +449,12 @@ class MegatronTrainRayActor(TrainRayActor):
         device_utils.maybe_backend_process_on_model_switch()
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
+        if self._active_model_tag == target_tag:
+            # Same-tag restore would be a byte-identical copy: paths that
+            # deliberately dirty the weights clear the tag first (see
+            # _rebuild_dpo_reference), so skipping avoids a redundant
+            # full-weight CPU->GPU copy per step after the ref forward.
+            return
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 
@@ -1825,8 +1831,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     "DPO frozen-reference checksum changed before checkpoint: "
                     f"expected={identity.parameter_sha256}, actual={actual_sha256}"
                 )
-            if dist.get_rank() == 0:
+            if dist.get_rank(group=get_gloo_group()) == 0:
                 write_reference_identity(reference_identity_path(self.args.save, rollout_id), identity)
+            # Functional barrier (not debugging): peers must not proceed past
+            # the checkpoint before rank 0's identity sidecar is durable,
+            # otherwise a concurrent resume could miss the file.
             dist.barrier(group=get_gloo_group())
 
         if self.args.save_hf is not None and self.role == "actor":
