@@ -2,7 +2,9 @@
 
 """Frozen-reference checksum, probe, optimizer and sidecar tests."""
 
+import hashlib
 import json
+import os
 import sys
 import types
 from argparse import Namespace
@@ -84,28 +86,36 @@ def test_reference_identity_sidecar_is_required_and_rejects_schema_damage(tmp_pa
         read_reference_identity(path)
 
 
+def _write_local_download_metadata(checkpoint, filename, revision):
+    source = checkpoint / filename
+    metadata = checkpoint / ".cache" / "huggingface" / "download" / f"{filename}.metadata"
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    content = source.read_bytes()
+    if source.suffix == ".safetensors":
+        etag = hashlib.sha256(content).hexdigest()
+    else:
+        etag = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+    metadata.write_text(f"{revision}\n{etag}\n{source.stat().st_mtime}\n", encoding="utf-8")
+
+
 def test_resolve_dpo_reference_checkpoint_uses_the_pinned_configured_local_snapshot(monkeypatch, tmp_path):
     revision = "a" * 40
     snapshot = tmp_path / f"Qwen3-0.6B-{revision}"
     snapshot.mkdir()
     (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    _write_local_download_metadata(snapshot, "config.json", revision)
+    _write_local_download_metadata(snapshot, "model.safetensors", revision)
     observed = {}
 
     def snapshot_download(**kwargs):
         observed.update(kwargs)
         return str(snapshot)
 
-    def get_cached_repo_tree(**kwargs):
-        observed["tree"] = kwargs
-        return []
-
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
-        types.SimpleNamespace(snapshot_download=snapshot_download, get_cached_repo_tree=get_cached_repo_tree),
-    )
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub.errors", types.SimpleNamespace(CachedRepoTreeNotFoundError=RuntimeError)
+        types.SimpleNamespace(snapshot_download=snapshot_download),
     )
     assert resolve_dpo_reference_checkpoint("org/model", revision, str(snapshot)) == str(snapshot.resolve())
     assert observed == {
@@ -113,11 +123,6 @@ def test_resolve_dpo_reference_checkpoint_uses_the_pinned_configured_local_snaps
         "revision": revision,
         "local_dir": str(snapshot.resolve()),
         "local_files_only": True,
-        "tree": {
-            "repo_id": "org/model",
-            "revision": revision,
-            "local_dir": str(snapshot.resolve()),
-        },
     }
 
 
@@ -131,10 +136,7 @@ def test_resolve_dpo_reference_checkpoint_rejects_missing_local_snapshot(monkeyp
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
-        types.SimpleNamespace(snapshot_download=snapshot_download, get_cached_repo_tree=lambda **_kwargs: []),
-    )
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub.errors", types.SimpleNamespace(CachedRepoTreeNotFoundError=RuntimeError)
+        types.SimpleNamespace(snapshot_download=snapshot_download),
     )
     with pytest.raises(RuntimeError, match="hf download org/model --revision"):
         resolve_dpo_reference_checkpoint("org/model", "a" * 40, str(checkpoint))
@@ -151,12 +153,7 @@ def test_resolve_dpo_reference_checkpoint_rejects_different_resolved_directory(m
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
-        types.SimpleNamespace(
-            snapshot_download=lambda **_kwargs: str(other), get_cached_repo_tree=lambda **_kwargs: []
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules, "huggingface_hub.errors", types.SimpleNamespace(CachedRepoTreeNotFoundError=RuntimeError)
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(other)),
     )
     with pytest.raises(RuntimeError, match="different from --hf-checkpoint"):
         resolve_dpo_reference_checkpoint("org/model", "a" * 40, str(checkpoint))
@@ -167,22 +164,51 @@ def test_resolve_dpo_reference_checkpoint_rejects_missing_pinned_local_metadata(
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
-    missing_metadata = type("CachedRepoTreeNotFoundError", (Exception,), {})
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
+    )
+    with pytest.raises(RuntimeError, match="missing valid Hugging Face local-dir metadata"):
+        resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
+
+
+def test_resolve_dpo_reference_checkpoint_rejects_mismatched_file_metadata(monkeypatch, tmp_path):
+    revision = "a" * 40
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    _write_local_download_metadata(checkpoint, "config.json", "c" * 40)
 
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
-        types.SimpleNamespace(
-            snapshot_download=lambda **_kwargs: str(checkpoint),
-            get_cached_repo_tree=lambda **_kwargs: (_ for _ in ()).throw(missing_metadata()),
-        ),
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
     )
+    with pytest.raises(RuntimeError, match="metadata does not match the pinned revision"):
+        resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
+
+
+def test_resolve_dpo_reference_checkpoint_rejects_replaced_file_with_restored_mtime(monkeypatch, tmp_path):
+    revision = "a" * 40
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    config = checkpoint / "config.json"
+    config.write_text("{}", encoding="utf-8")
+    _write_local_download_metadata(checkpoint, "config.json", revision)
+    weights = checkpoint / "model.safetensors"
+    weights.write_bytes(b"weights")
+    original_stat = weights.stat()
+    _write_local_download_metadata(checkpoint, "model.safetensors", revision)
+    weights.write_bytes(b"changed")
+    os.utime(weights, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
     monkeypatch.setitem(
         sys.modules,
-        "huggingface_hub.errors",
-        types.SimpleNamespace(CachedRepoTreeNotFoundError=missing_metadata),
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
     )
-    with pytest.raises(RuntimeError, match="missing pinned Hugging Face local-dir metadata"):
+    with pytest.raises(RuntimeError, match="contents do not match its Hugging Face ETag"):
         resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
 
 

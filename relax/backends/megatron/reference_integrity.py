@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import math
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -17,14 +18,57 @@ import torch
 REFERENCE_IDENTITY_FILENAME = "relax_dpo_reference.json"
 REFERENCE_LOADER_MODE = "hf_bridge_model_only_v1"
 _GIT_COMMIT_SHA256_RE = re.compile(r"^[0-9a-f]{40}$")
+_HF_ETAG_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _file_matches_hf_etag(path: Path, etag: str) -> bool:
+    digest = hashlib.sha256() if len(etag) == 64 else hashlib.sha1()
+    with path.open("rb") as file:
+        if len(etag) == 40:
+            size = os.fstat(file.fileno()).st_size
+            digest.update(f"blob {size}\0".encode())
+        while chunk := file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest() == etag
+
+
+def _validate_local_download_metadata(checkpoint: Path, revision: str) -> None:
+    metadata_root = checkpoint / ".cache" / "huggingface" / "download"
+    snapshot_files = [
+        path for path in checkpoint.rglob("*") if path.is_file() and checkpoint / ".cache" not in path.parents
+    ]
+    for path in snapshot_files:
+        relative_path = path.relative_to(checkpoint)
+        metadata_path = metadata_root.joinpath(*relative_path.parts).with_name(f"{relative_path.name}.metadata")
+        try:
+            lines = metadata_path.read_text(encoding="utf-8").splitlines()
+            metadata_revision, etag, timestamp_text = lines
+            timestamp = float(timestamp_text)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"DPO reference file is missing valid Hugging Face local-dir metadata: {relative_path.as_posix()!r}"
+            ) from exc
+        if (
+            metadata_revision != revision
+            or _HF_ETAG_RE.fullmatch(etag) is None
+            or not math.isfinite(timestamp)
+            or path.stat().st_mtime - 1 > timestamp
+        ):
+            raise RuntimeError(
+                "DPO reference file metadata does not match the pinned revision or file contents: "
+                f"{relative_path.as_posix()!r}"
+            )
+        if not _file_matches_hf_etag(path, etag):
+            raise RuntimeError(
+                f"DPO reference file contents do not match its Hugging Face ETag: {relative_path.as_posix()!r}"
+            )
 
 
 def resolve_dpo_reference_checkpoint(repository: str, revision: str, local_checkpoint: str) -> str:
     """Resolve a pinned DPO reference in the configured local model
     directory."""
     try:
-        from huggingface_hub import get_cached_repo_tree, snapshot_download
-        from huggingface_hub.errors import CachedRepoTreeNotFoundError
+        from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise RuntimeError("standard DPO requires huggingface_hub to resolve its frozen reference") from exc
 
@@ -57,15 +101,10 @@ def resolve_dpo_reference_checkpoint(repository: str, revision: str, local_check
             f"repository={repository!r}, revision={revision!r}, path={checkpoint}"
         )
     try:
-        get_cached_repo_tree(
-            repo_id=repository,
-            revision=revision,
-            local_dir=str(configured_checkpoint),
-        )
-    except CachedRepoTreeNotFoundError as exc:
+        _validate_local_download_metadata(checkpoint, revision)
+    except RuntimeError as exc:
         raise RuntimeError(
-            "DPO reference is missing pinned Hugging Face local-dir metadata; re-download it with "
-            f"`hf download {repository} --revision {revision} --local-dir {local_checkpoint}`"
+            f"{exc}; re-download with `hf download {repository} --revision {revision} --local-dir {local_checkpoint}`"
         ) from exc
     return str(checkpoint)
 
