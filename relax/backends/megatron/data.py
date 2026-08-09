@@ -792,21 +792,6 @@ def _get_preference_data_iterator(
     pair_costs = [int(cost) for cost in rollout_data["preference_pair_costs"]]
     pair_ids = [str(pair_id) for pair_id in rollout_data["preference_pair_ids"]]
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-    dp_group = mpu.get_data_parallel_group()
-    device = device_utils.make_current_torch_device()
-    count_tensor = torch.tensor([len(pair_costs)], dtype=torch.int64, device=device)
-    # MIN and MAX ride a single MAX all_reduce on [count, -count].
-    minmax_tensor = torch.tensor([len(pair_costs), -len(pair_costs)], dtype=torch.int64, device=device)
-    dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM, group=dp_group)
-    dist.all_reduce(minmax_tensor, op=dist.ReduceOp.MAX, group=dp_group)
-    step_global_pair_count = int(count_tensor.item())
-    global_max = int(minmax_tensor[0].item())
-    global_min = -int(minmax_tensor[1].item())
-    if global_min != global_max:
-        raise ValueError(
-            "preference objectives require equal local pair rows on every DP rank: "
-            f"global_min={global_min}, global_max={global_max}"
-        )
     dynamic_count = rollout_data.get("dynamic_global_batch_size")
     if isinstance(dynamic_count, (list, tuple)):
         normalized = {int(value) for value in dynamic_count}
@@ -814,18 +799,30 @@ def _get_preference_data_iterator(
             raise ValueError(f"dynamic_global_batch_size values must be identical, got {dynamic_count}")
         dynamic_count = normalized.pop()
     expected_global_pairs = int(args.global_batch_size) if dynamic_count is None else int(dynamic_count)
-    if expected_global_pairs != step_global_pair_count:
+    capacity = int(max_tokens_per_gpu or args.max_tokens_per_gpu)
+    pair_bins = pack_preference_pair_indices(pair_costs, pair_ids, capacity=capacity)
+    control_values = [None] * dp_size
+    dist.all_gather_object(
+        control_values,
+        (len(pair_costs), expected_global_pairs, len(pair_bins)),
+        group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+    )
+    local_pair_counts = {int(values[0]) for values in control_values}
+    if len(local_pair_counts) != 1:
+        raise ValueError(f"preference objectives require equal local pair rows on every DP rank: {local_pair_counts}")
+    declared_global_pairs = {int(values[1]) for values in control_values}
+    if len(declared_global_pairs) != 1:
+        raise ValueError(f"dynamic_global_batch_size must be identical on every DP rank: {declared_global_pairs}")
+    step_global_pair_count = local_pair_counts.pop() * dp_size
+    declared_global_pair_count = declared_global_pairs.pop()
+    if declared_global_pair_count != step_global_pair_count:
         raise ValueError(
             "dynamic_global_batch_size must equal the step-global preference pair count: "
-            f"declared={expected_global_pairs}, actual={step_global_pair_count}, "
+            f"declared={declared_global_pair_count}, actual={step_global_pair_count}, "
             f"local={len(pair_costs)}, dp_size={dp_size}"
         )
     rollout_data["dynamic_global_batch_size"] = step_global_pair_count
-    capacity = int(max_tokens_per_gpu or args.max_tokens_per_gpu)
-    pair_bins = pack_preference_pair_indices(pair_costs, pair_ids, capacity=capacity)
-    bin_count = torch.tensor([len(pair_bins)], dtype=torch.int, device=device)
-    dist.all_reduce(bin_count, op=dist.ReduceOp.MAX, group=dp_group)
-    pair_bins = _split_preference_bins_to_count(pair_bins, int(bin_count.item()))
+    pair_bins = _split_preference_bins_to_count(pair_bins, max(int(values[2]) for values in control_values))
     if any(sum(pair_costs[index] for index in group) > capacity for group in pair_bins):
         raise RuntimeError("preference DP bin synchronization produced an over-capacity micro-batch")
     branch_bins = [

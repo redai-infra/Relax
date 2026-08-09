@@ -53,6 +53,8 @@ def validate_preference_args(args: Namespace) -> None:
         raise ValueError("preference objectives v1 require --qkv-format thd")
     if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
         raise ValueError("preference objectives v1 support synchronous SFT topology only")
+    if not getattr(args, "use_gloo_process_groups", False):
+        raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")
     if getattr(args, "sft_chunked_logits", False) or getattr(args, "enable_mtp_training", False):
         raise ValueError("preference objectives v1 do not support SFT chunked logits or MTP")
     if getattr(args, "calculate_per_token_loss", False):

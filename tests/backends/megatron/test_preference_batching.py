@@ -8,7 +8,6 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
-import torch
 
 
 try:
@@ -53,9 +52,12 @@ def test_capacity_packer_is_deterministic_complete_and_bounded():
 def test_preference_iterator_validates_step_global_pair_denominator(monkeypatch):
     flat = expand_preference_rollout_data(_pair_rows())
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1)
-    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group", lambda: object())
-    monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(data_module.dist, "all_reduce", lambda tensor, **kwargs: None)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
+
+    def all_gather_object(output, value, **_kwargs):
+        output[:] = [value]
+
+    monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
     args = Namespace(global_batch_size=2, max_tokens_per_gpu=16)
     iterators, counts = data_module._get_preference_data_iterator(args, flat, None)
     assert counts == [1]
@@ -71,14 +73,12 @@ def test_preference_iterator_validates_step_global_pair_denominator(monkeypatch)
 def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch):
     flat = expand_preference_rollout_data(_pair_rows())
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 2)
-    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group", lambda: object())
-    monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
 
-    def all_reduce(tensor, *, op, **kwargs):
-        if op == data_module.dist.ReduceOp.SUM:
-            tensor.mul_(2)
+    def all_gather_object(output, value, **_kwargs):
+        output[:] = [value, value]
 
-    monkeypatch.setattr(data_module.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
     args = Namespace(global_batch_size=4, max_tokens_per_gpu=4)
     iterators, counts = data_module._get_preference_data_iterator(args, flat, None)
     assert flat["dynamic_global_batch_size"] == 4
@@ -90,6 +90,26 @@ def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch):
         assert set(batch["preference_is_chosen"]) == {False, True}
         seen.extend(batch["preference_branch_pair_ids"])
     assert sorted(seen) == [100, 100, 101, 101]
+
+
+def test_preference_iterator_has_no_device_scalar_readback():
+    source = inspect.getsource(data_module._get_preference_data_iterator)
+    assert ".item(" not in source
+    assert "all_reduce(" not in source
+
+
+def test_preference_iterator_rejects_unequal_dp_pair_rows_via_gloo(monkeypatch):
+    flat = expand_preference_rollout_data(_pair_rows())
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
+
+    def all_gather_object(output, value, **_kwargs):
+        output[:] = [value, (value[0] + 1, value[1], value[2])]
+
+    monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
+    args = Namespace(global_batch_size=4, max_tokens_per_gpu=16)
+    with pytest.raises(ValueError, match="equal local pair rows"):
+        data_module._get_preference_data_iterator(args, flat, None)
 
 
 def test_oversize_error_names_pair_cost_and_capacity():
