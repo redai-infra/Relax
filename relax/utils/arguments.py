@@ -2818,6 +2818,8 @@ def _validate_lora_args(args) -> None:
             raise ValueError("Mixture-of-LoRA does not support --lora-merge-mode or --lora-adapter-mode.")
         if getattr(args, "fully_async", False):
             raise ValueError("Mixture-of-LoRA does not support --fully-async.")
+        if getattr(args, "dynamic_context_parallel", False):
+            raise ValueError("Mixture-of-LoRA currently supports static context parallelism only.")
         if not getattr(args, "colocate", False):
             raise ValueError("Mixture-of-LoRA requires --colocate.")
 

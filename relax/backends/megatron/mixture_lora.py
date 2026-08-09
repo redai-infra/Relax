@@ -61,6 +61,8 @@ class MixtureLoRARoutingContext:
     calculate_per_token_loss: bool
     objective_scale: float
     main_loss_backward_scale: torch.Tensor
+    context_parallel_group: Any = None
+    context_parallel_world_size: int = 1
     is_dummy: bool = False
     records: dict[str, MixtureLoRARoutingRecord] = field(default_factory=dict, init=False)
 
@@ -75,6 +77,10 @@ class MixtureLoRARoutingContext:
             raise ValueError("main_loss_backward_scale must be a one-element tensor")
         if not math.isfinite(self.objective_scale) or self.objective_scale < 0:
             raise ValueError("objective_scale must be finite and non-negative")
+        if self.context_parallel_world_size <= 0:
+            raise ValueError("context_parallel_world_size must be positive")
+        if self.context_parallel_world_size > 1 and self.context_parallel_group is None:
+            raise ValueError("context_parallel_group is required when context parallelism is enabled")
 
     def response_mask_for(self, x: torch.Tensor) -> torch.Tensor:
         """Align a batch-first mask with Megatron's activation layout."""
@@ -113,24 +119,27 @@ class MixtureLoRARoutingContext:
 
         response_mask = self.response_mask_for(x)
         statistics = compute_routing_statistics(decision, response_mask)
-        # This is a microbatch-level F_e * P_e objective. It is not an
-        # average of independent per-token losses.
-        balance_loss = statistics.balance_loss
-        site_aux_loss = balance_loss * (config.aux_loss_coef / self.num_sites)
+        gradient_balance_loss, recorded_balance_loss, global_valid_token_count = _context_parallel_balance_losses(
+            statistics,
+            self.context_parallel_group,
+            self.context_parallel_world_size,
+        )
+        site_aux_loss = gradient_balance_loss * (config.aux_loss_coef / self.num_sites)
+        recorded_site_aux_loss = recorded_balance_loss * (config.aux_loss_coef / self.num_sites)
         sample_or_token_count = (
-            statistics.valid_token_count
+            global_valid_token_count
             if self.calculate_per_token_loss
             else statistics.valid_token_count.new_tensor(self.num_samples)
         )
         objective_weight = sample_or_token_count * self.objective_scale
         aux_loss_payload = site_aux_loss * sample_or_token_count
-        objective_aux_loss = site_aux_loss * objective_weight
+        objective_aux_loss = recorded_site_aux_loss * objective_weight / self.context_parallel_world_size
         if record_statistics:
             key = (self.optimizer_step, self.microbatch_id, site_id)
             self.records[site_id] = MixtureLoRARoutingRecord(
                 key=key,
                 statistics=_detach_routing_statistics(statistics),
-                balance_loss=balance_loss.detach(),
+                balance_loss=recorded_balance_loss,
                 aux_loss=objective_aux_loss.detach(),
                 objective_weight=objective_weight.detach(),
             )
@@ -257,6 +266,42 @@ def _detach_routing_statistics(statistics: RoutingStatistics) -> RoutingStatisti
         valid_token_count=statistics.valid_token_count.detach(),
         top_k=statistics.top_k,
     )
+
+
+def _context_parallel_balance_losses(
+    statistics: RoutingStatistics,
+    context_parallel_group: Any,
+    context_parallel_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the local gradient contribution and global CP balance loss."""
+
+    if context_parallel_world_size == 1:
+        balance_loss = statistics.balance_loss
+        return balance_loss, balance_loss.detach(), statistics.valid_token_count
+
+    num_experts = statistics.pre_topk_prob_sum.numel()
+    reduced = torch.cat(
+        (
+            statistics.pre_topk_prob_sum.detach(),
+            statistics.selection_count.detach(),
+            statistics.valid_token_count.detach().reshape(1),
+        )
+    ).clone()
+    torch.distributed.all_reduce(reduced, group=context_parallel_group)
+    global_pre_topk_prob_sum = reduced[:num_experts]
+    global_selection_count = reduced[num_experts : 2 * num_experts]
+    global_valid_token_count = reduced[-1]
+    denominator = global_valid_token_count.clamp_min(1)
+    has_valid_tokens = (global_valid_token_count > 0).to(reduced.dtype)
+    selection_share = global_selection_count / (denominator * statistics.top_k)
+
+    # Keep only this rank's probability sum differentiable. CP/DDP gradient
+    # reduction adds the rank-local contributions into the full-sequence loss.
+    local_mean_prob = statistics.pre_topk_prob_sum / denominator
+    local_balance_loss = num_experts * torch.sum(selection_share * local_mean_prob) * has_valid_tokens
+    global_mean_prob = global_pre_topk_prob_sum / denominator
+    global_balance_loss = num_experts * torch.sum(selection_share * global_mean_prob) * has_valid_tokens
+    return local_balance_loss, global_balance_loss, global_valid_token_count
 
 
 def pack_mixture_lora_routing_records(

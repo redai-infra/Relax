@@ -158,6 +158,7 @@ def test_mixture_configuration_rejects_invalid_values(arguments_module, override
         ({"lora_merge_mode": True}, "merge-mode"),
         ({"lora_adapter_mode": True}, "adapter-mode"),
         ({"fully_async": True}, "fully-async"),
+        ({"dynamic_context_parallel": True}, "static context parallelism"),
         ({"colocate": False}, "colocate"),
         ({"sglang_dp_size": 2}, "DP size 1"),
         ({"sglang_tp_size": 2}, "TP size 1"),

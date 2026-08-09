@@ -164,6 +164,10 @@ def _build_mixture_lora_routing_context(
         calculate_per_token_loss=args.calculate_per_token_loss,
         objective_scale=objective_scale,
         main_loss_backward_scale=main_loss_backward_scale.detach().clone(),
+        context_parallel_group=(
+            mpu.get_context_parallel_group() if mpu.get_context_parallel_world_size() > 1 else None
+        ),
+        context_parallel_world_size=mpu.get_context_parallel_world_size(),
         is_dummy=batch.get("__is_dummy__", False),
     )
 

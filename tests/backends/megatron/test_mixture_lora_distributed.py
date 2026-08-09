@@ -14,7 +14,12 @@ from relax.backends.megatron.mixture_lora import (
     mixture_lora_metrics_from_packed_records,
     pack_mixture_lora_routing_records,
 )
-from relax.utils.mixture_lora import DenseRoutedLoRAExecutor, MixtureLoraConfig, route_topk
+from relax.utils.mixture_lora import (
+    DenseRoutedLoRAExecutor,
+    MixtureLoraConfig,
+    compute_routing_statistics,
+    route_topk,
+)
 
 
 def _config() -> MixtureLoraConfig:
@@ -143,6 +148,105 @@ def _distributed_routing_metrics_worker(rank: int, world_size: int, init_method:
 def test_routing_metrics_reduce_across_two_real_processes(tmp_path):
     init_method = f"file://{tmp_path / 'mixture-lora-gloo-init'}"
     mp.spawn(_distributed_routing_metrics_worker, args=(2, init_method), nprocs=2, join=True)
+
+
+def _context_parallel_balance_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        config = _config()
+        full_logits = torch.tensor(
+            [
+                [2.0, 0.5, -1.0],
+                [0.2, 1.7, -0.4],
+                [-0.3, 0.1, 2.1],
+                [1.2, -0.7, 0.4],
+            ]
+        )
+        for calculate_per_token_loss in (False, True):
+            for empty_second_rank in (False, True):
+                full_mask = torch.tensor(
+                    [1, 1, 0, 0] if empty_second_rank else [1, 1, 1, 0],
+                    dtype=torch.bool,
+                )
+                local_logits = full_logits.chunk(world_size)[rank].clone().requires_grad_(True)
+                local_mask = full_mask.chunk(world_size)[rank]
+                decision = route_topk(local_logits, config.top_k, config.temperature)
+                objective_scale = 1.0 if calculate_per_token_loss else float(world_size)
+                context = MixtureLoRARoutingContext(
+                    optimizer_step=0,
+                    microbatch_id=2 * int(calculate_per_token_loss) + int(empty_second_rank),
+                    response_mask=local_mask.unsqueeze(0),
+                    num_microbatches=1,
+                    num_sites=1,
+                    num_samples=1,
+                    calculate_per_token_loss=calculate_per_token_loss,
+                    objective_scale=objective_scale,
+                    main_loss_backward_scale=torch.ones(1),
+                    context_parallel_group=dist.group.WORLD,
+                    context_parallel_world_size=world_size,
+                )
+                output = local_logits.sum() * 0.0 + torch.zeros(2, 1, 1)
+                attached = context.attach_aux_loss(
+                    output,
+                    torch.zeros(2, 1, 1),
+                    "layers.0.linear_qkv",
+                    config,
+                    decision,
+                )
+                attached.sum().backward()
+
+                reference_logits = full_logits.clone().requires_grad_(True)
+                reference_decision = route_topk(reference_logits, config.top_k, config.temperature)
+                reference_balance_loss = compute_routing_statistics(reference_decision, full_mask).balance_loss
+                objective_count = full_mask.sum() if calculate_per_token_loss else 1
+                (reference_balance_loss * config.aux_loss_coef * objective_count * objective_scale).backward()
+                expected_gradient = reference_logits.grad.chunk(world_size)[rank]
+                torch.testing.assert_close(local_logits.grad, expected_gradient, atol=1e-6, rtol=1e-6)
+
+                record = context.records["layers.0.linear_qkv"]
+                torch.testing.assert_close(record.balance_loss, reference_balance_loss.detach())
+                torch.testing.assert_close(
+                    record.aux_loss,
+                    reference_balance_loss.detach()
+                    * config.aux_loss_coef
+                    * objective_count
+                    * objective_scale
+                    / world_size,
+                )
+                packed = pack_mixture_lora_routing_records(
+                    [context],
+                    ("layers.0.linear_qkv",),
+                    num_experts=config.num_experts,
+                    top_k=config.top_k,
+                    device=torch.device("cpu"),
+                )
+                dist.all_reduce(packed)
+                metrics = mixture_lora_metrics_from_packed_records(
+                    packed,
+                    ("layers.0.linear_qkv",),
+                    num_experts=config.num_experts,
+                    top_k=config.top_k,
+                    calculate_per_token_loss=calculate_per_token_loss,
+                    data_parallel_world_size_with_cp=world_size,
+                )
+                torch.testing.assert_close(
+                    metrics["molora/aux_loss"],
+                    (reference_balance_loss.detach() * config.aux_loss_coef).to(torch.float64),
+                )
+                dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_context_parallel_balance_loss_matches_full_sequence_reference(tmp_path):
+    init_method = f"file://{tmp_path / 'mixture-lora-cp-gloo-init'}"
+    mp.spawn(_context_parallel_balance_worker, args=(2, init_method), nprocs=2, join=True)
 
 
 def _reference_forward_and_backward(
