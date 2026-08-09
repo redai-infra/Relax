@@ -55,6 +55,7 @@ def _args(**overrides):
         colocate=True,
         sglang_dp_size=1,
         sglang_tp_size=1,
+        tensor_model_parallel_size=2,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -138,6 +139,7 @@ def test_missing_mixture_values_are_reported_together(arguments_module):
     [
         ({"lora_num_experts": 0}, "lora-num-experts"),
         ({"lora_rank": 0}, "lora-rank"),
+        ({"lora_rank": 15}, "divisible"),
         ({"lora_router_top_k": 0}, "top_k"),
         ({"lora_router_top_k": 5}, "top_k"),
         ({"lora_router_temperature": 0.0}, "temperature"),

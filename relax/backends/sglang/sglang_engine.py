@@ -28,6 +28,7 @@ from relax.utils.megatron_peft_utils import (
     build_mixture_lora_config,
     convert_megatron_to_hf_target_modules,
     is_lora_enabled,
+    is_mixture_lora_enabled,
 )
 from relax.utils.mixture_lora import configure_mixture_lora_external_model
 
@@ -1375,6 +1376,11 @@ def _compute_server_args(
         # Mandatory: base is synced once, so it must survive colocate sleep/wake. Without CPU
         # backup, release_memory_occupation drops the GPU pages and base becomes garbage after
         # the first wake (other modes re-push full base every step and never notice).
+        kwargs["enable_weights_cpu_backup"] = True
+
+    # Mixture sync also sends the frozen base only once. Keep its CPU copy alive
+    # while colocate sleep releases the GPU weight pages between rollout phases.
+    if is_mixture_lora_enabled(args):
         kwargs["enable_weights_cpu_backup"] = True
 
     if worker_type == "prefill":

@@ -3,6 +3,7 @@
 """Megatron model modules and Bridge injection for Mixture-of-LoRA."""
 
 import math
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -893,7 +894,7 @@ class MixtureParallelLinearAdapter(nn.Module):
         return sharded_state
 
 
-def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float):
+def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float, vp_stage: int | None = None):
     """Build a Bridge PEFT object that injects routed adapters at matched
     sites."""
 
@@ -929,6 +930,11 @@ def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float):
                 raise RuntimeError("Mixture-of-LoRA PEFT is missing its configuration")
             _, full_name = match
             attributes = get_adapter_attributes_from_linear(module)
+            site_id = _global_mixture_lora_site_id(
+                full_name,
+                getattr(module, "config", None),
+                vp_stage,
+            )
             tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
             tp_group = getattr(module, "tp_group", None)
             if tp_world_size > 1 and tp_group is None:
@@ -936,7 +942,7 @@ def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float):
             return MixtureParallelLinearAdapter(
                 module,
                 self.mixture_config,
-                full_name,
+                site_id,
                 attributes.in_features,
                 attributes.out_features,
                 dropout=self.dropout,
@@ -972,3 +978,18 @@ __all__ = [
     "mixture_lora_metrics_from_packed_records",
     "pack_mixture_lora_routing_records",
 ]
+_DECODER_LAYER_SITE_PATTERN = re.compile(r"^(?P<prefix>.*decoder\.layers\.)(?P<layer>\d+)(?P<suffix>\..+)$")
+
+
+def _global_mixture_lora_site_id(site_id: str, transformer_config: Any, vp_stage: int | None) -> str:
+    """Convert a pipeline-local decoder layer name into its global name."""
+
+    match = _DECODER_LAYER_SITE_PATTERN.fullmatch(site_id)
+    if match is None or transformer_config is None:
+        return site_id
+
+    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+    layer_offset = get_transformer_layer_offset(transformer_config, vp_stage=vp_stage)
+    global_layer = int(match.group("layer")) + layer_offset
+    return f"{match.group('prefix')}{global_layer}{match.group('suffix')}"

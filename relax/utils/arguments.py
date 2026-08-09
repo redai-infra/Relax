@@ -2809,6 +2809,12 @@ def _validate_lora_args(args) -> None:
     else:
         if getattr(args, "lora_rank", 0) <= 0:
             raise ValueError("--lora-num-experts greater than 1 requires --lora-rank greater than 0.")
+        training_tp_size = getattr(args, "tensor_model_parallel_size", 1)
+        if args.lora_rank % training_tp_size != 0:
+            raise ValueError(
+                f"Mixture-of-LoRA requires --lora-rank to be divisible by the Megatron TP size; "
+                f"got rank {args.lora_rank} and TP size {training_tp_size}."
+            )
         missing = [option for attribute, option in mixture_fields if getattr(args, attribute, None) is None]
         if missing:
             raise ValueError(

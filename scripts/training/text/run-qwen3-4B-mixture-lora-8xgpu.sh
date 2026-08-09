@@ -4,7 +4,7 @@
 #
 # Qwen3-4B Mixture-of-LoRA GRPO on DAPO math with 8 colocated GPUs.
 
-set -euo pipefail
+set -ex
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 if [[ -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then

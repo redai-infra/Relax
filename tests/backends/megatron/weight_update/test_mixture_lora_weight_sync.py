@@ -6,12 +6,83 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from relax.backends.megatron.weight_update.common import _maybe_get_cpu_backup
+from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge
 from relax.backends.megatron.weight_update.mixture_lora_sync import (
     MixtureLoraParamInfo,
+    _gather_pipeline_param_infos,
     merge_mixture_lora_tp_shards,
 )
 from relax.backends.megatron.weight_update.update_weight_from_tensor import iter_mixture_weight_updates
 from relax.utils.mixture_lora import MixtureLoraStateSpec
+from relax.utils.types import ParamInfo
+
+
+def test_selective_offload_uses_cpu_copy_only_after_live_storage_is_released():
+    cpu_copy = torch.arange(4, dtype=torch.float32)
+    released = torch.empty(0)
+    released._relax_cpu_offload_data = cpu_copy
+
+    assert _maybe_get_cpu_backup(released) is cpu_copy
+
+    resident = torch.ones(1)
+    resident._relax_cpu_offload_data = cpu_copy
+
+    assert _maybe_get_cpu_backup(resident) is resident
+
+
+def _run_non_expert_bridge_iterator(*, current_rank: int, src_rank: int):
+    name = "decoder.layers.0.self_attention.linear_proj.to_wrap.weight"
+    info = ParamInfo(
+        name=name,
+        dtype=torch.float32,
+        shape=torch.Size((4, 8)),
+        attrs={},
+        size=4 * 8 * 4,
+        src_rank=src_rank,
+    )
+    parameter = torch.nn.Parameter(torch.ones(info.shape), requires_grad=False)
+    converted = [("model.layers.0.self_attn.o_proj.weight", torch.full(info.shape, 2.0))]
+    iterator = HfWeightIteratorBridge.__new__(HfWeightIteratorBridge)
+    iterator.args = MagicMock()
+    iterator._bridge_converter = MagicMock()
+    iterator._bridge_converter.convert.return_value = converted
+    iterator.lora_merge_mode = False
+    iterator._expert_buckets = []
+    iterator._non_expert_buckets = [[info]]
+    iterator._vanilla_key_map = {info.name: info.name}
+
+    def broadcast_owner_result(bucket_infos, all_converted, device):
+        assert bucket_infos == [info]
+        assert device == "cpu"
+        assert all_converted == ([converted] if current_rank == src_rank else [None])
+        return converted
+
+    module = "relax.backends.megatron.weight_update.hf_weight_iterator_bridge"
+    with (
+        patch(f"{module}.dist.get_rank", return_value=current_rank),
+        patch(f"{module}.device_utils.make_current_torch_device", return_value="cpu"),
+        patch(f"{module}._load_to_gpu", return_value=[parameter]),
+        patch(f"{module}.all_gather_param", return_value=parameter),
+        patch(f"{module}._broadcast_converted_bucket", side_effect=broadcast_owner_result),
+    ):
+        result = list(iterator._iter_hf_params({info.name: parameter}))
+
+    return iterator, result, converted
+
+
+def test_non_expert_owner_stage_runs_bridge_conversion():
+    iterator, result, converted = _run_non_expert_bridge_iterator(current_rank=0, src_rank=0)
+
+    assert result == converted
+    iterator._bridge_converter.convert.assert_called_once()
+
+
+def test_non_expert_remote_stage_only_receives_converted_result():
+    iterator, result, converted = _run_non_expert_bridge_iterator(current_rank=1, src_rank=0)
+
+    assert result == converted
+    iterator._bridge_converter.convert.assert_not_called()
 
 
 def _info(site, kind, global_shape, local_shape, shard_dim):
@@ -28,6 +99,43 @@ def _info(site, kind, global_shape, local_shape, shard_dim):
         src_rank=0,
         weight_key="weight",
     )
+
+
+def test_pipeline_metadata_gather_uses_output_list_first_and_merges_stages():
+    stage_0 = _info("linear_qkv", "router.weight", (2, 6), (2, 6), None)
+    stage_1 = MixtureLoraParamInfo(
+        state=MixtureLoraStateSpec(
+            schema_version=1,
+            site_id="decoder.layers.1.self_attention.linear_qkv",
+            parameter_kind="router.weight",
+            global_shape=(2, 6),
+            dtype=torch.float32,
+        ),
+        local_shape=(2, 6),
+        tp_shard_dim=None,
+        src_rank=1,
+        weight_key="stage-1-weight",
+    )
+
+    def gather(output_list, input_object, group=None):
+        assert input_object == (0, {stage_0.state.parameter_name: stage_0})
+        assert group == "pp-group"
+        output_list[:] = [input_object, (1, {stage_1.state.parameter_name: stage_1})]
+
+    with (
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.all_gather_object", side_effect=gather),
+    ):
+        merged = _gather_pipeline_param_infos(
+            {stage_0.state.parameter_name: stage_0},
+            pipeline_group="pp-group",
+            pipeline_world_size=2,
+        )
+
+    assert merged == {
+        stage_0.state.parameter_name: stage_0,
+        stage_1.state.parameter_name: stage_1,
+    }
 
 
 def test_qkv_lora_b_tp_shards_are_converted_from_group_layout_to_qkv_blocks():

@@ -215,6 +215,9 @@ def _hf_validate_args(args, hf_config):
     # RoPE kernel cannot handle this and produces numerically different results from the
     # unfused HF/SGLang implementation, causing training-inference log-prob mismatch.
     is_multimodal = hasattr(hf_config, "text_config") or hasattr(hf_config, "thinker_config")
+    mixture_lora_enabled = getattr(args, "lora_num_experts", 1) > 1
+    if mixture_lora_enabled and is_multimodal:
+        errors.append("Mixture-of-LoRA currently supports text-only base models; multimodal models are unsupported.")
     if is_multimodal and getattr(args, "apply_rope_fusion", False):
         errors.append(
             "Multimodal models use multi-axis RoPE (list of tensors) which is incompatible "
@@ -229,6 +232,9 @@ def _hf_validate_args(args, hf_config):
     # multimodal models have different config structure
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
+
+    if mixture_lora_enabled and _is_moe_config(hf_config):
+        errors.append("Mixture-of-LoRA currently supports dense base models; MoE base models are unsupported.")
 
     validate_dense_ffn = not _is_moe_config(hf_config) or _has_dense_moe_layers(args)
 

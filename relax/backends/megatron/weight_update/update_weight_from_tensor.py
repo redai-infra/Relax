@@ -394,6 +394,11 @@ class UpdateWeightFromTensor:
             operation()
         except Exception as error:
             local_error = error
+            logger.error(
+                "Weight update phase failed on rank %d before failure synchronization",
+                dist.get_rank(),
+                exc_info=(type(error), error, error.__traceback__),
+            )
         failed = torch.tensor([local_error is not None], dtype=torch.int32)
         dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=get_gloo_group())
         return local_error, bool(failed.item())

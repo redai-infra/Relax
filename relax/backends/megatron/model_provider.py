@@ -489,7 +489,7 @@ def wrap_model_provider_with_lora(original_provider, args):
                 mixture_config = build_mixture_lora_config(args)
                 if mixture_config is None:
                     raise RuntimeError("Mixture-of-LoRA is enabled but its validated configuration is missing")
-                peft = build_mixture_lora_peft(mixture_config, args.lora_dropout)
+                peft = build_mixture_lora_peft(mixture_config, args.lora_dropout, vp_stage=vp_stage)
             else:
                 peft = build_lora_peft(args)
             model = peft(model, training=True)

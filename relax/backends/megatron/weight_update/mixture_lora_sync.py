@@ -32,6 +32,30 @@ class MixtureLoraParamInfo:
     weight_key: str
 
 
+def _gather_pipeline_param_infos(
+    local_infos: dict[str, MixtureLoraParamInfo],
+    *,
+    pipeline_group,
+    pipeline_world_size: int,
+) -> dict[str, MixtureLoraParamInfo]:
+    """Collect parameter metadata from every stage in one PP group."""
+
+    gathered_infos = [None] * pipeline_world_size
+    dist.all_gather_object(
+        gathered_infos,
+        (dist.get_rank(), local_infos),
+        group=pipeline_group,
+    )
+    merged_infos: dict[str, MixtureLoraParamInfo] = {}
+    for _, stage_infos in gathered_infos:
+        for name, info in stage_infos.items():
+            previous = merged_infos.get(name)
+            if previous is not None and previous != info:
+                raise ValueError(f"Conflicting Mixture-of-LoRA metadata for {name}")
+            merged_infos[name] = info
+    return merged_infos
+
+
 def _qwen3_attention_dimensions(args: Namespace) -> tuple[int, int, int]:
     head_dim = getattr(args, "kv_channels", None)
     if head_dim is None:
@@ -218,19 +242,13 @@ class MixtureLoraSync:
                 weight_key=weight_key,
             )
 
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
-            gathered_infos = [None] * mpu.get_pipeline_model_parallel_world_size()
-            dist.all_gather_object(
-                (rank, local_infos),
-                object_list=gathered_infos,
-                group=mpu.get_pipeline_model_parallel_group(),
+        pipeline_world_size = mpu.get_pipeline_model_parallel_world_size()
+        if pipeline_world_size > 1:
+            local_infos = _gather_pipeline_param_infos(
+                local_infos,
+                pipeline_group=mpu.get_pipeline_model_parallel_group(),
+                pipeline_world_size=pipeline_world_size,
             )
-            for _, stage_infos in gathered_infos:
-                for name, info in stage_infos.items():
-                    previous = local_infos.get(name)
-                    if previous is not None and previous != info:
-                        raise ValueError(f"Conflicting Mixture-of-LoRA metadata for {name}")
-                    local_infos[name] = info
         return tuple(local_infos[name] for name in sorted(local_infos))
 
     def get_weight_chunks(

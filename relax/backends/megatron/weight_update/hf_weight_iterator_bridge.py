@@ -110,29 +110,32 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             yield from results
             del all_converted, results
 
-        # --- Non-expert weights: original path ---
+        # --- Non-expert weights ---
         for bucket_infos in self._non_expert_buckets:
-            t_b0 = time.monotonic()
-            params = _load_and_broadcast(
+            params = _load_to_gpu(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
             )
-            t_b1 = time.monotonic()
-            t_bcast_total += t_b1 - t_b0
-
+            all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
                 t_g0 = time.monotonic()
                 gathered = all_gather_param(self.args, info.name, param)
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
-
-                converted = self._bridge_converter.convert(info.name, gathered)
-                t_convert_total += time.monotonic() - t_g1
-
-                param_count += len(converted)
-                yield from converted
-                del gathered, converted
-
+                if rank == info.src_rank:
+                    t_c0 = time.monotonic()
+                    all_converted.append(self._bridge_converter.convert(info.name, gathered))
+                    t_convert_total += time.monotonic() - t_c0
+                else:
+                    all_converted.append(None)
+                del gathered
             del params
+
+            t_b0 = time.monotonic()
+            results = _broadcast_converted_bucket(bucket_infos, all_converted, device)
+            t_bcast_total += time.monotonic() - t_b0
+            param_count += len(results)
+            yield from results
+            del all_converted, results
 
         if rank == 0:
             logger.info(

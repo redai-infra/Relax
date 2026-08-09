@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
-from relax.backends.sglang.sglang_engine import _configure_external_model_environment
+from relax.backends.sglang.sglang_engine import _compute_server_args, _configure_external_model_environment
 from relax.utils.mixture_lora import (
     MixtureLoraConfig,
     configure_mixture_lora_external_model,
@@ -69,3 +70,34 @@ def test_text_external_model_clears_multimodal_environment(monkeypatch):
     assert os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] == "relax.models.qwen3_mixture_lora.sglang"
     assert "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE" not in os.environ
     assert "SGLANG_EXTERNAL_MM_MODEL_ARCH" not in os.environ
+
+
+def test_mixture_lora_keeps_base_cpu_backup_for_colocate_sleep():
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=1,
+        num_gpus_per_node=8,
+        colocate=True,
+        hf_checkpoint="/models/Qwen3-4B",
+        seed=42,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=True,
+        lora_rank=16,
+        lora_num_experts=4,
+        lora_adapter_mode=False,
+    )
+
+    kwargs, _ = _compute_server_args(
+        args,
+        rank=0,
+        dist_init_addr="127.0.0.1:1234",
+        nccl_port=1235,
+        host="127.0.0.1",
+        port=30000,
+        base_gpu_id=0,
+    )
+
+    assert kwargs["enable_weights_cpu_backup"] is True

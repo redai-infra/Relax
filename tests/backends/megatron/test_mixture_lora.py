@@ -23,6 +23,7 @@ from relax.backends.megatron.mixture_lora import (
     mixture_lora_metrics_from_packed_records,
     pack_mixture_lora_routing_records,
 )
+from relax.utils import megatron_bridge_utils
 from relax.utils.mixture_lora import MixtureLoraConfig, compute_routing_statistics
 
 
@@ -36,6 +37,37 @@ def _config(*, num_experts=3, top_k=2, rank=2, alpha=4.0):
         alpha=alpha,
         target_modules=("linear_qkv", "linear_proj"),
     )
+
+
+def test_bridge_base_load_filters_mixture_parameters_only_inside_patch_context():
+    peft_bridge = pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
+    bridge = peft_bridge.MegatronPeftBridge()
+    parameter_name = "decoder.layers.0.self_attention.linear_qkv.mixture_lora.router.weight"
+    model = torch.nn.Module()
+    model.config = SimpleNamespace()
+    model.share_embeddings_and_output_weights = False
+
+    assert bridge._is_adapter_param_name(parameter_name) is False
+    with megatron_bridge_utils.patch_megatron_model([model]):
+        assert bridge._is_adapter_param_name(parameter_name) is True
+        assert bridge._is_adapter_param_name("decoder.layers.0.self_attention.linear_qkv.weight") is False
+    assert bridge._is_adapter_param_name(parameter_name) is False
+
+
+def test_bridge_mixture_filter_tolerates_missing_bridge_helpers(monkeypatch):
+    original_import = __import__
+
+    def import_without_peft_bridge(name, *args, **kwargs):
+        if name == "megatron.bridge.models.conversion.peft_bridge":
+            raise ImportError("bridge PEFT helpers unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(megatron_bridge_utils, "_bridge_mixture_filter_patched", False)
+    monkeypatch.setattr("builtins.__import__", import_without_peft_bridge)
+
+    megatron_bridge_utils._ensure_bridge_mixture_filter_patched()
+
+    assert megatron_bridge_utils._bridge_mixture_filter_patched is False
 
 
 class _TupleLinear(torch.nn.Module):
@@ -689,6 +721,30 @@ def test_mixture_lora_peft_uses_bridge_matcher_and_freezes_base(monkeypatch):
     assert transformed.linear_qkv.mixture_lora.site_id == "decoder.layers.0.self_attention.linear_qkv"
     assert all(not parameter.requires_grad for parameter in transformed.linear_qkv.to_wrap.parameters())
     assert all(parameter.requires_grad for parameter in transformed.linear_qkv.mixture_lora.parameters())
+
+
+def test_mixture_lora_peft_uses_global_layer_id_with_pipeline_offset(monkeypatch):
+    _install_fake_bridge(monkeypatch)
+    transformer_package = types.ModuleType("megatron.core.transformer")
+    transformer_layer_module = types.ModuleType("megatron.core.transformer.transformer_layer")
+    observed = {}
+
+    def get_transformer_layer_offset(config, vp_stage=None):
+        observed["config"] = config
+        observed["vp_stage"] = vp_stage
+        return 18
+
+    transformer_layer_module.get_transformer_layer_offset = get_transformer_layer_offset
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", transformer_package)
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer.transformer_layer", transformer_layer_module)
+    model = torch.nn.Module()
+    model.linear_qkv = _TupleLinear(4, 5)
+    model.linear_qkv.config = SimpleNamespace(num_layers=36)
+
+    transformed = build_mixture_lora_peft(_config(), dropout=0.0, vp_stage=1)(model, training=True)
+
+    assert transformed.linear_qkv.mixture_lora.site_id == "decoder.layers.18.self_attention.linear_qkv"
+    assert observed == {"config": model.linear_qkv.to_wrap.config, "vp_stage": 1}
 
 
 def test_mixture_lora_peft_instantiates_with_real_bridge_when_available():
