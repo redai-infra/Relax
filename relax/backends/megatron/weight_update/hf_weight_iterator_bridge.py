@@ -17,6 +17,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    is_mixture_lora_param,
 )
 from relax.utils.types import ParamInfo
 
@@ -243,6 +244,8 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
     vanilla_key_map = {}
     adapter_map: dict[str, dict[str, str]] = {}
     for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
+        if is_mixture_lora_param(g_name):
+            continue
         if collect_adapters and is_lora_adapter_param(g_name):
             # LoRA adapter param: keep it out of the conversion buckets (no standalone
             # bridge mapping) and record its vanilla key for load-time merging.

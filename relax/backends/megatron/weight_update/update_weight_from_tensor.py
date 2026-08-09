@@ -25,11 +25,13 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    is_mixture_lora_enabled,
 )
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .lora_adapter_sync import LoraAdapterSync
+from .mixture_lora_sync import MixtureLoraSync
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -39,6 +41,26 @@ from .update_weight_from_distributed import (
 
 
 logger = get_logger(__name__)
+_CURRENT_WEIGHT_VERSION = object()
+
+
+def iter_mixture_weight_updates(base_chunks, mixture_chunks, *, include_base: bool, weight_version: int):
+    """Yield base first and attach the version only to the final routed
+    chunk."""
+
+    if include_base:
+        for chunk in base_chunks:
+            yield chunk, None
+
+    iterator = iter(mixture_chunks)
+    try:
+        pending = next(iterator)
+    except StopIteration as error:
+        raise ValueError("Mixture-of-LoRA weight sync produced no routed tensors") from error
+    for chunk in iterator:
+        yield pending, None
+        pending = chunk
+    yield pending, weight_version
 
 
 class UpdateWeightFromTensor:
@@ -73,10 +95,12 @@ class UpdateWeightFromTensor:
         self.lora_enabled = is_lora_enabled(args)
         self.lora_merge_mode = is_lora_merge_mode(args) if self.lora_enabled else False
         self.lora_adapter_mode = is_lora_adapter_mode(args) if self.lora_enabled else False
+        self.mixture_lora_enabled = is_mixture_lora_enabled(args)
 
         # Adapter-mode incremental-sync state (base-once + adapter-delta protocol) lives in the
         # shared LoraAdapterSync helper; the backend keeps only its in-memory transport below.
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
+        self._mixture_lora_sync = MixtureLoraSync(args, model) if self.mixture_lora_enabled else None
 
         self._hf_weight_iterator = HfWeightIteratorBase.create(
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
@@ -130,6 +154,9 @@ class UpdateWeightFromTensor:
             colocate_engine_nums += 1
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
+
+        if self.mixture_lora_enabled and self.use_distribute:
+            raise ValueError("Mixture-of-LoRA weight sync currently requires colocated rollout engines")
 
         if self.use_distribute:
             self.rollout_engines = rollout_engines[:colocate_engine_nums]
@@ -190,6 +217,9 @@ class UpdateWeightFromTensor:
         # LoRA adapter mode has its own base-once + adapter-delta sync protocol.
         if self.lora_enabled and self.lora_adapter_mode:
             self._update_weights_adapter_mode()
+            return
+        if self.mixture_lora_enabled:
+            self._update_weights_mixture_lora()
             return
 
         self.weight_version += 1
@@ -270,6 +300,75 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _update_weights_mixture_lora(self) -> None:
+        """Sync the frozen base once and all routed parameters every step."""
+
+        next_weight_version = self.weight_version + 1
+        include_base = not self._mixture_lora_sync.base_sync_done
+        all_engines = list(self.rollout_engines)
+        rank = dist.get_rank()
+
+        if rank == 0:
+            ray.get([engine.pause_generation.remote() for engine in all_engines])
+            ray.get([engine.flush_cache.remote() for engine in all_engines])
+            if (
+                include_base
+                and self.quantization_config
+                and self.quantization_config["quant_method"] in ["compressed-tensors"]
+            ):
+                post_process_weights(
+                    restore_weights_before_load=True,
+                    post_process_quantization=False,
+                    rollout_engines=all_engines,
+                )
+        dist.barrier(group=get_gloo_group())
+
+        local_weights = self.weights_getter()
+        base_chunks = self._hf_weight_iterator.get_hf_weight_chunks(local_weights)
+        mixture_chunks = self._mixture_lora_sync.get_weight_chunks(local_weights)
+        updates = iter_mixture_weight_updates(
+            base_chunks,
+            mixture_chunks,
+            include_base=include_base,
+            weight_version=next_weight_version,
+        )
+        self._send_weight_update_stream(updates)
+
+        dist.barrier(group=get_gloo_group())
+        if rank == 0:
+            if (
+                include_base
+                and self.quantization_config
+                and self.quantization_config["quant_method"] in ["compressed-tensors"]
+            ):
+                post_process_weights(
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                    rollout_engines=all_engines,
+                )
+            ray.get([engine.continue_generation.remote() for engine in all_engines])
+        dist.barrier(group=get_gloo_group())
+
+        self.weight_version = next_weight_version
+        self._mixture_lora_sync.base_sync_done = True
+
+    def _send_weight_update_stream(self, updates) -> None:
+        """Pipeline conversion collectives with the preceding IPC request."""
+
+        previous_refs: list[ObjectRef] = []
+        previous_tensors = None
+        for named_tensors, weight_version in updates:
+            refs, long_lived_tensors = self._send_hf_params(named_tensors, weight_version=weight_version)
+            if previous_refs:
+                ray.get(previous_refs)
+            del previous_tensors
+            previous_refs = refs
+            previous_tensors = long_lived_tensors
+            device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+        if previous_refs:
+            ray.get(previous_refs)
+        del previous_tensors
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -476,8 +575,14 @@ class UpdateWeightFromTensor:
         finally:
             set_sharing_strategy(prev_strategy)
 
-    def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
+    def _send_hf_params(
+        self,
+        hf_named_tensors,
+        *,
+        weight_version: int | None | object = _CURRENT_WEIGHT_VERSION,
+    ) -> tuple[list[ObjectRef], Any]:
         all_refs = []
+        resolved_weight_version = self.weight_version if weight_version is _CURRENT_WEIGHT_VERSION else weight_version
 
         long_lived_tensors = None
         if self._ipc_engine is not None:
@@ -486,7 +591,7 @@ class UpdateWeightFromTensor:
                 ipc_engine=self._ipc_engine,
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
-                weight_version=self.weight_version,
+                weight_version=resolved_weight_version,
             )
             all_refs.extend(refs_colocated)
 
@@ -494,7 +599,7 @@ class UpdateWeightFromTensor:
             refs_distributed = update_weights_from_distributed(
                 self._group_name,
                 self._model_update_groups,
-                self.weight_version,
+                resolved_weight_version,
                 self.distributed_rollout_engines,
                 hf_named_tensors,
             )
@@ -510,7 +615,7 @@ def _send_to_colocated_engine(
     ipc_engine,
     ipc_gather_src,
     ipc_gather_group,
-    weight_version,
+    weight_version: int | None,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -571,7 +676,7 @@ def _send_to_colocated_engine(
                 ipc_engine.update_weights_from_tensor.remote(
                     serialized_named_tensors=[tensors[i] for tensors in serialized_named_tensors],
                     load_format="flattened_bucket",
-                    weight_version=str(weight_version),
+                    weight_version=None if weight_version is None else str(weight_version),
                 )
             )
 
