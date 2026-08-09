@@ -1682,7 +1682,7 @@ def save(
         train_data_iterator=None,
         preprocess_common_state_dict_fn=None,
     )
-    if is_lora_enabled(args):
+    if is_lora_enabled(args) and not is_mixture_lora_enabled(args):
         checkpoint_dir = Path(args.save) / f"iter_{iteration:07d}"
         _save_lora_to_checkpoint(model, str(checkpoint_dir), args)
     if should_disable_forward_pre_hook(args):
@@ -1748,7 +1748,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         if allow_missing_mtp_keys and is_export_writer:
             reconcile_hf_export_index(str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=True)
 
-        if is_lora_enabled(args):
+        if is_lora_enabled(args) and not is_mixture_lora_enabled(args):
             _save_lora_to_checkpoint(model, str(path), args, bridge=bridge)
         if should_log:
             logger.info(f"Successfully saved HuggingFace model to {path}")

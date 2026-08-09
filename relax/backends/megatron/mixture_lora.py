@@ -585,6 +585,8 @@ class MixtureLoRAAdapter(nn.Module):
 
         self.config = config
         self.site_id = site_id
+        self.input_size = input_size
+        self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         self.sequence_parallel = sequence_parallel
         self.tp_group = tp_group
@@ -624,6 +626,42 @@ class MixtureLoRAAdapter(nn.Module):
         reduced_gradient = gradient.contiguous()
         torch.distributed.all_reduce(reduced_gradient, group=self.tp_group)
         return reduced_gradient
+
+    def get_extra_state(self) -> dict[str, Any]:
+        """Return the configuration required to validate checkpoint restore."""
+
+        return {
+            "schema_version": self.config.schema_version,
+            "site_id": self.site_id,
+            "num_experts": self.config.num_experts,
+            "rank": self.config.rank,
+            "top_k": self.config.top_k,
+            "temperature": self.config.temperature,
+            "aux_loss_coef": self.config.aux_loss_coef,
+            "alpha": self.config.alpha,
+            "target_modules": list(self.config.target_modules),
+            "input_size": self.input_size,
+            "output_size": self.output_size,
+            "dtype": str(self.router.weight.dtype),
+        }
+
+    def set_extra_state(self, state: dict[str, Any]) -> None:
+        """Validate saved Mixture-of-LoRA metadata before loading tensors."""
+
+        if not isinstance(state, dict):
+            raise RuntimeError(f"Mixture-of-LoRA checkpoint metadata must be a dict, got {type(state).__name__}")
+        expected = self.get_extra_state()
+        mismatches = {
+            key: (expected_value, state.get(key))
+            for key, expected_value in expected.items()
+            if state.get(key) != expected_value
+        }
+        if mismatches:
+            details = ", ".join(
+                f"{key}: expected {expected_value!r}, checkpoint has {saved_value!r}"
+                for key, (expected_value, saved_value) in mismatches.items()
+            )
+            raise RuntimeError(f"Mixture-of-LoRA checkpoint metadata mismatch for {self.site_id}: {details}")
 
     def route(self, x: torch.Tensor) -> RoutingDecision:
         logits = self.router(x.reshape(-1, x.shape[-1]))
@@ -771,6 +809,43 @@ class MixtureParallelLinearAdapter(nn.Module):
             keep_vars=keep_vars,
         )
         return destination
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Combine the base layer and routed TP shards for native
+        checkpointing."""
+
+        from megatron.core import parallel_state
+        from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+
+        sharded_state = self.to_wrap.sharded_state_dict(prefix, sharded_offsets, metadata)
+        adapter_state = self.mixture_lora.state_dict(prefix="", keep_vars=True)
+        axis_map = {
+            "experts.lora_A": 2 if self.mixture_lora.input_is_parallel else 1,
+            "experts.lora_B": 1,
+        }
+        if self.mixture_lora.input_is_parallel:
+            axis_map["router.weight"] = 1
+        dp_cp_group = (
+            metadata["dp_cp_group"]
+            if metadata is not None and metadata.get("dp_cp_group") is not None
+            else parallel_state.get_data_parallel_group(with_context_parallel=True)
+        )
+        sharded_state.update(
+            make_sharded_tensors_for_checkpoint(
+                adapter_state,
+                f"{prefix}mixture_lora.",
+                axis_map,
+                sharded_offsets,
+                tp_group=self.mixture_lora.tp_group,
+                dp_cp_group=dp_cp_group,
+            )
+        )
+        return sharded_state
 
 
 def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float):

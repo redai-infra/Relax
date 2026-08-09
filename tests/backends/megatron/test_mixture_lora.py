@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import copy
 import sys
 import types
 from dataclasses import dataclass, field
@@ -176,10 +177,45 @@ def test_mixture_lora_wrapper_keeps_base_state_keys_stable():
     assert set(state) == {
         "weight",
         "bias",
+        "mixture_lora._extra_state",
         "mixture_lora.experts.lora_A",
         "mixture_lora.experts.lora_B",
         "mixture_lora.router.weight",
     }
+
+
+def test_mixture_lora_state_restores_output_and_validates_metadata():
+    source = MixtureLoRAAdapter(
+        _config(),
+        "linear_qkv",
+        4,
+        5,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    target = MixtureLoRAAdapter(
+        _config(),
+        "linear_qkv",
+        4,
+        5,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        source.experts.lora_B.normal_(mean=0.0, std=0.2)
+    x = torch.randn(3, 2, 4)
+    expected = source(x)
+
+    state = copy.deepcopy(source.state_dict())
+    target.load_state_dict(state)
+
+    torch.testing.assert_close(target(x), expected)
+    mismatched_state = copy.deepcopy(state)
+    mismatched_state["_extra_state"]["top_k"] = 1
+    with pytest.raises(RuntimeError, match=r"top_k: expected 2, checkpoint has 1"):
+        target.load_state_dict(mismatched_state)
 
 
 @pytest.mark.parametrize(
@@ -648,6 +684,55 @@ def test_mixture_lora_peft_wraps_real_column_parallel_linear_when_available(tmp_
         assert all(parameter.requires_grad for parameter in transformed.linear_qkv.mixture_lora.parameters())
         assert all(parameter.grad is None for parameter in transformed.linear_qkv.to_wrap.parameters())
         assert torch.count_nonzero(transformed.linear_qkv.mixture_lora.router.weight.grad) > 0
+        sharded_state = transformed.linear_qkv.sharded_state_dict(
+            metadata={"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+        )
+        assert {
+            "mixture_lora._extra_state",
+            "mixture_lora.experts.lora_A",
+            "mixture_lora.experts.lora_B",
+            "mixture_lora.router.weight",
+        }.issubset(sharded_state)
+        assert sharded_state["mixture_lora.experts.lora_A"].global_shape == (3, 2, 4)
+        assert sharded_state["mixture_lora.experts.lora_B"].global_shape == (3, 5, 2)
+        assert sharded_state["mixture_lora.router.weight"].global_shape == (3, 4)
+
+        from megatron.core import dist_checkpointing
+
+        checkpoint_dir = tmp_path / "mixture_lora_dist_checkpoint"
+        checkpoint_dir.mkdir()
+        fixed_input = torch.randn(3, 1, 4)
+        expected_output = transformed.linear_qkv(fixed_input)[0].detach()
+        expected_loss = expected_output.square().mean()
+        expected_routing = transformed.linear_qkv.mixture_lora.route(fixed_input)
+        expected_parameters = {
+            name: parameter.detach().clone()
+            for name, parameter in transformed.linear_qkv.mixture_lora.named_parameters()
+        }
+        dist_checkpointing.save(sharded_state, str(checkpoint_dir))
+        with torch.no_grad():
+            transformed.linear_qkv.mixture_lora.experts.lora_A.zero_()
+            transformed.linear_qkv.mixture_lora.experts.lora_B.zero_()
+            transformed.linear_qkv.mixture_lora.router.weight.zero_()
+        load_template = transformed.linear_qkv.sharded_state_dict(
+            metadata={"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+        )
+        loaded_state = dist_checkpointing.load(load_template, str(checkpoint_dir))
+        mixture_state = {
+            key.removeprefix("mixture_lora."): value
+            for key, value in loaded_state.items()
+            if key.startswith("mixture_lora.")
+        }
+        transformed.linear_qkv.mixture_lora.load_state_dict(mixture_state)
+        restored_output = transformed.linear_qkv(fixed_input)[0]
+        restored_routing = transformed.linear_qkv.mixture_lora.route(fixed_input)
+        torch.testing.assert_close(restored_output, expected_output)
+        torch.testing.assert_close(restored_output.square().mean(), expected_loss)
+        torch.testing.assert_close(restored_routing.pre_topk_probs, expected_routing.pre_topk_probs)
+        torch.testing.assert_close(restored_routing.post_topk_weights, expected_routing.post_topk_weights)
+        assert torch.equal(restored_routing.topk_indices, expected_routing.topk_indices)
+        for name, parameter in transformed.linear_qkv.mixture_lora.named_parameters():
+            torch.testing.assert_close(parameter, expected_parameters[name])
     finally:
         parallel_state.destroy_model_parallel()
         torch.distributed.destroy_process_group()
