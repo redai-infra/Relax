@@ -34,6 +34,7 @@ from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
+    evaluation_step_for_rollout,
     is_preference_mode,
     is_sft_mode,
     sft_partition_id,
@@ -1192,7 +1193,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id + 1 if is_sft_mode(self.args) else rollout_id)
+        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here
@@ -1661,7 +1662,10 @@ class MegatronTrainRayActor(TrainRayActor):
         self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id, end_update_weight=True)
+        self._run_step_evaluation(
+            evaluation_step_for_rollout(self.args, rollout_id),
+            end_update_weight=True,
+        )
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -1744,7 +1748,10 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_only, actor_fwd_only = self._check_services_health()
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(rollout_id, end_update_weight=True)
+            self._run_step_evaluation(
+                evaluation_step_for_rollout(self.args, rollout_id),
+                end_update_weight=True,
+            )
             # On the final training step the rollout component has already
             # exited its main loop, so the eval just triggered above will not
             # be awaited anywhere. Block until it finishes; otherwise the

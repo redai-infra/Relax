@@ -5,7 +5,7 @@ configured."""
 
 from argparse import Namespace
 
-from relax.engine.sft.runtime import should_run_sft_eval, should_run_sft_predict
+from relax.engine.sft.runtime import evaluation_step_for_rollout, should_run_sft_eval, should_run_sft_predict
 
 
 def _mk_actor_args():
@@ -70,3 +70,13 @@ def test_should_run_sft_predict_uses_completed_step_boundaries():
     assert should_run_sft_predict(args, completed_steps=10) is True
     assert should_run_sft_predict(args, completed_steps=19) is False
     assert should_run_sft_predict(args, completed_steps=20) is True
+
+
+def test_evaluation_step_mapping_is_completed_for_sft_and_zero_based_for_rl():
+    args = _mk_actor_args()
+    assert evaluation_step_for_rollout(args, rollout_id=0) == 1
+    assert evaluation_step_for_rollout(args, rollout_id=9) == 10
+
+    args.loss_type = "policy_loss"
+    assert evaluation_step_for_rollout(args, rollout_id=0) == 0
+    assert evaluation_step_for_rollout(args, rollout_id=9) == 9

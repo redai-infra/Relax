@@ -176,3 +176,8 @@ def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
     if interval is None or interval <= 0:
         return False
     return completed_steps > 0 and completed_steps % interval == 0
+
+
+def evaluation_step_for_rollout(args: Namespace, rollout_id: int) -> int:
+    """Map a zero-based training rollout to the evaluation step namespace."""
+    return rollout_id + 1 if is_sft_mode(args) else rollout_id
