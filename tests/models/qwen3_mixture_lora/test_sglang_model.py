@@ -7,6 +7,7 @@ from torch import nn
 
 from relax.backends.megatron.mixture_lora import MixtureLoRAAdapter
 from relax.models.qwen3_mixture_lora.sglang.model import (
+    EntryClass,
     SGLangMixtureLoRA,
     attach_sglang_mixture_lora,
     load_sglang_mixture_lora_weights,
@@ -24,6 +25,10 @@ def _config():
         alpha=4.0,
         target_modules=("linear_qkv", "linear_proj"),
     )
+
+
+def test_external_entry_class_overrides_the_checkpoint_architecture():
+    assert EntryClass.__name__ == "Qwen3ForCausalLM"
 
 
 class _TupleLinear(nn.Module):

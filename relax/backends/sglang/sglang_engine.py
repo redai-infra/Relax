@@ -147,6 +147,20 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
+def _configure_external_model_environment(external_pkg: str, *, text_only: bool) -> str | None:
+    os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_pkg
+    if text_only:
+        os.environ.pop("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", None)
+        os.environ.pop("SGLANG_EXTERNAL_MM_MODEL_ARCH", None)
+        return None
+
+    os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = external_pkg
+    arch = _resolve_external_model_arch(external_pkg)
+    if arch:
+        os.environ["SGLANG_EXTERNAL_MM_MODEL_ARCH"] = arch
+    return arch
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
@@ -471,17 +485,18 @@ class SGLangEngine(RayActor):
         # Must be set before launch_server_process() spawns child process
         # (multiprocessing start_method='spawn'), because the child inherits
         # the parent's os.environ at spawn time.
+        mixture_lora_config = build_mixture_lora_config(self.args)
         external_pkg = configure_mixture_lora_external_model(
-            build_mixture_lora_config(self.args),
+            mixture_lora_config,
             getattr(self.args, "sglang_external_model_package", None),
         )
         if external_pkg:
-            os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_pkg
-            os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = external_pkg
-            arch = _resolve_external_model_arch(external_pkg)
-            if arch:
-                os.environ["SGLANG_EXTERNAL_MM_MODEL_ARCH"] = arch
-            logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg}, SGLANG_EXTERNAL_MM_MODEL_ARCH={arch}")
+            is_mixture_lora = mixture_lora_config is not None
+            arch = _configure_external_model_environment(external_pkg, text_only=is_mixture_lora)
+            if not is_mixture_lora:
+                logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg}, SGLANG_EXTERNAL_MM_MODEL_ARCH={arch}")
+            else:
+                logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg} for Mixture-of-LoRA")
 
         # Warm the OS page cache for this engine's HF checkpoint before the SGLang
         # subprocess mmaps the safetensors. Applies uniformly to rollout / genrm /

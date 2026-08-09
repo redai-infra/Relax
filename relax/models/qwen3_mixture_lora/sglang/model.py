@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.models.qwen3 import Qwen3ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM as SGLangQwen3ForCausalLM
 from torch import nn
 from torch.nn import functional as F
 
@@ -154,7 +154,9 @@ def load_sglang_mixture_lora_weights(
     return loaded_names
 
 
-class Qwen3MixtureLoRAForCausalLM(Qwen3ForCausalLM):
+# SGLang registers external models by the checkpoint architecture name. Keeping
+# this name replaces its built-in Qwen3 entry while preserving checkpoint metadata.
+class Qwen3ForCausalLM(SGLangQwen3ForCausalLM):
     """Qwen3 external model that routes LoRA experts at attention
     projections."""
 
@@ -213,4 +215,4 @@ class Qwen3MixtureLoRAForCausalLM(Qwen3ForCausalLM):
         load_sglang_mixture_lora_weights(self, mixture_weights)
 
 
-EntryClass = Qwen3MixtureLoRAForCausalLM
+EntryClass = Qwen3ForCausalLM

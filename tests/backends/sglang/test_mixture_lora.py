@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from relax.backends.sglang.sglang_engine import _configure_external_model_environment
 from relax.utils.mixture_lora import (
     MixtureLoraConfig,
     configure_mixture_lora_external_model,
@@ -53,3 +54,18 @@ def test_single_lora_does_not_enable_external_mixture_model(monkeypatch):
 def test_mixture_lora_rejects_conflicting_external_package():
     with pytest.raises(ValueError, match="requires the Qwen3 external model package"):
         configure_mixture_lora_external_model(_config(), "custom.other.package")
+
+
+def test_text_external_model_clears_multimodal_environment(monkeypatch):
+    monkeypatch.setenv("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", "stale.processor")
+    monkeypatch.setenv("SGLANG_EXTERNAL_MM_MODEL_ARCH", "StaleArchitecture")
+
+    arch = _configure_external_model_environment(
+        "relax.models.qwen3_mixture_lora.sglang",
+        text_only=True,
+    )
+
+    assert arch is None
+    assert os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] == "relax.models.qwen3_mixture_lora.sglang"
+    assert "SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE" not in os.environ
+    assert "SGLANG_EXTERNAL_MM_MODEL_ARCH" not in os.environ
