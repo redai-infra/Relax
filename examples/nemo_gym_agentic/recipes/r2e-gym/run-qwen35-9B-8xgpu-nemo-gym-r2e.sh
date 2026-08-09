@@ -29,6 +29,7 @@ source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 : "${RUNTIME_ENV_JSON:?RUNTIME_ENV_JSON must be set by a Relax entrypoint}"
 test -s "${MODEL_DIR}/Qwen3.5-9B/config.json"
 test -s "${MODEL_DIR}/Qwen3.5-9B/preprocessor_config.json"
+DATA_LIMIT="$(wc -l < "${NEMO_GYM_SOURCE_DATA}")"
 
 RUNTIME_ENV_JSON="$(
    jq -c --arg relax_root "${RELAX_ROOT}" '
@@ -65,20 +66,22 @@ ROLLOUT_ARGS=(
      "NEMO_GYM_CONFIG=r2e-gym-v1"
      "NEMO_GYM_MODEL=model"
      "NEMO_GYM_INTERRUPT_POLICY=protected"
-     "NEMO_GYM_DEADLINE_S=7200"
+     "NEMO_GYM_DEADLINE_S=1200"
      "NEMO_GYM_LEASE_S=120"
-   --agent-timeout 7260
+   --agent-timeout 1260
    --agentic-tool-call-parser qwen3_coder
-   --agentic-prepare-pool-size 1
+   --agentic-prepare-pool-size 4
 
    --num-rollout 32
-   --rollout-batch-size 4
+   --rollout-batch-size 8
    --n-samples-per-prompt 8
-   --rollout-max-prompt-len 8191
-   --rollout-max-response-len 24576
-   --rollout-max-context-len 32768
+   --rollout-max-prompt-len 8192
+   --rollout-max-response-len 43008
+   --rollout-max-context-len 51200
    --rollout-temperature 0.7
-   --global-batch-size 32
+   --global-batch-size 64
+
+   # --debug-rollout-only
 )
 
 PERF_ARGS=(
@@ -89,7 +92,6 @@ PERF_ARGS=(
    --calculate-per-token-loss
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
-   --micro-batch-size 1
 
    --recompute-granularity full
    --recompute-method uniform
@@ -97,8 +99,7 @@ PERF_ARGS=(
    --no-rope-fusion
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
-   --log-probs-max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 12800
    --log-probs-chunk-size 512
 )
 
@@ -148,7 +149,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- bash "${RELAX_ROOT}/examples/nemo_gym_agentic/scripts/run_training.sh" \
-   "${GATEWAY_URL}" "${NEMO_GYM_SOURCE_DATA}" "${PROMPT_SET}" 32 \
+   "${GATEWAY_URL}" "${NEMO_GYM_SOURCE_DATA}" "${PROMPT_SET}" "${DATA_LIMIT}" \
    --resource '{"actor":[1,8],"rollout":[1,8]}' \
    --max-staleness 0 \
    --num-data-storage-units 1 \

@@ -148,6 +148,7 @@ class GatewayRegistry:
         validate_callback_url(
             request.model_endpoint.base_url,
             self.settings.callback_allowed_hosts,
+            allowed_networks=self.settings.callback_allowed_networks,
             require_tls=self.settings.callback_proxy is not None,
         )
         fingerprint = self._payload_fingerprint(payload)

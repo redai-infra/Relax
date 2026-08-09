@@ -248,6 +248,21 @@ find "${R2E_DATA_DIR}/sif" -maxdepth 1 -name '*.sif' -type f -size +0c -ls
 首次只准备 1 题。一题 golden reward=1 后再提高 `R2E_GYM_LIMIT`；N 题通常意味着 N 个独立镜像，
 磁盘开销会线性增长。
 
+已有共享 SIF 时不需要复制或创建逐文件软链。启动脚本支持独立目录和文件名前缀，例如：
+
+```bash
+export R2E_GYM_SHARED_SIF_DIR="/shared/r2e-gym/sif"
+export R2E_GYM_SHARED_SIF_PREFIX="r2egym_"
+```
+
+该目录中的 `r2egym_<repo>_final_<commit>.sif` 会按 prefix-aware formatter 直接解析。remote
+launcher 会把外部 SIF 目录只读挂载到容器内的相同绝对路径。
+
+remote launcher 的 `--sif-dir` 必须对 Docker daemon 所在宿主可见。Docker-in-Docker 场景中，
+只在当前开发容器内创建的 FUSE mount 无法被外层 Docker daemon bind mount；应先在外层宿主挂载
+共享目录，或改用直接运行在该 mount namespace 内的 local launcher。脚本会先用临时容器做可见性
+检查，失败时不会删除或替换已有 NeMo Gym 容器。
+
 ## 4. Golden 模式启动 NeMo Gym
 
 Golden 模式不调用模型。它从任务 metadata 重建 reference patch，在 SIF 中应用并运行 evaluator，
@@ -257,6 +272,8 @@ Golden 模式不调用模型。它从任务 metadata 重建 reference patch，�
 bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_remote.sh \
   --gym-host "${GYM_HOST}" \
   --data-dir "${R2E_DATA_DIR}" \
+  --sif-dir "${R2E_GYM_SHARED_SIF_DIR}" \
+  --sif-prefix "${R2E_GYM_SHARED_SIF_PREFIX}" \
   --mode golden \
   --image "${NEMO_GYM_IMAGE}" \
   --repo-dir "${REPO_ROOT}" \
@@ -320,6 +337,8 @@ R2E-Gym golden verification passed: ... reward=1.0
 bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_remote.sh \
   --gym-host "${GYM_HOST}" \
   --data-dir "${R2E_DATA_DIR}" \
+  --sif-dir "${R2E_GYM_SHARED_SIF_DIR}" \
+  --sif-prefix "${R2E_GYM_SHARED_SIF_PREFIX}" \
   --mode train \
   --callback-host "${RELAX_HOST}" \
   --image "${NEMO_GYM_IMAGE}" \
@@ -387,6 +406,8 @@ local launcher 必须在 Ray head 容器中。它只需要数据目录、运行�
 ```bash
 bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh \
   --data-dir "${R2E_DATA_DIR}" \
+  --sif-dir "${R2E_GYM_SHARED_SIF_DIR}" \
+  --sif-prefix "${R2E_GYM_SHARED_SIF_PREFIX}" \
   --mode train \
   --max-concurrency 1 \
   --proxy "${https_proxy}" \

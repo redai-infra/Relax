@@ -186,7 +186,10 @@ def test_r2e_recipe_uses_configured_ray_and_apptainer() -> None:
     submit_script = (recipe_dir / "submit_r2e_gym.sh").read_text()
     swe_agents_patch = (EXAMPLE_DIR / "service" / "patches" / "swe_agents_r2e.patch").read_text()
     assert '+ray_head_node_address="${GYM_RAY_ADDRESS}"' in start_script
-    assert "container_formatter='${R2E_GYM_SIF_DIR}/{instance_id}.sif'" in start_script
+    assert "container_formatter='${R2E_GYM_SIF_DIR}/${R2E_GYM_SIF_PREFIX}{instance_id}.sif'" in start_script
+    assert 'R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-${R2E_DATA_DIR}/sif}"' in start_script
+    assert 'R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"' in start_script
+    assert 'find -L "${R2E_GYM_SIF_DIR}"' in start_script
     assert "ray start" not in start_script
     assert "ray stop" not in start_script
     assert "pkill" not in start_script
@@ -205,15 +208,25 @@ def test_r2e_recipe_uses_configured_ray_and_apptainer() -> None:
     assert 'psutil.net_connections(kind="tcp")' in start_script
     assert "process.terminate()" in start_script
     assert "process.kill()" in start_script
+    assert "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)" in start_script
+    assert "for _ in range(20):" in start_script
     assert "/opt/nemo-gym/.venv/bin/ray start" in remote_script
     assert '--env RAY_CLI="/opt/nemo-gym/.venv/bin/ray"' in remote_script
     assert '--env R2E_GYM_CLUSTER_PYTHON="/opt/nemo-gym/.venv/bin/python"' in remote_script
+    assert '--env R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR}"' in remote_script
+    assert '--env R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX}"' in remote_script
+    assert 'sif_mount_args+=(--volume "${R2E_GYM_SIF_DIR}:${R2E_GYM_SIF_DIR}:ro")' in remote_script
+    assert '--sif-dir "${R2E_GYM_SIF_DIR}"' in remote_script
+    assert '--sif-prefix "${R2E_GYM_SIF_PREFIX}"' in remote_script
+    assert "Docker daemon cannot read the configured Relax checkout, dataset, or SIF directory." in remote_script
+    assert remote_script.index("docker run --rm") < remote_script.index('docker rm -f "${NEMO_GYM_CONTAINER}"')
     assert 'export RAY_ADDRESS="${GYM_HOST}:6381"' in remote_script
     assert (
         "exec bash /opt/relax-integration/examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh"
         in remote_script
     )
     assert 'apptainer build "${local_sif}" "docker://${docker_image}"' in prepare_script
+    assert 'sif_path="${SIF_DIR}/${R2E_GYM_SIF_PREFIX}${sif_name}"' in prepare_script
     assert 'PREPARE_LOCK_DIR="${R2E_GYM_OUTPUT_DIR}/.prepare_r2e_gym.lockdir"' in prepare_script
     assert 'shared_partial="${sif_path}.partial.${BASHPID}.${RANDOM}"' in prepare_script
     assert "Usage: $0 <ray-head-ip> [golden|train]" in submit_script

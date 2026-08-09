@@ -81,6 +81,59 @@ def test_settings_reject_wildcard_callback_hosts():
         GatewaySettings.from_env(environ)
 
 
+def test_callback_url_accepts_ip_in_allowlisted_network():
+    environ = _environ()
+    environ["NEMO_GYM_CALLBACK_ALLOWED_HOSTS"] = ""
+    environ["NEMO_GYM_CALLBACK_ALLOWED_NETWORKS"] = "192.0.2.0/24,198.51.100.0/24"
+    settings = GatewaySettings.from_env(environ)
+
+    validate_callback_url(
+        "http://192.0.2.148:8000/agentic_api",
+        settings.callback_allowed_hosts,
+        allowed_networks=settings.callback_allowed_networks,
+    )
+    with pytest.raises(GatewayConfigError, match="allowlist"):
+        validate_callback_url(
+            "http://203.0.113.1:8000/agentic_api",
+            settings.callback_allowed_hosts,
+            allowed_networks=settings.callback_allowed_networks,
+        )
+
+
+def test_callback_url_keeps_exact_ip_host_compatibility():
+    validate_callback_url("http://192.0.2.148:8000/agentic_api", frozenset({"192.0.2.148"}))
+
+
+def test_callback_url_accepts_ipv6_in_allowlisted_network():
+    environ = _environ()
+    environ["NEMO_GYM_CALLBACK_ALLOWED_HOSTS"] = ""
+    environ["NEMO_GYM_CALLBACK_ALLOWED_NETWORKS"] = "fd00::/8"
+    settings = GatewaySettings.from_env(environ)
+
+    validate_callback_url(
+        "http://[fd12::34]:8000/agentic_api",
+        settings.callback_allowed_hosts,
+        allowed_networks=settings.callback_allowed_networks,
+    )
+
+
+def test_settings_reject_invalid_callback_network():
+    environ = _environ()
+    environ["NEMO_GYM_CALLBACK_ALLOWED_NETWORKS"] = "192.0.2.3/24"
+
+    with pytest.raises(GatewayConfigError, match="valid CIDR"):
+        GatewaySettings.from_env(environ)
+
+
+@pytest.mark.parametrize("network", ["0.0.0.0/0", "::/0"])
+def test_settings_reject_default_route_callback_network(network):
+    environ = _environ()
+    environ["NEMO_GYM_CALLBACK_ALLOWED_NETWORKS"] = network
+
+    with pytest.raises(GatewayConfigError, match="default-route"):
+        GatewaySettings.from_env(environ)
+
+
 def test_callback_url_requires_exact_allowlisted_host():
     allowed = frozenset({"relax-head"})
 
