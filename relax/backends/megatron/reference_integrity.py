@@ -19,6 +19,11 @@ REFERENCE_IDENTITY_FILENAME = "relax_dpo_reference.json"
 REFERENCE_LOADER_MODE = "hf_bridge_model_only_v1"
 _GIT_COMMIT_SHA256_RE = re.compile(r"^[0-9a-f]{40}$")
 _HF_ETAG_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_WEIGHT_INDEXES = (
+    ("model.safetensors.index.json", ".safetensors"),
+    ("pytorch_model.bin.index.json", ".bin"),
+)
+_SINGLE_WEIGHT_NAMES = ("model.safetensors", "pytorch_model.bin")
 
 
 def _file_matches_hf_etag(path: Path, etag: str) -> bool:
@@ -30,6 +35,38 @@ def _file_matches_hf_etag(path: Path, etag: str) -> bool:
         while chunk := file.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest() == etag
+
+
+def _validate_reference_weight_files(checkpoint: Path) -> None:
+    found_weights = any((checkpoint / filename).is_file() for filename in _SINGLE_WEIGHT_NAMES)
+    for index_name, shard_suffix in _WEIGHT_INDEXES:
+        index_path = checkpoint / index_name
+        if not index_path.is_file():
+            continue
+        found_weights = True
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            weight_map = payload["weight_map"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"DPO reference weight index is invalid: {index_name!r}") from exc
+        if not isinstance(weight_map, Mapping) or not weight_map:
+            raise RuntimeError(f"DPO reference weight index has an empty weight_map: {index_name!r}")
+        shard_names = set()
+        for filename in weight_map.values():
+            if not isinstance(filename, str) or not filename:
+                raise RuntimeError(f"DPO reference weight index contains an invalid shard name: {index_name!r}")
+            shard_names.add(filename)
+        for filename in shard_names:
+            relative_path = Path(filename)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise RuntimeError(f"DPO reference weight index contains an unsafe shard path: {filename!r}")
+            if relative_path.suffix != shard_suffix:
+                raise RuntimeError(f"DPO reference weight index contains an invalid shard suffix: {filename!r}")
+            if not (checkpoint / relative_path).is_file():
+                raise RuntimeError(f"DPO reference weight index points to a missing shard: {filename!r}")
+    if not found_weights:
+        supported = ", ".join((*_SINGLE_WEIGHT_NAMES, *(name for name, _suffix in _WEIGHT_INDEXES)))
+        raise RuntimeError(f"DPO reference has no supported model weights or index; expected one of: {supported}")
 
 
 def _validate_local_download_metadata(checkpoint: Path, revision: str) -> None:
@@ -101,6 +138,7 @@ def resolve_dpo_reference_checkpoint(repository: str, revision: str, local_check
             f"repository={repository!r}, revision={revision!r}, path={checkpoint}"
         )
     try:
+        _validate_reference_weight_files(checkpoint)
         _validate_local_download_metadata(checkpoint, revision)
     except RuntimeError as exc:
         raise RuntimeError(

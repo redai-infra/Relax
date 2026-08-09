@@ -164,6 +164,7 @@ def test_resolve_dpo_reference_checkpoint_rejects_missing_pinned_local_metadata(
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
     monkeypatch.setitem(
         sys.modules,
         "huggingface_hub",
@@ -179,6 +180,8 @@ def test_resolve_dpo_reference_checkpoint_rejects_mismatched_file_metadata(monke
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
     _write_local_download_metadata(checkpoint, "config.json", "c" * 40)
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    _write_local_download_metadata(checkpoint, "model.safetensors", revision)
 
     monkeypatch.setitem(
         sys.modules,
@@ -209,6 +212,67 @@ def test_resolve_dpo_reference_checkpoint_rejects_replaced_file_with_restored_mt
         types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
     )
     with pytest.raises(RuntimeError, match="contents do not match its Hugging Face ETag"):
+        resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
+
+
+def test_resolve_dpo_reference_checkpoint_rejects_snapshot_without_supported_weights(monkeypatch, tmp_path):
+    revision = "a" * 40
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    _write_local_download_metadata(checkpoint, "config.json", revision)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
+    )
+    with pytest.raises(RuntimeError, match="no supported model weights or index"):
+        resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
+
+
+def test_resolve_dpo_reference_checkpoint_accepts_complete_safetensors_index(monkeypatch, tmp_path):
+    revision = "a" * 40
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    index_name = "model.safetensors.index.json"
+    shard_names = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+    weight_map = {f"layer.{index}.weight": shard for index, shard in enumerate(shard_names)}
+    (checkpoint / index_name).write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+    for shard_name in shard_names:
+        (checkpoint / shard_name).write_bytes(shard_name.encode())
+    for filename in ("config.json", index_name, *shard_names):
+        _write_local_download_metadata(checkpoint, filename, revision)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
+    )
+    assert resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint)) == str(checkpoint.resolve())
+
+
+def test_resolve_dpo_reference_checkpoint_rejects_missing_indexed_shard_and_metadata(monkeypatch, tmp_path):
+    revision = "a" * 40
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    index_name = "model.safetensors.index.json"
+    shard_name = "model-00001-of-00001.safetensors"
+    (checkpoint / index_name).write_text(json.dumps({"weight_map": {"model.weight": shard_name}}), encoding="utf-8")
+    (checkpoint / shard_name).write_bytes(b"weights")
+    for filename in ("config.json", index_name, shard_name):
+        _write_local_download_metadata(checkpoint, filename, revision)
+    (checkpoint / shard_name).unlink()
+    (checkpoint / ".cache" / "huggingface" / "download" / f"{shard_name}.metadata").unlink()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(checkpoint)),
+    )
+    with pytest.raises(RuntimeError, match="weight index points to a missing shard"):
         resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
 
 
