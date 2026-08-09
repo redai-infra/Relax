@@ -258,8 +258,8 @@ def test_model_provider_uses_mixture_lora_for_multiple_experts(monkeypatch):
     calls = []
     mixture_module = types.ModuleType("relax.backends.megatron.mixture_lora")
 
-    def build_mixture_lora_peft(received_config, dropout):
-        calls.append((received_config, dropout))
+    def build_mixture_lora_peft(received_config, dropout, vp_stage=None):
+        calls.append((received_config, dropout, vp_stage))
         return lambda received_model, training: received_model
 
     mixture_module.build_mixture_lora_peft = build_mixture_lora_peft
@@ -274,7 +274,7 @@ def test_model_provider_uses_mixture_lora_for_multiple_experts(monkeypatch):
     provider = module.wrap_model_provider_with_lora(lambda **kwargs: model, args)
 
     assert provider() is model
-    assert calls == [(config, 0.1)]
+    assert calls == [(config, 0.1, None)]
 
 
 def test_model_provider_keeps_single_expert_on_existing_lora_path(monkeypatch):

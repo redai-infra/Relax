@@ -76,7 +76,7 @@ Prompt、padding 和 dummy token 不参与 balance loss 与路由指标。静态
 
 ## Checkpoint
 
-Expert 和 router 是 Megatron 原生 distributed checkpoint 中的普通模型参数。Optimizer、scheduler、iteration 和 RNG 状态沿用同一个 checkpoint 恢复。Mixture 模式不会额外导出一份 HF PEFT adapter。
+Expert 和 router 是 Megatron 原生 distributed checkpoint 中的普通模型参数。Optimizer、scheduler、iteration 和 RNG 状态沿用同一个 checkpoint 恢复。Mixture 模式不会额外导出一份 HF PEFT adapter。随附的 recipe 启用了 Megatron 的 fully reshardable distributed optimizer 格式，因此保持 TP 和 PP 不变时，可以修改 DP size 后继续训练。
 
 恢复训练时使用同一 recipe，并让 `--load` 和 `--save` 指向已有输出目录。加载 tensor 前会检查 checkpoint 中的 expert 数、rank、Top-K、temperature、coefficient、alpha、target module、dtype 和 site 维度是否与当前配置一致。
 

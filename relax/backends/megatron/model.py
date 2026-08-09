@@ -119,6 +119,10 @@ def _reduce_mixture_lora_routing_metrics(
         )
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         torch.distributed.all_reduce(packed, group=mpu.get_pipeline_model_parallel_group())
+    # Routed sites record statistics on TP rank 0 only. Replicate the reduced
+    # step metrics so logging remains correct regardless of the selected rank.
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        torch.distributed.all_reduce(packed, group=mpu.get_tensor_model_parallel_group())
     return mixture_lora_metrics_from_packed_records(
         packed,
         site_ids,

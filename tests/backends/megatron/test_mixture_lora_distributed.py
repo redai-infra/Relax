@@ -1,11 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 
 from relax.backends.megatron.mixture_lora import (
     MixtureLoRAAdapter,
@@ -148,6 +150,291 @@ def _distributed_routing_metrics_worker(rank: int, world_size: int, init_method:
 def test_routing_metrics_reduce_across_two_real_processes(tmp_path):
     init_method = f"file://{tmp_path / 'mixture-lora-gloo-init'}"
     mp.spawn(_distributed_routing_metrics_worker, args=(2, init_method), nprocs=2, join=True)
+
+
+def _tensor_parallel_routing_metrics_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    from megatron.core import parallel_state
+
+    from relax.backends.megatron.model import _reduce_mixture_lora_routing_metrics
+
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size=world_size)
+    try:
+        site_ids = ("layers.0.linear_qkv",)
+        contexts = (
+            [_routing_context(site_ids[0], torch.ones(1, 2, dtype=torch.bool), num_sites=1, objective_scale=1.0)]
+            if rank == 0
+            else []
+        )
+        metrics = _reduce_mixture_lora_routing_metrics(
+            SimpleNamespace(calculate_per_token_loss=False),
+            contexts,
+            (site_ids, 3, 2),
+            torch.device("cpu"),
+        )
+        _assert_uniform_metrics(metrics, f"molora/{site_ids[0]}")
+        torch.testing.assert_close(metrics["molora/aux_loss"], torch.tensor(0.01, dtype=torch.float64))
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+
+
+def test_routing_metrics_are_available_on_every_tensor_parallel_rank(tmp_path):
+    init_method = f"file://{tmp_path / 'mixture-lora-tp-metrics-gloo-init'}"
+    mp.spawn(_tensor_parallel_routing_metrics_worker, args=(2, init_method), nprocs=2, join=True)
+
+
+def _new_distributed_adapter(config: MixtureLoraConfig, site_id: str) -> MixtureLoRAAdapter:
+    return MixtureLoRAAdapter(
+        config,
+        site_id,
+        4,
+        4,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+
+def _set_distributed_adapter_weights(adapter: MixtureLoRAAdapter, seed: int) -> None:
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        adapter.experts.lora_A.copy_(torch.randn(adapter.experts.lora_A.shape, generator=generator))
+        adapter.experts.lora_B.copy_(torch.randn(adapter.experts.lora_B.shape, generator=generator))
+        adapter.router.weight.copy_(torch.randn(adapter.router.weight.shape, generator=generator))
+
+
+def _distributed_microbatch(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(6100 + rank)
+    x = torch.randn(3, 1, 4, generator=generator)
+    mask = torch.tensor([[1, 1, rank == 0]], dtype=torch.bool)
+    return x, mask
+
+
+def _new_routing_context(
+    site_ids: tuple[str, ...],
+    mask: torch.Tensor,
+    *,
+    microbatch_id: int,
+    main_loss_backward_scale: float,
+) -> MixtureLoRARoutingContext:
+    return MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=microbatch_id,
+        response_mask=mask,
+        num_microbatches=1,
+        num_sites=len(site_ids),
+        num_samples=mask.shape[0],
+        calculate_per_token_loss=False,
+        objective_scale=1.0,
+        main_loss_backward_scale=torch.tensor([main_loss_backward_scale]),
+    )
+
+
+def _routing_metrics_from_contexts(
+    contexts: list[MixtureLoRARoutingContext],
+    site_ids: tuple[str, ...],
+    config: MixtureLoraConfig,
+    *,
+    data_parallel_world_size: int,
+) -> dict[str, torch.Tensor]:
+    packed = pack_mixture_lora_routing_records(
+        contexts,
+        site_ids,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        device=torch.device("cpu"),
+    )
+    return mixture_lora_metrics_from_packed_records(
+        packed,
+        site_ids,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        calculate_per_token_loss=False,
+        data_parallel_world_size_with_cp=data_parallel_world_size,
+    )
+
+
+def _assert_metric_dict_close(actual: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]) -> None:
+    assert actual.keys() == expected.keys()
+    for name in actual:
+        torch.testing.assert_close(actual[name], expected[name], atol=1e-8, rtol=1e-8, msg=name)
+
+
+def _data_parallel_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        config = _config()
+        site_ids = ("layers.0.linear_qkv",)
+        adapter = _new_distributed_adapter(config, site_ids[0])
+        _set_distributed_adapter_weights(adapter, 6200)
+        distributed_adapter = DistributedDataParallel(adapter)
+
+        local_x, local_mask = _distributed_microbatch(rank)
+        local_context = _new_routing_context(
+            site_ids,
+            local_mask,
+            microbatch_id=rank,
+            main_loss_backward_scale=1.0,
+        )
+        with activate_mixture_lora_routing_context(local_context):
+            local_output = distributed_adapter(local_x)
+        local_output.square().mean().backward()
+
+        reference = _new_distributed_adapter(config, site_ids[0])
+        _set_distributed_adapter_weights(reference, 6200)
+        reference_contexts = []
+        for microbatch_rank in range(world_size):
+            reference_x, reference_mask = _distributed_microbatch(microbatch_rank)
+            reference_context = _new_routing_context(
+                site_ids,
+                reference_mask,
+                microbatch_id=microbatch_rank,
+                main_loss_backward_scale=1.0 / world_size,
+            )
+            with activate_mixture_lora_routing_context(reference_context):
+                reference_output = reference(reference_x)
+            (reference_output.square().mean() / world_size).backward()
+            reference_contexts.append(reference_context)
+
+        for distributed_param, reference_param in zip(
+            distributed_adapter.module.parameters(), reference.parameters(), strict=True
+        ):
+            torch.testing.assert_close(distributed_param.grad, reference_param.grad, atol=2e-6, rtol=2e-6)
+
+        packed = pack_mixture_lora_routing_records(
+            [local_context],
+            site_ids,
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+            device=torch.device("cpu"),
+        )
+        dist.all_reduce(packed)
+        actual_metrics = mixture_lora_metrics_from_packed_records(
+            packed,
+            site_ids,
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+            calculate_per_token_loss=False,
+            data_parallel_world_size_with_cp=world_size,
+        )
+        expected_metrics = _routing_metrics_from_contexts(
+            reference_contexts,
+            site_ids,
+            config,
+            data_parallel_world_size=world_size,
+        )
+        _assert_metric_dict_close(actual_metrics, expected_metrics)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_data_parallel_gradients_and_metrics_match_microbatch_reference(tmp_path):
+    init_method = f"file://{tmp_path / 'mixture-lora-dp-gloo-init'}"
+    mp.spawn(_data_parallel_worker, args=(2, init_method), nprocs=2, join=True)
+
+
+def _pipeline_parallel_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        config = _config()
+        site_ids = ("layers.0.linear_qkv", "layers.1.linear_qkv")
+        x, mask = _distributed_microbatch(0)
+
+        reference_adapters = [_new_distributed_adapter(config, site_id) for site_id in site_ids]
+        for stage, reference_adapter in enumerate(reference_adapters):
+            _set_distributed_adapter_weights(reference_adapter, 6300 + stage)
+        reference_context = _new_routing_context(
+            site_ids,
+            mask,
+            microbatch_id=0,
+            main_loss_backward_scale=1.0,
+        )
+        with activate_mixture_lora_routing_context(reference_context):
+            reference_hidden = reference_adapters[0](x)
+            reference_output = reference_adapters[1](reference_hidden)
+        reference_output.square().mean().backward()
+
+        local_adapter = _new_distributed_adapter(config, site_ids[rank])
+        _set_distributed_adapter_weights(local_adapter, 6300 + rank)
+        local_context = _new_routing_context(
+            site_ids,
+            mask,
+            microbatch_id=0,
+            main_loss_backward_scale=1.0,
+        )
+        if rank == 0:
+            with activate_mixture_lora_routing_context(local_context):
+                local_hidden = local_adapter(x)
+            torch.testing.assert_close(local_hidden, reference_hidden.detach())
+            dist.send(local_hidden.detach(), dst=1)
+            hidden_gradient = torch.empty_like(local_hidden)
+            dist.recv(hidden_gradient, src=1)
+            local_hidden.backward(hidden_gradient)
+        else:
+            local_hidden = torch.empty_like(reference_hidden)
+            dist.recv(local_hidden, src=0)
+            local_hidden.requires_grad_(True)
+            with activate_mixture_lora_routing_context(local_context):
+                local_output = local_adapter(local_hidden)
+            torch.testing.assert_close(local_output, reference_output.detach())
+            local_output.square().mean().backward()
+            dist.send(local_hidden.grad, dst=0)
+
+        for local_param, reference_param in zip(
+            local_adapter.parameters(), reference_adapters[rank].parameters(), strict=True
+        ):
+            torch.testing.assert_close(local_param.grad, reference_param.grad, atol=2e-6, rtol=2e-6)
+        assert local_adapter.router.weight.grad.norm() > 0
+
+        packed = pack_mixture_lora_routing_records(
+            [local_context],
+            site_ids,
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+            device=torch.device("cpu"),
+        )
+        dist.all_reduce(packed)
+        actual_metrics = mixture_lora_metrics_from_packed_records(
+            packed,
+            site_ids,
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+            calculate_per_token_loss=False,
+            data_parallel_world_size_with_cp=1,
+        )
+        expected_metrics = _routing_metrics_from_contexts(
+            [reference_context],
+            site_ids,
+            config,
+            data_parallel_world_size=1,
+        )
+        _assert_metric_dict_close(actual_metrics, expected_metrics)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_pipeline_parallel_stage_gradients_and_metrics_match_reference(tmp_path):
+    init_method = f"file://{tmp_path / 'mixture-lora-pp-gloo-init'}"
+    mp.spawn(_pipeline_parallel_worker, args=(2, init_method), nprocs=2, join=True)
 
 
 def _context_parallel_balance_worker(rank: int, world_size: int, init_method: str) -> None:

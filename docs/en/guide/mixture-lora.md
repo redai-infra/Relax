@@ -76,7 +76,7 @@ If an update fails, Relax resumes generation, keeps the previous weight version,
 
 ## Checkpoints
 
-Expert and router tensors are ordinary model parameters in the native Megatron distributed checkpoint. The same checkpoint also restores optimizer, scheduler, iteration, and RNG state. Mixture mode does not create a separate HF PEFT adapter export.
+Expert and router tensors are ordinary model parameters in the native Megatron distributed checkpoint. The same checkpoint also restores optimizer, scheduler, iteration, and RNG state. Mixture mode does not create a separate HF PEFT adapter export. The provided recipe enables Megatron's fully reshardable distributed-optimizer format so a saved run can be resumed with a different data-parallel size while keeping TP and PP unchanged.
 
 Resume by launching the same recipe with `--load` and `--save` pointing to the existing output directory. The saved Mixture metadata is checked against the current expert count, rank, Top-K, temperature, coefficient, alpha, target modules, dtype, and site dimensions before tensors are loaded.
 

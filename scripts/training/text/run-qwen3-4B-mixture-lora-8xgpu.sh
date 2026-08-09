@@ -30,6 +30,7 @@ CKPT_ARGS=(
     --load "${OUTPUT_DIR}"
     --save "${OUTPUT_DIR}"
     --save-interval "${SAVE_INTERVAL:-50}"
+    --dist-ckpt-optim-fully-reshardable
 )
 
 LORA_ARGS=(
