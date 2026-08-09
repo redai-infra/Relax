@@ -11,6 +11,26 @@ from typing import Any, Sequence
 PREFERENCE_PROBE_PAIR_COUNT = 512
 
 
+def preference_eval_chunk_sizes(pair_count: int, global_batch_size: int) -> list[int]:
+    """Split every real probe pair into capacity-bounded eval chunks."""
+    if pair_count <= 0 or global_batch_size <= 0:
+        raise ValueError("preference eval pair count and global batch size must be positive")
+    full_chunks, remainder = divmod(pair_count, global_batch_size)
+    return [global_batch_size] * full_chunks + ([remainder] if remainder else [])
+
+
+def preference_eval_local_batch_sizes(pair_count: int, global_batch_size: int, dp_size: int) -> list[int]:
+    if dp_size <= 0:
+        raise ValueError("preference eval data-parallel size must be positive")
+    chunk_sizes = preference_eval_chunk_sizes(pair_count, global_batch_size)
+    invalid = [size for size in chunk_sizes if size % dp_size != 0]
+    if invalid:
+        raise ValueError(
+            f"preference eval chunk sizes must be divisible by data-parallel size: chunks={invalid}, dp={dp_size}"
+        )
+    return [size // dp_size for size in chunk_sizes]
+
+
 def encoded_pair_id(pair_id: str) -> int:
     return int.from_bytes(hashlib.sha256(pair_id.encode()).digest()[:8], "big") >> 1
 
@@ -178,6 +198,8 @@ __all__ = [
     "canonical_sha256",
     "encoded_pair_id",
     "paired_bootstrap",
+    "preference_eval_chunk_sizes",
+    "preference_eval_local_batch_sizes",
     "record_probe_contract",
     "write_pair_artifacts",
 ]

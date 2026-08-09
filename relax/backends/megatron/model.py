@@ -663,6 +663,19 @@ def force_param_sync(model_chunks: Sequence[DDP]) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _restore_micro_batch_output_order(values: list, micro_batch_indices: list[list[int]]) -> list:
+    """Restore per-sample outputs from packed micro-batch order."""
+    origin_indices = sum(micro_batch_indices, [])
+    if len(values) != len(origin_indices):
+        return values
+    if sorted(origin_indices) != list(range(len(origin_indices))):
+        raise RuntimeError("micro-batch indices must be a complete permutation of original sample indices")
+    origin_values = [None] * len(values)
+    for value, origin_index in zip(values, origin_indices, strict=False):
+        origin_values[origin_index] = value
+    return origin_values
+
+
 @torch.no_grad()
 def forward_only(
     f: Callable[..., dict[str, list[torch.Tensor]]],
@@ -894,21 +907,17 @@ def forward_only(
                 assert isinstance(value[key], list)
                 values += value[key]
 
-            if args.use_dynamic_batch_size:
+            micro_batch_indices = data_iterator[0].micro_batch_indices
+            if micro_batch_indices is not None:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
-                origin_indices = sum(data_iterator[0].micro_batch_indices, [])
                 # Per-sample callbacks (log_probs/values) emit one tensor per
                 # sample, so values aligns with origin_indices and we can
                 # restore the pre-balance order. Per-microbatch callbacks
                 # (e.g. compute_sft_eval_step) emit one aggregate per
                 # microbatch — len(values) == num_microbatches, not
                 # num_samples — and have no per-sample order to restore.
-                if len(values) == len(origin_indices):
-                    origin_values = [None] * len(values)
-                    for value, origin_index in zip(values, origin_indices, strict=False):
-                        origin_values[origin_index] = value
-                    values = origin_values
+                values = _restore_micro_batch_output_order(values, micro_batch_indices)
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 

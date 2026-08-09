@@ -11,9 +11,34 @@ import pytest
 from relax.engine.sft.eval.acceptance import (
     encoded_pair_id,
     paired_bootstrap,
+    preference_eval_chunk_sizes,
+    preference_eval_local_batch_sizes,
     record_probe_contract,
     write_pair_artifacts,
 )
+
+
+@pytest.mark.parametrize(
+    ("global_batch_size", "expected"),
+    [
+        (1, [1] * 512),
+        (30, [30] * 17 + [2]),
+        (32, [32] * 16),
+        (512, [512]),
+        (513, [512]),
+    ],
+)
+def test_preference_eval_chunks_preserve_all_512_unique_pairs(global_batch_size, expected):
+    sizes = preference_eval_chunk_sizes(512, global_batch_size)
+    assert sizes == expected
+    assert sum(sizes) == 512
+    assert max(sizes) <= global_batch_size
+
+
+def test_preference_eval_partial_chunk_uses_actual_per_rank_batch_size():
+    assert preference_eval_local_batch_sizes(512, 30, dp_size=2) == [15] * 17 + [1]
+    with pytest.raises(ValueError, match="divisible by data-parallel size"):
+        preference_eval_local_batch_sizes(512, 31, dp_size=2)
 
 
 def test_paired_bootstrap_matches_pcg64_float64_golden_fixture():

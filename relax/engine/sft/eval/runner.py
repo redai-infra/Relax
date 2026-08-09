@@ -195,6 +195,11 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
     from relax.backends.megatron.data import expand_preference_rollout_data, get_data_iterator
     from relax.backends.megatron.initialize import is_megatron_main_rank
     from relax.backends.megatron.model import forward_only
+    from relax.engine.sft.eval.acceptance import (
+        PREFERENCE_PROBE_PAIR_COUNT,
+        preference_eval_chunk_sizes,
+        preference_eval_local_batch_sizes,
+    )
     from relax.engine.sft.eval.preference import (
         compute_reward_model_eval_step,
         finalize_pair_metrics,
@@ -204,7 +209,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
 
     args = actor.args
     task_name = "sft_eval"
-    batch_size = args.global_batch_size // mpu.get_data_parallel_world_size(with_context_parallel=False)
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     data_fields = [
         "pair_ids",
         "chosen_tokens",
@@ -217,12 +222,16 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
         "rejected_score_positions",
     ]
     n_chunks = _wait_for_eval_chunk_count(actor, rollout_id)
+    chunk_sizes = preference_eval_chunk_sizes(PREFERENCE_PROBE_PAIR_COUNT, args.global_batch_size)
+    local_batch_sizes = preference_eval_local_batch_sizes(PREFERENCE_PROBE_PAIR_COUNT, args.global_batch_size, dp_size)
+    if len(chunk_sizes) != n_chunks:
+        raise RuntimeError(f"preference eval chunk plan mismatch: producer={n_chunks}, consumer={len(chunk_sizes)}")
     local = torch.zeros(7, device=device_utils.make_current_torch_device(), dtype=torch.float64)
     local_rows: list[dict] = []
     local_plan: list[dict] = []
     started = time.monotonic()
     with timer("preference_eval"):
-        for chunk_idx in range(n_chunks):
+        for chunk_idx, (global_chunk_size, batch_size) in enumerate(zip(chunk_sizes, local_batch_sizes, strict=True)):
             partition_id = f"sft_eval_{rollout_id}_n{n_chunks}_{chunk_idx}"
             _wait_for_eval_partition_present(actor, partition_id)
             batch_index = 0
@@ -234,6 +243,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                     continue
                 batch_index += 1
                 rollout_data = expand_preference_rollout_data(pair_rows)
+                rollout_data["dynamic_global_batch_size"] = global_chunk_size
                 data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
                 for microbatch_index, branch_indices in enumerate(data_iterator[0].micro_batch_indices):
                     encoded_ids = []

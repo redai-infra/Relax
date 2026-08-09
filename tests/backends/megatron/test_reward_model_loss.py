@@ -11,8 +11,34 @@ import torch
 
 try:
     from relax.backends.megatron.loss import reward_model_loss_function
+    from relax.backends.megatron.model import _restore_micro_batch_output_order
 except Exception as exc:
     pytest.skip(f"Megatron reward-model loss unavailable: {exc}", allow_module_level=True)
+
+
+def test_preference_outputs_restore_original_order_without_dynamic_batch_flag():
+    packed_values = [
+        "pair-2-chosen",
+        "pair-2-rejected",
+        "pair-0-chosen",
+        "pair-0-rejected",
+        "pair-1-chosen",
+        "pair-1-rejected",
+    ]
+    schedule = [[4, 5, 0, 1], [2, 3]]
+
+    assert _restore_micro_batch_output_order(packed_values, schedule) == [
+        "pair-0-chosen",
+        "pair-0-rejected",
+        "pair-1-chosen",
+        "pair-1-rejected",
+        "pair-2-chosen",
+        "pair-2-rejected",
+    ]
+    assert _restore_micro_batch_output_order(["aggregate-0", "aggregate-1"], schedule) == [
+        "aggregate-0",
+        "aggregate-1",
+    ]
 
 
 def _batch():

@@ -434,7 +434,11 @@ class SFT(Base):
             self._logger.warning("Eval source produced 0 valid samples; skipping eval push.")
             return
         if is_preference_mode(self.config):
-            from relax.engine.sft.eval.acceptance import record_probe_contract
+            from relax.engine.sft.eval.acceptance import (
+                preference_eval_chunk_sizes,
+                preference_eval_local_batch_sizes,
+                record_probe_contract,
+            )
 
             samples = sorted(samples, key=lambda pair: pair.pair_id)
             record_probe_contract(
@@ -444,15 +448,13 @@ class SFT(Base):
                 samples,
             )
 
-        # Pad sub-gbs eval pools with random resamples so the eval set always
-        # forms at least one full ``global_batch_size`` chunk. Without this the
-        # chunking loop below would skip eval entirely (n_chunks==0), and the
-        # consumer — which enters ``run_sft_eval`` purely on interval — would
-        # block forever waiting for partitions that never come. Seeded by step
-        # so the padding is reproducible across restarts.
+        # Causal eval pads sub-GBS pools because its legacy consumer requests a
+        # fixed batch size. Preference eval uses actual partial-chunk sizes and
+        # must preserve every unique probe pair without padding.
         gbs = self.config.global_batch_size
         n_original = len(samples)
-        if n_original < gbs:
+        preference_mode = is_preference_mode(self.config)
+        if n_original < gbs and not preference_mode:
             rng = random.Random(completed_steps)
             pad_count = gbs - n_original
             samples = list(samples) + rng.choices(samples, k=pad_count)
@@ -463,7 +465,7 @@ class SFT(Base):
                 f"interpret with caution."
             )
 
-        if is_preference_mode(self.config):
+        if preference_mode:
             backend_batch, preference_custom_meta = pack_preference_pairs_for_tq(samples)
         else:
             backend_batch = pack_samples_for_tq(
@@ -480,15 +482,28 @@ class SFT(Base):
             await self._wait_for_partition_drained(f"sft_{completed_steps - 1}")
 
         chunk_size = self.config.global_batch_size
-        # Drop trailing samples that don't fill a full chunk. The consumer's
+        # Causal eval retains the legacy full-chunk requirement. Preference
+        # eval uses actual per-chunk batch sizes below and never drops pairs.
+        # The causal consumer's
         # `_get_data_from_transfer_queue` calls `tq.get_meta(batch_size=...)`
         # which returns size=0 when the partition has fewer than batch_size
         # samples, so a partial last chunk would never be marked consumed and
         # the actor's `while not all_consumed` loop would spin forever (it
         # already burned a full eval round in the wild — see the
         # `[get_data_profile] samples=0` log spam).
-        n_chunks = n_samples // chunk_size
-        n_dropped = n_samples - n_chunks * chunk_size
+        if preference_mode:
+            chunk_sizes = preference_eval_chunk_sizes(n_samples, chunk_size)
+            preference_eval_local_batch_sizes(
+                n_samples,
+                chunk_size,
+                int(getattr(self.config, "data_parallel_size", 1)),
+            )
+            n_chunks = len(chunk_sizes)
+            n_dropped = 0
+        else:
+            n_chunks = n_samples // chunk_size
+            n_dropped = n_samples - n_chunks * chunk_size
+            chunk_sizes = [chunk_size] * n_chunks
         if n_chunks == 0:
             self._logger.warning(
                 f"Eval @ completed_steps={completed_steps}: eval pool of {n_samples} samples is smaller than "
@@ -507,12 +522,14 @@ class SFT(Base):
         # step. On timeout we clear our own pending chunk and bail.
         chunk_drain_timeout = float(getattr(self.config, "sft_eval_chunk_drain_timeout_sec", 600.0))
         self._logger.info(
-            f"Eval @ completed_steps={completed_steps}: pushing {n_chunks * chunk_size} samples "
+            f"Eval @ completed_steps={completed_steps}: pushing {sum(chunk_sizes)} samples "
             f"in {n_chunks} chunk(s) of {chunk_size}."
         )
-        for chunk_idx in range(n_chunks):
-            s = chunk_idx * chunk_size
-            e = s + chunk_size
+        offset = 0
+        for chunk_idx, current_chunk_size in enumerate(chunk_sizes):
+            s = offset
+            e = s + current_chunk_size
+            offset = e
             chunk = {k: v[s:e] for k, v in backend_batch.items()}
             partition_id = f"sft_eval_{completed_steps}_n{n_chunks}_{chunk_idx}"
             await self.data_system_client.async_put(

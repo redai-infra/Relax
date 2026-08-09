@@ -166,8 +166,8 @@ def actor_training_input_ready(args: Namespace, step: int, partition_ids: list[s
     return sft_partition_id(args, step) in partition_ids
 
 
-def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
-    """SFT periodic predict triggers every ``--sft-predict-interval`` steps.
+def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
+    """SFT periodic predict triggers after each completed interval.
 
     Argparse already validated ``--loss-type sft``, ``--save``, and the eval
     data source, so we only need the interval check here.
@@ -175,4 +175,4 @@ def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
     interval = getattr(args, "sft_predict_interval", None)
     if interval is None or interval <= 0:
         return False
-    return (rollout_id + 1) % interval == 0
+    return completed_steps > 0 and completed_steps % interval == 0
