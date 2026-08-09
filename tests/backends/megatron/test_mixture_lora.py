@@ -545,9 +545,15 @@ def _install_fake_bridge(monkeypatch):
     base_module.PEFT = FakePEFT
     matcher_module.ModuleMatcher = FakeModuleMatcher
     utils_module.get_adapter_attributes_from_linear = lambda module: SimpleNamespace(
-        in_features=module.weight.shape[1], out_features=module.weight.shape[0]
+        in_features=module.weight.shape[1],
+        out_features=module.weight.shape[0],
+        input_is_parallel=False,
+        disable_sequence_parallel_comm=True,
     )
-    core_module.parallel_state = SimpleNamespace(get_tensor_model_parallel_world_size=lambda: 1)
+    core_module.parallel_state = SimpleNamespace(
+        get_tensor_model_parallel_world_size=lambda: 1,
+        get_tensor_model_parallel_rank=lambda: 0,
+    )
 
     modules = {
         "megatron": megatron,

@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from relax.utils.mixture_lora import (
-    DenseRoutedLoRAExecutor,
     MixtureLoraConfig,
     RoutingDecision,
     RoutingStatistics,
@@ -103,8 +102,14 @@ class MixtureLoRARoutingContext:
         site_id: str,
         config: MixtureLoraConfig,
         decision: RoutingDecision,
+        *,
+        record_statistics: bool = True,
+        backward_divisor: int = 1,
     ) -> torch.Tensor:
         """Attach one site's balance loss and replace its detached record."""
+
+        if backward_divisor <= 0:
+            raise ValueError("backward_divisor must be positive")
 
         response_mask = self.response_mask_for(x)
         statistics = compute_routing_statistics(decision, response_mask)
@@ -120,16 +125,19 @@ class MixtureLoRARoutingContext:
         objective_weight = sample_or_token_count * self.objective_scale
         aux_loss_payload = site_aux_loss * sample_or_token_count
         objective_aux_loss = site_aux_loss * objective_weight
-        key = (self.optimizer_step, self.microbatch_id, site_id)
-        self.records[site_id] = MixtureLoRARoutingRecord(
-            key=key,
-            statistics=_detach_routing_statistics(statistics),
-            balance_loss=balance_loss.detach(),
-            aux_loss=objective_aux_loss.detach(),
-            objective_weight=objective_weight.detach(),
-        )
+        if record_statistics:
+            key = (self.optimizer_step, self.microbatch_id, site_id)
+            self.records[site_id] = MixtureLoRARoutingRecord(
+                key=key,
+                statistics=_detach_routing_statistics(statistics),
+                balance_loss=balance_loss.detach(),
+                aux_loss=objective_aux_loss.detach(),
+                objective_weight=objective_weight.detach(),
+            )
 
-        backward_scale = self.main_loss_backward_scale.to(device=output.device) * self.objective_scale
+        backward_scale = (
+            self.main_loss_backward_scale.to(device=output.device) * self.objective_scale / backward_divisor
+        )
         return _AttachAuxLoss.apply(output, aux_loss_payload, backward_scale)
 
 
@@ -354,6 +362,139 @@ def mixture_lora_metrics_from_packed_records(
     return metrics
 
 
+class _CopyToTensorParallelRegion(torch.autograd.Function):
+    """Keep the forward value and sum tensor-parallel input gradients."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, group: Any) -> torch.Tensor:
+        ctx.group = group
+        return value
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        grad_input = grad_output.contiguous().clone()
+        torch.distributed.all_reduce(grad_input, group=ctx.group)
+        return grad_input, None
+
+
+class _ReduceFromTensorParallelRegion(torch.autograd.Function):
+    """Sum tensor-parallel partials while leaving backward rank-local."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, group: Any) -> torch.Tensor:
+        del ctx
+        output = value.contiguous().clone()
+        torch.distributed.all_reduce(output, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        del ctx
+        return grad_output, None
+
+
+class _GatherLastDimFromTensorParallelRegion(torch.autograd.Function):
+    """Gather hidden shards and return the local shard in backward."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, group: Any, rank: int, world_size: int) -> torch.Tensor:
+        ctx.rank = rank
+        ctx.world_size = world_size
+        gathered = [torch.empty_like(value) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, value.contiguous(), group=group)
+        return torch.cat(gathered, dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        return grad_output.chunk(ctx.world_size, dim=-1)[ctx.rank].contiguous(), None, None, None
+
+
+class _GatherFirstDimFromTensorParallelRegion(torch.autograd.Function):
+    """Gather sequence shards and reduce-scatter their input gradients."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, group: Any, rank: int, world_size: int) -> torch.Tensor:
+        ctx.group = group
+        ctx.rank = rank
+        ctx.world_size = world_size
+        gathered = [torch.empty_like(value) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, value.contiguous(), group=group)
+        return torch.cat(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        grad_input = grad_output.contiguous().clone()
+        torch.distributed.all_reduce(grad_input, group=ctx.group)
+        return grad_input.chunk(ctx.world_size, dim=0)[ctx.rank].contiguous(), None, None, None
+
+
+class _ScatterFirstDimToTensorParallelRegion(torch.autograd.Function):
+    """Scatter sequence tokens and gather their output gradients."""
+
+    @staticmethod
+    def forward(ctx, value: torch.Tensor, group: Any, rank: int, world_size: int) -> torch.Tensor:
+        ctx.group = group
+        ctx.world_size = world_size
+        if value.shape[0] % world_size != 0:
+            raise ValueError("sequence dimension must be divisible by tensor parallel size")
+        return value.chunk(world_size, dim=0)[rank].contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        gathered = [torch.empty_like(grad_output) for _ in range(ctx.world_size)]
+        torch.distributed.all_gather(gathered, grad_output.contiguous(), group=ctx.group)
+        return torch.cat(gathered, dim=0), None, None, None
+
+
+class MegatronDenseRoutedLoRAExecutor(nn.Module):
+    """Dense expert execution with explicit Megatron tensor-parallel
+    collectives."""
+
+    def __init__(self, *, input_is_parallel: bool, tp_group: Any, tp_rank: int, tp_world_size: int) -> None:
+        super().__init__()
+        self.input_is_parallel = input_is_parallel
+        self.tp_group = tp_group
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        routing_decision: RoutingDecision,
+        scale: float,
+    ) -> torch.Tensor:
+        input_shape = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+        expert_hidden = torch.einsum("ti,nri->tnr", x_flat, lora_a)
+        if self.tp_world_size > 1:
+            if self.input_is_parallel:
+                expert_hidden = _ReduceFromTensorParallelRegion.apply(expert_hidden, self.tp_group)
+            else:
+                expert_hidden = _GatherLastDimFromTensorParallelRegion.apply(
+                    expert_hidden,
+                    self.tp_group,
+                    self.tp_rank,
+                    self.tp_world_size,
+                )
+            # B is output-sharded, so its input gradient must include every
+            # output shard before it reaches A.
+            expert_hidden = _CopyToTensorParallelRegion.apply(expert_hidden, self.tp_group)
+
+        expert_outputs = torch.einsum("tnr,nor->tno", expert_hidden, lora_b)
+        if self.input_is_parallel and self.tp_world_size > 1:
+            expert_outputs = _GatherLastDimFromTensorParallelRegion.apply(
+                expert_outputs,
+                self.tp_group,
+                self.tp_rank,
+                self.tp_world_size,
+            )
+        routing_weights = routing_decision.dense_weights().to(dtype=expert_outputs.dtype)
+        delta = torch.sum(expert_outputs * routing_weights.unsqueeze(-1), dim=1)
+        return (delta * scale).reshape(*input_shape, expert_outputs.shape[-1])
+
+
 class MixtureLoRAExperts(nn.Module):
     """LoRA expert parameters stored in one stable logical layout."""
 
@@ -363,15 +504,21 @@ class MixtureLoRAExperts(nn.Module):
         input_size: int,
         output_size: int,
         *,
+        local_rank: int | None = None,
+        local_input_size: int | None = None,
+        local_output_size: int | None = None,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
+        local_rank = config.rank if local_rank is None else local_rank
+        local_input_size = input_size if local_input_size is None else local_input_size
+        local_output_size = output_size if local_output_size is None else local_output_size
         self.lora_A = nn.Parameter(
-            torch.empty(config.num_experts, config.rank, input_size, device=device, dtype=dtype)
+            torch.empty(config.num_experts, local_rank, local_input_size, device=device, dtype=dtype)
         )
         self.lora_B = nn.Parameter(
-            torch.empty(config.num_experts, output_size, config.rank, device=device, dtype=dtype)
+            torch.empty(config.num_experts, local_output_size, config.rank, device=device, dtype=dtype)
         )
         self.reset_parameters()
 
@@ -414,6 +561,11 @@ class MixtureLoRAAdapter(nn.Module):
         dropout: float,
         device: torch.device,
         dtype: torch.dtype,
+        input_is_parallel: bool = False,
+        sequence_parallel: bool = False,
+        tp_group: Any = None,
+        tp_rank: int = 0,
+        tp_world_size: int = 1,
     ) -> None:
         super().__init__()
         if not isinstance(site_id, str) or not site_id.strip():
@@ -422,30 +574,102 @@ class MixtureLoRAAdapter(nn.Module):
             raise ValueError(f"dropout must satisfy 0 <= dropout < 1, got {dropout}")
         if not dtype.is_floating_point:
             raise TypeError(f"dtype must be floating point, got {dtype}")
+        if tp_world_size <= 0 or not 0 <= tp_rank < tp_world_size:
+            raise ValueError("tp_rank and tp_world_size do not describe a valid tensor-parallel group")
+        if tp_world_size > 1 and tp_group is None:
+            raise ValueError("tp_group is required when tensor parallelism is enabled")
+        if input_size % tp_world_size != 0 or output_size % tp_world_size != 0:
+            raise ValueError("Mixture-of-LoRA input and output sizes must be divisible by tensor parallel size")
+        if not input_is_parallel and config.rank % tp_world_size != 0:
+            raise ValueError("Mixture-of-LoRA rank must be divisible by tensor parallel size for column layers")
 
         self.config = config
         self.site_id = site_id
-        self.experts = MixtureLoRAExperts(config, input_size, output_size, device=device, dtype=dtype)
-        self.router = MixtureLoRARouter(config.num_experts, input_size, device=device, dtype=dtype)
+        self.input_is_parallel = input_is_parallel
+        self.sequence_parallel = sequence_parallel
+        self.tp_group = tp_group
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
+        local_rank = config.rank if input_is_parallel else config.rank // tp_world_size
+        local_input_size = input_size // tp_world_size if input_is_parallel else input_size
+        local_output_size = output_size // tp_world_size
+        self.experts = MixtureLoRAExperts(
+            config,
+            input_size,
+            output_size,
+            local_rank=local_rank,
+            local_input_size=local_input_size,
+            local_output_size=local_output_size,
+            device=device,
+            dtype=dtype,
+        )
+        self.router = MixtureLoRARouter(config.num_experts, local_input_size, device=device, dtype=dtype)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-        self.executor = DenseRoutedLoRAExecutor()
+        self.executor = MegatronDenseRoutedLoRAExecutor(
+            input_is_parallel=input_is_parallel,
+            tp_group=tp_group,
+            tp_rank=tp_rank,
+            tp_world_size=tp_world_size,
+        )
+        if tp_world_size > 1 and not input_is_parallel:
+            self._synchronize_replicated_router()
+            self.router.weight.register_hook(self._reduce_replicated_router_gradient)
+
+    def _synchronize_replicated_router(self) -> None:
+        source_rank = torch.distributed.get_global_rank(self.tp_group, 0)
+        with torch.no_grad():
+            torch.distributed.broadcast(self.router.weight, src=source_rank, group=self.tp_group)
+
+    def _reduce_replicated_router_gradient(self, gradient: torch.Tensor) -> torch.Tensor:
+        reduced_gradient = gradient.contiguous()
+        torch.distributed.all_reduce(reduced_gradient, group=self.tp_group)
+        return reduced_gradient
 
     def route(self, x: torch.Tensor) -> RoutingDecision:
         logits = self.router(x.reshape(-1, x.shape[-1]))
+        if self.input_is_parallel and self.tp_world_size > 1:
+            logits = _ReduceFromTensorParallelRegion.apply(logits, self.tp_group)
         return route_topk(logits, self.config.top_k, self.config.temperature)
 
     def forward_with_routing(self, x: torch.Tensor) -> tuple[torch.Tensor, RoutingDecision]:
-        decision = self.route(x)
+        routed_input = x
+        if not self.input_is_parallel and self.tp_world_size > 1:
+            if self.sequence_parallel:
+                routed_input = _GatherFirstDimFromTensorParallelRegion.apply(
+                    routed_input,
+                    self.tp_group,
+                    self.tp_rank,
+                    self.tp_world_size,
+                )
+            else:
+                routed_input = _CopyToTensorParallelRegion.apply(routed_input, self.tp_group)
+
+        decision = self.route(routed_input)
         delta = self.executor(
-            self.dropout(x),
+            self.dropout(routed_input),
             self.experts.lora_A,
             self.experts.lora_B,
             decision,
             self.config.scale,
         )
+        if self.input_is_parallel and self.sequence_parallel and self.tp_world_size > 1:
+            delta = _ScatterFirstDimToTensorParallelRegion.apply(
+                delta,
+                self.tp_group,
+                self.tp_rank,
+                self.tp_world_size,
+            )
         routing_context = get_mixture_lora_routing_context()
         if routing_context is not None:
-            delta = routing_context.attach_aux_loss(delta, x, self.site_id, self.config, decision)
+            delta = routing_context.attach_aux_loss(
+                delta,
+                routed_input,
+                self.site_id,
+                self.config,
+                decision,
+                record_statistics=self.tp_rank == 0,
+                backward_divisor=self.tp_world_size if not self.input_is_parallel else 1,
+            )
         return delta, decision
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -465,6 +689,11 @@ class MixtureParallelLinearAdapter(nn.Module):
         output_size: int,
         *,
         dropout: float,
+        input_is_parallel: bool = False,
+        sequence_parallel: bool = False,
+        tp_group: Any = None,
+        tp_rank: int = 0,
+        tp_world_size: int = 1,
     ) -> None:
         super().__init__()
         try:
@@ -481,6 +710,11 @@ class MixtureParallelLinearAdapter(nn.Module):
             dropout=dropout,
             device=first_parameter.device,
             dtype=first_parameter.dtype,
+            input_is_parallel=input_is_parallel,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_rank=tp_rank,
+            tp_world_size=tp_world_size,
         )
         self._adapter_enabled = True
 
@@ -573,11 +807,12 @@ def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float):
                 return module
             if self.mixture_config is None:
                 raise RuntimeError("Mixture-of-LoRA PEFT is missing its configuration")
-            if parallel_state.get_tensor_model_parallel_world_size() != 1:
-                raise NotImplementedError("Mixture-of-LoRA tensor parallel execution is not implemented yet")
-
             _, full_name = match
             attributes = get_adapter_attributes_from_linear(module)
+            tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+            tp_group = getattr(module, "tp_group", None)
+            if tp_world_size > 1 and tp_group is None:
+                tp_group = parallel_state.get_tensor_model_parallel_group()
             return MixtureParallelLinearAdapter(
                 module,
                 self.mixture_config,
@@ -585,6 +820,12 @@ def build_mixture_lora_peft(config: MixtureLoraConfig, dropout: float):
                 attributes.in_features,
                 attributes.out_features,
                 dropout=self.dropout,
+                input_is_parallel=attributes.input_is_parallel,
+                sequence_parallel=getattr(getattr(module, "config", None), "sequence_parallel", False)
+                and not attributes.disable_sequence_parallel_comm,
+                tp_group=tp_group,
+                tp_rank=parallel_state.get_tensor_model_parallel_rank(),
+                tp_world_size=tp_world_size,
             )
 
     return MixtureLoRAPEFT(
@@ -601,6 +842,7 @@ __all__ = [
     "MixtureLoRAExperts",
     "MixtureLoRARouter",
     "MixtureParallelLinearAdapter",
+    "MegatronDenseRoutedLoRAExecutor",
     "activate_mixture_lora_routing_context",
     "build_mixture_lora_peft",
     "ensure_mixture_lora_recompute_inputs_grad",
