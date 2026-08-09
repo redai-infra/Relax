@@ -80,6 +80,12 @@ def validate_preference_args(args: Namespace) -> None:
     beta = float(getattr(args, "dpo_beta", 0.1))
     if not math.isfinite(beta) or beta <= 0:
         raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
+    likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
+    if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
+        raise ValueError(
+            "preference objectives require --rollout-temperature 1.0 so sampling temperature does not scale "
+            "policy/reference likelihood logits"
+        )
     if getattr(args, "ref_load", None) is not None:
         raise ValueError(
             "preference objectives do not use --ref-load: standard DPO snapshots the frozen reference "

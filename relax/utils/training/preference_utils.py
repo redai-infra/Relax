@@ -8,6 +8,14 @@ import torch
 import torch.nn.functional as F
 
 
+def require_tensor_condition(condition: torch.Tensor, message: str) -> None:
+    """Raise on CPU immediately and enqueue a device-side assertion on CUDA."""
+    if condition.device.type == "cuda":
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ValueError(message)
+
+
 def _validate_same_shape(name: str, *values: torch.Tensor) -> None:
     if not values:
         raise ValueError(f"{name} requires at least one tensor")
@@ -15,8 +23,6 @@ def _validate_same_shape(name: str, *values: torch.Tensor) -> None:
     if any(value.shape != expected for value in values[1:]):
         shapes = [tuple(value.shape) for value in values]
         raise ValueError(f"{name} tensors must have identical shapes, got {shapes}")
-    if any(not torch.isfinite(value).all() for value in values):
-        raise ValueError(f"{name} tensors must contain only finite values")
 
 
 def build_causal_lm_labels(tokens: torch.Tensor, raw_loss_mask: torch.Tensor) -> torch.Tensor:
@@ -61,8 +67,7 @@ def dpo_pair_loss(
         )
         reference_logratio = reference_chosen - reference_rejected
     logits = beta * (policy_logratio - reference_logratio)
-    if not torch.isfinite(logits).all():
-        raise ValueError("DPO logits must contain only finite values")
+    require_tensor_condition(torch.isfinite(logits).all(), "DPO logits must contain only finite values")
     return -F.logsigmoid(logits)
 
 
@@ -147,4 +152,5 @@ __all__ = [
     "build_causal_lm_labels",
     "dpo_pair_loss",
     "pack_preference_pair_indices",
+    "require_tensor_condition",
 ]

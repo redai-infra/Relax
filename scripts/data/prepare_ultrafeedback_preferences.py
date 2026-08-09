@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from relax.engine.sft.dataset.sample import VALID_ROLES
+
 
 DATASET_ID = "HuggingFaceH4/ultrafeedback_binarized"
 DATASET_REVISION = "3949bf5f8c17c394422ccfab0c31ea9c20bdeb85"
@@ -48,6 +50,22 @@ def _validate_row(row: dict[str, Any], *, split: str, index: int) -> str:
     rejected = row.get("rejected")
     if not isinstance(chosen, list) or not isinstance(rejected, list) or not chosen or not rejected:
         raise ValueError(f"{split}[{index}] {prompt_id} has invalid chosen/rejected messages")
+    for branch_name, messages in (("chosen", chosen), ("rejected", rejected)):
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise ValueError(
+                    f"{split}[{index}] {prompt_id} {branch_name}[{message_index}] must be a message object"
+                )
+            role = message.get("role")
+            content = message.get("content")
+            if role not in VALID_ROLES:
+                raise ValueError(
+                    f"{split}[{index}] {prompt_id} {branch_name}[{message_index}] has invalid role {role!r}"
+                )
+            if not isinstance(content, str):
+                raise ValueError(
+                    f"{split}[{index}] {prompt_id} {branch_name}[{message_index}] content must be a string"
+                )
     if chosen == rejected:
         raise ValueError(f"{split}[{index}] {prompt_id} has identical chosen/rejected branches")
     if chosen[-1].get("role") != "assistant" or rejected[-1].get("role") != "assistant":
@@ -62,6 +80,16 @@ def _select(dataset, *, split: str, count: int) -> tuple[list[dict[str, Any]], l
     candidates: list[tuple[str, str, dict[str, Any]]] = []
     rejected: list[dict[str, Any]] = []
     for index, row in enumerate(dataset):
+        if not isinstance(row, dict):
+            rejected.append(
+                {
+                    "prompt_id": None,
+                    "source_index": index,
+                    "reason_code": "schema",
+                    "reason": f"{split}[{index}] must be an object",
+                }
+            )
+            continue
         prompt_id = row.get("prompt_id")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise ValueError(f"{split}[{index}] has no non-empty prompt_id")

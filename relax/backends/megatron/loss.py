@@ -33,7 +33,11 @@ from relax.utils.training.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from relax.utils.training.preference_utils import build_preference_pair_indices, dpo_pair_loss
+from relax.utils.training.preference_utils import (
+    build_preference_pair_indices,
+    dpo_pair_loss,
+    require_tensor_condition,
+)
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1215,8 +1219,10 @@ def dpo_loss_function(
                     "DPO branch log-probability/mask shape mismatch: "
                     f"{tuple(branch_values.shape)} vs {tuple(branch_mask.shape)}"
                 )
-            if not bool(branch_mask.to(dtype=torch.bool).any()):
-                raise ValueError("DPO branch completion mask must contain at least one supervised token")
+            require_tensor_condition(
+                branch_mask.to(dtype=torch.bool).any(),
+                "DPO branch completion mask must contain at least one supervised token",
+            )
             sums.append((branch_values * branch_mask).sum())
         return torch.stack(sums)
 

@@ -2,6 +2,8 @@
 
 """Pure numerical and batching tests for offline preference training."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,7 +12,24 @@ from relax.utils.training.preference_utils import (
     build_causal_lm_labels,
     dpo_pair_loss,
     pack_preference_pair_indices,
+    require_tensor_condition,
 )
+
+
+def test_tensor_condition_uses_async_assert_without_python_bool_on_cuda(monkeypatch):
+    class _CudaCondition:
+        device = SimpleNamespace(type="cuda")
+
+        def __bool__(self):
+            raise AssertionError("CUDA conditions must not be converted to Python bool")
+
+    calls = []
+    monkeypatch.setattr(torch, "_assert_async", lambda condition, message: calls.append((condition, message)))
+    condition = _CudaCondition()
+
+    require_tensor_condition(condition, "finite")
+
+    assert calls == [(condition, "finite")]
 
 
 def test_build_causal_lm_labels_uses_next_token_mask():
