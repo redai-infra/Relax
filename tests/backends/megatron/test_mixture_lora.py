@@ -218,6 +218,78 @@ def test_mixture_lora_state_restores_output_and_validates_metadata():
         target.load_state_dict(mismatched_state)
 
 
+def test_checkpoint_restore_matches_uninterrupted_next_optimizer_step():
+    torch.manual_seed(1234)
+    adapter = MixtureLoRAAdapter(
+        _config(),
+        "linear_qkv",
+        4,
+        5,
+        dropout=0.25,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        adapter.experts.lora_B.normal_(mean=0.0, std=0.2)
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=0.03, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.8)
+    batches = (
+        torch.linspace(-1.0, 1.0, steps=24).reshape(3, 2, 4),
+        torch.linspace(0.8, -0.6, steps=24).reshape(3, 2, 4),
+    )
+
+    def train_step(x):
+        optimizer.zero_grad()
+        loss = adapter(x).square().mean()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        return loss.detach()
+
+    train_step(batches[0])
+    checkpoint = {
+        "model": copy.deepcopy(adapter.state_dict()),
+        "optimizer": copy.deepcopy(optimizer.state_dict()),
+        "scheduler": copy.deepcopy(scheduler.state_dict()),
+        "iteration": 1,
+        "rng": torch.get_rng_state().clone(),
+    }
+
+    expected_loss = train_step(batches[1])
+    expected_parameters = {name: parameter.detach().clone() for name, parameter in adapter.named_parameters()}
+    expected_optimizer_state = {
+        name: {
+            key: value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+            for key, value in optimizer.state[parameter].items()
+        }
+        for name, parameter in adapter.named_parameters()
+    }
+    expected_scheduler_state = copy.deepcopy(scheduler.state_dict())
+    expected_iteration = checkpoint["iteration"] + 1
+    assert not torch.equal(expected_parameters["router.weight"], checkpoint["model"]["router.weight"])
+
+    torch.rand(17)
+    adapter.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    torch.set_rng_state(checkpoint["rng"])
+    restored_iteration = checkpoint["iteration"]
+    restored_loss = train_step(batches[1])
+    restored_iteration += 1
+
+    torch.testing.assert_close(restored_loss, expected_loss)
+    assert restored_iteration == expected_iteration
+    assert scheduler.state_dict() == expected_scheduler_state
+    for name, parameter in adapter.named_parameters():
+        torch.testing.assert_close(parameter, expected_parameters[name])
+        for key, expected_value in expected_optimizer_state[name].items():
+            restored_value = optimizer.state[parameter][key]
+            if torch.is_tensor(expected_value):
+                torch.testing.assert_close(restored_value, expected_value)
+            else:
+                assert restored_value == expected_value
+
+
 @pytest.mark.parametrize(
     ("calculate_per_token_loss", "is_dummy", "explicit_loss_scale", "expected"),
     [
