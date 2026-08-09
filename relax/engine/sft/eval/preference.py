@@ -12,20 +12,39 @@ def compute_reward_model_eval_step(
     *,
     total_lengths,
     score_positions=None,
+    raw_loss_masks=None,
+    packed_tokens=None,
+    branch_tokens=None,
+    cu_seqlens=None,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     if score_positions is None:
         raise ValueError("reward-model eval batch is missing score_positions")
-    scores = select_packed_sequence_scores(logits, total_lengths, score_positions).detach()
-    return torch.empty((0,), device=logits.device), {"scores": [scores]}
+    scores = select_packed_sequence_scores(
+        logits,
+        total_lengths,
+        score_positions,
+        raw_loss_masks=raw_loss_masks,
+        packed_tokens=packed_tokens,
+        branch_tokens=branch_tokens,
+        cu_seqlens=cu_seqlens,
+    ).detach()
+    # Emit one scalar per branch so ``forward_only`` can restore original
+    # sample order after dynamic micro-batch length balancing.
+    return torch.empty((0,), device=logits.device), {"scores": list(scores.unbind())}
 
 
-def pair_metric_sums(chosen: torch.Tensor, rejected: torch.Tensor, losses: torch.Tensor) -> torch.Tensor:
+def pair_metric_sums(
+    chosen: torch.Tensor,
+    rejected: torch.Tensor,
+    losses: torch.Tensor,
+    *,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
     """Return additive loss/count/score/margin/correct/tie statistics."""
     if chosen.shape != rejected.shape or chosen.shape != losses.shape:
         raise ValueError("preference eval tensors must have identical shapes")
     margin = chosen - rejected
-    epsilon = 1e-6
     correct = (margin > epsilon).to(torch.float64).sum()
     ties = (margin.abs() <= epsilon).to(torch.float64).sum()
     return torch.stack(

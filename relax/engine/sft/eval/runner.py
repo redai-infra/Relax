@@ -218,6 +218,8 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
     ]
     n_chunks = _wait_for_eval_chunk_count(actor, rollout_id)
     local = torch.zeros(7, device=device_utils.make_current_torch_device(), dtype=torch.float64)
+    local_rows: list[dict] = []
+    local_plan: list[dict] = []
     started = time.monotonic()
     with timer("preference_eval"):
         for chunk_idx in range(n_chunks):
@@ -233,6 +235,22 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                 batch_index += 1
                 rollout_data = expand_preference_rollout_data(pair_rows)
                 data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
+                for microbatch_index, branch_indices in enumerate(data_iterator[0].micro_batch_indices):
+                    encoded_ids = []
+                    for branch_index in branch_indices:
+                        pair_id = int(rollout_data["preference_branch_pair_ids"][branch_index])
+                        if not encoded_ids or encoded_ids[-1] != pair_id:
+                            encoded_ids.append(pair_id)
+                    local_plan.append(
+                        {
+                            "rank": dist.get_rank(),
+                            "chunk": chunk_idx,
+                            "batch": batch_index - 1,
+                            "microbatch": microbatch_index,
+                            "encoded_pair_ids": encoded_ids,
+                        }
+                    )
+                encoded_pair_ids = [int(value) for value in pair_rows["pair_ids"]]
                 if args.sft_objective == "dpo":
                     if args.dpo_reference_free:
                         reference_sums = None
@@ -263,6 +281,36 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                         reference_free=args.dpo_reference_free,
                     )
                     local += pair_metric_sums(chosen_values, rejected_values, losses)
+                    policy_chosen_values = policy_chosen.detach().cpu().tolist()
+                    policy_rejected_values = policy_rejected.detach().cpu().tolist()
+                    reference_chosen_values = (
+                        [0.0] * len(encoded_pair_ids)
+                        if reference_chosen is None
+                        else reference_chosen.detach().cpu().tolist()
+                    )
+                    reference_rejected_values = (
+                        [0.0] * len(encoded_pair_ids)
+                        if reference_rejected is None
+                        else reference_rejected.detach().cpu().tolist()
+                    )
+                    chosen_reward_values = chosen_values.detach().cpu().tolist()
+                    rejected_reward_values = rejected_values.detach().cpu().tolist()
+                    loss_values = losses.detach().cpu().tolist()
+                    for index, encoded_pair_id in enumerate(encoded_pair_ids):
+                        margin = chosen_reward_values[index] - rejected_reward_values[index]
+                        local_rows.append(
+                            {
+                                "encoded_pair_id": encoded_pair_id,
+                                "policy_chosen_logp": policy_chosen_values[index],
+                                "policy_rejected_logp": policy_rejected_values[index],
+                                "reference_chosen_logp": reference_chosen_values[index],
+                                "reference_rejected_logp": reference_rejected_values[index],
+                                "chosen_implicit_reward": chosen_reward_values[index],
+                                "rejected_implicit_reward": rejected_reward_values[index],
+                                "reward_margin": margin,
+                                "pair_loss": loss_values[index],
+                            }
+                        )
                 else:
                     outputs = forward_only(
                         compute_reward_model_eval_step,
@@ -273,10 +321,22 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                         store_prefix="",
                     )
                     if mpu.is_pipeline_last_stage():
-                        scores = torch.cat(outputs["scores"]).to(local.device)
+                        scores = torch.stack(outputs["scores"]).to(local.device)
                         chosen_scores, rejected_scores = scores[0::2], scores[1::2]
                         losses = reward_model_pair_loss(chosen_scores, rejected_scores)
-                        local += pair_metric_sums(chosen_scores, rejected_scores, losses)
+                        local += pair_metric_sums(chosen_scores, rejected_scores, losses, epsilon=0.0)
+                        chosen_values = chosen_scores.detach().cpu().tolist()
+                        rejected_values = rejected_scores.detach().cpu().tolist()
+                        loss_values = losses.detach().cpu().tolist()
+                        for index, encoded_pair_id in enumerate(encoded_pair_ids):
+                            local_rows.append(
+                                {
+                                    "encoded_pair_id": encoded_pair_id,
+                                    "chosen_score": chosen_values[index],
+                                    "rejected_score": rejected_values[index],
+                                    "pair_loss": loss_values[index],
+                                }
+                            )
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
                 run(actor.data_system_client.async_clear_partition(partition_id=partition_id))
@@ -285,7 +345,25 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
     dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group(with_context_parallel=True))
     metrics = finalize_pair_metrics(local, prefix="dpo" if args.sft_objective == "dpo" else "rm")
     metrics["perf/preference_eval_time"] = time.monotonic() - started
+    gloo_group = get_gloo_group()
+    gathered_rows = [None] * dist.get_world_size(group=gloo_group)
+    gathered_plans = [None] * dist.get_world_size(group=gloo_group)
+    dist.all_gather_object(gathered_rows, local_rows, group=gloo_group)
+    dist.all_gather_object(gathered_plans, local_plan, group=gloo_group)
     if is_megatron_main_rank():
+        from relax.engine.sft.eval.acceptance import write_pair_artifacts
+
+        summary = write_pair_artifacts(
+            getattr(args, "save", None),
+            args.sft_objective,
+            rollout_id,
+            [row for rank_rows in gathered_rows for row in rank_rows],
+            [entry for rank_plan in gathered_plans for entry in rank_plan],
+        )
+        if summary is not None:
+            metrics[f"eval/{'dpo' if args.sft_objective == 'dpo' else 'rm'}_bootstrap_lower_95"] = summary[
+                "bootstrap"
+            ]["lower_95"]
         step = compute_rollout_step(args, rollout_id)
         metrics["rollout/step"] = step
         tracking_utils.log(args, metrics, step_key="rollout/step")

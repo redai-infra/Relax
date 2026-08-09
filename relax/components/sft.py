@@ -41,7 +41,7 @@ from relax.engine.sft.dataset.preference import (
 )
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample
-from relax.engine.sft.runtime import is_preference_mode
+from relax.engine.sft.runtime import is_preference_mode, should_run_sft_eval
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
 from relax.utils.training.eval_config import build_named_prompt_data_configs
@@ -399,7 +399,7 @@ class SFT(Base):
             self._logger.info(
                 f"SFT step {self.step}: epoch boundary crossed (epoch={self._dataset.index_manager.current_epoch})"
             )
-        await self._maybe_produce_eval()
+        await self._maybe_produce_eval(self.step + 1)
         self.step += 1
 
     def _build_eval_batches(self) -> list[ProcessedSample] | None:
@@ -414,8 +414,8 @@ class SFT(Base):
             return self._eval_dataset.get_batch_in_order(0, len(self._eval_dataset))
         return None
 
-    async def _maybe_produce_eval(self) -> None:
-        """Push the eval set under partitions ``sft_eval_<step>_n<N>_<i>`` when
+    async def _maybe_produce_eval(self, completed_steps: int) -> None:
+        """Push eval partitions keyed by completed optimizer-step count when
         due, chunked into ``global_batch_size`` pieces and serially drained.
 
         TQ per-partition storage is sized for ``global_batch_size`` (one train
@@ -425,10 +425,7 @@ class SFT(Base):
         discover it, and push-then-wait-for-drain serially. Eval blocks the
         producer here, but only on eval steps.
         """
-        eval_interval = getattr(self.config, "eval_interval", None)
-        if not eval_interval or eval_interval <= 0:
-            return
-        if (self.step + 1) % eval_interval != 0:
+        if not should_run_sft_eval(self.config, completed_steps):
             return
         samples = self._build_eval_batches()
         if samples is None:
@@ -436,6 +433,16 @@ class SFT(Base):
         if not samples:
             self._logger.warning("Eval source produced 0 valid samples; skipping eval push.")
             return
+        if is_preference_mode(self.config):
+            from relax.engine.sft.eval.acceptance import record_probe_contract
+
+            samples = sorted(samples, key=lambda pair: pair.pair_id)
+            record_probe_contract(
+                getattr(self.config, "save", None),
+                self.config.sft_objective,
+                completed_steps,
+                samples,
+            )
 
         # Pad sub-gbs eval pools with random resamples so the eval set always
         # forms at least one full ``global_batch_size`` chunk. Without this the
@@ -446,11 +453,11 @@ class SFT(Base):
         gbs = self.config.global_batch_size
         n_original = len(samples)
         if n_original < gbs:
-            rng = random.Random(self.step)
+            rng = random.Random(completed_steps)
             pad_count = gbs - n_original
             samples = list(samples) + rng.choices(samples, k=pad_count)
             self._logger.warning(
-                f"Eval @ step {self.step}: eval pool of {n_original} samples is smaller than "
+                f"Eval @ completed_steps={completed_steps}: eval pool of {n_original} samples is smaller than "
                 f"global_batch_size ({gbs}); random-padded with {pad_count} resampled (with "
                 f"replacement) samples to fill one batch. PPL counts duplicated samples — "
                 f"interpret with caution."
@@ -469,7 +476,8 @@ class SFT(Base):
 
         # Drain the current train partition so the eval chunks have the full
         # TQ capacity to themselves.
-        await self._wait_for_partition_drained(f"sft_{self.step}")
+        if completed_steps > 0:
+            await self._wait_for_partition_drained(f"sft_{completed_steps - 1}")
 
         chunk_size = self.config.global_batch_size
         # Drop trailing samples that don't fill a full chunk. The consumer's
@@ -483,13 +491,13 @@ class SFT(Base):
         n_dropped = n_samples - n_chunks * chunk_size
         if n_chunks == 0:
             self._logger.warning(
-                f"Eval @ step {self.step}: eval pool of {n_samples} samples is smaller than "
+                f"Eval @ completed_steps={completed_steps}: eval pool of {n_samples} samples is smaller than "
                 f"global_batch_size ({chunk_size}); cannot push any chunk, skipping eval."
             )
             return
         if n_dropped > 0:
             self._logger.warning(
-                f"Eval @ step {self.step}: dropping {n_dropped} trailing sample(s) so eval "
+                f"Eval @ completed_steps={completed_steps}: dropping {n_dropped} trailing sample(s) so eval "
                 f"chunks align to global_batch_size ({chunk_size}); raise eval pool size or "
                 f"reduce global_batch_size if this matters."
             )
@@ -499,13 +507,14 @@ class SFT(Base):
         # step. On timeout we clear our own pending chunk and bail.
         chunk_drain_timeout = float(getattr(self.config, "sft_eval_chunk_drain_timeout_sec", 600.0))
         self._logger.info(
-            f"Eval @ step {self.step}: pushing {n_chunks * chunk_size} samples in {n_chunks} chunk(s) of {chunk_size}."
+            f"Eval @ completed_steps={completed_steps}: pushing {n_chunks * chunk_size} samples "
+            f"in {n_chunks} chunk(s) of {chunk_size}."
         )
         for chunk_idx in range(n_chunks):
             s = chunk_idx * chunk_size
             e = s + chunk_size
             chunk = {k: v[s:e] for k, v in backend_batch.items()}
-            partition_id = f"sft_eval_{self.step}_n{n_chunks}_{chunk_idx}"
+            partition_id = f"sft_eval_{completed_steps}_n{n_chunks}_{chunk_idx}"
             await self.data_system_client.async_put(
                 data=dict_to_tensordict(chunk, batch_size=len(chunk[row_key])),
                 partition_id=partition_id,
@@ -514,7 +523,8 @@ class SFT(Base):
             drained = await self._wait_for_partition_drained(partition_id, timeout_sec=chunk_drain_timeout)
             if not drained:
                 self._logger.warning(
-                    f"Eval @ step {self.step}: chunk {chunk_idx}/{n_chunks} ({partition_id}) did not drain "
+                    f"Eval @ completed_steps={completed_steps}: chunk {chunk_idx}/{n_chunks} "
+                    f"({partition_id}) did not drain "
                     f"within {chunk_drain_timeout}s; aborting eval push and clearing TQ."
                 )
                 await self.data_system_client.async_clear_partition(partition_id=partition_id)
@@ -528,6 +538,8 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
+            if self.step == 0 and is_preference_mode(self.config):
+                await self._maybe_produce_eval(0)
             for _ in range(self.config.num_rollout):
                 if self._stop_event.is_set():
                     break

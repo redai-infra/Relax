@@ -451,6 +451,7 @@ def get_batch(
 
     from relax.utils.sft_utils import align_loss_mask_for_sft
 
+    batch["raw_loss_masks"] = list(batch["loss_masks"])
     loss_masks: list[torch.Tensor] = []
     per_sample_loss_masks: list[torch.Tensor] = []
     full_per_sample_loss_masks: list[torch.Tensor] = []

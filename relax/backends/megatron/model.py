@@ -42,7 +42,13 @@ from relax.utils.training.ppo_utils import (
     validate_reward_model_head_registration,
 )
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import (
+    REWARD_MODEL_HEAD_TYPE,
+    is_megatron_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+    scheduler_state_was_restored,
+)
 from .data import DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
@@ -803,6 +809,12 @@ def forward_only(
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
             loss_masks=batch.get("loss_masks", None),
+            raw_loss_masks=batch.get("raw_loss_masks", None),
+            packed_tokens=batch.get("tokens", None),
+            branch_tokens=batch.get("unconcat_tokens", None),
+            cu_seqlens=(
+                batch["packed_seq_params"].cu_seqlens_q if batch.get("packed_seq_params") is not None else None
+            ),
             score_positions=batch.get("score_positions", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
@@ -1211,6 +1223,13 @@ def train_one_step(
             # CP degree under dynamic CP (and is a no-op under static CP, where the
             # count previously carried the cancelling cp factor).
             loss_reduced[key] = value / num_samples_or_tokens
+        if "rm/_score_chosen_second_moment" in loss_reduced:
+            chosen_second = loss_reduced.pop("rm/_score_chosen_second_moment")
+            rejected_second = loss_reduced.pop("rm/_score_rejected_second_moment")
+            chosen_mean = loss_reduced["rm/score_chosen_mean"]
+            rejected_mean = loss_reduced["rm/score_rejected_mean"]
+            loss_reduced["rm/score_chosen_std"] = math.sqrt(max(chosen_second - chosen_mean**2, 0.0))
+            loss_reduced["rm/score_rejected_std"] = math.sqrt(max(rejected_second - rejected_mean**2, 0.0))
         return loss_reduced, grad_norm
     return {}, grad_norm
 
@@ -1470,6 +1489,14 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
+    role = getattr(model[0], "role", "actor")
+    args.checkpoint_role = role
+    if role == "actor" and is_preference_mode(args) and args.sft_objective == "reward_model":
+        args.head_type = REWARD_MODEL_HEAD_TYPE
+    elif role == "critic":
+        args.head_type = "critic_value_terminal_v1"
+    else:
+        args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
     save_checkpoint(
@@ -1588,6 +1615,7 @@ def initialize_model_and_optimizer(
     elif is_preference_mode(args) and args.sft_objective == "reward_model":
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
+    resumed_from_megatron = is_megatron_checkpoint(args.load)
     iteration, _ = load_checkpoint(
         model,
         optimizer,
@@ -1609,7 +1637,8 @@ def initialize_model_and_optimizer(
             "reward-model head parameter identities changed during checkpoint loading"
         )
     clear_memory()
-    if opt_param_scheduler is not None:
+    scheduler_was_restored = scheduler_state_was_restored(args, resumed_from_megatron)
+    if opt_param_scheduler is not None and not scheduler_was_restored:
         opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
     return model, optimizer, opt_param_scheduler, iteration

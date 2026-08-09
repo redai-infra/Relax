@@ -43,7 +43,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --load "${SAVE_DIR}/${EXP_NAME}" \
     --save-interval 50 \
     --num-rollout "${NUM_ROLLOUT:-200}" \
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-8}" \
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}" \
     --use-dynamic-batch-size \
     --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}" \
     --tensor-model-parallel-size 1 \

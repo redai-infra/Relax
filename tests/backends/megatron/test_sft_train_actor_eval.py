@@ -5,21 +5,13 @@ configured."""
 
 from argparse import Namespace
 
-import pytest
-
-
-# Importing relax.backends.megatron.actor pulls in CUDA-only deps. Skip the
-# whole module on CPU-only envs — matches the pattern used in
-# tests/backends/megatron/test_sft_train_data_fields.py.
-try:
-    from relax.backends.megatron.actor import _should_run_sft_eval  # noqa: F401
-except (ImportError, AssertionError) as _exc:
-    pytest.skip(f"relax.backends.megatron.actor unavailable: {_exc}", allow_module_level=True)
+from relax.engine.sft.runtime import should_run_sft_eval
 
 
 def _mk_actor_args():
     return Namespace(
         loss_type="sft",
+        sft_objective="causal_lm",
         compute_advantages_and_returns=False,
         eval_prompt_data=["eval", "/dev/null"],
         eval_size=None,
@@ -36,25 +28,34 @@ def _mk_actor_args():
 
 def test_should_run_sft_eval_at_interval_boundary():
     args = _mk_actor_args()
-    assert _should_run_sft_eval(args, rollout_id=9) is True
-    assert _should_run_sft_eval(args, rollout_id=19) is True
-    assert _should_run_sft_eval(args, rollout_id=4) is False
-    assert _should_run_sft_eval(args, rollout_id=0) is False
+    assert should_run_sft_eval(args, completed_steps=10) is True
+    assert should_run_sft_eval(args, completed_steps=20) is True
+    assert should_run_sft_eval(args, completed_steps=5) is False
+    assert should_run_sft_eval(args, completed_steps=0) is False
+
+
+def test_preference_eval_includes_true_baseline_and_final_independent_of_interval():
+    args = _mk_actor_args()
+    args.sft_objective = "reward_model"
+    args.eval_interval = 200
+    assert should_run_sft_eval(args, completed_steps=0) is True
+    assert should_run_sft_eval(args, completed_steps=20) is True
+    assert should_run_sft_eval(args, completed_steps=1) is False
 
 
 def test_should_run_sft_eval_disabled_when_no_interval():
     args = _mk_actor_args()
     args.eval_interval = None
-    assert _should_run_sft_eval(args, rollout_id=9) is False
+    assert should_run_sft_eval(args, completed_steps=10) is False
 
 
 def test_should_run_sft_eval_disabled_when_no_eval_source():
     args = _mk_actor_args()
     args.eval_prompt_data = None
-    assert _should_run_sft_eval(args, rollout_id=9) is False
+    assert should_run_sft_eval(args, completed_steps=10) is False
 
 
 def test_should_run_sft_eval_disabled_for_non_sft():
     args = _mk_actor_args()
     args.loss_type = "policy_loss"
-    assert _should_run_sft_eval(args, rollout_id=9) is False
+    assert should_run_sft_eval(args, completed_steps=10) is False

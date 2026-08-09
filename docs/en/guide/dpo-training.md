@@ -62,3 +62,11 @@ DPO emits the following training metrics under the `train/dpo/` namespace:
 - `strict_accuracy`, `tie_rate`, and `tie_aware_accuracy`.
 
 For distributed parity claims, run DP=1 and DP=2 with the same image, model/data revisions, hyperparameters, and batch semantics, and retain the raw logs and reference digests.
+
+## Reward modeling and acceptance artifacts
+
+The companion recipe is `scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh`. It defaults to 200 optimizer steps and 32 pairs per global batch. Preference evaluation runs before the first optimizer step (step 0), periodically, and after the final completed step even when the interval does not divide the run length.
+
+Both DPO and reward modeling write acceptance data under `<SAVE_DIR>/<EXP_NAME>/preference_eval/`: the canonical probe contract and SHA-256, the DP/micro-batch plan and SHA-256, step-0/final per-pair JSONL, and a 10,000-replicate FP64 PCG64 paired-bootstrap summary. Final evaluation fails if probe preprocessing, pair order, or the batch plan differs from step 0. Retain this directory together with the expanded command, environment inventory, raw stdout/stderr, metrics, and curves.
+
+Reward-model Megatron checkpoints persist `sft_objective=reward_model`, `head_type=reward_model_terminal_v1`, and `checkpoint_role=actor`. Resume rejects missing or incompatible metadata, non-exact scalar-head keys/shapes, partial optimizer/RNG restoration, and PPO critic checkpoints.

@@ -100,6 +100,24 @@ def test_reward_model_pair_loss_matches_independent_reference_and_gradient():
     assert torch.allclose(actual_grad, chosen.grad, rtol=1e-6, atol=1e-6)
 
 
+def test_reward_model_pair_loss_uses_shared_tensor_condition(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "relax.utils.training.preference_utils.require_tensor_condition",
+        lambda condition, message: calls.append((condition, message)),
+    )
+
+    reward_model_pair_loss(torch.tensor([1.0]), torch.tensor([0.0]))
+
+    assert len(calls) == 1
+    assert "finite" in calls[0][1]
+
+
+def test_reward_model_pair_loss_rejects_non_finite_cpu_margin():
+    with pytest.raises(ValueError, match="finite"):
+        reward_model_pair_loss(torch.tensor([float("inf")]), torch.tensor([0.0]))
+
+
 def test_select_packed_sequence_scores_preserves_pair_order_and_gradient():
     flat_logits = torch.arange(10, dtype=torch.float32, requires_grad=True)
     logits = flat_logits.reshape(1, 10, 1)

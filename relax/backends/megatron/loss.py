@@ -1301,19 +1301,37 @@ def reward_model_loss_function(
     score_positions = batch.get("score_positions")
     if score_positions is None:
         raise ValueError("reward-model batch is missing score_positions")
-    scores = select_packed_sequence_scores(logits, batch["total_lengths"], score_positions)
-    chosen_scores, rejected_scores = scores[0::2], scores[1::2]
+    scores = select_packed_sequence_scores(
+        logits,
+        batch["total_lengths"],
+        score_positions,
+        raw_loss_masks=batch.get("raw_loss_masks"),
+        packed_tokens=batch.get("tokens"),
+        branch_tokens=batch.get("unconcat_tokens"),
+        cu_seqlens=(batch["packed_seq_params"].cu_seqlens_q if batch.get("packed_seq_params") is not None else None),
+    )
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("reward-model batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+    chosen_scores = scores.index_select(0, chosen_index)
+    rejected_scores = scores.index_select(0, rejected_index)
     pair_losses = reward_model_pair_loss(chosen_scores, rejected_scores)
     margins = chosen_scores - rejected_scores
     loss = pair_losses.sum()
     if pair_losses.numel() == 0:
         loss = loss + 0 * logits.sum()
     return loss, {
-        "loss": pair_losses.detach().sum(),
-        "rm_chosen_score": chosen_scores.detach().sum(),
-        "rm_rejected_score": rejected_scores.detach().sum(),
-        "rm_margin": margins.detach().sum(),
-        "rm_pair_accuracy": (margins > 0).to(torch.float32).detach().sum(),
+        "rm/loss": pair_losses.detach().sum(),
+        "rm/score_chosen_mean": chosen_scores.detach().sum(),
+        "rm/score_rejected_mean": rejected_scores.detach().sum(),
+        "rm/score_margin_mean": margins.detach().sum(),
+        "rm/accuracy": (margins > 0).to(torch.float32).detach().sum(),
+        "rm/_score_chosen_second_moment": chosen_scores.detach().square().sum(),
+        "rm/_score_rejected_second_moment": rejected_scores.detach().square().sum(),
     }
 
 

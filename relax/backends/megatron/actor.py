@@ -771,10 +771,10 @@ class MegatronTrainRayActor(TrainRayActor):
             should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
             try:
                 if should_run_eval:
-                    if dist.get_rank() == 0:
+                    if rollout_id > 0 and dist.get_rank() == 0:
                         run(
                             self.data_system_client.async_clear_partition(
-                                partition_id=sft_partition_id(self.args, rollout_id)
+                                partition_id=sft_partition_id(self.args, rollout_id - 1)
                             )
                         )
                     dist.barrier(group=get_gloo_group())
@@ -807,6 +807,14 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
     def train(self, rollout_id: int) -> None:
+        if (
+            rollout_id == 0
+            and is_preference_mode(self.args)
+            and not self.args.debug_train_only
+            and should_run_sft_eval(self.args, 0)
+        ):
+            self._run_step_evaluation(0)
+
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
@@ -1184,7 +1192,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id)
+        self._run_step_evaluation(rollout_id + 1 if is_sft_mode(self.args) else rollout_id)
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here

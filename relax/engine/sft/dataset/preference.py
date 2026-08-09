@@ -509,9 +509,9 @@ def pack_preference_pairs_for_tq(
     """Pack atomic pair rows and matching TransferQueue length metadata."""
     if not pairs:
         raise ValueError("preference pair batch must not be empty")
-    encoded_pair_ids = [
-        int.from_bytes(hashlib.sha256(pair.pair_id.encode()).digest()[:8], "big") >> 1 for pair in pairs
-    ]
+    from relax.engine.sft.eval.acceptance import encoded_pair_id
+
+    encoded_pair_ids = [encoded_pair_id(pair.pair_id) for pair in pairs]
     if len(set(encoded_pair_ids)) != len(encoded_pair_ids):
         raise ValueError("preference pair ID hash collision within batch")
     batch: dict[str, list[Any]] = {

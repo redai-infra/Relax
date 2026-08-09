@@ -124,8 +124,14 @@ def sft_task_name(args: Namespace, *, component: str = "actor") -> str:
     return "train"
 
 
-def should_run_sft_eval(args: Namespace, rollout_id: int) -> bool:
-    """SFT PPL eval triggers every ``--eval-interval`` steps under SFT mode
+def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
+    """Return whether eval is due after ``completed_steps`` optimizer steps.
+
+    Preference objectives additionally evaluate at the true pre-training
+    baseline (0) and at the final completed step, independent of whether the
+    periodic interval happens to divide the run length.
+
+    SFT PPL eval triggers every ``--eval-interval`` steps under SFT mode
     when an eval source is configured (either ``--eval-prompt-data`` or
     ``--eval-size``, mutually exclusive — see ``utils/arguments.py``).
 
@@ -139,7 +145,9 @@ def should_run_sft_eval(args: Namespace, rollout_id: int) -> bool:
     interval = getattr(args, "eval_interval", None)
     if interval is None or interval <= 0:
         return False
-    return (rollout_id + 1) % interval == 0
+    if is_preference_mode(args) and completed_steps in {0, int(getattr(args, "num_rollout", 0) or 0)}:
+        return True
+    return completed_steps > 0 and completed_steps % interval == 0
 
 
 def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:

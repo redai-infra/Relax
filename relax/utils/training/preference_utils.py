@@ -112,8 +112,10 @@ def reward_model_pair_loss(chosen_scores: torch.Tensor, rejected_scores: torch.T
     """Return unreduced Bradley-Terry loss, one value per preference pair."""
     _validate_same_shape("reward-model scores", chosen_scores, rejected_scores)
     margins = chosen_scores - rejected_scores
-    if not torch.isfinite(margins).all():
-        raise ValueError("reward-model margins must contain only finite values")
+    require_tensor_condition(
+        torch.isfinite(margins).all(),
+        "reward-model margins must contain only finite values",
+    )
     return -F.logsigmoid(margins)
 
 
@@ -121,8 +123,13 @@ def select_packed_sequence_scores(
     logits: torch.Tensor,
     total_lengths: Sequence[int],
     score_positions: Sequence[int],
+    *,
+    raw_loss_masks: Sequence[torch.Tensor] | None = None,
+    packed_tokens: torch.Tensor | None = None,
+    branch_tokens: Sequence[torch.Tensor] | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select one scalar score per sequence from a CP=1 THD packed output."""
+    """Validate and select one terminal score per CP=1 THD branch."""
     if len(total_lengths) != len(score_positions):
         raise ValueError(
             f"total_lengths/score_positions length mismatch: {len(total_lengths)} vs {len(score_positions)}"
@@ -136,6 +143,31 @@ def select_packed_sequence_scores(
     else:
         raise ValueError(f"reward-model logits must have shape [1,T,1], [T,1], or [T], got {tuple(logits.shape)}")
 
+    branch_count = len(total_lengths)
+    optional_fields = {
+        "raw_loss_masks": raw_loss_masks,
+        "branch_tokens": branch_tokens,
+    }
+    for name, values in optional_fields.items():
+        if values is not None and len(values) != branch_count:
+            raise ValueError(f"{name} must be branch aligned: expected {branch_count}, got {len(values)}")
+    if (packed_tokens is None) != (branch_tokens is None):
+        raise ValueError("packed_tokens and branch_tokens must be provided together")
+
+    if packed_tokens is not None:
+        if packed_tokens.ndim == 2 and packed_tokens.shape[0] == 1:
+            flat_packed_tokens = packed_tokens[0]
+        elif packed_tokens.ndim == 1:
+            flat_packed_tokens = packed_tokens
+        else:
+            raise ValueError(f"packed reward tokens must have shape [1,T] or [T], got {tuple(packed_tokens.shape)}")
+        if flat_packed_tokens.numel() != flat_logits.numel():
+            raise ValueError(
+                f"packed reward token/logit length mismatch: {flat_packed_tokens.numel()} vs {flat_logits.numel()}"
+            )
+    else:
+        flat_packed_tokens = None
+
     offsets: list[int] = []
     cursor = 0
     for index, (length, position) in enumerate(zip(total_lengths, score_positions, strict=True)):
@@ -145,10 +177,53 @@ def select_packed_sequence_scores(
             raise ValueError(f"sequence {index} has non-positive total length {length}")
         if not 0 <= position < length:
             raise ValueError(f"sequence {index} score position {position} is outside [0, {length})")
-        offsets.append(cursor + position)
+        packed_index = cursor + position
+        offsets.append(packed_index)
+        if raw_loss_masks is not None:
+            raw_mask = torch.as_tensor(raw_loss_masks[index])
+            if raw_mask.ndim != 1 or raw_mask.numel() != length:
+                raise ValueError(
+                    f"sequence {index} raw loss mask must have length {length}, got {tuple(raw_mask.shape)}"
+                )
+            require_tensor_condition(
+                raw_mask[position] == 1,
+                f"sequence {index} score position must be supervised by raw_loss_mask",
+            )
+        if flat_packed_tokens is not None and branch_tokens is not None:
+            branch = torch.as_tensor(branch_tokens[index], device=flat_packed_tokens.device)
+            if branch.ndim != 1 or branch.numel() != length:
+                raise ValueError(
+                    f"sequence {index} branch tokens must have length {length}, got {tuple(branch.shape)}"
+                )
+            require_tensor_condition(
+                flat_packed_tokens[packed_index] == branch[position],
+                f"sequence {index} packed terminal token does not match branch terminal token",
+            )
         cursor += length
     if cursor > flat_logits.numel():
         raise ValueError(f"packed reward logits contain {flat_logits.numel()} tokens, expected at least {cursor}")
+    if cu_seqlens is not None:
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() not in {branch_count + 1, branch_count + 2}:
+            raise ValueError(
+                "reward-model cu_seqlens must describe the real branches and at most one trailing padding segment"
+            )
+        expected = torch.tensor(
+            [0, *torch.tensor(total_lengths, dtype=torch.long).cumsum(0).tolist()],
+            device=cu_seqlens.device,
+            dtype=cu_seqlens.dtype,
+        )
+        require_tensor_condition(
+            (cu_seqlens[: branch_count + 1] == expected).all(),
+            "reward-model cu_seqlens do not match branch lengths/order",
+        )
+        if cu_seqlens.numel() == branch_count + 1:
+            if flat_logits.numel() != cursor:
+                raise ValueError("reward-model packed tail must be represented by an explicit padding segment")
+        else:
+            require_tensor_condition(
+                cu_seqlens[-1] == flat_logits.numel(),
+                "reward-model padding segment must cover only the packed tail",
+            )
     if not offsets:
         return flat_logits.new_empty((0,))
     return flat_logits[torch.tensor(offsets, device=flat_logits.device, dtype=torch.long)]

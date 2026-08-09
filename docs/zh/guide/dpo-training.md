@@ -62,3 +62,11 @@ DPO 在 `train/dpo/` 命名空间下记录以下训练指标：
 - `strict_accuracy`、`tie_rate` 和 `tie_aware_accuracy`。
 
 如需声明分布式一致性，应在相同镜像、模型/数据 revision、超参数和 batch 语义下分别运行 DP=1、DP=2，并保留原始日志与 reference digest。
+
+## Reward Modeling 与验收产物
+
+配套 recipe 为 `scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh`，默认运行 200 个 optimizer step，global batch 为 32 pairs。偏好评测会在第一次 optimizer step 之前（step 0）、周期边界以及最终完成 step 后运行；最终评测不依赖 interval 恰好整除训练步数。
+
+DPO 与 Reward Modeling 都会在 `<SAVE_DIR>/<EXP_NAME>/preference_eval/` 下写出验收数据：canonical probe 合同及 SHA-256、DP/micro-batch plan 及 SHA-256、step-0/final 逐 pair JSONL，以及 10,000 次 FP64 PCG64 paired-bootstrap summary。若 final 与 step 0 的预处理、pair 顺序或 batch plan 不一致，评测会立即失败。提交证据时需将该目录与展开后的命令、环境清单、原始 stdout/stderr、metrics 和曲线一并保留。
+
+Reward Model 的 Megatron checkpoint 会持久化 `sft_objective=reward_model`、`head_type=reward_model_terminal_v1` 与 `checkpoint_role=actor`。resume 会拒绝缺失或不兼容的 metadata、非精确 scalar-head key/shape、只恢复部分 optimizer/RNG 状态，以及 PPO critic checkpoint。

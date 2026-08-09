@@ -3,7 +3,19 @@
 import pytest
 import torch
 
-from relax.engine.sft.eval.preference import finalize_pair_metrics, pair_metric_sums
+from relax.engine.sft.eval.preference import compute_reward_model_eval_step, finalize_pair_metrics, pair_metric_sums
+
+
+def test_reward_model_eval_emits_one_score_per_branch_for_order_restoration():
+    _, outputs = compute_reward_model_eval_step(
+        torch.tensor([0.0, 1.0, 2.0, 3.0]),
+        total_lengths=[2, 2],
+        score_positions=[1, 1],
+    )
+
+    assert len(outputs["scores"]) == 2
+    assert all(score.ndim == 0 for score in outputs["scores"])
+    assert torch.stack(outputs["scores"]).tolist() == [1.0, 3.0]
 
 
 def test_pair_metric_sums_and_finalize_keep_ties_explicit():
