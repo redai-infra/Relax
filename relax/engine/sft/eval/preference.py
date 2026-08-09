@@ -7,6 +7,16 @@ import torch
 from relax.utils.training.preference_utils import select_packed_sequence_scores
 
 
+def extract_preference_eval_pair_ids(pair_data: dict) -> list[int]:
+    """Read one ID per pair from either expanded or raw preference data."""
+    pair_ids = pair_data.get("preference_pair_ids")
+    if pair_ids is None:
+        pair_ids = pair_data.get("pair_ids")
+    if pair_ids is None:
+        raise RuntimeError("preference eval data is missing pair IDs; expected preference_pair_ids or pair_ids")
+    return [int(value) for value in pair_ids]
+
+
 def compute_reward_model_eval_step(
     logits: torch.Tensor,
     *,
@@ -76,4 +86,9 @@ def finalize_pair_metrics(values: torch.Tensor, *, prefix: str) -> dict[str, flo
     }
 
 
-__all__ = ["compute_reward_model_eval_step", "finalize_pair_metrics", "pair_metric_sums"]
+__all__ = [
+    "compute_reward_model_eval_step",
+    "extract_preference_eval_pair_ids",
+    "finalize_pair_metrics",
+    "pair_metric_sums",
+]

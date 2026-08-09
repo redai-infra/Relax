@@ -202,6 +202,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
     )
     from relax.engine.sft.eval.preference import (
         compute_reward_model_eval_step,
+        extract_preference_eval_pair_ids,
         finalize_pair_metrics,
         pair_metric_sums,
     )
@@ -260,7 +261,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                             "encoded_pair_ids": encoded_ids,
                         }
                     )
-                encoded_pair_ids = [int(value) for value in pair_rows["pair_ids"]]
+                encoded_pair_ids = extract_preference_eval_pair_ids(rollout_data)
                 if args.sft_objective == "dpo":
                     if args.dpo_reference_free:
                         reference_sums = None

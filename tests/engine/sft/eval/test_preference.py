@@ -3,7 +3,29 @@
 import pytest
 import torch
 
-from relax.engine.sft.eval.preference import compute_reward_model_eval_step, finalize_pair_metrics, pair_metric_sums
+from relax.engine.sft.eval.preference import (
+    compute_reward_model_eval_step,
+    extract_preference_eval_pair_ids,
+    finalize_pair_metrics,
+    pair_metric_sums,
+)
+
+
+@pytest.mark.parametrize(
+    ("pair_data", "expected"),
+    [
+        ({"pair_ids": [17, 23]}, [17, 23]),
+        ({"preference_pair_ids": [17, 23]}, [17, 23]),
+        ({"pair_ids": [99], "preference_pair_ids": [17]}, [17]),
+    ],
+)
+def test_extract_preference_eval_pair_ids_supports_raw_and_expanded_data(pair_data, expected):
+    assert extract_preference_eval_pair_ids(pair_data) == expected
+
+
+def test_extract_preference_eval_pair_ids_rejects_missing_pair_level_identity():
+    with pytest.raises(RuntimeError, match="expected preference_pair_ids or pair_ids"):
+        extract_preference_eval_pair_ids({"preference_branch_pair_ids": [17, 17]})
 
 
 def test_reward_model_eval_emits_one_score_per_branch_for_order_restoration():

@@ -85,7 +85,9 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
 
     assert [tensor.tolist() for tensor in rollout_data["tokens"]] == [[1, 2, 3], [1, 4]]
     assert [tensor.tolist() for tensor in rollout_data["loss_masks"]] == [[0, 1, 1], [0, 1]]
+    assert "pair_ids" not in rollout_data
     assert rollout_data["preference_pair_ids"] == [17]
+    assert rollout_data["preference_branch_pair_ids"] == [17, 17]
     assert rollout_data["preference_pair_costs"] == [5]
 
 
