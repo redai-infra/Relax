@@ -8,6 +8,7 @@ here keeps the dispatchers in those files to one-line calls.
 """
 
 import math
+import re
 from argparse import Namespace
 
 
@@ -148,6 +149,21 @@ def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     if is_preference_mode(args) and completed_steps in {0, int(getattr(args, "num_rollout", 0) or 0)}:
         return True
     return completed_steps > 0 and completed_steps % interval == 0
+
+
+def actor_training_input_ready(args: Namespace, step: int, partition_ids: list[str] | None) -> bool:
+    """Allow the backend to enter step 0 when its preference baseline is ready.
+
+    In colocate mode the Actor service normally waits for the train partition
+    before calling the backend. Preference producers intentionally publish and
+    drain the step-0 eval partition first, so that baseline partition is the
+    backend's first input and must also release the service-level wait.
+    """
+    if not partition_ids:
+        return False
+    if step == 0 and is_preference_mode(args) and should_run_sft_eval(args, completed_steps=0):
+        return any(re.fullmatch(r"sft_eval_0_n\d+_0", partition_id) for partition_id in partition_ids)
+    return sft_partition_id(args, step) in partition_ids
 
 
 def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
