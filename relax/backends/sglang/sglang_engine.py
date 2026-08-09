@@ -24,7 +24,12 @@ from relax.utils.async_utils import run
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.megatron_peft_utils import (
+    build_mixture_lora_config,
+    convert_megatron_to_hf_target_modules,
+    is_lora_enabled,
+)
+from relax.utils.mixture_lora import configure_mixture_lora_external_model
 
 
 logger = get_logger(__name__)
@@ -466,7 +471,10 @@ class SGLangEngine(RayActor):
         # Must be set before launch_server_process() spawns child process
         # (multiprocessing start_method='spawn'), because the child inherits
         # the parent's os.environ at spawn time.
-        external_pkg = getattr(self.args, "sglang_external_model_package", None)
+        external_pkg = configure_mixture_lora_external_model(
+            build_mixture_lora_config(self.args),
+            getattr(self.args, "sglang_external_model_package", None),
+        )
         if external_pkg:
             os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_pkg
             os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = external_pkg

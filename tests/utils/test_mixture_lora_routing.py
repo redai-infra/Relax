@@ -16,8 +16,11 @@ from relax.utils.mixture_lora import (
     TransportTensorSpec,
     build_mixture_lora_state_specs,
     compute_routing_statistics,
+    deserialize_mixture_lora_config,
     mean_routing_balance_loss,
+    megatron_mixture_lora_name_to_sglang,
     route_topk,
+    serialize_mixture_lora_config,
 )
 
 
@@ -39,6 +42,63 @@ def _config(**overrides):
     }
     values.update(overrides)
     return MixtureLoraConfig(**values)
+
+
+def test_runtime_config_json_round_trip_is_canonical():
+    config = _config()
+
+    serialized = serialize_mixture_lora_config(config)
+
+    assert deserialize_mixture_lora_config(serialized) == config
+    assert serialize_mixture_lora_config(deserialize_mixture_lora_config(serialized)) == serialized
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("", "non-empty JSON string"),
+        ("[]", "must contain an object"),
+        ('{"num_experts":4}', "fields do not match schema"),
+        ("not-json", "Invalid Mixture-of-LoRA runtime configuration JSON"),
+    ],
+)
+def test_runtime_config_json_rejects_incomplete_or_invalid_input(raw, message):
+    with pytest.raises(ValueError, match=message):
+        deserialize_mixture_lora_config(raw)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "decoder.layers.0.self_attention.linear_qkv.mixture_lora.experts.lora_A",
+            "model.layers.0.self_attn.qkv_proj.mixture_lora.experts.lora_A",
+        ),
+        (
+            "decoder.layers.17.self_attention.linear_qkv.mixture_lora.experts.lora_B",
+            "model.layers.17.self_attn.qkv_proj.mixture_lora.experts.lora_B",
+        ),
+        (
+            "decoder.layers.2.self_attention.linear_proj.mixture_lora.router.weight",
+            "model.layers.2.self_attn.o_proj.mixture_lora.router.weight",
+        ),
+    ],
+)
+def test_megatron_mixture_parameter_name_maps_to_sglang(source, expected):
+    assert megatron_mixture_lora_name_to_sglang(source) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "decoder.layers.x.self_attention.linear_qkv.mixture_lora.router.weight",
+        "decoder.layers.0.mlp.linear_fc1.mixture_lora.router.weight",
+        "decoder.layers.0.self_attention.linear_qkv.mixture_lora.unknown",
+    ],
+)
+def test_megatron_mixture_parameter_name_rejects_unsupported_schema(name):
+    with pytest.raises(ValueError):
+        megatron_mixture_lora_name_to_sglang(name)
 
 
 def _reference_routed_lora(x, lora_a, lora_b, decision, scale):

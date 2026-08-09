@@ -2,7 +2,9 @@
 
 """Backend-independent routing primitives for Mixture-of-LoRA."""
 
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Literal, Protocol, Sequence, runtime_checkable
 
@@ -13,6 +15,16 @@ from torch import nn
 MIXTURE_LORA_SCHEMA_VERSION = 1
 MixtureLoraParameterKind = Literal["experts.lora_A", "experts.lora_B", "router.weight"]
 _PARAMETER_KINDS = {"experts.lora_A", "experts.lora_B", "router.weight"}
+_CONFIG_JSON_FIELDS = {
+    "schema_version",
+    "num_experts",
+    "rank",
+    "top_k",
+    "temperature",
+    "aux_loss_coef",
+    "alpha",
+    "target_modules",
+}
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,102 @@ class MixtureLoraConfig:
     @property
     def scale(self) -> float:
         return self.alpha / self.rank
+
+
+def serialize_mixture_lora_config(config: MixtureLoraConfig) -> str:
+    """Serialize validated runtime configuration for spawned rollout
+    workers."""
+
+    if not isinstance(config, MixtureLoraConfig):
+        raise TypeError(f"config must be MixtureLoraConfig, got {type(config).__name__}")
+    payload = {
+        "schema_version": config.schema_version,
+        "num_experts": config.num_experts,
+        "rank": config.rank,
+        "top_k": config.top_k,
+        "temperature": config.temperature,
+        "aux_loss_coef": config.aux_loss_coef,
+        "alpha": config.alpha,
+        "target_modules": list(config.target_modules),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def deserialize_mixture_lora_config(raw: str) -> MixtureLoraConfig:
+    """Parse and validate runtime configuration inherited by rollout
+    workers."""
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Mixture-of-LoRA runtime configuration must be a non-empty JSON string")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid Mixture-of-LoRA runtime configuration JSON: {error.msg}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Mixture-of-LoRA runtime configuration JSON must contain an object")
+    fields = set(payload)
+    if fields != _CONFIG_JSON_FIELDS:
+        missing = sorted(_CONFIG_JSON_FIELDS - fields)
+        unexpected = sorted(fields - _CONFIG_JSON_FIELDS)
+        raise ValueError(
+            f"Mixture-of-LoRA runtime configuration fields do not match schema: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return MixtureLoraConfig(
+        schema_version=payload["schema_version"],
+        num_experts=payload["num_experts"],
+        rank=payload["rank"],
+        top_k=payload["top_k"],
+        temperature=payload["temperature"],
+        aux_loss_coef=payload["aux_loss_coef"],
+        alpha=payload["alpha"],
+        target_modules=tuple(payload["target_modules"]),
+    )
+
+
+def configure_mixture_lora_external_model(
+    config: MixtureLoraConfig | None,
+    external_package: str | None,
+) -> str | None:
+    """Set the validated rollout configuration before spawning SGLang."""
+
+    if config is None:
+        return external_package
+    mixture_external_package = "relax.models.qwen3_mixture_lora.sglang"
+    if external_package not in (None, mixture_external_package):
+        raise ValueError(
+            "Mixture-of-LoRA requires the Qwen3 external model package, "
+            f"but sglang_external_model_package is {external_package!r}"
+        )
+    os.environ["RELAX_MIXTURE_LORA_CONFIG"] = serialize_mixture_lora_config(config)
+    return mixture_external_package
+
+
+def megatron_mixture_lora_name_to_sglang(parameter_name: str) -> str:
+    """Map one stable Megatron Mixture parameter name to Qwen3 SGLang."""
+
+    if not isinstance(parameter_name, str) or ".mixture_lora." not in parameter_name:
+        raise ValueError(f"Invalid Mixture-of-LoRA parameter name: {parameter_name!r}")
+    site_id, parameter_kind = parameter_name.split(".mixture_lora.", maxsplit=1)
+    if parameter_kind not in _PARAMETER_KINDS:
+        raise ValueError(f"Unsupported Mixture-of-LoRA parameter kind: {parameter_kind!r}")
+    site_parts = site_id.split(".")
+    if len(site_parts) != 5 or site_parts[:2] != ["decoder", "layers"] or site_parts[3] != "self_attention":
+        raise ValueError(f"Unsupported Mixture-of-LoRA site_id: {site_id!r}")
+    try:
+        layer_id = int(site_parts[2])
+    except ValueError as error:
+        raise ValueError(f"Mixture-of-LoRA layer id must be an integer: {site_parts[2]!r}") from error
+    if layer_id < 0:
+        raise ValueError(f"Mixture-of-LoRA layer id must be non-negative: {layer_id}")
+    target_mapping = {
+        "linear_qkv": "qkv_proj",
+        "linear_proj": "o_proj",
+    }
+    target = site_parts[4]
+    if target not in target_mapping:
+        raise ValueError(f"Unsupported Mixture-of-LoRA target module: {target!r}")
+    return f"model.layers.{layer_id}.self_attn.{target_mapping[target]}.mixture_lora.{parameter_kind}"
 
 
 @dataclass(frozen=True)
