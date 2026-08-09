@@ -113,15 +113,25 @@ def scheduler_state_was_restored(args, resumed_from_megatron: bool) -> bool:
     )
 
 
-def _checkpoint_iteration_dir(load_path: str | Path) -> Path:
+def _checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path:
     path = Path(load_path)
     if re.fullmatch(r"iter_\d{7}", path.name):
         return path
     tracker = path / "latest_checkpointed_iteration.txt"
     try:
-        iteration = int(tracker.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError) as exc:
+        metadata = tracker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
         raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if metadata == "release":
+        return path / "release"
+    try:
+        iteration = int(metadata)
+    except ValueError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if ckpt_step is not None:
+        iteration = int(ckpt_step)
+    if iteration < 0:
+        raise RuntimeError(f"Megatron checkpoint iteration must be non-negative, got {iteration}")
     return path / f"iter_{iteration:07d}"
 
 
@@ -153,6 +163,23 @@ def _validate_reward_model_tensor_metadata(tensor_metadata: dict, hidden_size: i
 def _validate_checkpoint_contract(args, ddp_model, checkpoint_dir: Path) -> None:
     from megatron.core import dist_checkpointing
 
+    role = getattr(ddp_model[0], "role", "actor")
+    current_is_rm = (
+        role == "actor"
+        and getattr(args, "loss_type", None) == "sft"
+        and getattr(args, "sft_objective", "causal_lm") == "reward_model"
+    )
+    if current_is_rm and checkpoint_dir.name == "release":
+        raise RuntimeError(
+            "RM resume rejects release checkpoints because optimizer, scheduler, and RNG state are absent"
+        )
+    if not dist_checkpointing.check_is_distributed_checkpoint(str(checkpoint_dir)):
+        if current_is_rm:
+            raise RuntimeError(
+                "RM resume requires a distributed checkpoint with contract metadata; legacy Megatron "
+                "checkpoints are not supported"
+            )
+        return
     common = dist_checkpointing.load_common_state_dict(checkpoint_dir)
     saved_args = common.get("args")
     if saved_args is None:
@@ -160,12 +187,6 @@ def _validate_checkpoint_contract(args, ddp_model, checkpoint_dir: Path) -> None
     saved_objective = _metadata_value(saved_args, "sft_objective")
     saved_head_type = _metadata_value(saved_args, "head_type")
     saved_role = _metadata_value(saved_args, "checkpoint_role")
-    role = getattr(ddp_model[0], "role", "actor")
-    current_is_rm = (
-        role == "actor"
-        and getattr(args, "loss_type", None) == "sft"
-        and getattr(args, "sft_objective", "causal_lm") == "reward_model"
-    )
     saved_is_rm = saved_objective == "reward_model" or saved_head_type == REWARD_MODEL_HEAD_TYPE
 
     if current_is_rm:
@@ -203,7 +224,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
     if exist and is_megatron_checkpoint(load_path):
-        _validate_checkpoint_contract(args, ddp_model, _checkpoint_iteration_dir(load_path))
+        _validate_checkpoint_contract(
+            args,
+            ddp_model,
+            _checkpoint_iteration_dir(load_path, getattr(args, "ckpt_step", None)),
+        )
         try:
             return _load_checkpoint_megatron(
                 ddp_model=ddp_model,
