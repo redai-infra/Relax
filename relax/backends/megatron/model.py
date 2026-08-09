@@ -50,6 +50,8 @@ from .mixture_lora import (
     MixtureParallelLinearAdapter,
     activate_mixture_lora_routing_context,
     get_microbatch_objective_scale,
+    mixture_lora_metrics_from_packed_records,
+    pack_mixture_lora_routing_records,
 )
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
@@ -57,29 +59,74 @@ from .model_provider import get_model_provider_func, wrap_model_provider_with_fr
 logger = get_logger(__name__)
 
 
-def _get_global_mixture_lora_site_count(args: Namespace, model: Sequence[DDP]) -> int:
-    cached_count = getattr(args, "_mixture_lora_global_site_count", None)
-    if cached_count is not None:
-        return cached_count
+def _get_global_mixture_lora_metadata(args: Namespace, model: Sequence[DDP]) -> tuple[tuple[str, ...], int, int]:
+    cached_metadata = getattr(args, "_mixture_lora_global_metadata", None)
+    if cached_metadata is not None:
+        return cached_metadata
 
-    local_site_ids = {
-        module.mixture_lora.site_id
+    local_adapters = [
+        module
         for model_chunk in model
         for module in model_chunk.modules()
         if isinstance(module, MixtureParallelLinearAdapter)
-    }
-    site_count = torch.tensor(
-        len(local_site_ids),
-        dtype=torch.int64,
-        device=next(model[0].parameters()).device,
-    )
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        torch.distributed.all_reduce(site_count, group=mpu.get_pipeline_model_parallel_group())
-    global_site_count = int(site_count.item())
-    if global_site_count <= 0:
+    ]
+    local_site_ids = sorted({module.mixture_lora.site_id for module in local_adapters})
+    if len(local_site_ids) != len(local_adapters):
+        raise RuntimeError("Mixture-of-LoRA site_id values must be unique within a pipeline stage")
+
+    pipeline_world_size = mpu.get_pipeline_model_parallel_world_size()
+    if pipeline_world_size > 1:
+        gathered_site_ids: list[list[str] | None] = [None] * pipeline_world_size
+        torch.distributed.all_gather_object(
+            gathered_site_ids,
+            local_site_ids,
+            group=mpu.get_pipeline_model_parallel_group(),
+        )
+        global_site_ids = tuple(sorted(site_id for stage_ids in gathered_site_ids for site_id in stage_ids or []))
+    else:
+        global_site_ids = tuple(local_site_ids)
+    if not global_site_ids:
         raise RuntimeError("Mixture-of-LoRA is enabled but the model contains no routed sites")
-    args._mixture_lora_global_site_count = global_site_count
-    return global_site_count
+    if len(global_site_ids) != len(set(global_site_ids)):
+        raise RuntimeError("Mixture-of-LoRA site_id values must be unique across pipeline stages")
+
+    metadata = (global_site_ids, args.lora_num_experts, args.lora_router_top_k)
+    args._mixture_lora_global_metadata = metadata
+    return metadata
+
+
+def _reduce_mixture_lora_routing_metrics(
+    args: Namespace,
+    contexts: list[MixtureLoRARoutingContext],
+    metadata: tuple[tuple[str, ...], int, int],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Reduce detached routing records after the pipeline schedule finishes."""
+
+    site_ids, num_experts, top_k = metadata
+    packed = pack_mixture_lora_routing_records(
+        contexts,
+        site_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        device=device,
+    )
+    data_parallel_world_size_with_cp = mpu.get_data_parallel_world_size(with_context_parallel=True)
+    if data_parallel_world_size_with_cp > 1:
+        torch.distributed.all_reduce(
+            packed,
+            group=mpu.get_data_parallel_group(with_context_parallel=True),
+        )
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        torch.distributed.all_reduce(packed, group=mpu.get_pipeline_model_parallel_group())
+    return mixture_lora_metrics_from_packed_records(
+        packed,
+        site_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        data_parallel_world_size_with_cp=data_parallel_world_size_with_cp,
+    )
 
 
 def _build_mixture_lora_routing_context(
@@ -1055,7 +1102,8 @@ def train_one_step(
 
     main_loss_has_tokens = False
     mixture_lora_enabled = is_mixture_lora_enabled(args)
-    mixture_lora_num_sites = _get_global_mixture_lora_site_count(args, model) if mixture_lora_enabled else 0
+    mixture_lora_metadata = _get_global_mixture_lora_metadata(args, model) if mixture_lora_enabled else None
+    mixture_lora_num_sites = len(mixture_lora_metadata[0]) if mixture_lora_metadata is not None else 0
     # Checkpoint closures retain these contexts until their microbatch backward completes.
     routing_contexts: list[MixtureLoRARoutingContext] = []
     next_routing_microbatch_id = 0
@@ -1267,7 +1315,15 @@ def train_one_step(
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
 
-    # All checkpoint recomputation and aux backward work is complete here.
+    mixture_lora_metrics = {}
+    if mixture_lora_metadata is not None:
+        mixture_lora_metrics = _reduce_mixture_lora_routing_metrics(
+            args,
+            routing_contexts,
+            mixture_lora_metadata,
+            next(model[0].parameters()).device,
+        )
+    # All checkpoint recomputation, aux backward, and metric reduction work is complete here.
     routing_contexts.clear()
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
@@ -1354,6 +1410,7 @@ def train_one_step(
             # CP degree under dynamic CP (and is a no-op under static CP, where the
             # count previously carried the cancelling cp factor).
             loss_reduced[key] = value / num_samples_or_tokens
+        loss_reduced.update(mixture_lora_metrics)
         return loss_reduced, grad_norm
     return {}, grad_norm
 

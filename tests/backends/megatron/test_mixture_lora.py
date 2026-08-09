@@ -19,6 +19,8 @@ from relax.backends.megatron.mixture_lora import (
     get_microbatch_objective_scale,
     get_mixture_lora_routing_context,
     install_mixture_lora_checkpoint_context,
+    mixture_lora_metrics_from_packed_records,
+    pack_mixture_lora_routing_records,
 )
 from relax.utils.mixture_lora import MixtureLoraConfig, compute_routing_statistics
 
@@ -312,6 +314,135 @@ def test_dummy_routing_context_records_zero_aux_loss():
     torch.testing.assert_close(record.statistics.valid_token_count, torch.tensor(0.0))
     torch.testing.assert_close(record.balance_loss, torch.tensor(0.0))
     torch.testing.assert_close(record.aux_loss, torch.tensor(0.0))
+    torch.testing.assert_close(record.objective_weight, torch.tensor(0.0))
+
+
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+def test_routing_records_pack_and_report_step_metrics(calculate_per_token_loss):
+    config = _config()
+    adapters = [
+        MixtureLoRAAdapter(
+            config,
+            site_id,
+            4,
+            5,
+            dropout=0.0,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        for site_id in ("layers.0.linear_qkv", "layers.1.linear_qkv")
+    ]
+    context = MixtureLoRARoutingContext(
+        optimizer_step=3,
+        microbatch_id=1,
+        response_mask=torch.tensor([[0, 1, 1], [1, 1, 0]], dtype=torch.bool),
+        num_microbatches=2,
+        num_sites=2,
+        num_samples=2,
+        calculate_per_token_loss=calculate_per_token_loss,
+        objective_scale=1.0 if calculate_per_token_loss else 0.25,
+        main_loss_backward_scale=torch.ones(1),
+    )
+    x = torch.randn(3, 2, 4)
+    with activate_mixture_lora_routing_context(context):
+        for adapter in adapters:
+            adapter(x)
+
+    site_ids = tuple(adapter.site_id for adapter in adapters)
+    packed = pack_mixture_lora_routing_records(
+        [context],
+        site_ids,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        device=torch.device("cpu"),
+    )
+    metrics = mixture_lora_metrics_from_packed_records(
+        packed,
+        site_ids,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        calculate_per_token_loss=calculate_per_token_loss,
+        data_parallel_world_size_with_cp=2,
+    )
+
+    for site_id in site_ids:
+        record = context.records[site_id]
+        prefix = f"molora/{site_id}"
+        for expert_id in range(config.num_experts):
+            torch.testing.assert_close(
+                metrics[f"{prefix}/expert_{expert_id}_pre_topk_mean_prob"],
+                record.statistics.pre_topk_mean_prob[expert_id].double(),
+            )
+            torch.testing.assert_close(
+                metrics[f"{prefix}/expert_{expert_id}_post_topk_mean_weight"],
+                record.statistics.post_topk_mean_weight[expert_id].double(),
+            )
+        torch.testing.assert_close(metrics[f"{prefix}/balance_loss"], record.balance_loss.double())
+    torch.testing.assert_close(
+        sum(metrics[f"molora/global/expert_{expert_id}_selection_share"] for expert_id in range(config.num_experts)),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    aux_loss_sum = sum(record.aux_loss for record in context.records.values()).double()
+    denominator = (
+        next(iter(context.records.values())).statistics.valid_token_count.double()
+        if calculate_per_token_loss
+        else torch.tensor(2.0, dtype=torch.float64)
+    )
+    torch.testing.assert_close(metrics["molora/aux_loss"], aux_loss_sum / denominator)
+
+
+def test_recompute_replaces_routing_record_instead_of_counting_twice():
+    adapter = MixtureLoRAAdapter(
+        _config(),
+        "linear_qkv",
+        4,
+        5,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    context = MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=0,
+        response_mask=torch.ones(1, 2),
+        num_microbatches=1,
+        num_sites=1,
+        num_samples=1,
+        calculate_per_token_loss=False,
+        objective_scale=1.0,
+        main_loss_backward_scale=torch.ones(1),
+    )
+
+    with activate_mixture_lora_routing_context(context):
+        adapter(torch.ones(2, 1, 4))
+        _, recomputed_decision = adapter.forward_with_routing(torch.full((2, 1, 4), 2.0))
+
+    assert len(context.records) == 1
+    expected = compute_routing_statistics(recomputed_decision, torch.ones(2))
+    torch.testing.assert_close(
+        context.records[adapter.site_id].statistics.pre_topk_prob_sum, expected.pre_topk_prob_sum
+    )
+
+
+def test_empty_routing_records_produce_zero_metrics():
+    site_ids = ("layers.0.linear_qkv",)
+    packed = pack_mixture_lora_routing_records(
+        [],
+        site_ids,
+        num_experts=3,
+        top_k=2,
+        device=torch.device("cpu"),
+    )
+    metrics = mixture_lora_metrics_from_packed_records(
+        packed,
+        site_ids,
+        num_experts=3,
+        top_k=2,
+        calculate_per_token_loss=True,
+        data_parallel_world_size_with_cp=1,
+    )
+
+    assert all(metric.item() == 0.0 for metric in metrics.values())
 
 
 def test_checkpoint_wrapper_restores_captured_routing_context(monkeypatch):

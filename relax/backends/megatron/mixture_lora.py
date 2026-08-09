@@ -31,6 +31,7 @@ class MixtureLoRARoutingRecord:
     statistics: RoutingStatistics
     balance_loss: torch.Tensor
     aux_loss: torch.Tensor
+    objective_weight: torch.Tensor
 
 
 class _AttachAuxLoss(torch.autograd.Function):
@@ -111,18 +112,21 @@ class MixtureLoRARoutingContext:
         # average of independent per-token losses.
         balance_loss = statistics.balance_loss
         site_aux_loss = balance_loss * (config.aux_loss_coef / self.num_sites)
-        if self.calculate_per_token_loss:
-            aux_loss_payload = site_aux_loss * statistics.valid_token_count
-        else:
-            aux_loss_payload = site_aux_loss * self.num_samples
-
-        objective_aux_loss = aux_loss_payload * self.objective_scale
+        sample_or_token_count = (
+            statistics.valid_token_count
+            if self.calculate_per_token_loss
+            else statistics.valid_token_count.new_tensor(self.num_samples)
+        )
+        objective_weight = sample_or_token_count * self.objective_scale
+        aux_loss_payload = site_aux_loss * sample_or_token_count
+        objective_aux_loss = site_aux_loss * objective_weight
         key = (self.optimizer_step, self.microbatch_id, site_id)
         self.records[site_id] = MixtureLoRARoutingRecord(
             key=key,
             statistics=_detach_routing_statistics(statistics),
             balance_loss=balance_loss.detach(),
             aux_loss=objective_aux_loss.detach(),
+            objective_weight=objective_weight.detach(),
         )
 
         backward_scale = self.main_loss_backward_scale.to(device=output.device) * self.objective_scale
@@ -245,6 +249,109 @@ def _detach_routing_statistics(statistics: RoutingStatistics) -> RoutingStatisti
         valid_token_count=statistics.valid_token_count.detach(),
         top_k=statistics.top_k,
     )
+
+
+def pack_mixture_lora_routing_records(
+    contexts: list[MixtureLoRARoutingContext],
+    site_ids: tuple[str, ...],
+    *,
+    num_experts: int,
+    top_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pack local step statistics into a fixed site-major tensor."""
+
+    if not site_ids or len(set(site_ids)) != len(site_ids):
+        raise ValueError("site_ids must be non-empty and unique")
+    if num_experts <= 0 or not 1 <= top_k <= num_experts:
+        raise ValueError("num_experts and top_k do not describe a valid router")
+
+    scalar_fields = 6
+    row_width = 4 * num_experts + scalar_fields
+    packed = torch.zeros(len(site_ids), row_width, dtype=torch.float64, device=device)
+    site_indices = {site_id: index for index, site_id in enumerate(site_ids)}
+    scalar_offset = 4 * num_experts
+
+    for context in contexts:
+        for site_id, record in context.records.items():
+            if site_id not in site_indices:
+                raise ValueError(f"routing record references unknown site_id {site_id!r}")
+            statistics = record.statistics
+            if statistics.pre_topk_prob_sum.numel() != num_experts or statistics.top_k != top_k:
+                raise ValueError(f"routing record for {site_id!r} does not match the configured router")
+
+            row = packed[site_indices[site_id]]
+            row[0:num_experts] += statistics.pre_topk_prob_sum.to(device=device, dtype=packed.dtype)
+            row[num_experts : 2 * num_experts] += statistics.post_topk_weight_sum.to(device=device, dtype=packed.dtype)
+            row[2 * num_experts : 3 * num_experts] += statistics.selection_count.to(device=device, dtype=packed.dtype)
+            row[3 * num_experts : 4 * num_experts] += statistics.top1_count.to(device=device, dtype=packed.dtype)
+            row[scalar_offset] += statistics.pre_topk_entropy_sum.to(device=device, dtype=packed.dtype)
+            row[scalar_offset + 1] += statistics.post_topk_entropy_sum.to(device=device, dtype=packed.dtype)
+            row[scalar_offset + 2] += statistics.valid_token_count.to(device=device, dtype=packed.dtype)
+            row[scalar_offset + 3] += (record.balance_loss * record.objective_weight).to(
+                device=device, dtype=packed.dtype
+            )
+            row[scalar_offset + 4] += record.objective_weight.to(device=device, dtype=packed.dtype)
+            row[scalar_offset + 5] += record.aux_loss.to(device=device, dtype=packed.dtype)
+
+    return packed
+
+
+def mixture_lora_metrics_from_packed_records(
+    packed: torch.Tensor,
+    site_ids: tuple[str, ...],
+    *,
+    num_experts: int,
+    top_k: int,
+    calculate_per_token_loss: bool,
+    data_parallel_world_size_with_cp: int,
+) -> dict[str, torch.Tensor]:
+    """Compute routed-site and global metrics after distributed reduction."""
+
+    expected_shape = (len(site_ids), 4 * num_experts + 6)
+    if tuple(packed.shape) != expected_shape:
+        raise ValueError(f"packed routing statistics must have shape {expected_shape}, got {tuple(packed.shape)}")
+    if data_parallel_world_size_with_cp <= 0:
+        raise ValueError("data_parallel_world_size_with_cp must be positive")
+
+    scalar_offset = 4 * num_experts
+    metrics: dict[str, torch.Tensor] = {}
+
+    def divide_or_zero(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+        nonzero = denominator > 0
+        safe_denominator = torch.where(nonzero, denominator, torch.ones_like(denominator))
+        return numerator / safe_denominator * nonzero.to(numerator.dtype)
+
+    def add_statistics(prefix: str, row: torch.Tensor) -> None:
+        valid_token_count = row[scalar_offset + 2]
+        pre_topk_mean_prob = divide_or_zero(row[0:num_experts], valid_token_count)
+        post_topk_mean_weight = divide_or_zero(row[num_experts : 2 * num_experts], valid_token_count)
+        selection_share = divide_or_zero(row[2 * num_experts : 3 * num_experts], valid_token_count * top_k)
+        top1_fraction = divide_or_zero(row[3 * num_experts : 4 * num_experts], valid_token_count)
+        for expert_id in range(num_experts):
+            metrics[f"{prefix}/expert_{expert_id}_pre_topk_mean_prob"] = pre_topk_mean_prob[expert_id]
+            metrics[f"{prefix}/expert_{expert_id}_post_topk_mean_weight"] = post_topk_mean_weight[expert_id]
+            metrics[f"{prefix}/expert_{expert_id}_selection_share"] = selection_share[expert_id]
+            metrics[f"{prefix}/expert_{expert_id}_top1_fraction"] = top1_fraction[expert_id]
+        metrics[f"{prefix}/pre_topk_normalized_entropy"] = divide_or_zero(row[scalar_offset], valid_token_count)
+        metrics[f"{prefix}/post_topk_normalized_entropy"] = divide_or_zero(row[scalar_offset + 1], valid_token_count)
+
+    for site_id, row in zip(site_ids, packed, strict=True):
+        prefix = f"molora/{site_id}"
+        add_statistics(prefix, row)
+        metrics[f"{prefix}/balance_loss"] = divide_or_zero(row[scalar_offset + 3], row[scalar_offset + 4])
+
+    global_row = packed.sum(dim=0)
+    add_statistics("molora/global", global_row)
+    aux_loss_sum = global_row[scalar_offset + 5]
+    if calculate_per_token_loss:
+        # Every configured site routes the same response-token stream. Use one
+        # site's count so the site sum in the numerator is not divided twice.
+        aux_denominator = packed[0, scalar_offset + 2]
+    else:
+        aux_denominator = packed.new_tensor(data_parallel_world_size_with_cp)
+    metrics["molora/aux_loss"] = divide_or_zero(aux_loss_sum, aux_denominator)
+    return metrics
 
 
 class MixtureLoRAExperts(nn.Module):
@@ -500,4 +607,6 @@ __all__ = [
     "get_microbatch_objective_scale",
     "get_mixture_lora_routing_context",
     "install_mixture_lora_checkpoint_context",
+    "mixture_lora_metrics_from_packed_records",
+    "pack_mixture_lora_routing_records",
 ]
