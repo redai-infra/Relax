@@ -308,8 +308,12 @@ class UpdateWeightFromTensor:
         include_base = not self._mixture_lora_sync.base_sync_done
         all_engines = list(self.rollout_engines)
         rank = dist.get_rank()
+        quantization_restored = False
 
-        if rank == 0:
+        def pause_and_flush() -> None:
+            nonlocal quantization_restored
+            if rank != 0:
+                return
             ray.get([engine.pause_generation.remote() for engine in all_engines])
             ray.get([engine.flush_cache.remote() for engine in all_engines])
             if (
@@ -322,23 +326,27 @@ class UpdateWeightFromTensor:
                     post_process_quantization=False,
                     rollout_engines=all_engines,
                 )
-        dist.barrier(group=get_gloo_group())
+                quantization_restored = True
 
-        local_weights = self.weights_getter()
-        base_chunks = self._hf_weight_iterator.get_hf_weight_chunks(local_weights)
-        mixture_chunks = self._mixture_lora_sync.get_weight_chunks(local_weights)
-        updates = iter_mixture_weight_updates(
-            base_chunks,
-            mixture_chunks,
-            include_base=include_base,
-            weight_version=next_weight_version,
-        )
-        self._send_weight_update_stream(updates)
+        def send_weights() -> None:
+            local_weights = self.weights_getter()
+            base_chunks = self._hf_weight_iterator.get_hf_weight_chunks(local_weights)
+            mixture_chunks = self._mixture_lora_sync.get_weight_chunks(local_weights)
+            updates = iter_mixture_weight_updates(
+                base_chunks,
+                mixture_chunks,
+                include_base=include_base,
+                weight_version=next_weight_version,
+            )
+            self._send_weight_update_stream(updates)
 
-        dist.barrier(group=get_gloo_group())
-        if rank == 0:
+        def resume_generation(*, finish_quantization: bool) -> None:
+            if rank != 0:
+                return
             if (
-                include_base
+                finish_quantization
+                and quantization_restored
+                and include_base
                 and self.quantization_config
                 and self.quantization_config["quant_method"] in ["compressed-tensors"]
             ):
@@ -348,10 +356,47 @@ class UpdateWeightFromTensor:
                     rollout_engines=all_engines,
                 )
             ray.get([engine.continue_generation.remote() for engine in all_engines])
-        dist.barrier(group=get_gloo_group())
+
+        for phase_name, operation in (("pause and flush", pause_and_flush), ("send weights", send_weights)):
+            local_error, phase_failed = self._run_synchronized_weight_update_phase(operation)
+            if not phase_failed:
+                continue
+
+            cleanup_error, _ = self._run_synchronized_weight_update_phase(
+                lambda: resume_generation(finish_quantization=True)
+            )
+            if cleanup_error is not None:
+                logger.error(
+                    "Failed to resume rollout generation after Mixture-of-LoRA update failure",
+                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                )
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(f"Mixture-of-LoRA weight update phase {phase_name!r} failed on another rank")
+
+        local_error, phase_failed = self._run_synchronized_weight_update_phase(
+            lambda: resume_generation(finish_quantization=True)
+        )
+        if phase_failed:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("Mixture-of-LoRA weight update phase 'resume generation' failed on another rank")
 
         self.weight_version = next_weight_version
         self._mixture_lora_sync.base_sync_done = True
+
+    @staticmethod
+    def _run_synchronized_weight_update_phase(operation):
+        """Run one update phase and share its failure state across ranks."""
+
+        local_error = None
+        try:
+            operation()
+        except Exception as error:
+            local_error = error
+        failed = torch.tensor([local_error is not None], dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        return local_error, bool(failed.item())
 
     def _send_weight_update_stream(self, updates) -> None:
         """Pipeline conversion collectives with the preceding IPC request."""
@@ -360,12 +405,18 @@ class UpdateWeightFromTensor:
         previous_tensors = None
         for named_tensors, weight_version in updates:
             refs, long_lived_tensors = self._send_hf_params(named_tensors, weight_version=weight_version)
+            previous_error = None
             if previous_refs:
-                ray.get(previous_refs)
+                try:
+                    ray.get(previous_refs)
+                except Exception as error:
+                    previous_error = error
             del previous_tensors
             previous_refs = refs
             previous_tensors = long_lived_tensors
             device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+            if previous_error is not None:
+                raise previous_error
         if previous_refs:
             ray.get(previous_refs)
         del previous_tensors

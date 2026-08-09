@@ -265,7 +265,7 @@ def test_update_lifecycle_keeps_call_order_and_skips_base_after_first_sync():
 
     with (
         patch("torch.distributed.get_rank", return_value=0),
-        patch("torch.distributed.barrier"),
+        patch("torch.distributed.all_reduce"),
         patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
         patch("ray.get", side_effect=lambda refs: refs),
     ):
@@ -286,3 +286,73 @@ def test_update_lifecycle_keeps_call_order_and_skips_base_after_first_sync():
     )
     assert updater.weight_version == 2
     assert updater._mixture_lora_sync.base_sync_done is True
+
+
+def test_update_failure_resumes_generation_and_keeps_previous_version():
+    from relax.backends.megatron.weight_update.update_weight_from_tensor import UpdateWeightFromTensor
+
+    events = []
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self):
+            events.append(self.name)
+            return self.name
+
+    engine = SimpleNamespace(
+        pause_generation=RemoteMethod("pause"),
+        flush_cache=RemoteMethod("flush"),
+        continue_generation=RemoteMethod("continue"),
+    )
+    updater = UpdateWeightFromTensor.__new__(UpdateWeightFromTensor)
+    updater.weight_version = 4
+    updater.rollout_engines = [engine]
+    updater.quantization_config = None
+    updater.weights_getter = MagicMock(return_value={"weight": torch.ones(1)})
+    updater._hf_weight_iterator = MagicMock()
+    updater._hf_weight_iterator.get_hf_weight_chunks.return_value = iter([[("base", torch.ones(1))]])
+    updater._mixture_lora_sync = SimpleNamespace(base_sync_done=False)
+    updater._mixture_lora_sync.get_weight_chunks = MagicMock(return_value=iter([[("router", torch.ones(1))]]))
+
+    def fail_update(_updates):
+        events.append("update")
+        raise RuntimeError("engine rejected routed weights")
+
+    updater._send_weight_update_stream = fail_update
+
+    with (
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.all_reduce"),
+        patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
+        patch("ray.get", side_effect=lambda refs: refs),
+        pytest.raises(RuntimeError, match="engine rejected routed weights"),
+    ):
+        updater._update_weights_mixture_lora()
+
+    assert events == ["pause", "flush", "update", "continue"]
+    assert updater.weight_version == 4
+    assert updater._mixture_lora_sync.base_sync_done is False
+
+
+def test_stream_failure_reaches_chunk_barrier_before_raising():
+    from relax.backends.megatron.weight_update.update_weight_from_tensor import UpdateWeightFromTensor
+
+    updater = UpdateWeightFromTensor.__new__(UpdateWeightFromTensor)
+    updater._send_hf_params = MagicMock(
+        side_effect=[(["first-ref"], ["first-tensor"]), (["second-ref"], ["second-tensor"])]
+    )
+
+    with (
+        patch("ray.get", side_effect=RuntimeError("engine update failed")),
+        patch(
+            "relax.backends.megatron.weight_update.update_weight_from_tensor."
+            "device_utils.maybe_backend_barrier_on_weight_chunk"
+        ) as chunk_barrier,
+        patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
+        pytest.raises(RuntimeError, match="engine update failed"),
+    ):
+        updater._send_weight_update_stream([([("first", torch.ones(1))], None), ([("second", torch.ones(1))], 5)])
+
+    assert chunk_barrier.call_count == 2
