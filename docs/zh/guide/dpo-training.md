@@ -31,15 +31,18 @@ chosen/rejected 必须共享完全相同的 prompt，并包含不同且非空的
 
 ```bash
 export MODEL_DIR=/models
+export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca
+export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-0.6B-${MODEL_REVISION}"
 export PROMPT_DATA=/data/task31-ultrafeedback/ultrafeedback_train.parquet
 export SAVE_DIR=/checkpoints/task31-dpo
 
+hf download Qwen/Qwen3-0.6B --revision "${MODEL_REVISION}" --local-dir "${HF_CHECKPOINT}"
 bash scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
 ```
 
 recipe 默认运行 200 个 optimizer step，每个 global batch 为 32 个 preference pair，`beta=0.1`，单分支最大 1,024 token。可以显式覆盖 `GLOBAL_BATCH_SIZE`、`NUM_ROLLOUT`、`MAX_TOKENS_PER_GPU` 和 `SAVE_INTERVAL`。
 
-标准 DPO 会从固定 repository revision 重建冻结 reference。checkpoint 带有 reference identity sidecar，其中保存 canonical parameter digest 和固定 probe digest；sidecar 缺失或不一致时，会在下一次 forward 前失败。
+标准 DPO 会先在本地 `HF_CHECKPOINT` 目录中校验固定的 repository revision，再从该目录重建冻结 reference。checkpoint 带有 reference identity sidecar，其中保存 canonical parameter digest 和固定 probe digest；sidecar 缺失或不一致时，会在下一次 forward 前失败。
 
 probe digest 是对冻结 reference log-probability 的逐字节 SHA-256，因此 resume 假定 GPU 型号、驱动、镜像与内核栈与原运行完全一致。在不同硬件或软件环境上 resume 会按设计触发 probe 校验失败——这表示环境不匹配，而非数据损坏。
 

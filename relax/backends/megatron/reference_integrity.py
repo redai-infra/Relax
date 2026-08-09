@@ -17,6 +17,42 @@ REFERENCE_IDENTITY_FILENAME = "relax_dpo_reference.json"
 REFERENCE_LOADER_MODE = "hf_bridge_model_only_v1"
 
 
+def resolve_dpo_reference_checkpoint(repository: str, revision: str, local_checkpoint: str) -> str:
+    """Resolve a pinned DPO reference in the configured local model
+    directory."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError("standard DPO requires huggingface_hub to resolve its frozen reference") from exc
+
+    try:
+        configured_checkpoint = Path(local_checkpoint).resolve(strict=True)
+        checkpoint = Path(
+            snapshot_download(
+                repo_id=repository,
+                revision=revision,
+                local_dir=str(configured_checkpoint),
+                local_files_only=True,
+            )
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "standard DPO requires its pinned reference in --hf-checkpoint; prepare it with "
+            f"`hf download {repository} --revision {revision} --local-dir {local_checkpoint}`"
+        ) from exc
+    if checkpoint != configured_checkpoint:
+        raise RuntimeError(
+            "DPO reference resolution returned a directory different from --hf-checkpoint: "
+            f"configured={configured_checkpoint}, resolved={checkpoint}"
+        )
+    if not (checkpoint / "config.json").is_file():
+        raise RuntimeError(
+            "resolved DPO reference snapshot is missing config.json: "
+            f"repository={repository!r}, revision={revision!r}, path={checkpoint}"
+        )
+    return str(checkpoint)
+
+
 @dataclass(frozen=True)
 class DPOReferenceIdentity:
     """Identity persisted beside every standard-DPO checkpoint."""
@@ -171,5 +207,6 @@ __all__ = [
     "read_reference_identity",
     "reference_identity_path",
     "reference_probe_sha256",
+    "resolve_dpo_reference_checkpoint",
     "write_reference_identity",
 ]

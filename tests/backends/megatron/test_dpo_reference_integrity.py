@@ -3,6 +3,8 @@
 """Frozen-reference checksum, probe, optimizer and sidecar tests."""
 
 import json
+import sys
+import types
 from argparse import Namespace
 
 import pytest
@@ -15,6 +17,7 @@ from relax.backends.megatron.reference_integrity import (
     canonical_tensor_sha256,
     read_reference_identity,
     reference_probe_sha256,
+    resolve_dpo_reference_checkpoint,
     write_reference_identity,
 )
 
@@ -79,6 +82,55 @@ def test_reference_identity_sidecar_is_required_and_rejects_schema_damage(tmp_pa
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported"):
         read_reference_identity(path)
+
+
+def test_resolve_dpo_reference_checkpoint_uses_the_pinned_configured_local_snapshot(monkeypatch, tmp_path):
+    snapshot = tmp_path / "Qwen3-0.6B-fixed-revision"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    observed = {}
+
+    def snapshot_download(**kwargs):
+        observed.update(kwargs)
+        return str(snapshot)
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=snapshot_download))
+    assert resolve_dpo_reference_checkpoint("org/model", "fixed-revision", str(snapshot)) == str(snapshot.resolve())
+    assert observed == {
+        "repo_id": "org/model",
+        "revision": "fixed-revision",
+        "local_dir": str(snapshot.resolve()),
+        "local_files_only": True,
+    }
+
+
+def test_resolve_dpo_reference_checkpoint_rejects_missing_local_snapshot(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    def snapshot_download(**_kwargs):
+        raise OSError("not cached")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=snapshot_download))
+    with pytest.raises(RuntimeError, match="hf download org/model --revision fixed-revision"):
+        resolve_dpo_reference_checkpoint("org/model", "fixed-revision", str(checkpoint))
+
+
+def test_resolve_dpo_reference_checkpoint_rejects_different_resolved_directory(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    other = tmp_path / "other"
+    checkpoint.mkdir()
+    other.mkdir()
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    (other / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=lambda **_kwargs: str(other)),
+    )
+    with pytest.raises(RuntimeError, match="different from --hf-checkpoint"):
+        resolve_dpo_reference_checkpoint("org/model", "fixed-revision", str(checkpoint))
 
 
 def test_resume_probe_materializes_manifest_lists_as_tensors(monkeypatch):

@@ -89,7 +89,7 @@ def validate_preference_args(args: Namespace) -> None:
     if getattr(args, "ref_load", None) is not None:
         raise ValueError(
             "preference objectives do not use --ref-load: standard DPO snapshots the frozen reference "
-            "from the initialized policy and rebuilds it from --hf-checkpoint on resume"
+            "from the pinned --dpo-reference-repository/--dpo-reference-revision snapshot"
         )
     if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
         raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")

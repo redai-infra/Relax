@@ -103,6 +103,7 @@ from .reference_integrity import (
     read_reference_identity,
     reference_identity_path,
     reference_probe_sha256,
+    resolve_dpo_reference_checkpoint,
     write_reference_identity,
 )
 from .weight_update.common import named_params_and_buffers
@@ -285,13 +286,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
             if with_ref:
                 if is_preference_mode(args) and args.sft_objective == "dpo":
-                    if not resumed_from_megatron:
-                        self.weights_backuper.backup("ref")
-                        self._dpo_reference_identity = self._build_dpo_reference_identity()
-                    else:
+                    reference_checkpoint = resolve_dpo_reference_checkpoint(
+                        args.dpo_reference_repository, args.dpo_reference_revision, args.hf_checkpoint
+                    )
+                    if resumed_from_megatron:
                         identity_path = reference_identity_path(args.load, loaded_rollout_id)
                         self._expected_dpo_reference_identity = read_reference_identity(identity_path)
-                        self._rebuild_dpo_reference(args.hf_checkpoint)
+                    self._rebuild_dpo_reference(reference_checkpoint)
                 else:
                     self.load_other_checkpoint("ref", args.ref_load)
 

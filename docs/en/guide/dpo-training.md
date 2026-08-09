@@ -31,15 +31,18 @@ Download the pinned Qwen checkpoint, then set the model, data, and output locati
 
 ```bash
 export MODEL_DIR=/models
+export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca
+export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-0.6B-${MODEL_REVISION}"
 export PROMPT_DATA=/data/task31-ultrafeedback/ultrafeedback_train.parquet
 export SAVE_DIR=/checkpoints/task31-dpo
 
+hf download Qwen/Qwen3-0.6B --revision "${MODEL_REVISION}" --local-dir "${HF_CHECKPOINT}"
 bash scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
 ```
 
 The recipe defaults to 200 optimizer steps, 32 preference pairs per global batch, `beta=0.1`, and a 1,024-token branch limit. `GLOBAL_BATCH_SIZE`, `NUM_ROLLOUT`, `MAX_TOKENS_PER_GPU`, and `SAVE_INTERVAL` can be overridden explicitly.
 
-Standard DPO reconstructs the frozen reference from the pinned repository revision. Checkpoints include a reference-identity sidecar containing canonical parameter and fixed-probe digests. A missing or mismatched sidecar fails before the next forward pass.
+Standard DPO verifies the pinned repository revision against the local `HF_CHECKPOINT` directory, then reconstructs the frozen reference from that directory. Checkpoints include a reference-identity sidecar containing canonical parameter and fixed-probe digests. A missing or mismatched sidecar fails before the next forward pass.
 
 The probe digest is a byte-exact SHA-256 over frozen-reference log-probabilities, so resume assumes the same GPU model, driver, image, and kernel stack as the original run. Resuming on different hardware or software fails the probe check by design — treat it as an environment mismatch, not data corruption.
 
