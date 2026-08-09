@@ -157,3 +157,43 @@ def test_sglang_weight_loader_maps_training_names_and_validates_tensors():
             model,
             [("decoder.layers.1.self_attention.linear_qkv.mixture_lora.router.weight", torch.randn(4, 4))],
         )
+
+
+def test_sglang_weight_loader_skips_layers_owned_by_another_pp_stage():
+    model = _fake_qwen_model_with_routed_qkv()
+    model.model.start_layer = 0
+    model.model.end_layer = 1
+
+    loaded_names = load_sglang_mixture_lora_weights(
+        model,
+        [("decoder.layers.1.self_attention.linear_qkv.mixture_lora.router.weight", torch.randn(4, 4))],
+    )
+
+    assert loaded_names == set()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_sglang_adapter_can_be_captured_by_cuda_graph():
+    adapter = SGLangMixtureLoRA(
+        _config(),
+        "decoder.layers.0.self_attention.linear_qkv",
+        16,
+        24,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+    )
+    x = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            adapter(x)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output = adapter(x)
+    graph.replay()
+
+    assert captured_output.shape == (8, 24)
+    assert torch.isfinite(captured_output).all()

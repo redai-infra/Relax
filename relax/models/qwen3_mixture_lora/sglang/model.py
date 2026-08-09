@@ -132,6 +132,11 @@ def load_sglang_mixture_lora_weights(
         if target_name in loaded_names:
             raise ValueError(f"Duplicate Mixture-of-LoRA weight: {target_name}")
         if target_name not in parameters:
+            layer_id = int(target_name.split(".", maxsplit=3)[2])
+            start_layer = getattr(getattr(model, "model", None), "start_layer", None)
+            end_layer = getattr(getattr(model, "model", None), "end_layer", None)
+            if start_layer is not None and end_layer is not None and not start_layer <= layer_id < end_layer:
+                continue
             raise ValueError(f"Unknown Mixture-of-LoRA weight for SGLang: {target_name}")
         parameter = parameters[target_name]
         if tuple(loaded_weight.shape) != tuple(parameter.shape):
