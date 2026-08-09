@@ -35,6 +35,10 @@ def validate_preference_args(args: Namespace) -> None:
     if not is_preference_mode(args):
         return
     objective = sft_objective(args)
+    if objective == "reward_model" and getattr(args, "save_hf", None) is not None:
+        raise ValueError(
+            "reward_model v1 does not support --save-hf; use native Megatron checkpoints for RM persistence"
+        )
     if getattr(args, "custom_dataset_class_path", None):
         raise ValueError("preference objectives do not support --custom-dataset-class")
     if getattr(args, "multimodal_keys", None) is not None:

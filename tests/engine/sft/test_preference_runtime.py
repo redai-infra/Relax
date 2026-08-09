@@ -31,6 +31,7 @@ def _args(**overrides) -> Namespace:
         "hidden_dropout": 0.0,
         "attention_dropout": 0.0,
         "sft_predict_interval": None,
+        "save_hf": None,
         "eval_interval": None,
         "dpo_beta": 0.1,
         "rollout_temperature": 1.0,
@@ -99,5 +100,16 @@ def test_reward_model_accepts_hf_load_and_held_out_evaluation():
             enable_weights_backuper=False,
             dpo_reference_repository=None,
             dpo_reference_revision=None,
+            save_hf=None,
         )
     )
+
+
+def test_reward_model_rejects_hf_export():
+    with pytest.raises(ValueError, match="reward_model v1 does not support --save-hf"):
+        validate_preference_args(_args(sft_objective="reward_model", save_hf="/models/rm-{rollout_id}"))
+
+
+def test_dpo_and_causal_sft_keep_hf_export_support():
+    validate_preference_args(_args(save_hf="/models/dpo-{rollout_id}"))
+    validate_preference_args(_args(sft_objective="causal_lm", save_hf="/models/sft-{rollout_id}"))
