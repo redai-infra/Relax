@@ -31,7 +31,7 @@ chosen/rejected 必须共享完全相同的 prompt，并包含不同且非空的
 
 ```bash
 export MODEL_DIR=/models
-export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca
+export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca # 完整的 40 位 commit SHA
 export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-0.6B-${MODEL_REVISION}"
 export PROMPT_DATA=/data/task31-ultrafeedback/ultrafeedback_train.parquet
 export SAVE_DIR=/checkpoints/task31-dpo

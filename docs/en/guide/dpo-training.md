@@ -31,7 +31,7 @@ Download the pinned Qwen checkpoint, then set the model, data, and output locati
 
 ```bash
 export MODEL_DIR=/models
-export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca
+export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca # full 40-character commit SHA
 export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-0.6B-${MODEL_REVISION}"
 export PROMPT_DATA=/data/task31-ultrafeedback/ultrafeedback_train.parquet
 export SAVE_DIR=/checkpoints/task31-dpo

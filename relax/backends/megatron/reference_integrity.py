@@ -5,6 +5,7 @@
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -15,15 +16,20 @@ import torch
 
 REFERENCE_IDENTITY_FILENAME = "relax_dpo_reference.json"
 REFERENCE_LOADER_MODE = "hf_bridge_model_only_v1"
+_GIT_COMMIT_SHA256_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def resolve_dpo_reference_checkpoint(repository: str, revision: str, local_checkpoint: str) -> str:
     """Resolve a pinned DPO reference in the configured local model
     directory."""
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import get_cached_repo_tree, snapshot_download
+        from huggingface_hub.errors import CachedRepoTreeNotFoundError
     except ImportError as exc:
         raise RuntimeError("standard DPO requires huggingface_hub to resolve its frozen reference") from exc
+
+    if _GIT_COMMIT_SHA256_RE.fullmatch(revision) is None:
+        raise ValueError("standard DPO requires --dpo-reference-revision to be a full 40-character commit SHA")
 
     try:
         configured_checkpoint = Path(local_checkpoint).resolve(strict=True)
@@ -50,6 +56,17 @@ def resolve_dpo_reference_checkpoint(repository: str, revision: str, local_check
             "resolved DPO reference snapshot is missing config.json: "
             f"repository={repository!r}, revision={revision!r}, path={checkpoint}"
         )
+    try:
+        get_cached_repo_tree(
+            repo_id=repository,
+            revision=revision,
+            local_dir=str(configured_checkpoint),
+        )
+    except CachedRepoTreeNotFoundError as exc:
+        raise RuntimeError(
+            "DPO reference is missing pinned Hugging Face local-dir metadata; re-download it with "
+            f"`hf download {repository} --revision {revision} --local-dir {local_checkpoint}`"
+        ) from exc
     return str(checkpoint)
 
 
