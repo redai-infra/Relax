@@ -132,6 +132,14 @@ def test_rank_indices_reject_lengths_not_divisible_by_two_cp(cp_size):
         cpl.get_thd_context_parallel_rank_indices(bad, cp_size, 0, "zigzag")
 
 
+def test_gdn_rejects_packed_lengths_not_divisible_by_cp():
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    cu = _cu([8, 6])
+    with pytest.raises(ValueError, match="divisible by cp_size=4"):
+        GatedDeltaNet._resolve_cu_seqlens(None, None, cu, int(cu[-1]), "cu_seqlens_q", cp_size=4)
+
+
 def test_rank_indices_reject_unknown_layout():
     with pytest.raises(ValueError, match="Unsupported context-parallel layout"):
         cpl.get_thd_context_parallel_rank_indices(_cu([16, 16]), 2, 0, "contiguous_ish")
@@ -223,7 +231,7 @@ def test_chunkwise_config_only_requires_heads_divisible_by_tp():
 
 
 def test_all_gather_config_uses_the_tp_only_head_rule():
-    """`--gdn-cp-mode=all_gather` must be constructible on a non-divisible
+    """`--linear-cp-mode=all_gather` must be constructible on a non-divisible
     geometry.
 
     Relax's all-gather fallback keeps GDN weights TP-only, so declaring it
@@ -234,7 +242,7 @@ def test_all_gather_config_uses_the_tp_only_head_rule():
 
 
 def test_config_rejects_unresolved_and_unknown_linear_cp_mode():
-    """`auto` is resolved before construction; MCore must never see it."""
+    """MCore only accepts the three concrete execution modes."""
     for bad in ("auto", "allgather", "chunk", ""):
         with pytest.raises(AssertionError, match="linear_cp_mode"):
             _gdn_config(context_parallel_size=2, linear_cp_mode=bad)
