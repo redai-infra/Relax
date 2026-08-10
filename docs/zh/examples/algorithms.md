@@ -322,7 +322,7 @@ SAPO_ARGS=(
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
 | **REINFORCE++** | Token KL-to-go return + 全局 token 归一化 | PPO-Clip（硬裁剪） | shaped reward 中的 k1 KL |
 | **REINFORCE++-baseline** | Inclusive group mean + 全局 token 归一化 | PPO-Clip（硬裁剪） | 独立 k2 KL loss |
-| **Dr.GRPO** | 不除组内 std 的中心化 reward | 使用固定 `N * B` 分母的 PPO-Clip | 可选 KL reward shaping 或 explicit KL loss |
+| **Dr.GRPO** | 不除组内 std 的中心化 reward | 使用固定 `N * B` 分母的 PPO-Clip | 可选 explicit KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |

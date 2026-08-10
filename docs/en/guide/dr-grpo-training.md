@@ -1,6 +1,6 @@
 # Dr.GRPO Training
 
-Relax supports Dr.GRPO (Group Relative Policy Optimization Done Right) for synchronous dense-model training with the Megatron backend.
+Relax supports Dr.GRPO (Group Relative Policy Optimization Done Right) for closed-window dense-model training in synchronous colocate and hybrid modes with the Megatron backend.
 
 ## Overview
 
@@ -52,7 +52,7 @@ The implementation is split across four existing layers:
 |---|---|
 | Reward post-processing | Center rewards within each prompt group without group-std division |
 | Optimizer-window preparation | Count global `(N, T)` after the final loss masks are available and compute `alpha` |
-| Data iterator metadata | Replay the opaque `__loss_scale__` value on every micro-batch in the same optimizer window |
+| Data iterator metadata | Replay the opaque `__dr_grpo_window_scale__` value on every micro-batch in the same optimizer window |
 | Megatron loss path | Scale the combined Actor loss, then reuse Megatron's global `/T` gradient normalization |
 
 The same scale is applied to the policy-gradient, entropy, and explicit KL terms in the combined Actor loss. Micro-batch boundaries only control execution and do not change `N`, `T`, or the final denominator.
@@ -62,6 +62,8 @@ The same scale is applied to the policy-gradient, entropy, and explicit KL terms
 Dr.GRPO automatically enables `calculate_per_token_loss`. With CP greater than one, each CP rank contributes only the valid response tokens in its local zig-zag shard. Megatron sums the CP-local token counts before applying `/T`, so padding, CP degree, and micro-batch partitioning do not duplicate token counts.
 
 The optimizer-window `(N, T)` reduction uses the DP group without CP. CP ranks receive the same `alpha`, while Megatron remains responsible for assembling the global token normalizer.
+
+Pure fully-async training is rejected because its streaming `__loss_scale__` has different semantics and the Dr.GRPO fixed-budget metadata is not prepared from a closed optimizer window. Hybrid mode first closes and merges the optimizer window, so it can use the same Dr.GRPO metadata path as synchronous training.
 
 ## Quick Start
 
@@ -111,13 +113,13 @@ Adjust the GPU counts, model configuration, data paths, and token budget for you
 | `--global-batch-size` | `None` | Number of responses in one optimizer step for the usual fixed-size schedule |
 | `--calculate-per-token-loss` | off | Automatically enabled for Dr.GRPO; required by Megatron when CP is enabled |
 | `--normalize-advantages` | off | Optionally apply masked advantage whitening after group centering |
-| `--disable-rewards-normalization` | off | Does not disable mandatory group centering for Dr.GRPO |
-| `--kl-coef` | `0.0` | Apply token-level KL reward shaping before the fixed-budget reduction |
+| `--disable-rewards-normalization` | off | Rejected because group centering is mandatory for Dr.GRPO |
+| `--kl-coef` | `0.0` | Must remain zero; Dr.GRPO does not add reward-side KL |
 | `--use-kl-loss` | off | Add an explicit KL loss term |
 | `--kl-loss-coef` | `0.0` | Coefficient of the explicit KL loss |
 | `--entropy-coef` | `0.0` | Coefficient of the entropy bonus |
 
-`--kl-coef` and a non-zero `--kl-loss-coef` cannot be enabled together. This is enforced by Relax's argument validation.
+Use `--use-kl-loss` with a positive `--kl-loss-coef` when an explicit KL penalty is required. Reward-side `--kl-coef` is rejected so GRPO and Dr.GRPO comparisons differ only in the two Dr.GRPO normalization changes.
 
 ## Best Practices
 
@@ -136,6 +138,10 @@ Keep `--calculate-per-token-loss` enabled. Dr.GRPO sets it automatically, and Me
 ### The fixed denominator is incorrect
 
 Check that `--rollout-max-response-len` matches the intended response budget and that custom rollout post-processing produces the final `loss_masks` before Actor training. `T` is counted from those final masks.
+
+### Pure fully-async training is rejected
+
+Use synchronous colocate or hybrid mode. Pure fully-async streaming does not yet prepare the closed-window `(N, T)` metadata required by the fixed denominator.
 
 ## Next Steps
 

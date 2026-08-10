@@ -2949,6 +2949,30 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
         )
 
 
+def _validate_dr_grpo_args(args) -> None:
+    """Validate Dr.GRPO's fixed-budget optimization contract."""
+    if getattr(args, "advantage_estimator", None) != "dr_grpo":
+        return
+
+    if type(args.rollout_max_response_len) is not int or args.rollout_max_response_len <= 0:
+        raise ValueError("--rollout-max-response-len must be a positive integer for Dr.GRPO.")
+    if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+        raise ValueError(
+            "Dr.GRPO does not support pure --fully-async training because its fixed-budget loss scale "
+            "requires a closed optimizer window; use synchronous colocate or --hybrid mode."
+        )
+    if not getattr(args, "rewards_normalization", True):
+        raise ValueError("Dr.GRPO requires group reward centering; --disable-rewards-normalization is not supported.")
+    if getattr(args, "kl_coef", 0.0) != 0:
+        raise ValueError(
+            "Dr.GRPO does not apply reward-side KL; set --kl-coef 0 and use --use-kl-loss with "
+            "--kl-loss-coef for an explicit KL penalty."
+        )
+
+    args.calculate_per_token_loss = True
+    logger.info("Dr.GRPO selected Megatron per-token normalization.")
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -3634,11 +3658,7 @@ def slime_validate_args(args):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
 
-    if args.advantage_estimator == "dr_grpo":
-        if type(args.rollout_max_response_len) is not int or args.rollout_max_response_len <= 0:
-            raise ValueError("--rollout-max-response-len must be a positive integer for Dr.GRPO.")
-        args.calculate_per_token_loss = True
-        logger.info("Dr.GRPO selected Megatron per-token normalization.")
+    _validate_dr_grpo_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(

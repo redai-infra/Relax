@@ -176,8 +176,6 @@ class Advantages(Base):
         if self.config.advantage_estimator in ["grpo", "dr_grpo", "gspo", "sapo", "cispo", "rloo"]:
             rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
             returns = get_grpo_returns(rewards, kl)
-            if self.config.advantage_estimator == "dr_grpo" and self.config.kl_coef != 0:
-                returns = [ret - self.config.kl_coef * k.detach() for ret, k in zip(returns, kl, strict=True)]
             advantages = list(returns)  # make a copy
 
         elif self.config.advantage_estimator == "ppo":

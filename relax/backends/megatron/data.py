@@ -700,7 +700,7 @@ class DataIterator:
 
         if self.metadata_by_microbatch is not None:
             batch.update(self.metadata_by_microbatch[self.microbatch_offset])
-        self.microbatch_offset += 1
+            self.microbatch_offset += 1
         return batch
 
     def reset(self) -> "DataIterator":
@@ -718,6 +718,9 @@ def bind_optimizer_window_metadata(
     """Replay opaque optimizer-specific window metadata on its micro-
     batches."""
     if metadata_by_window is None:
+        for iterator in data_iterators:
+            iterator.metadata_by_microbatch = None
+            iterator.microbatch_offset = 0
         return
 
     metadata_by_microbatch = [
@@ -727,6 +730,7 @@ def bind_optimizer_window_metadata(
     ]
     for iterator in data_iterators:
         iterator.metadata_by_microbatch = metadata_by_microbatch
+        iterator.microbatch_offset = 0
 
 
 def get_data_iterator(

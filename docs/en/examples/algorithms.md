@@ -325,7 +325,7 @@ SAPO_ARGS=(
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
 | **REINFORCE++** | Token KL-to-go return + global token normalization | PPO-Clip (hard clip) | k1 KL in shaped reward |
 | **REINFORCE++-baseline** | Inclusive group mean + global token normalization | PPO-Clip (hard clip) | Separate k2 KL loss |
-| **Dr.GRPO** | Group-centered reward without group std | PPO-Clip with fixed `N * B` denominator | Optional KL reward shaping or explicit KL loss |
+| **Dr.GRPO** | Group-centered reward without group std | PPO-Clip with fixed `N * B` denominator | Optional explicit KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |

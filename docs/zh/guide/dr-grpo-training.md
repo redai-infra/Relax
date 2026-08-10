@@ -1,6 +1,6 @@
 # Dr.GRPO 训练
 
-Relax 支持在 Megatron 后端上使用 Dr.GRPO（Group Relative Policy Optimization Done Right）进行同步 dense 模型训练。
+Relax 支持在 Megatron 后端的同步 colocate 和 hybrid 模式中，使用 Dr.GRPO（Group Relative Policy Optimization Done Right）进行 closed-window dense 模型训练。
 
 ## 概述
 
@@ -52,7 +52,7 @@ $$
 |---|---|
 | Reward 后处理 | 在每个 prompt group 内中心化 reward，不除以组内标准差 |
 | Optimizer-window preparation | 在最终 loss mask 就绪后统计全局 `(N, T)` 并计算 `alpha` |
-| Data iterator metadata | 将不透明的 `__loss_scale__` 重放到同一 optimizer window 的每个 micro-batch |
+| Data iterator metadata | 将不透明的 `__dr_grpo_window_scale__` 重放到同一 optimizer window 的每个 micro-batch |
 | Megatron loss 路径 | 缩放组合后的 Actor loss，再复用 Megatron 的全局 `/T` gradient normalization |
 
 组合 Actor loss 中的 policy-gradient、entropy 和 explicit KL 项使用同一个 scale。Micro-batch 边界只控制执行方式，不会改变 `N`、`T` 或最终分母。
@@ -62,6 +62,8 @@ $$
 Dr.GRPO 会自动启用 `calculate_per_token_loss`。当 CP 大于 1 时，每个 CP rank 只贡献其本地 zig-zag shard 中的有效 response token。Megatron 会先汇总 CP-local token count，再执行 `/T`，因此 padding、CP degree 和 micro-batch 划分不会造成 token 重复计数。
 
 Optimizer-window 的 `(N, T)` reduction 使用不包含 CP 的 DP group。所有 CP rank 获得相同的 `alpha`，全局 token normalizer 仍由 Megatron 负责汇总。
+
+纯 fully-async 训练会被拒绝，因为其 streaming `__loss_scale__` 语义不同，而且 Dr.GRPO 无法从闭合的 optimizer window 准备 fixed-budget metadata。Hybrid 模式会先闭合并合并 optimizer window，因此可以与同步训练复用相同的 Dr.GRPO metadata 路径。
 
 ## 快速开始
 
@@ -111,13 +113,13 @@ PERF_ARGS=(
 | `--global-batch-size` | `None` | 常规固定 batch schedule 下，每个 optimizer step 的 response 数 |
 | `--calculate-per-token-loss` | 关闭 | Dr.GRPO 会自动启用；Megatron 在 CP 场景下也强制要求 |
 | `--normalize-advantages` | 关闭 | 在组内中心化后可选执行 masked advantage whitening |
-| `--disable-rewards-normalization` | 关闭 | 不会关闭 Dr.GRPO 强制执行的组内中心化 |
-| `--kl-coef` | `0.0` | 在 fixed-budget reduction 前进行 token-level KL reward shaping |
+| `--disable-rewards-normalization` | 关闭 | 会被拒绝，因为 Dr.GRPO 必须执行组内中心化 |
+| `--kl-coef` | `0.0` | 必须保持为零；Dr.GRPO 不添加 reward-side KL |
 | `--use-kl-loss` | 关闭 | 添加 explicit KL loss 项 |
 | `--kl-loss-coef` | `0.0` | Explicit KL loss 的系数 |
 | `--entropy-coef` | `0.0` | Entropy bonus 的系数 |
 
-`--kl-coef` 与非零 `--kl-loss-coef` 不能同时启用，Relax 会在参数校验阶段检查该约束。
+需要显式 KL penalty 时，请组合使用 `--use-kl-loss` 和正数 `--kl-loss-coef`。Reward-side `--kl-coef` 会被拒绝，确保 GRPO 与 Dr.GRPO 对照只包含 Dr.GRPO 的两处 normalization 改动。
 
 ## 最佳实践
 
@@ -136,6 +138,10 @@ PERF_ARGS=(
 ### Fixed denominator 不正确
 
 检查 `--rollout-max-response-len` 是否与预期 response budget 一致，并确认自定义 rollout 后处理在 Actor 训练前已经生成最终 `loss_masks`。`T` 根据这些最终 mask 统计。
+
+### 纯 fully-async 训练被拒绝
+
+请使用同步 colocate 或 hybrid 模式。纯 fully-async streaming 尚未准备 fixed denominator 所需的 closed-window `(N, T)` metadata。
 
 ## 下一步
 

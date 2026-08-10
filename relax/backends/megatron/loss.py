@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from relax.utils import device as device_utils
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -579,8 +580,6 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     if args.advantage_estimator in ["grpo", "dr_grpo", "gspo", "sapo", "cispo", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
-        if args.advantage_estimator == "dr_grpo" and args.kl_coef != 0:
-            returns = [ret - args.kl_coef * k.detach() for ret, k in zip(returns, kl, strict=True)]
         # TODO: is the copy necessary?
         advantages = [r for r in returns]  # noqa: C416
 
@@ -739,12 +738,19 @@ def prepare_policy_optimizer_window_metadata(
 ) -> list[dict[str, torch.Tensor]] | None:
     """Prepare optimizer-window metadata consumed by the policy loss."""
     if args.advantage_estimator == "dr_grpo":
+        if type(args.rollout_max_response_len) is not int or args.rollout_max_response_len <= 0:
+            raise ValueError("--rollout-max-response-len must be a positive integer for Dr.GRPO.")
+
+        stats_device = device_utils.make_current_torch_device()
         step_stats = []
         start = 0
         for step_local_sample_count in step_local_sample_counts:
             end = start + step_local_sample_count
             local_response_tokens = torch.stack(
-                [mask.sum().to(dtype=torch.float32) for mask in rollout_data["loss_masks"][start:end]]
+                [
+                    mask.sum().to(device=stats_device, dtype=torch.float32)
+                    for mask in rollout_data["loss_masks"][start:end]
+                ]
             ).sum()
             step_stats.append(
                 torch.stack(
@@ -759,7 +765,7 @@ def prepare_policy_optimizer_window_metadata(
         stats = torch.stack(step_stats)
         dist.all_reduce(stats, group=mpu.get_data_parallel_group(with_context_parallel=False))
         step_loss_scales = stats[:, 1] / (stats[:, 0] * args.rollout_max_response_len)
-        return [{"__loss_scale__": scale} for scale in step_loss_scales]
+        return [{"__dr_grpo_window_scale__": scale} for scale in step_loss_scales]
 
     return None
 
@@ -1461,6 +1467,7 @@ def loss_function(
     # mbs must contribute zero gradient AND zero metric values.
     is_dummy = batch.get("__is_dummy__", False)
     explicit_loss_scale = batch.get("__loss_scale__", None)
+    dr_grpo_window_scale = batch.get("__dr_grpo_window_scale__", None)
 
     # Rescale the loss for Megatron's gradient accumulation. The non-per-token
     # branch folds in the DP(+CP) world size (cancelled by DDP's 1/dp_cp grad
@@ -1484,8 +1491,8 @@ def loss_function(
     else:
         if is_dummy:
             loss = 0.0 * loss
-        elif explicit_loss_scale is not None:
-            loss = loss * explicit_loss_scale
+        elif dr_grpo_window_scale is not None:
+            loss = loss * dr_grpo_window_scale
         # Non-dummy per-token path: do NOT scale by cp_size. `loss` is the
         # CP-local token-sum; finalize_model_grads normalizes the summed gradient
         # by the all-reduced CP-local `num_tokens`. A `* cp_size` here would weight
@@ -1493,10 +1500,10 @@ def loss_function(
         # (dynamic CP). Under static CP the removed factor exactly cancels the old
         # full-count denominator, leaving the final loss/grad unchanged.
 
-    if args.advantage_estimator == "dr_grpo" and explicit_loss_scale is not None:
+    if dr_grpo_window_scale is not None:
         for key in ("loss", "pg_loss", "entropy_loss", "kl_loss"):
             if key in log:
-                log[key] = log[key] * explicit_loss_scale
+                log[key] = log[key] * dr_grpo_window_scale
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     log_values = torch.tensor(
