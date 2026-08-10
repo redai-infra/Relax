@@ -462,19 +462,6 @@ class MegatronTrainRayActor(TrainRayActor):
     def _is_standard_dpo(self) -> bool:
         return is_preference_mode(self.args) and self.args.sft_objective == "dpo" and not self.args.dpo_reference_free
 
-    def _build_dpo_reference_identity(self, *, probe_sha256: str | None = None) -> DPOReferenceIdentity:
-        parameter_sha256 = canonical_tensor_sha256(self.weights_backuper.get("ref").items())
-        self._assert_dp_reference_digest_equal(parameter_sha256)
-        return DPOReferenceIdentity(
-            schema_version=1,
-            repository=self.args.dpo_reference_repository,
-            revision=self.args.dpo_reference_revision,
-            loader_mode=REFERENCE_LOADER_MODE,
-            parameter_sha256=parameter_sha256,
-            probe_sha256=probe_sha256,
-            probe_manifest=None,
-        )
-
     def _assert_dp_reference_digest_equal(self, digest: str) -> None:
         digests = [None] * dist.get_world_size(group=get_gloo_group())
         dist.all_gather_object(digests, digest, group=get_gloo_group())
