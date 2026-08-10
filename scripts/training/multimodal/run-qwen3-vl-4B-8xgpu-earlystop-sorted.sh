@@ -2,10 +2,11 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-VL-4B 8xGPU colocate training script.
+# Qwen3-VL-4B 8xGPU colocate training script (early stopping + length-aware scheduling).
+# Enables fast colocate switching + early stopping + prompt sorting by length.
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu.sh
+#   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu-earlystop-sorted.sh
 
 set -ex
 set -o pipefail
@@ -53,6 +54,8 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len 8192
    --rollout-max-prompt-len 2048
    --rollout-temperature 1.0
+   --rollout-stop "</answer>"
+   --sort-prompts-by-length
 )
 
 PERF_ARGS=(
@@ -110,7 +113,7 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen3-vl-4b-GRPO-gpu8-${now}
+   --tb-experiment-name qwen3-vl-4b-GRPO-gpu8-earlystop-sorted-${now}
 )
 
 MISC_ARGS=(
@@ -134,6 +137,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --num-data-storage-units 1 \
    --colocate \
    --use-health-check \
+   --fast-colocate-switching \
+   --pg-destroy-delay 1.0 \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

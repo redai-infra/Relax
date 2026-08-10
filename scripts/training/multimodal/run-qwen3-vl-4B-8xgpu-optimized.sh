@@ -2,10 +2,11 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-VL-4B 8xGPU colocate training script.
+# Qwen3-VL-4B 8xGPU colocate training script (optimized).
+# Enables fast colocate switching and reduced PG destroy delay.
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu.sh
+#   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu-optimized.sh
 
 set -ex
 set -o pipefail
@@ -134,6 +135,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --num-data-storage-units 1 \
    --colocate \
    --use-health-check \
+   --fast-colocate-switching \
+   --pg-destroy-delay 1.0 \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

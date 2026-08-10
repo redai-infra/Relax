@@ -2,10 +2,11 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-VL-4B 8xGPU colocate training script.
+# Qwen3-VL-4B 8xGPU colocate training script (all opts + no recompute).
+# Enables fast switching + early stopping + prompt sorting + partial rollout + no activation recompute.
 #
 # Usage:
-#   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu.sh
+#   bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu-no-recompute.sh
 
 set -ex
 set -o pipefail
@@ -53,6 +54,8 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len 8192
    --rollout-max-prompt-len 2048
    --rollout-temperature 1.0
+   --rollout-stop "</answer>"
+   --sort-prompts-by-length
 )
 
 PERF_ARGS=(
@@ -65,13 +68,13 @@ PERF_ARGS=(
 
    --recompute-granularity full
    --recompute-method uniform
-   --recompute-num-layers 1
+   --recompute-num-layers 0
 
    # --qkv-format bshd
    # --micro-batch-size 1 # avoid OOM
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 20480
-   --log-probs-max-tokens-per-gpu 40960
+   --max-tokens-per-gpu 16384
+   --log-probs-max-tokens-per-gpu 32768
 
    --no-rope-fusion
    --calculate-per-token-loss
@@ -110,7 +113,14 @@ WANDB_ARGS=(
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen3-vl-4b-GRPO-gpu8-${now}
+   --tb-experiment-name qwen3-vl-4b-GRPO-gpu8-no-recompute-${now}
+)
+
+PARTIAL_ROLLOUT_ARGS=(
+   --partial-rollout
+   --over-sampling-batch-size 128
+   --mask-offpolicy-in-partial-rollout
+   --partial-rollout-max-aborted-count 3
 )
 
 MISC_ARGS=(
@@ -134,6 +144,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --num-data-storage-units 1 \
    --colocate \
    --use-health-check \
+   --fast-colocate-switching \
+   --pg-destroy-delay 1.0 \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
@@ -141,5 +153,6 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${GRPO_ARGS[@]}" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
+   "${PARTIAL_ROLLOUT_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-vl-4b-GRPO-gpu8-${now}.log

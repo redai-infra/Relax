@@ -386,7 +386,11 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
+
+        if getattr(self.args, "fast_colocate_switching", False) and self.args.colocate:
+            logger.info("fast_colocate_switching: skipping destroy_process_groups in sleep()")
+        else:
+            destroy_process_groups(post_destroy_delay=getattr(self.args, "pg_destroy_delay", 2.0))
 
         self._train_state_offloader.offload()
 
@@ -1598,7 +1602,7 @@ class MegatronTrainRayActor(TrainRayActor):
             save_hf_model(self.args, rollout_id, self.model)
 
         if self.args.offload_train and self._per_step_rollout:
-            destroy_process_groups()
+            destroy_process_groups(post_destroy_delay=getattr(self.args, "pg_destroy_delay", 2.0))
 
     @timer
     def update_weights(self) -> None:
@@ -1639,7 +1643,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.wake_up()
         elif self.args.offload_train:
-            reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            if getattr(self.args, "fast_colocate_switching", False) and self.args.colocate:
+                logger.info("fast_colocate_switching: skipping reload_process_groups in update_weights()")
+            else:
+                reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
@@ -1678,7 +1685,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
-            destroy_process_groups()
+            destroy_process_groups(post_destroy_delay=getattr(self.args, "pg_destroy_delay", 2.0))
 
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
