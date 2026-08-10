@@ -31,6 +31,7 @@ from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
@@ -1532,21 +1533,109 @@ def save(
         enable_forward_pre_hook(model)
 
 
-def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
+def _install_streaming_fp8_writer(bridge, strategy, block_size):
+    """Monkey-patch the bridge source's save_generator with a
+    StreamingFP8Writer.
+
+    Returns (writer, restore_fn). Caller MUST invoke restore_fn in a finally
+    block so subsequent BF16 exports on the same bridge instance are not
+    hijacked.
+    """
+    from relax.utils.quant_cast.fp8_checkpoint import StreamingFP8Writer
+
+    state = getattr(bridge.hf_pretrained, "state", None)
+    source = getattr(state, "source", None) if state is not None else None
+    if source is None or not hasattr(source, "key_to_filename_map"):
+        raise ValueError("Online FP8 export requires --hf-checkpoint to point to a safetensors-backed HF directory.")
+
+    writer = StreamingFP8Writer(
+        source.key_to_filename_map,
+        strategy,
+        block_size,
+        device="cuda",
+    )
+    original_save_generator = source.save_generator
+    source.save_generator = writer.save_generator
+
+    def restore() -> None:
+        source.save_generator = original_save_generator
+
+    return writer, restore
+
+
+def _apply_fp8_quantization_config(config_path, strategy, block_size, modules_to_not_convert):
+    """Merge FP8 `quantization_config` into an already-written HF
+    config.json."""
+    import json
+
+    from relax.utils.quant_cast.fp8 import build_quantization_config
+
+    if not os.path.isfile(config_path):
+        return
+    with open(config_path) as f:
+        cfg = json.load(f)
+    cfg["quantization_config"] = build_quantization_config(strategy, block_size, modules_to_not_convert)
+    with open(config_path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=False):
+    """Invoke the user-supplied post-save hook; log-and-swallow exceptions.
+
+    Called on WORLD rank 0 only, after every HF shard + LoRA adapter + FP8
+    config patch have hit disk. Sync-return-fast contract: hooks that need to
+    do heavy I/O (uploads, RPCs) must enqueue to their own background pool and
+    return immediately.
+
+    When ``force_sync=True`` (final save), also invokes the hook module's
+    optional module-level ``flush()`` so the container does not exit while
+    background work is still in flight. ``flush()`` is best-effort: absent
+    attr is a no-op, and exceptions are swallowed.
+    """
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    try:
+        from relax.utils.misc import load_function
+
+        hook = load_function(hook_path)
+        hook(
+            args,
+            str(hf_path),
+            rollout_id,
+            dtype=getattr(args, "save_hf_dtype", "bf16"),
+            is_lora=is_lora,
+        )
+    except Exception:
+        logger.exception(f"save-hf post-hook {hook_path!r} raised; training continues")
+
+    if force_sync:
+        try:
+            import importlib
+
+            module_path = hook_path.rpartition(".")[0]
+            hook_module = importlib.import_module(module_path)
+            flush = getattr(hook_module, "flush", None)
+            if callable(flush):
+                logger.info(f"save-hf post-hook: draining {module_path}.flush() on final save")
+                flush()
+        except Exception:
+            logger.exception(f"save-hf post-hook flush for {hook_path!r} raised; training continues")
+
+
+def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bool = False) -> None:
     """Save Megatron model in HuggingFace format.
 
     Args:
         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.
         rollout_id (int): Rollout ID for path formatting.
     """
-    should_log = (
+    should_log = not torch.distributed.is_initialized() or (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
     )
 
     try:
         from megatron.bridge import AutoBridge
-
-        from relax.utils.megatron_bridge_utils import patch_megatron_model
 
         path = Path(args.save_hf.format(rollout_id=rollout_id))
 
@@ -1570,12 +1659,30 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         allow_missing_mtp_keys = reference_expects_mtp(args.hf_checkpoint) and not model_has_mtp
         strict = not allow_missing_mtp_keys
 
-        with patch_megatron_model(model):
-            bridge.save_hf_pretrained(
-                model,
-                path=path,
-                strict=strict,
+        save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
+        fp8_writer = None
+        restore_save_generator = None
+        if save_fp8:
+            fp8_writer, restore_save_generator = _install_streaming_fp8_writer(
+                bridge,
+                args.save_hf_fp8_quant_mode,
+                args.save_hf_fp8_block_size,
             )
+            # StreamingFP8Writer runs its own strict check against the source
+            # safetensors index and doesn't understand the "MTP is expected but
+            # missing" case; drop strict so Bridge yields whatever it has.
+            strict = strict and not allow_missing_mtp_keys
+
+        try:
+            with patch_megatron_model(model):
+                bridge.save_hf_pretrained(
+                    model,
+                    path=path,
+                    strict=strict,
+                )
+        finally:
+            if restore_save_generator is not None:
+                restore_save_generator()
 
         # When MTP keys are tolerated as missing (strict=False above), Megatron-Bridge's
         # non-distributed save still lists those mtp.* keys in model.safetensors.index.json
@@ -1583,18 +1690,31 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         # absent. Reconcile: rebuild the index from the tensors actually written and
         # supplement MTP from the base HF model, so the checkpoint loads cleanly (incl.
         # EAGLE speculative decoding). The bridge writes on WORLD rank 0, so run the
-        # reconcile there too (the output lives on shared storage).
+        # reconcile there too (the output lives on shared storage). The FP8 path uses a
+        # separate streaming writer with its own index and is skipped here (mirrors
+        # scripts/tools/convert_torch_dist_to_hf_bridge.py).
         is_export_writer = (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         )
-        if allow_missing_mtp_keys and is_export_writer:
+        if allow_missing_mtp_keys and is_export_writer and not save_fp8:
             reconcile_hf_export_index(str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=True)
+
+        if save_fp8 and is_export_writer and fp8_writer is not None:
+            _apply_fp8_quantization_config(
+                str(path / "config.json"),
+                args.save_hf_fp8_quant_mode,
+                args.save_hf_fp8_block_size,
+                fp8_writer.result.modules_to_not_convert,
+            )
 
         if is_lora_enabled(args):
             _save_lora_to_checkpoint(model, str(path), args, bridge=bridge)
         if should_log:
             logger.info(f"Successfully saved HuggingFace model to {path}")
+
+        if is_export_writer:
+            _invoke_save_hf_post_hook(args, path, rollout_id, is_lora=is_lora_enabled(args), force_sync=force_sync)
     except Exception as e:
         if should_log:
             logger.error(f"Failed to save HuggingFace format: {e}")

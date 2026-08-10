@@ -1596,7 +1596,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model
 
-            save_hf_model(self.args, rollout_id, self.model)
+            save_hf_model(self.args, rollout_id, self.model, force_sync=force_sync)
 
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()

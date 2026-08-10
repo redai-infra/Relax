@@ -1582,6 +1582,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The model will be saved to `save_hf.format(rollout_id)`. "
                 ),
             )
+            parser.add_argument(
+                "--save-hf-dtype",
+                type=str,
+                choices=["bf16", "fp8"],
+                default="bf16",
+                help=(
+                    "Precision for online --save-hf export. 'bf16' (default) preserves prior "
+                    "behavior; 'fp8' streams e4m3 quantized shards. FP8 requires --save-hf and "
+                    "an --hf-checkpoint backed by safetensors."
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-fp8-quant-mode",
+                type=str,
+                choices=["block", "channel", "tensor"],
+                default="block",
+                help="FP8 quantization strategy for --save-hf-dtype fp8 (default: block).",
+            )
+            parser.add_argument(
+                "--save-hf-fp8-block-size",
+                type=int,
+                nargs=2,
+                default=None,
+                metavar=("ROWS", "COLS"),
+                help="Block shape for block FP8; defaults to (128, 128) when quant-mode=block.",
+            )
+            parser.add_argument(
+                "--save-hf-post-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Dotted path (module.func) to a callable invoked on WORLD rank 0 after each "
+                    "HF checkpoint is written. Signature: "
+                    "`hook(args, hf_path: str, rollout_id: int, *, dtype: str, is_lora: bool) -> None`. "
+                    "Called synchronously; heavy work (uploads, RPCs) must be enqueued to a background "
+                    "thread by the hook itself. Exceptions are logged and swallowed."
+                ),
+            )
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
@@ -2643,6 +2681,41 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
 
 
+def validate_save_hf_fp8_args(args) -> None:
+    """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
+    default."""
+    dtype = getattr(args, "save_hf_dtype", "bf16")
+    if dtype != "fp8":
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
+
+    from relax.utils.quant_cast.fp8 import validate_fp8_options
+
+    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
+    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    if strategy == "block" and block_size is None:
+        block_size = [128, 128]
+        args.save_hf_fp8_block_size = block_size
+    validate_fp8_options(strategy, block_size)
+
+
+def validate_save_hf_post_hook_args(args) -> None:
+    """Validate --save-hf-post-hook-path resolves and is paired with --save-
+    hf."""
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
+
+    from relax.utils.misc import load_function
+
+    hook = load_function(hook_path)
+    if not callable(hook):
+        raise TypeError(f"--save-hf-post-hook-path {hook_path!r} is not callable: got {type(hook).__name__}")
+
+
 def _validate_agentic_rollout_args(args) -> None:
     if not args.use_agentic_rollout:
         return
@@ -2846,6 +2919,8 @@ def slime_validate_args(args):
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
+    validate_save_hf_fp8_args(args)
+    validate_save_hf_post_hook_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
