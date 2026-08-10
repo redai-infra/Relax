@@ -9,6 +9,12 @@ import pytest
 
 @pytest.fixture()
 def registry_module(monkeypatch):
+    registry_name = "relax.core.registry"
+    core_module = importlib.import_module("relax.core")
+    missing = object()
+    original_module = sys.modules.get(registry_name, missing)
+    original_attribute = getattr(core_module, "registry", missing)
+
     component_names = {
         "actor": "Actor",
         "actor_fwd": "ActorFwd",
@@ -25,10 +31,20 @@ def registry_module(monkeypatch):
         classes[class_name] = component_class
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
-    sys.modules.pop("relax.core.registry", None)
-    module = importlib.import_module("relax.core.registry")
-    yield module, classes
-    sys.modules.pop("relax.core.registry", None)
+    sys.modules.pop(registry_name, None)
+    module = importlib.import_module(registry_name)
+    try:
+        yield module, classes
+    finally:
+        if original_module is missing:
+            sys.modules.pop(registry_name, None)
+        else:
+            sys.modules[registry_name] = original_module
+
+        if original_attribute is missing:
+            delattr(core_module, "registry")
+        else:
+            core_module.registry = original_attribute
 
 
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])

@@ -268,16 +268,11 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
 
 
 def _build_optimizer_config_kwargs(args: Namespace) -> dict[str, object]:
-    """Build optimizer kwargs from normalized runtime arguments."""
+    """Copy validated runtime arguments accepted by ``OptimizerConfig``."""
     kwargs = {}
     for field in dataclasses.fields(OptimizerConfig):
         if hasattr(args, field.name):
             kwargs[field.name] = getattr(args, field.name)
-    if args.fp16:
-        kwargs["bf16"] = False
-        kwargs["fp16"] = True
-        kwargs["params_dtype"] = torch.float16
-        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
     return kwargs
 
 
@@ -343,6 +338,8 @@ def setup_model_and_optimizer(
         return model, None, None
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
+    if args.fp16:
+        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
     config = OptimizerConfig(**kwargs)
     config.timers = None
 

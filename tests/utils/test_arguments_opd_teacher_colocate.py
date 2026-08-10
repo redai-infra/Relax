@@ -4,6 +4,7 @@ import argparse
 import importlib
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -183,6 +184,13 @@ def _opd_args() -> SimpleNamespace:
     )
 
 
+def _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args) -> None:
+    """Mirror parse_args ordering: load custom YAML, then run the backend
+    resolver."""
+    arguments_module.slime_validate_args(args)
+    megatron_arguments_module._resolve_optimizer_precision_args(args)
+
+
 def test_opd_sampled_token_loss_is_accepted(arguments_module):
     args = _opd_args()
     args.opd_kl_coef = 0.0
@@ -201,6 +209,193 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+def test_custom_config_fp16_uses_fp16_optimizer_fallbacks(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\n")
+    warning = Mock()
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = False
+    args.bf16 = True
+    args.initial_loss_scale = None
+    args.min_loss_scale = None
+    args.use_precision_aware_optimizer = None
+    args.store_param_remainders = None
+    args.custom_config_path = str(config_path)
+
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+    assert args.fp16 is True
+    assert args.bf16 is False
+    assert args.initial_loss_scale == 32768.0
+    assert args.min_loss_scale == 1.0
+    assert args.use_precision_aware_optimizer is True
+    assert args.store_param_remainders is False
+    warning.assert_called_once()
+
+
+def test_custom_config_disabling_cli_fp16_preserves_fp32_baseline(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: false\n")
+    warning = Mock()
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = True
+    args.bf16 = False
+    args.custom_config_path = str(config_path)
+
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+    assert args.fp16 is False
+    assert args.bf16 is False
+    assert args.store_param_remainders is True
+    warning.assert_not_called()
+
+
+def test_custom_config_fp16_false_preserves_existing_bf16(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: false\n")
+    warning = Mock()
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = False
+    args.bf16 = True
+    args.custom_config_path = str(config_path)
+
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+    assert args.fp16 is False
+    assert args.bf16 is True
+    assert args.store_param_remainders is True
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("config", "flag"),
+    [
+        ('fp16: "false"\n', "fp16"),
+        ("fp16: 1\n", "fp16"),
+        ('bf16: "true"\n', "bf16"),
+        ("bf16: 0\n", "bf16"),
+    ],
+)
+def test_custom_config_precision_flags_require_booleans(arguments_module, tmp_path, config, flag):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text(config)
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match=rf"custom config.*{flag}.*boolean"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_custom_config_fp16_rejects_invalid_optimizer_scale(arguments_module, megatron_arguments_module, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\ninitial_loss_scale: 0\n")
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match="--initial-loss-scale"):
+        _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+
+def test_custom_config_static_loss_scale_leaves_dynamic_scales_unset(
+    arguments_module, megatron_arguments_module, monkeypatch, tmp_path
+):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\nloss_scale: 1024\n")
+    warning = Mock()
+    monkeypatch.setattr(megatron_arguments_module.logger, "warning", warning)
+    args = _opd_args()
+    args.fp16 = False
+    args.bf16 = True
+    args.initial_loss_scale = None
+    args.min_loss_scale = None
+    args.use_precision_aware_optimizer = None
+    args.store_param_remainders = None
+    args.custom_config_path = str(config_path)
+
+    _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+    assert args.fp16 is True
+    assert args.bf16 is False
+    assert args.loss_scale == 1024
+    assert args.initial_loss_scale is None
+    assert args.min_loss_scale is None
+    assert args.use_precision_aware_optimizer is True
+    assert args.store_param_remainders is False
+    warning.assert_called_once()
+    warning_text = " ".join(str(value) for value in warning.call_args.args)
+    assert "--initial-loss-scale" not in warning_text
+    assert "--min-loss-scale" not in warning_text
+
+
+@pytest.mark.parametrize(
+    "loss_scale",
+    ["true", '"1024"', ".nan", ".inf", "0", "-1"],
+)
+def test_custom_config_rejects_invalid_static_loss_scale(
+    arguments_module, megatron_arguments_module, tmp_path, loss_scale
+):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text(f"fp16: true\nloss_scale: {loss_scale}\n")
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match="--loss-scale"):
+        _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+
+@pytest.mark.parametrize(
+    ("config", "option"),
+    [
+        ("fp16: true\nuse_precision_aware_optimizer: 1\n", "--use-precision-aware-optimizer"),
+        ('fp16: true\nuse_precision_aware_optimizer: "true"\n', "--use-precision-aware-optimizer"),
+        ("fp16: true\nstore_param_remainders: 0\n", "--store-param-remainders"),
+        ('fp16: true\nstore_param_remainders: "false"\n', "--store-param-remainders"),
+        ('fp16: false\nbf16: true\nuse_precision_aware_optimizer: "false"\n', "--use-precision-aware-optimizer"),
+        ("fp16: false\nbf16: true\nstore_param_remainders: 0\n", "--store-param-remainders"),
+        ('fp16: false\nbf16: false\nuse_precision_aware_optimizer: "false"\n', "--use-precision-aware-optimizer"),
+        ('fp16: false\nbf16: false\nstore_param_remainders: "false"\n', "--store-param-remainders"),
+    ],
+)
+def test_custom_config_rejects_non_boolean_optimizer_values(
+    arguments_module, megatron_arguments_module, tmp_path, config, option
+):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text(config)
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match=option):
+        _validate_with_optimizer_resolution(arguments_module, megatron_arguments_module, args)
+
+
+def test_custom_config_rejects_simultaneous_fp16_and_bf16(arguments_module, tmp_path):
+    config_path = tmp_path / "custom-config.yaml"
+    config_path.write_text("fp16: true\nbf16: true\n")
+    args = _opd_args()
+    args.custom_config_path = str(config_path)
+
+    with pytest.raises(ValueError, match="fp16.*bf16"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_kl_loss_requires_existing_ref_load(arguments_module, tmp_path):
+    args = _opd_args()
+    args.use_kl_loss = True
+    args.ref_load = str(tmp_path / "missing-ref")
+
+    with pytest.raises(FileNotFoundError, match=r"ref_load .* does not exist"):
+        arguments_module.slime_validate_args(args)
 
 
 def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):

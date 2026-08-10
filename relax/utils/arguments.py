@@ -75,16 +75,19 @@ def _positive_int(value: str) -> int:
 
 
 def reset_arg(parser, name, **kwargs):
-    """Reset the default value of a Megatron argument.
+    """Reset selected metadata on an existing Megatron argument.
 
     :param parser: The argument parser.
     :param name: The name of the argument to reset.
     :param default: The new default value.
+    :param help: The new help text.
     """
     for action in parser._actions:
         if name in action.option_strings:
             if "default" in kwargs:
                 action.default = kwargs["default"]
+            if "help" in kwargs:
+                action.help = kwargs["help"]
             break
     else:
         parser.add_argument(name, **kwargs)
@@ -97,21 +100,21 @@ def _add_fp16_optimizer_arguments(parser):
         "--initial-loss-scale",
         type=float,
         default=None,
-        help="Initial loss scale for dynamic FP16 loss scaling.",
+        help="Initial loss scale. When omitted in FP16 mode, Relax uses 32768.0.",
     )
     reset_arg(
         parser,
         "--min-loss-scale",
         type=float,
         default=None,
-        help="Minimum loss scale for dynamic FP16 loss scaling.",
+        help="Minimum loss scale. When omitted in FP16 mode, Relax uses 1.0.",
     )
     reset_arg(
         parser,
         "--use-precision-aware-optimizer",
         action="store_true",
         default=None,
-        help="Use TransformerEngine's precision-aware optimizer.",
+        help="Use the precision-aware optimizer. When omitted in FP16 mode, Relax enables it.",
     )
     if "--no-use-precision-aware-optimizer" not in parser._option_string_actions:
         parser.add_argument(
@@ -126,7 +129,7 @@ def _add_fp16_optimizer_arguments(parser):
         "--store-param-remainders",
         action="store_true",
         default=None,
-        help="Store parameter remainders in the distributed optimizer.",
+        help="Store parameter remainders. When omitted in FP16 mode, Relax disables it.",
     )
     if "--no-store-param-remainders" not in parser._option_string_actions:
         parser.add_argument(
@@ -323,6 +326,41 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_train_arguments(parser):
             # --train-backend is parsed early in _pre_parse_mode() and merged later.
+            reset_arg(
+                parser,
+                "--initial-loss-scale",
+                type=float,
+                default=None,
+                help="Initial loss scale. When omitted in FP16 mode, Relax uses 32768.0.",
+            )
+            reset_arg(
+                parser,
+                "--min-loss-scale",
+                type=float,
+                default=None,
+                help="Minimum loss scale. When omitted in FP16 mode, Relax uses 1.0.",
+            )
+            reset_arg(
+                parser,
+                "--use-precision-aware-optimizer",
+                action="store_true",
+                default=None,
+                help="Use the precision-aware optimizer. When omitted in FP16 mode, Relax enables it.",
+            )
+            parser.add_argument(
+                "--no-use-precision-aware-optimizer",
+                action="store_false",
+                dest="use_precision_aware_optimizer",
+                default=None,
+                help="Disable the precision-aware optimizer explicitly.",
+            )
+            reset_arg(
+                parser,
+                "--store-param-remainders",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Store parameter remainders. When omitted in FP16 mode, Relax disables it.",
+            )
             parser.add_argument(
                 "--qkv-format",
                 type=str,
@@ -2540,7 +2578,7 @@ def parse_args(add_custom_arguments=None):
     # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
     # are silently ignored by the megatron parser.
-    from relax.backends.megatron.arguments import megatron_parse_args
+    from relax.backends.megatron.arguments import _resolve_optimizer_precision_args, megatron_parse_args
     from relax.backends.megatron.arguments import validate_args as megatron_validate_args
 
     args = megatron_parse_args(
@@ -2562,6 +2600,13 @@ def parse_args(add_custom_arguments=None):
             setattr(args, key, value)
 
     slime_validate_args(args)
+
+    # _set_default_megatron_args resolves optimizer precision immediately for
+    # the normal CLI path. Custom YAML is deliberately loaded later by
+    # slime_validate_args, so resolve that deferred path exactly once here,
+    # after YAML values have replaced the parser namespace.
+    if args.custom_config_path:
+        _resolve_optimizer_precision_args(args)
 
     if not args.debug_rollout_only:
         args = megatron_validate_args(args)
@@ -3346,10 +3391,18 @@ def slime_validate_args(args):
     if args.custom_config_path:
         with open(args.custom_config_path) as f:
             data = yaml.safe_load(f) or {}
+        for precision_flag in ("fp16", "bf16"):
+            if precision_flag in data and not isinstance(data[precision_flag], bool):
+                raise ValueError(f"custom config field {precision_flag!r} must be a boolean")
         for k, v in data.items():
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        if data.get("fp16") is True and "bf16" not in data:
+            args.bf16 = False
+
+    if bool(getattr(args, "fp16", False)) and bool(getattr(args, "bf16", False)):
+        raise ValueError("fp16 and bf16 cannot both be enabled")
 
     if args.eval_max_context_len is None:
         logger.info(
