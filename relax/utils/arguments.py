@@ -2703,6 +2703,12 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
 
+    # Preserve whether the user explicitly requested a rollout start before
+    # validation derives 0 for an apparent HF/cold-start load. Actor init uses
+    # this provenance to recover from a checkpoint-readiness race without
+    # overriding an intentional --start-rollout-id.
+    args._start_rollout_id_explicit = args.start_rollout_id is not None
+
     # Serialize the driver-derived descriptor with args to every Ray actor.
     args.model_source = model_source
 

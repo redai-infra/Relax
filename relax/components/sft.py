@@ -466,9 +466,7 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
-            for _ in range(self.config.num_rollout):
-                if self._stop_event.is_set():
-                    break
+            while self.step < self.config.num_rollout and not self._stop_event.is_set():
                 await self._produce_one_step()
         except Exception as exc:
             error_msg = f"SFT producer crashed at step {self.step}: {type(exc).__name__}: {str(exc)}"
