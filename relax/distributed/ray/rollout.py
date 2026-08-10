@@ -50,6 +50,7 @@ from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -1231,6 +1232,7 @@ class RolloutManager(ReloadableMixin):
             try:
                 from relax.utils.data.processing_utils import load_tokenizer
 
+                prepare_model_maybe_update_args(self.args, completeness="metadata")
                 self._tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
                 logger.info(f"Loaded tokenizer from {self.args.hf_checkpoint}")
             except Exception as e:

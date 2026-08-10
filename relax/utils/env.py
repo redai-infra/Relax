@@ -202,6 +202,10 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
 
+    # ------------- S3 model cache cleanup -------------
+    RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S = EnvProperty("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", float, 600.0)
+    RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S = EnvProperty("RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S", float, 30.0)
+
     # ------------- LoRA -------------
     RELAX_LORA_LIVE_DIR = EnvProperty("RELAX_LORA_LIVE_DIR", str, None)
 

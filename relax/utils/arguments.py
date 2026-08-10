@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 from typing import Any
 
@@ -391,6 +392,51 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "and to genrm / teacher SGLang engines. Coordinated per node per checkpoint path, "
                     "so each unique checkpoint is streamed at most once per node."
                 ),
+            )
+            parser.add_argument(
+                "--disable-s3-model-download",
+                action="store_true",
+                default=False,
+                help="Disable Relax-managed S3-to-SHM model materialization",
+            )
+            parser.add_argument(
+                "--disable-s3-model-cleanup",
+                action="store_true",
+                default=False,
+                help="Keep downloaded S3 model weight shards in SHM after service initialization",
+            )
+            parser.add_argument(
+                "--s3-model-download-workers",
+                type=int,
+                default=20,
+                help="Number of concurrent workers used to download an S3 model to SHM",
+            )
+            parser.add_argument(
+                "--s3-model-shm-root",
+                type=str,
+                default="/dev/shm",
+                help=(
+                    "S3 model SHM root; it must already exist on every model consumer node, "
+                    "otherwise loading fails without falling back to disk"
+                ),
+            )
+            parser.add_argument(
+                "--s3-model-endpoint",
+                type=str,
+                default=None,
+                help="Optional endpoint URL for an S3-compatible model store",
+            )
+            parser.add_argument(
+                "--s3-model-use-placeholder-credentials",
+                action="store_true",
+                default=False,
+                help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+            )
+            parser.add_argument(
+                "--s3-model-use-path-style",
+                action="store_true",
+                default=False,
+                help="Use path-style addressing for an S3-compatible model store",
             )
             parser.add_argument(
                 "--custom-model-provider-path",
@@ -2559,8 +2605,62 @@ def _pre_parse_mode():
     return temp_args
 
 
+def _pre_parse_cli_model_source():
+    """Build a serializable model source from the generic CLI."""
+    from relax.utils.model_source import ModelSource
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--hf-checkpoint", help="Hugging Face checkpoint path or model URI")
+    parser.add_argument(
+        "--disable-s3-model-download",
+        action="store_true",
+        help="Disable Relax-managed S3-to-SHM model materialization",
+    )
+    parser.add_argument(
+        "--s3-model-endpoint",
+        help="Optional endpoint URL for an S3-compatible model store",
+    )
+    parser.add_argument(
+        "--s3-model-use-placeholder-credentials",
+        action="store_true",
+        help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+    )
+    parser.add_argument(
+        "--s3-model-use-path-style",
+        action="store_true",
+        help="Use path-style addressing for an S3-compatible model store",
+    )
+    pre, _ = parser.parse_known_args()
+    if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
+        return None
+    return ModelSource(
+        uri=pre.hf_checkpoint,
+        endpoint=pre.s3_model_endpoint,
+        credential_mode="placeholder" if pre.s3_model_use_placeholder_credentials else "default",
+        addressing_style="path" if pre.s3_model_use_path_style else "auto",
+    )
+
+
 def parse_args(add_custom_arguments=None):
+    """Parse Relax arguments with an optional registered model source."""
+    from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
+
+    original_argv = sys.argv
+    provider_source = resolve_model_source(original_argv)
+    if provider_source is not None:
+        sys.argv = apply_model_source_to_argv(original_argv, provider_source)
+    try:
+        return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+    finally:
+        sys.argv = original_argv
+
+
+def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    model_source = provider_source or _pre_parse_cli_model_source()
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2583,7 +2683,11 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
+        skip_hf_validate=(
+            pre.debug_rollout_only
+            or pre.skip_hf_validate
+            or (model_source is not None and is_s3_uri(model_source.uri))
+        ),
     )
 
     # Merge pre-parsed args into the main namespace
@@ -2598,6 +2702,9 @@ def parse_args(add_custom_arguments=None):
     if teacher_sglang_ns is not None:
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
+
+    # Serialize the driver-derived descriptor with args to every Ray actor.
+    args.model_source = model_source
 
     slime_validate_args(args)
 

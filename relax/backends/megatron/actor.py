@@ -59,6 +59,7 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.rotate_ckpt import rotate_ckpt
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
@@ -175,6 +176,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if role == "reference" or role == "actor_fwd":
             process_args(args, role)
         super().init(args, role, with_ref, with_opd_teacher)
+
+        # Materialize an S3 checkpoint on this node before Megatron init(args)
+        # reads model metadata or weights.
+        # Leaf actor with private args, safe to remap in place.
+        prepare_model_maybe_update_args(args)
 
         self.genrm_manager = None
 

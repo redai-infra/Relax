@@ -17,6 +17,14 @@ from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
+
+try:
+    from sglang.srt.server_args import LOAD_FORMAT_CHOICES
+except ImportError:
+    # Older SGLang releases expose the legacy remote loader but not the shared
+    # choices constant. Keep module import compatible with those releases.
+    LOAD_FORMAT_CHOICES = ("remote",)
+
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
@@ -25,6 +33,13 @@ from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.model_source import ModelSource, SGLangLoadPlan
+from relax.utils.s3_model_loader import (
+    get_s3_model_cached_path,
+    is_s3_uri,
+    maybe_resolve_s3_model_to_shm,
+    resolve_s3_model_metadata_to_shm,
+)
 
 
 logger = get_logger(__name__)
@@ -38,6 +53,79 @@ _GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
 _GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
 _SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
 _MIN_HTTP_TIMEOUT_S = 1.0
+
+
+def _preferred_s3_stream_load_format() -> str:
+    if "runai_streamer" in LOAD_FORMAT_CHOICES:
+        return "runai_streamer"
+    if "remote" in LOAD_FORMAT_CHOICES:
+        logger.warning("SGLang does not expose runai_streamer; falling back to the legacy remote loader")
+        return "remote"
+    raise RuntimeError("The installed SGLang does not support runai_streamer or the legacy remote loader")
+
+
+def _configure_runai_streamer_env(args) -> None:
+    model_source = args.model_source
+    if model_source.endpoint:
+        os.environ["AWS_ENDPOINT_URL"] = model_source.endpoint
+        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = model_source.endpoint
+    if model_source.addressing_style == "path":
+        os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = "0"
+    else:
+        os.environ.pop("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", None)
+    if model_source.credential_mode == "placeholder":
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+        os.environ["AWS_ACCESS_KEY_ID"] = "mock"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "mock"
+        os.environ.pop("AWS_SESSION_TOKEN", None)
+
+
+def build_sglang_load_plan(server_args: dict, args) -> SGLangLoadPlan:
+    """Build one policy loading decision for an SGLang engine group."""
+    model_source = getattr(args, "model_source", None)
+    model_path = server_args["model_path"]
+    load_format = server_args.get("load_format", "auto")
+    if model_source is None:
+        return SGLangLoadPlan(
+            model_path=model_path,
+            load_format=load_format,
+            source=ModelSource(uri=model_path),
+        )
+    if model_path != model_source.uri or not is_s3_uri(model_source.uri):
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    if load_format in {"runai_streamer", "remote"}:
+        _configure_runai_streamer_env(args)
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    cached_path = get_s3_model_cached_path(model_source.uri, args)
+    if load_format == "dummy":
+        model_path = cached_path or resolve_s3_model_metadata_to_shm(model_source.uri, args)
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    if load_format == "auto":
+        # A multi-node engine group must not make node-local cache decisions
+        # independently. Until group-wide readiness coordination is available,
+        # all ranks use streaming. Single-node groups may reuse ready SHM.
+        if server_args.get("nnodes", 1) == 1 and cached_path is not None:
+            return SGLangLoadPlan(model_path=cached_path, load_format=load_format, source=model_source)
+        load_format = _preferred_s3_stream_load_format()
+        _configure_runai_streamer_env(args)
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    model_path = maybe_resolve_s3_model_to_shm(model_source.uri, args)
+    return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+
+def _apply_sglang_policy_load_plan(server_args: dict, args) -> dict:
+    """Apply the policy model load plan to a copied ServerArgs dictionary."""
+    plan = build_sglang_load_plan(server_args, args)
+    resolved = dict(server_args)
+    resolved["model_path"] = plan.model_path
+    resolved["load_format"] = plan.load_format
+    return resolved
+
+
 # Consecutive connection failures that mean "the server process is gone" rather
 # than "the server is briefly busy". Bail out instead of retrying until the
 # drain deadline: a dead engine will never answer.
@@ -446,7 +534,10 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict):
+    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+        if apply_policy_load_plan:
+            server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
             os.environ["RELAX_OPTIMIZE_ROUTING_REPLAY"] = "1"
@@ -1088,7 +1179,7 @@ class GenRMEngine(SGLangEngine):
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
         else:
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, apply_policy_load_plan=False)
 
     def release_memory_occupation(self):
         # GenRM is colocated on the training GPUs, so it must offload at the
@@ -1200,8 +1291,9 @@ def _compute_genrm_server_args(
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
 
+    hf_model_path = args.genrm_model_path
     kwargs = {
-        "model_path": os.path.normpath(args.genrm_model_path),
+        "model_path": hf_model_path if is_s3_uri(hf_model_path) else os.path.normpath(hf_model_path),
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
@@ -1234,8 +1326,10 @@ def _compute_genrm_server_args(
         "enable_draft_weights_cpu_backup": True,
         # GenRM Only
         "enable_weights_cpu_backup": True,
+        # The global load format belongs to policy rollout engines. GenRM must
+        # load real weights unless its own engine config explicitly overrides it.
+        "load_format": "auto",
     }
-
     # Allow per-genrm SGLang mem_fraction_static via --genrm-engine-config; this overrides
     # the global --sglang-mem-fraction-static below so rollout and genrm can share GPUs.
     if "mem_fraction_static" in args.genrm_engine_config:
@@ -1310,8 +1404,10 @@ def _compute_server_args(
     node_rank = rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
+
+    hf_model_path = args.hf_checkpoint
     kwargs = {
-        "model_path": os.path.normpath(args.hf_checkpoint),
+        "model_path": hf_model_path if is_s3_uri(hf_model_path) else os.path.normpath(hf_model_path),
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory

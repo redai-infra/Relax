@@ -38,6 +38,7 @@ from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingData
 from relax.engine.sft.debug_print import print_first_sample
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
 
@@ -95,6 +96,7 @@ class SFT(Base):
     def _init_data_pipeline(self) -> None:
         if self._dataset is not None:
             return
+        prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
