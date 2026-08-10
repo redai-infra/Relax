@@ -6,16 +6,23 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from relax.backends.megatron.weight_update.common import _maybe_get_cpu_backup
-from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge
-from relax.backends.megatron.weight_update.mixture_lora_sync import (
+
+# These tests exercise the real Megatron Bridge weight conversion and
+# distributed synchronization modules, which are not installed in CPU CI.
+pytest.importorskip("megatron.bridge.peft.lora")
+
+from relax.backends.megatron.weight_update.common import _maybe_get_cpu_backup  # noqa: E402
+from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge  # noqa: E402
+from relax.backends.megatron.weight_update.mixture_lora_sync import (  # noqa: E402
     MixtureLoraParamInfo,
     _gather_pipeline_param_infos,
     merge_mixture_lora_tp_shards,
 )
-from relax.backends.megatron.weight_update.update_weight_from_tensor import iter_mixture_weight_updates
-from relax.utils.mixture_lora import MixtureLoraStateSpec
-from relax.utils.types import ParamInfo
+from relax.backends.megatron.weight_update.update_weight_from_tensor import (  # noqa: E402
+    iter_mixture_weight_updates,
+)
+from relax.utils.mixture_lora import MixtureLoraStateSpec  # noqa: E402
+from relax.utils.types import ParamInfo  # noqa: E402
 
 
 def test_selective_offload_uses_cpu_copy_only_after_live_storage_is_released():

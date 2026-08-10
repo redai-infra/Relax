@@ -5,8 +5,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.backends.sglang.sglang_engine import _compute_server_args, _configure_external_model_environment
-from relax.utils.mixture_lora import (
+
+# The engine imports the real SGLang router and Megatron-backed checkpoint
+# client. CPU CI omits these backend dependencies.
+pytest.importorskip("megatron.core")
+pytest.importorskip("sglang.srt.server_args")
+pytest.importorskip("sglang_router")
+
+from relax.backends.sglang.sglang_engine import (  # noqa: E402
+    _compute_server_args,
+    _configure_external_model_environment,
+)
+from relax.utils.mixture_lora import (  # noqa: E402
     MixtureLoraConfig,
     configure_mixture_lora_external_model,
     deserialize_mixture_lora_config,

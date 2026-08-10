@@ -5,14 +5,20 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from relax.backends.megatron.mixture_lora import MixtureLoRAAdapter
-from relax.models.qwen3_mixture_lora.sglang.model import (
+
+# This parity suite needs both model backends. They are available in the
+# official Relax image but intentionally absent from the default CPU CI.
+pytest.importorskip("megatron.bridge")
+pytest.importorskip("sglang.srt.models.qwen3")
+
+from relax.backends.megatron.mixture_lora import MixtureLoRAAdapter  # noqa: E402
+from relax.models.qwen3_mixture_lora.sglang.model import (  # noqa: E402
     EntryClass,
     SGLangMixtureLoRA,
     attach_sglang_mixture_lora,
     load_sglang_mixture_lora_weights,
 )
-from relax.utils.mixture_lora import MixtureLoraConfig
+from relax.utils.mixture_lora import MixtureLoraConfig  # noqa: E402
 
 
 def _config():

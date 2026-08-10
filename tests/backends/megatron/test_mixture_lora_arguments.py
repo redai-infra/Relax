@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.backends.megatron.arguments import _hf_validate_args
+
+# The default CPU CI does not install Megatron. The validation tests run in
+# the official Relax image with the real Megatron argument definitions.
+pytest.importorskip("megatron.training.arguments")
+
+from relax.backends.megatron.arguments import _hf_validate_args  # noqa: E402
 
 
 def test_mixture_lora_rejects_multimodal_hf_config():
