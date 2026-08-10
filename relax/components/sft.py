@@ -435,6 +435,7 @@ class SFT(Base):
             return
         if is_preference_mode(self.config):
             from relax.engine.sft.eval.acceptance import (
+                PREFERENCE_PROBE_PAIR_COUNT,
                 preference_eval_chunk_sizes,
                 preference_eval_local_batch_sizes,
                 record_probe_contract,
@@ -475,6 +476,11 @@ class SFT(Base):
         assert backend_batch is not None
         row_key = "pair_ids" if is_preference_mode(self.config) else "tokens"
         n_samples = len(backend_batch[row_key])
+        if preference_mode and n_samples != PREFERENCE_PROBE_PAIR_COUNT:
+            raise RuntimeError(
+                "preference eval packing must preserve exactly "
+                f"{PREFERENCE_PROBE_PAIR_COUNT} probe pairs, got {n_samples}"
+            )
 
         # Drain the current train partition so the eval chunks have the full
         # TQ capacity to themselves.

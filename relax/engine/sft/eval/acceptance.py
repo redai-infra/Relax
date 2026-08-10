@@ -84,6 +84,8 @@ def record_probe_contract(
     *,
     expected_pair_count: int = PREFERENCE_PROBE_PAIR_COUNT,
 ) -> dict[str, Any] | None:
+    if len(pairs) != expected_pair_count:
+        raise RuntimeError(f"preference eval requires exactly {expected_pair_count} probe pairs, got {len(pairs)}")
     directory = artifact_directory(save_path)
     if directory is None:
         return None
@@ -100,8 +102,6 @@ def record_probe_contract(
         }
         for pair in pairs
     ]
-    if len(rows) != expected_pair_count:
-        raise RuntimeError(f"preference eval requires exactly {expected_pair_count} probe pairs, got {len(rows)}")
     contract = {
         "objective": objective,
         "pair_count": len(rows),

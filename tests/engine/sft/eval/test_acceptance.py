@@ -94,3 +94,14 @@ def test_pair_artifacts_preserve_original_ids_and_require_identical_final_plan(t
 def test_probe_contract_rejects_any_count_other_than_frozen_512(tmp_path):
     with pytest.raises(RuntimeError, match="exactly 512 probe pairs"):
         record_probe_contract(str(tmp_path), "reward_model", 0, [_pair("pair-0", 0)])
+
+
+@pytest.mark.parametrize("save_path", [None, ""])
+def test_probe_contract_rejects_nonfrozen_count_without_artifact_output(save_path):
+    with pytest.raises(RuntimeError, match="exactly 512 probe pairs"):
+        record_probe_contract(save_path, "reward_model", 0, [_pair("pair-0", 0)])
+
+
+def test_probe_contract_accepts_frozen_count_without_artifact_output():
+    pairs = [_pair(f"pair-{index}", index) for index in range(512)]
+    assert record_probe_contract(None, "reward_model", 0, pairs) is None
