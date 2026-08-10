@@ -269,19 +269,24 @@ async def test_lease_expiry_cancels_a_running_trial():
         await registry.close()
 
 
-async def test_agent_failure_cleans_the_remote_run_before_marking_failed():
+async def test_agent_failure_cleans_the_remote_run_before_marking_failed(caplog):
     adapter = ControlledAdapter()
     registry = GatewayRegistry(settings=_settings(), adapter=adapter)
     await registry.start()
     try:
-        await registry.create(_request("request-one").to_payload())
-        await asyncio.wait_for(adapter.started.wait(), timeout=1.0)
-        adapter.handles[0].result.set_exception(RuntimeError("agent failed"))
+        with caplog.at_level("ERROR", logger="uvicorn.error"):
+            await registry.create(_request("request-one").to_payload())
+            await asyncio.wait_for(adapter.started.wait(), timeout=1.0)
+            adapter.handles[0].result.set_exception(RuntimeError("agent failed"))
 
-        result = await _wait_for_status(registry, "request-one", "failed")
+            result = await _wait_for_status(registry, "request-one", "failed")
 
         assert result["error"]["code"] == "agent_error"
         assert adapter.handles[0].abort_calls == 1
+        error_records = [record for record in caplog.records if "NeMo Gym trial failed" in record.message]
+        assert len(error_records) == 1
+        assert error_records[0].exc_info is not None
+        assert "agent failed" in caplog.text
     finally:
         await registry.close()
 

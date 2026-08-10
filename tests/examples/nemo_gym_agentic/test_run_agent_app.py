@@ -15,7 +15,7 @@ from typing import Any, Iterator
 import pytest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_agent_app.sh"
+SCRIPT = Path(__file__).resolve().parents[3] / "examples" / "nemo_gym_agentic" / "scripts" / "run_agent_app.sh"
 PROTOCOL_VERSION = "relax-nemo-gym/v1"
 REQUIRED_ENV = {
     "RELAX_INPUT_JSON": "/tmp/input.json",

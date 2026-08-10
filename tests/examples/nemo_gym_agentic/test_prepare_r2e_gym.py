@@ -9,7 +9,14 @@ from pathlib import Path
 import pytest
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "recipes" / "r2e-gym" / "prepare_r2e_gym.py"
+MODULE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "examples"
+    / "nemo_gym_agentic"
+    / "recipes"
+    / "r2e-gym"
+    / "prepare_r2e_gym.py"
+)
 MODULE_SPEC = importlib.util.spec_from_file_location("prepare_r2e_gym", MODULE_PATH)
 if MODULE_SPEC is None or MODULE_SPEC.loader is None:
     raise RuntimeError(f"Unable to load R2E-Gym preparation module from {MODULE_PATH}")

@@ -124,3 +124,34 @@ def test_convert_row_preserves_workplace_assistant_verifier_and_tools() -> None:
         "tools": row["responses_create_params"]["tools"],
         "parallel_tool_calls": False,
     }
+
+
+def test_convert_row_preserves_calendar_verifier_state() -> None:
+    row = {
+        "responses_create_params": {
+            "input": [
+                {"role": "system", "content": "Return the calendar as JSON."},
+                {"role": "user", "content": "Schedule planning at 10am."},
+            ],
+            "tools": [],
+        },
+        "exp_cal_state": {
+            "0": {
+                "event_id": 0,
+                "duration": 60,
+                "constraint": "at 10am",
+                "min_time": "10:00",
+                "max_time": "16:00",
+            }
+        },
+    }
+
+    converted = convert_row(row)
+
+    assert converted == {
+        "input": row["responses_create_params"]["input"],
+        "metadata": {
+            "exp_cal_state": row["exp_cal_state"],
+            "tools": [],
+        },
+    }

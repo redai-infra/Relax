@@ -6,10 +6,22 @@
 这是本目录最复杂、资源开销最大的 recipe。请先阅读 [PITFAIL.md](PITFAIL.md)，不要跳过 golden
 verification 直接开训。总体 trial/session 协议见[顶层文档](../../README.md)。
 
-## 任务和上游项目
+## 这是个什么任务
 
 [R2E-Gym](https://github.com/R2E-Gym/R2E-Gym) 是面向真实软件工程 agent 的可执行环境项目。
 官方项目提供自然语言问题、代码仓库状态、容器镜像和单元测试，并支持根据测试执行结果计算 reward。
+
+它是“真实开源仓库代码修复”任务：
+
+- 输入一个自然语言 issue，以及对应仓库的修复前代码状态。
+- 每道题在独立 Apptainer SIF 中运行，仓库从 `base_commit` 开始，而不是从已包含答案的修复 commit
+  开始。
+- `swe_agents` 驱动 OpenHands 多轮查看文件、搜索代码、编辑实现、执行 shell 命令和测试。
+- agent 完成后，系统收集相对 `base_commit` 的 Git patch。
+- R2E evaluator 将 patch 放入隔离环境并运行题目对应的可执行测试，判断问题是否真正解决。
+
+因此它不是一次模型生成，也不是只比较最终文本；一次 trajectory 通常包含多轮模型调用、工具执行、
+代码修改和测试反馈。
 
 本 recipe 默认流式读取公开数据集
 [`R2E-Gym/R2E-Gym-Lite`](https://huggingface.co/datasets/R2E-Gym/R2E-Gym-Lite)：
@@ -19,22 +31,72 @@ verification 直接开训。总体 trial/session 协议见[顶层文档](../../R
 - 每题引用一个 OCI image，官方说明通常约 300—500 MB；
 - prepare 默认只取 1 条并构建 1 个 SIF，确认流程后再扩大。
 
-| 项目                 | 本 recipe 的值                                                         |
-| -------------------- | ---------------------------------------------------------------------- |
-| NeMo Gym environment | `r2e_gym`                                                              |
-| Gateway config       | `r2e-gym-v1`                                                           |
-| Agent                | `swe_agents`                                                           |
-| Agent framework      | pinned NVIDIA OpenHands fork                                           |
-| Verifier             | pinned NVIDIA R2E evaluator，在 SIF 内执行测试                         |
-| Reward               | 测试 resolved 为 1，否则为 0                                           |
-| 参考模型             | Qwen3.5-9B                                                             |
-| 配置上下文           | 32K total context，单次最多 24K response，最多 100 agent turns         |
-| 训练并行             | 8 GPU colocate；Megatron TP=2；4 个 SGLang TP=2 engine                 |
-| 推荐模型规模         | 9B 是当前训练基线；更强能力评测仍建议 14B/32B 级代码模型               |
-| Sandbox              | 必需；每题独立 SIF，运行时通常有 OpenHands 与 evaluator 两个 Apptainer |
+| 项目                 | 本 recipe 的值                                                            |
+| -------------------- | ------------------------------------------------------------------------- |
+| NeMo Gym environment | `r2e_gym`                                                                 |
+| Gateway config       | `r2e-gym-v1`                                                              |
+| Agent                | `swe_agents`                                                              |
+| Agent framework      | pinned NVIDIA OpenHands fork                                              |
+| Verifier             | pinned NVIDIA R2E evaluator，在 SIF 内执行测试                            |
+| Reward               | resolved 为 1；有 patch 但未 resolved 为 0.1；其余为 0                    |
+| 参考模型             | Qwen3.5-9B                                                                |
+| 配置上下文           | 51.2K total context，单次最多 43K response；remote/local 最多 50/30 turns |
+| 训练并行             | 8 GPU colocate；Megatron TP=2；4 个 SGLang TP=2 engine                    |
+| 推荐模型规模         | 9B 是当前训练基线；更强能力评测仍建议 14B/32B 级代码模型                  |
+| Sandbox              | 必需；每题独立 SIF，运行时通常有 OpenHands 与 evaluator 两个 Apptainer    |
 
-Qwen3.5-9B 使用仓库已有的 `qwen35-9B.sh` Megatron Bridge 配置。当前训练脚本使用 32K context、
-TP=2、不启用 CP，并启用 full recompute；R2E 仍是长耗时任务，应先用少量数据验证链路。
+Qwen3.5-9B 使用仓库已有的 `qwen35-9B.sh` Megatron Bridge 配置。当前训练脚本使用 51.2K context、
+TP=2、CP=4，并启用 full recompute；R2E 仍是长耗时任务，应先用少量数据验证链路。
+
+## Reward 怎么算
+
+上游 R2E evaluator 的结果是严格二值：模型 patch 通过目标测试、`resolved=true` 时 reward=1，否则
+reward=0。当前 Relax 接入额外加入一档部分奖励，让 GRPO 能区分“完全没有可评测修改”和“已经生成
+patch 但尚未解决问题”：
+
+| Relax 训练 reward | 条件                                            |
+| ----------------- | ----------------------------------------------- |
+| 1.0               | evaluator 返回 `resolved=true`                  |
+| 0.1               | 上游 reward=0，但返回 `patch_exists=true`       |
+| 0.0               | 没有可评测 patch，或在 patch 收集前链路已经失败 |
+
+完整流程是：
+
+1. OpenHands 在题目 SIF 中运行模型和工具，修改仓库。
+2. agent 完成时收集相对稳定 `base_commit` 的 Git patch。
+3. evaluator 应用模型 patch，并在隔离环境中执行题目测试。
+4. Gym 返回 `patch_exists`、`resolved` 和原始二值 reward。
+5. Relax adapter 在 `patch_exists=true` 且原始 reward=0 时，将训练 reward 改为 0.1。
+
+### Reward 实现细节
+
+- 0.1 是 Relax 接入增加的 reward shaping，不是 R2E-Gym 上游的原始分数，也不代表测试已经正常完成；
+  evaluator timeout、OOM 等情况仍要结合日志判断。
+- `patch_exists=true` 只说明系统收集到了可评测 patch；只有 `resolved=true`、reward=1 才表示测试通过。
+- reward=0 不能单独证明模型能力失败。callback、OpenHands、patch 收集、SIF 或 evaluator 在更早阶段
+  出错，也可能没有产生有效 patch。
+- Golden 模式使用 reference patch 验证 dataset、SIF 和 evaluator，绕过真实模型与 patch 收集链路；
+  golden reward=1 不等于模型训练链路已经跑通。
+- `rollout/raw_reward` 包含 0.1 部分奖励，其均值不是严格的题目通过率。真实成功率应统计 reward=1，
+  并结合 artifact 或 evaluator 日志中的 `resolved`、`patch_exists` 检查。
+
+## 训练曲线示例
+
+### Actor MFU 与 rollout time
+
+![R2E-Gym 训练的 Actor MFU 与 rollout time 曲线](assets/r2e-training-mfu-rollout-time.png)
+
+### Raw reward
+
+![R2E-Gym 训练的 raw reward 曲线](assets/r2e-training-raw-reward.png)
+
+### 平均 rollout turns
+
+![R2E-Gym 训练的平均 rollout turns 曲线](assets/r2e-training-rollout-turns.png)
+
+### Entropy loss 与 grad norm
+
+![R2E-Gym 训练的 entropy loss 与 grad norm 曲线](assets/r2e-training-entropy-grad-norm.png)
 
 ## 启动脚本命名
 

@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 
-EXAMPLE_DIR = Path(__file__).resolve().parents[1]
+EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "nemo_gym_agentic"
 REPO_ROOT = EXAMPLE_DIR.parents[1]
 
 
@@ -26,6 +26,12 @@ def test_shared_scripts_remain_under_example_scripts() -> None:
 
 def test_each_recipe_owns_its_scripts() -> None:
     expected = {
+        "calendar": {
+            "prepare_calendar.sh",
+            "run-qwen3-4B-8xgpu-nemo-gym-calendar.sh",
+            "start_calendar_gym.sh",
+            "verify_calendar.py",
+        },
         "gsm8k": {
             "prepare_gsm8k.sh",
             "run-qwen3-4B-8xgpu-nemo-gym.sh",
@@ -67,7 +73,7 @@ def test_generic_recipe_local_entrypoint_exists() -> None:
 def test_each_recipe_has_chinese_runbook_and_pitfall_record() -> None:
     recipes_dir = EXAMPLE_DIR / "recipes"
 
-    for recipe_name in ("gsm8k", "workplace-assistant", "r2e-gym"):
+    for recipe_name in ("calendar", "gsm8k", "workplace-assistant", "r2e-gym"):
         recipe_dir = recipes_dir / recipe_name
         readme = (recipe_dir / "README.md").read_text(encoding="utf-8")
         pitfail = (recipe_dir / "PITFAIL.md").read_text(encoding="utf-8")
@@ -80,7 +86,7 @@ def test_each_recipe_has_chinese_runbook_and_pitfall_record() -> None:
 def test_each_recipe_training_script_configures_tracking_names() -> None:
     training_scripts = sorted((EXAMPLE_DIR / "recipes").glob("*/run-*.sh"))
 
-    assert len(training_scripts) == 4
+    assert len(training_scripts) == 5
     for script in training_scripts:
         content = script.read_text()
         assert 'PROJECT_NAME="${PROJECT_NAME:-Relax/dev/nemo-gym}"' in content
@@ -97,6 +103,28 @@ def test_each_recipe_training_script_configures_tracking_names() -> None:
         assert "--use-metrics-service" in content
         assert '--tb-project-name "${PROJECT_NAME}"' in content
         assert '--tb-experiment-name "${EXP_NAME}-${now}"' in content
+
+
+def test_calendar_recipe_reuses_standard_gateway_and_training_path() -> None:
+    recipe_dir = EXAMPLE_DIR / "recipes" / "calendar"
+    start_script = (recipe_dir / "start_calendar_gym.sh").read_text()
+    training_script = (recipe_dir / "run-qwen3-4B-8xgpu-nemo-gym-calendar.sh").read_text()
+    dockerfile = (EXAMPLE_DIR / "service" / "Dockerfile").read_text()
+
+    assert "environments/calendar/config.yaml" in start_script
+    assert '"agent_name": "calendar_simple_agent"' in start_script
+    assert '++calendar.resources_servers.calendar.port="${CALENDAR_RESOURCE_PORT}"' in start_script
+    assert "++global_aiohttp_client_request_debug=True" in start_script
+    assert '"NEMO_GYM_ENVIRONMENT=calendar"' in training_script
+    assert '"NEMO_GYM_CONFIG=calendar-v1"' in training_script
+    assert "NEMO_GYM_GATEWAY_PORT:-29100" in training_script
+    assert "NEMO_GYM_NUM_ROLLOUT" not in training_script
+    assert "NEMO_GYM_N_SAMPLES_PER_PROMPT" not in training_script
+    assert "--num-rollout 200" in training_script
+    assert "--rollout-batch-size 32" in training_script
+    assert "--n-samples-per-prompt 8" in training_script
+    assert "--global-batch-size 256" in training_script
+    assert "resources_servers/calendar" in dockerfile
 
 
 def test_workplace_training_uses_shared_checkout_without_runtime_upload() -> None:
