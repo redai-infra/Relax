@@ -531,6 +531,7 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
     monkeypatch.setattr(_loss_mod, "checkpoint", spy_checkpoint)
     monkeypatch.setattr(_loss_mod, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(1))
     monkeypatch.setattr(_loss_mod, "get_sum_of_sample_mean", lambda *args, **kwargs: object())
+    monkeypatch.setattr(_loss_mod.mpu, "get_data_parallel_world_size", lambda **_kwargs: 1)
 
     args = Namespace(
         loss_type="sft",
