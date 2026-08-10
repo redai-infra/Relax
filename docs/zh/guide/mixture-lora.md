@@ -91,4 +91,4 @@ OUTPUT_DIR=/path/to/qwen3-4b-mixture-lora \
 bash scripts/training/text/run-qwen3-4B-mixture-lora-8xgpu.sh
 ```
 
-Actor 使用 TP=2 和 sequence parallel。Rollout 资源会建立八个独立的单卡 SGLang engine。可以通过 `NUM_ROLLOUT`、`LORA_NUM_EXPERTS`、`LORA_RANK`、`LORA_ROUTER_TOP_K` 等环境变量覆盖 recipe 中的值，也可以在命令末尾继续追加 Relax 参数。
+Actor 使用 TP=2 和 sequence parallel。Rollout 资源会建立八个独立的单卡 SGLang engine。可以通过 `NUM_ROLLOUT`、`LORA_NUM_EXPERTS`、`LORA_RANK`、`LORA_ROUTER_TOP_K` 等环境变量覆盖 recipe 中的值。这份 recipe 使用 BF16，也可以在命令末尾继续追加 Relax 参数。

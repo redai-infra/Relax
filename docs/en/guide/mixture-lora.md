@@ -91,4 +91,4 @@ OUTPUT_DIR=/path/to/qwen3-4b-mixture-lora \
 bash scripts/training/text/run-qwen3-4B-mixture-lora-8xgpu.sh
 ```
 
-The actor uses TP=2 with sequence parallelism. The rollout allocation creates eight independent one-GPU SGLang engines. Environment variables such as `NUM_ROLLOUT`, `LORA_NUM_EXPERTS`, `LORA_RANK`, and `LORA_ROUTER_TOP_K` can override the recipe values. Additional Relax arguments can be appended to the command.
+The actor uses TP=2 with sequence parallelism. The rollout allocation creates eight independent one-GPU SGLang engines. Environment variables such as `NUM_ROLLOUT`, `LORA_NUM_EXPERTS`, `LORA_RANK`, and `LORA_ROUTER_TOP_K` can override the recipe values. The recipe uses BF16. Additional Relax arguments can be appended to the command.

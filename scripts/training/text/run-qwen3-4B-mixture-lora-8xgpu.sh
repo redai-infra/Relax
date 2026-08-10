@@ -80,8 +80,6 @@ OPTIMIZER_ARGS=(
     --weight-decay 0.1
     --adam-beta1 0.9
     --adam-beta2 0.98
-    --initial-loss-scale 32768
-    --min-loss-scale 1
     --use-precision-aware-optimizer
     --no-store-param-remainders
 )
@@ -135,7 +133,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDRESS:-http://127.0.
     --max-staleness 0 \
     --num-data-storage-units 1 \
     --colocate \
-    --fp16 \
+    --bf16 \
     --use-health-check \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
