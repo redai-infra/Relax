@@ -12,10 +12,9 @@ Appendix Algorithm 2.
 
 This module is deliberately free of any Megatron / ``mpu`` dependency: it owns
 the formulas, the masking discipline and the stop-gradient boundaries, while
-collectives and step lifecycle live in the Megatron backend. The ESS scope in
-Relax is one *optimizer* step (not one micro-batch), so the sufficient
-statistics are produced here and reduced by the caller before being frozen into
-a :class:`P3OStepContext`.
+collectives and lifecycle live in the Megatron backend. The same sufficient
+statistics support both paper-compatible micro-batch ESS and Relax's optional
+optimizer-step ESS.
 """
 
 from dataclasses import dataclass
@@ -46,16 +45,6 @@ def _require_identical_shapes(**tensors: torch.Tensor) -> None:
     if len(set(shapes.values())) != 1:
         formatted = ", ".join(f"{name}={shape}" for name, shape in shapes.items())
         raise ValueError(f"P3O token tensors must have identical shapes; got {formatted}")
-
-
-def _assert_scalar_condition(condition: torch.Tensor, message: str) -> None:
-    """Assert a scalar condition without synchronizing a CUDA hot path."""
-    condition = condition.reshape(())
-    if condition.device.type == "cpu":
-        if not bool(condition):
-            raise ValueError(message)
-        return
-    torch._assert_async(condition, message)
 
 
 @dataclass(frozen=True)
@@ -139,6 +128,7 @@ class P3OTokenTerms:
             policy, *not* multiplied by ``(1 - ESS)``. Keeps gradient.
         adaptive_kl_loss: ``(1 - ESS) * behavior_kl_proxy``.
         cap_hits: 1.0 where ``rho_i > cap``, else 0.0.
+        clip_hits: 1.0 where ``rho_i`` is outside the monitoring interval.
     """
 
     ratio: torch.Tensor
@@ -146,6 +136,7 @@ class P3OTokenTerms:
     behavior_kl_proxy: torch.Tensor
     adaptive_kl_loss: torch.Tensor
     cap_hits: torch.Tensor
+    clip_hits: torch.Tensor
 
 
 def compute_p3o_log_ratio(
@@ -200,10 +191,9 @@ def compute_p3o_sufficient_stats(
         ValueError: If a valid position produced a non-finite ratio.
     """
     stats, invalid_flag = compute_p3o_sufficient_stats_unchecked(log_probs, behavior_log_probs, valid_mask)
-    # This is the sync-ing convenience wrapper: it materializes the flag to host
-    # memory so callers outside the micro-batch loop (tests, single-batch CPU
-    # use) still get an eager ValueError. Hot-path callers must use the
-    # unchecked variant and reduce the flag with the stats.
+    # This convenience wrapper is used outside the micro-batch hot path, so an
+    # eager host check gives callers a deterministic error. Training uses the
+    # unchecked variant and reduces the device flag with the ESS moments.
     if bool(invalid_flag > 0):
         raise ValueError(NONFINITE_RATIO_MESSAGE)
     return stats
@@ -272,48 +262,61 @@ def finalize_p3o_step_context(stats: P3OSufficientStats) -> P3OStepContext:
         Immutable :class:`P3OStepContext` reused by every micro-batch of the
         current optimizer step.
 
-    Raises:
-        ValueError: If the global valid-token count is zero, or if the reduced
-            statistics are non-finite. Both are hard errors rather than a silent
-            ``ESS = 1`` fallback, so a broken step fails loudly on all ranks.
+    Non-finite statistics and an empty valid-token set use the reference
+    implementation's neutral fallback: ``ESS=cap=1``, ratio mean 1 and ratio
+    std 0. This stays device-resident and does not synchronize a CUDA hot path.
     """
     sum_ratio = stats.sum_ratio.to(torch.float64)
     sum_ratio_sq = stats.sum_ratio_sq.to(torch.float64)
     count = stats.valid_token_count.to(torch.float64)
 
-    _assert_scalar_condition(
-        torch.stack((sum_ratio, sum_ratio_sq, count)).isfinite().all(),
-        "P3O: non-finite global ESS statistics.",
-    )
-    _assert_scalar_condition(
-        count >= 0.5,
-        (
-            "P3O: global valid response-token count is zero for this optimizer step. "
-            "The step cannot be normalized; skip or abort instead of assuming ESS=1."
-        ),
-    )
+    valid = torch.stack((sum_ratio, sum_ratio_sq, count)).isfinite().all() & (count >= 0.5)
+    one = torch.ones((), dtype=torch.float64, device=count.device)
+    zero = torch.zeros((), dtype=torch.float64, device=count.device)
+    safe_sum_ratio = torch.where(valid, sum_ratio, one)
+    safe_sum_ratio_sq = torch.where(valid, sum_ratio_sq, one)
+    safe_count = torch.where(valid, count, one)
 
-    raw_ess = sum_ratio.pow(2) / (count * (sum_ratio_sq + ESS_DENOM_EPS))
-    ess = raw_ess.clamp(min=0.0, max=1.0)
+    raw_ess = safe_sum_ratio.pow(2) / (safe_count * (safe_sum_ratio_sq + ESS_DENOM_EPS))
+    ess = torch.where(valid, raw_ess.clamp(min=0.0, max=1.0), one)
 
-    ratio_mean = sum_ratio / count
-    variance = (sum_ratio_sq / count) - ratio_mean.pow(2)
-    ratio_std = variance.clamp(min=0.0).sqrt()
+    ratio_mean = torch.where(valid, safe_sum_ratio / safe_count, one)
+    variance = (safe_sum_ratio_sq / safe_count) - ratio_mean.pow(2)
+    ratio_std = torch.where(valid, variance.clamp(min=0.0).sqrt(), zero)
+    valid_token_count = torch.where(torch.isfinite(count) & (count >= 0.0), count, zero)
 
     return P3OStepContext(
         normalized_ess=ess,
         adaptive_cap=ess.clone(),
-        valid_token_count=count,
+        valid_token_count=valid_token_count,
         ratio_mean=ratio_mean,
         ratio_std=ratio_std,
         clamp_events=0,
     )
 
 
+class _P3OProxySafeK3(torch.autograd.Function):
+    """FeynRL k3 forward with a bounded, sign-correct extreme backward."""
+
+    @staticmethod
+    def forward(ctx, log_ratio: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(log_ratio)
+        exponent = torch.clamp(-log_ratio, min=-BEHAVIOR_KL_EXP_CLAMP, max=BEHAVIOR_KL_EXP_CLAMP)
+        return log_ratio + torch.exp(exponent) - 1.0
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        (log_ratio,) = ctx.saved_tensors
+        exponent = torch.clamp(-log_ratio, min=-BEHAVIOR_KL_EXP_CLAMP, max=BEHAVIOR_KL_EXP_CLAMP)
+        gradient = 1.0 - torch.exp(exponent)
+        return (grad_output * gradient,)
+
+
 def compute_p3o_behavior_kl_proxy(
     log_probs: torch.Tensor,
     behavior_log_probs: torch.Tensor,
     valid_mask: torch.Tensor,
+    mode: str = "proxy",
 ) -> torch.Tensor:
     """Sampled-token k3 proxy for ``KL(pi_theta || pi_b)``.
 
@@ -335,14 +338,60 @@ def compute_p3o_behavior_kl_proxy(
         behavior_log_probs: Behavior-policy (rollout) log-probs, detached.
         valid_mask: Boolean mask selecting valid response tokens.
 
+        mode: ``proxy`` preserves the FeynRL autograd behavior. ``proxy_safe``
+            preserves the exact forward values but corrects the saturated
+            negative-log-ratio gradient direction.
+
     Returns:
         Element-wise KL proxy, zero at invalid positions.
     """
+    if mode not in {"proxy", "proxy_safe"}:
+        raise ValueError(f"P3O sampled-token KL mode must be proxy or proxy_safe, got {mode!r}")
     mask_bool = valid_mask.bool()
     log_ratio = compute_p3o_log_ratio(log_probs, behavior_log_probs, mask_bool)
-    exponent = torch.clamp(-log_ratio, min=-BEHAVIOR_KL_EXP_CLAMP, max=BEHAVIOR_KL_EXP_CLAMP)
-    kl = log_ratio + torch.exp(exponent) - 1.0
+    if mode == "proxy_safe":
+        kl = _P3OProxySafeK3.apply(log_ratio)
+    else:
+        exponent = torch.clamp(-log_ratio, min=-BEHAVIOR_KL_EXP_CLAMP, max=BEHAVIOR_KL_EXP_CLAMP)
+        kl = log_ratio + torch.exp(exponent) - 1.0
     return torch.where(mask_bool, kl, torch.zeros_like(kl))
+
+
+def compute_p3o_exact_kl(
+    policy_logits: torch.Tensor,
+    behavior_logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the exact forward KL over a full vocabulary.
+
+    This pure helper is intended for small-vocabulary verification and for a
+    future training path that carries behavior logits. Production rollout data
+    currently stores only selected-token log-probs, so the loss integration
+    rejects ``exact`` mode with an explicit error.
+    """
+    if policy_logits.shape != behavior_logits.shape:
+        raise ValueError(
+            "P3O exact-KL logits must have identical shapes; "
+            f"got policy={tuple(policy_logits.shape)}, behavior={tuple(behavior_logits.shape)}"
+        )
+    if policy_logits.ndim < 1 or tuple(policy_logits.shape[:-1]) != tuple(valid_mask.shape):
+        raise ValueError(
+            "P3O exact-KL valid_mask must match the logits token dimensions; "
+            f"got logits={tuple(policy_logits.shape)}, mask={tuple(valid_mask.shape)}"
+        )
+
+    mask_bool = valid_mask.bool()
+    expanded_mask = mask_bool.unsqueeze(-1)
+    safe_policy_logits = torch.where(expanded_mask, policy_logits.float(), torch.zeros_like(policy_logits.float()))
+    safe_behavior_logits = torch.where(
+        expanded_mask,
+        behavior_logits.detach().float(),
+        torch.zeros_like(behavior_logits.detach().float()),
+    )
+    policy_log_probs = torch.log_softmax(safe_policy_logits, dim=-1)
+    behavior_log_probs = torch.log_softmax(safe_behavior_logits, dim=-1)
+    exact_kl = (policy_log_probs.exp() * (policy_log_probs - behavior_log_probs)).sum(dim=-1)
+    return torch.where(mask_bool, exact_kl, torch.zeros_like(exact_kl))
 
 
 def compute_p3o_token_terms(
@@ -351,6 +400,9 @@ def compute_p3o_token_terms(
     advantages: torch.Tensor,
     valid_mask: torch.Tensor,
     step_context: P3OStepContext,
+    kl_mode: str = "proxy",
+    clip_low: float = 0.2,
+    clip_high: float = 0.2,
 ) -> P3OTokenTerms:
     """Compute the element-wise P3O loss terms for one micro-batch.
 
@@ -367,10 +419,22 @@ def compute_p3o_token_terms(
         advantages: GRPO group-relative advantages broadcast to response tokens.
         valid_mask: Boolean mask selecting valid response tokens.
         step_context: Frozen context carrying this optimizer step's global cap.
+        kl_mode: Sampled-token behavioral KL implementation. ``exact`` is
+            rejected because this function receives no behavior logits.
+        clip_low: Lower monitoring margin around ratio 1.
+        clip_high: Upper monitoring margin around ratio 1.
 
     Returns:
         :class:`P3OTokenTerms` with no reduction applied.
     """
+    if kl_mode == "exact":
+        raise ValueError(
+            "P3O exact KL requires full-vocabulary behavior logits; rollout data currently stores only "
+            "selected-token log-probs. Use proxy/proxy_safe for training."
+        )
+    if clip_low < 0.0 or clip_high < 0.0:
+        raise ValueError(f"P3O clip monitoring margins must be non-negative, got {clip_low}, {clip_high}")
+
     _require_identical_shapes(
         log_probs=log_probs,
         behavior_log_probs=behavior_log_probs,
@@ -392,11 +456,12 @@ def compute_p3o_token_terms(
         # GPU-to-CPU synchronization in every training micro-batch.
         coefficient = torch.minimum(ratio, cap)
         cap_hits = (mask_bool & (ratio > cap)).to(dtype=torch.float32)
+        clip_hits = (mask_bool & ((ratio < 1.0 - clip_low) | (ratio > 1.0 + clip_high))).to(dtype=torch.float32)
 
     score_loss = -(coefficient * log_probs.float() * advantages.detach().float())
     score_loss = torch.where(mask_bool, score_loss, torch.zeros_like(score_loss))
 
-    behavior_kl_proxy = compute_p3o_behavior_kl_proxy(log_probs, behavior_log_probs, mask_bool)
+    behavior_kl_proxy = compute_p3o_behavior_kl_proxy(log_probs, behavior_log_probs, mask_bool, mode=kl_mode)
     adaptive_kl_loss = (1.0 - ess) * behavior_kl_proxy
 
     return P3OTokenTerms(
@@ -405,4 +470,5 @@ def compute_p3o_token_terms(
         behavior_kl_proxy=behavior_kl_proxy,
         adaptive_kl_loss=adaptive_kl_loss,
         cap_hits=cap_hits,
+        clip_hits=clip_hits,
     )

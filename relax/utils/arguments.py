@@ -1751,6 +1751,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If not set, we will use the logprobs from the actor model."
                 ),
             )
+            parser.add_argument(
+                "--p3o-ess-scope",
+                choices=["micro-batch", "step"],
+                default="micro-batch",
+                help="P3O ESS scope: paper-compatible micro-batch (default) or optimizer step.",
+            )
+            parser.add_argument(
+                "--p3o-kl-mode",
+                choices=["proxy", "proxy_safe", "exact"],
+                default="proxy",
+                help=(
+                    "P3O behavior-KL implementation. Production training supports proxy and proxy_safe; "
+                    "exact is retained for pure full-vocabulary verification helpers and is rejected by validation."
+                ),
+            )
+            parser.add_argument(
+                "--clip-low",
+                type=float,
+                default=0.2,
+                help="Lower ratio margin used only for P3O clip-fraction monitoring.",
+            )
+            parser.add_argument(
+                "--clip-high",
+                type=float,
+                default=0.2,
+                help="Upper ratio margin used only for P3O clip-fraction monitoring.",
+            )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
                 "--use-tis",
@@ -2685,6 +2712,22 @@ def _validate_p3o_args(args) -> None:
     # asserts, and every condition here silently changes the objective rather
     # than crashing, so a stripped check would let a non-P3O run masquerade as
     # one for its entire duration.
+    scope = getattr(args, "p3o_ess_scope", "micro-batch")
+    if scope not in {"micro-batch", "step"}:
+        raise ValueError(f"--p3o-ess-scope must be micro-batch or step, got {scope!r}.")
+    kl_mode = getattr(args, "p3o_kl_mode", "proxy")
+    if kl_mode not in {"proxy", "proxy_safe", "exact"}:
+        raise ValueError(f"--p3o-kl-mode must be proxy, proxy_safe, or exact, got {kl_mode!r}.")
+    if kl_mode == "exact":
+        raise ValueError(
+            "--p3o-kl-mode exact is verifier-only and cannot be used for production P3O training: "
+            "rollouts store selected-token behavior log-probabilities, not full-vocabulary behavior logits."
+        )
+    clip_low = getattr(args, "clip_low", 0.2)
+    clip_high = getattr(args, "clip_high", 0.2)
+    if clip_low < 0.0 or clip_high < 0.0:
+        raise ValueError(f"--clip-low/--clip-high must be non-negative, got {clip_low}, {clip_high}.")
+
     if not args.use_rollout_logprobs:
         raise ValueError(
             "P3O requires the rollout sampling distribution as its behavior policy. "
@@ -2721,27 +2764,31 @@ def _validate_p3o_args(args) -> None:
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         raise ValueError("P3O requires token-sum normalization and does not support a custom PG-loss reducer.")
 
-    # The ESS pre-pass replays the same micro-batch window under no_grad. Ops that
-    # mutate state on a forward would make the two passes disagree.
-    if getattr(args, "fp8", None) is not None:
-        raise ValueError(
-            "P3O's ESS pre-pass runs a second forward over the same window, which would "
-            "advance FP8 amax history and make the training forward non-reproducible. "
-            "Disable FP8 or run P3O without the two-pass ESS scope."
+    if scope == "step":
+        # The ESS pre-pass replays the same micro-batch window under no_grad. Ops
+        # that mutate state on a forward would make the two passes disagree.
+        if getattr(args, "fp8", None) is not None:
+            raise ValueError(
+                "P3O's ESS pre-pass runs a second forward over the same window, which would "
+                "advance FP8 amax history and make the training forward non-reproducible. "
+                "Disable FP8 or use --p3o-ess-scope micro-batch."
+            )
+        dropout = max(
+            getattr(args, "attention_dropout", 0.0) or 0.0,
+            getattr(args, "hidden_dropout", 0.0) or 0.0,
         )
-    dropout = max(getattr(args, "attention_dropout", 0.0) or 0.0, getattr(args, "hidden_dropout", 0.0) or 0.0)
-    if dropout > 0.0:
-        raise ValueError(
-            f"P3O requires deterministic replay of the optimizer-step window, but dropout is "
-            f"enabled (max rate {dropout}). Set --attention-dropout 0.0 and --hidden-dropout 0.0."
-        )
+        if dropout > 0.0:
+            raise ValueError(
+                f"P3O step scope requires deterministic replay, but dropout is enabled (max rate {dropout}). "
+                "Set both dropout rates to 0.0 or use --p3o-ess-scope micro-batch."
+            )
 
-    if getattr(args, "fully_async", False):
-        raise ValueError(
-            "P3O's optimizer-step ESS scope requires the whole micro-batch window to be "
-            "available before the training pass. Fully-async mode streams micro-batches, so "
-            "the window is not knowable in advance."
-        )
+        if getattr(args, "fully_async", False):
+            raise ValueError(
+                "P3O's optimizer-step ESS scope requires the whole micro-batch window to be "
+                "available before the training pass. Fully-async mode streams micro-batches; "
+                "use --p3o-ess-scope micro-batch instead."
+            )
 
 
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:

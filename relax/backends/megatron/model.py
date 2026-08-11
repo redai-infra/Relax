@@ -1170,10 +1170,13 @@ def train_one_step(
     # Dynamic CP mutates the model's CP process group inside each forward.
     # Protect both P3O passes so failures cannot leak a per-micro-batch group.
     with _preserved_dynamic_cp_group(args, model):
-        # P3O: freeze one adaptive cap for the whole optimizer step before any
-        # gradient is produced, so gradient accumulation cannot change the objective.
+        # Optional step scope freezes one adaptive cap before gradients are
+        # produced. Micro-batch scope computes its cap inside the loss callback.
         p3o_context_manager = contextlib.nullcontext()
-        if getattr(args, "advantage_estimator", None) == "p3o":
+        if (
+            getattr(args, "advantage_estimator", None) == "p3o"
+            and getattr(args, "p3o_ess_scope", "micro-batch") == "step"
+        ):
             from relax.backends.megatron.p3o_step import (
                 compute_p3o_step_context,
                 p3o_step_context_published,

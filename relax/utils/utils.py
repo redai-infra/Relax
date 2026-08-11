@@ -114,10 +114,43 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         "sample_indices": [sample.index for sample in samples],
     }
 
+    has_rollout_log_probs = [sample.rollout_log_probs is not None for sample in samples]
+    if any(has_rollout_log_probs) and not all(has_rollout_log_probs):
+        raise ValueError("rollout_log_probs must be present for every sample in a training batch or for none of them")
+    if getattr(args, "use_rollout_logprobs", False) and not all(has_rollout_log_probs):
+        raise ValueError("--use-rollout-logprobs requires behavior log-probs for every training sample")
+
+    rollout_log_probs_masks: list[list[bool]] | None = None
+    if all(has_rollout_log_probs):
+        candidate_masks: list[list[bool]] = []
+        masks_aligned = True
+        for sample in samples:
+            rollout_log_probs = sample.rollout_log_probs
+            assert rollout_log_probs is not None
+            if len(rollout_log_probs) != sample.response_length:
+                if getattr(args, "use_rollout_logprobs", False) or rollout_log_probs:
+                    raise ValueError(
+                        f"rollout log-prob length {len(rollout_log_probs)} != response length {sample.response_length}"
+                    )
+                masks_aligned = False
+                continue
+            pairing_mask = sample.rollout_log_probs_mask
+            if pairing_mask is None:
+                pairing_mask = [True] * sample.response_length
+            if len(pairing_mask) != len(rollout_log_probs):
+                raise ValueError(
+                    "rollout log-prob mask length "
+                    f"{len(pairing_mask)} != rollout log-prob length {len(rollout_log_probs)}"
+                )
+            sample.rollout_log_probs_mask = [bool(value) for value in pairing_mask]
+            candidate_masks.append(sample.rollout_log_probs_mask)
+        if masks_aligned and len(candidate_masks) == len(samples):
+            rollout_log_probs_masks = candidate_masks
+
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
-    for sample in samples:
+    for sample_index, sample in enumerate(samples):
         # always instantiate loss_mask if not provided
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
@@ -130,6 +163,15 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         )
         if sample.remove_sample:
             sample.loss_mask = [0] * sample.response_length
+        if rollout_log_probs_masks is not None:
+            sample.loss_mask = [
+                int(bool(loss_value) and pairing_value)
+                for loss_value, pairing_value in zip(
+                    sample.loss_mask,
+                    rollout_log_probs_masks[sample_index],
+                    strict=True,
+                )
+            ]
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
 
@@ -146,8 +188,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
 
     # Add rollout log probabilities for off-policy correction
-    if samples[0].rollout_log_probs is not None:
+    if all(has_rollout_log_probs):
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+    if rollout_log_probs_masks is not None:
+        train_data["rollout_log_probs_mask"] = rollout_log_probs_masks
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
@@ -203,9 +247,14 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                     f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
                 )
             group_rewards = rewards[positions]
-            group_rewards = group_rewards - group_rewards.mean()
-            if args.advantage_estimator in GRPO_STYLE_ADVANTAGE_ESTIMATORS and args.grpo_std_normalization:
-                group_rewards = group_rewards / (group_rewards.std() + 1e-6)
+            if args.advantage_estimator == "p3o":
+                if len(positions) > 1:
+                    group_rewards = group_rewards - group_rewards.mean()
+                    group_rewards = group_rewards / (group_rewards.std(correction=1) + 1e-8)
+            else:
+                group_rewards = group_rewards - group_rewards.mean()
+                if args.advantage_estimator in GRPO_STYLE_ADVANTAGE_ESTIMATORS and args.grpo_std_normalization:
+                    group_rewards = group_rewards / (group_rewards.std() + 1e-6)
             normalized_rewards[positions] = group_rewards
 
         return raw_rewards, normalized_rewards.tolist()

@@ -19,10 +19,13 @@ from relax.utils.opd.opd_utils import (
     compute_policy_opd_loss,
     resolve_opd_gather_topk_token_ids,
     validate_opd_topk_gather,
+    validate_p3o_opd_compatibility,
 )
 from relax.utils.training.p3o_utils import (
     P3OStepContext,
+    compute_p3o_sufficient_stats_unchecked,
     compute_p3o_token_terms,
+    finalize_p3o_step_context,
 )
 from relax.utils.training.ppo_utils import (
     GRPO_STYLE_ADVANTAGE_ESTIMATORS,
@@ -50,6 +53,7 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .p3o_step import synchronize_p3o_stats
 
 
 def get_responses(
@@ -809,6 +813,35 @@ def get_p3o_step_context(args: Namespace) -> P3OStepContext:
     return step_context
 
 
+def get_p3o_context(
+    args: Namespace,
+    log_probs: torch.Tensor,
+    behavior_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> P3OStepContext:
+    """Resolve the configured P3O ESS scope for one loss micro-batch."""
+    scope = getattr(args, "p3o_ess_scope", "micro-batch")
+    if scope == "step":
+        return get_p3o_step_context(args)
+    if scope != "micro-batch":
+        raise ValueError(f"P3O ESS scope must be 'micro-batch' or 'step', got {scope!r}")
+
+    stats, invalid_count = compute_p3o_sufficient_stats_unchecked(
+        log_probs,
+        behavior_log_probs,
+        valid_mask,
+    )
+    distributed = dist.is_available() and dist.is_initialized()
+    stats = synchronize_p3o_stats(
+        stats,
+        invalid_count,
+        dp_cp_group=mpu.get_data_parallel_group(with_context_parallel=True) if distributed else None,
+        pp_group=None,
+        is_pipeline_last_stage=True,
+    )
+    return finalize_p3o_step_context(stats)
+
+
 def p3o_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -847,8 +880,6 @@ def p3o_loss_function(
         pre-multiplied by this rank's valid-token count, because the caller
         divides every reported metric by the globally reduced token count.
     """
-    step_context = get_p3o_step_context(args)
-
     if isinstance(batch["advantages"], list):
         advantages = torch.cat(batch["advantages"], dim=0)
     else:
@@ -892,6 +923,7 @@ def p3o_loss_function(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
+    step_context = get_p3o_context(args, log_probs, behavior_log_probs, valid_mask)
 
     terms = compute_p3o_token_terms(
         log_probs=log_probs,
@@ -899,12 +931,16 @@ def p3o_loss_function(
         advantages=advantages,
         valid_mask=valid_mask,
         step_context=step_context,
+        kl_mode=getattr(args, "p3o_kl_mode", "proxy"),
+        clip_low=getattr(args, "clip_low", 0.2),
+        clip_high=getattr(args, "clip_high", 0.2),
     )
 
     score_loss = sum_of_sample_mean(terms.score_loss)
     adaptive_kl_loss = sum_of_sample_mean(terms.adaptive_kl_loss)
     behavior_kl_proxy = sum_of_sample_mean(terms.behavior_kl_proxy)
     cap_fraction = sum_of_sample_mean(terms.cap_hits)
+    clip_fraction = sum_of_sample_mean(terms.clip_hits)
 
     entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
     entropy_loss = sum_of_sample_mean(entropy)
@@ -942,6 +978,7 @@ def p3o_loss_function(
         "p3o/reference_kl": reference_kl_metric,
         "p3o/entropy": entropy_loss.clone().detach(),
         "p3o/cap_fraction": cap_fraction.clone().detach(),
+        "p3o/clip_fraction": clip_fraction.clone().detach(),
         "p3o/total_loss": loss.clone().detach(),
         "p3o/normalized_ess": scaled(step_context.normalized_ess),
         "p3o/adaptive_cap": scaled(step_context.adaptive_cap),
@@ -1468,6 +1505,24 @@ def sft_loss_function_chunked(
     return loss, {"loss": loss.clone().detach()}
 
 
+def _select_policy_loss_function(
+    args: Namespace,
+) -> Callable[..., tuple[torch.Tensor, dict[str, torch.Tensor]]]:
+    """Select one policy objective without composing unrelated algorithm
+    families.
+
+    P3O has a dedicated score-function/trust-region objective and therefore
+    bypasses :func:`policy_loss_function`, including its optional
+    :func:`compute_policy_opd_loss` term. The compatibility guard is repeated
+    here so callers that bypass normal argument validation still fail before a
+    hybrid loss can be computed.
+    """
+    validate_p3o_opd_compatibility(args)
+    if getattr(args, "advantage_estimator", None) == "p3o":
+        return p3o_loss_function
+    return policy_loss_function
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1547,7 +1602,7 @@ def loss_function(
 
     match args.loss_type:
         case "policy_loss":
-            func = p3o_loss_function if args.advantage_estimator == "p3o" else policy_loss_function
+            func = _select_policy_loss_function(args)
         case "value_loss":
             func = value_loss_function
         case "sft":

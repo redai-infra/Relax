@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Optimizer-step scoped ESS pre-pass for P3O.
+"""Optional optimizer-step scoped ESS pre-pass for P3O.
 
 Relax computes ESS over one whole optimizer step to ensure that neither the
 number of micro-batches nor the DP/CP split change the adaptive cap or the
@@ -124,6 +124,8 @@ def synchronize_p3o_stats(
         if not bool(valid):
             raise ValueError(P3O_NONFINITE_RATIO_ERROR)
     else:
+        # Keep the accelerator hot path asynchronous. Every rank observes the
+        # globally reduced invalid flag, so they all fail consistently.
         torch._assert_async(valid, P3O_NONFINITE_RATIO_ERROR)
     return P3OSufficientStats.from_vector(vector[:3])
 

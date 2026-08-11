@@ -10,6 +10,7 @@ keeping these assertions running in CI instead of silently skipping.
 
 from argparse import Namespace
 
+import pytest
 import torch
 
 from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
@@ -27,6 +28,7 @@ REQUIRED_P3O_METRICS = {
     "p3o/ratio_mean",
     "p3o/ratio_std",
     "p3o/cap_fraction",
+    "p3o/clip_fraction",
     "p3o/score_loss",
     "p3o/behavior_kl_proxy",
     "p3o/adaptive_kl_loss",
@@ -35,6 +37,26 @@ REQUIRED_P3O_METRICS = {
     "p3o/valid_tokens",
     "p3o/total_loss",
 }
+
+
+def test_get_p3o_context_computes_micro_batch_scope_without_prepass():
+    args = Namespace(p3o_ess_scope="micro-batch")
+    log_probs = torch.tensor([-0.4, -0.8])
+    behavior_log_probs = torch.tensor([-0.5, -0.7])
+    valid_mask = torch.tensor([True, True])
+
+    context = loss_module.get_p3o_context(args, log_probs, behavior_log_probs, valid_mask)
+
+    assert context.valid_token_count.item() == 2
+    assert 0.0 < context.normalized_ess.item() <= 1.0
+    assert torch.equal(context.normalized_ess, context.adaptive_cap)
+
+
+def test_get_p3o_context_rejects_unknown_scope():
+    args = Namespace(p3o_ess_scope="window")
+
+    with pytest.raises(ValueError, match="micro-batch.*step"):
+        loss_module.get_p3o_context(args, torch.zeros(1), torch.zeros(1), torch.ones(1, dtype=torch.bool))
 
 
 def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
@@ -48,6 +70,7 @@ def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
     args = Namespace(
         _p3o_step_context=step_context,
         entropy_coef=0.0,
+        p3o_ess_scope="step",
         qkv_format="thd",
         use_kl_loss=False,
     )
@@ -80,6 +103,7 @@ def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
     _, metrics = loss_module.p3o_loss_function(args, batch, torch.zeros(1), torch.sum)
 
     assert REQUIRED_P3O_METRICS <= metrics.keys()
+    assert not any(metric.startswith("opd/") for metric in metrics)
     assert torch.equal(metrics["p3o/reference_kl"], torch.zeros(()))
     assert not metrics["p3o/reference_kl"].requires_grad
 
@@ -94,6 +118,7 @@ def test_p3o_loss_function_normalizes_by_true_valid_tokens(monkeypatch):
         loss_type="policy_loss",
         qkv_format="thd",
         recompute_loss_function=False,
+        use_opd=False,
     )
     batch = {
         "loss_masks": [torch.zeros(2), torch.tensor([1.0, 0.0])],
@@ -112,8 +137,37 @@ def test_p3o_loss_function_normalizes_by_true_valid_tokens(monkeypatch):
         "p3o_loss_function",
         lambda *args, **kwargs: (torch.tensor(3.0, requires_grad=True), {"loss": torch.tensor(3.0)}),
     )
+    monkeypatch.setattr(
+        loss_module,
+        "policy_loss_function",
+        lambda *args, **kwargs: pytest.fail("P3O must not use the ordinary policy-loss path"),
+    )
+    monkeypatch.setattr(
+        loss_module,
+        "compute_policy_opd_loss",
+        lambda *args, **kwargs: pytest.fail("P3O must not call compute_policy_opd_loss"),
+    )
 
     _, normalizer, logging_dict = loss_module.loss_function(args, batch, 1, torch.zeros(1))
 
     assert normalizer.item() == 1
     assert logging_dict["values"][0].item() == 1
+
+
+def test_policy_loss_dispatch_selects_dedicated_p3o_path():
+    args = Namespace(advantage_estimator="p3o", use_opd=False)
+
+    assert loss_module._select_policy_loss_function(args) is loss_module.p3o_loss_function
+
+
+def test_policy_loss_dispatch_rejects_p3o_with_opd():
+    args = Namespace(advantage_estimator="p3o", use_opd=True)
+
+    with pytest.raises(ValueError, match="P3O and OPD are mutually exclusive"):
+        loss_module._select_policy_loss_function(args)
+
+
+def test_policy_loss_dispatch_preserves_opd_for_non_p3o_estimators():
+    args = Namespace(advantage_estimator="grpo", use_opd=True)
+
+    assert loss_module._select_policy_loss_function(args) is loss_module.policy_loss_function

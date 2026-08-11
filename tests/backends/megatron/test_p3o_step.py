@@ -28,6 +28,10 @@ def _stub_cp_world_size(monkeypatch):
         "mpu",
         SimpleNamespace(get_context_parallel_world_size=lambda: 1),
     )
+    # The target SIF has a real Megatron installation, whereas lightweight
+    # developer environments use the module stubs above. Keep these unit tests
+    # hermetic in both cases instead of querying an uninitialized PP group.
+    monkeypatch.setattr(p3o_step.mpu, "is_pipeline_last_stage", lambda ignore_virtual=False: True)
 
 
 def _stats(values: tuple[float, float, float]) -> P3OSufficientStats:

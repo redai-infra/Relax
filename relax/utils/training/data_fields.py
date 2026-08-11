@@ -15,6 +15,8 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
+    if getattr(args, "use_rollout_logprobs", False):
+        fields.append("rollout_log_probs_mask")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
     return fields

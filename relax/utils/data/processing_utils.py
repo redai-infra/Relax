@@ -302,6 +302,51 @@ def sanitize_kimi_k25_response_tokens(
     return [replacement_id if t == placeholder_id else t for t in response_tokens]
 
 
+def _sanitize_response_tokens_for_logprobs(
+    tokenizer: object,
+    processor: object | None,
+    response_tokens: list[int],
+) -> tuple[list[int], list[bool], dict[str, int]]:
+    """Replace invalid multimodal output tokens and mark stale log-prob
+    pairs."""
+    sanitized = list(response_tokens)
+    pairing_mask = [True] * len(sanitized)
+    replacement_counts: dict[str, int] = {}
+    pad_token_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+
+    for label, attribute in (
+        ("image", "image_token_id"),
+        ("audio", "audio_token_id"),
+        ("video", "video_token_id"),
+    ):
+        special_token_id = getattr(tokenizer, attribute, None)
+        if special_token_id is None:
+            continue
+        replaced = 0
+        for index, token_id in enumerate(sanitized):
+            if token_id == special_token_id:
+                sanitized[index] = pad_token_id
+                pairing_mask[index] = False
+                replaced += 1
+        if replaced:
+            replacement_counts[label] = replaced
+
+    if processor is not None:
+        media_sanitized = sanitize_kimi_k25_response_tokens(processor, sanitized)
+        if len(media_sanitized) != len(sanitized):
+            raise ValueError("multimodal response sanitization must preserve token count")
+        replaced = 0
+        for index, (before, after) in enumerate(zip(sanitized, media_sanitized, strict=True)):
+            if before != after:
+                pairing_mask[index] = False
+                replaced += 1
+        if replaced:
+            replacement_counts["media_pad"] = replaced
+        sanitized = media_sanitized
+
+    return sanitized, pairing_mask, replacement_counts
+
+
 def expand_kimi_k25_placeholders(
     processor: object,
     prompt_ids: list[int],

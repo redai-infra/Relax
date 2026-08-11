@@ -3,10 +3,8 @@
 """Element-wise parity tests for the P3O primitives.
 
 The golden values come from running the reference implementation (FeynRL
-``algs/P3O/p3o.py``) over one *optimizer* step's tokens concatenated into a
-single logical batch. Relax computes ESS over the optimizer step rather than
-per micro-batch, so the reference's per-micro-batch loop is not the oracle for
-the statistical scope -- only for the element-wise formulas.
+``algs/P3O/p3o.py``) over one logical batch. The same element-wise oracle is
+used by the default micro-batch scope and the optional optimizer-step scope.
 """
 
 import math
@@ -18,6 +16,7 @@ from relax.utils.training.p3o_utils import (
     P3OStepContext,
     P3OSufficientStats,
     compute_p3o_behavior_kl_proxy,
+    compute_p3o_exact_kl,
     compute_p3o_sufficient_stats,
     compute_p3o_token_terms,
     finalize_p3o_step_context,
@@ -278,10 +277,15 @@ def test_p3o_utils_all_masked_poison_produces_fp64_zero_stats():
         assert torch.equal(value, torch.zeros((), dtype=torch.float64))
 
 
-def test_p3o_utils_empty_global_batch_raises():
+def test_p3o_utils_empty_global_batch_falls_back_to_full_ess():
     stats = P3OSufficientStats.zeros()
-    with pytest.raises(ValueError, match="valid response-token count is zero"):
-        finalize_p3o_step_context(stats)
+    context = finalize_p3o_step_context(stats)
+
+    assert float(context.normalized_ess) == 1.0
+    assert float(context.adaptive_cap) == 1.0
+    assert float(context.valid_token_count) == 0.0
+    assert float(context.ratio_mean) == 1.0
+    assert float(context.ratio_std) == 0.0
 
 
 @pytest.mark.parametrize("mismatched", ["behavior", "mask"])
@@ -342,6 +346,60 @@ def test_p3o_utils_behavior_kl_proxy_clamps_extreme_divergence():
     assert float(kl[0, 0]) == pytest.approx(-50.0 + math.exp(10.0) - 1.0, rel=1e-6)
 
 
+def test_p3o_utils_proxy_safe_matches_proxy_forward_and_has_correct_gradient_sign():
+    behavior_log_probs = torch.zeros(121, dtype=torch.float32)
+    proxy_log_probs = torch.linspace(-30.0, 30.0, 121, requires_grad=True)
+    safe_log_probs = proxy_log_probs.detach().clone().requires_grad_(True)
+    valid_mask = torch.ones_like(proxy_log_probs, dtype=torch.bool)
+
+    proxy = compute_p3o_behavior_kl_proxy(proxy_log_probs, behavior_log_probs, valid_mask, mode="proxy")
+    proxy_safe = compute_p3o_behavior_kl_proxy(safe_log_probs, behavior_log_probs, valid_mask, mode="proxy_safe")
+
+    torch.testing.assert_close(proxy_safe, proxy, rtol=0.0, atol=0.0)
+    proxy.sum().backward()
+    proxy_safe.sum().backward()
+
+    negative = safe_log_probs.detach() < 0
+    positive = safe_log_probs.detach() > 0
+    assert torch.all(safe_log_probs.grad[negative] <= 0)
+    assert torch.all(safe_log_probs.grad[positive] >= 0)
+    assert float(safe_log_probs.grad.abs().max()) <= math.exp(10.0)
+    assert float(proxy_log_probs.grad[0]) > 0
+    assert float(safe_log_probs.grad[0]) < 0
+
+
+def test_p3o_utils_exact_kl_matches_manual_small_vocabulary_oracle():
+    policy_logits = torch.tensor([[[1.0, 0.0, -1.0], [float("nan"), 2.0, 1.0]]], requires_grad=True)
+    behavior_logits = torch.tensor([[[0.0, 0.5, -0.5], [float("inf"), 0.0, 0.0]]], requires_grad=True)
+    valid_mask = torch.tensor([[True, False]])
+
+    exact = compute_p3o_exact_kl(policy_logits, behavior_logits, valid_mask)
+    policy_log_probs = torch.log_softmax(policy_logits[0, 0], dim=-1)
+    behavior_log_probs = torch.log_softmax(behavior_logits[0, 0].detach(), dim=-1)
+    expected = (policy_log_probs.exp() * (policy_log_probs - behavior_log_probs)).sum()
+
+    torch.testing.assert_close(exact[0, 0], expected)
+    assert float(exact[0, 1].detach()) == 0.0
+    exact.sum().backward()
+    assert policy_logits.grad is not None
+    assert behavior_logits.grad is None
+
+
+def test_p3o_utils_exact_training_mode_requires_behavior_logits():
+    log_probs, behavior_log_probs, advantages, valid_mask = _golden_batch()
+    context = finalize_p3o_step_context(compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask))
+
+    with pytest.raises(ValueError, match="full-vocabulary behavior logits"):
+        compute_p3o_token_terms(
+            log_probs,
+            behavior_log_probs,
+            advantages,
+            valid_mask,
+            context,
+            kl_mode="exact",
+        )
+
+
 def test_p3o_utils_advantage_and_cap_are_stop_gradient():
     log_probs, behavior_log_probs, advantages, valid_mask = _golden_batch(requires_grad=True)
     advantages = advantages.clone().requires_grad_(True)
@@ -383,6 +441,26 @@ def test_p3o_utils_entire_adaptive_coefficient_is_stop_gradient():
 
     torch.testing.assert_close(log_probs.grad, torch.tensor([-1.5]))
     assert adaptive_cap.grad is None
+
+
+def test_p3o_utils_clip_hits_use_monitoring_interval_not_adaptive_cap():
+    behavior_log_probs = torch.zeros(1, 5)
+    ratios = torch.tensor([[0.79, 0.8, 1.0, 1.2, 1.21]])
+    log_probs = ratios.log()
+    valid_mask = torch.ones_like(log_probs, dtype=torch.bool)
+    context = finalize_p3o_step_context(compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask))
+
+    terms = compute_p3o_token_terms(
+        log_probs,
+        behavior_log_probs,
+        torch.ones_like(log_probs),
+        valid_mask,
+        context,
+        clip_low=0.2,
+        clip_high=0.2,
+    )
+
+    torch.testing.assert_close(terms.clip_hits, torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0]]))
 
 
 def test_p3o_utils_token_terms_keep_adaptive_cap_on_device(monkeypatch):

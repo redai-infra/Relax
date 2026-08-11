@@ -63,3 +63,7 @@ def test_p3o_model_step_guard_covers_stats_and_train_passes():
     }
     assert "compute_p3o_step_context" in guarded_calls
     assert "forward_backward_func" in guarded_calls
+    guarded_source = ast.dump(guard)
+    assert "p3o_ess_scope" in guarded_source
+    assert "micro-batch" in guarded_source
+    assert "step" in guarded_source

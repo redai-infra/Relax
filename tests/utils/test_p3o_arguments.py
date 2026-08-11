@@ -40,6 +40,10 @@ def _p3o_args(**overrides) -> Namespace:
     """A minimal P3O-valid config, with individual fields overridable."""
     config = dict(
         advantage_estimator="p3o",
+        p3o_ess_scope="micro-batch",
+        p3o_kl_mode="proxy",
+        clip_low=0.2,
+        clip_high=0.2,
         use_rollout_logprobs=True,
         calculate_per_token_loss=True,
         use_tis=False,
@@ -69,6 +73,38 @@ def test_p3o_arguments_accepts_true_on_policy_scheduling():
     validate_p3o_args(_p3o_args(true_on_policy_mode=True))
 
 
+def test_p3o_arguments_rejects_exact_kl_before_training():
+    with pytest.raises(ValueError, match="verifier-only"):
+        validate_p3o_args(_p3o_args(p3o_kl_mode="exact"))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(fp8="hybrid"),
+        dict(attention_dropout=0.1),
+        dict(hidden_dropout=0.1),
+        dict(fully_async=True),
+    ],
+)
+def test_p3o_arguments_micro_batch_scope_accepts_replay_sensitive_features(overrides):
+    validate_p3o_args(_p3o_args(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(fp8="hybrid"),
+        dict(attention_dropout=0.1),
+        dict(hidden_dropout=0.1),
+        dict(fully_async=True),
+    ],
+)
+def test_p3o_arguments_step_scope_rejects_replay_sensitive_features(overrides):
+    with pytest.raises(ValueError):
+        validate_p3o_args(_p3o_args(p3o_ess_scope="step", **overrides))
+
+
 @pytest.mark.parametrize(
     ("reason", "overrides"),
     [
@@ -76,10 +112,6 @@ def test_p3o_arguments_accepts_true_on_policy_scheduling():
         ("per-sample-mean reintroduces a micro-batch denominator", dict(calculate_per_token_loss=False)),
         ("TIS double-corrects the same mismatch", dict(use_tis=True)),
         ("P3O is critic-free", dict(use_critic=True)),
-        ("FP8 amax history breaks replay", dict(fp8="hybrid")),
-        ("attention dropout breaks replay", dict(attention_dropout=0.1)),
-        ("hidden dropout breaks replay", dict(hidden_dropout=0.1)),
-        ("async streaming hides the window", dict(fully_async=True)),
         ("mismatch metrics add an unverified extra forward", dict(get_mismatch_metrics=True)),
         ("OPSM changes the policy-gradient mask", dict(use_opsm=True)),
         (
@@ -94,6 +126,20 @@ def test_p3o_arguments_accepts_true_on_policy_scheduling():
 )
 def test_p3o_arguments_rejects_configs_that_change_the_objective(reason, overrides):
     with pytest.raises((AssertionError, ValueError)):
+        validate_p3o_args(_p3o_args(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(p3o_ess_scope="window"),
+        dict(p3o_kl_mode="unsafe"),
+        dict(clip_low=-0.1),
+        dict(clip_high=-0.1),
+    ],
+)
+def test_p3o_arguments_rejects_invalid_active_plan_values(overrides):
+    with pytest.raises(ValueError):
         validate_p3o_args(_p3o_args(**overrides))
 
 
