@@ -65,15 +65,6 @@ CORRECTNESS_GUARDRAIL_TAGS = (
     "train/ppo_kl",
     "train/pg_clipfrac",
 )
-QUALITY_TAG_FRAGMENTS = (
-    "raw_reward",
-    "reward",
-    "loss",
-    "grad_norm",
-    "response_length",
-    "truncated",
-    "staleness",
-)
 RUN_MANIFEST_REQUIRED_FIELDS = {
     "hostname",
     "condition",
@@ -1655,29 +1646,35 @@ def _plot_comparison(
     figure.suptitle("Task 21 GPU utilization and VRAM")
     finish("task21_gpu_util_vram.png")
 
-    quality_tags = sorted(
-        {
-            row["tag"]
-            for analysis in analyses
-            for row in analysis.scalar_rows
-            if any(fragment in row["tag"].lower() for fragment in QUALITY_TAG_FRAGMENTS)
-        }
+    quality_tags = (
+        "rollout/raw_reward",
+        "rollout/response_lengths",
+        "rollout/truncated_ratio",
+        "train/loss",
+        "train/grad_norm",
+        "train/ppo_kl",
     )
-    plt.figure(figsize=(12, 7))
-    for analysis in analyses:
-        for tag in quality_tags:
-            values = [row for row in analysis.scalar_rows if row["tag"] == tag]
-            if values:
-                plt.plot(
-                    [row["step"] for row in values],
-                    [row["value"] for row in values],
-                    label=f"{analysis.manifest['condition']}-s{analysis.manifest['seed']}:{tag}",
-                )
-    plt.xlabel("rollout / optimizer step")
-    plt.ylabel("raw metric value")
-    if quality_tags:
-        plt.legend(fontsize=7, ncol=2)
-    plt.title("Task 21 correctness and quality guardrails")
+    figure, axes = plt.subplots(3, 2, figsize=(14, 12))
+    seeds = sorted({int(analysis.manifest["seed"]) for analysis in analyses})
+    for axis, tag in zip(axes.flat, quality_tags, strict=True):
+        for condition in ("baseline", "experiment"):
+            condition_runs = {
+                int(analysis.manifest["seed"]): analysis
+                for analysis in analyses
+                if analysis.manifest["condition"] == condition
+            }
+            values = []
+            for seed in seeds:
+                analysis = condition_runs.get(seed)
+                metric = analysis.summary["metrics"].get(tag) if analysis is not None else None
+                values.append(numeric_or_nan(metric.get("mean") if metric is not None else None))
+            axis.plot(seeds, values, marker="o", label=condition)
+        axis.set_title(tag)
+        axis.set_xlabel("seed")
+        axis.set_ylabel("mean metric value")
+        axis.tick_params(axis="x", rotation=20)
+        axis.legend()
+    figure.suptitle("Task 21 correctness and quality guardrails")
     finish("task21_correctness_quality.png")
 
     paired = comparison["paired_runs"]

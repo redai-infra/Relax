@@ -1,0 +1,10 @@
+5016e5fc77093f2df3d85942e8abf95999738c75191c17a37176d53bbfc8a4b3  /data01/LWX/relax-task21/comparisons/FORMAL-FINAL8-Q3VL8B-R1024-C4-DET-GPU12346-FIRSTSTEP/comparison_summary.json
+6e72053891db350c2863bbf3508188a3740d13d176cd86eaf0b56261d3875938  /data01/LWX/relax-task21/comparisons/FORMAL-FINAL8-Q3VL8B-R1024-C4-DET-GPU12346-FIRSTSTEP/console-final.log
+025300b86959bc7c0dfb7dd941989423be873a3b8b06452c1697a8886da73018  docs/assets/task21-hybrid-mm-forward-pipeline/formal-paired-results.csv
+da9b541bc2fbd26d5a4730eb9096d3b152d9470d2dd81c03f5104b4a62d03306  docs/assets/task21-hybrid-mm-forward-pipeline/paired_run_summary.csv
+7408c899219b63619335ebf42f6374421df46a664b7d22c4a45ed03567b38f5e  docs/assets/task21-hybrid-mm-forward-pipeline/task21_correctness_quality.png
+38c6f272370cb0e12abb1d9a403596681ae4f150f30624e35d0b85943adf8c91  docs/assets/task21-hybrid-mm-forward-pipeline/task21_gpu_util_vram.png
+e1256d0fdd7b5b22f81411ba8e20224f26f58e0955142352a37b492aa9b6a708  docs/assets/task21-hybrid-mm-forward-pipeline/task21_phase1_overlap.png
+bbad23dc4059ffc0610786b4d042b9af37558a8753cb298e5bf5429e44011134  docs/assets/task21-hybrid-mm-forward-pipeline/task21_step_throughput.png
+c989433666edfcecbe5d0761c0e03b41d104772a232c15fb6abdfe5c6699bd0a  docs/assets/task21-hybrid-mm-forward-pipeline/task21_window_summary.png
+ea8cfbd0958c16f54ef799aecf9a9bc45601b7861e8dd01ba7dd8a8ed033eb64  docs/assets/task21-hybrid-mm-forward-pipeline/window_speedup_summary.csv
