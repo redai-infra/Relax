@@ -51,19 +51,25 @@ def _install_fake_matplotlib(monkeypatch):
     def axes(count):
         return [MagicMock() for _ in range(count)]
 
-    matrix_axes = {(row, column): MagicMock() for row in range(2) for column in range(2)}
-    for axis in matrix_axes.values():
-        axis.get_legend_handles_labels.return_value = ([], [])
-
     class AxesGrid:
+        def __init__(self, rows, columns):
+            self._axes = {(row, column): MagicMock() for row in range(rows) for column in range(columns)}
+            self._rows = [[self._axes[row, column] for column in range(columns)] for row in range(rows)]
+            for axis in self._axes.values():
+                axis.get_legend_handles_labels.return_value = ([], [])
+
         def __getitem__(self, key):
-            return matrix_axes[key]
+            return self._axes[key]
+
+        def __iter__(self):
+            return iter(self._rows)
 
     pyplot.subplots = MagicMock(
         side_effect=[
             (MagicMock(), axes(2)),
             (MagicMock(), axes(3)),
-            (MagicMock(), AxesGrid()),
+            (MagicMock(), AxesGrid(2, 2)),
+            (MagicMock(), AxesGrid(3, 2)),
             (MagicMock(), axes(2)),
         ]
     )

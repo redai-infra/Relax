@@ -1656,7 +1656,7 @@ def _plot_comparison(
     )
     figure, axes = plt.subplots(3, 2, figsize=(14, 12))
     seeds = sorted({int(analysis.manifest["seed"]) for analysis in analyses})
-    for axis, tag in zip(axes.flat, quality_tags, strict=True):
+    for axis, tag in zip((axis for row in axes for axis in row), quality_tags, strict=True):
         for condition in ("baseline", "experiment"):
             condition_runs = {
                 int(analysis.manifest["seed"]): analysis
