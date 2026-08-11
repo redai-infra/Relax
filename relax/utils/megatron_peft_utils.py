@@ -70,6 +70,19 @@ MEGATRON_TO_HF_MODULES = {
 }
 
 
+def _leaf_module_name(pattern: str) -> str:
+    """Reduce a Bridge target-module pattern to the module name it selects.
+
+    Bridge's matcher accepts a path pattern so LoRA can be anchored to part of the
+    tree — ``scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh``
+    uses ``*decoder.layers.*.linear_qkv`` to keep the MTP layers frozen. HF target
+    module names are bare and position-independent, so only the trailing segment
+    survives the translation; the anchoring is carried by which weights the exported
+    adapter actually contains.
+    """
+    return pattern.rsplit(".", 1)[-1]
+
+
 def convert_megatron_to_hf_target_modules(megatron_modules: list[str]) -> list[str]:
     """Expand Megatron-style LoRA target module names to HF-style names.
 
@@ -80,16 +93,32 @@ def convert_megatron_to_hf_target_modules(megatron_modules: list[str]) -> list[s
     so translation happens at export time via this one-to-many expansion.
 
     Args:
-        megatron_modules: List of Megatron-style module names
-            (e.g. ``["linear_qkv", "linear_proj"]``).
+        megatron_modules: List of Megatron-style module names, optionally written as
+            Bridge path patterns (e.g. ``["linear_qkv", "*decoder.layers.*.linear_proj"]``).
 
     Returns:
-        List of HF-style module names with duplicates removed. Unknown names are
+        List of HF-style module names with duplicates removed. A pattern contributes
+        its trailing segment, since HF names carry no position. Unknown names are
         passed through unchanged (already HF-style or custom).
+
+    Raises:
+        ValueError: If a pattern's trailing segment is itself a wildcard, which has no
+            HF equivalent.
     """
     hf_target_modules = []
     for module in megatron_modules:
-        hf_target_modules.extend(MEGATRON_TO_HF_MODULES.get(module, [module]))
+        name = _leaf_module_name(module)
+        if "*" in name:
+            # A wildcard inside the trailing segment (e.g. "linear_*") has no HF
+            # equivalent. Passing it through would put a glob in adapter_config.json,
+            # where neither PEFT nor SGLang matches anything, so fail loudly instead of
+            # emitting a config that silently selects nothing.
+            raise ValueError(
+                f"LoRA target module {module!r} cannot be translated to an HF module name: "
+                f"the trailing segment {name!r} is itself a wildcard. Anchor the pattern on a "
+                f"concrete module name instead, e.g. '*decoder.layers.*.linear_qkv'."
+            )
+        hf_target_modules.extend(MEGATRON_TO_HF_MODULES.get(name, [name]))
     # Remove duplicates while preserving order
     return list(dict.fromkeys(hf_target_modules))
 
