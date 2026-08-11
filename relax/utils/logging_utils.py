@@ -210,7 +210,7 @@ for _method_name in _LOG_METHODS:
     setattr(LazyConfiguredLogger, _method_name, _create_log_method(_method_name))
 
 
-def get_logger(name: str, prefix: str = "") -> LazyConfiguredLogger:
+def get_logger(name: str, prefix: str = "") -> logging.Logger:
     """Get a logger instance with automatic lazy configuration.
 
     Returns a logger that automatically configures logging on first use.
@@ -231,15 +231,26 @@ def get_logger(name: str, prefix: str = "") -> LazyConfiguredLogger:
         prefix: (Deprecated) Additional prefix for log timestamps
 
     Returns:
-        LazyConfiguredLogger: A logger instance ready for use
+        logging.Logger: A logger instance ready for use. This is normally a
+            ``LazyConfiguredLogger``; if ``name`` is already registered as a
+            different ``Logger`` subclass, that instance is returned as-is.
     """
-    # Set the logger class for this logger
-    logging.setLoggerClass(LazyConfiguredLogger)
     logger = logging.getLogger(name)
-    logging.setLoggerClass(logging.Logger)  # Reset to default for other loggers
 
-    if not isinstance(logger, LazyConfiguredLogger):
-        # If logger already exists and is not our class, create a new instance
-        logger = LazyConfiguredLogger(name)
+    if type(logger) is logging.Logger:
+        # Upgrade the manager-registered instance in place instead of building a
+        # detached `LazyConfiguredLogger(name)`: a Logger constructed directly
+        # (not via getLogger) has parent=None and no handlers, so every record
+        # it emits falls through to logging.lastResort (WARNING+) and INFO
+        # output silently disappears. The plain instance exists either because
+        # getLogger just created it (fresh name, default logger class) or
+        # because the name was pre-registered before get_logger ran — e.g.
+        # Ray/cloudpickle reconstructs @ray.remote class namespaces by value
+        # and unpickles their module-global loggers via getLogger(name) (see
+        # the _LOCAL_ROLLOUT_MANAGER note in relax/distributed/ray/rollout.py).
+        # In-place upgrade also avoids logging.setLoggerClass entirely: that
+        # would mutate process-global state, race with concurrent getLogger
+        # calls on other threads, and stomp third-party default logger classes.
+        logger.__class__ = LazyConfiguredLogger
 
     return logger
