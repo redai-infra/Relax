@@ -526,9 +526,7 @@ def process_args(args: Namespace, role: str) -> None:
             setattr(args, key, args.ref_actor_config[key])
     args.max_tokens_per_gpu = args.log_probs_max_tokens_per_gpu
     args.only_load_weight = True
-    if role == "reference":
-        args.load = args.ref_load
-    if role == "actor_fwd":
+    if role in ("reference", "actor_fwd") and args.ref_load is not None:
         args.load = args.ref_load
 
 

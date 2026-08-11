@@ -2781,6 +2781,66 @@ def _drop_unused_reference_resource(args) -> bool:
     return True
 
 
+def _validate_hybrid_weight_publication_args(args) -> None:
+    """Require a valid behavior-policy reference when Hybrid skips
+    publications."""
+    if not getattr(args, "hybrid", False) or getattr(args, "update_weights_interval", 1) <= 1:
+        return
+
+    if getattr(args, "use_tis", False):
+        return
+
+    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    if not true_on_policy and getattr(args, "use_rollout_logprobs", False):
+        return
+
+    if not true_on_policy and getattr(args, "max_staleness", 0) == 0 and getattr(args, "keep_old_actor", False):
+        return
+
+    if true_on_policy:
+        valid_options = "--use-tis"
+    elif getattr(args, "max_staleness", 0) > 0:
+        valid_options = "--use-tis or --use-rollout-logprobs"
+    else:
+        valid_options = "--use-tis, --keep-old-actor, or --use-rollout-logprobs"
+    raise ValueError(
+        "--hybrid with --update-weights-interval > 1 reuses previously published Rollout weights, so "
+        f"old log-probs require correction. Enable {valid_options}, or set --update-weights-interval 1."
+    )
+
+
+def _resolve_checkpoint_load_args(args) -> None:
+    has_megatron_load = (
+        args.load is not None
+        and os.path.exists(args.load)
+        and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+    )
+
+    if args.megatron_to_hf_mode == "bridge":
+        if not has_megatron_load:
+            if args.load is None:
+                args.load = args.ref_load or args.hf_checkpoint
+            # If is a HF checkpoint, set start_rollout_id to 0 here.
+            args.start_rollout_id = 0
+        return
+
+    if has_megatron_load:
+        return
+
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    if args.ref_load is None:
+        raise ValueError(
+            "--megatron-to-hf-mode raw requires an existing Megatron checkpoint from "
+            "--load or --ref-load; raw mode cannot initialize training weights from --hf-checkpoint."
+        )
+    args.load = args.ref_load
+    if args.ref_ckpt_step is not None:
+        args.ckpt_step = args.ref_ckpt_step
+    args.start_rollout_id = 0
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -2893,32 +2953,7 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
-            args.start_rollout_id = 0
-    else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+    _resolve_checkpoint_load_args(args)
 
     if args.eval_interval is not None:
         if args.loss_type == "sft":
@@ -2985,6 +3020,8 @@ def slime_validate_args(args):
                     f"== global_batch_size ({args.global_batch_size}). actor_fwd will be skipped."
                 )
             args.true_on_policy_mode = True
+
+        _validate_hybrid_weight_publication_args(args)
 
         # Validate --resource has the producer roles the trainer will fetch from
         # TransferQueue in fully-async mode. Without these, train_async would poll

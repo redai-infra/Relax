@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.utils.test_arguments_helpers import _arguments_module  # noqa: F401
+
 
 @pytest.mark.parametrize(
     ("argv", "expected"),

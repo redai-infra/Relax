@@ -16,7 +16,7 @@ from relax.agentic.pipeline.runtime import (
     _request_envelope_from_sample,
 )
 from relax.agentic.pipeline.transfer import TransferDomain
-from relax.agentic.rollout import AgenticResidentPipeline, _AgenticStepHandle
+from relax.agentic.rollout import AgenticResidentPipeline, _AgenticStepHandle, _post_train_eval_expected
 from relax.agentic.session.service import (
     AgenticSessionShard,
     _decide_ir_release,
@@ -117,6 +117,19 @@ class _FakeTokenizer:
 
 def _chars(text: str) -> list[int]:
     return [ord(ch) for ch in text]
+
+
+def test_terminal_eval_ignores_epoch_boundary_when_batches_wrap_epochs() -> None:
+    args = SimpleNamespace(
+        eval_interval=10,
+        eval_prompt_data=["aime", "/data/aime.jsonl"],
+        rollout_global_dataset=True,
+        rollout_batch_size=16,
+        num_rollout_per_epoch=None,
+    )
+    data_source = SimpleNamespace(lengths=SimpleNamespace(remote=lambda: pytest.fail("unexpected length query")))
+
+    assert not _post_train_eval_expected(args, rollout_id=4, data_source=data_source)
 
 
 def _forest_with_initial_obs(

@@ -11,9 +11,25 @@ Run with: pytest tests/engine/rollout/test_data_source.py -v
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+from relax.engine.rollout.data_source import RolloutDataSource
+from relax.utils.types import Sample
+
+
+class _EagerSamples:
+    def __init__(self, prompts):
+        self.samples = [Sample(prompt=prompt) for prompt in prompts]
+        self.shuffle_calls = []
+
+    def __len__(self):
+        return len(self.samples)
+
+    def shuffle(self, epoch_id):
+        self.shuffle_calls.append(epoch_id)
 
 
 class TestEagerDataset:
@@ -95,6 +111,7 @@ class TestDataSourceIntegration:
         args.apply_chat_template = False
         args.apply_chat_template_kwargs = None
         args.rollout_seed = 42
+        args.rollout_shuffle = False
         args.custom_prompt_path = None
 
         tokenizer = MagicMock()
@@ -103,6 +120,7 @@ class TestDataSourceIntegration:
 
         assert isinstance(dataset, StreamingDataset)
         assert len(dataset) == len(data)
+        assert dataset.index_manager.shuffle_enabled is False
 
     def test_factory_function_traditional(self, jsonl_file):
         """Test _create_dataset factory with streaming disabled."""
@@ -131,6 +149,54 @@ class TestDataSourceIntegration:
         dataset = _create_dataset(args, tokenizer, processor=None)
 
         assert isinstance(dataset, Dataset)
+
+    def test_eager_data_source_repeatedly_wraps_to_fill_batch(self):
+        source = RolloutDataSource.__new__(RolloutDataSource)
+        source.args = SimpleNamespace(n_samples_per_prompt=1, rollout_shuffle=False)
+        source.epoch_id = 0
+        source.sample_group_index = 0
+        source.sample_index = 0
+        source.sample_offset = 0
+        source._use_streaming = False
+        source.dataset = _EagerSamples(["a", "b", "c"])
+
+        first = source.get_samples(8)
+        second = source.get_samples(8)
+
+        assert [group[0].prompt for group in first] == ["a", "b", "c", "a", "b", "c", "a", "b"]
+        assert [group[0].prompt for group in second] == ["c", "a", "b", "c", "a", "b", "c", "a"]
+        assert source.sample_offset == 1
+        assert source.epoch_id == 5
+
+    def test_eager_data_source_rejects_empty_dataset(self):
+        source = RolloutDataSource.__new__(RolloutDataSource)
+        source.args = SimpleNamespace(n_samples_per_prompt=1, rollout_shuffle=False)
+        source._use_streaming = False
+        source.dataset = _EagerSamples([])
+
+        with pytest.raises(ValueError, match="empty dataset"):
+            source.get_samples(1)
+
+    def test_streaming_data_source_uses_exact_internal_epoch(self):
+        class _StreamingSamples:
+            def get_batch(self, num_samples):
+                return [Sample(prompt=str(index)) for index in range(num_samples)], True
+
+            def get_state(self):
+                return {"epoch_id": 3}
+
+        source = RolloutDataSource.__new__(RolloutDataSource)
+        source.args = SimpleNamespace(n_samples_per_prompt=1)
+        source.epoch_id = 0
+        source.sample_group_index = 0
+        source.sample_index = 0
+        source._use_streaming = True
+        source.dataset = _StreamingSamples()
+
+        samples = source.get_samples(8)
+
+        assert len(samples) == 8
+        assert source.epoch_id == 3
 
     def test_factory_function_streaming_multi_file_slice(self):
         """Test _create_dataset factory with streaming dataset over multiple

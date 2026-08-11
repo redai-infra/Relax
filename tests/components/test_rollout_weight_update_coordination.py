@@ -61,7 +61,13 @@ async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
     Base.__init__(rollout)
     rollout.step = 1
     rollout.status = "running"
-    rollout._weight_update_ready = asyncio.Event()
+    rollout._weight_update_transactions = {}
+    rollout._completed_weight_update_transaction_sequences = {}
+    rollout._weight_update_session_last_seen = {}
+    rollout._weight_update_prepare_lock = asyncio.Lock()
+    rollout._weight_update_idle = asyncio.Event()
+    rollout._weight_update_idle.set()
+    rollout._active_weight_update_transaction_id = None
     rollout._async_check_production_for_update_weight = AsyncMock(return_value=True)
     rollout.rollout_manager = SimpleNamespace(
         health_monitoring_pause=SimpleNamespace(remote=AsyncMock()),
@@ -72,6 +78,6 @@ async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
         await rollout.can_do_update_weight_for_async()
 
     assert rollout.status == "running"
-    assert rollout._weight_update_ready.is_set()
+    assert "legacy" not in rollout._weight_update_transactions
     assert rollout.rollout_manager.set_weight_updating.remote.await_args_list[1].args == (False,)
     rollout.rollout_manager.health_monitoring_resume.remote.assert_awaited_once_with()

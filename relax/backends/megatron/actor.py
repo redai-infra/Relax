@@ -5,6 +5,7 @@ import os
 import random
 import socket
 import time
+import uuid
 from argparse import Namespace
 from functools import partial
 from typing import Any, Callable, List
@@ -611,25 +612,37 @@ class MegatronTrainRayActor(TrainRayActor):
         if dist.get_rank() == 0:
             try:
                 rollout_serve_url = get_serve_url("rollout")
-                # Evaluation can legitimately outlive a short control-plane
-                # timeout, so only the cleanup request below is bounded.
-                response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
+                response = requests.get(
+                    f"{rollout_serve_url}/evaluate",
+                    params={"train_step": rollout_id},
+                    timeout=self.args.rollout_http_timeout,
+                )
                 response.raise_for_status()
             except Exception as e:
                 logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
         if end_update_weight:
             self._resume_rollout_weight_update(rollout_serve_url, rollout_id)
 
-    def _end_rollout_weight_update(self, rollout_serve_url: str | None, rollout_id: int | None) -> None:
+    def _end_rollout_weight_update(
+        self,
+        rollout_serve_url: str | None,
+        rollout_id: int | None,
+        *,
+        transaction_id: str | None = None,
+    ) -> None:
+        transaction_id = transaction_id or getattr(self, "_active_rollout_weight_update_transaction_id", None)
         last_error = None
         for attempt in range(1, 4):
             try:
                 current_rollout_serve_url = rollout_serve_url or get_serve_url("rollout")
                 response = requests.get(
                     f"{current_rollout_serve_url}/end_update_weight",
+                    params={"transaction_id": transaction_id} if transaction_id is not None else None,
                     timeout=self.args.rollout_http_timeout,
                 )
                 response.raise_for_status()
+                if getattr(self, "_active_rollout_weight_update_transaction_id", None) == transaction_id:
+                    self._active_rollout_weight_update_transaction_id = None
                 return
             except Exception as e:
                 last_error = e
@@ -640,6 +653,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 if attempt < 3:
                     time.sleep(1)
         raise RuntimeError(f"Failed to resume rollout after weight update for rollout_id {rollout_id}") from last_error
+
+    def _new_rollout_weight_update_transaction_id(self) -> str:
+        session_id = getattr(self, "_rollout_weight_update_session_id", None)
+        if session_id is None:
+            session_id = uuid.uuid4().hex
+            self._rollout_weight_update_session_id = session_id
+        sequence = getattr(self, "_rollout_weight_update_transaction_sequence", 0)
+        self._rollout_weight_update_transaction_sequence = sequence + 1
+        return f"relax-v1:{session_id}:{sequence}"
 
     def _resume_rollout_weight_update(self, rollout_serve_url: str | None, rollout_id: int) -> None:
         resume_failed = False
@@ -1820,13 +1842,16 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_serve_url = None
             pause_may_have_succeeded = False
             pause_confirmed = False
+            transaction_id = None
             try:
                 rollout_serve_url = get_serve_url("rollout")
+                transaction_id = self._new_rollout_weight_update_transaction_id()
                 while True:
                     pause_may_have_succeeded = True
                     try:
                         response = requests.get(
                             f"{rollout_serve_url}/can_do_update_weight_for_async",
+                            params={"transaction_id": transaction_id},
                             timeout=self.args.rollout_http_timeout,
                         )
                     except requests.exceptions.ConnectionError as connection_error:
@@ -1839,8 +1864,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     res = response.json()
                     if res:
                         pause_confirmed = True
-                        response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
+                        response = requests.get(
+                            f"{rollout_serve_url}/recover_rollout_engines",
+                            timeout=self.args.rollout_engine_init_timeout,
+                        )
                         response.raise_for_status()
+                        self._active_rollout_weight_update_transaction_id = transaction_id
                         break
                     else:
                         pause_may_have_succeeded = False
@@ -1848,16 +1877,15 @@ class MegatronTrainRayActor(TrainRayActor):
             except Exception as e:
                 if pause_may_have_succeeded:
                     try:
-                        self._end_rollout_weight_update(rollout_serve_url, rollout_id)
+                        self._end_rollout_weight_update(
+                            rollout_serve_url,
+                            rollout_id,
+                            transaction_id=transaction_id,
+                        )
                     except Exception as resume_error:
                         pause_state = "confirmed" if pause_confirmed else "uncertain"
-                        if pause_confirmed:
-                            rollout_resume_failed = True
-                            logger.error(f"Failed to restore Rollout after a {pause_state} pause: {resume_error}")
-                        else:
-                            logger.warning(
-                                f"Could not restore Rollout after an {pause_state} pause result: {resume_error}"
-                            )
+                        rollout_resume_failed = True
+                        logger.error(f"Failed to restore Rollout after a {pause_state} pause: {resume_error}")
                 logger.warning(
                     f"Error checking rollout service: {e}, maybe caused by rollout server failure. "
                     "Will continue without rollout update for this step."
@@ -1896,7 +1924,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if rollout_resume_failed:
             raise RuntimeError(f"Failed to resume Rollout after weight-update preparation at rollout_id {rollout_id}")
-
         return rollout_only, actor_fwd_only
 
     def _wait_for_previous_eval(self, max_wait_seconds: int = 1800) -> None:
