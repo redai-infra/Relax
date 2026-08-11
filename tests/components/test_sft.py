@@ -2,13 +2,21 @@
 
 """Unit tests for SFT producer component (loop-only, no Ray runtime)."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
 
 from relax.engine.sft.dataset.streaming import ProcessedSample
+
+
+@pytest.fixture(autouse=True)
+def stub_processor_pool_module(monkeypatch):
+    module = ModuleType("relax.utils.data.processor_pool")
+    module.ProcessorPool = object
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", module)
 
 
 def _make_processed(idx: int = 0, n_tokens: int = 8) -> ProcessedSample:

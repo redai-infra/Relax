@@ -7,6 +7,7 @@ import json
 
 import httpx
 import pytest
+from relax_nemo_gym_example.app import client as client_mod
 from relax_nemo_gym_example.app.client import (
     ClientConfig,
     GatewayClient,
@@ -61,6 +62,17 @@ def _result_payload(request_id, status, **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+@pytest.fixture()
+def py310_sleep_or_stop(monkeypatch):
+    async def sleep_or_stop(*, stop_event: asyncio.Event, delay_s: float) -> None:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay_s)
+        except (TimeoutError, asyncio.TimeoutError):
+            return
+
+    monkeypatch.setattr(client_mod, "_sleep_or_stop", sleep_or_stop)
 
 
 def test_build_request_preserves_session_input_and_uses_request_scoped_callback():
@@ -145,7 +157,7 @@ async def test_completed_create_uses_single_versioned_endpoint():
     assert json.loads(seen[0].content)["protocol_version"] == PROTOCOL_VERSION
 
 
-async def test_running_trial_is_polled_to_completion():
+async def test_running_trial_is_polled_to_completion(py310_sleep_or_stop):
     request = build_trial_request({"messages": [], "metadata": {}}, _environ())
     paths = []
 
@@ -220,7 +232,7 @@ async def test_stop_event_aborts_running_trial():
     assert paths[-1] == f"/v1/trials/{request.request_id}/abort"
 
 
-async def test_stop_event_cancels_inflight_status_request_before_abort():
+async def test_stop_event_cancels_inflight_status_request_before_abort(py310_sleep_or_stop):
     request = build_trial_request({"messages": [], "metadata": {}}, _environ())
 
     class BlockingStatusTransport(httpx.AsyncBaseTransport):

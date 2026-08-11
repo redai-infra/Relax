@@ -8,11 +8,14 @@ checkpoint to a shm path *before* handing it to the tokenizer /
 processor loaders, and must NOT mutate the shared args/config object.
 """
 
-from types import SimpleNamespace
+import importlib
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from relax.agentic.pipeline import runtime
-from relax.components import sft
 from relax.engine.sft.predict import loop as predict_loop
 from relax.utils import s3_model_loader
 
@@ -23,7 +26,41 @@ def _model_source(uri: str, *, enabled: bool = True):
     return s3_model_loader.ModelSource(uri, "http://s3.example")
 
 
-def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch):
+@pytest.fixture()
+def processor_pool_module(monkeypatch):
+    module = ModuleType("relax.utils.data.processor_pool")
+    module.ProcessorPool = object
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", module)
+    return module
+
+
+@pytest.fixture()
+def sft_module(monkeypatch, processor_pool_module):
+    module_name = "relax.components.sft"
+    original_module = sys.modules.get(module_name)
+    module_was_loaded = module_name in sys.modules
+    components_module = sys.modules.get("relax.components")
+    sft_attr_was_set = components_module is not None and hasattr(components_module, "sft")
+    original_sft_attr = getattr(components_module, "sft", None) if sft_attr_was_set else None
+
+    sys.modules.pop(module_name, None)
+    if components_module is not None and sft_attr_was_set:
+        delattr(components_module, "sft")
+    module = importlib.import_module(module_name)
+    try:
+        yield module
+    finally:
+        sys.modules.pop(module_name, None)
+        if module_was_loaded:
+            sys.modules[module_name] = original_module
+        if components_module is not None:
+            if sft_attr_was_set:
+                setattr(components_module, "sft", original_sft_attr)
+            elif hasattr(components_module, "sft"):
+                delattr(components_module, "sft")
+
+
+def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch, processor_pool_module):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -36,7 +73,7 @@ def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch):
         return "POOL"
 
     monkeypatch.setattr(runtime, "prepare_model_maybe_update_args", fake_update)
-    monkeypatch.setattr("relax.utils.data.processor_pool.ProcessorPool", fake_pool)
+    monkeypatch.setattr(processor_pool_module, "ProcessorPool", fake_pool)
 
     args = SimpleNamespace(
         mm_processor_pool_size=2,
@@ -52,7 +89,7 @@ def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch):
     assert args.hf_checkpoint == "/dev/shm/resolved_model"
 
 
-def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch):
+def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch, processor_pool_module):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -64,7 +101,7 @@ def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch):
         return "POOL"
 
     monkeypatch.setattr(runtime, "prepare_model_maybe_update_args", fake_update)
-    monkeypatch.setattr("relax.utils.data.processor_pool.ProcessorPool", fake_pool)
+    monkeypatch.setattr(processor_pool_module, "ProcessorPool", fake_pool)
 
     args = SimpleNamespace(
         mm_processor_pool_size=1,
@@ -95,10 +132,10 @@ class _FakeDataset:
         return None
 
 
-def _make_sft_instance(config):
+def _make_sft_instance(config, sft_module):
     # SFT is a @serve.deployment; grab the underlying class and bypass __init__
     # so we can exercise _init_data_pipeline in isolation.
-    cls = sft.SFT.func_or_class
+    cls = sft_module.SFT.func_or_class
     obj = object.__new__(cls)
     obj._dataset = None
     obj.config = config
@@ -108,7 +145,7 @@ def _make_sft_instance(config):
     return obj
 
 
-def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch):
+def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -116,15 +153,15 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch):
         captured["resolve_kwargs"] = kwargs
         obj.hf_checkpoint = "/dev/shm/resolved_sft"
 
-    monkeypatch.setattr(sft, "prepare_model_maybe_update_args", fake_update)
-    monkeypatch.setattr(sft, "AutoTokenizer", MagicMock())
-    monkeypatch.setattr(sft, "ProcessorPool", MagicMock())
-    monkeypatch.setattr(sft, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
-    monkeypatch.setattr(sft, "build_named_prompt_data_configs", MagicMock(return_value=[]))
+    monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", fake_update)
+    monkeypatch.setattr(sft_module, "AutoTokenizer", MagicMock())
+    monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
+    monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
+    monkeypatch.setattr(sft_module, "build_named_prompt_data_configs", MagicMock(return_value=[]))
 
     fake_cls = MagicMock()
     fake_cls.from_args = MagicMock(return_value=_FakeDataset())
-    monkeypatch.setattr(sft, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
+    monkeypatch.setattr(sft_module, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
 
     config = SimpleNamespace(
         hf_checkpoint="s3://bkt/sftmodel/",
@@ -141,35 +178,35 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch):
         eval_size=None,
         global_batch_size=1,
     )
-    obj = _make_sft_instance(config)
+    obj = _make_sft_instance(config, sft_module)
 
     obj._init_data_pipeline()
 
     resolved = "/dev/shm/resolved_sft"
     assert captured["resolve_args"] is config
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
-    sft.AutoTokenizer.from_pretrained.assert_called_once_with(resolved, trust_remote_code=True)
-    sft.ProcessorPool.assert_called_once_with(resolved, pool_size=None, trust_remote_code=True)
-    sft._resolve_pad_token_ids_from_config.assert_called_once_with(resolved)
+    sft_module.AutoTokenizer.from_pretrained.assert_called_once_with(resolved, trust_remote_code=True)
+    sft_module.ProcessorPool.assert_called_once_with(resolved, pool_size=None, trust_remote_code=True)
+    sft_module._resolve_pad_token_ids_from_config.assert_called_once_with(resolved)
     assert config.hf_checkpoint == resolved
 
 
-def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch):
+def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch, sft_module):
     captured = {}
 
     def fake_update(obj, **kwargs):
         captured["resolve_args"] = obj
         captured["resolve_kwargs"] = kwargs
 
-    monkeypatch.setattr(sft, "prepare_model_maybe_update_args", fake_update)
-    monkeypatch.setattr(sft, "AutoTokenizer", MagicMock())
-    monkeypatch.setattr(sft, "ProcessorPool", MagicMock())
-    monkeypatch.setattr(sft, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
-    monkeypatch.setattr(sft, "build_named_prompt_data_configs", MagicMock(return_value=[]))
+    monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", fake_update)
+    monkeypatch.setattr(sft_module, "AutoTokenizer", MagicMock())
+    monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
+    monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
+    monkeypatch.setattr(sft_module, "build_named_prompt_data_configs", MagicMock(return_value=[]))
 
     fake_cls = MagicMock()
     fake_cls.from_args = MagicMock(return_value=_FakeDataset())
-    monkeypatch.setattr(sft, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
+    monkeypatch.setattr(sft_module, "_load_custom_dataset_class", MagicMock(return_value=fake_cls))
 
     config = SimpleNamespace(
         hf_checkpoint="s3://bkt/sftmodel/",
@@ -186,13 +223,13 @@ def test_sft_init_data_pipeline_noop_when_S3_disabled(monkeypatch):
         eval_size=None,
         global_batch_size=1,
     )
-    obj = _make_sft_instance(config)
+    obj = _make_sft_instance(config, sft_module)
 
     obj._init_data_pipeline()
 
     assert captured["resolve_args"] is config
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
-    sft.AutoTokenizer.from_pretrained.assert_called_once_with("s3://bkt/sftmodel/", trust_remote_code=True)
+    sft_module.AutoTokenizer.from_pretrained.assert_called_once_with("s3://bkt/sftmodel/", trust_remote_code=True)
 
 
 class _EmptyEvalDataset:

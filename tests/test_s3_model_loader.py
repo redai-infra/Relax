@@ -1,16 +1,161 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import importlib
+import logging
 import os
 import sys
-from types import SimpleNamespace
+from dataclasses import dataclass
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from relax.utils import s3_model_loader as m
 
 
-def test_pre_parse_cli_model_source(monkeypatch):
-    from relax.utils.arguments import _pre_parse_cli_model_source
+@pytest.fixture()
+def arguments_module(monkeypatch):
+    sglang_arguments = ModuleType("relax.backends.sglang.arguments")
+    sglang_arguments.sglang_parse_args = lambda: None
+    sglang_arguments.validate_args = lambda args: args
+    monkeypatch.setitem(sys.modules, "relax.backends.sglang.arguments", sglang_arguments)
+
+    module_name = "relax.utils.arguments"
+    original_module = sys.modules.get(module_name)
+    module_was_loaded = module_name in sys.modules
+    utils_module = sys.modules.get("relax.utils")
+    arguments_attr_was_set = utils_module is not None and hasattr(utils_module, "arguments")
+    original_arguments_attr = getattr(utils_module, "arguments", None) if arguments_attr_was_set else None
+
+    sys.modules.pop(module_name, None)
+    if utils_module is not None and arguments_attr_was_set:
+        delattr(utils_module, "arguments")
+    module = importlib.import_module(module_name)
+    try:
+        yield module
+    finally:
+        sys.modules.pop(module_name, None)
+        if module_was_loaded:
+            sys.modules[module_name] = original_module
+        if utils_module is not None:
+            if arguments_attr_was_set:
+                setattr(utils_module, "arguments", original_arguments_attr)
+            elif hasattr(utils_module, "arguments"):
+                delattr(utils_module, "arguments")
+
+
+@pytest.fixture()
+def sglang_engine_module(monkeypatch):
+    ray = ModuleType("ray")
+    ray.get_runtime_context = lambda: SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "ray", ray)
+
+    sglang_router = ModuleType("sglang_router")
+    sglang_router.__version__ = "0.3.2"
+    monkeypatch.setitem(sys.modules, "sglang_router", sglang_router)
+
+    sglang = ModuleType("sglang")
+    sglang_srt = ModuleType("sglang.srt")
+    server_args = ModuleType("sglang.srt.server_args")
+
+    @dataclass
+    class ServerArgs:
+        model_path: str = ""
+        trust_remote_code: bool = True
+        random_seed: int = 0
+        enable_memory_saver: bool = False
+        host: str = ""
+        port: int = 0
+        nccl_port: int = 0
+        nnodes: int = 1
+        node_rank: int = 0
+        dist_init_addr: str = ""
+        gpu_id_step: int = 1
+        base_gpu_id: int = 0
+        tp_size: int = 1
+        dp_size: int = 1
+        pp_size: int = 1
+        ep_size: int = 1
+        moe_dense_tp_size: int | None = None
+        skip_server_warmup: bool = False
+        enable_draft_weights_cpu_backup: bool = False
+        enable_weights_cpu_backup: bool = False
+        load_format: str = "auto"
+
+    server_args.LOAD_FORMAT_CHOICES = ("auto", "runai_streamer", "remote", "dummy")
+    server_args.ServerArgs = ServerArgs
+    sglang_utils = ModuleType("sglang.srt.utils")
+    sglang_utils.kill_process_tree = lambda _pid: None
+    monkeypatch.setitem(sys.modules, "sglang", sglang)
+    monkeypatch.setitem(sys.modules, "sglang.srt", sglang_srt)
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args)
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
+
+    checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")
+    checkpoint_client.create_client = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "relax.distributed.checkpoint_service.client.engine", checkpoint_client)
+
+    ray_actor = ModuleType("relax.distributed.ray.ray_actor")
+    ray_actor.RayActor = object
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.ray_actor", ray_actor)
+
+    device = ModuleType("relax.utils.device")
+    device.get_visible_devices_env_var = lambda: "CUDA_VISIBLE_DEVICES"
+    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
+
+    async_utils = ModuleType("relax.utils.async_utils")
+    async_utils.run = lambda value: value
+    monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
+
+    env = ModuleType("relax.utils.env")
+    env.Envs = SimpleNamespace(
+        RELAX_OPTIMIZE_ROUTING_REPLAY=False,
+        RELAX_OPD_PREEXPANDED_PATCH=False,
+        RELAX_OPD_PER_POS_TOKEN_IDS=False,
+    )
+    monkeypatch.setitem(sys.modules, "relax.utils.env", env)
+
+    http_utils = ModuleType("relax.utils.http_utils")
+    http_utils.get_host_info = lambda: ("worker", "127.0.0.1")
+    http_utils.router_worker_base_url = lambda host, port, worker_id: f"http://{host}:{port}/workers/{worker_id}"
+    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
+
+    logging_utils = ModuleType("relax.utils.logging_utils")
+    logging_utils.get_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, "relax.utils.logging_utils", logging_utils)
+
+    megatron_peft_utils = ModuleType("relax.utils.megatron_peft_utils")
+    megatron_peft_utils.convert_megatron_to_hf_target_modules = lambda value: value
+    megatron_peft_utils.is_lora_enabled = lambda _args: False
+    monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
+
+    module_name = "relax.backends.sglang.sglang_engine"
+    sys.modules.pop(module_name, None)
+    module = importlib.import_module(module_name)
+    try:
+        yield module
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.fixture()
+def boto3_module(monkeypatch):
+    boto3 = ModuleType("boto3")
+    botocore = ModuleType("botocore")
+    botocore_config = ModuleType("botocore.config")
+
+    class Config:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    botocore_config.Config = Config
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
+    return boto3
+
+
+def test_pre_parse_cli_model_source(monkeypatch, arguments_module):
+    _pre_parse_cli_model_source = arguments_module._pre_parse_cli_model_source
 
     monkeypatch.setattr(
         sys,
@@ -34,8 +179,8 @@ def test_pre_parse_cli_model_source(monkeypatch):
     )
 
 
-def test_pre_parse_cli_model_source_disabled(monkeypatch):
-    from relax.utils.arguments import _pre_parse_cli_model_source
+def test_pre_parse_cli_model_source_disabled(monkeypatch, arguments_module):
+    _pre_parse_cli_model_source = arguments_module._pre_parse_cli_model_source
 
     monkeypatch.setattr(
         sys,
@@ -46,9 +191,7 @@ def test_pre_parse_cli_model_source_disabled(monkeypatch):
     assert _pre_parse_cli_model_source() is None
 
 
-def test_s3_policy_dummy_does_not_affect_genrm():
-    from relax.backends.sglang.sglang_engine import _compute_genrm_server_args
-
+def test_s3_policy_dummy_does_not_affect_genrm(sglang_engine_module):
     args = SimpleNamespace(
         genrm_num_gpus_per_engine=1,
         num_gpus_per_node=8,
@@ -62,7 +205,7 @@ def test_s3_policy_dummy_does_not_affect_genrm():
         model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"),
     )
 
-    server_args, _ = _compute_genrm_server_args(
+    server_args, _ = sglang_engine_module._compute_genrm_server_args(
         args,
         rank=0,
         dist_init_addr="127.0.0.1:1234",
@@ -75,37 +218,31 @@ def test_s3_policy_dummy_does_not_affect_genrm():
     assert server_args["load_format"] == "auto"
 
 
-def test_s3_policy_auto_prefers_ready_shm(monkeypatch):
-    from relax.backends.sglang import sglang_engine
-
+def test_s3_policy_auto_prefers_ready_shm(monkeypatch, sglang_engine_module):
     args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"))
-    monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
+    monkeypatch.setattr(sglang_engine_module, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
 
-    resolved = sglang_engine._apply_sglang_policy_load_plan(
+    resolved = sglang_engine_module._apply_sglang_policy_load_plan(
         {"model_path": args.model_source.uri, "load_format": "auto"}, args
     )
 
     assert resolved == {"model_path": "/dev/shm/student", "load_format": "auto"}
 
 
-def test_s3_policy_plan_is_noop_when_generic_download_is_disabled(monkeypatch):
-    from relax.backends.sglang import sglang_engine
-
+def test_s3_policy_plan_is_noop_when_generic_download_is_disabled(monkeypatch, sglang_engine_module):
     args = SimpleNamespace(model_source=None)
     monkeypatch.setattr(
-        sglang_engine,
+        sglang_engine_module,
         "get_s3_model_cached_path",
         lambda uri, obj: pytest.fail("disabled S3 source must not inspect SHM"),
     )
 
     server_args = {"model_path": "s3://bucket/student/", "load_format": "auto"}
 
-    assert sglang_engine._apply_sglang_policy_load_plan(server_args, args) == server_args
+    assert sglang_engine_module._apply_sglang_policy_load_plan(server_args, args) == server_args
 
 
-def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
-    from relax.backends.sglang import sglang_engine
-
+def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path, sglang_engine_module):
     for name in (
         "AWS_ENDPOINT_URL",
         "AWS_EC2_METADATA_DISABLED",
@@ -116,9 +253,9 @@ def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
         model_source=m.ModelSource("s3://bucket/student/", "http://s3.example", addressing_style="path"),
         s3_model_shm_root=str(tmp_path / "missing"),
     )
-    monkeypatch.setattr(sglang_engine, "LOAD_FORMAT_CHOICES", ["auto", "runai_streamer", "remote"])
+    monkeypatch.setattr(sglang_engine_module, "LOAD_FORMAT_CHOICES", ["auto", "runai_streamer", "remote"])
 
-    resolved = sglang_engine._apply_sglang_policy_load_plan(
+    resolved = sglang_engine_module._apply_sglang_policy_load_plan(
         {"model_path": args.model_source.uri, "load_format": "auto"}, args
     )
 
@@ -128,14 +265,12 @@ def test_s3_policy_auto_streams_when_shm_not_ready(monkeypatch, tmp_path):
     assert "AWS_EC2_METADATA_DISABLED" not in os.environ
 
 
-def test_s3_policy_auto_streams_uniformly_for_multi_node(monkeypatch):
-    from relax.backends.sglang import sglang_engine
-
+def test_s3_policy_auto_streams_uniformly_for_multi_node(monkeypatch, sglang_engine_module):
     args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
-    monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
-    monkeypatch.setattr(sglang_engine, "LOAD_FORMAT_CHOICES", ["auto", "runai_streamer"])
+    monkeypatch.setattr(sglang_engine_module, "get_s3_model_cached_path", lambda uri, obj: "/dev/shm/student")
+    monkeypatch.setattr(sglang_engine_module, "LOAD_FORMAT_CHOICES", ["auto", "runai_streamer"])
 
-    resolved = sglang_engine._apply_sglang_policy_load_plan(
+    resolved = sglang_engine_module._apply_sglang_policy_load_plan(
         {"model_path": args.model_source.uri, "load_format": "auto", "nnodes": 2}, args
     )
 
@@ -146,46 +281,38 @@ def test_s3_policy_auto_streams_uniformly_for_multi_node(monkeypatch):
     }
 
 
-def test_explicit_s3_stream_does_not_require_shm_root(tmp_path):
-    from relax.backends.sglang import sglang_engine
-
+def test_explicit_s3_stream_does_not_require_shm_root(tmp_path, sglang_engine_module):
     config = m.ModelSource("s3://bucket/student/", "http://s3.example")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
 
-    resolved = sglang_engine._apply_sglang_policy_load_plan(
+    resolved = sglang_engine_module._apply_sglang_policy_load_plan(
         {"model_path": config.uri, "load_format": "runai_streamer"}, args
     )
 
     assert resolved == {"model_path": config.uri, "load_format": "runai_streamer"}
 
 
-def test_s3_policy_dummy_is_explicit_and_uses_shm(monkeypatch):
-    from relax.backends.sglang import sglang_engine
-
+def test_s3_policy_dummy_is_explicit_and_uses_shm(monkeypatch, sglang_engine_module):
     args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/", "http://s3.example"))
-    monkeypatch.setattr(sglang_engine, "get_s3_model_cached_path", lambda uri, obj: None)
-    monkeypatch.setattr(sglang_engine, "resolve_s3_model_metadata_to_shm", lambda uri, obj: "/dev/shm/student")
+    monkeypatch.setattr(sglang_engine_module, "get_s3_model_cached_path", lambda uri, obj: None)
+    monkeypatch.setattr(sglang_engine_module, "resolve_s3_model_metadata_to_shm", lambda uri, obj: "/dev/shm/student")
 
-    resolved = sglang_engine._apply_sglang_policy_load_plan(
+    resolved = sglang_engine_module._apply_sglang_policy_load_plan(
         {"model_path": args.model_source.uri, "load_format": "dummy"}, args
     )
 
     assert resolved == {"model_path": "/dev/shm/student", "load_format": "dummy"}
 
 
-def test_s3_policy_dummy_requires_shm_root(tmp_path):
-    from relax.backends.sglang import sglang_engine
-
+def test_s3_policy_dummy_requires_shm_root(tmp_path, sglang_engine_module):
     config = m.ModelSource("s3://bucket/student/", "http://s3.example")
     args = SimpleNamespace(model_source=config, s3_model_shm_root=str(tmp_path / "missing"))
 
     with pytest.raises(RuntimeError, match="SHM root does not exist"):
-        sglang_engine._apply_sglang_policy_load_plan({"model_path": config.uri, "load_format": "dummy"}, args)
+        sglang_engine_module._apply_sglang_policy_load_plan({"model_path": config.uri, "load_format": "dummy"}, args)
 
 
-def test_runai_streamer_env_overrides_stale_credentials(monkeypatch):
-    from relax.backends.sglang import sglang_engine
-
+def test_runai_streamer_env_overrides_stale_credentials(monkeypatch, sglang_engine_module):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "stale-access-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "stale-secret-key")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "stale-session-token")
@@ -193,21 +320,19 @@ def test_runai_streamer_env_overrides_stale_credentials(monkeypatch):
         model_source=m.ModelSource("s3://bucket/student/", "http://s3.example", credential_mode="placeholder")
     )
 
-    sglang_engine._configure_runai_streamer_env(args)
+    sglang_engine_module._configure_runai_streamer_env(args)
 
     assert os.environ["AWS_ACCESS_KEY_ID"] == "mock"
     assert os.environ["AWS_SECRET_ACCESS_KEY"] == "mock"
     assert "AWS_SESSION_TOKEN" not in os.environ
 
 
-def test_runai_streamer_env_preserves_standard_credential_chain(monkeypatch):
-    from relax.backends.sglang import sglang_engine
-
+def test_runai_streamer_env_preserves_standard_credential_chain(monkeypatch, sglang_engine_module):
     monkeypatch.setenv("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", "0")
     monkeypatch.delenv("AWS_EC2_METADATA_DISABLED", raising=False)
     args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
 
-    sglang_engine._configure_runai_streamer_env(args)
+    sglang_engine_module._configure_runai_streamer_env(args)
 
     assert "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING" not in os.environ
     assert "AWS_EC2_METADATA_DISABLED" not in os.environ
@@ -368,11 +493,11 @@ def test_prepare_metadata_then_full_only_rewrites_load_for_full(monkeypatch):
     assert calls == [("metadata", source.uri), ("full", source.uri)]
 
 
-def test_make_s3_client_uses_explicit_placeholder_credentials(monkeypatch):
-    import boto3
-
+def test_make_s3_client_uses_explicit_placeholder_credentials(monkeypatch, boto3_module):
     captured = {}
-    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: captured.update(kwargs) or object())
+    monkeypatch.setattr(
+        boto3_module, "client", lambda *args, **kwargs: captured.update(kwargs) or object(), raising=False
+    )
 
     m._make_s3_client(endpoint="http://s3.example", use_placeholder_credentials=True)
 
@@ -380,11 +505,11 @@ def test_make_s3_client_uses_explicit_placeholder_credentials(monkeypatch):
     assert captured["aws_secret_access_key"] == "mock"
 
 
-def test_make_s3_client_preserves_default_credentials_for_generic_s3(monkeypatch):
-    import boto3
-
+def test_make_s3_client_preserves_default_credentials_for_generic_s3(monkeypatch, boto3_module):
     captured = {}
-    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: captured.update(kwargs) or object())
+    monkeypatch.setattr(
+        boto3_module, "client", lambda *args, **kwargs: captured.update(kwargs) or object(), raising=False
+    )
 
     m._make_s3_client(endpoint="http://generic-s3.example")
 
