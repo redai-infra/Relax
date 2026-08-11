@@ -94,6 +94,7 @@ def test_patch_preserves_upstream_outputs_and_recomputes_mrope():
     assert output.mm_items == ["image"]
     assert output.mrope_positions == "restored positions"
     assert output.mrope_position_delta == "restored delta"
+    assert processor._deepeyes_processor_hit_count == 1
 
 
 def test_merge_mrope_grid_items_combines_multi_turn_image_grids():
