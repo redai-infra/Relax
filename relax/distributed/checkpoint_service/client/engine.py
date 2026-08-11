@@ -286,7 +286,13 @@ class CheckpointEngineClient:
             return
         self._backend.recv_weight()
 
-    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> dict[str, Any]:
+    async def update_weights_for_rollout(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        *,
+        target_actor_step: int | None = None,
+    ) -> dict[str, Any]:
         """Update weights for rollout role from trainer."""
         started_at = time.monotonic()
         response = await self._http_client.get(f"{self.coordinator_url}/topology")
@@ -297,7 +303,14 @@ class CheckpointEngineClient:
         group_metrics = {}
         if not actor_fwd_only:
             group_metrics = self._backend.init_process_group_for_rollout(data) or {}
-        weight_metrics = self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only) or {}
+        weight_metrics = (
+            self._backend.update_weights_for_rollout(
+                rollout_only,
+                actor_fwd_only,
+                target_actor_step=target_actor_step,
+            )
+            or {}
+        )
         metrics = {
             "topology_seconds": topology_seconds,
             **group_metrics,

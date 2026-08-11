@@ -20,6 +20,7 @@ class ActiveRequestVersion:
     rid: str
     worker: str
     kv_epoch_version: int
+    kv_epoch_actor_step: int
     registered_at: float
 
 
@@ -28,8 +29,13 @@ class PublicationPlan:
     publication_id: str
     previous_version: int
     target_version: int
+    previous_actor_step: int
+    target_actor_step: int
     max_gap: int
+    max_actor_step_gap: int
     expired_by_worker: dict[str, tuple[str, ...]]
+    publication_gap_expired_rids: tuple[str, ...]
+    actor_step_gap_expired_rids: tuple[str, ...]
     active_request_count: int
 
     @property
@@ -46,10 +52,13 @@ class PublicationPlan:
 class RequestVersionLedger:
     """Track active request KV epochs and serialize weight publications."""
 
-    def __init__(self, *, initial_version: int = 0) -> None:
+    def __init__(self, *, initial_version: int = 0, initial_actor_step: int = 0) -> None:
         if initial_version < 0:
             raise ValueError("initial_version must be non-negative")
+        if initial_actor_step < 0:
+            raise ValueError("initial_actor_step must be non-negative")
         self.current_version = initial_version
+        self.current_actor_step = initial_actor_step
         self.active: dict[str, ActiveRequestVersion] = {}
         self._condition = asyncio.Condition()
         self._publication: PublicationPlan | None = None
@@ -75,6 +84,7 @@ class RequestVersionLedger:
                 rid=rid,
                 worker=worker,
                 kv_epoch_version=self.current_version,
+                kv_epoch_actor_step=self.current_actor_step,
                 registered_at=time.monotonic(),
             )
             self.active[rid] = request
@@ -91,12 +101,16 @@ class RequestVersionLedger:
         self,
         *,
         target_version: int,
+        target_actor_step: int,
         max_gap: int,
+        max_actor_step_gap: int,
         abort_request: Callable[[str, str], Awaitable[None]],
         timeout_seconds: float,
     ) -> PublicationPlan:
         if max_gap < 1:
             raise ValueError("max_gap must be positive")
+        if max_actor_step_gap < 0:
+            raise ValueError("max_actor_step_gap must be non-negative")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
@@ -107,17 +121,35 @@ class RequestVersionLedger:
                 raise PublicationError(
                     f"target_version must advance exactly once: current={self.current_version}, target={target_version}"
                 )
+            if target_actor_step < self.current_actor_step:
+                raise PublicationError(
+                    "target_actor_step must not move backwards: "
+                    f"current={self.current_actor_step}, target={target_actor_step}"
+                )
 
             expired: dict[str, list[str]] = defaultdict(list)
+            publication_gap_expired_rids: list[str] = []
+            actor_step_gap_expired_rids: list[str] = []
             for request in self.active.values():
-                if target_version - request.kv_epoch_version > max_gap:
+                publication_gap_expired = target_version - request.kv_epoch_version > max_gap
+                actor_step_gap_expired = target_actor_step - request.kv_epoch_actor_step > max_actor_step_gap
+                if publication_gap_expired:
+                    publication_gap_expired_rids.append(request.rid)
+                if actor_step_gap_expired:
+                    actor_step_gap_expired_rids.append(request.rid)
+                if publication_gap_expired or actor_step_gap_expired:
                     expired[request.worker].append(request.rid)
             plan = PublicationPlan(
                 publication_id=uuid.uuid4().hex,
                 previous_version=self.current_version,
                 target_version=target_version,
+                previous_actor_step=self.current_actor_step,
+                target_actor_step=target_actor_step,
                 max_gap=max_gap,
+                max_actor_step_gap=max_actor_step_gap,
                 expired_by_worker={worker: tuple(sorted(rids)) for worker, rids in sorted(expired.items())},
+                publication_gap_expired_rids=tuple(sorted(publication_gap_expired_rids)),
+                actor_step_gap_expired_rids=tuple(sorted(actor_step_gap_expired_rids)),
                 active_request_count=len(self.active),
             )
             self._publication = plan
@@ -176,24 +208,36 @@ class RequestVersionLedger:
             raise
         return plan
 
-    async def commit(self, publication_id: str, target_version: int) -> PublicationPlan:
+    async def commit(self, publication_id: str, target_version: int, target_actor_step: int) -> PublicationPlan:
         async with self._condition:
-            plan = self._require_publication(publication_id, target_version)
+            plan = self._require_publication(publication_id, target_version, target_actor_step)
             self.current_version = target_version
+            self.current_actor_step = target_actor_step
             self._publication = None
             self._failed_reason = None
             self._condition.notify_all()
             return plan
 
-    async def fail(self, publication_id: str, target_version: int, reason: str) -> PublicationPlan:
+    async def fail(
+        self,
+        publication_id: str,
+        target_version: int,
+        target_actor_step: int,
+        reason: str,
+    ) -> PublicationPlan:
         async with self._condition:
-            plan = self._require_publication(publication_id, target_version)
+            plan = self._require_publication(publication_id, target_version, target_actor_step)
             self._failed_reason = reason or "weight publication failed"
             self._publication = None
             self._condition.notify_all()
             return plan
 
-    def _require_publication(self, publication_id: str, target_version: int) -> PublicationPlan:
+    def _require_publication(
+        self,
+        publication_id: str,
+        target_version: int,
+        target_actor_step: int,
+    ) -> PublicationPlan:
         plan = self._publication
         if plan is None:
             raise PublicationError("no publication is active")
@@ -203,6 +247,11 @@ class RequestVersionLedger:
             raise PublicationError(
                 f"publication target mismatch: active={plan.target_version}, supplied={target_version}"
             )
+        if plan.target_actor_step != target_actor_step:
+            raise PublicationError(
+                "publication actor-step target mismatch: "
+                f"active={plan.target_actor_step}, supplied={target_actor_step}"
+            )
         return plan
 
     async def snapshot(self) -> dict[str, Any]:
@@ -210,12 +259,14 @@ class RequestVersionLedger:
             publication = self._publication.to_dict() if self._publication is not None else None
             return {
                 "current_version": self.current_version,
+                "current_actor_step": self.current_actor_step,
                 "publication": publication,
                 "failed_reason": self._failed_reason,
                 "active": {
                     rid: {
                         "worker": request.worker,
                         "kv_epoch_version": request.kv_epoch_version,
+                        "kv_epoch_actor_step": request.kv_epoch_actor_step,
                         "registered_at": request.registered_at,
                     }
                     for rid, request in sorted(self.active.items())

@@ -684,10 +684,23 @@ class DeviceDirectBackend(CommBackend):
                     f"Actor_fwd PP{pp_rank} joined group {group_name} as rank {global_rank} (world_size={world_size})"
                 )
 
-    def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> dict[str, float | int | bool]:
+    def update_weights_for_rollout(
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        *,
+        target_actor_step: int | None = None,
+    ) -> dict[str, float | int | bool]:
+        if self._targeted_publication_enabled() and not actor_fwd_only:
+            if target_actor_step is None or target_actor_step < 0:
+                raise ValueError("targeted DCS publication requires a non-negative target_actor_step")
         self._active_publication = None
         try:
-            return self._update_weights_for_rollout_impl(rollout_only, actor_fwd_only)
+            return self._update_weights_for_rollout_impl(
+                rollout_only,
+                actor_fwd_only,
+                target_actor_step=target_actor_step,
+            )
         except BaseException as exc:
             publication = self._active_publication
             if publication is not None and dist.get_rank() == 0:
@@ -697,6 +710,7 @@ class DeviceDirectBackend(CommBackend):
                         {
                             "publication_id": publication["publication_id"],
                             "target_version": publication["target_version"],
+                            "target_actor_step": publication["target_actor_step"],
                             "reason": f"{type(exc).__name__}: {exc}",
                         },
                     )
@@ -708,7 +722,11 @@ class DeviceDirectBackend(CommBackend):
 
     @torch.no_grad()
     def _update_weights_for_rollout_impl(
-        self, rollout_only=False, actor_fwd_only=False
+        self,
+        rollout_only: bool = False,
+        actor_fwd_only: bool = False,
+        *,
+        target_actor_step: int | None = None,
     ) -> dict[str, float | int | bool]:
         """Update weights used by rollout nodes.
 
@@ -720,6 +738,7 @@ class DeviceDirectBackend(CommBackend):
         self.weight_version += 1
         self._weight_sync_metrics = {
             "weight_version": self.weight_version,
+            "target_actor_step": -1 if target_actor_step is None else target_actor_step,
             "source_materialize_seconds": 0.0,
             "source_h2d_bytes": 0,
             "source_tensor_count": 0,
@@ -738,6 +757,8 @@ class DeviceDirectBackend(CommBackend):
             "targeted_prepare_seconds": 0.0,
             "targeted_active_requests": 0,
             "targeted_expired_requests": 0,
+            "targeted_publication_gap_expired_requests": 0,
+            "targeted_actor_step_gap_expired_requests": 0,
             "targeted_safe_requests": 0,
         }
         weight_source = self._materialize_weight_source()
@@ -758,7 +779,9 @@ class DeviceDirectBackend(CommBackend):
                     "prepare",
                     {
                         "target_version": self.weight_version,
+                        "target_actor_step": target_actor_step,
                         "max_gap": int(self.args.cross_version_kv_max_gap),
+                        "max_actor_step_gap": int(self.args.max_staleness),
                         "timeout_seconds": float(self.args.targeted_retirement_timeout_seconds),
                     },
                 )
@@ -766,6 +789,12 @@ class DeviceDirectBackend(CommBackend):
                 self._weight_sync_metrics["targeted_prepare_seconds"] = float(publication.get("prepare_seconds", 0.0))
                 self._weight_sync_metrics["targeted_active_requests"] = int(publication.get("active_request_count", 0))
                 self._weight_sync_metrics["targeted_expired_requests"] = int(publication.get("expired_count", 0))
+                self._weight_sync_metrics["targeted_publication_gap_expired_requests"] = int(
+                    len(publication.get("publication_gap_expired_rids", ()))
+                )
+                self._weight_sync_metrics["targeted_actor_step_gap_expired_requests"] = int(
+                    len(publication.get("actor_step_gap_expired_rids", ()))
+                )
                 self._weight_sync_metrics["targeted_safe_requests"] = int(publication.get("safe_count", 0))
             pause_started_at = time.monotonic()
             if dist.get_rank() == 0:
@@ -865,6 +894,7 @@ class DeviceDirectBackend(CommBackend):
                     {
                         "publication_id": publication["publication_id"],
                         "target_version": self.weight_version,
+                        "target_actor_step": target_actor_step,
                     },
                 )
                 self._active_publication = None

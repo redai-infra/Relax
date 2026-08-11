@@ -1801,10 +1801,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 raise RuntimeError(f"Hybrid DCS requires a live rollout router, got {router_address}")
             self.args.sglang_router_ip = router_ip
             self.args.sglang_router_port = router_port
-            metrics = run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+            target_actor_step = 0 if rollout_id is None else rollout_id + 1
+            metrics = run(
+                self.checkpoint_engine_client.update_weights_for_rollout(
+                    rollout_only=True,
+                    target_actor_step=target_actor_step,
+                )
+            )
             if dist.get_rank() == 0:
                 logger.info(
-                    "DCS_WEIGHT_SYNC logical_step=%s weight_version=%s "
+                    "DCS_WEIGHT_SYNC logical_step=%s target_actor_step=%s weight_version=%s "
                     "group_reused=%s group_world_size=%s rollout_receivers=%s "
                     "topology_seconds=%.6f group_setup_seconds=%.6f "
                     "source_materialize_seconds=%.6f source_h2d_bytes=%s source_local_bytes=%s "
@@ -1812,10 +1818,12 @@ class MegatronTrainRayActor(TrainRayActor):
                     "lock_wait_seconds=%.6f broadcast_seconds=%.6f receiver_finalize_seconds=%.6f "
                     "pause_flush_seconds=%.6f continue_seconds=%.6f "
                     "targeted_prepare_seconds=%.6f targeted_active_requests=%s "
-                    "targeted_expired_requests=%s targeted_safe_requests=%s "
+                    "targeted_expired_requests=%s targeted_publication_gap_expired_requests=%s "
+                    "targeted_actor_step_gap_expired_requests=%s targeted_safe_requests=%s "
                     "broadcast_buckets=%s broadcast_tensors=%s broadcast_bytes=%s fanout_bytes=%s "
                     "backend_total_seconds=%.6f client_total_seconds=%.6f",
                     -1 if rollout_id is None else rollout_id,
+                    metrics.get("target_actor_step", target_actor_step),
                     metrics.get("weight_version", -1),
                     str(bool(metrics.get("group_reused", False))).lower(),
                     metrics.get("group_world_size", 0),
@@ -1835,6 +1843,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     float(metrics.get("targeted_prepare_seconds", 0.0)),
                     metrics.get("targeted_active_requests", 0),
                     metrics.get("targeted_expired_requests", 0),
+                    metrics.get("targeted_publication_gap_expired_requests", 0),
+                    metrics.get("targeted_actor_step_gap_expired_requests", 0),
                     metrics.get("targeted_safe_requests", 0),
                     metrics.get("broadcast_bucket_count", 0),
                     metrics.get("broadcast_tensor_count", 0),

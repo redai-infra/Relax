@@ -262,7 +262,9 @@ class SlimeRouter:
     async def prepare_publication(self, request: Request):
         payload = await request.json()
         target_version = int(payload.get("target_version", -1))
+        target_actor_step = int(payload.get("target_actor_step", -1))
         max_gap = int(payload.get("max_gap", -1))
+        max_actor_step_gap = int(payload.get("max_actor_step_gap", -1))
         timeout_seconds = float(payload.get("timeout_seconds", 15.0))
         started_at = time.monotonic()
 
@@ -273,19 +275,25 @@ class SlimeRouter:
 
         plan = await self.request_version_ledger.prepare(
             target_version=target_version,
+            target_actor_step=target_actor_step,
             max_gap=max_gap,
+            max_actor_step_gap=max_actor_step_gap,
             abort_request=abort_request,
             timeout_seconds=timeout_seconds,
         )
         result = plan.to_dict()
         result["prepare_seconds"] = time.monotonic() - started_at
         logger.info(
-            "DCS_TARGETED_RETIRE event=prepare publication_id=%s target_version=%s "
-            "active_requests=%s expired_requests=%s safe_requests=%s workers=%s prepare_seconds=%.6f",
+            "DCS_TARGETED_RETIRE event=prepare publication_id=%s target_version=%s target_actor_step=%s "
+            "active_requests=%s expired_requests=%s publication_gap_expired=%s "
+            "actor_step_gap_expired=%s safe_requests=%s workers=%s prepare_seconds=%.6f",
             plan.publication_id,
             plan.target_version,
+            plan.target_actor_step,
             plan.active_request_count,
             len(plan.expired_rids),
+            len(plan.publication_gap_expired_rids),
+            len(plan.actor_step_gap_expired_rids),
             plan.active_request_count - len(plan.expired_rids),
             len(plan.expired_by_worker),
             result["prepare_seconds"],
@@ -297,11 +305,14 @@ class SlimeRouter:
         plan = await self.request_version_ledger.commit(
             str(payload.get("publication_id", "")),
             int(payload.get("target_version", -1)),
+            int(payload.get("target_actor_step", -1)),
         )
         logger.info(
-            "DCS_TARGETED_RETIRE event=commit publication_id=%s target_version=%s expired_requests=%s",
+            "DCS_TARGETED_RETIRE event=commit publication_id=%s target_version=%s "
+            "target_actor_step=%s expired_requests=%s",
             plan.publication_id,
             plan.target_version,
+            plan.target_actor_step,
             len(plan.expired_rids),
         )
         return {"status": "committed", **plan.to_dict()}
@@ -311,6 +322,7 @@ class SlimeRouter:
         plan = await self.request_version_ledger.fail(
             str(payload.get("publication_id", "")),
             int(payload.get("target_version", -1)),
+            int(payload.get("target_actor_step", -1)),
             str(payload.get("reason", "weight publication failed")),
         )
         logger.error(

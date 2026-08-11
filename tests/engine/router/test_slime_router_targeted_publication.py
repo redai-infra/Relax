@@ -27,7 +27,11 @@ def _args():
 
 
 def _request(*, rid: str | None = None) -> Request:
-    body = json.dumps({"rid": rid} if rid is not None else {}).encode()
+    return _json_request({"rid": rid} if rid is not None else {}, path="/generate")
+
+
+def _json_request(payload: dict, *, path: str) -> Request:
+    body = json.dumps(payload).encode()
     sent = False
 
     async def receive():
@@ -41,7 +45,7 @@ def _request(*, rid: str | None = None) -> Request:
         {
             "type": "http",
             "method": "POST",
-            "path": "/generate",
+            "path": path,
             "headers": [],
         },
         receive,
@@ -108,3 +112,40 @@ async def test_targeted_publication_namespaces_cache_by_request_and_weight_epoch
     assert captured["payload"]["extra_key"] == ":weight-version:3"
     assert "content-length" not in captured["headers"]
     assert (await router.request_version_ledger.snapshot())["active"] == {}
+
+
+async def test_targeted_publication_commits_actor_step_provenance() -> None:
+    args = _args()
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    router = SlimeRouter(args)
+    try:
+        prepared = await router.prepare_publication(
+            _json_request(
+                {
+                    "target_version": 1,
+                    "target_actor_step": 0,
+                    "max_gap": 1,
+                    "max_actor_step_gap": 2,
+                    "timeout_seconds": 1,
+                },
+                path="/_relax/weight_publication/prepare",
+            )
+        )
+        await router.commit_publication(
+            _json_request(
+                {
+                    "publication_id": prepared["publication_id"],
+                    "target_version": 1,
+                    "target_actor_step": 0,
+                },
+                path="/_relax/weight_publication/commit",
+            )
+        )
+        request = await router.request_version_ledger.register("rid", "http://engine-a")
+    finally:
+        await router.client.aclose()
+        await router.control_client.aclose()
+
+    assert request.kv_epoch_version == 1
+    assert request.kv_epoch_actor_step == 0

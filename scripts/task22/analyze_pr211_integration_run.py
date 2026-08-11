@@ -98,10 +98,14 @@ def _publication_rows(driver_log: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"group_reused={reused_raw!r}")
             row = {
                 "logical_step": int(fields["logical_step"]),
+                "target_actor_step": int(fields["target_actor_step"]),
                 "weight_version": int(fields["weight_version"]),
                 "group_reused": reused_raw == "true",
                 "group_world_size": int(fields["group_world_size"]),
                 "rollout_receiver_count": int(fields["rollout_receivers"]),
+                "targeted_expired_requests": int(fields["targeted_expired_requests"]),
+                "targeted_publication_gap_expired_requests": int(fields["targeted_publication_gap_expired_requests"]),
+                "targeted_actor_step_gap_expired_requests": int(fields["targeted_actor_step_gap_expired_requests"]),
                 "line": line_no,
             }
         except (KeyError, ValueError) as exc:
@@ -181,6 +185,26 @@ def analyze(run_contract: Path, driver_log: Path) -> dict[str, Any]:
     expected_world_size = expected_topology["group_world_size"]
     for row in rows:
         step = row["logical_step"]
+        expected_actor_step = 0 if step == -1 else step + 1
+        if row["target_actor_step"] != expected_actor_step:
+            errors.append(
+                f"logical_step={step}:target_actor_step={row['target_actor_step']}:expected={expected_actor_step}"
+            )
+        expired = row["targeted_expired_requests"]
+        publication_gap_expired = row["targeted_publication_gap_expired_requests"]
+        actor_step_gap_expired = row["targeted_actor_step_gap_expired_requests"]
+        if (
+            expired < 0
+            or publication_gap_expired < 0
+            or actor_step_gap_expired < 0
+            or publication_gap_expired > expired
+            or actor_step_gap_expired > expired
+            or expired > publication_gap_expired + actor_step_gap_expired
+        ):
+            errors.append(
+                f"logical_step={step}:inconsistent_expiration_counts="
+                f"{expired}/{publication_gap_expired}/{actor_step_gap_expired}"
+            )
         if row["rollout_receiver_count"] != expected_receivers or row["group_world_size"] != expected_world_size:
             errors.append(
                 f"logical_step={step}:topology="

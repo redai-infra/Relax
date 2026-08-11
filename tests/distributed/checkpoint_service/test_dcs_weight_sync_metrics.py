@@ -189,3 +189,48 @@ def test_router_prepare_timeout_wraps_internal_retirement_deadline() -> None:
 
     assert result == {"ok": True}
     assert calls["timeout"] == 20.0
+
+
+def test_targeted_publication_requires_actor_step_before_mutating_backend() -> None:
+    backend = module.DeviceDirectBackend.__new__(module.DeviceDirectBackend)
+    backend.args = type(
+        "Args",
+        (),
+        {
+            "hybrid_dcs_weight_sync": True,
+            "enable_cross_version_kv_continuation": True,
+        },
+    )()
+    backend._active_publication = None
+
+    with pytest.raises(ValueError, match="target_actor_step"):
+        backend.update_weights_for_rollout(rollout_only=True)
+
+
+def test_targeted_publication_forwards_actor_step_to_backend_impl(monkeypatch) -> None:
+    backend = module.DeviceDirectBackend.__new__(module.DeviceDirectBackend)
+    backend.args = type(
+        "Args",
+        (),
+        {
+            "hybrid_dcs_weight_sync": True,
+            "enable_cross_version_kv_continuation": True,
+        },
+    )()
+    backend._active_publication = None
+    captured = {}
+
+    def update_impl(rollout_only, actor_fwd_only, *, target_actor_step):
+        captured.update(
+            rollout_only=rollout_only,
+            actor_fwd_only=actor_fwd_only,
+            target_actor_step=target_actor_step,
+        )
+        return {"target_actor_step": target_actor_step}
+
+    monkeypatch.setattr(backend, "_update_weights_for_rollout_impl", update_impl)
+
+    result = backend.update_weights_for_rollout(rollout_only=True, target_actor_step=4)
+
+    assert result == {"target_actor_step": 4}
+    assert captured == {"rollout_only": True, "actor_fwd_only": False, "target_actor_step": 4}

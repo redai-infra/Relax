@@ -45,11 +45,28 @@ def _contract(tmp_path: Path, *, total_gpus: int, per_engine: int, interval: int
     return path
 
 
-def _marker(step: int, *, world_size: int, receivers: int, reused: bool) -> str:
+def _marker(
+    step: int,
+    *,
+    world_size: int,
+    receivers: int,
+    reused: bool,
+    target_actor_step: int | None = None,
+    expired: int = 0,
+    publication_gap_expired: int = 0,
+    actor_step_gap_expired: int = 0,
+) -> str:
+    actor_step = 0 if step == -1 else step + 1
+    if target_actor_step is not None:
+        actor_step = target_actor_step
     return (
         "prefix DCS_WEIGHT_SYNC "
-        f"logical_step={step} weight_version={step + 2} group_reused={str(reused).lower()} "
-        f"group_world_size={world_size} rollout_receivers={receivers} trailing_metric=1"
+        f"logical_step={step} target_actor_step={actor_step} "
+        f"weight_version={step + 2} group_reused={str(reused).lower()} "
+        f"group_world_size={world_size} rollout_receivers={receivers} "
+        f"targeted_expired_requests={expired} "
+        f"targeted_publication_gap_expired_requests={publication_gap_expired} "
+        f"targeted_actor_step_gap_expired_requests={actor_step_gap_expired} trailing_metric=1"
     )
 
 
@@ -112,6 +129,48 @@ def test_analyzer_rejects_missing_publication_and_group_rebuild(tmp_path) -> Non
     assert result["verdict"] == "INVALID_INPUT"
     assert any(error.startswith("publication_step_coverage:") for error in result["errors"])
     assert "logical_step=2:group_not_reused" in result["errors"]
+
+
+def test_analyzer_rejects_actor_step_provenance_drift(tmp_path) -> None:
+    contract = _contract(tmp_path, total_gpus=2, per_engine=1)
+    rows = [_marker(-1, world_size=3, receivers=2, reused=False)]
+    rows.extend(
+        _marker(
+            step,
+            world_size=3,
+            receivers=2,
+            reused=True,
+            target_actor_step=7 if step == 1 else None,
+        )
+        for step in range(3)
+    )
+
+    result = analyzer.analyze(contract, _log(tmp_path, rows))
+
+    assert result["verdict"] == "INVALID_INPUT"
+    assert "logical_step=1:target_actor_step=7:expected=2" in result["errors"]
+
+
+def test_analyzer_rejects_inconsistent_dynamic_expiration_metrics(tmp_path) -> None:
+    contract = _contract(tmp_path, total_gpus=2, per_engine=1)
+    rows = [_marker(-1, world_size=3, receivers=2, reused=False)]
+    rows.extend(
+        _marker(
+            step,
+            world_size=3,
+            receivers=2,
+            reused=True,
+            expired=1 if step == 1 else 0,
+            publication_gap_expired=0,
+            actor_step_gap_expired=0,
+        )
+        for step in range(3)
+    )
+
+    result = analyzer.analyze(contract, _log(tmp_path, rows))
+
+    assert result["verdict"] == "INVALID_INPUT"
+    assert "logical_step=1:inconsistent_expiration_counts=1/0/0" in result["errors"]
 
 
 def test_kv_off_arm_is_valid_only_without_dcs_publications(tmp_path) -> None:

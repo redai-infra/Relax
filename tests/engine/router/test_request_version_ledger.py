@@ -15,6 +15,7 @@ async def test_prepare_targets_only_requests_older_than_max_gap() -> None:
     await ledger.register("old-a", "engine-a")
     await ledger.register("old-b", "engine-b")
     ledger.current_version = 1
+    ledger.current_actor_step = 1
     await ledger.register("safe", "engine-a")
 
     aborted: list[tuple[str, str]] = []
@@ -25,7 +26,9 @@ async def test_prepare_targets_only_requests_older_than_max_gap() -> None:
 
     plan = await ledger.prepare(
         target_version=2,
+        target_actor_step=2,
         max_gap=1,
+        max_actor_step_gap=1,
         abort_request=abort_request,
         timeout_seconds=1,
     )
@@ -37,14 +40,16 @@ async def test_prepare_targets_only_requests_older_than_max_gap() -> None:
     }
     assert "safe" in ledger.active
 
-    await ledger.commit(plan.publication_id, plan.target_version)
+    await ledger.commit(plan.publication_id, plan.target_version, plan.target_actor_step)
     assert ledger.current_version == 2
+    assert ledger.current_actor_step == 2
 
 
 async def test_prepare_retries_abort_until_late_dispatch_becomes_visible() -> None:
     ledger = RequestVersionLedger(initial_version=0)
     await ledger.register("late", "engine-a")
     ledger.current_version = 1
+    ledger.current_actor_step = 1
     attempts = 0
 
     async def abort_request(_worker: str, rid: str) -> None:
@@ -55,19 +60,22 @@ async def test_prepare_retries_abort_until_late_dispatch_becomes_visible() -> No
 
     plan = await ledger.prepare(
         target_version=2,
+        target_actor_step=2,
         max_gap=1,
+        max_actor_step_gap=1,
         abort_request=abort_request,
         timeout_seconds=1,
     )
 
     assert attempts == 2
-    await ledger.commit(plan.publication_id, plan.target_version)
+    await ledger.commit(plan.publication_id, plan.target_version, plan.target_actor_step)
 
 
 async def test_publication_fence_blocks_new_registration_until_commit() -> None:
     ledger = RequestVersionLedger(initial_version=0)
     await ledger.register("expired", "engine-a")
     ledger.current_version = 1
+    ledger.current_actor_step = 1
     abort_started = asyncio.Event()
 
     async def abort_request(_worker: str, _rid: str) -> None:
@@ -76,7 +84,9 @@ async def test_publication_fence_blocks_new_registration_until_commit() -> None:
     prepare_task = asyncio.create_task(
         ledger.prepare(
             target_version=2,
+            target_actor_step=2,
             max_gap=1,
+            max_actor_step_gap=1,
             abort_request=abort_request,
             timeout_seconds=1,
         )
@@ -89,10 +99,11 @@ async def test_publication_fence_blocks_new_registration_until_commit() -> None:
     await ledger.unregister("expired")
     plan = await prepare_task
     assert not register_task.done()
-    await ledger.commit(plan.publication_id, plan.target_version)
+    await ledger.commit(plan.publication_id, plan.target_version, plan.target_actor_step)
 
     request = await register_task
     assert request.kv_epoch_version == 2
+    assert request.kv_epoch_actor_step == 2
 
 
 async def test_prepare_surfaces_abort_failure_after_attempting_all_workers() -> None:
@@ -100,6 +111,7 @@ async def test_prepare_surfaces_abort_failure_after_attempting_all_workers() -> 
     await ledger.register("expired-a", "engine-a")
     await ledger.register("expired-b", "engine-b")
     ledger.current_version = 1
+    ledger.current_actor_step = 1
     attempted: list[str] = []
 
     async def abort_request(_worker: str, rid: str) -> None:
@@ -114,7 +126,9 @@ async def test_prepare_surfaces_abort_failure_after_attempting_all_workers() -> 
     ):
         await ledger.prepare(
             target_version=2,
+            target_actor_step=2,
             max_gap=1,
+            max_actor_step_gap=1,
             abort_request=abort_request,
             timeout_seconds=1,
         )
@@ -122,12 +136,14 @@ async def test_prepare_surfaces_abort_failure_after_attempting_all_workers() -> 
     assert sorted(attempted) == ["expired-a", "expired-b"]
     request = await ledger.register("new", "engine-a")
     assert request.kv_epoch_version == 1
+    assert request.kv_epoch_actor_step == 1
 
 
 async def test_prepare_timeout_rolls_back_without_advancing_version() -> None:
     ledger = RequestVersionLedger(initial_version=0)
     await ledger.register("expired", "engine-a")
     ledger.current_version = 1
+    ledger.current_actor_step = 1
 
     async def abort_request(_worker: str, _rid: str) -> None:
         return None
@@ -135,7 +151,9 @@ async def test_prepare_timeout_rolls_back_without_advancing_version() -> None:
     with pytest.raises(TimeoutError):
         await ledger.prepare(
             target_version=2,
+            target_actor_step=2,
             max_gap=1,
+            max_actor_step_gap=1,
             abort_request=abort_request,
             timeout_seconds=0.01,
         )
@@ -144,6 +162,7 @@ async def test_prepare_timeout_rolls_back_without_advancing_version() -> None:
     assert request.kv_epoch_version == 1
     state = await ledger.snapshot()
     assert state["current_version"] == 1
+    assert state["current_actor_step"] == 1
     assert state["publication"] is None
     assert state["failed_reason"].startswith("targeted retirement failed: TimeoutError:")
 
@@ -152,6 +171,7 @@ async def test_prepare_timeout_bounds_stuck_abort_and_releases_fence() -> None:
     ledger = RequestVersionLedger(initial_version=0)
     await ledger.register("expired", "engine-a")
     ledger.current_version = 1
+    ledger.current_actor_step = 1
     abort_cancelled = asyncio.Event()
 
     async def abort_request(_worker: str, _rid: str) -> None:
@@ -163,7 +183,9 @@ async def test_prepare_timeout_bounds_stuck_abort_and_releases_fence() -> None:
     with pytest.raises(TimeoutError):
         await ledger.prepare(
             target_version=2,
+            target_actor_step=2,
             max_gap=1,
+            max_actor_step_gap=1,
             abort_request=abort_request,
             timeout_seconds=0.01,
         )
@@ -181,17 +203,20 @@ async def test_failed_publication_ends_current_transaction_without_poisoning_rou
 
     plan = await ledger.prepare(
         target_version=3,
+        target_actor_step=1,
         max_gap=2,
+        max_actor_step_gap=2,
         abort_request=abort_request,
         timeout_seconds=1,
     )
-    await ledger.fail(plan.publication_id, plan.target_version, "DCS broadcast failed")
+    await ledger.fail(plan.publication_id, plan.target_version, plan.target_actor_step, "DCS broadcast failed")
 
     request = await ledger.register("rid", "engine-a")
     assert request.kv_epoch_version == 2
     failed_state = await ledger.snapshot()
     assert failed_state["publication"] is None
     assert failed_state["current_version"] == 2
+    assert failed_state["current_actor_step"] == 0
     assert failed_state["failed_reason"] == "DCS broadcast failed"
 
 
@@ -204,7 +229,73 @@ async def test_publication_version_must_advance_exactly_once() -> None:
     with pytest.raises(PublicationError, match="advance exactly once"):
         await ledger.prepare(
             target_version=4,
+            target_actor_step=1,
             max_gap=2,
+            max_actor_step_gap=2,
             abort_request=abort_request,
             timeout_seconds=1,
         )
+
+
+async def test_actor_step_gap_retires_request_after_skipped_publication() -> None:
+    ledger = RequestVersionLedger(initial_version=1, initial_actor_step=0)
+    await ledger.register("stale-after-skip", "engine-a")
+    aborted: list[str] = []
+
+    async def abort_request(_worker: str, rid: str) -> None:
+        aborted.append(rid)
+        await ledger.unregister(rid)
+
+    plan = await ledger.prepare(
+        target_version=2,
+        target_actor_step=4,
+        max_gap=1,
+        max_actor_step_gap=2,
+        abort_request=abort_request,
+        timeout_seconds=1,
+    )
+
+    assert aborted == ["stale-after-skip"]
+    assert plan.publication_gap_expired_rids == ()
+    assert plan.actor_step_gap_expired_rids == ("stale-after-skip",)
+
+
+async def test_short_forced_publication_keeps_request_within_actor_step_gap() -> None:
+    ledger = RequestVersionLedger(initial_version=1, initial_actor_step=2)
+    request = await ledger.register("safe-forced-publish", "engine-a")
+    assert request.kv_epoch_actor_step == 2
+
+    async def abort_request(_worker: str, _rid: str) -> None:
+        pytest.fail("safe request was retired")
+
+    plan = await ledger.prepare(
+        target_version=2,
+        target_actor_step=3,
+        max_gap=1,
+        max_actor_step_gap=2,
+        abort_request=abort_request,
+        timeout_seconds=1,
+    )
+
+    assert plan.expired_rids == ()
+    await ledger.commit(plan.publication_id, plan.target_version, plan.target_actor_step)
+    assert ledger.current_actor_step == 3
+
+
+async def test_commit_rejects_actor_step_identity_mismatch() -> None:
+    ledger = RequestVersionLedger(initial_version=1, initial_actor_step=2)
+
+    async def abort_request(_worker: str, _rid: str) -> None:
+        return None
+
+    plan = await ledger.prepare(
+        target_version=2,
+        target_actor_step=4,
+        max_gap=1,
+        max_actor_step_gap=2,
+        abort_request=abort_request,
+        timeout_seconds=1,
+    )
+
+    with pytest.raises(PublicationError, match="actor-step target mismatch"):
+        await ledger.commit(plan.publication_id, plan.target_version, target_actor_step=3)
