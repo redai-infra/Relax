@@ -383,8 +383,10 @@ exit-status artifacts for every run.
 The manifest also records and cross-checks `max_staleness`, global/rollout
 batch sizes, samples per prompt, and actor chunk count, so CLI expectations
 cannot silently disagree with the measured workload.
-The registered four-stage protocol additionally requires exactly four producer
-puts of 64 samples for every rollout; regrouped producer puts fail validation.
+The registered four-stage protocol requires exactly four actor fetch/forward
+chunks of 64 samples. Producer puts may be regrouped by asynchronous completion;
+their events must close and their aggregate sample count and fingerprint must
+match the actor-consumed workload exactly.
 Before any paired statistics are calculated, the analyzer also requires
 identical model/config/data paths, prompt/response/context limits, actor token
 budget, actor/rollout resource topology, SGLang determinism and memory

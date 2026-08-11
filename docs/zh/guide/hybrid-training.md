@@ -361,8 +361,9 @@ step end wall time 和 duration 重建。sampled peak VRAM 仍使用 full-run
 launcher log，以及值为 0 的训练、验证和最终退出状态文件。
 manifest 还会记录并交叉校验 `max_staleness`、global/rollout batch size、
 每 prompt 样本数和 actor chunk 数，避免分析器 CLI 与实际工作负载静默不一致。
-注册的四阶段协议还要求每个 rollout 恰好执行四次、每次 64 sample 的 producer
-put；producer 重新分组会导致验证失败。
+注册的四阶段协议要求 actor 恰好执行四次、每次 64 sample 的 fetch/forward。
+producer put 可因异步完成顺序重新分组，但事件必须闭合，且聚合后的 sample 总数与
+fingerprint 必须和 actor 实际消费的工作量精确一致。
 在计算任何配对统计前，分析器还要求模型、模型配置、数据路径、prompt/response/
 context 上限、actor token 预算、actor/rollout 资源拓扑、SGLang 确定性与显存
 配置、物理卡到容器卡映射、checkpoint 模式以及 debug 捕获/回放配置完全一致；
