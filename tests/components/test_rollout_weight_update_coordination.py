@@ -65,6 +65,7 @@ async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
     rollout._async_check_production_for_update_weight = AsyncMock(return_value=True)
     rollout.rollout_manager = SimpleNamespace(
         health_monitoring_pause=SimpleNamespace(remote=AsyncMock()),
+        health_monitoring_resume=SimpleNamespace(remote=AsyncMock()),
         set_weight_updating=SimpleNamespace(remote=AsyncMock(side_effect=[RuntimeError("prepare failed"), None])),
     )
     with pytest.raises(RuntimeError, match="prepare failed"):
@@ -73,3 +74,4 @@ async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
     assert rollout.status == "running"
     assert rollout._weight_update_ready.is_set()
     assert rollout.rollout_manager.set_weight_updating.remote.await_args_list[1].args == (False,)
+    rollout.rollout_manager.health_monitoring_resume.remote.assert_awaited_once_with()

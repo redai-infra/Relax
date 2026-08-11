@@ -593,8 +593,10 @@ class Rollout(Base):
         if can_update:
             self._weight_update_ready.clear()
             self.status = "paused"
+            health_monitoring_paused = False
             try:
                 await self.rollout_manager.health_monitoring_pause.remote()
+                health_monitoring_paused = True
                 await self.rollout_manager.set_weight_updating.remote(True)
             except Exception:
                 self.status = "running"
@@ -602,6 +604,11 @@ class Rollout(Base):
                     await self.rollout_manager.set_weight_updating.remote(False)
                 except Exception:
                     self._logger.exception("Failed to roll back Rollout weight-update state")
+                if health_monitoring_paused:
+                    try:
+                        await self.rollout_manager.health_monitoring_resume.remote()
+                    except Exception:
+                        self._logger.exception("Failed to resume Rollout health monitoring")
                 raise
             finally:
                 # Always release the handshake gate: even if the remote calls
