@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import math
 import os
+import string
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
@@ -1623,6 +1624,15 @@ def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=
             logger.exception(f"save-hf post-hook flush for {hook_path!r} raised; training continues")
 
 
+def _resolve_save_hf_path(save_hf: str, rollout_id: int) -> Path:
+    """Resolve an HF checkpoint path while preserving legacy templates."""
+    has_rollout_id = any(field_name == "rollout_id" for _, field_name, _, _ in string.Formatter().parse(save_hf))
+    path = Path(save_hf.format(rollout_id=rollout_id))
+    if not has_rollout_id:
+        path /= f"iter_{rollout_id:07d}"
+    return path
+
+
 def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bool = False) -> None:
     """Save Megatron model in HuggingFace format.
 
@@ -1637,7 +1647,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
     try:
         from megatron.bridge import AutoBridge
 
-        path = Path(args.save_hf.format(rollout_id=rollout_id))
+        path = _resolve_save_hf_path(args.save_hf, rollout_id)
 
         if should_log:
             logger.info(f"Saving model in HuggingFace format to {path}")

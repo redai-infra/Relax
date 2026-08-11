@@ -17,6 +17,7 @@ Plus argument validation: `--save-hf-dtype fp8` requires `--save-hf`.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -174,6 +175,19 @@ class TestSaveHfDtypeValidation:
         )
         with pytest.raises(ValueError):
             validate_save_hf_fp8_args(args)
+
+
+class TestResolveSaveHfPath:
+    def test_appends_iteration_to_root_path(self):
+        assert model_mod._resolve_save_hf_path("/tmp/hf_output", 7) == Path("/tmp/hf_output/iter_0000007")
+
+    def test_preserves_rollout_id_template(self):
+        assert model_mod._resolve_save_hf_path("/tmp/hf_output/iter_{rollout_id}", 7) == Path("/tmp/hf_output/iter_7")
+
+    def test_supports_rollout_id_format_spec(self):
+        assert model_mod._resolve_save_hf_path("/tmp/hf_output/iter_{rollout_id:07d}", 7) == Path(
+            "/tmp/hf_output/iter_0000007"
+        )
 
 
 class TestSaveHfModelFp8Branch:

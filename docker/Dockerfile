@@ -1,7 +1,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.15.post1-cu129
+ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.15.post1-cu129
 ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
 
@@ -77,12 +77,6 @@ RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytor
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
     git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
 
-ARG TRAIN_IMAGE=train
-FROM ${TRAIN_IMAGE} as relax
-
-ARG PATCH_VERSION=latest
-ARG ENABLE_SGLANG_PATCH=1
-
 WORKDIR /root
 
 # Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
@@ -90,6 +84,14 @@ COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
 RUN cd /tmp/int4_qat && \
     pip install . --no-build-isolation --no-cache-dir && \
     rm -rf /tmp/int4_qat
+
+ARG TRAIN_IMAGE=train
+FROM ${TRAIN_IMAGE} as relax
+
+WORKDIR /root
+
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
 
 ARG MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
