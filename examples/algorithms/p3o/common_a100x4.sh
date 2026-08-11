@@ -6,7 +6,31 @@ set -euo pipefail
 
 P3O_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 P3O_REPO_ROOT="$(cd -- "${P3O_SCRIPT_DIR}/../../.." >/dev/null 2>&1 && pwd)"
-source "${P3O_REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
+P3O_MODE="${P3O_MODE:-formal}"
+if [[ -z "${P3O_MODEL_ROTARY_BASE:-}" ]]; then
+    if [[ "${P3O_MODE}" == "formal" ]]; then
+        P3O_MODEL_ROTARY_BASE="5000000"
+    else
+        P3O_MODEL_ROTARY_BASE="1000000"
+    fi
+fi
+if [[ ! "${P3O_MODEL_ROTARY_BASE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "P3O_MODEL_ROTARY_BASE must be a positive integer" >&2
+    exit 2
+fi
+MODEL_ARGS_ROTARY_BASE="${P3O_MODEL_ROTARY_BASE}"
+if [[ -z "${P3O_MODEL_CONFIG:-}" ]]; then
+    if [[ "${P3O_MODE}" == "smoke" ]]; then
+        P3O_MODEL_CONFIG="${P3O_REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
+    else
+        P3O_MODEL_CONFIG="${P3O_REPO_ROOT}/scripts/models/qwen3-4B.sh"
+    fi
+fi
+if [[ ! -f "${P3O_MODEL_CONFIG}" ]]; then
+    echo "P3O_MODEL_CONFIG does not exist: ${P3O_MODEL_CONFIG}" >&2
+    exit 2
+fi
+source "${P3O_MODEL_CONFIG}"
 
 P3O_ALGORITHM="${P3O_ALGORITHM:?set P3O_ALGORITHM to p3o or grpo}"
 P3O_ENABLE_TEMPERATURE_OVERRIDE="${P3O_ENABLE_TEMPERATURE_OVERRIDE:-0}"
@@ -14,11 +38,39 @@ P3O_BEHAVIOR_TEMPERATURE="${P3O_BEHAVIOR_TEMPERATURE:-}"
 P3O_MAX_STALENESS="${P3O_MAX_STALENESS:-0}"
 P3O_UPDATE_WEIGHTS_INTERVAL="${P3O_UPDATE_WEIGHTS_INTERVAL:-1}"
 P3O_PIPELINE_MODEL_PARALLEL_SIZE="${P3O_PIPELINE_MODEL_PARALLEL_SIZE:-1}"
-P3O_MODE="${P3O_MODE:-formal}"
 P3O_SEED="${P3O_SEED:-42}"
+P3O_ESS_SCOPE="${P3O_ESS_SCOPE:-micro-batch}"
+P3O_KL_MODE="${P3O_KL_MODE:-proxy_safe}"
+P3O_CLIP_LOW="${P3O_CLIP_LOW:-0.2}"
+P3O_CLIP_HIGH="${P3O_CLIP_HIGH:-0.2}"
+P3O_ACTIVATION_RECOMPUTE="${P3O_ACTIVATION_RECOMPUTE:-0}"
+P3O_LOG_PROBS_CHUNK_SIZE="${P3O_LOG_PROBS_CHUNK_SIZE:--1}"
+P3O_ROLLOUT_SHUFFLE="${P3O_ROLLOUT_SHUFFLE:-1}"
+P3O_DETERMINISTIC_INFERENCE="${P3O_DETERMINISTIC_INFERENCE:-0}"
+P3O_CLEAR_RUNTIME_PROXIES="${P3O_CLEAR_RUNTIME_PROXIES:-0}"
 P3O_DRY_RUN="${P3O_DRY_RUN:-0}"
 P3O_NCCL_DEBUG="${P3O_NCCL_DEBUG:-WARN}"
 P3O_TORCH_DISTRIBUTED_DEBUG="${P3O_TORCH_DISTRIBUTED_DEBUG:-OFF}"
+if [[ -z "${P3O_INPUT_KEY:-}" ]]; then
+    if [[ "${P3O_MODE}" == "formal" ]]; then
+        P3O_INPUT_KEY="problem"
+    else
+        P3O_INPUT_KEY="question"
+    fi
+fi
+P3O_LABEL_KEY="${P3O_LABEL_KEY:-answer}"
+if [[ -z "${P3O_RM_TYPE:-}" ]]; then
+    if [[ "${P3O_MODE}" == "formal" ]]; then
+        P3O_RM_TYPE="deepscaler"
+    else
+        P3O_RM_TYPE="mopd"
+    fi
+fi
+P3O_EVAL_NAME="${P3O_EVAL_NAME:-deepscaler}"
+P3O_EVAL_N_SAMPLES="${P3O_EVAL_N_SAMPLES:-16}"
+P3O_EVAL_MAX_RESPONSE_LEN="${P3O_EVAL_MAX_RESPONSE_LEN:-4096}"
+P3O_EVAL_TEMPERATURE="${P3O_EVAL_TEMPERATURE:-1.0}"
+P3O_EVAL_TOP_P="${P3O_EVAL_TOP_P:-0.95}"
 
 if [[ "${P3O_DRY_RUN}" == "1" ]]; then
     P3O_MODEL_DIR="${P3O_MODEL_DIR:-/dummy/model}"
@@ -36,6 +88,35 @@ else
     else
         P3O_EVAL_DATA="${P3O_EVAL_DATA:-}"
     fi
+fi
+
+if [[ "${P3O_ROLLOUT_SHUFFLE}" != "0" && "${P3O_ROLLOUT_SHUFFLE}" != "1" ]]; then
+    echo "P3O_ROLLOUT_SHUFFLE must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${P3O_DETERMINISTIC_INFERENCE}" != "0" && "${P3O_DETERMINISTIC_INFERENCE}" != "1" ]]; then
+    echo "P3O_DETERMINISTIC_INFERENCE must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${P3O_CLEAR_RUNTIME_PROXIES}" != "0" && "${P3O_CLEAR_RUNTIME_PROXIES}" != "1" ]]; then
+    echo "P3O_CLEAR_RUNTIME_PROXIES must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${P3O_ACTIVATION_RECOMPUTE}" != "0" && "${P3O_ACTIVATION_RECOMPUTE}" != "1" ]]; then
+    echo "P3O_ACTIVATION_RECOMPUTE must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "${P3O_LOG_PROBS_CHUNK_SIZE}" != "-1" && ! "${P3O_LOG_PROBS_CHUNK_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "P3O_LOG_PROBS_CHUNK_SIZE must be -1 or a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${P3O_EVAL_N_SAMPLES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "P3O_EVAL_N_SAMPLES must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "${P3O_EVAL_MAX_RESPONSE_LEN}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "P3O_EVAL_MAX_RESPONSE_LEN must be a positive integer" >&2
+    exit 2
 fi
 
 : "${P3O_RAY_DASHBOARD:?P3O_RAY_DASHBOARD must be set}"
@@ -66,6 +147,14 @@ if [[ "${P3O_MODE}" != "formal" && "${P3O_MODE}" != "smoke" ]]; then
     echo "P3O_MODE must be formal or smoke" >&2
     exit 2
 fi
+if [[ "${P3O_ESS_SCOPE}" != "micro-batch" && "${P3O_ESS_SCOPE}" != "step" ]]; then
+    echo "P3O_ESS_SCOPE must be micro-batch or step" >&2
+    exit 2
+fi
+if [[ "${P3O_KL_MODE}" != "proxy" && "${P3O_KL_MODE}" != "proxy_safe" ]]; then
+    echo "P3O_KL_MODE must be proxy or proxy_safe for production training" >&2
+    exit 2
+fi
 if [[ ! "${P3O_UPDATE_WEIGHTS_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
     echo "P3O_UPDATE_WEIGHTS_INTERVAL must be a positive integer" >&2
     exit 2
@@ -80,10 +169,10 @@ if [[ ! "${P3O_PIPELINE_MODEL_PARALLEL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 if [[ "${P3O_MODE}" == "formal" ]]; then
-    P3O_NUM_ROLLOUT="${P3O_NUM_ROLLOUT:-11}"
-    P3O_ROLLOUT_BATCH_SIZE="${P3O_ROLLOUT_BATCH_SIZE:-12}"
-    P3O_N_SAMPLES="${P3O_N_SAMPLES:-4}"
-    P3O_GLOBAL_BATCH_SIZE="${P3O_GLOBAL_BATCH_SIZE:-48}"
+    P3O_NUM_ROLLOUT="${P3O_NUM_ROLLOUT:-30}"
+    P3O_ROLLOUT_BATCH_SIZE="${P3O_ROLLOUT_BATCH_SIZE:-4}"
+    P3O_N_SAMPLES="${P3O_N_SAMPLES:-16}"
+    P3O_GLOBAL_BATCH_SIZE="${P3O_GLOBAL_BATCH_SIZE:-64}"
     # Full-length responses make the FP32 logits conversion exceed A100-40GB at micro-batch 4.
     P3O_MICRO_BATCH_SIZE="${P3O_MICRO_BATCH_SIZE:-1}"
     P3O_MAX_RESPONSE_LEN="${P3O_MAX_RESPONSE_LEN:-4096}"
@@ -118,11 +207,10 @@ P3O_build_args() {
 
     P3O_ROLLOUT_ARGS=(
         --prompt-data "${P3O_TRAIN_DATA}"
-        --input-key question
-        --label-key answer
+        --input-key "${P3O_INPUT_KEY}"
+        --label-key "${P3O_LABEL_KEY}"
         --apply-chat-template
-        --rollout-shuffle
-        --rm-type mopd
+        --rm-type "${P3O_RM_TYPE}"
         --num-rollout "${P3O_NUM_ROLLOUT}"
         --rollout-batch-size "${P3O_ROLLOUT_BATCH_SIZE}"
         --n-samples-per-prompt "${P3O_N_SAMPLES}"
@@ -136,6 +224,9 @@ P3O_build_args() {
         --balance-data
         --log-passrate
     )
+    if [[ "${P3O_ROLLOUT_SHUFFLE}" == "1" ]]; then
+        P3O_ROLLOUT_ARGS+=(--rollout-shuffle)
+    fi
 
     P3O_PERF_ARGS=(
         --tensor-model-parallel-size 1
@@ -146,6 +237,16 @@ P3O_build_args() {
         --micro-batch-size "${P3O_MICRO_BATCH_SIZE}"
         --calculate-per-token-loss
     )
+    if [[ "${P3O_ACTIVATION_RECOMPUTE}" == "1" ]]; then
+        P3O_PERF_ARGS+=(
+            --recompute-granularity full
+            --recompute-method uniform
+            --recompute-num-layers 1
+        )
+    fi
+    if [[ "${P3O_LOG_PROBS_CHUNK_SIZE}" != "-1" ]]; then
+        P3O_PERF_ARGS+=(--log-probs-chunk-size "${P3O_LOG_PROBS_CHUNK_SIZE}")
+    fi
 
     P3O_OPTIMIZER_ARGS=(
         --optimizer adam
@@ -164,6 +265,14 @@ P3O_build_args() {
         --kl-coef 0.0
         --entropy-coef 0.0
     )
+    if [[ "${P3O_ALGORITHM}" == "p3o" ]]; then
+        P3O_ALGO_ARGS+=(
+            --p3o-ess-scope "${P3O_ESS_SCOPE}"
+            --p3o-kl-mode "${P3O_KL_MODE}"
+            --clip-low "${P3O_CLIP_LOW}"
+            --clip-high "${P3O_CLIP_HIGH}"
+        )
+    fi
     if [[ "${P3O_ALGORITHM}" == "grpo" ]]; then
         P3O_ALGO_ARGS+=(--eps-clip 0.4 --eps-clip-high 0.4)
     fi
@@ -176,6 +285,9 @@ P3O_build_args() {
         --rollout-num-gpus-per-engine 1
         --sglang-mem-fraction-static 0.70
     )
+    if [[ "${P3O_DETERMINISTIC_INFERENCE}" == "1" ]]; then
+        P3O_SGLANG_ARGS+=(--sglang-enable-deterministic-inference)
+    fi
 
     P3O_MISC_ARGS=(
         --seed "${P3O_SEED}"
@@ -195,11 +307,11 @@ P3O_build_args() {
     if [[ "${P3O_MODE}" == "formal" ]]; then
         P3O_EVAL_ARGS+=(
             --eval-interval "${P3O_NUM_ROLLOUT}"
-            --eval-prompt-data gsm8k "${P3O_EVAL_DATA}"
-            --n-samples-per-eval-prompt 16
-            --eval-max-response-len 4096
-            --eval-temperature 1.0
-            --eval-top-p 0.95
+            --eval-prompt-data "${P3O_EVAL_NAME}" "${P3O_EVAL_DATA}"
+            --n-samples-per-eval-prompt "${P3O_EVAL_N_SAMPLES}"
+            --eval-max-response-len "${P3O_EVAL_MAX_RESPONSE_LEN}"
+            --eval-temperature "${P3O_EVAL_TEMPERATURE}"
+            --eval-top-p "${P3O_EVAL_TOP_P}"
         )
     fi
 
@@ -225,6 +337,8 @@ P3O_build_args() {
 P3O_run() {
     P3O_build_args
     if [[ "${P3O_DRY_RUN:-0}" == "1" ]]; then
+        P3O_EFFECTIVE_ROLLOUT_RESULT_DIR="${P3O_ROLLOUT_RESULT_DIR:-${P3O_OUTPUT_ROOT}/rollout_results}"
+        P3O_TRAIN_ARGS+=(--rollout-result-dir "${P3O_EFFECTIVE_ROLLOUT_RESULT_DIR}")
         printf '%s\n' "${P3O_TRAIN_ARGS[@]}"
         return 0
     fi
@@ -248,6 +362,8 @@ P3O_run() {
         exit 2
     fi
     mkdir "${P3O_RUN_DIR}/tensorboard"
+    P3O_EFFECTIVE_ROLLOUT_RESULT_DIR="${P3O_ROLLOUT_RESULT_DIR:-${P3O_RUN_DIR}/rollout_results}"
+    P3O_TRAIN_ARGS+=(--rollout-result-dir "${P3O_EFFECTIVE_ROLLOUT_RESULT_DIR}")
     P3O_JOB_ID="${P3O_CONFIG_NAME}-seed-${P3O_SEED}-${P3O_RUN_ID}"
     P3O_GIT_COMMIT="$(git -C "${P3O_REPO_ROOT}" rev-parse HEAD)"
     P3O_GIT_BRANCH="$(git -C "${P3O_REPO_ROOT}" symbolic-ref --short -q HEAD || true)"
@@ -264,6 +380,14 @@ P3O_run() {
         echo "config=${P3O_CONFIG_NAME}"
         echo "mode=${P3O_MODE}"
         echo "seed=${P3O_SEED}"
+        echo "model_config=${P3O_MODEL_CONFIG}"
+        echo "model_rotary_base=${P3O_MODEL_ROTARY_BASE}"
+        echo "p3o_ess_scope=${P3O_ESS_SCOPE}"
+        echo "p3o_kl_mode=${P3O_KL_MODE}"
+        echo "clip_low=${P3O_CLIP_LOW}"
+        echo "clip_high=${P3O_CLIP_HIGH}"
+        echo "activation_recompute=${P3O_ACTIVATION_RECOMPUTE}"
+        echo "log_probs_chunk_size=${P3O_LOG_PROBS_CHUNK_SIZE}"
         echo "max_staleness=${P3O_MAX_STALENESS}"
         echo "update_weights_interval=${P3O_UPDATE_WEIGHTS_INTERVAL}"
         echo "pipeline_model_parallel_size=${P3O_PIPELINE_MODEL_PARALLEL_SIZE}"
@@ -274,7 +398,19 @@ P3O_run() {
         echo "repo=${P3O_REPO_ROOT}"
         echo "model=${P3O_MODEL_DIR}"
         echo "train_data=${P3O_TRAIN_DATA}"
+        echo "input_key=${P3O_INPUT_KEY}"
+        echo "label_key=${P3O_LABEL_KEY}"
+        echo "rm_type=${P3O_RM_TYPE}"
+        echo "rollout_shuffle=${P3O_ROLLOUT_SHUFFLE}"
+        echo "deterministic_inference=${P3O_DETERMINISTIC_INFERENCE}"
+        echo "clear_runtime_proxies=${P3O_CLEAR_RUNTIME_PROXIES}"
+        echo "rollout_result_dir=${P3O_EFFECTIVE_ROLLOUT_RESULT_DIR}"
         echo "eval_data=${P3O_EVAL_DATA}"
+        echo "eval_name=${P3O_EVAL_NAME}"
+        echo "eval_n_samples=${P3O_EVAL_N_SAMPLES}"
+        echo "eval_max_response_len=${P3O_EVAL_MAX_RESPONSE_LEN}"
+        echo "eval_temperature=${P3O_EVAL_TEMPERATURE}"
+        echo "eval_top_p=${P3O_EVAL_TOP_P}"
         echo "ray_dashboard=${P3O_RAY_DASHBOARD}"
         echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } >"${P3O_RUN_DIR}/run_identity.env"
@@ -284,6 +420,7 @@ P3O_run() {
         P3O_TENSORBOARD_DIR="${P3O_RUN_DIR}/tensorboard" \
         P3O_RUNTIME_ENABLE_TEMPERATURE_OVERRIDE="${P3O_ENABLE_TEMPERATURE_OVERRIDE}" \
         P3O_RUNTIME_BEHAVIOR_TEMPERATURE="${P3O_BEHAVIOR_TEMPERATURE}" \
+        P3O_RUNTIME_CLEAR_PROXIES="${P3O_CLEAR_RUNTIME_PROXIES}" \
         P3O_RUNTIME_NCCL_DEBUG="${P3O_NCCL_DEBUG}" \
         P3O_RUNTIME_TORCH_DISTRIBUTED_DEBUG="${P3O_TORCH_DISTRIBUTED_DEBUG}" \
         P3O_RUNTIME_CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}" \
@@ -310,6 +447,23 @@ env_vars = {
     "NCCL_NVLS_ENABLE": os.environ["P3O_RUNTIME_NCCL_NVLS_ENABLE"],
     "NVSHMEM_DISABLE_NCCL": os.environ["P3O_RUNTIME_NVSHMEM_DISABLE_NCCL"],
 }
+
+if os.environ["P3O_RUNTIME_CLEAR_PROXIES"] == "1":
+    # Some clusters inject an outbound proxy into the raylet. SGLang's local
+    # node-IP readiness probes must bypass it, but clearing worker networking is
+    # intentionally opt-in because other deployments require those proxies.
+    env_vars.update(
+        {
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "ALL_PROXY": "",
+            "http_proxy": "",
+            "https_proxy": "",
+            "all_proxy": "",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+        }
+    )
 
 if os.environ["P3O_RUNTIME_ENABLE_TEMPERATURE_OVERRIDE"] == "1":
     env_vars["P3O_BEHAVIOR_TEMPERATURE"] = os.environ["P3O_RUNTIME_BEHAVIOR_TEMPERATURE"]

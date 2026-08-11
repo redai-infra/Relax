@@ -70,6 +70,33 @@ def _shell_path(path: Path, bash: str) -> str:
 
 def _dry_run(script: Path, *extra_args: str, env_overrides: dict[str, str] | None = None) -> list[str]:
     env = os.environ.copy()
+    for name in (
+        "P3O_ACTIVATION_RECOMPUTE",
+        "P3O_CLIP_HIGH",
+        "P3O_CLIP_LOW",
+        "P3O_CLEAR_RUNTIME_PROXIES",
+        "P3O_DETERMINISTIC_INFERENCE",
+        "P3O_ESS_SCOPE",
+        "P3O_EVAL_MAX_RESPONSE_LEN",
+        "P3O_EVAL_NAME",
+        "P3O_EVAL_N_SAMPLES",
+        "P3O_EVAL_TEMPERATURE",
+        "P3O_EVAL_TOP_P",
+        "P3O_INPUT_KEY",
+        "P3O_KL_MODE",
+        "P3O_LABEL_KEY",
+        "P3O_LOG_PROBS_CHUNK_SIZE",
+        "P3O_MODE",
+        "P3O_MODEL_CONFIG",
+        "P3O_MODEL_ROTARY_BASE",
+        "P3O_NUM_ROLLOUT",
+        "P3O_RM_TYPE",
+        "P3O_ROLLOUT_RESULT_DIR",
+        "P3O_ROLLOUT_SHUFFLE",
+        "P3O_ROLLOUT_BATCH_SIZE",
+        "P3O_N_SAMPLES",
+    ):
+        env.pop(name, None)
     env["P3O_DRY_RUN"] = "1"
     env["P3O_RAY_DASHBOARD"] = "http://example.invalid:8265"
     if env_overrides is not None:
@@ -128,10 +155,24 @@ def _run_fake_ray(
 
     env = os.environ.copy()
     for name in (
+        "P3O_ACTIVATION_RECOMPUTE",
         "P3O_ALGORITHM",
         "P3O_BEHAVIOR_TEMPERATURE",
+        "P3O_CLEAR_RUNTIME_PROXIES",
+        "P3O_DETERMINISTIC_INFERENCE",
         "P3O_ENABLE_TEMPERATURE_OVERRIDE",
+        "P3O_EVAL_MAX_RESPONSE_LEN",
+        "P3O_EVAL_NAME",
+        "P3O_EVAL_N_SAMPLES",
+        "P3O_EVAL_TEMPERATURE",
+        "P3O_EVAL_TOP_P",
+        "P3O_LOG_PROBS_CHUNK_SIZE",
         "P3O_NCCL_DEBUG",
+        "P3O_MODEL_CONFIG",
+        "P3O_MODEL_ROTARY_BASE",
+        "P3O_RM_TYPE",
+        "P3O_ROLLOUT_RESULT_DIR",
+        "P3O_ROLLOUT_SHUFFLE",
         "P3O_TORCH_DISTRIBUTED_DEBUG",
         "P3O_UPDATE_WEIGHTS_INTERVAL",
     ):
@@ -197,6 +238,10 @@ def _comparable_args(args: list[str]) -> list[str]:
         "--advantage-estimator",
         "--eps-clip",
         "--eps-clip-high",
+        "--p3o-ess-scope",
+        "--p3o-kl-mode",
+        "--clip-low",
+        "--clip-high",
         "--tb-experiment-name",
     }
     normalized = []
@@ -212,10 +257,13 @@ def _comparable_args(args: list[str]) -> list[str]:
 
 def test_p3o_configs_freeze_required_formal_values():
     for args in map(_dry_run, FORMAL_SCRIPTS.values()):
-        assert _option_value(args, "--num-rollout") == "11"
-        assert _option_value(args, "--rollout-batch-size") == "12"
-        assert _option_value(args, "--n-samples-per-prompt") == "4"
-        assert _option_value(args, "--global-batch-size") == "48"
+        assert _option_value(args, "--input-key") == "problem"
+        assert _option_value(args, "--label-key") == "answer"
+        assert _option_value(args, "--rm-type") == "deepscaler"
+        assert _option_value(args, "--num-rollout") == "30"
+        assert _option_value(args, "--rollout-batch-size") == "4"
+        assert _option_value(args, "--n-samples-per-prompt") == "16"
+        assert _option_value(args, "--global-batch-size") == "64"
         assert _option_value(args, "--micro-batch-size") == "1"
         assert _option_value(args, "--rollout-max-response-len") == "4096"
         assert _option_value(args, "--rollout-temperature") == "1.0"
@@ -225,18 +273,37 @@ def test_p3o_configs_freeze_required_formal_values():
         assert _option_value(args, "--weight-decay") == "0.01"
         assert "--calculate-per-token-loss" in args
         assert "--use-rollout-logprobs" in args
+        assert "--rollout-shuffle" in args
         assert "--colocate" in args
         assert "--fully-async" not in args
         assert "--use-tis" not in args
         assert "--use-kl-loss" not in args
         assert "--eval-size" not in args
+        assert _option_value(args, "--num-layers") == "36"
+        assert _option_value(args, "--hidden-size") == "2560"
+        assert _option_value(args, "--rotary-base") == "5000000"
         assert (
             int(_option_value(args, "--num-rollout"))
             * int(_option_value(args, "--rollout-batch-size"))
             * int(_option_value(args, "--n-samples-per-prompt"))
-            == 528
+            == 1920
         )
         assert int(_option_value(args, "--rollout-batch-size")) % 4 == 0
+        assert int(_option_value(args, "--global-batch-size")) == (
+            int(_option_value(args, "--rollout-batch-size")) * int(_option_value(args, "--n-samples-per-prompt"))
+        )
+
+
+def test_p3o_configs_use_active_algorithm_settings_only_for_p3o():
+    p3o_args = _dry_run(FORMAL_SCRIPTS["p3o_on_policy"])
+    grpo_args = _dry_run(FORMAL_SCRIPTS["grpo_on_policy"])
+
+    assert _option_value(p3o_args, "--p3o-ess-scope") == "micro-batch"
+    assert _option_value(p3o_args, "--p3o-kl-mode") == "proxy_safe"
+    assert _option_value(p3o_args, "--clip-low") == "0.2"
+    assert _option_value(p3o_args, "--clip-high") == "0.2"
+    for option in ("--p3o-ess-scope", "--p3o-kl-mode", "--clip-low", "--clip-high"):
+        assert option not in grpo_args
 
 
 def test_p3o_configs_are_comparable_within_each_scenario():
@@ -306,7 +373,66 @@ def test_p3o_smoke_uses_one_small_optimizer_step():
     assert _option_value(args, "--global-batch-size") == "16"
     assert _option_value(args, "--micro-batch-size") == "1"
     assert _option_value(args, "--rollout-max-response-len") == "128"
+    assert _option_value(args, "--input-key") == "question"
+    assert _option_value(args, "--rm-type") == "mopd"
+    assert _option_value(args, "--num-layers") == "28"
+    assert _option_value(args, "--hidden-size") == "1024"
+    assert _option_value(args, "--rotary-base") == "1000000"
+    assert _option_value(args, "--p3o-ess-scope") == "micro-batch"
+    assert _option_value(args, "--p3o-kl-mode") == "proxy_safe"
+    assert _option_value(args, "--rollout-result-dir") == "/dummy/output/rollout_results"
     assert "--eval-prompt-data" not in args
+
+
+def test_p3o_dataset_keys_can_be_overridden():
+    args = _dry_run(
+        SCRIPT_DIR / "run_p3o_smoke.sh",
+        "p3o_on_policy",
+        env_overrides={"P3O_INPUT_KEY": "problem", "P3O_LABEL_KEY": "solution"},
+    )
+
+    assert _option_value(args, "--input-key") == "problem"
+    assert _option_value(args, "--label-key") == "solution"
+
+
+def test_p3o_reward_type_can_be_overridden_for_deepscaler_smoke():
+    args = _dry_run(
+        SCRIPT_DIR / "run_p3o_smoke.sh",
+        "p3o_on_policy",
+        env_overrides={"P3O_RM_TYPE": "deepscaler"},
+    )
+
+    assert _option_value(args, "--rm-type") == "deepscaler"
+
+
+def test_p3o_rollout_result_dir_can_be_overridden():
+    args = _dry_run(
+        SCRIPT_DIR / "run_p3o_smoke.sh",
+        "p3o_on_policy",
+        env_overrides={"P3O_ROLLOUT_RESULT_DIR": "/evidence/raw_rollouts"},
+    )
+
+    assert _option_value(args, "--rollout-result-dir") == "/evidence/raw_rollouts"
+
+
+def test_p3o_rollout_shuffle_can_be_disabled_for_a_fixed_prompt_schedule():
+    args = _dry_run(
+        SCRIPT_DIR / "run_p3o_smoke.sh",
+        "p3o_on_policy",
+        env_overrides={"P3O_ROLLOUT_SHUFFLE": "0"},
+    )
+
+    assert "--rollout-shuffle" not in args
+
+
+def test_p3o_deterministic_inference_can_be_enabled_for_paired_sampling():
+    args = _dry_run(
+        SCRIPT_DIR / "run_p3o_smoke.sh",
+        "p3o_on_policy",
+        env_overrides={"P3O_DETERMINISTIC_INFERENCE": "1"},
+    )
+
+    assert args.count("--sglang-enable-deterministic-inference") == 1
 
 
 def test_p3o_smoke_can_select_pipeline_parallel_size_two():
@@ -391,6 +517,20 @@ def test_p3o_runner_executes_all_scenarios_with_fake_ray(
     ):
         assert proxy_name not in runtime_env
     assert {"GIT_COMMIT", "GIT_BRANCH", "GIT_DIRTY", "started_utc", "ended_utc"} <= identity.keys()
+    assert identity["model_config"].endswith("qwen3-0.6B.sh")
+    assert identity["model_rotary_base"] == _option_value(resolved_args, "--rotary-base") == "1000000"
+    assert identity["p3o_ess_scope"] == "micro-batch"
+    assert identity["p3o_kl_mode"] == "proxy_safe"
+    assert identity["clip_low"] == identity["clip_high"] == "0.2"
+    assert identity["input_key"] == "question"
+    assert identity["label_key"] == "answer"
+    assert identity["rm_type"] == "mopd"
+    assert identity["rollout_shuffle"] == "1"
+    assert identity["clear_runtime_proxies"] == "0"
+    assert identity["rollout_result_dir"].endswith(f"/{scenario}/seed_42/integration/rollout_results")
+    assert _option_value(resolved_args, "--rollout-result-dir").endswith(
+        f"/{scenario}/seed_42/integration/rollout_results"
+    )
     assert identity["config"] == scenario
     assert identity["ray_job_id"] == f"{scenario}-seed-42-integration"
     if expected_temperature is None:
@@ -403,6 +543,22 @@ def test_p3o_runner_executes_all_scenarios_with_fake_ray(
         assert runtime_env["P3O_BEHAVIOR_TEMPERATURE"] == expected_temperature
     assert (run_dir / "exit_code.txt").read_text(encoding="utf-8").strip() == "0"
     assert (run_dir / "job_status.txt").read_text(encoding="utf-8").strip() == "TERMINAL"
+
+
+def test_p3o_runner_can_clear_runtime_proxies_explicitly(tmp_path):
+    result, run_dir, ray_calls = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={"P3O_CLEAR_RUNTIME_PROXIES": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtime_env = json.loads(_option_value(ray_calls, "--runtime-env-json"))["env_vars"]
+    identity = (run_dir / "run_identity.env").read_text(encoding="utf-8")
+    for proxy_name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        assert runtime_env[proxy_name] == ""
+    assert runtime_env["NO_PROXY"] == runtime_env["no_proxy"] == "*"
+    assert "clear_runtime_proxies=1" in identity
 
 
 def test_p3o_runner_preserves_debug_overrides(tmp_path):
@@ -460,8 +616,64 @@ def test_p3o_formal_runner_accepts_existing_eval_data(tmp_path):
 
     assert result.returncode == 0, result.stderr
     resolved_args = (run_dir / "resolved_args.txt").read_text(encoding="utf-8").splitlines()
-    assert _option_value(resolved_args, "--eval-prompt-data") == "gsm8k"
+    assert _option_value(resolved_args, "--eval-prompt-data") == "deepscaler"
     assert str(eval_data.name) in resolved_args[resolved_args.index("--eval-prompt-data") + 2]
+    assert _option_value(resolved_args, "--n-samples-per-eval-prompt") == "16"
+    assert _option_value(resolved_args, "--eval-max-response-len") == "4096"
+    assert _option_value(resolved_args, "--eval-temperature") == "1.0"
+    assert _option_value(resolved_args, "--eval-top-p") == "0.95"
+
+
+def test_p3o_formal_runner_records_resource_adjusted_eval_contract(tmp_path):
+    eval_data = tmp_path / "eval.jsonl"
+    eval_data.write_text("{}\n", encoding="utf-8")
+
+    result, run_dir, _ = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={
+            "P3O_MODE": "formal",
+            "P3O_EVAL_DATA": str(eval_data),
+            "P3O_EVAL_NAME": "local-deepscaler",
+            "P3O_EVAL_N_SAMPLES": "1",
+            "P3O_EVAL_MAX_RESPONSE_LEN": "2048",
+            "P3O_EVAL_TEMPERATURE": "0.8",
+            "P3O_EVAL_TOP_P": "0.9",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    resolved_args = (run_dir / "resolved_args.txt").read_text(encoding="utf-8").splitlines()
+    identity = (run_dir / "run_identity.env").read_text(encoding="utf-8")
+    assert _option_value(resolved_args, "--eval-prompt-data") == "local-deepscaler"
+    assert _option_value(resolved_args, "--n-samples-per-eval-prompt") == "1"
+    assert _option_value(resolved_args, "--eval-max-response-len") == "2048"
+    assert _option_value(resolved_args, "--eval-temperature") == "0.8"
+    assert _option_value(resolved_args, "--eval-top-p") == "0.9"
+    assert "eval_name=local-deepscaler" in identity
+    assert "eval_n_samples=1" in identity
+    assert "eval_max_response_len=2048" in identity
+
+
+def test_p3o_runner_records_resource_adjusted_activation_contract(tmp_path):
+    result, run_dir, _ = _run_fake_ray(
+        tmp_path,
+        FORMAL_SCRIPTS["p3o_on_policy"],
+        env_overrides={
+            "P3O_ACTIVATION_RECOMPUTE": "1",
+            "P3O_LOG_PROBS_CHUNK_SIZE": "128",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    resolved_args = (run_dir / "resolved_args.txt").read_text(encoding="utf-8").splitlines()
+    identity = (run_dir / "run_identity.env").read_text(encoding="utf-8")
+    assert _option_value(resolved_args, "--recompute-granularity") == "full"
+    assert _option_value(resolved_args, "--recompute-method") == "uniform"
+    assert _option_value(resolved_args, "--recompute-num-layers") == "1"
+    assert _option_value(resolved_args, "--log-probs-chunk-size") == "128"
+    assert "activation_recompute=1" in identity
+    assert "log_probs_chunk_size=128" in identity
 
 
 def test_p3o_runner_validates_megatron_directory_before_ray(tmp_path):
