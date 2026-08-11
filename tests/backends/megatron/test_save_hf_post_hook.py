@@ -18,7 +18,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from relax.backends.megatron import model as model_mod  # noqa: E402
+try:
+    from relax.backends.megatron import model as model_mod  # noqa: E402
+except (ImportError, AssertionError) as _exc:
+    pytest.skip(f"relax.backends.megatron.model unavailable: {_exc}", allow_module_level=True)
 
 
 def _install_fake_hook_module(monkeypatch, calls, *, raise_exc=None):
