@@ -12,7 +12,6 @@ from argparse import Namespace
 import pytest
 import torch
 
-from relax.backends.megatron.checkpoint import is_megatron_checkpoint
 from relax.backends.megatron.reference_integrity import (
     DPOReferenceIdentity,
     canonical_optimizer_sha256,
@@ -25,6 +24,9 @@ from relax.backends.megatron.reference_integrity import (
 
 
 def test_megatron_resume_detection_ignores_fresh_output_directory(tmp_path):
+    pytest.importorskip("megatron.training.checkpointing")
+    from relax.backends.megatron.checkpoint import is_megatron_checkpoint
+
     output = tmp_path / "run"
     output.mkdir()
     (output / "transformer_config.json").write_text("{}", encoding="utf-8")
