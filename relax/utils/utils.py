@@ -529,7 +529,10 @@ def process_args(args: Namespace, role: str) -> None:
     if role == "reference":
         args.load = args.ref_load
     if role == "actor_fwd":
-        args.load = args.ref_load
+        # Zero-KL normalization may legitimately remove ``ref_load`` while an
+        # actor_fwd service is still required. Preserve the already-resolved
+        # actor checkpoint instead of overwriting it with ``None``.
+        args.load = args.ref_load or args.load or args.hf_checkpoint
 
 
 def get_serve_url(route_prefix: str = "") -> str:

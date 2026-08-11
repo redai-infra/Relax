@@ -165,6 +165,7 @@ def test_cross_version_kv_validation_accepts_task22_contract() -> None:
         update_weights_interval=1,
         cross_version_kv_max_gap=2,
         max_staleness=2,
+        use_tis=True,
     )
 
     # slime_validate_args normalizes --hybrid before invoking the helper.
@@ -184,6 +185,7 @@ def test_cross_version_kv_validation_does_not_require_admission_control() -> Non
         update_weights_interval=1,
         cross_version_kv_max_gap=2,
         max_staleness=2,
+        use_tis=True,
     )
 
     validate_cross_version_kv_args(args)
@@ -192,7 +194,7 @@ def test_cross_version_kv_validation_does_not_require_admission_control() -> Non
 @pytest.mark.parametrize(
     ("override", "message"),
     [
-        ({"update_weights_interval": 2}, "update-weights-interval 1"),
+        ({"update_weights_interval": 2}, "must not exceed"),
         ({"cross_version_kv_max_gap": 3}, "must not exceed"),
         ({"offload_rollout": True}, "incompatible"),
     ],
@@ -208,8 +210,26 @@ def test_cross_version_kv_validation_rejects_unsafe_contracts(override: dict, me
         "update_weights_interval": 1,
         "cross_version_kv_max_gap": 2,
         "max_staleness": 2,
+        "use_tis": True,
     }
     values.update(override)
 
     with pytest.raises(ValueError, match=message):
         validate_cross_version_kv_args(SimpleNamespace(**values))
+
+
+def test_cross_version_kv_validation_accepts_interval_two_with_one_publication_gap() -> None:
+    validate_cross_version_kv_args(
+        SimpleNamespace(
+            enable_cross_version_kv_continuation=True,
+            hybrid=True,
+            fully_async=True,
+            partial_rollout=True,
+            colocate=True,
+            offload_rollout=False,
+            update_weights_interval=2,
+            cross_version_kv_max_gap=1,
+            max_staleness=2,
+            use_tis=True,
+        )
+    )

@@ -2811,6 +2811,40 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _normalize_zero_kl_loss_args(args) -> bool:
+    """Disable a KL-loss path that is multiplied by exactly zero."""
+    if not getattr(args, "use_kl_loss", False) or getattr(args, "kl_loss_coef", 0.0) != 0.0:
+        return False
+
+    args.use_kl_loss = False
+    return True
+
+
+def _drop_unused_reference_resource(args) -> bool:
+    resource = getattr(args, "resource", None)
+    reference_needed = getattr(args, "kl_coef", 0.0) != 0.0 or getattr(args, "use_kl_loss", False)
+    if reference_needed or not resource or "reference" not in resource:
+        return False
+
+    del resource["reference"]
+    return True
+
+
+def _validate_hybrid_weight_publication_args(args) -> None:
+    """Reject publication intervals that lose the behavior-policy baseline."""
+    update_weights_interval = int(getattr(args, "update_weights_interval", 1))
+    if update_weights_interval < 1:
+        raise ValueError("--update-weights-interval must be >= 1.")
+    if not getattr(args, "hybrid", False) or update_weights_interval == 1:
+        return
+    if any(bool(getattr(args, name, False)) for name in ("use_tis", "use_rollout_logprobs", "keep_old_actor")):
+        return
+    raise ValueError(
+        "Hybrid --update-weights-interval > 1 lets Rollout sample with an older published policy and "
+        "requires --use-tis, --use-rollout-logprobs, or --keep-old-actor."
+    )
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -2895,6 +2929,14 @@ def slime_validate_args(args):
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
+
+    if _normalize_zero_kl_loss_args(args):
+        logger.info(
+            "Auto-disabling --use-kl-loss because --kl-loss-coef is exactly 0. "
+            "The reference forward cannot affect the training objective."
+        )
+    if _drop_unused_reference_resource(args):
+        logger.info("Removing unused 'reference' resource because no KL objective requires ref_log_probs.")
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
@@ -3213,6 +3255,8 @@ def slime_validate_args(args):
             raise ValueError("--hybrid-weights-backuper-on-gpu requires --hybrid-dcs-weight-sync.")
         if not getattr(args, "enable_weights_backuper", True):
             raise ValueError("--hybrid-weights-backuper-on-gpu requires the weights backuper to remain enabled.")
+
+    _validate_hybrid_weight_publication_args(args)
 
     # Cross-version KV continuation depends on Hybrid's normalized execution
     # flags, so validate only after --hybrid has enabled fully_async+colocate.

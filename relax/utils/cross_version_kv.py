@@ -122,17 +122,19 @@ def validate_cross_version_kv_args(args: object) -> None:
         raise ValueError("--enable-cross-version-kv-continuation currently requires colocated weight sync.")
     if getattr(args, "offload_rollout", False):
         raise ValueError("--enable-cross-version-kv-continuation is incompatible with rollout offload.")
-    if getattr(args, "update_weights_interval", 1) != 1:
-        raise ValueError(
-            "--enable-cross-version-kv-continuation requires --update-weights-interval 1 "
-            "so every Actor step still publishes weights."
-        )
+    update_weights_interval = int(getattr(args, "update_weights_interval", 1))
+    if update_weights_interval < 1:
+        raise ValueError("--update-weights-interval must be >= 1.")
     max_gap = int(getattr(args, "cross_version_kv_max_gap", 0))
     if max_gap < 1:
         raise ValueError("--cross-version-kv-max-gap must be >= 1.")
     max_staleness = int(getattr(args, "max_staleness"))
-    if max_gap > max_staleness:
-        raise ValueError(f"--cross-version-kv-max-gap must not exceed --max-staleness ({max_gap} > {max_staleness}).")
+    effective_actor_update_gap = max_gap * update_weights_interval
+    if effective_actor_update_gap > max_staleness:
+        raise ValueError(
+            "--cross-version-kv-max-gap * --update-weights-interval must not exceed "
+            f"--max-staleness ({max_gap} * {update_weights_interval} > {max_staleness})."
+        )
 
 
 def cross_version_kv_strict_refresh(weight_version: int, max_gap: int) -> bool:

@@ -107,30 +107,51 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
     #   - only num_epoch   -> num_epoch * rollout_per_epoch
     #   - only num_rollout -> use as-is
-    # SFT pre-resolves both num_rollout and num_rollout_per_epoch from the SFT
-    # dataset in controller.py before any role is launched; the injected Rollout
-    # has no RL global dataset, so trust those values and skip the RL-side
-    # computation (which would assert on rollout_global_dataset).
+    # SFT resolves directly from its dataset; RL resolves after its data-source
+    # actor is available. Both controller paths run before any service is
+    # launched. Keep the fallback below for direct RolloutManager construction.
     if getattr(args, "loss_type", None) == "sft":
         num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
         logger.info(
             f"RolloutManager initialized successfully (SFT mode). "
             f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
         )
+    elif not args.rollout_global_dataset:
+        num_rollout_per_epoch = None
+        logger.info("RolloutManager initialized successfully (non-global dataset; no epoch boundary).")
+    elif getattr(args, "num_rollout_per_epoch", None) is not None:
+        num_rollout_per_epoch = args.num_rollout_per_epoch
+        logger.info(
+            f"RolloutManager initialized successfully. num_rollout_per_epoch={num_rollout_per_epoch} "
+            "(pre-resolved by controller)."
+        )
     else:
         num_rollout_per_epoch = ray.get(
             rollout_manager.get_num_rollout_per_epoch.remote(),
         )
-        logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
+        if num_rollout_per_epoch <= 0:
+            if args.num_epoch is not None:
+                raise ValueError(
+                    "Cannot derive num_rollout from num_epoch because the dataset is smaller than rollout_batch_size"
+                )
+            num_rollout_per_epoch = None
+            logger.warning(
+                "Dataset is smaller than rollout_batch_size; direct RolloutManager construction will use "
+                "the explicit num_rollout without epoch boundaries."
+            )
+        else:
+            logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
 
+    if getattr(args, "loss_type", None) != "sft":
         args.num_rollout_per_epoch = num_rollout_per_epoch
-        if args.num_epoch is not None:
+        if num_rollout_per_epoch is not None and args.num_epoch is not None:
             epoch_rollout = num_rollout_per_epoch * args.num_epoch
             args.num_rollout = min(args.num_rollout, epoch_rollout) if args.num_rollout is not None else epoch_rollout
-        assert args.num_rollout is not None and args.num_rollout > 0, (
-            f"num_rollout resolved to {args.num_rollout}; "
-            f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
-        )
+        if args.num_rollout is None or args.num_rollout <= 0:
+            raise ValueError(
+                f"num_rollout resolved to {args.num_rollout}; "
+                f"num_rollout_per_epoch={num_rollout_per_epoch}, num_epoch={args.num_epoch}"
+            )
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))

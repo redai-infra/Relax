@@ -55,6 +55,12 @@ def _shell():
     return shell
 
 
+def _patch_resume_collective(monkeypatch):
+    """Keep unit tests independent from an initialized distributed process."""
+    monkeypatch.setattr(actor_mod.dist, "all_reduce", lambda *_a, **_k: None)
+    monkeypatch.setattr(actor_mod, "get_gloo_group", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # _run_step_evaluation: /evaluate + /end_update_weight
 # ---------------------------------------------------------------------------
@@ -66,6 +72,7 @@ def test_run_step_evaluation_probes_carry_timeout(monkeypatch):
     monkeypatch.setattr(actor_mod.requests, "get", _record_get(calls))
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    _patch_resume_collective(monkeypatch)
 
     shell = _shell()
     shell.args = Namespace(rollout_http_timeout=17.0)
@@ -102,6 +109,7 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
     monkeypatch.setattr(actor_mod.requests, "get", _get)
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    _patch_resume_collective(monkeypatch)
 
     shell = _shell()
     shell.rollout_manager = object()  # non-None -> has_rollout
@@ -114,18 +122,21 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
 
 def test_run_step_evaluation_swallows_timeout(monkeypatch):
 
-    def _timeout_get(*_a, **_k):
-        raise requests.exceptions.Timeout("boom")
+    def _timeout_get(url, *_a, **_k):
+        if url.endswith("/evaluate"):
+            raise requests.exceptions.Timeout("boom")
+        return _Resp()
 
     monkeypatch.setattr(actor_mod, "get_serve_url", lambda *_a, **_k: "http://svc:0")
     monkeypatch.setattr(actor_mod.requests, "get", _timeout_get)
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    _patch_resume_collective(monkeypatch)
 
     shell = _shell()
     shell.rollout_manager = object()
 
-    # Timeout must be swallowed (existing ``except Exception``) -> no raise.
+    # Evaluation failure is non-fatal, but cleanup must still complete.
     shell._run_step_evaluation(3, end_update_weight=True)
 
 
@@ -166,19 +177,23 @@ def test_check_services_health_can_do_and_get_step_carry_timeout(monkeypatch):
         assert "timeout" not in k
 
 
-def test_check_services_health_swallows_timeout(monkeypatch):
+def test_check_services_health_degrades_when_pause_resume_is_uncertain(monkeypatch):
     from argparse import Namespace
 
-    def _timeout_get(*_a, **_k):
-        raise requests.exceptions.Timeout("boom")
+    def _timeout_get(url, *_a, **_k):
+        if url.endswith(("/can_do_update_weight_for_async", "/end_update_weight")):
+            raise requests.exceptions.Timeout("boom")
+        return _Resp()
 
     _patch_health_common(monkeypatch, _timeout_get)
 
     shell = _shell()
     shell.args = Namespace(true_on_policy_mode=False, hybrid=False, rollout_http_timeout=120.0)
 
-    # Timeout swallowed by the two ``except Exception`` blocks -> degrades to
-    # actor_fwd_only / rollout_only rather than crashing.
+    # A timeout after the pause request is sent leaves the rollout state
+    # uncertain. Attempt a compensating resume, but preserve fault-tolerant
+    # degradation when neither the pause nor resume can be confirmed.
     rollout_only, actor_fwd_only = shell._check_services_health()
+
+    assert rollout_only is False
     assert actor_fwd_only is True
-    assert rollout_only is True

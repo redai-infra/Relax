@@ -7,8 +7,8 @@ orchestrator. Three responsibilities:
 
 * ``resolve_sft_num_rollout(config)`` — fill in ``config.num_rollout`` /
   ``config.num_rollout_per_epoch`` for the SFT path before any actor is
-  launched. RL goes through ``placement_group.py`` after RolloutManager
-  init, so it doesn't go through here.
+  launched. RL uses ``relax.engine.rollout.bootstrap`` once its data-source
+  actor is available, so it doesn't go through here.
 * ``resolve_sft_algo_key(config)`` — single source of truth for the
   ``ALGOS`` lookup key, parallel to ``relax.core.registry.process_role``.
 * ``validate_sft_resource(config)`` — fail-fast on a missing ``sft``

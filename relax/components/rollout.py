@@ -20,6 +20,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.misc import should_run_periodic_action
 
 
 app = FastAPI()
@@ -346,6 +347,13 @@ class Rollout(Base):
         # Set by can_do_update_weight_for_async when it finishes; end_update_weight waits on it.
         self._weight_update_ready = asyncio.Event()
         self._weight_update_ready.set()
+        # Operation-scoped coordination closes the timeout race where an
+        # /end_update_weight request could overtake a still-running prepare
+        # request on another HTTP connection.  The legacy event remains for
+        # callers that do not yet pass an operation_id.
+        self._weight_update_prepare_lock = asyncio.Lock()
+        self._weight_update_prepare_tasks: dict[str, asyncio.Task[int]] = {}
+        self._ended_weight_update_operations: dict[str, None] = {}
         self.eval_handler = None
         self.status = "running"
 
@@ -361,12 +369,15 @@ class Rollout(Base):
         if self.config.eval_interval is None or self.config.eval_prompt_data is None:
             return False
 
-        step = local_step + 1
-
-        should_eval = (step % self.config.eval_interval == 0) or (
-            self.num_rollout_per_epoch is not None and step % self.num_rollout_per_epoch == 0
+        # RL evaluation remains interval/epoch-boundary only; passing num_rollout
+        # would also force an evaluation on the final training step.
+        should_eval = should_run_periodic_action(
+            local_step,
+            self.config.eval_interval,
+            num_rollout_per_epoch=self.num_rollout_per_epoch,
+            num_rollout=None,
         )
-        self._logger.info(f"Checking whether to evaluate rollout {step}, should_eval: {should_eval}")
+        self._logger.info(f"Checking whether to evaluate rollout {local_step + 1}, should_eval: {should_eval}")
         return should_eval
 
     async def run(self) -> None:
@@ -581,29 +592,85 @@ class Rollout(Base):
 
         return await handle_predict(self, train_step)
 
-    @app.get("/can_do_update_weight_for_async")
-    async def can_do_update_weight_for_async(self):
-        self._logger.debug("Handling can_do_update_weight_for_async request")
+    async def _prepare_weight_update(self) -> int:
         step = self.step
         can_update = await self._async_check_production_for_update_weight(step)
         if can_update:
             self._weight_update_ready.clear()
+            self.status = "paused"
+            health_monitoring_paused = False
             try:
-                self.status = "paused"
                 await self.rollout_manager.health_monitoring_pause.remote()
+                health_monitoring_paused = True
                 await self.rollout_manager.set_weight_updating.remote(True)
+            except Exception:
+                self.status = "running"
+                try:
+                    await self.rollout_manager.set_weight_updating.remote(False)
+                except Exception:
+                    self._logger.exception("Failed to roll back Rollout weight-update state")
+                if health_monitoring_paused:
+                    try:
+                        await self.rollout_manager.health_monitoring_resume.remote()
+                    except Exception:
+                        self._logger.exception("Failed to resume Rollout health monitoring")
+                raise
             finally:
                 # Always release the handshake gate: even if the remote calls
-                # above raise (e.g. RayActorError from a dead engine),
-                # end_update_weight must not block forever. The 500 still
-                # propagates to the actor, which already has graceful
-                # degradation (actor_fwd_only). _weight_update_ready only orders
-                # the can_do <-> end_update_weight handshake; it does not gate
-                # the real weight transfer, so setting it on the failure path
-                # cannot make an engine use wrong weights.
+                # above raise, end_update_weight must not block forever.
                 self._weight_update_ready.set()
             return 1
         return 0
+
+    def _ensure_weight_update_operation_state(self) -> None:
+        """Lazily initialise operation state for recovery/test shells."""
+        if not hasattr(self, "_weight_update_prepare_lock"):
+            self._weight_update_prepare_lock = asyncio.Lock()
+        if not hasattr(self, "_weight_update_prepare_tasks"):
+            self._weight_update_prepare_tasks = {}
+        if not hasattr(self, "_ended_weight_update_operations"):
+            self._ended_weight_update_operations = {}
+
+    def _mark_weight_update_operation_ended(self, operation_id: str) -> None:
+        self._ended_weight_update_operations[operation_id] = None
+        # A long-running job must not retain one tombstone per training step.
+        while len(self._ended_weight_update_operations) > 256:
+            oldest_operation = next(iter(self._ended_weight_update_operations))
+            self._ended_weight_update_operations.pop(oldest_operation, None)
+
+    @app.get("/can_do_update_weight_for_async")
+    async def can_do_update_weight_for_async(self, operation_id: Optional[str] = None):
+        self._logger.debug(
+            "Handling can_do_update_weight_for_async request%s",
+            f" for operation {operation_id}" if operation_id is not None else "",
+        )
+        if operation_id is None:
+            return await self._prepare_weight_update()
+
+        self._ensure_weight_update_operation_state()
+        async with self._weight_update_prepare_lock:
+            if operation_id in self._ended_weight_update_operations:
+                # A cleanup request reached the service before a delayed
+                # prepare request.  Never let that late request pause rollout.
+                return 0
+            prepare_task = self._weight_update_prepare_tasks.get(operation_id)
+            if prepare_task is None:
+                prepare_task = asyncio.create_task(self._prepare_weight_update())
+                self._weight_update_prepare_tasks[operation_id] = prepare_task
+
+        try:
+            result = await asyncio.shield(prepare_task)
+        except Exception:
+            async with self._weight_update_prepare_lock:
+                if self._weight_update_prepare_tasks.get(operation_id) is prepare_task:
+                    self._weight_update_prepare_tasks.pop(operation_id, None)
+            raise
+
+        if result == 0:
+            async with self._weight_update_prepare_lock:
+                if self._weight_update_prepare_tasks.get(operation_id) is prepare_task:
+                    self._weight_update_prepare_tasks.pop(operation_id, None)
+        return result
 
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
         # During final backfill the rollout service may have stepped past
@@ -644,12 +711,42 @@ class Rollout(Base):
         return {"done": len(ready) > 0}
 
     @app.get("/end_update_weight")
-    async def end_update_weight(self):
-        self._logger.info("Ending update weight, resuming rollout")
-        await self._weight_update_ready.wait()
+    async def end_update_weight(self, operation_id: Optional[str] = None):
+        self._logger.info(
+            "Ending update weight, resuming rollout%s",
+            f" for operation {operation_id}" if operation_id is not None else "",
+        )
+        if operation_id is None:
+            await self._weight_update_ready.wait()
+            self.status = "running"
+            await self.rollout_manager.set_weight_updating.remote(False)
+            return
 
-        self.status = "running"
-        await self.rollout_manager.set_weight_updating.remote(False)
+        self._ensure_weight_update_operation_state()
+        async with self._weight_update_prepare_lock:
+            prepare_task = self._weight_update_prepare_tasks.get(operation_id)
+            if prepare_task is None:
+                # Tombstone an unknown operation so a delayed prepare request
+                # cannot pause rollout after this cleanup has returned.
+                self._mark_weight_update_operation_ended(operation_id)
+                return
+
+        prepare_succeeded = False
+        try:
+            prepare_succeeded = bool(await asyncio.shield(prepare_task))
+        except Exception:
+            # _prepare_weight_update already restores status/monitoring on its
+            # failure path.  Cleanup remains idempotent and successful.
+            self._logger.exception("Weight-update prepare failed before cleanup for operation %s", operation_id)
+
+        if prepare_succeeded:
+            self.status = "running"
+            await self.rollout_manager.set_weight_updating.remote(False)
+
+        async with self._weight_update_prepare_lock:
+            if self._weight_update_prepare_tasks.get(operation_id) is prepare_task:
+                self._weight_update_prepare_tasks.pop(operation_id, None)
+            self._mark_weight_update_operation_ended(operation_id)
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):
