@@ -5,6 +5,7 @@ partition naming."""
 
 from argparse import Namespace
 
+import pytest
 import torch
 
 
@@ -63,6 +64,7 @@ def test_preference_data_fields_keep_pairs_atomic():
 
 
 def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypatch):
+    pytest.importorskip("megatron.core")
     from relax.utils.data import stream_dataloader
 
     rollout_data = {
