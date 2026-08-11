@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import ast
+import math
 
+from megatron.core.optimizer import OptimizerConfig
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 
@@ -20,6 +22,80 @@ from relax.utils.logging_utils import get_logger
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = get_logger(__name__)
+
+_FP16_OPTIMIZER_FALLBACKS = {
+    "initial_loss_scale": 32768.0,
+    "min_loss_scale": 1.0,
+    "use_precision_aware_optimizer": True,
+    "store_param_remainders": False,
+}
+_DYNAMIC_LOSS_SCALE_FIELDS = ("initial_loss_scale", "min_loss_scale")
+
+
+def _optimizer_option(name: str) -> str:
+    return f"--{name.replace('_', '-')}"
+
+
+def _format_optimizer_fallback(name: str, value: object) -> str:
+    option = _optimizer_option(name)
+    if isinstance(value, bool):
+        return option if value else f"--no-{option[2:]}"
+    return f"{option} {value!r}"
+
+
+def _validate_fp16_optimizer_args(args) -> None:
+    if getattr(args, "loss_scale", None) is None:
+        for name in _DYNAMIC_LOSS_SCALE_FIELDS:
+            value = getattr(args, name)
+            option = _optimizer_option(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{option} must be a finite number greater than 0, got {value!r}.")
+
+        if args.min_loss_scale > args.initial_loss_scale:
+            raise ValueError(
+                "--min-loss-scale must be less than or equal to --initial-loss-scale, "
+                f"got {args.min_loss_scale!r} > {args.initial_loss_scale!r}."
+            )
+
+    for name, fallback in _FP16_OPTIMIZER_FALLBACKS.items():
+        if not isinstance(fallback, bool):
+            continue
+        value = getattr(args, name)
+        if not isinstance(value, bool):
+            option = _optimizer_option(name)
+            raise ValueError(f"{option} must resolve to a boolean, got {value!r}.")
+
+
+def _resolve_optimizer_precision_args(args):
+    """Resolve precision optimizer arguments before Megatron validates them."""
+    native_defaults = None if args.fp16 else OptimizerConfig()
+    missing = []
+    for name, fp16_fallback in _FP16_OPTIMIZER_FALLBACKS.items():
+        if args.fp16 and getattr(args, "loss_scale", None) is not None and name in _DYNAMIC_LOSS_SCALE_FIELDS:
+            continue
+        if getattr(args, name, None) is None:
+            fallback = fp16_fallback if args.fp16 else getattr(native_defaults, name)
+            setattr(args, name, fallback)
+            if args.fp16:
+                missing.append(name)
+
+    if not args.fp16:
+        return args
+
+    _validate_fp16_optimizer_args(args)
+    if missing:
+        fallback_text = ", ".join(_format_optimizer_fallback(name, getattr(args, name)) for name in missing)
+        logger.warning(
+            "FP16 optimizer options were not explicitly configured; using Relax compatibility fallbacks: %s. "
+            "Pass the active FP16 optimizer options explicitly to silence this warning.",
+            fallback_text,
+        )
+    return args
 
 
 def _validate_dynamic_context_parallel(args):
@@ -190,6 +266,7 @@ def _set_default_megatron_args(args):
     args.use_distributed_optimizer = True
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
+    _resolve_optimizer_precision_args(args)
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096

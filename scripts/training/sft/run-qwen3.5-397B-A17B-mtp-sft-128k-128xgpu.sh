@@ -96,6 +96,7 @@ PERF_ARGS=(
 
    --moe-flex-dispatcher-backend deepep
    --moe-token-dispatcher-type flex
+   --cross-entropy-loss-fusion
 )
 
 # 优化器参数:

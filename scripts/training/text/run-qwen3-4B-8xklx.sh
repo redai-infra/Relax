@@ -160,8 +160,10 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
     \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"OPENBLAS_NUM_THREADS\": \"64\",
-    \"OMP_NUM_THREADS\": \"64\",
+    \"OPENBLAS_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"OMP_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"MKL_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
+    \"NUMEXPR_NUM_THREADS\": \"${CPU_THREADS_PER_ACTOR}\",
     \"TOKENIZERS_PARALLELISM\": \"true\",
     \"NCCL_CUMEM_ENABLE\": \"0\",
     \"NCCL_SOCKET_IFNAME\": \"eth0\",
@@ -251,7 +253,8 @@ RUNTIME_ENV_JSON="{
     \"HYDRAX_USE_PROTEUS\": \"0\",
     \"XSGL_INT8_LM_HEAD\": \"0\",
     \"NVTE_DEBUG\": \"1\",
-    \"NVTE_DEBUG_LEVEL\": \"1\"
+    \"NVTE_DEBUG_LEVEL\": \"1\",
+    \"HEALTH_GENERATE_TOPK\": \"-1\"
   }
 }"
 
@@ -264,7 +267,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
-    --use-health-check \
+   --use-health-check \
+   --selective-offload \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
     "${ROLLOUT_ARGS[@]}" \

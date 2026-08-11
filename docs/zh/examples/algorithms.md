@@ -4,6 +4,8 @@ Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数�
 
 GRPO、CISPO、GSPO 与 SAPO 使用相同的服务拓扑，可以直接在现有脚本中替换算法参数块。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
+REINFORCE++ 与 REINFORCE++-baseline 同样复用 GRPO 服务拓扑，但 return、全局归一化和 KL 契约由算法单独定义。启用任一 estimator 前，请先阅读 [REINFORCE++ 训练文档](../guide/reinforce-plus-plus.md)。
+
 ---
 
 ## GRPO
@@ -208,6 +210,8 @@ SAPO_ARGS=(
 |------|---------------|---------|-----------|
 | **PPO** | Critic value + GAE | PPO-Clip（硬裁剪） | 当前同步拓扑中禁用 |
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
+| **REINFORCE++** | Token KL-to-go return + 全局 token 归一化 | PPO-Clip（硬裁剪） | shaped reward 中的 k1 KL |
+| **REINFORCE++-baseline** | Inclusive group mean + 全局 token 归一化 | PPO-Clip（硬裁剪） | 独立 k2 KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
@@ -215,6 +219,7 @@ SAPO_ARGS=(
 ## 下一步
 
 - [PPO 训练](../guide/ppo-training.md)
+- [REINFORCE++ 训练](../guide/reinforce-plus-plus.md)
 - [快速开始](../guide/quick-start.md)
 - [在线策略蒸馏](./on-policy-distillation.md)
 - [生成式奖励模型](./generative-reward-model.md)

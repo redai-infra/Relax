@@ -29,6 +29,7 @@ from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
@@ -88,8 +89,12 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
 
 
 @contextmanager
-def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
-    """Make output_layer a passthrough so model() returns hidden_states.
+def _bypass_output_layer(
+    model: torch.nn.Module,
+    *,
+    mtp_output_layer_calls: int = 0,
+) -> Iterator[Callable | None]:
+    """Defer the main output_layer so model() returns hidden_states.
 
     With ``--sequence-parallel`` the decoder emits ``[S/TP, B, H]`` and the
     original lm_head would AG before the matmul; we do that AG here so
@@ -97,8 +102,14 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
     the *original* lm_head forward with ``sequence_parallel=False`` (input
     already gathered) so it emits ``[chunk, 1, V/TP]`` per call.
 
+    MTP invokes the same output layer once per prediction depth before the
+    main head. ``mtp_output_layer_calls`` lets those calls use the real head;
+    only the following main-head call becomes a passthrough. This preserves
+    MTP loss computation while still deferring the main SFT logits.
+
     No-op on PP stages with no output layer (the loss never runs there).
     """
+    assert mtp_output_layer_calls >= 0, f"{mtp_output_layer_calls=}"
     output_layer = _find_lm_output_layer(model)
     if output_layer is None:
         yield None
@@ -107,11 +118,27 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
     original_forward = output_layer.forward
     sp_enabled = bool(getattr(output_layer, "sequence_parallel", False))
     tp_group = getattr(output_layer, "tp_group", None) or mpu.get_tensor_model_parallel_group()
+    remaining_mtp_calls = mtp_output_layer_calls
+    deferred_weight = None
+    main_head_deferred = False
 
     if sp_enabled:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
-    def _passthrough(input_, weight=None, runtime_gather_output=None):
+    def _passthrough(input_, weight=None, runtime_gather_output=None, **kwargs):
+        nonlocal deferred_weight, main_head_deferred, remaining_mtp_calls
+        if remaining_mtp_calls > 0:
+            remaining_mtp_calls -= 1
+            return original_forward(
+                input_,
+                weight=weight,
+                runtime_gather_output=runtime_gather_output,
+                **kwargs,
+            )
+        if main_head_deferred:
+            raise RuntimeError("output_layer was called more than once after all MTP head calls")
+        main_head_deferred = True
+        deferred_weight = weight
         if sp_enabled:
             input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=False, group=tp_group)
         return input_, None
@@ -120,19 +147,28 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
         # ColumnParallelLinear's cuBLAS matmul requires input.dtype == weight.dtype.
         # The VL bridge upcasts hidden_states to fp32 before output_layer; downcast
         # here so matmul stays bf16/bf16. The caller upcasts logits back to fp32.
-        w = weight if weight is not None else output_layer.weight
+        call_weight = weight if weight is not None else deferred_weight
+        w = call_weight if call_weight is not None else output_layer.weight
+        if w is None:
+            raise RuntimeError("Unable to resolve lm_head weight for chunked SFT loss")
         if input_.dtype != w.dtype:
             input_ = input_.to(w.dtype)
         prev_sp = output_layer.sequence_parallel
         output_layer.sequence_parallel = False
         try:
-            return original_forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
+            return original_forward(input_, weight=call_weight, runtime_gather_output=runtime_gather_output)
         finally:
             output_layer.sequence_parallel = prev_sp
 
     output_layer.forward = _passthrough
     try:
         yield _chunked_call
+        if not main_head_deferred:
+            observed_mtp_calls = mtp_output_layer_calls - remaining_mtp_calls
+            raise RuntimeError(
+                "The main output_layer was not reached after the configured MTP head calls: "
+                f"{mtp_output_layer_calls=}, {observed_mtp_calls=}"
+            )
     finally:
         try:
             del output_layer.forward
@@ -147,7 +183,7 @@ def _should_use_sft_chunked(args: Namespace) -> bool:
     - SFT mode (loss_type == "sft")
     - User explicitly opted in via --sft-chunked-logits
 
-    All incompatibilities (tied embeddings, MTP, combined-1f1b) are enforced
+    Remaining incompatibilities (tied embeddings, combined-1f1b) are enforced
     earlier as hard AssertionErrors in arguments.py.slime_validate_args, so
     by the time we reach this gate sft_chunked_logits=True is guaranteed safe.
     """
@@ -238,6 +274,20 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     return opt_param_scheduler
 
 
+def _build_optimizer_config_kwargs(args: Namespace) -> dict[str, object]:
+    """Build optimizer kwargs from normalized runtime arguments."""
+    kwargs = {}
+    for field in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, field.name):
+            kwargs[field.name] = getattr(args, field.name)
+    if args.fp16:
+        kwargs["bf16"] = False
+        kwargs["fp16"] = True
+        kwargs["params_dtype"] = torch.float16
+        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
+    return kwargs
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -279,7 +329,7 @@ def setup_model_and_optimizer(
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
     # the actual model modules to remove stale (orphaned) entries.
-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+    if Envs.ENABLE_ROUTING_REPLAY:
         from relax.utils.training.routing_replay import RoutingReplay
 
         active_replays = []
@@ -299,19 +349,7 @@ def setup_model_and_optimizer(
     if args.only_load_weight:
         return model, None, None
     # Optimizer
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    if args.fp16:
-        kwargs["bf16"] = False
-        kwargs["fp16"] = True
-        kwargs["params_dtype"] = torch.float16
-        kwargs["initial_loss_scale"] = 32768
-        kwargs["min_loss_scale"] = 1
-        kwargs["use_precision_aware_optimizer"] = True
-        kwargs["store_param_remainders"] = False
-        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
+    kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
@@ -684,6 +722,7 @@ def forward_only(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     store_prefix: str = "",
+    per_sample_output: bool = True,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -703,6 +742,10 @@ def forward_only(
         data_iterator (Sequence[DataIterator]): Iterable(s) yielding batches for inference.
         num_microbatches (Sequence[int]): Number of microbatches per rollout step.
         store_prefix (str): Prefix to prepend to stored output keys.
+        per_sample_output (bool): Whether the callback returns one tensor per
+            sample. Dynamic CP reconstructs and reorders only per-sample
+            outputs; per-microbatch aggregates remain CP-local and are reduced
+            by their caller.
 
     Returns:
         dict[str, list[torch.Tensor]]: Aggregated outputs keyed by ``store_prefix + key``.
@@ -833,7 +876,7 @@ def forward_only(
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
 
-        if getattr(args, "dynamic_context_parallel", False):
+        if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
             # Carry per-mb dynamic-CP metadata on the result so
             # dynamic_cp_merge_output can reconstruct the full mb (CP
             # all-gather + cross-sub-group gather + reorder) before the write-back.
@@ -888,7 +931,7 @@ def forward_only(
     rollout_data = {}
     # Store the results on the last stage
     if mpu.is_pipeline_last_stage():
-        if getattr(args, "dynamic_context_parallel", False):
+        if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
             # Reconstruct each mb's full sample set (CP all-gather + cross-sub-group
             # gather + reorder) so the per-sample outputs line up with the full
             # micro_batch_indices used by the write-back below.
@@ -1021,7 +1064,7 @@ def train_one_step(
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
@@ -1088,12 +1131,18 @@ def train_one_step(
             # SFT: defer lm_head into the loss (sft_loss_function_chunked)
             # so the full [B, S, V/TP] fp32 logits tensor never materializes.
             if sft_chunked:
-                with _bypass_output_layer(model) as lm_head_forward:
+                mtp_output_layer_calls = (
+                    int(getattr(args, "mtp_num_layers", 0) or 0) if getattr(args, "enable_mtp_training", False) else 0
+                )
+                with _bypass_output_layer(
+                    model,
+                    mtp_output_layer_calls=mtp_output_layer_calls,
+                ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
                 output_tensor = model(**forward_kwargs)
 
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
         # Always dispatch via loss_function. lm_head_forward is None unless the

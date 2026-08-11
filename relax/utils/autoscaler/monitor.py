@@ -190,6 +190,7 @@ class MetricsHistory:
         self.token_usage: deque[float] = deque(maxlen=max_points)
         self.running_reqs: deque[float] = deque(maxlen=max_points)
         self.queue_reqs: deque[float] = deque(maxlen=max_points)
+        self.engines: deque[float] = deque(maxlen=max_points)
         self.timestamps: deque[str] = deque(maxlen=max_points)
 
     def add_point(
@@ -199,11 +200,13 @@ class MetricsHistory:
         running_reqs: int,
         queue_reqs: int,
         timestamp: str,
+        engines: int = 0,
     ) -> None:
         self.throughput.append(throughput)
         self.token_usage.append(token_usage)
         self.running_reqs.append(float(running_reqs))
         self.queue_reqs.append(float(queue_reqs))
+        self.engines.append(float(engines))
         self.timestamps.append(timestamp)
 
     def clear(self) -> None:
@@ -211,6 +214,7 @@ class MetricsHistory:
         self.token_usage.clear()
         self.running_reqs.clear()
         self.queue_reqs.clear()
+        self.engines.clear()
         self.timestamps.clear()
 
 
@@ -224,6 +228,7 @@ def _render_chart(
     fmt: str = ".1f",
     y_min: float | None = None,
     y_max: float | None = None,
+    integer_yaxis: bool = False,
 ) -> str:
     """使用 Half-block 半方块绘制连续折线图，包含坐标轴与边框。"""
     if not values:
@@ -315,6 +320,10 @@ def _render_chart(
             space /= 5
         elif rng / space < 5:
             space /= 2
+        if integer_yaxis:
+            # Integer quantities (e.g. engine count) must not get sub-integer
+            # ticks like 0.2 / 0.8 -- force a whole-number step of at least 1.
+            space = max(1.0, float(round(space)))
         start = math.ceil(ymin / space) * space
         t, v = [], start
         while v <= ymax + 1e-9:
@@ -713,6 +722,7 @@ class AutoscalerMonitorApp:
             #chart_throughput { width: 1fr; }
             #chart_token { width: 1fr; }
             #chart_running { width: 1fr; }
+            #chart_engines { width: 1fr; }
 
             """
 
@@ -756,6 +766,8 @@ class AutoscalerMonitorApp:
                                 yield Static(id="chart_token_text")
                             with Vertical(id="chart_running", classes="panel"):
                                 yield Static(id="chart_running_text")
+                            with Vertical(id="chart_engines", classes="panel"):
+                                yield Static(id="chart_engines_text")
                 yield Footer()
 
             async def on_mount(self) -> None:
@@ -815,8 +827,13 @@ class AutoscalerMonitorApp:
                         token_usage = _as_float(metrics.get("avg_token_usage"))
                         running_reqs = _as_int(metrics.get("total_running_reqs"))
                         queue_reqs = _as_int(metrics.get("total_queue_reqs"))
+                        engines = _as_int(
+                            _coalesce(status.get("current_engines"), metrics.get("num_engines"), default=0)
+                        )
                         timestamp = _fmt_ts_short(self.snapshot.last_refresh_ts)
-                        self._history.add_point(throughput, token_usage, running_reqs, queue_reqs, timestamp)
+                        self._history.add_point(
+                            throughput, token_usage, running_reqs, queue_reqs, timestamp, engines=engines
+                        )
                     except Exception as e:
                         self.snapshot.last_error = str(e)
                         logger_local.warning(f"Autoscaler monitor refresh failed: {e}")
@@ -900,6 +917,20 @@ class AutoscalerMonitorApp:
                         unit="",
                         fmt=".0f",
                         y_min=0.0,
+                    )
+                )
+
+                self.query_one("#chart_engines_text", Static).update(
+                    _render_chart(
+                        list(self._history.engines),
+                        width=chart_width,
+                        height=6,
+                        color="magenta",
+                        title="Engines",
+                        unit="",
+                        fmt=".0f",
+                        y_min=0.0,
+                        integer_yaxis=True,
                     )
                 )
 
