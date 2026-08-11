@@ -58,6 +58,17 @@ def _patched_load_model_config(checkpoint_path):
         from megatron.bridge.models.model_provider import ModelProviderMixin
 
         if not isinstance(model_cfg, ModelProviderMixin):
+            # A list-valued MoE pattern makes TransformerBlock use layer-indexed
+            # distributed-checkpoint keys. Preserve that representation from the
+            # checkpoint even when it is semantically equivalent to provider's
+            # integer value (for example, [1] * num_layers versus 1).
+            checkpoint_moe_layer_freq = getattr(model_cfg, "moe_layer_freq", None)
+            if isinstance(checkpoint_moe_layer_freq, list):
+                provider.moe_layer_freq = checkpoint_moe_layer_freq
+                print(
+                    "[convert] Preserving checkpoint moe_layer_freq list "
+                    f"({len(checkpoint_moe_layer_freq)} layers) for sharded key compatibility"
+                )
             print(f"[convert] Overriding MLM TransformerConfig with Bridge provider: {type(provider).__name__}")
             return provider, mlm_args
     return model_cfg, mlm_args
