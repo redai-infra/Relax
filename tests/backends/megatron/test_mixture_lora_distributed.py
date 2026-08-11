@@ -3,6 +3,7 @@
 from datetime import timedelta
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -186,6 +187,10 @@ def _tensor_parallel_routing_metrics_worker(rank: int, world_size: int, init_met
 
 
 def test_routing_metrics_are_available_on_every_tensor_parallel_rank(tmp_path):
+    # The spawned workers need the real Megatron tensor-parallel state, which the
+    # default CPU CI does not install. This case runs in the official Relax image.
+    pytest.importorskip("megatron.core")
+    pytest.importorskip("megatron.training")
     init_method = f"file://{tmp_path / 'mixture-lora-tp-metrics-gloo-init'}"
     mp.spawn(_tensor_parallel_routing_metrics_worker, args=(2, init_method), nprocs=2, join=True)
 
