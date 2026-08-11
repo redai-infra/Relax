@@ -163,7 +163,21 @@ class DeviceDirectBackend(CommBackend):
 
     def _router_publication_request(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         base_url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        response = self.http_client.post(f"{base_url}/_relax/weight_publication/{action}", json=payload)
+        if action == "prepare":
+            # The Router enforces the retirement deadline internally. Give it a
+            # small response-delivery margin without allowing the caller to wait
+            # beyond the DCS operation budget.
+            request_timeout = min(
+                float(self.timeout_seconds),
+                max(float(payload.get("timeout_seconds", 0.0)) + 5.0, 5.0),
+            )
+        else:
+            request_timeout = min(float(self.timeout_seconds), 30.0)
+        response = self.http_client.post(
+            f"{base_url}/_relax/weight_publication/{action}",
+            json=payload,
+            timeout=request_timeout,
+        )
         response.raise_for_status()
         return response.json()
 
@@ -188,7 +202,9 @@ class DeviceDirectBackend(CommBackend):
         error: str | None = None
         if dist.get_rank() == 0:
             try:
-                ray.get(self._batch_request(endpoint, payload))
+                request_timeout = min(float(self.timeout_seconds), 60.0)
+                futures = self._batch_request(endpoint, payload, timeout_seconds=request_timeout)
+                ray.get(futures, timeout=request_timeout + 5.0)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
         objects = [{"error": error}]
@@ -260,11 +276,17 @@ class DeviceDirectBackend(CommBackend):
         """
         logger.info(f"Creating {len(rollout_topology)} RolloutEngine actors...")
         for rank, node_info in rollout_topology.items():
-            actor = RolloutEngine.remote(int(rank), node_info)
+            actor = RolloutEngine.remote(int(rank), node_info, timeout_seconds=float(self.timeout_seconds))
             self.rollout_engines[int(rank)] = actor
             logger.info(f"Created RolloutEngine actor for rank {rank}")
 
-    def _batch_request(self, endpoint: str, payload: Optional[Dict] = None, get_rank: bool = False) -> List[Any]:
+    def _batch_request(
+        self,
+        endpoint: str,
+        payload: Optional[Dict] = None,
+        get_rank: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> List[Any]:
         """Send HTTP requests to all rollout engines and collect futures.
 
         Args:
@@ -285,7 +307,7 @@ class DeviceDirectBackend(CommBackend):
                 payload_cur = payload.get(int(rank), {}) if payload else None
             else:
                 payload_cur = payload
-            future = engine.make_request.remote(endpoint, payload_cur)
+            future = engine.make_request.remote(endpoint, payload_cur, timeout_seconds)
             futures.append(future)
         return futures
 
@@ -501,7 +523,7 @@ class DeviceDirectBackend(CommBackend):
                     destroy_payload = {"group_name": self._group_name}
                     futures = self._batch_request("/destroy_weights_update_group", destroy_payload)
                     dist.destroy_process_group(self._model_update_groups)
-                    ray.get(futures)
+                    ray.get(futures, timeout=float(self.timeout_seconds) + 5.0)
                     self._model_update_groups = None
                     # Wait for NCCL socket ports to be released by the OS
                     time.sleep(2.0)
@@ -552,7 +574,7 @@ class DeviceDirectBackend(CommBackend):
                         group_name=self._group_name,
                         timeout=timedelta(seconds=180),
                     )
-                    ray.get(futures)
+                    ray.get(futures, timeout=float(self.timeout_seconds) + 5.0)
                     last_error = None
                     break
                 except Exception as e:
@@ -575,14 +597,14 @@ class DeviceDirectBackend(CommBackend):
                     f"Failed to init process group for rollout after {max_retries} attempts"
                 ) from last_error
 
-                # Group successfully (re)built — remember the topology it actually
-                # serves so the next update with the same topology takes the reuse
-                # fast path above. Recompute from ``self.rollout_topology`` rather
-                # than the pre-check ``new_sig`` because ``_update_rollout_engines``
-                # may have pruned dead engines from it; storing the stale full
-                # signature would let the fast path reuse a group that is missing a
-                # since-recovered engine (orphaning it).
-                self._rollout_topology_signature = self._rollout_topology_signature_of(self._rollout_topology)
+            # Group successfully (re)built — remember the topology it actually
+            # serves so the next update with the same topology takes the reuse
+            # fast path above. Recompute from ``self.rollout_topology`` rather
+            # than the pre-check ``new_sig`` because ``_update_rollout_engines``
+            # may have pruned dead engines from it; storing the stale full
+            # signature would let the fast path reuse a group that is missing a
+            # since-recovered engine (orphaning it).
+            self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
             result["group_setup_seconds"] = time.monotonic() - started_at
             return result
 
@@ -1023,12 +1045,21 @@ class DeviceDirectBackend(CommBackend):
         """
 
         lock_started_at = time.monotonic()
+        lock_deadline = lock_started_at + float(self.timeout_seconds)
         acquired = False
         try:
             while not acquired:
-                acquired = ray.get(self.lock.acquire.remote())
+                remaining = lock_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out after {self.timeout_seconds}s waiting for the DCS weight-sync lock")
+                try:
+                    acquired = ray.get(self.lock.acquire.remote(), timeout=remaining)
+                except ray.exceptions.GetTimeoutError as exc:
+                    raise TimeoutError(
+                        f"Timed out waiting for the DCS weight-sync lock actor within the {self.timeout_seconds}s budget"
+                    ) from exc
                 if not acquired:
-                    time.sleep(0.1)
+                    time.sleep(min(0.1, max(lock_deadline - time.monotonic(), 0.0)))
             if self._weight_sync_metrics is not None:
                 self._weight_sync_metrics["lock_wait_seconds"] += time.monotonic() - lock_started_at
             broadcast_bytes = sum(param.numel() * param.element_size() for _, param in converted_named_tensors)
@@ -1052,11 +1083,11 @@ class DeviceDirectBackend(CommBackend):
             for handle in handles:
                 handle.wait()
             broadcast_finished_at = time.monotonic()
-            ray.get(futures)  # Ensure remote update completes
+            ray.get(futures, timeout=float(self.timeout_seconds) + 5.0)  # Ensure remote update completes
             receiver_finished_at = time.monotonic()
         finally:
             if acquired:
-                ray.get(self.lock.release.remote())
+                ray.get(self.lock.release.remote(), timeout=min(float(self.timeout_seconds), 30.0))
         if self._weight_sync_metrics is not None:
             self._weight_sync_metrics["broadcast_seconds"] += broadcast_finished_at - broadcast_started_at
             self._weight_sync_metrics["receiver_finalize_seconds"] += receiver_finished_at - broadcast_finished_at
@@ -1270,7 +1301,7 @@ class RolloutEngine:
     Encapsulates HTTP communication with a specific rollout endpoint.
     """
 
-    def __init__(self, rank: int, node_info: Dict[str, Any]):
+    def __init__(self, rank: int, node_info: Dict[str, Any], timeout_seconds: float = 300.0):
         """Initialize RolloutEngine actor.
 
         Args:
@@ -1280,6 +1311,9 @@ class RolloutEngine:
         self.rank = rank
         self.node_info = node_info
         self.base_url = f"http://{node_info['ip']}:{node_info['port']}"
+        if timeout_seconds <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
+        self.timeout_seconds = float(timeout_seconds)
         logger.info(f"RolloutEngine #{self.rank} initialized for {self.base_url}")
 
     def health(self, timeout: float = 5.0) -> bool:
@@ -1287,7 +1321,12 @@ class RolloutEngine:
         response.raise_for_status()
         return True
 
-    def make_request(self, endpoint: str, payload: Optional[Dict] = None) -> Any:
+    def make_request(
+        self,
+        endpoint: str,
+        payload: Optional[Dict] = None,
+        timeout_seconds: float | None = None,
+    ) -> Any:
         """Send a synchronous HTTP POST to the rollout node and return JSON.
 
         Args:
@@ -1299,7 +1338,14 @@ class RolloutEngine:
         """
         endpoint = endpoint.lstrip("/")
         url = f"{self.base_url}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        request_timeout = self.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+        if request_timeout <= 0:
+            raise ValueError(f"timeout_seconds must be positive, got {request_timeout}")
+        response = requests.post(
+            url,
+            json=payload or {},
+            timeout=(min(5.0, request_timeout), request_timeout),
+        )
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -1312,18 +1358,27 @@ class RolloutEngine:
 
         Retries for a short period and raises on timeout.
         """
-        # flush_cache may return non-200 while there are pending requests
+        # flush_cache may return non-200 while there are pending requests.
+        # Preserve the historical ~60 second budget while bounding every
+        # individual socket operation inside that budget.
         url = f"{self.base_url}/flush_cache"
+        deadline = time.monotonic() + min(self.timeout_seconds, 60.0)
         for _ in range(60):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timeout while flushing cache.")
             try:
-                response = requests.get(url)
+                response = requests.get(
+                    url,
+                    timeout=(min(5.0, remaining), min(5.0, remaining)),
+                )
                 if response.status_code == 200:
                     break
             except NewConnectionError:
                 raise
             except Exception as e:
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
+                time.sleep(min(1.0, max(deadline - time.monotonic(), 0.0)))
                 continue
         else:
             raise TimeoutError("Timeout while flushing cache.")
