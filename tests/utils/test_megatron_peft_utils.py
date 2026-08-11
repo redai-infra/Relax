@@ -29,6 +29,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    to_peft_state_dict,
     write_hf_peft_adapter,
 )
 
@@ -144,6 +145,61 @@ class TestWriteHfPeftAdapter:
             lora_dropout=0.0,
         )
         assert (target / "adapter_config.json").is_file()
+
+    def test_write_hf_peft_adapter_adds_peft_prefix(self, tmp_path):
+        """Bare exporter names are written in PEFT's layout.
+
+        ``AutoBridge.export_adapter_weights`` yields bare HF parameter names.
+        Written as-is, ``peft.PeftModel.from_pretrained`` matches none of them:
+        it warns about missing adapter keys and leaves every ``lora_B`` at
+        zero, so the adapter loads as a no-op instead of failing.
+        """
+        from safetensors.torch import load_file
+
+        merged = {
+            "model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(8, 16),
+            "model.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(16, 8),
+        }
+        adapter_dir = tmp_path / "lora_adapter"
+        write_hf_peft_adapter(
+            merged,
+            adapter_dir,
+            lora_rank=8,
+            lora_alpha=16,
+            target_modules=["q_proj"],
+            lora_dropout=0.0,
+        )
+
+        loaded = load_file(str(adapter_dir / "adapter_model.safetensors"))
+        assert set(loaded) == {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+        }
+        for name, tensor in merged.items():
+            assert torch.allclose(loaded[f"base_model.model.{name}"], tensor)
+
+
+class TestToPeftStateDict:
+    def test_bare_names_get_the_prefix(self):
+        state = to_peft_state_dict({"model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros(2, 2)})
+        assert list(state) == ["base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"]
+
+    def test_multimodal_names_keep_their_own_prefix(self):
+        """A submodel prefix (e.g. Qwen3-Omni's ``thinker.``) is part of the
+        parameter path and stays inside the PEFT prefix."""
+        state = to_peft_state_dict({"thinker.model.layers.0.self_attn.o_proj.lora_B.weight": torch.zeros(2, 2)})
+        assert list(state) == ["base_model.model.thinker.model.layers.0.self_attn.o_proj.lora_B.weight"]
+
+    def test_already_prefixed_names_are_left_alone(self):
+        """Idempotent, so a state dict that is already in PEFT form survives a
+        second pass unchanged."""
+        name = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        assert list(to_peft_state_dict({name: torch.zeros(2, 2)})) == [name]
+
+    def test_tensors_are_passed_through_unchanged(self):
+        tensor = torch.randn(4, 4)
+        state = to_peft_state_dict({"model.layers.0.self_attn.q_proj.lora_A.weight": tensor})
+        assert next(iter(state.values())) is tensor
 
 
 class TestLoraPredicates:
