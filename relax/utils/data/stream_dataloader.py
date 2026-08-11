@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import logging
-import os
 import pickle
 import time
 from argparse import Namespace
@@ -16,6 +15,7 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import timer
 
@@ -49,14 +49,14 @@ def _maybe_log_per_rank_fetch_diag(rollout_data: list) -> None:
     """
     if rollout_data[0] is None:
         return
-    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+    if not Envs.RELAX_TGD_PROFILE:
         return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
 
     global _per_rank_fetch_diag_call_count
     _per_rank_fetch_diag_call_count += 1
-    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    every = Envs.RELAX_TGD_PROFILE_EVERY
     if _per_rank_fetch_diag_call_count > 3 and _per_rank_fetch_diag_call_count % every != 0:
         return
 
@@ -107,12 +107,12 @@ def _maybe_log_tgd_pickle_diag(rollout_data: list, should_fetch: bool) -> None:
         return
     if rollout_data[0] is None:
         return
-    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+    if not Envs.RELAX_TGD_PROFILE:
         return
 
     global _tgd_diag_call_count
     _tgd_diag_call_count += 1
-    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    every = Envs.RELAX_TGD_PROFILE_EVERY
     if _tgd_diag_call_count > 3 and _tgd_diag_call_count % every != 0:
         return
 

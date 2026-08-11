@@ -246,6 +246,8 @@ export default defineConfig({
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'DPO Training', link: '/en/guide/dpo-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
+                { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
@@ -356,6 +358,8 @@ export default defineConfig({
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: 'DPO 训练', link: '/zh/guide/dpo-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
+                { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ 训练与数值验证报告', link: '/zh/guide/reinforce-plus-plus-training-report' },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]
