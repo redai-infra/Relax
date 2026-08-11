@@ -74,16 +74,22 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def _patched_run_scheduler_process(*args, **kwargs):
-    """Scheduler-subprocess entry used for the routing-replay path.
+    """Scheduler-subprocess entry for Relax's SGLang runtime patches.
 
-    This wrapper is only installed when ``--optimize-routing-replay`` is
-    enabled (see ``_launch_server_with_patches``), so the routing-replay async
-    D→H patch is applied **unconditionally** here, preserving the original
-    behavior.
+    The deterministic sampler endpoint backport is version-gated internally.
+    The routing-replay async D→H patch remains gated by its existing runtime
+    environment flag.
     """
-    from relax.backends.sglang.routing_replay_patch import apply_patch
+    from relax.backends.sglang.deterministic_sampler_patch import (
+        apply_deterministic_sampler_endpoint_patch,
+    )
 
-    apply_patch()
+    apply_deterministic_sampler_endpoint_patch()
+
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+        from relax.backends.sglang.routing_replay_patch import apply_patch
+
+        apply_patch()
 
     from sglang.srt.managers.scheduler import run_scheduler_process
 
@@ -96,9 +102,8 @@ def _launch_server_with_patches(server_args: ServerArgs):
 
     - main process: OPD pre-expanded multimodal patch
       (``RELAX_OPD_PREEXPANDED_PATCH=1``).
-    - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
+    - scheduler subprocess: version-gated deterministic-sampler endpoint fix;
+      routing replay remains gated by ``RELAX_OPTIMIZE_ROUTING_REPLAY=1``.
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
@@ -107,10 +112,7 @@ def _launch_server_with_patches(server_args: ServerArgs):
 
         apply_opd_preexpanded_patch()
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
-        launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
-    else:
-        launch_server(server_args)
+    launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
 
 
 def _resolve_external_model_arch(package_name):
@@ -146,9 +148,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
 
-    # Each SGLang patch is controlled by its own env flag and applied
-    # independently (see ``_launch_server_with_patches`` and
-    # ``_patched_run_scheduler_process``); any combination is valid:
+    # Runtime patches are applied independently in the scheduler subprocess
+    # (see ``_launch_server_with_patches`` and ``_patched_run_scheduler_process``):
+    #   - deterministic sampler endpoint fix: version-gated backport
     #   - RELAX_OPTIMIZE_ROUTING_REPLAY : async D→H routing-replay patch (runtime)
     #   - RELAX_OPD_PREEXPANDED_PATCH   : OPD pre-expanded multimodal patch (runtime)
     #   - RELAX_OPD_PER_POS_TOKEN_IDS   : OPD per-position token_ids logprob;
