@@ -101,7 +101,7 @@ class TrainRayActor(RayActor):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def update_weights(self):
+    def update_weights(self, rollout_id: int | None = None):
         raise NotImplementedError
 
     @abc.abstractmethod
