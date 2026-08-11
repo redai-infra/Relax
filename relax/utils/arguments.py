@@ -2101,6 +2101,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
+                "--load-forge-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Path (or {rollout_id} template) to a dumped rollout .pt replayed by "
+                    "relax.engine.rollout.forge_load.generate_rollout. A path without the placeholder is "
+                    "a literal file reused for every rollout; a path with {rollout_id} loads a per-rollout "
+                    "file. Unlike --load-debug-rollout-data, this does NOT set skip_sglang, so sglang, "
+                    "router, weight sync and the colocate offload/onload dance stay live (the point: "
+                    "measuring real colocate memory at long context)."
+                ),
+            )
+            parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
                 default=None,
@@ -3366,8 +3379,6 @@ def slime_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-            if args.use_critic:
-                args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
     elif args.colocate and genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True

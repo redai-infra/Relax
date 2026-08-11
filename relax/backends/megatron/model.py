@@ -1763,7 +1763,5 @@ def initialize_model_and_optimizer(
         )
         install_critic_value_head_runtime_check(model)
     clear_memory()
-    if opt_param_scheduler is not None:
-        opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
     return model, optimizer, opt_param_scheduler, iteration

@@ -29,6 +29,7 @@ from ray.serve.schema import LoggingConfig
 from relax.distributed.checkpoint_service.config import DCSConfig, RoleInfo, TopologyConfig
 from relax.distributed.checkpoint_service.coordinator.topology import TopologyManager
 from relax.utils.env import Envs
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.utils import get_serve_url
 
 
@@ -399,7 +400,7 @@ class DCSCoordinator:
             metadata = role.metadata
             if metadata.get("is_pp_src_rank"):
                 group_name = f"update_actor_pp_{metadata.get('pp_rank')}"
-                init_method = f"tcp://{metadata.get('master_address')}:{metadata.get('master_port')}"
+                init_method = f"tcp://{_wrap_ipv6(metadata.get('master_address'))}:{metadata.get('master_port')}"
                 pp_groups[group_name] = init_method
 
         return GroupRanksResponse(

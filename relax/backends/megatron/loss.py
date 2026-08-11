@@ -53,6 +53,7 @@ def get_responses(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    apply_temperature: bool = True,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -174,13 +175,14 @@ def get_responses(
 
         # Apply temperature per-chunk instead of on the full [T, V] logits to avoid
         # a single ~16GiB allocation that OOMs under fragmentation.
-        # Skip when SFT chunked path is on (--sft-chunked-logits): in that mode
-        # `logits_chunk` here is actually `hidden_states` (shape [R, H], not
-        # [R, V]) — dividing hidden activations by a softmax-distribution
-        # temperature is mathematically meaningless. That caller applies
-        # temperature on the real per-sub-chunk logits after lm_head instead.
-        if args.rollout_temperature != 1.0 and not (
-            args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False)
+        # Skipped when apply_temperature is False (value head: scalar predictions
+        # must not be temperature-scaled), and on the SFT chunked path where
+        # `logits_chunk` is hidden_states [R, H] not logits (that caller applies
+        # temperature on the real per-sub-chunk logits after lm_head instead).
+        if (
+            apply_temperature
+            and args.rollout_temperature != 1.0
+            and not (args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False))
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -236,12 +238,18 @@ def _allgather_cp_redistribute(
             e = min(logit_global_end, chunk_end)
 
             if e <= s:
-                # This rank has no response logprobs for this sample
+                # This rank has no response logprobs for this sample. Match the
+                # placeholder's requires_grad to the real data (`value`): forcing
+                # requires_grad=True makes the concatenated all_reduce input require
+                # grad on ranks with an empty chunk while non-empty ranks (F.pad of
+                # a no-grad `value`) do not, so the differentiable dist.nn.all_reduce
+                # below builds a backward graph on some CP ranks but not others and
+                # the collective deadlocks.
                 full_resp = torch.zeros(
                     response_length,
                     dtype=value.dtype,
                     device=value.device,
-                    requires_grad=True,
+                    requires_grad=value.requires_grad,
                 )
             else:
                 resp_start = s - logit_global_start
@@ -465,8 +473,8 @@ def get_values(
 
     Args:
         logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
+        args: Configuration passed to `get_responses`; temperature scaling is
+            disabled for value outputs.
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
@@ -488,6 +496,7 @@ def get_values(
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        apply_temperature=False,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
