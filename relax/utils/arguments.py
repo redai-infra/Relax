@@ -244,6 +244,61 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=1,
                 help="Fully async pipeline num of iters every global batch.",
             )
+            # ── RDMA transport (MooncakeStore backend) ──────────────────────────
+            # Default values are equivalent to current main behavior (SimpleStorage,
+            # no RDMA). These expose *intent* only; Mooncake internals (endpoint,
+            # buffer, segment, timeout, master strategy) are handled via internal
+            # defaults / deployment environment, not CLI flags.
+            parser.add_argument(
+                "--tq-storage-backend",
+                choices=["simple", "mooncake"],
+                default="simple",
+                help=(
+                    "TransferQueue storage backend. 'simple' (default) uses "
+                    "SimpleStorage/ZMQ and is equivalent to current behavior. "
+                    "'mooncake' uses MooncakeStore, which supports RDMA transport "
+                    "via --tq-rdma-mode."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-mode",
+                choices=["off", "auto", "required"],
+                default="off",
+                help=(
+                    "RDMA transport mode for MooncakeStore backend. 'off' (default) "
+                    "never uses RDMA even if hardware is available. 'auto' probes "
+                    "RDMA capability at startup and degrades to TCP/SimpleStorage if "
+                    "unavailable (with a WARNING). 'required' fails fast on probe "
+                    "failure instead of degrading; it covers the transport only, not "
+                    "GDR (see --tq-use-gdr). Only effective with "
+                    "--tq-storage-backend mooncake."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-device",
+                type=str,
+                default="",
+                help=(
+                    "RDMA device name for MooncakeStore (e.g. mlx5_bond_0). Empty "
+                    "(default) lets Mooncake auto-select. On multi-NIC hosts the "
+                    "auto-selected device may fail cross-node; specify explicitly if "
+                    "needed."
+                ),
+            )
+            parser.add_argument(
+                "--tq-use-gdr",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "EXPERIMENTAL: enable GPU Direct RDMA (GDR) staging for "
+                    "MooncakeStore. Eligibility is NOT probed at startup (the probe "
+                    "runs in a separate Ray task with no CUDA context), so each "
+                    "worker decides at runtime: without an initialised CUDA context "
+                    "it falls back to host RDMA with a WARNING, and "
+                    "--tq-rdma-mode=required does not fail fast on that. Requires "
+                    "RDMA protocol. Default off."
+                ),
+            )
             return parser
 
         def add_cluster_arguments(parser):

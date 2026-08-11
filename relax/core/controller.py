@@ -47,7 +47,10 @@ from relax.utils.opd.opd_utils import (
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
+from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate_config
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
+from relax.utils.tq_config import build_backend_config
+from relax.utils.tq_lifecycle import close_tq_and_unmount, kill_tq_controller_and_wait, reap_unusable_tq_controller
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
@@ -277,17 +280,126 @@ class Controller:
                     "sampler": sampler,
                     "polling_mode": self.config.polling_mode,
                 },
-                "backend": {
-                    "SimpleStorage": {
-                        "total_storage_size": total_storage_size,
-                        "num_data_storage_units": self.config.num_data_storage_units,
-                    },
-                },
+                "backend": self._resolve_tq_backend(total_storage_size),
             },
             flags={"allow_objects": True},
         )
         tq_config = tq.init(conf=tq_config) or tq_config
         self.config.tq_config = tq_config
+
+    def _resolve_tq_backend(self, total_storage_size: int) -> dict:
+        """Resolve the TransferQueue ``backend`` config dict.
+
+        Default behavior (``--tq-storage-backend=simple``) is identical to the
+        previous hardcoded SimpleStorage path.  When MooncakeStore is
+        requested, runs the RDMA capability probe *before* ``tq.init``, applies
+        graded degradation, and emits the startup log line.
+        """
+        # 1. Validate flag combinations (structural, before any probe).
+        #    getattr defaults keep old checkpoints / non-argparse configs safe.
+        errors = validate_config(self.config)
+        if errors:
+            raise ValueError("Invalid TransferQueue RDMA configuration:\n  " + "\n  ".join(errors))
+
+        backend = getattr(self.config, "tq_storage_backend", "simple")
+        mode = getattr(self.config, "tq_rdma_mode", "off")
+
+        # 2. SimpleStorage short-circuit (default, zero behavior change).
+        if backend == "simple" or mode == "off":
+            from relax.utils.tq_config import build_simple_storage_config
+
+            return build_simple_storage_config(
+                total_storage_size=total_storage_size,
+                num_data_storage_units=self.config.num_data_storage_units,
+            )
+
+        # 3. MooncakeStore path: probe → reduce → effective config.
+        #    The driver fans the probe out to every alive GPU node via Ray
+        #    (probe_cluster_nodes), then AND-reduces to a single job-level
+        #    effective config so all data-plane workers converge identically.
+        device = getattr(self.config, "tq_rdma_device", "")
+        probe_results = probe_cluster_nodes(device)
+        for r in probe_results:
+            logger.debug(r.summary())
+
+        effective = reduce_results(
+            probe_results,
+            requested_backend=backend,
+            requested_device=device,
+            use_gdr=getattr(self.config, "tq_use_gdr", False),
+        )
+
+        # 4. required mode: fail fast instead of silently degrading (probe level).
+        if mode == "required" and effective.fallback_reason:
+            detail = "\n".join(r.summary() for r in probe_results)
+            raise RuntimeError(
+                f"--tq-rdma-mode=required but RDMA probe failed: {effective.fallback_reason}.\n"
+                f"Probe details:\n{detail}"
+            )
+
+        # 5. Build backend dict (may fall back to SimpleStorage on capacity error).
+        backend_dict, cap_error = build_backend_config(self.config, effective, total_storage_size=total_storage_size)
+        actual_backend = "MooncakeStore" if "MooncakeStore" in backend_dict else "SimpleStorage"
+
+        # 6. required mode: also fail fast on capacity-induced fallback.
+        if mode == "required" and cap_error:
+            raise RuntimeError(f"--tq-rdma-mode=required but segment capacity insufficient: {cap_error}")
+
+        # 7. GDR is EXPERIMENTAL in this phase: --tq-rdma-mode=required only
+        #    covers the *transport* (MooncakeStore + RDMA), not GDR.  The probe
+        #    cannot decide GDR eligibility -- it runs as a separate Ray task
+        #    where torch.cuda.is_initialized() is always False -- so the real
+        #    check happens per worker in the runtime client
+        #    (mooncake_client.py:87), which silently falls back to host RDMA.
+        use_gdr = getattr(self.config, "tq_use_gdr", False)
+        if use_gdr and (effective.protocol != "rdma" or actual_backend != "MooncakeStore"):
+            logger.warning(
+                "[dataplane] --tq-use-gdr requested but the effective path is not RDMA "
+                f"(protocol={effective.protocol}, backend={actual_backend}); GDR inactive."
+            )
+        elif use_gdr:
+            logger.warning(
+                "[dataplane] --tq-use-gdr is EXPERIMENTAL: eligibility is not probed, and "
+                "workers without an initialised CUDA context fall back to host RDMA silently. "
+                "--tq-rdma-mode=required does NOT fail fast on unavailable GDR."
+            )
+
+        # 8. F10 anti-hang: reap a half-initialised controller before tq.init,
+        #    for every backend (a stale MooncakeStore controller used to survive
+        #    because the guard only ran on the SimpleStorage fallback path).
+        #    Only unusable controllers are killed -- a healthy one belongs to
+        #    whoever created it and tq.init legitimately attaches to it.
+        self._reap_unusable_tq_controller()
+
+        # 9. Log requested vs effective so the startup log alone explains the
+        #    decision, plus one summary block per probed node.
+        logger.info(
+            f"[dataplane] requested: backend={backend} rdma_mode={mode} device={device or 'auto'} gdr={use_gdr}"
+        )
+        for result in probe_results:
+            logger.info(f"[dataplane] probe result:\n{result.summary()}")
+        if cap_error:
+            logger.warning(f"[dataplane] MooncakeStore capacity fallback to SimpleStorage: {cap_error}")
+            logger.info("[dataplane] backend=SimpleStorage protocol=tcp (capacity fallback)")
+        else:
+            logger.info(effective.log_line())
+        return backend_dict
+
+    def _reap_unusable_tq_controller(self) -> None:
+        """Delegate to
+        :func:`relax.utils.tq_lifecycle.reap_unusable_tq_controller`."""
+        reap_unusable_tq_controller()
+
+    def _kill_stale_tq_controller(self) -> None:
+        """Delegate to
+        :func:`relax.utils.tq_lifecycle.kill_tq_controller_and_wait`."""
+        kill_tq_controller_and_wait()
+
+    @staticmethod
+    def _close_data_system() -> None:
+        """Delegate to
+        :func:`relax.utils.tq_lifecycle.close_tq_and_unmount`."""
+        close_tq_and_unmount()
 
     def _deploy_metrics_service(self):
         """Deploy the MetricsService as a lightweight Ray Serve deployment.
@@ -1006,7 +1118,7 @@ class Controller:
 
         # --- 1.7 Tear down data system (storage units + controller) ---
         try:
-            tq.close()
+            self._close_data_system()
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
