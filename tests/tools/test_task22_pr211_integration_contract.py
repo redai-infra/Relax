@@ -9,6 +9,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "task22" / "validate_pr211_integration_contract.py"
+RUNNER = Path(__file__).parents[2] / "scripts" / "task22" / "run_pr211_integration_4gpu.sh"
 SPEC = importlib.util.spec_from_file_location("task22_integration_contract", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 contract = importlib.util.module_from_spec(SPEC)
@@ -92,3 +93,15 @@ def test_off_arm_rejects_candidate_flag_drift() -> None:
 
     with pytest.raises(contract.ContractError, match="candidate flag"):
         contract.validate_contract(arm="interval1_kv_off", num_rollout=21, argv=argv)
+
+
+def test_runner_predeclares_reviewed_formal_headline() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert '"headline": {"logical_step_lo": 3, "logical_step_hi": 17} if num_rollout == 21 else None' in source
+
+
+def test_runner_derives_topology_contract_and_runs_external_analyzer() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert '"rollout_receiver_count": rollout_total_gpus // rollout_gpus_per_engine' in source
+    assert '"group_world_size": 1 + rollout_total_gpus' in source
+    assert "analyze_pr211_integration_run.py" in source

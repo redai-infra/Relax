@@ -101,6 +101,14 @@ destination = Path(sys.argv[2])
 start = float(sys.argv[3])
 end = float(sys.argv[4])
 exit_code = int(sys.argv[5])
+analysis_path = source / "analysis_pr211_integration.json"
+analysis_verdict = None
+if analysis_path.is_file():
+    try:
+        analysis_verdict = json.loads(analysis_path.read_text(encoding="utf-8")).get("verdict")
+    except (OSError, json.JSONDecodeError):
+        analysis_verdict = "MALFORMED"
+status = "INVALID_INPUT" if analysis_verdict == "INVALID_INPUT" else ("SUCCEEDED" if exit_code == 0 else "FAILED")
 (source / "run_lifecycle.json").write_text(
     json.dumps(
         {
@@ -109,7 +117,8 @@ exit_code = int(sys.argv[5])
             "run_end_epoch": end,
             "run_elapsed_seconds": end - start,
             "exit_code": exit_code,
-            "status": "SUCCEEDED" if exit_code == 0 else "FAILED",
+            "status": status,
+            "analysis_verdict": analysis_verdict,
         },
         indent=2,
         sort_keys=True,
@@ -117,7 +126,11 @@ exit_code = int(sys.argv[5])
     + "\n",
     encoding="utf-8",
 )
-(source / "STATUS").write_text("SUCCEEDED\n" if exit_code == 0 else f"FAILED exit_code={exit_code}\n")
+(source / "STATUS").write_text(
+    "INVALID_INPUT\n"
+    if status == "INVALID_INPUT"
+    else ("SUCCEEDED\n" if status == "SUCCEEDED" else f"FAILED exit_code={exit_code}\n")
+)
 
 
 def sha256(path: Path) -> str:
@@ -333,18 +346,50 @@ def sha256(path: Path) -> str:
 
 model_config = Path(os.environ["MODEL_PATH"]) / "config.json"
 dataset = Path(os.environ["PROMPT_DATA"])
+num_rollout = int(os.environ["NUM_ROLLOUT"])
+train_argv = json.loads(os.environ["TRAIN_ARGS_JSON"])
+
+
+def option(flag: str) -> str:
+    positions = [index for index, item in enumerate(train_argv) if item == flag or item.startswith(f"{flag}=")]
+    if len(positions) != 1:
+        raise SystemExit(f"{flag} must appear exactly once, found {len(positions)}")
+    index = positions[0]
+    item = train_argv[index]
+    if item.startswith(f"{flag}="):
+        return item.split("=", maxsplit=1)[1]
+    if index + 1 >= len(train_argv) or train_argv[index + 1].startswith("--"):
+        raise SystemExit(f"{flag} has no value")
+    return train_argv[index + 1]
+
+
+resource = json.loads(option("--resource"))
+rollout_total_gpus = int(resource["rollout"][1])
+rollout_gpus_per_engine = int(option("--rollout-num-gpus-per-engine"))
+if rollout_total_gpus <= 0 or rollout_gpus_per_engine <= 0:
+    raise SystemExit("Rollout GPU counts must be positive")
+if rollout_total_gpus % rollout_gpus_per_engine:
+    raise SystemExit("Rollout total GPUs must be divisible by GPUs per engine")
 payload = {
     "schema_version": 1,
     "git_sha": os.environ["ACTUAL_GIT_SHA"],
     "arm": os.environ["TASK22_ARM"],
-    "num_rollout": int(os.environ["NUM_ROLLOUT"]),
-    "headline": {"logical_step_lo": 2, "logical_step_hi": int(os.environ["NUM_ROLLOUT"]) - 2},
+    "num_rollout": num_rollout,
+    # The formal 21-step primary window was predeclared as 3..17 after review.
+    # Shorter runs are diagnostic probes and must not manufacture a headline.
+    "headline": {"logical_step_lo": 3, "logical_step_hi": 17} if num_rollout == 21 else None,
     "update_weights_interval": int(os.environ["UPDATE_WEIGHTS_INTERVAL"]),
     "cross_version_kv": os.environ["CROSS_VERSION_KV"] == "1",
     "cross_version_kv_max_gap": (
         int(os.environ["CROSS_VERSION_KV_MAX_GAP"]) if os.environ["CROSS_VERSION_KV_MAX_GAP"] else None
     ),
-    "train_argv": json.loads(os.environ["TRAIN_ARGS_JSON"]),
+    "train_argv": train_argv,
+    "expected_topology": {
+        "rollout_total_gpus": rollout_total_gpus,
+        "rollout_gpus_per_engine": rollout_gpus_per_engine,
+        "rollout_receiver_count": rollout_total_gpus // rollout_gpus_per_engine,
+        "group_world_size": 1 + rollout_total_gpus,
+    },
     # Do not persist arbitrary runtime env values: callers may inject service
     # credentials into RUNTIME_ENV_JSON.  Only attest the experiment controls.
     "runtime_env_attestation": {
@@ -393,3 +438,8 @@ printf '%s\n' "RUNNING" > "$TASK22_LOCAL_RUN_DIR/STATUS"
     --runtime-env-json="$RUNTIME_ENV_JSON" \
     -- "$TASK22_PYTHON" -m relax.entrypoints.train \
     "${TRAIN_ARGS[@]}" 2>&1 | tee "$TASK22_LOCAL_RUN_DIR/driver.log"
+
+"$TASK22_PYTHON" "$REPO/scripts/task22/analyze_pr211_integration_run.py" \
+    --run-contract "$TASK22_LOCAL_RUN_DIR/run_contract.json" \
+    --driver-log "$TASK22_LOCAL_RUN_DIR/driver.log" \
+    --output "$TASK22_LOCAL_RUN_DIR/analysis_pr211_integration.json"
