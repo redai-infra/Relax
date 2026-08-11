@@ -1759,11 +1759,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         windows = _parse_windows(args.steady_windows)
-        if (
-            args.expected_samples <= 0
-            or args.expected_actor_chunks <= 0
-            or args.expected_gpu_count <= 0
-        ):
+        if args.expected_samples <= 0 or args.expected_actor_chunks <= 0 or args.expected_gpu_count <= 0:
             _fail("expected sample, actor chunk, and GPU counts must be positive")
         if len(args.run_dir) > 1 and args.output_dir is None:
             _fail("--output-dir is required when comparing multiple runs")
