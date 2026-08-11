@@ -1197,6 +1197,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--disable-early-prefetch",
+                action="store_true",
+                default=False,
+                help=(
+                    "By default, the cross-step rollout prefetch (data_buffer.get_samples, plus "
+                    "dedup image-processor encoding when --dedup-multimodal-preprocess is on) is "
+                    "submitted as soon as this step's own dedup-encoding phase finishes (still "
+                    "mid-step, before generation/reward-scoring/transfer complete), maximizing its "
+                    "head start. Set this to fall back to the old behavior: submit it only after "
+                    "the whole step (generation + reward scoring + transfer) has finished. Exists "
+                    "for A/B benchmarking the timing change in isolation from "
+                    "--dedup-multimodal-preprocess itself."
+                ),
+            )
+            parser.add_argument(
                 "--pin-multimodal-h2d-copy",
                 action="store_true",
                 default=False,
