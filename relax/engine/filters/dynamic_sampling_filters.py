@@ -18,6 +18,14 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     multi-reward algorithm it is whether *every* component is flat; judging
     those by the summed scalar would drop the groups the algorithm exists to
     keep.
+
+    Note this can now raise rather than merely returning a verdict: for a
+    multi-reward algorithm it runs the same component extraction the reward
+    stage does, which rejects malformed rewards. `call_dynamic_filter` does not
+    catch, so a broken reward function fails the rollout here instead of a few
+    lines later in `post_process_rewards`. That is the same failure, earlier and
+    attributed to the group that caused it -- but it does mean this filter is no
+    longer guaranteed to be side-effect-free on bad data.
     """
     keep = group_carries_reward_signal(args, samples)
     return DynamicFilterOutput(

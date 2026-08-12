@@ -228,12 +228,37 @@ def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
     Each column is standardised on its own. A column that is flat across the
     group contributes exactly zero rather than ``0 / (0 + eps)`` noise, which
     is what lets the remaining columns keep their signal.
+
+    The arithmetic runs in float64, for the same reason
+    :func:`relax.algorithms.numerics.distributed_mean_std` does: the means and
+    stds are the part where cancellation bites, and widening them is cheap.
+
+    It does **not** fix the related failure worth knowing about. Two columns
+    that sum to a constant should standardise to exact opposites and cancel,
+    and in float64 they do -- exactly. But the columns arrive already cast to
+    float32 by :func:`extract_reward_components`, and a value like
+    ``C - r`` does not survive that cast unchanged. The pair still *sums* to
+    ``C`` in float32 (the addition rounds back), so the group looks flat, while
+    the individual values have drifted enough to leave a residue of order 1e-4
+    after standardisation. Step 3 then divides that residue by a batch std of
+    the same order and returns advantages of order 1: a group with no signal
+    gets a confident gradient whose direction is decided by rounding.
+
+    Measured on rewards summing to 308.95172119140625, the batch comes out as
+    [-0.4344, 0.5251, -0.0908]. GRPO does not have this failure, because it
+    standardises the sum, which *is* exactly constant, and its collapse check
+    catches it. Raising the precision here does not help -- the information was
+    lost before this function saw it. Documented in examples/gdpo/README.md
+    under the deviations; fixing it needs either a wider reward dtype end to
+    end or a noise floor in step 3, neither of which belongs in this PR.
     """
-    centered = group - group.mean(dim=0, keepdim=True)
-    std = group.std(dim=0)
+    work = group.double()
+    centered = work - work.mean(dim=0, keepdim=True)
+    std = work.std(dim=0)
     collapsed = collapsed_columns(group, dim=0)
     scaled = centered / (std + GDPO_EPS)
-    return torch.where(collapsed.unsqueeze(0), torch.zeros_like(scaled), scaled)
+    scaled = torch.where(collapsed.unsqueeze(0), torch.zeros_like(scaled), scaled)
+    return scaled.to(group.dtype)
 
 
 def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[float]) -> list[float]:

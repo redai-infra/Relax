@@ -251,6 +251,12 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
         advantage_fn="gae",
         policy_loss_fn="ppo_clip",
         needs_critic=True,
+        # `validate_ppo_config` in `relax/utils/training/ppo_utils.py` rejects
+        # both --fully-async and --hybrid for PPO. Declaring it means argument
+        # validation says so up front instead of the Controller saying it at
+        # service-registration time, and stops the spec from asserting the
+        # opposite by omission.
+        supports_fully_async=False,
     ),
     "reinforce_plus_plus": AlgorithmSpec(
         name="reinforce_plus_plus",

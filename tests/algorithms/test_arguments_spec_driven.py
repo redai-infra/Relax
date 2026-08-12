@@ -472,7 +472,7 @@ def test_supports_fully_async_is_declared_wherever_it_is_false():
     from relax.algorithms import get_algorithm, list_algorithm_names
 
     unsupported = {n for n in list_algorithm_names() if not get_algorithm(n).supports_fully_async}
-    assert unsupported == {"gdpo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+    assert unsupported == {"gdpo", "ppo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
 
 
 def test_dynamic_sampling_filter_warns_for_multi_reward(arguments_module, caplog):
@@ -525,3 +525,21 @@ def test_yaml_cannot_bypass_the_frozen_reinforce_plus_plus_contract(arguments_mo
     )
     with pytest.raises(ValueError, match="custom-reward-post-process-path"):
         arguments_module.apply_custom_config_overrides(args)
+
+
+def test_a_typo_in_advantage_normalization_is_rejected(arguments_module):
+    """It is not a lookup key, so a typo would otherwise pass validation.
+
+    `advantage_normalization` selects between masked whitening and
+    REINFORCE++'s token-global normalisation in `loss.py`. An unrecognised
+    value there does not raise -- it falls through to the default branch and
+    quietly trains with different maths, which is the failure this whole
+    registry exists to remove.
+    """
+    import dataclasses
+
+    from relax.algorithms import get_algorithm
+
+    broken = dataclasses.replace(get_algorithm("grpo"), advantage_normalization="typo")
+    with pytest.raises(ValueError, match="advantage_normalization"):
+        arguments_module._assert_spec_implementations_resolve(broken)

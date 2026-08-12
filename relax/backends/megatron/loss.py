@@ -12,7 +12,6 @@ from torch.utils.checkpoint import checkpoint
 from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
-from relax.backends.megatron.data import ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -601,7 +600,14 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         # rollout. Passing them is what lets a batch-level statistic describe one
         # batch instead of the whole merged rollout; estimators that do not have
         # one absorb this in **_unused.
-        mini_batch_sizes=rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY),
+        # The key is spelled out rather than imported from
+        # `relax.backends.megatron.data`: that module pulls in
+        # `megatron.core.packed_seq_params` at import time, and the CPU-only
+        # tests for this file stub `megatron.core` without that submodule, so
+        # importing it for one string makes `loss.py` unimportable for them.
+        # `test_loss_py_uses_the_canonical_mini_batch_key` pins this literal to
+        # the definition so the two cannot drift.
+        mini_batch_sizes=rollout_data.get("rollout_mini_local_sample_counts"),
     )
 
     # Optional pure OPD mode: remove all non-OPD reward contribution.

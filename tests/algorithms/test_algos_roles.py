@@ -133,3 +133,28 @@ def test_each_algorithm_gets_an_independent_role_dict():
     names = list_algorithm_names()
     for left, right in zip(names, names[1:], strict=False):
         assert ALGOS[left] is not ALGOS[right], f"{left} and {right} share one dict object"
+
+
+def test_loss_py_uses_the_canonical_mini_batch_key():
+    """`loss.py` spells the key out; this pins it to the definition.
+
+    Importing `ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY` from
+    `relax.backends.megatron.data` would be the obvious way to avoid a
+    duplicated literal, but that module imports
+    `megatron.core.packed_seq_params` at module scope, and the CPU-only tests
+    for `loss.py` stub `megatron.core` without it -- one import for one string
+    made `loss.py` unimportable for them. Comparing the source text keeps the
+    two in sync without either file importing the other, and works on a runner
+    with no megatron at all.
+    """
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    data_src = (root / "relax" / "backends" / "megatron" / "data.py").read_text(encoding="utf-8")
+    match = re.search(r'ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY\s*=\s*"([^"]+)"', data_src)
+    assert match, "the canonical key definition moved or changed shape"
+
+    loss_src = (root / "relax" / "backends" / "megatron" / "loss.py").read_text(encoding="utf-8")
+    assert f'"{match.group(1)}"' in loss_src, (
+        f"loss.py no longer reads the canonical key {match.group(1)!r}; the literal drifted"
+    )

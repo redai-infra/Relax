@@ -548,7 +548,11 @@ def test_loss_py_actually_forwards_the_mini_batch_boundaries():
 
     call = re.search(r"compute_advantages_and_returns_impl\((.*?)\n    \)", src, re.DOTALL)
     assert call, "compute_advantages_and_returns_impl call not found"
-    assert "mini_batch_sizes=rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)" in call.group(1), (
+    # The key is a literal in loss.py, not the imported constant: importing it
+    # from `megatron.data` drags in `megatron.core.packed_seq_params` and makes
+    # loss.py unimportable for its own CPU tests. `test_algos_roles.py` pins the
+    # literal to the definition.
+    assert 'mini_batch_sizes=rollout_data.get("rollout_mini_local_sample_counts")' in call.group(1), (
         "loss.py must pass the per-training-batch counts; without them GDPO's step 3 "
         "normalises over the whole merged rollout again"
     )

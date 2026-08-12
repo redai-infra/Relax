@@ -2999,6 +2999,18 @@ def _assert_spec_implementations_resolve(spec) -> None:
                 f"Available: {sorted(table)}."
             )
 
+    # Not a lookup key, so the loop above cannot cover it, but it has the same
+    # failure mode and a worse consequence: a typo does not raise, it silently
+    # selects the default branch in `relax/backends/megatron/loss.py` and
+    # changes the training maths.
+    valid_normalizations = {"whiten", "token_global"}
+    if spec.advantage_normalization not in valid_normalizations:
+        raise ValueError(
+            f"Algorithm {spec.name!r} declares advantage_normalization="
+            f"{spec.advantage_normalization!r}, which is not a known mode. "
+            f"Available: {sorted(valid_normalizations)}."
+        )
+
 
 def validate_algorithm_args(args) -> None:
     """Apply the constraints the algorithm registry declares for this run.
