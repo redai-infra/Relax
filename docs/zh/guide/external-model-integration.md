@@ -110,7 +110,7 @@ MISC_ARGS=(...)
 - `--fully-async`
 - `--hybrid`
 
-纯 fully async 不支持 `--balance-data`；需要数据均衡时使用 colocate 或 hybrid。
+全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会自动在 DP rank 间做 token 均衡。`--balance-data` 仍适用于静态/序列长度均衡路径；在动态 batch 路径上传入该 flag 是允许的，但不会额外改变行为。
 
 ## 对齐验证
 

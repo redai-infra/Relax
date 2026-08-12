@@ -110,7 +110,7 @@ Choose exactly one execution mode:
 - `--fully-async`
 - `--hybrid`
 
-Pure fully async mode does not support `--balance-data`; use colocate or hybrid when data balancing is required.
+In fully async with `--use-dynamic-batch-size`, the dynamic batch path automatically balances tokens across DP ranks. `--balance-data` remains useful on the static/seqlen-balanced path and is accepted without extra effect on dynamic batching.
 
 ## Alignment
 
