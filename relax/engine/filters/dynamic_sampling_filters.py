@@ -12,10 +12,12 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     """Drop prompt groups whose rewards carry no signal for this algorithm.
 
     "No signal" is algorithm-dependent, which is why the test is not spelled
-    out here. For a single-reward algorithm it is the standard deviation of the
-    ``--reward-key`` scalar, exactly as before. For a multi-reward algorithm it
-    is whether *every* component is flat -- judging those by the summed scalar
-    would drop the groups the algorithm exists to keep.
+    out here. For a single-reward algorithm it is whether the ``--reward-key``
+    scalar varies in float32 -- equivalent to the ``std > 0`` this replaced,
+    since ``min == max`` and ``std == 0`` agree on every float32 input. For a
+    multi-reward algorithm it is whether *every* component is flat; judging
+    those by the summed scalar would drop the groups the algorithm exists to
+    keep.
     """
     keep = group_carries_reward_signal(args, samples)
     return DynamicFilterOutput(

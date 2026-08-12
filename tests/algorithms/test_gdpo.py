@@ -72,8 +72,15 @@ def _manual_gdpo(correctness, fmt, groups, weights=(1.0, 1.0)):
             mean = sum(vals) / len(vals)
             var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
             std = math.sqrt(var)
-            scale = max(abs(v) for v in vals)
-            collapsed = std <= 1e-6 * scale
+            # Exact equality, matching the implementation. A relative tolerance
+            # here would make the oracle disagree with the code on precisely the
+            # inputs where the choice matters -- a narrow continuous column with
+            # std near 1e-6 * scale, which the oracle would zero and the
+            # implementation would keep. The existing cases are binary rewards,
+            # whose std is either exactly 0 or >= 0.5, so the two criteria never
+            # diverge there and the mismatch would go unnoticed until someone
+            # added a continuous case and mistrusted the wrong side.
+            collapsed = max(vals) == min(vals)
             # 1e-4, hardcoded on purpose: this oracle exists to pin parity with
             # the reference implementation (trl grpo_trainer.py's scale_rewards
             # GDPO path divides by std + 1e-4 at both steps), so importing our

@@ -5,10 +5,13 @@
 # Qwen3-0.6B single-GPU GDPO training on GSM8K.
 #
 # GDPO (arXiv 2601.05242) standardizes each reward component within its prompt
-# group before combining them, so a group whose rollouts share the same summed
-# reward but differ in their components still carries signal -- e.g. (correct,
-# badly formatted) and (wrong, well formatted) both sum to 1, which GRPO flattens
-# to nothing. The reward function in reward_gdpo.py returns both components;
+# group before combining them. That keeps two things GRPO's single
+# standardization of the summed reward loses: the relative strength between
+# groups (per-group standardization forces every group to unit variance), and
+# the balance between components of very different scale. It does NOT rescue a
+# group whose components sum to a constant -- those cancel to zero under equal
+# weights, same as GRPO. See examples/gdpo/README.md.
+# The reward function in reward_gdpo.py returns both components;
 # --gdpo-reward-keys names them.
 #
 # Usage:

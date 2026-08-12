@@ -2,13 +2,24 @@
 
 """Two-component reward for the GDPO example: correctness and format.
 
-GDPO standardizes each component within its prompt group before combining them,
-so a group whose rollouts differ in their reward *components* but share the same
-*summed* reward still carries a learning signal. Example: (correct, badly
-formatted) and (wrong, well formatted) both sum to 1 -- GRPO sees one constant
-summed reward and the whole group contributes nothing, while GDPO keeps each
-component's signal. (If every component is constant within the group, GDPO
-returns zero too.)
+GDPO standardizes each component within its prompt group before combining them.
+Two things survive that GRPO's single standardization of the summed reward
+destroys:
+
+* **Relative strength between groups.** Standardizing per group forces every
+  group to unit variance, so a group where only `correctness` varies and one
+  where both components vary come out identical. Standardizing each component
+  first makes the latter twice the amplitude, and step 3 whitens across the
+  *batch*, so the difference reaches the final advantage.
+* **Scale disparity between components.** A `correctness` in {0, 1} added to a
+  reward in the hundreds gives a sum whose variance is essentially the large
+  component's, so GRPO's direction is decided by it alone.
+
+What GDPO does *not* do: rescue a group whose components sum to a constant.
+There `format = C - correctness` forces the standardized values to be exact
+opposites, and equal weights cancel them to zero -- the same answer GRPO
+gives. Only unequal weights break that tie. (If every component is constant
+within the group, GDPO returns zero too.)
 
 Wire it up with::
 
@@ -55,8 +66,14 @@ def compute_gdpo_reward(response: str, label: Any) -> dict[str, float]:
     """Score one response on answer correctness and on output format.
 
     The two components are deliberately decorrelated: a response can be correct
-    without the expected tags, and well-formatted while wrong. That is the
-    situation GDPO handles better than a summed reward.
+    without the expected tags, and well-formatted while wrong.
+
+    ``score`` is ``correctness`` rather than the sum, on purpose. It feeds
+    ``--reward-key``, which selects the scalar for metrics and the
+    ``raw_reward`` column only -- it does not participate in the GDPO
+    computation, which reads the two components directly. Reporting accuracy
+    there is more legible on a dashboard than a blended number. Note this means
+    ``rollout/raw_reward`` tracks correctness alone, not overall reward.
     """
     answer = _extract_answer(response)
     correctness = 1.0 if answer is not None and answer == _final_answer(label) else 0.0

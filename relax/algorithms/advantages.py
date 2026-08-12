@@ -66,8 +66,18 @@ def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | No
 
 
 def _as_reward_tensor(rewards: Any, kl: list[torch.Tensor]) -> torch.Tensor:
+    """Rewards as a detached float32 tensor on the KL tensors' device.
+
+    ``detach()`` is load-bearing, not defensive. The pre-registry code built
+    this with ``torch.tensor(rewards, ...)``, which copies and drops autograd
+    history even when handed a tensor. ``.to()`` returns the *same* object when
+    dtype and device already match, so without the detach a caller passing a
+    reward tensor with ``requires_grad=True`` would get advantages that carry
+    grad history into the policy loss -- a path that did not exist before and
+    that no caller asks for. Rewards are data, not something to backprop into.
+    """
     if isinstance(rewards, torch.Tensor):
-        return rewards.to(dtype=torch.float32, device=kl[0].device)
+        return rewards.detach().to(dtype=torch.float32, device=kl[0].device)
     return torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
 
 
@@ -137,6 +147,23 @@ def _whiten_by_segment(values, mini_batch_sizes, process_group):
     data, so every rank is expected to run the same number of segments;
     :func:`_agree_on_segmentation` is what turns that expectation into a
     checked precondition rather than a deadlock.
+
+    What it checks is the segment *count*, not segment *identity*. Two further
+    properties are relied on and not verified here:
+
+    * Segment ``k`` holds training batch ``k`` on every rank. ``actor.py``
+      fetches batches in ``batch_index`` order and appends the counts in that
+      same order, so the orders agree; nothing in this function would notice if
+      they stopped agreeing, and the failure would be silent -- statistics
+      mixed across two training batches, no error.
+    * A segment's sample count may differ between ranks (a data-parallel split
+      balances tokens, not samples) and that is fine, because the statistic is
+      reduced across the group. What is not fine is two ranks disagreeing about
+      *which* batch a segment belongs to.
+
+    Both are guaranteed upstream rather than here because checking identity
+    would need a batch id in the metadata, which the plan does not currently
+    carry. If that metadata ever appears, fold it into the same MAX reduction.
     """
     # Validate whatever was passed, including a single segment: treating an empty
     # or malformed list as "fall back to one window" would silently restore the

@@ -296,7 +296,13 @@ $$A_\text{sum}^{(i,j)} = \sum_k w_k A_k^{(i,j)}$$
 
 $$\hat{A}^{(i,j)} = \frac{A_\text{sum}^{(i,j)} - \mathrm{mean}_\text{batch}}{\mathrm{std}_\text{batch} + \epsilon}$$
 
-**相对 GRPO 的收益**：当一组 rollout 的各**分量不同、但总和恰好相同**时（例如 `(1,0)` 与 `(0,1)` 都求和为 1），GRPO 看到的组内总奖励无差异、整组 advantage 归零被丢弃；GDPO 对每个分量单独标准化，仍能保留各分量的学习信号。若某个分量在组内恒定，则只有**该分量**贡献 0、其它分量照常提供信号；若**所有**分量都恒定，GDPO 与 GRPO 一样返回零。
+**相对 GRPO 的收益**：GRPO 把各分量相加后只做一次组内标准化，这会丢掉两类信息。
+
+*一是组间的相对强度*：组内标准化把每一组都拉到单位方差，于是「只有一个分量在变」的组与「两个分量都在变」的组得到完全相同的 advantage。GDPO 让各分量先各自标准化，后者幅度自然是两倍；而第三步的 batch 白化是**跨组**的，这个差异会保留到最终 advantage。实测（G=2，一个 batch 两组）：GRPO 两组同为 ±0.707，GDPO 分别为 ±0.548 与 ±1.095。
+
+*二是分量间的尺度差异*：`correctness ∈ {0,1}` 与一个取值上百的分量（论文实验用响应长度）相加时，和的方差几乎全部来自后者，GRPO 的方向由它单独决定；GDPO 先让每个分量单位方差，权重才真正表达相对重要性而非量纲。
+
+**GDPO 做不到什么**：若各分量在组内**恰好加和为常数**（`r₂ = C − r₁`），标准化后恒有 `z₂ = −z₁`，等权重下**完全抵消为零**，与 GRPO 结果相同——只有不等权重能在这类组上取得信号。若**所有**分量都恒定，GDPO 同样返回零。
 
 **关于 $\epsilon$**：GDPO 的两步都用 $\epsilon = 10^{-4}$，与参考实现（TRL `GRPOTrainer` 的 `scale_rewards` GDPO 分支）一致，而 GRPO / GSPO / SAPO / CISPO 沿用本仓库既有的 $10^{-6}$。两者的差别只在近乎塌缩的组上显现：二值 reward、组大小 8 时组内标准差约 0.4，两个取值的差异是 0.02%；但连续 reward（论文的数学实验用响应长度）可能让某组的标准差落到 $10^{-3}$ 量级，此时 $10^{-4}$ 会把该组的信号额外压低约 7%，而 $10^{-6}$ 只压低 0.08%。**完全**塌缩的组不会走到这个除法——它们由 exact 相等判定后直接置零。
 
@@ -345,7 +351,9 @@ GDPO_ARGS=(
 - 不能与 `--agentic-custom-advantage-path` 同用：`post_process_rewards` 里的第二个早返回点，同样赶在归一化器之前返回，后果与上一条相同。两者由 `AlgorithmSpec.allows_reward_post_process_hooks` 一起把守。
 - 不能与 `--fully-async` 同用（见上）。
 
-以上都会在参数校验阶段直接报错。配合 `--dynamic-sampling-filter-path` 时会给出警告：内置的 `check_reward_nonzero_std` 只看 `--reward-key` 那一个标量，可能丢掉只存在于其它分量的信号。
+以上都会在参数校验阶段直接报错。
+
+`--dynamic-sampling-filter-path` **不**冲突：内置的 `check_reward_nonzero_std` 已经是分量感知的，它直接算出 GDPO 前两步的组合结果、按其是否非零判定，因此与训练实际拿到的信号一致。只有指向**自定义** filter 时才会给出警告——那种 filter 若只看 `--reward-key` 标量，就会丢掉只存在于其它分量的信号。
 
 ---
 

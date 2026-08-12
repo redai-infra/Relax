@@ -222,6 +222,20 @@ def extract_reward_components(samples: list[Any], keys: list[str]) -> torch.Tens
     return components
 
 
+def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
+    """GDPO step 1 on one ``[G, K]`` prompt group (arXiv 2601.05242, Eq. 4).
+
+    Each column is standardised on its own. A column that is flat across the
+    group contributes exactly zero rather than ``0 / (0 + eps)`` noise, which
+    is what lets the remaining columns keep their signal.
+    """
+    centered = group - group.mean(dim=0, keepdim=True)
+    std = group.std(dim=0)
+    collapsed = collapsed_columns(group, dim=0)
+    scaled = centered / (std + GDPO_EPS)
+    return torch.where(collapsed.unsqueeze(0), torch.zeros_like(scaled), scaled)
+
+
 def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[float]) -> list[float]:
     """GDPO steps 1 and 2 (arXiv 2601.05242, Eq. 4 and Eq. 7).
 
@@ -231,10 +245,20 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     TransferQueue schema change.  Step 3 (batch whitening) runs later, in
     :func:`relax.algorithms.advantages.advantage_gdpo`.
 
-    Standardising per component before combining is what separates GDPO from
-    GRPO: when one component collapses within a group, only that component
-    contributes zero, while GRPO's summed reward would collapse and discard the
-    whole group.
+    What standardising per component actually buys, stated carefully because
+    it is easy to overclaim: the combined advantage is ``sum_k w_k * z_k``,
+    where each ``z_k`` has unit variance within the group. GRPO instead
+    standardises ``sum_k r_k``, so a component with a large spread dominates
+    the direction. When the components have comparable spread the two agree up
+    to a positive scalar; they diverge when the spreads differ, which is the
+    case GDPO is for -- a correctness reward in ``{0, 1}`` combined with a
+    length reward in the hundreds is decided almost entirely by length under
+    GRPO, and half by each under GDPO.
+
+    It does **not** rescue a group whose components sum to a constant. There
+    ``r_2 = C - r_1`` forces ``z_2 = -z_1``, so equal weights cancel to exactly
+    zero -- the same answer GRPO gives. Unequal weights break the tie; equal
+    weights cannot.
     """
     keys = resolve_gdpo_keys(args)
     weights = resolve_gdpo_weights(args, keys)
@@ -246,12 +270,8 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     fully_collapsed_groups = 0
     for positions in positions_by_group.values():
         group = components[positions]
-        centered = group - group.mean(dim=0, keepdim=True)
-        std = group.std(dim=0)
-        collapsed = collapsed_columns(group, dim=0)
-        scaled = centered / (std + GDPO_EPS)
-        normalized[positions] = torch.where(collapsed.unsqueeze(0), torch.zeros_like(scaled), scaled)
-        if bool(collapsed.all()):
+        normalized[positions] = standardize_group_components(group)
+        if bool(collapsed_columns(group, dim=0).all()):
             fully_collapsed_groups += 1
 
     if fully_collapsed_groups == len(positions_by_group):
@@ -269,7 +289,36 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
         )
 
     weight_tensor = torch.tensor(weights, dtype=torch.float32)
-    return (normalized * weight_tensor).sum(dim=1).tolist()
+    if not torch.isfinite(weight_tensor).all():
+        # `resolve_gdpo_weights` checked `math.isfinite` on the Python floats.
+        # That is a different question: 1e300 is finite in float64 and `inf`
+        # once it lands in this tensor.
+        raise ValueError(
+            f"--gdpo-reward-weights {weights} contains a value that overflows float32; "
+            f"the largest representable is {_FLOAT32_MAX:.6g}."
+        )
+    if float(weight_tensor.abs().sum()) == 0.0:
+        # Same gap in the other direction: 1e-50 is a nonzero Python float that
+        # flushes to zero in float32, so a weight vector that passed the
+        # "not all zero" check can still be all zeros by the time it multiplies.
+        raise ValueError(
+            f"--gdpo-reward-weights {weights} are all zero once cast to float32; "
+            "the combined advantage would be identically 0."
+        )
+
+    combined = (normalized * weight_tensor).sum(dim=1)
+    if not torch.isfinite(combined).all():
+        # Every individual reward fit in float32 (checked in
+        # `extract_reward_components`), but the arithmetic between them need
+        # not: a group of [3e38, 2e38, 1e38, 0] overflows while computing its
+        # own mean. Left unchecked the `inf` reaches `whiten_scalar`, reads as
+        # a non-finite std, and the batch is silently zeroed -- the exact
+        # failure the per-value check was added to prevent, one stage later.
+        raise ValueError(
+            "GDPO produced a non-finite combined advantage from finite inputs; the float32 "
+            f"arithmetic overflowed. Rescale the rewards (keys={keys}) or their weights."
+        )
+    return combined.tolist()
 
 
 def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
@@ -281,30 +330,50 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
     single scalar ``--reward-key`` selects, which is the right question only
     for an algorithm that consumes that scalar.
 
-    A multi-reward algorithm standardises each component separately, so a group
-    is dead only when *every* component is flat. Judging GDPO by the summed
-    scalar throws away exactly the groups it exists to keep: ``(1, 0)`` and
-    ``(0, 1)`` have identical sums and different components.
+    For a multi-reward algorithm the honest test is not "did any component
+    vary" but "is the combined advantage this algorithm will actually compute
+    non-zero". Those differ: a zero weight mutes a varying component, and two
+    components whose standardised values are exact opposites cancel. Asking
+    the cheaper question keeps groups that then contribute no gradient, and
+    under-reports the zero-std metrics. Steps 1 and 2 are per-group and cheap,
+    so this runs them.
 
-    The two consumers did not previously agree on the single-reward test:
-    ``check_reward_nonzero_std`` used ``std > 0``, the zero-std metrics used
-    exact equality. This unifies them on exact equality, matching
-    :func:`relax.algorithms.numerics.is_collapsed` and for the same reason --
-    a tolerance wide enough to absorb float error also discards real signal,
-    and the two answers differ only for a group that is exactly flat yet whose
-    computed standard deviation is not exactly 0.
+    The single-reward test is deliberately performed **in float32**, on a
+    tensor, rather than on the Python floats. That is the precision the reward
+    actually reaches training in (:func:`_group_normalize` casts to float32,
+    and so does the GDPO path), so it is the precision that decides whether a
+    group will still carry signal by the time it matters.
+
+    Comparing the float64 values instead is not a harmless tightening: it flips
+    the verdict for any group whose spread survives in float64 but collapses on
+    cast -- ``[0.1 + 0.2, 0.3, ...]`` is the everyday example, and a group of
+    NaNs is the pathological one (``nan != nan`` reads as signal). Both would
+    be kept and then contribute a zero gradient. Judging on the tensor keeps
+    this identical to the ``std > 0`` test it replaces: ``min == max`` and
+    ``std == 0`` agree on every float32 input.
     """
     if not samples:
         return False
 
     spec = get_algorithm(args.advantage_estimator)
     if not spec.uses_reward_components:
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return any(reward != rewards[0] for reward in rewards)
+        rewards = torch.tensor([sample.get_reward_value(args) for sample in samples], dtype=torch.float32)
+        if not torch.isfinite(rewards).all():
+            # A group containing NaN or inf reads as "varying" under any
+            # inequality test (`nan != nan` is True), which would forward a
+            # broken reward into training. `std > 0` answered False here
+            # because the std is itself NaN, so False preserves that. Raising
+            # would arguably be better -- a non-finite reward is a bug in the
+            # reward function, not a property of the group -- but that is a
+            # behaviour change this refactor is not the place for.
+            return False
+        return bool(rewards.amin() != rewards.amax())
 
     keys = resolve_gdpo_keys(args)
+    weights = torch.tensor(resolve_gdpo_weights(args, keys), dtype=torch.float32)
     components = extract_reward_components(samples, keys)
-    return bool((~collapsed_columns(components, dim=0)).any())
+    combined = (standardize_group_components(components) * weights).sum(dim=1)
+    return bool((combined != 0).any())
 
 
 REWARD_NORMALIZERS: dict[str, Callable[[Any, list[Any], list[float]], list[float]]] = {

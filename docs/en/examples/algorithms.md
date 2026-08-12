@@ -299,7 +299,13 @@ The weights multiply the **normalized** advantages, not the raw rewards. After s
 
 $$\hat{A}^{(i,j)} = \frac{A_\text{sum}^{(i,j)} - \mathrm{mean}_\text{batch}}{\mathrm{std}_\text{batch} + \epsilon}$$
 
-**Why this beats GRPO:** when one component is constant across a group (reward collapse), GRPO's summed reward collapses too, the whole group's advantages go to zero, and the samples are wasted. Under GDPO only *that component* contributes zero while the others still carry signal.
+**Why this beats GRPO:** summing first and standardizing once discards two things.
+
+*Relative strength between groups.* Per-group standardization forces every group to unit variance, so a group where only one component varies and a group where both vary come out identical. Standardizing each component first makes the latter twice the amplitude, and step 3 whitens across the *batch*, so the difference survives into the final advantage. Measured (G=2, two groups in one batch): GRPO gives both groups ±0.707; GDPO gives ±0.548 and ±1.095.
+
+*Scale disparity between components.* A `correctness` in {0, 1} added to a reward in the hundreds (the paper's maths setup scores response length) yields a sum whose variance is essentially the large component's, so GRPO's direction is decided by it alone. GDPO gives each component unit variance first, so a weight expresses relative importance rather than units.
+
+**What GDPO does not do:** rescue a group whose components sum to a constant. There `r₂ = C − r₁` forces `z₂ = −z₁`, so equal weights cancel to exactly zero — the same answer GRPO gives. Only unequal weights break that tie. If *every* component is constant, GDPO returns zero as well.
 
 **On $\epsilon$:** GDPO uses $\epsilon = 10^{-4}$ at both steps, matching the reference implementation (the `scale_rewards` GDPO branch of TRL's `GRPOTrainer`), whereas GRPO / GSPO / SAPO / CISPO keep this repository's existing $10^{-6}$. The two only diverge on near-degenerate groups: with binary rewards and a group of 8 the within-group standard deviation is around 0.4 and the constants differ by 0.02%, but a continuous reward (the paper's maths setup scores response length) can leave a group at a standard deviation of ~$10^{-3}$, where $10^{-4}$ damps that group's signal by about 7% against 0.08% for $10^{-6}$. Groups that collapse *exactly* never reach this division; they are detected by exact equality and zeroed.
 
@@ -348,7 +354,9 @@ Two differences between this implementation and the paper. Confirm they are acce
 - `--agentic-custom-advantage-path`: the second early return in `post_process_rewards`, which likewise returns ahead of the normalizer, with the same consequence. One flag, `AlgorithmSpec.allows_reward_post_process_hooks`, guards both.
 - `--fully-async`: see above.
 
-All of these fail during argument validation. Combining it with `--dynamic-sampling-filter-path` logs a warning instead: the built-in `check_reward_nonzero_std` judges a group by the single `--reward-key` scalar and may drop groups whose signal lives in the other components.
+All of these fail during argument validation.
+
+`--dynamic-sampling-filter-path` does **not** conflict: the built-in `check_reward_nonzero_std` is component-aware, computing what GDPO's first two steps actually produce and keeping the group only when that is non-zero, so its verdict matches the signal training receives. A warning is logged only for a *custom* filter, which may reduce the group to the single `--reward-key` scalar and drop groups whose signal lives in the other components.
 
 ---
 

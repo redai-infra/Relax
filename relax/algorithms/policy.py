@@ -23,7 +23,8 @@ from relax.utils.training.ppo_utils import (
 
 
 def policy_loss_ppo_clip(args: Any, *, log_probs, ppo_kl, advantages):
-    """Standard clipped surrogate objective (GRPO, GSPO, GDPO, REINFORCE++)."""
+    """Standard clipped surrogate objective (GRPO, GSPO, GDPO, PPO,
+    REINFORCE++)."""
     return compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
 

@@ -259,6 +259,13 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
         advantage_fn="reinforce_plus_plus",
         policy_loss_fn="ppo_clip",
         requires_normalize_advantages=True,
+        # `_validate_reinforce_plus_plus_args` also rejects --fully-async for
+        # this estimator. Declaring it here as well is not redundant: an
+        # undeclared field defaults to True, i.e. the spec would actively state
+        # something false about the algorithm, and any future reader of the
+        # spec would believe it. That function still runs first and still owns
+        # the wording its tests match on.
+        supports_fully_async=False,
     ),
     "reinforce_plus_plus_baseline": AlgorithmSpec(
         name="reinforce_plus_plus_baseline",
@@ -267,15 +274,18 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
         advantage_fn="reinforce_plus_plus_baseline",
         policy_loss_fn="ppo_clip",
         requires_normalize_advantages=True,
-        # `_validate_reinforce_plus_plus_args` in `relax/utils/arguments.py`
-        # already enforces these by hand, and it is a frozen Task 29 contract
-        # that owns the wording its tests match on. Declaring them here is
-        # still not redundant: an undeclared field is not neutral, it asserts
-        # the default -- leaving them out would have this spec state that the
-        # estimator runs fine with `--disable-rewards-normalization` and a
-        # group of one, both false. The frozen function runs first on both
-        # validation paths, so its messages still win.
+        # These five are also enforced by hand in
+        # `_validate_reinforce_plus_plus_args`, a frozen Task 29 contract that
+        # owns the wording its tests match on. They were left undeclared at
+        # first to avoid replacing that wording -- but an undeclared field is
+        # not neutral, it *asserts the default*, so the spec was stating five
+        # things about this estimator that are false. Both validation paths now
+        # run the frozen function first (the main one always did;
+        # `apply_custom_config_overrides` was fixed to match), so its messages
+        # still win and the spec can stop lying.
+        supports_fully_async=False,
         requires_rewards_normalization=True,
+        allows_reward_post_process_hooks=False,
         min_group_size=2,
         forbids_reward_side_kl=True,
     ),

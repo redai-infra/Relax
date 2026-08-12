@@ -441,11 +441,18 @@ def test_other_estimators_are_unaffected_by_fully_async(arguments_module, estima
     arguments_module.validate_algorithm_args(args)
 
 
-def test_supports_fully_async_defaults_to_true():
+def test_supports_fully_async_is_declared_wherever_it_is_false():
+    """The set must match what validation actually rejects.
+
+    An undeclared field defaults to True, which is an assertion, not silence:
+    the REINFORCE++ variants are rejected under --fully-async by
+    `_validate_reinforce_plus_plus_args`, so leaving them at the default would
+    make the spec state the opposite of the behaviour.
+    """
     from relax.algorithms import get_algorithm, list_algorithm_names
 
     unsupported = {n for n in list_algorithm_names() if not get_algorithm(n).supports_fully_async}
-    assert unsupported == {"gdpo"}
+    assert unsupported == {"gdpo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"}
 
 
 def test_dynamic_sampling_filter_warns_for_multi_reward(arguments_module, caplog):
@@ -465,3 +472,36 @@ def test_no_warning_without_a_filter(arguments_module, caplog):
         arguments_module.validate_algorithm_args(_args())
 
     assert not any("dynamic-sampling-filter-path" in r.message for r in caplog.records)
+
+
+def test_yaml_cannot_bypass_the_frozen_reinforce_plus_plus_contract(arguments_module, tmp_path):
+    """The YAML re-check must run *both* validators, like the main path does.
+
+    `reinforce_plus_plus_baseline` keeps three of its constraints in
+    `_validate_reinforce_plus_plus_args` instead of in its spec, precisely so
+    that function keeps owning its frozen wording. That decision opens a hole
+    if the override path re-runs only the spec-driven validator: a YAML file
+    could switch to that estimator and enable a reward hook it forbids, and
+    neither validator would object -- the spec because it is deliberately
+    silent, the frozen one because it never ran.
+    """
+    args = _overridable_args(
+        tmp_path,
+        "advantage_estimator: reinforce_plus_plus_baseline\ncustom_reward_post_process_path: foo.py\n",
+        normalize_advantages=True,
+        use_kl_loss=True,
+        kl_loss_coef=0.01,
+        kl_loss_type="k2",
+        kl_coef=0.0,
+        n_samples_per_prompt=4,
+        use_unbiased_kl=False,
+        # Everything else that validator insists on, so the assertion below is
+        # about the reward hook and not about whichever check fires first.
+        colocate=True,
+        fully_async=False,
+        hybrid=False,
+        context_parallel_size=1,
+        calculate_per_token_loss=False,
+    )
+    with pytest.raises(ValueError, match="custom-reward-post-process-path"):
+        arguments_module.apply_custom_config_overrides(args)
