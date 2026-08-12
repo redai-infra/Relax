@@ -207,14 +207,14 @@ class GenerateState(metaclass=SingletonMeta):
         # event; generate_and_rm_group()'s finally-block decrements and sets the
         # event once it reaches 0. Starts set (no pending dedup work at reset).
         self.pending_dedup_groups = 0
-        self.dedup_all_done_event = asyncio.Event()
-        self.dedup_all_done_event.set()
+        self.all_done_event = asyncio.Event()
+        self.all_done_event.set()
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
         if samples:
             if self.pending_dedup_groups == 0:
-                self.dedup_all_done_event.clear()
+                self.all_done_event.clear()
             self.pending_dedup_groups += len(samples)
         for group in samples:
             task = asyncio.create_task(
@@ -741,11 +741,7 @@ async def _dedup_encode_group(args: Namespace, group: list[Sample]) -> None:
 
     pre_train_inputs = None
     t_img = t_img_cpu = None
-    if (
-        getattr(args, "dedup_multimodal_preprocess", False)
-        and state.processor
-        and any(first_mm.get(k) for k in ("images", "videos", "audio"))
-    ):
+    if state.processor and any(first_mm.get(k) for k in ("images", "videos", "audio")):
         pre_prompt_ids, mm_train_inputs, t_img, t_img_cpu = await _run_image_processor(
             state, args, group[0].prompt, first_mm
         )
@@ -787,12 +783,11 @@ async def _prefetch_and_preprocess_next_step(
     loop = asyncio.get_running_loop()
     ref = data_buffer.get_samples.remote(num_samples)
     samples = await loop.run_in_executor(None, ray.get, ref)
-    if getattr(args, "dedup_multimodal_preprocess", False):
-        await asyncio.gather(*(_dedup_encode_group(args, group) for group in samples))
+    await asyncio.gather(*(_dedup_encode_group(args, group) for group in samples))
     return samples
 
 
-async def _fire_prefetch_when_dedup_done(args: Namespace, data_buffer: Any, state: "GenerateState") -> None:
+async def _fire_prefetch(args: Namespace, data_buffer: Any, state: "GenerateState") -> None:
     """Background waiter: submits the cross-step prefetch as soon as THIS
     step's own dedup-encoding work is done, instead of waiting for the whole
     step (generation + reward scoring + data transfer) to finish.
@@ -808,12 +803,12 @@ async def _fire_prefetch_when_dedup_done(args: Namespace, data_buffer: Any, stat
     step's own encode_executor/processor_pool usage (which is already done
     by the time this fires).
 
-    state.dedup_all_done_event is set from GenerateState.reset() (no pending
+    state.all_done_event is set from GenerateState.reset() (no pending
     work) and re-armed per step by submit_generate_tasks/generate_and_rm_group
     (see those for the counting protocol); it can only fire once per step
     since reset() replaces it with a fresh Event.
     """
-    await state.dedup_all_done_event.wait()
+    await state.all_done_event.wait()
     state.prefetched_samples_future = asyncio.run_coroutine_threadsafe(
         _prefetch_and_preprocess_next_step(args, data_buffer, args.over_sampling_batch_size),
         get_async_loop().loop,
@@ -821,22 +816,22 @@ async def _fire_prefetch_when_dedup_done(args: Namespace, data_buffer: Any, stat
     logger.info("Pre-submitted data fetch(+preprocess) for next step (this step's own dedup work just finished)")
 
 
-def _mark_group_dedup_done(state: "GenerateState", evaluation: bool) -> None:
+def _mark_group_done(state: "GenerateState", evaluation: bool) -> None:
     """Mirrors submit_generate_tasks' increment.
 
     Only training-rollout submissions (evaluation=False) increment the counter,
     so only those decrement it here. Must be called exactly once per group,
     right when that group's dedup-relevant work settles (success, exception, or
-    the aborted early-return) — NOT after generation, or dedup_all_done_event
+    the aborted early-return) — NOT after generation, or all_done_event
     would only ever fire once the whole step is done, defeating the point of
-    firing the cross-step prefetch early (see _fire_prefetch_when_dedup_done).
+    firing the cross-step prefetch early (see _fire_prefetch).
     """
     if evaluation:
         return
     state.pending_dedup_groups -= 1
     if state.pending_dedup_groups <= 0:
         state.pending_dedup_groups = 0
-        state.dedup_all_done_event.set()
+        state.all_done_event.set()
 
 
 async def generate_and_rm_group(
@@ -846,7 +841,7 @@ async def generate_and_rm_group(
 
     # eval requests should not be affected by abort state; only skip for training rollout
     if state.aborted and not evaluation:
-        _mark_group_dedup_done(state, evaluation)
+        _mark_group_done(state, evaluation)
         return group
 
     # Generate a unique session_id for each sample in the group
@@ -860,7 +855,7 @@ async def generate_and_rm_group(
         # Marked here — right after the dedup phase settles — rather than at
         # the end of the function, so it fires before the (much longer)
         # generation phase below even starts, not after it finishes too.
-        _mark_group_dedup_done(state, evaluation)
+        _mark_group_done(state, evaluation)
 
     tasks = []
     for idx, sample in enumerate(group):
@@ -1002,17 +997,34 @@ async def generate_rollout_async(
         state.pending_transfer_tasks = []
 
     # Cross-step prefetch: fire as soon as THIS step's own dedup-encoding work
-    # is done (see _fire_prefetch_when_dedup_done), not only after the whole
+    # is done (see _fire_prefetch), not only after the whole
     # step finishes. Same gating as before: skip for pure fully-async
     # (continuous TransferQueue streaming has no per-step "gap" to speak of)
     # and LoRA adapter mode (prefetched generation would almost always be
     # aborted by the next step's pause_generation and pollute the rollout).
     # --disable-early-prefetch opts back into the old end-of-step trigger (see
     # generate_rollout below) for A/B benchmarking the timing change alone.
+    #
+    # The waiter task is NOT created here, even though this looks like the
+    # natural spot: state.all_done_event is left .set() by the PREVIOUS
+    # step's reset() (see GenerateState.reset) as a "no pending work" default,
+    # and doesn't get cleared until THIS step's own first submit_generate_tasks
+    # call runs (below). Between here and that first call there are several
+    # awaits (start_sglang_profile, the initial get_samples fetch) that could
+    # let a task created here run immediately, see the event still in its
+    # stale "set" state from last step, and fire the next step's prefetch
+    # before this step has submitted a single one of its own generate
+    # requests — stealing encode_executor/processor_pool capacity from this
+    # step's own dispatch and delaying it. Creating the task right after the
+    # first submit_generate_tasks call instead guarantees the event has
+    # already been cleared (synchronously, no await in between) by the time
+    # the task can possibly run.
     _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
     _pure_fully_async = args.fully_async and not args.hybrid
-    if not _pure_fully_async and not _lora_adapter_mode and not getattr(args, "disable_early_prefetch", False):
-        asyncio.create_task(_fire_prefetch_when_dedup_done(args, data_source, state))
+    _should_fire_early_prefetch = (
+        not _pure_fully_async and not _lora_adapter_mode and not getattr(args, "disable_early_prefetch", False)
+    )
+    _early_prefetch_task_created = False
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -1118,6 +1130,14 @@ async def generate_rollout_async(
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
+            # See the comment above this function's _should_fire_early_prefetch
+            # setup: only safe to create this task once this step's own first
+            # submit_generate_tasks call has synchronously cleared
+            # all_done_event, so the waiter can't observe a stale
+            # "set" state left over from the previous step's reset().
+            if _should_fire_early_prefetch and not _early_prefetch_task_created:
+                asyncio.create_task(_fire_prefetch(args, data_source, state))
+                _early_prefetch_task_created = True
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -1576,8 +1596,8 @@ def generate_rollout(
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
     # Cross-step prefetch is fired from inside generate_rollout_async as soon as
-    # this step's own dedup-encoding work finishes (see
-    # _fire_prefetch_when_dedup_done), instead of unconditionally here after the
+    # this step's own encoding work finishes (see
+    # _fire_prefetch), instead of unconditionally here after the
     # whole step (generation + reward scoring + transfer) completes — that gave
     # the prefetch a much shorter, often-zero head start under --max-staleness > 0,
     # where the next step starts almost immediately after this one ends.
