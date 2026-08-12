@@ -188,6 +188,17 @@ class GenerateState(metaclass=SingletonMeta):
         # 0 before the first step / when the previous step met its target. fully_async only.
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
+        # Step N's own tail transfer_tasks (data_system_client.async_put calls still
+        # in flight when step N returns) — deferred here instead of awaited before
+        # returning, so step N+1's generate() call isn't gated on them. Drained at the
+        # top of the next generate_rollout_async call (see there), by which point they
+        # have almost always already finished on the persistent async-loop thread
+        # (async_utils.get_async_loop), overlapped with the staleness-wait loop and
+        # Ray dispatch overhead between steps in components/rollout.py's _async_run.
+        # Persisted across reset() like prefetched_samples_future — must survive from
+        # step N's reset() into step N+1's drain.
+        if not hasattr(self, "pending_transfer_tasks"):
+            self.pending_transfer_tasks: list[asyncio.Task] = []
         # Tracks this step's own dedup-encoding phase (see _dedup_encode_group),
         # so the cross-step prefetch can fire as soon as it's done rather than
         # waiting for the whole step (generation + reward scoring + transfer)
@@ -975,6 +986,21 @@ async def generate_rollout_async(
 
     state = GenerateState(args)
 
+    # Drain the previous step's deferred tail transfer (see the end of this
+    # function and pending_transfer_tasks in GenerateState.reset()) before this
+    # step does anything that depends on it. Not on the critical path in
+    # practice: those tasks have been running on the persistent async-loop
+    # thread since the previous step returned, through this step's own Ray
+    # dispatch and (in components/rollout.py's _async_run) the staleness-wait
+    # loop, so they are almost always already done by the time we get here.
+    # Awaiting (rather than dropping) also ensures a failed transfer still
+    # raises -- one step later than before, attributed to this step instead of
+    # the one that actually failed, which is the accepted trade-off for not
+    # gating step N+1's generation on step N's transfer tail.
+    if state.pending_transfer_tasks:
+        await asyncio.gather(*state.pending_transfer_tasks)
+        state.pending_transfer_tasks = []
+
     # Cross-step prefetch: fire as soon as THIS step's own dedup-encoding work
     # is done (see _fire_prefetch_when_dedup_done), not only after the whole
     # step finishes. Same gating as before: skip for pure fully-async
@@ -1005,6 +1031,16 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
+
+    # Whether a step N+1 call is expected to follow this one. If not, there is no
+    # next step to hide the tail transfer behind, so it must be awaited before
+    # returning (see the deferred-transfer-tail block at the end of this
+    # function) instead of being handed off to a drain that will never run.
+    # fully_async keeps the old always-await behavior unconditionally: it
+    # already streams transfers continuously during generation (no per-step
+    # gap to speak of, same reasoning as the early-prefetch skip above), and
+    # its final call is is_final_backfill rather than num_rollout - 1.
+    _is_last_rollout_step = args.fully_async or rollout_id >= args.num_rollout - 1
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -1240,10 +1276,18 @@ async def generate_rollout_async(
                 f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
             )
 
-    logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
-    # Wait for all transfer tasks to complete
+    # Deferred transfer tail: on all but the last step, hand the still-running
+    # transfer_tasks off to the next step's drain (top of this function)
+    # instead of blocking this step's return on them, so step N+1's generate()
+    # call isn't gated behind step N's own scoring+transfer. The last step has
+    # no next-step drain to catch them, so it falls back to awaiting here.
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        if _is_last_rollout_step:
+            logger.info(f"Last rollout step. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
+            await asyncio.gather(*transfer_tasks)
+        else:
+            logger.info(f"Deferring {len(transfer_tasks)} transfer tasks to next step's drain.")
+            state.pending_transfer_tasks.extend(transfer_tasks)
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
