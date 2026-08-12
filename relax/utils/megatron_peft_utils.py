@@ -3,6 +3,8 @@
 """Utilities for PEFT (Parameter-Efficient Fine-Tuning) of Megatron in
 Relax."""
 
+import base64
+import pickle
 from typing import Tuple
 
 import torch
@@ -297,6 +299,32 @@ def build_lora_peft(args):
     return create_peft(peft_config)
 
 
+def serialize_adapter_tensors(tensors: dict[str, torch.Tensor]) -> str:
+    """Serialize adapter tensors into a payload that carries its own bytes.
+
+    SGLang broadcasts one blob to every TP worker, so the adapter travels as
+    host memory rather than CUDA IPC handles. Torch's sharing strategies put
+    a reference in the pickle instead of the data, and neither reference
+    survives the Ray -> HTTP hops to the server process. ``file_descriptor``
+    sends an fd the server cannot claim. ``file_system`` sends a ``/dev/shm``
+    path whose storage is reference counted, so the workers that map it first
+    unlink it on the way out, and a straggler rank then opens a file that no
+    longer exists.
+
+    Adapters are small enough to inline: rank 16 on a 30B model is ~24MB. A
+    plain pickle carries the bytes and has no reference to resolve. SGLang
+    reads it unchanged, since ``MultiprocessingSerializer.deserialize``
+    base64-decodes and unpickles.
+
+    Args:
+        tensors: Adapter parameter name -> CPU tensor.
+
+    Returns:
+        A base64 string accepted by SGLang's tensor-load entry points.
+    """
+    return base64.b64encode(pickle.dumps(dict(tensors))).decode("utf-8")
+
+
 __all__ = [
     "LORA_ADAPTER_NAME",
     "count_adapter_parameters",
@@ -308,4 +336,5 @@ __all__ = [
     "is_lora_merge_mode",
     "is_lora_adapter_mode",
     "build_lora_peft",
+    "serialize_adapter_tensors",
 ]

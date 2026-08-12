@@ -25,6 +25,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    serialize_adapter_tensors,
 )
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
@@ -440,41 +441,32 @@ class UpdateWeightFromTensor:
 
         config_dict = self._lora_sync.config_dict()
 
-        # SGLang broadcasts this single blob to every TP worker (each slices its own shard), so the
-        # tensors must be host-shared, not CUDA-IPC handles. The default file_descriptor sharing
-        # strategy sends an fd that cannot cross the Ray -> HTTP hops to the server process; switch
-        # to file_system (self-describing /dev/shm filenames in the pickle) around the serialize.
-        from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
-
+        # The adapter is inlined into the payload rather than shared through host memory:
+        # a /dev/shm reference does not survive the Ray -> HTTP hops to the workers. See
+        # serialize_adapter_tensors for why.
         tensors = {name: t.contiguous() for name, t in full_adapter.items()}
-        prev_strategy = get_sharing_strategy()
-        set_sharing_strategy("file_system")
-        try:
-            serialized = MultiprocessingSerializer.serialize(tensors, output_str=True)
-            t3 = monotonic()
-            if not first_sync:
-                ray.get(self._ipc_engine.unload_lora_adapter.remote(LORA_ADAPTER_NAME))
-            # Keep `tensors` alive across the synchronous load: file_system storages live only while
-            # the producer holds them, and the server maps them during this call.
-            ray.get(
-                self._ipc_engine.load_lora_adapter_from_tensors.remote(
-                    lora_name=LORA_ADAPTER_NAME,
-                    serialized_tensors=serialized,
-                    config_dict=config_dict,
-                    load_format=None,
-                    pinned=False,
-                )
+        serialized = serialize_adapter_tensors(tensors)
+        t3 = monotonic()
+        if not first_sync:
+            ray.get(self._ipc_engine.unload_lora_adapter.remote(LORA_ADAPTER_NAME))
+        ray.get(
+            self._ipc_engine.load_lora_adapter_from_tensors.remote(
+                lora_name=LORA_ADAPTER_NAME,
+                serialized_tensors=serialized,
+                config_dict=config_dict,
+                load_format=None,
+                pinned=False,
             )
-            logger.info(
-                "[lora-adapter] tensor push: export=%.2fs gather=%.2fs load=%.2fs (%d tensors, rank=%d)",
-                t_export,
-                t_gather,
-                monotonic() - t3,
-                len(tensors),
-                dist.get_rank(),
-            )
-        finally:
-            set_sharing_strategy(prev_strategy)
+        )
+        logger.info(
+            "[lora-adapter] tensor push: export=%.2fs gather=%.2fs load=%.2fs (%d tensors, %.1fMB, rank=%d)",
+            t_export,
+            t_gather,
+            monotonic() - t3,
+            len(tensors),
+            len(serialized) / 1e6,
+            dist.get_rank(),
+        )
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
