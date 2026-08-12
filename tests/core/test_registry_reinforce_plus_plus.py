@@ -9,6 +9,13 @@ import pytest
 
 @pytest.fixture()
 def registry_module(monkeypatch):
+    registry_module_name = "relax.core.registry"
+    registry_module_was_loaded = registry_module_name in sys.modules
+    original_registry_module = sys.modules.get(registry_module_name)
+    core_module = sys.modules.get("relax.core")
+    registry_attr_was_set = core_module is not None and hasattr(core_module, "registry")
+    original_registry_attr = getattr(core_module, "registry", None) if registry_attr_was_set else None
+
     component_names = {
         "actor": "Actor",
         "actor_fwd": "ActorFwd",
@@ -25,10 +32,21 @@ def registry_module(monkeypatch):
         classes[class_name] = component_class
         monkeypatch.setitem(sys.modules, module.__name__, module)
 
-    sys.modules.pop("relax.core.registry", None)
-    module = importlib.import_module("relax.core.registry")
-    yield module, classes
-    sys.modules.pop("relax.core.registry", None)
+    sys.modules.pop(registry_module_name, None)
+    if core_module is not None and registry_attr_was_set:
+        delattr(core_module, "registry")
+    module = importlib.import_module(registry_module_name)
+    try:
+        yield module, classes
+    finally:
+        sys.modules.pop(registry_module_name, None)
+        if registry_module_was_loaded:
+            sys.modules[registry_module_name] = original_registry_module
+        if core_module is not None:
+            if registry_attr_was_set:
+                setattr(core_module, "registry", original_registry_attr)
+            elif hasattr(core_module, "registry"):
+                delattr(core_module, "registry")
 
 
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])

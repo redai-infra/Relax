@@ -10,13 +10,13 @@ Run with: pytest tests/engine/rollout/test_data_source.py -v
 
 import json
 import os
+import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from relax.engine.rollout.data_source import RolloutDataSource
 from relax.utils.types import Sample
 
 
@@ -30,6 +30,20 @@ class _EagerSamples:
 
     def shuffle(self, epoch_id):
         self.shuffle_calls.append(epoch_id)
+
+
+@pytest.fixture
+def data_source_module(monkeypatch):
+    processing_utils = ModuleType("relax.utils.data.processing_utils")
+    processing_utils.load_processor = MagicMock(return_value=None)
+    processing_utils.load_tokenizer = MagicMock()
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processing_utils", processing_utils)
+    monkeypatch.delitem(sys.modules, "relax.engine.rollout.data_source", raising=False)
+
+    from relax.engine.rollout import data_source
+
+    yield data_source
+    monkeypatch.delitem(sys.modules, "relax.engine.rollout.data_source", raising=False)
 
 
 class TestEagerDataset:
@@ -90,9 +104,8 @@ class TestDataSourceIntegration:
         yield filepath, data
         os.unlink(filepath)
 
-    def test_factory_function_streaming(self, jsonl_file):
+    def test_factory_function_streaming(self, jsonl_file, data_source_module):
         """Test _create_dataset factory with streaming enabled."""
-        from relax.engine.rollout.data_source import _create_dataset
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         filepath, data = jsonl_file
@@ -116,15 +129,14 @@ class TestDataSourceIntegration:
 
         tokenizer = MagicMock()
 
-        dataset = _create_dataset(args, tokenizer, processor=None)
+        dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
 
         assert isinstance(dataset, StreamingDataset)
         assert len(dataset) == len(data)
         assert dataset.index_manager.shuffle_enabled is False
 
-    def test_factory_function_traditional(self, jsonl_file):
+    def test_factory_function_traditional(self, jsonl_file, data_source_module):
         """Test _create_dataset factory with streaming disabled."""
-        from relax.engine.rollout.data_source import _create_dataset
         from relax.utils.data.data import Dataset
 
         filepath, data = jsonl_file
@@ -146,12 +158,12 @@ class TestDataSourceIntegration:
 
         tokenizer = MagicMock()
 
-        dataset = _create_dataset(args, tokenizer, processor=None)
+        dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
 
         assert isinstance(dataset, Dataset)
 
-    def test_eager_data_source_repeatedly_wraps_to_fill_batch(self):
-        source = RolloutDataSource.__new__(RolloutDataSource)
+    def test_eager_data_source_repeatedly_wraps_to_fill_batch(self, data_source_module):
+        source = data_source_module.RolloutDataSource.__new__(data_source_module.RolloutDataSource)
         source.args = SimpleNamespace(n_samples_per_prompt=1, rollout_shuffle=False)
         source.epoch_id = 0
         source.sample_group_index = 0
@@ -168,8 +180,8 @@ class TestDataSourceIntegration:
         assert source.sample_offset == 1
         assert source.epoch_id == 5
 
-    def test_eager_data_source_rejects_empty_dataset(self):
-        source = RolloutDataSource.__new__(RolloutDataSource)
+    def test_eager_data_source_rejects_empty_dataset(self, data_source_module):
+        source = data_source_module.RolloutDataSource.__new__(data_source_module.RolloutDataSource)
         source.args = SimpleNamespace(n_samples_per_prompt=1, rollout_shuffle=False)
         source._use_streaming = False
         source.dataset = _EagerSamples([])
@@ -177,7 +189,7 @@ class TestDataSourceIntegration:
         with pytest.raises(ValueError, match="empty dataset"):
             source.get_samples(1)
 
-    def test_streaming_data_source_uses_exact_internal_epoch(self):
+    def test_streaming_data_source_uses_exact_internal_epoch(self, data_source_module):
         class _StreamingSamples:
             def get_batch(self, num_samples):
                 return [Sample(prompt=str(index)) for index in range(num_samples)], True
@@ -185,11 +197,12 @@ class TestDataSourceIntegration:
             def get_state(self):
                 return {"epoch_id": 3}
 
-        source = RolloutDataSource.__new__(RolloutDataSource)
+        source = data_source_module.RolloutDataSource.__new__(data_source_module.RolloutDataSource)
         source.args = SimpleNamespace(n_samples_per_prompt=1)
         source.epoch_id = 0
         source.sample_group_index = 0
         source.sample_index = 0
+        source.sample_offset = 0
         source._use_streaming = True
         source.dataset = _StreamingSamples()
 
@@ -198,10 +211,9 @@ class TestDataSourceIntegration:
         assert len(samples) == 8
         assert source.epoch_id == 3
 
-    def test_factory_function_streaming_multi_file_slice(self):
+    def test_factory_function_streaming_multi_file_slice(self, data_source_module):
         """Test _create_dataset factory with streaming dataset over multiple
         files and outer slice."""
-        from relax.engine.rollout.data_source import _create_dataset
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         data1 = [{"text": f"A{i}", "label": f"a{i}"} for i in range(3)]
@@ -231,7 +243,7 @@ class TestDataSourceIntegration:
             args.custom_prompt_path = None
 
             tokenizer = MagicMock()
-            dataset = _create_dataset(args, tokenizer, processor=None)
+            dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
 
             assert isinstance(dataset, StreamingDataset)
             assert len(dataset) == 4

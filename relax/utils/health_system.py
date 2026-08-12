@@ -85,9 +85,8 @@ class HealthStatus:
         self.state[role].last_heartbeat = time.time()
         if step > self.state[role].current_step:
             self.state[role].current_step = step
-        self.state[role].task_running = True
-        # Mark as healthy on heartbeat update
-        self.state[role].healthy = True
+        if self.state[role].healthy:
+            self.state[role].task_running = True
 
     def set_task_status(self, role: str, running: bool) -> None:
         """Update task running status for a service.

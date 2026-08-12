@@ -10,6 +10,11 @@ SERVER_SESSION_ID=""
 INITIAL_POLL_DELAY_SECONDS="${INITIAL_POLL_DELAY_SECONDS:-15}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-3}"
 CANCEL_REQUEST_TIMEOUT_SECONDS="${CANCEL_REQUEST_TIMEOUT_SECONDS:-5}"
+# Consecutive poll failures tolerated before this client gives up. A restarted
+# agent server does not know the previous run's session ids, so without a bound
+# an orphaned client polls a 404 forever (observed: 128 clients left over from a
+# killed run still hitting a fresh server at ~43 req/s hours later).
+MAX_POLL_FAILURES="${MAX_POLL_FAILURES:-20}"
 
 trace_result() {
    # Persist a per-session diagnostic snapshot ONLY for genuine failures.
@@ -55,12 +60,20 @@ SERVER_SESSION_ID="$(jq -r ".session_id" "${RESULT_JSON}")"
 
 sleep "${INITIAL_POLL_DELAY_SECONDS}"
 
+poll_failures=0
 while true; do
    : > "${RESULT_JSON}"
    if curl -fsS -o "${RESULT_JSON}" "${AGENT_SERVER_URL}/sessions/${SERVER_SESSION_ID}"; then
+      poll_failures=0
       STATUS="$(jq -r ".status" "${RESULT_JSON}")"
       if [ "${STATUS}" = "completed" ] || [ "${STATUS}" = "failed" ] || [ "${STATUS}" = "cancelled" ]; then
          break
+      fi
+   else
+      poll_failures=$((poll_failures + 1))
+      if [ "${poll_failures}" -ge "${MAX_POLL_FAILURES}" ]; then
+         echo "agent_client: giving up on ${SERVER_SESSION_ID} after ${poll_failures} consecutive poll failures" >&2
+         exit 1
       fi
    fi
    sleep "${POLL_INTERVAL_SECONDS}"
