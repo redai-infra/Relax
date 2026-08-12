@@ -26,9 +26,9 @@ relax/algorithms/
 |---|---|
 | 复用现成的 reward 归一化 / advantage / policy loss，只是组合方式不同 | 1 个（`spec.py`） |
 | 需要一种新的数学（如新的 advantage 公式） | 2–3 个（`spec.py` + 对应的实现模块） |
-| 还需要新的命令行参数 | 4–6 个（上述 + `arguments.py` 的参数声明与校验 + 示例 + 文档） |
+| 还需要新的命令行参数（如 GDPO 的 `--gdpo-reward-keys`） | 4–6 个（上述 + `arguments.py` 的参数声明与校验 + 示例 + 文档） |
 
-注册表消除的是「同一个算法名散落在 6 处 if/elif」，不是「新增算法零成本」。
+注册表消除的是「同一个算法名散落在 6 处 if/elif」，不是「新增算法零成本」。GDPO 走的是最后一档。
 
 `ALGOS` 角色表是唯一真正做到零改动的部分——它从注册表自动派生。
 
@@ -64,6 +64,9 @@ relax/algorithms/
 | `forbids_reward_side_kl` | 要求 `--kl-coef 0`（reward 侧 KL 项无处可放；`--use-kl-loss` 不受影响） |
 | `requires_global_token_loss` | 强制要求 `--calculate-per-token-loss`（否则按样本取 token 均值，会按 `1 / response_length` 重新加权） |
 | `requires_on_policy_updates` | 一次性拒绝五项：`--fully-async` / `--hybrid`、`--max-staleness != 0`、`--num-steps-per-rollout != 1`、`rollout_batch_size * n_samples != global_batch_size`、`--partial-rollout` / `--use-dynamic-global-batch-size`。适用于没有重要性比值修正的目标函数 |
+| `supports_fully_async` | 设为 `False` 可拒绝 `--fully-async`（该模式下 advantage 由单副本服务按切片计算，无 DP 通信域） |
+| `allows_reward_post_process_hooks` | 设为 `False` 可同时拦住 `--custom-reward-post-process-path` 与 `--agentic-custom-advantage-path`——这两个钩子都会在归一化器之前从 `post_process_rewards` 返回，静默跳过本算法的奖励阶段 |
+| `uses_reward_components` | 算法消费多个具名奖励分量而非单个标量，驱动 `--gdpo-reward-keys` 校验 |
 
 表里除 `kl_level`、`needs_full_log_probs` 和 `advantage_normalization` 之外的字段，都由 `relax/utils/arguments.py` 的四个 `validate_*` 函数统一消费，**声明即生效**，不需要再去 `arguments.py` 加 `if`。（拆成四个是因为参数校验本身有推导顺序——例如 `--kl-coef` 必须在「检查 `--ref-load` 是否存在」之前判掉，one-update 等式必须在 `global_batch_size` 定稿之后判——与算法特殊性无关。）那三个字段是在 `relax/backends/megatron/loss.py` 里读的：新增一个前所未有的取值需要在那里加分支，复用已有取值则不用。
 
@@ -82,7 +85,7 @@ def normalize_my_strategy(args, samples, raw_rewards):
 REWARD_NORMALIZERS["my_strategy"] = normalize_my_strategy
 ```
 
-产出必须是**每个 sample 一个标量**。这条约束让 TransferQueue 的 schema 保持不变——即使算法内部要看多个奖励分量，也要在这一层收敛成一个标量。
+产出必须是**每个 sample 一个标量**。这条约束让 TransferQueue 的 schema 保持不变——多奖励算法（如 GDPO）也是在这一层把各分量收敛成一个标量的。
 
 **Advantage 估计器**（`relax/algorithms/advantages.py`），签名 `fn(args, *, rewards, kl, loss_masks, response_lengths, total_lengths, values) -> (advantages, returns)`，两者都是 `list[Tensor]`：
 
@@ -125,3 +128,4 @@ pytest tests/algorithms/ -v
 ## 参考
 
 - [算法参考](../examples/algorithms.md)
+- GDPO 是最近一个走完整个流程的例子，可以对照 `relax/algorithms/` 与 `examples/gdpo/` 阅读。

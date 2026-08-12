@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
+from relax.backends.megatron.data import ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -523,8 +524,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     `rollout_data`, computes KL divergences, then dispatches to the estimator
     named by `relax.algorithms.spec.ALGORITHM_SPECS[...].advantage_fn`. The
     supported methods are whatever that registry holds -- deliberately not
-    listed here, because keeping algorithm names in prose is the duplication
-    the registry exists to remove. When `args.normalize_advantages` is True,
+    listed here, because the list this replaced had already gone stale (it never
+    gained "gdpo") and keeping algorithm names in prose is the duplication the
+    registry exists to remove. When `args.normalize_advantages` is True,
     advantages are whitened across the data-parallel group using masked
     statistics.
 
@@ -587,6 +589,19 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         # at the padded offsets; omitting it does not raise, it reads the wrong
         # token positions.
         padded_total_lengths=padded_total_lengths,
+        # rollout_data is this rank's shard of the WHOLE rollout, not of one
+        # training batch: actor.py collects `num_rollout_minis` windows of
+        # global_batch_size/dp_size and concat_rollout_batches merges them before
+        # this call ("we may need normalize the whole rollout", actor.py). So the
+        # reduction below makes the statistic describe the rollout across the DP
+        # group -- which spans every optimizer step in it, not one batch. See the
+        # known-deviation note in docs/*/examples/algorithms.md.
+        process_group=mpu.get_data_parallel_group(),
+        # Per-training-batch counts, written by actor.py before it merges the
+        # rollout. Passing them is what lets a batch-level statistic describe one
+        # batch instead of the whole merged rollout; estimators that do not have
+        # one absorb this in **_unused.
+        mini_batch_sizes=rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY),
     )
 
     # Optional pure OPD mode: remove all non-OPD reward contribution.

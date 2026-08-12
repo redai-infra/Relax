@@ -185,6 +185,13 @@ def test_every_algorithm_main_supported_is_still_registered():
     assert not missing, f"{missing} were reachable on main {MAIN_SHA[:7]} and are gone now"
 
 
+def test_only_gdpo_was_added():
+    """Keeps the reference tables honest: any new algorithm must be listed
+    here."""
+    added = set(list_algorithm_names()) - set(MAIN_ALGORITHMS)
+    assert added == {"gdpo"}, f"unexpected new algorithms {added}; update this file's tables"
+
+
 def test_reward_normalizer_identifiers_all_resolve():
     for name in list_algorithm_names():
         assert get_algorithm(name).reward_normalizer in REWARD_NORMALIZERS
@@ -522,3 +529,26 @@ def test_rloo_advantage_adapter_is_the_grpo_broadcast():
 
     for left, right in zip(got, want, strict=True):
         assert torch.equal(left, right)
+
+
+def test_loss_py_actually_forwards_the_mini_batch_boundaries():
+    """Source-level, because loss.py needs megatron to import.
+
+    The per-batch whitening tests all call advantage_gdpo directly, so removing
+    the wiring in loss.py left every one of them green while GDPO silently went
+    back to whitening the merged rollout. This is the assertion that fails when
+    that happens.
+    """
+    import pathlib
+    import re
+
+    src = (pathlib.Path(__file__).resolve().parents[2] / "relax" / "backends" / "megatron" / "loss.py").read_text(
+        encoding="utf-8"
+    )
+
+    call = re.search(r"compute_advantages_and_returns_impl\((.*?)\n    \)", src, re.DOTALL)
+    assert call, "compute_advantages_and_returns_impl call not found"
+    assert "mini_batch_sizes=rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)" in call.group(1), (
+        "loss.py must pass the per-training-batch counts; without them GDPO's step 3 "
+        "normalises over the whole merged rollout again"
+    )

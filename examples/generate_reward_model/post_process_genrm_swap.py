@@ -109,12 +109,15 @@ def _grpo_normalize(args, raw_rewards):
     algorithm is added.
 
     The gate names the two normalizers this function actually reimplements
-    rather than asking ``spec.is_group_normalized``: that property would also be
-    true of a future normalizer computing something else entirely, and this
-    reimplementation would then silently diverge from it. Naming normalizers
-    keeps it registry-driven -- a new algorithm reusing either one is covered
-    for free, and a genuinely new normalizer is exactly the case where a human
-    needs to look at this function.
+    rather than asking ``spec.is_group_normalized``. That property is also true
+    of ``gdpo_decoupled``, which standardises several reward components
+    independently and is not what the code below computes. GDPO cannot reach
+    here today (``allows_reward_post_process_hooks=False`` rejects this hook in
+    ``relax/utils/arguments.py``), so this is a guard against a future
+    multi-reward algorithm that allows the hook, not a live bug. Naming
+    normalizers keeps it registry-driven: a new algorithm reusing either one is
+    covered for free, and a genuinely new normalizer is exactly the case where
+    this reimplementation needs a human to look at it.
     """
     from relax.algorithms import get_algorithm
 

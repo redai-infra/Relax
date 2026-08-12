@@ -9,7 +9,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from relax.algorithms.advantages import ADVANTAGE_FNS, compute_advantages_and_returns  # noqa: E402
+from relax.algorithms.advantages import (  # noqa: E402
+    ADVANTAGE_FNS,
+    compute_advantages_and_returns,
+    whiten_scalar,
+)
 
 
 def _args(estimator, **overrides):
@@ -105,3 +109,175 @@ def test_reinforce_plus_plus_baseline_zeroes_masked_tokens():
     inputs["loss_masks"] = [torch.tensor([1.0, 0.0, 1.0])]
     adv, _ = compute_advantages_and_returns(_args("reinforce_plus_plus_baseline"), rewards=[2.0], **inputs)
     assert torch.equal(adv[0], torch.tensor([2.0, 0.0, 2.0]))
+
+
+# ---------------- gdpo step 3 ----------------
+
+
+def test_whiten_scalar_produces_zero_mean_unit_std():
+    out = whiten_scalar(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert abs(out.mean().item()) < 1e-6
+    assert abs(out.std().item() - 1.0) < 1e-3
+
+
+def test_whiten_scalar_zero_variance_returns_zeros_not_noise():
+    """A collapsed batch must give exactly 0, not the fp32 residual over
+    eps."""
+    assert torch.equal(whiten_scalar(torch.full((7,), 0.7)), torch.zeros(7))
+
+
+def test_whiten_scalar_single_element_returns_zero():
+    """std of one element is NaN under Bessel correction."""
+    assert torch.equal(whiten_scalar(torch.tensor([3.0])), torch.zeros(1))
+
+
+def test_whiten_scalar_empty_returns_empty():
+    assert whiten_scalar(torch.tensor([])).numel() == 0
+
+
+def test_whiten_scalar_preserves_ordering():
+    values = torch.tensor([-3.0, 0.5, 0.0, 9.0])
+    out = whiten_scalar(values)
+    assert torch.equal(values.argsort(), out.argsort())
+
+
+def test_gdpo_advantage_whitens_before_broadcasting():
+    rewards = [2.0, -2.0]
+    adv, _ = compute_advantages_and_returns(_args("gdpo"), rewards=rewards, **_inputs())
+    expected = whiten_scalar(torch.tensor(rewards, dtype=torch.float32))
+    assert torch.allclose(adv[0], expected[0].expand(3))
+    assert torch.allclose(adv[1], expected[1].expand(2))
+
+
+def test_gdpo_differs_from_grpo_by_a_positive_scalar():
+    rewards = [1.0, -1.0, 0.5, -0.5]
+    inputs = _inputs(lengths=(1, 1, 1, 1))
+    grpo, _ = compute_advantages_and_returns(_args("grpo"), rewards=rewards, **inputs)
+    gdpo, _ = compute_advantages_and_returns(_args("gdpo"), rewards=rewards, **inputs)
+
+    grpo_flat = torch.cat(grpo)
+    gdpo_flat = torch.cat(gdpo)
+    ratio = gdpo_flat / grpo_flat
+    assert (ratio > 0).all()
+    assert torch.allclose(ratio, ratio[0].expand_as(ratio), atol=1e-4)
+    assert not torch.allclose(gdpo_flat, grpo_flat, atol=1e-3)
+
+
+def test_gdpo_collapsed_batch_gives_zero_advantages():
+    adv, _ = compute_advantages_and_returns(_args("gdpo"), rewards=[0.7, 0.7], **_inputs())
+    assert torch.equal(adv[0], torch.zeros(3))
+    assert torch.equal(adv[1], torch.zeros(2))
+
+
+# ---------------- collapse detection is exact ----------------
+
+
+def test_collapse_uses_exact_equality_not_a_relative_tolerance():
+    """A relative tolerance erased this perfectly informative batch."""
+    values = torch.tensor([10000.0, 10000.005, 10000.010, 10000.015])
+    out = whiten_scalar(values)
+    assert not torch.equal(out, torch.zeros_like(out))
+    assert torch.equal(values.argsort(), out.argsort())
+
+
+@pytest.mark.parametrize("magnitude", [0.0, 0.1, 0.7, 1.0, 1e6, -3.5])
+def test_identical_values_collapse_exactly_at_any_magnitude(magnitude):
+    out = whiten_scalar(torch.full((7,), magnitude))
+    assert torch.equal(out, torch.zeros(7))
+
+
+def test_two_values_differing_by_one_ulp_are_not_collapsed():
+    base = torch.tensor(1.0)
+    values = torch.stack([base, torch.nextafter(base, torch.tensor(2.0))] * 2)
+    out = whiten_scalar(values)
+    # The name's claim is the > 0: is_collapsed tests exact equality, so a
+    # one-ULP spread is real signal and must survive. An earlier version of this
+    # test asserted only the upper bound, which an all-zero output also passes --
+    # i.e. it did not test the thing it was named after.
+    assert out.abs().max() > 0.0
+    # eps damps it towards zero rather than amplifying it to unit scale.
+    assert out.abs().max() < 1.0
+
+
+def test_empty_batch_is_treated_as_collapsed():
+    assert whiten_scalar(torch.tensor([])).numel() == 0
+
+
+# ---------------- distributed statistics ----------------
+
+
+def test_distributed_mean_std_without_a_group_matches_torch():
+    from relax.algorithms.numerics import distributed_mean_std
+
+    values = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    mean, std = distributed_mean_std(values)
+    assert torch.allclose(mean, values.mean())
+    assert torch.allclose(std, values.std(), atol=1e-5)
+
+
+def test_whiten_scalar_matches_manual_formula_without_a_group():
+    values = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    # 1e-4, not the GRPO path's 1e-6: whiten_scalar is GDPO step 3 and matches
+    # the reference implementation's epsilon. Hardcoded rather than imported so
+    # the test would notice the constant moving.
+    expected = (values - values.mean()) / (values.std() + 1e-4)
+    assert torch.allclose(whiten_scalar(values), expected, atol=1e-6)
+
+
+def test_sharded_whitening_differs_from_local_whitening():
+    """Why the process group matters: local stats give each shard its own
+    scale.
+
+    Simulates two DP ranks by whitening each shard alone and comparing against
+    whitening the concatenated batch.
+    """
+    shard_a = torch.tensor([-0.7, 0.7])
+    shard_b = torch.tensor([-1.4, 1.4])
+
+    local = torch.cat([whiten_scalar(shard_a), whiten_scalar(shard_b)])
+    joint = whiten_scalar(torch.cat([shard_a, shard_b]))
+
+    # Local whitening flattens the two shards onto the same amplitude; the joint
+    # statistics keep shard_b's larger relative contribution.
+    assert torch.allclose(local[:2].abs(), local[2:].abs(), atol=1e-4)
+    assert not torch.allclose(joint[:2].abs(), joint[2:].abs(), atol=1e-2)
+
+
+def test_compute_advantages_and_returns_accepts_a_process_group_kwarg():
+    """Both call sites pass it; every estimator must tolerate it."""
+    from relax.algorithms import list_algorithm_names
+    from relax.algorithms.spec import get_algorithm
+
+    # "gae" needs a critic and "reinforce_plus_plus" imports megatron.core for the
+    # CP world size; neither is available on a CPU-only runner.
+    needs_megatron = {"gae", "reinforce_plus_plus"}
+    for name in list_algorithm_names():
+        if get_algorithm(name).advantage_fn in needs_megatron:
+            continue
+        args = _args(name, kl_coef=0.0)
+        adv, _ = compute_advantages_and_returns(args, rewards=[0.5, -0.5], process_group=None, **_inputs())
+        assert len(adv) == 2
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_a_non_finite_value_gives_zeros_rather_than_poisoning_the_gradient(bad):
+    """The `not torch.isfinite(std)` guard in whiten_scalar, which coverage
+    showed no test reached.
+
+    A single inf or nan among the rewards makes the batch std non-finite.
+    Without the guard the division propagates nan into every advantage in the
+    batch and from there into the gradient, where it is far harder to trace
+    back. Reward functions are user code, so this is reachable input, not a
+    hypothetical.
+    """
+    values = torch.tensor([1.0, bad, 2.0, 3.0])
+    out = whiten_scalar(values)
+    assert torch.equal(out, torch.zeros_like(values))
+
+
+def test_a_huge_but_finite_spread_is_still_whitened():
+    """The guard must catch non-finite, not merely large -- otherwise it would
+    silently discard batches it should scale."""
+    out = whiten_scalar(torch.tensor([1e38, -1e38, 0.0]))
+    assert not torch.equal(out, torch.zeros_like(out))
+    assert torch.isfinite(out).all()

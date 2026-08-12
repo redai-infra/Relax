@@ -178,6 +178,12 @@ class Advantages(Base):
             # `args.qkv_format` and the VL / unsplit-forward flags in the Megatron
             # worker, and this deployment has no equivalent. Passing nothing keeps
             # the behaviour this path already had.
+            #
+            # This deployment is a single replica and owns every sample it was
+            # handed, so batch statistics need no reduction. Note the batch is
+            # one `global_batch_size / num_iters_per_train_update` slice, not
+            # the whole training batch — see the GDPO notes in the docs.
+            process_group=None,
         )
 
         # Optional pure OPD mode: remove all non-OPD reward contribution.

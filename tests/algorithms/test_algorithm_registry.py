@@ -15,6 +15,7 @@ EXPECTED_NAMES = [
     "gspo",
     "sapo",
     "cispo",
+    "gdpo",
     "ppo",
     "reinforce_plus_plus",
     "reinforce_plus_plus_baseline",
@@ -62,13 +63,11 @@ def test_reward_normalizer_ids_match_current_behavior():
 
 
 def test_is_group_normalized_matches_the_legacy_whitelist():
-    """The pre-registry whitelist, exactly.
-
-    group.
-    """
+    """The pre-registry whitelist, plus GDPO which also normalizes per
+    group."""
     legacy = {"grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline"}
     actual = {n for n in EXPECTED_NAMES if get_algorithm(n).is_group_normalized}
-    assert actual == legacy
+    assert actual == legacy | {"gdpo"}
 
 
 def test_gspo_is_the_only_sequence_level_kl():
@@ -104,9 +103,12 @@ def test_policy_loss_ids_match_current_behavior():
 def test_defaults_are_permissive():
     spec = AlgorithmSpec(name="x", reward_normalizer="none", advantage_fn="a", policy_loss_fn="ppo_clip")
     assert spec.kl_level == "token"
-    assert spec.needs_full_log_probs is False
+    assert spec.min_group_size == 1
+    assert spec.allows_reward_post_process_hooks is True
+    assert spec.requires_rewards_normalization is False
+    assert spec.forbids_normalize_advantages is False
+    assert spec.uses_reward_components is False
     assert spec.needs_critic is False
-    assert spec.requires_normalize_advantages is False
 
 
 def test_spec_module_has_no_heavy_imports():

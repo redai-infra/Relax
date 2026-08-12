@@ -136,7 +136,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
         # NOTE(dev): the fallback must stay a scalar. `sample.reward` is a dict
         # whenever the reward function returns named components (any run using
-        # --reward-key), and mixing dicts into this column
+        # --reward-key, and every GDPO run), and mixing dicts into this column
         # makes dict_to_tensordict raise. `raw_rewards` already holds the scalar
         # that post_process_rewards selected for each sample.
         train_data["raw_reward"] = [
@@ -186,10 +186,12 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return custom_reward_post_process_func(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    # Second short-circuit: this one replaces the normalizer wholesale. Any
-    # algorithm whose reward stage is load-bearing would be silently skipped
-    # here while the run still reports itself as that algorithm; none of the
-    # currently registered normalizers is, so this stays as it was.
+    # Second short-circuit: this one replaces the normalizer wholesale, so an
+    # algorithm whose reward stage is load-bearing (GDPO's steps 1 and 2) would
+    # be silently skipped here while the run still reports itself as that
+    # algorithm.  Argument validation rejects the combination up front, driven
+    # by `AlgorithmSpec.allows_reward_post_process_hooks`, which guards this
+    # hook and --custom-reward-post-process-path together.
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
 

@@ -48,13 +48,15 @@ def arguments_module(monkeypatch):
     sys.modules.pop("relax.utils.arguments", None)
 
 
-def _args(estimator="grpo", **overrides):
+def _args(estimator="gdpo", **overrides):
     base = dict(
         advantage_estimator=estimator,
         normalize_advantages=False,
         rewards_normalization=True,
         custom_reward_post_process_path=None,
         n_samples_per_prompt=4,
+        gdpo_reward_keys=["correctness", "format"],
+        gdpo_reward_weights=None,
         reward_key="score",
         use_critic=False,
         fully_async=False,
@@ -91,11 +93,46 @@ def test_validation_reads_spec_fields():
     for field in (
         "needs_critic",
         "requires_normalize_advantages",
+        "forbids_normalize_advantages",
+        "requires_rewards_normalization",
+        "allows_reward_post_process_hooks",
+        "min_group_size",
+        "uses_reward_components",
+        "supports_fully_async",
     ):
         assert field in src, f"arguments.py does not consult spec.{field}"
 
 
+def test_gdpo_arguments_declared():
+    src = ARGS_PATH.read_text(encoding="utf-8")
+    assert "--gdpo-reward-keys" in src
+    assert "--gdpo-reward-weights" in src
+
+
 # ---------------- behaviour ----------------
+
+
+def test_parser_accepts_gdpo_and_its_options(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args(
+        [
+            "--advantage-estimator",
+            "gdpo",
+            "--gdpo-reward-keys",
+            "correctness",
+            "format",
+            "--gdpo-reward-weights",
+            "1.0",
+            "0.5",
+        ]
+    )
+
+    assert args.advantage_estimator == "gdpo"
+    assert args.gdpo_reward_keys == ["correctness", "format"]
+    assert args.gdpo_reward_weights == [1.0, 0.5]
 
 
 def test_parser_rejects_an_unregistered_estimator(arguments_module):
@@ -119,14 +156,62 @@ def test_every_registered_algorithm_is_an_accepted_choice(arguments_module):
         assert parsed.advantage_estimator == name
 
 
+def test_gdpo_rejects_custom_reward_post_process(arguments_module):
+    with pytest.raises(ValueError, match="custom-reward-post-process-path"):
+        arguments_module.validate_algorithm_args(_args(custom_reward_post_process_path="pkg.mod.fn"))
+
+
+def test_gdpo_rejects_normalize_advantages(arguments_module):
+    with pytest.raises(ValueError, match="normalize-advantages"):
+        arguments_module.validate_algorithm_args(_args(normalize_advantages=True))
+
+
+def test_gdpo_rejects_group_size_below_two(arguments_module):
+    with pytest.raises(ValueError, match="n-samples-per-prompt"):
+        arguments_module.validate_algorithm_args(_args(n_samples_per_prompt=1))
+
+
+def test_gdpo_rejects_disabled_rewards_normalization(arguments_module):
+    with pytest.raises(ValueError, match="reward normalization"):
+        arguments_module.validate_algorithm_args(_args(rewards_normalization=False))
+
+
+def test_gdpo_requires_at_least_two_keys(arguments_module):
+    with pytest.raises(ValueError, match="at least two reward keys"):
+        arguments_module.validate_algorithm_args(_args(gdpo_reward_keys=["correctness"]))
+
+
+def test_gdpo_rejects_duplicate_keys(arguments_module):
+    with pytest.raises(ValueError, match="duplicates"):
+        arguments_module.validate_algorithm_args(_args(gdpo_reward_keys=["a", "a"]))
+
+
+def test_gdpo_rejects_weight_count_mismatch(arguments_module):
+    with pytest.raises(ValueError, match="gdpo-reward-weights"):
+        arguments_module.validate_algorithm_args(_args(gdpo_reward_weights=[1.0]))
+
+
+def test_gdpo_requires_reward_key(arguments_module):
+    with pytest.raises(ValueError, match="reward-key"):
+        arguments_module.validate_algorithm_args(_args(reward_key=None))
+
+
+def test_gdpo_happy_path(arguments_module):
+    args = _args()
+    arguments_module.validate_algorithm_args(args)
+    assert args.use_critic is False
+
+
 def test_reinforce_family_requires_normalize_advantages(arguments_module):
     for estimator in ("reinforce_plus_plus", "reinforce_plus_plus_baseline"):
         with pytest.raises(ValueError, match="normalize-advantages"):
-            arguments_module.validate_algorithm_args(_args(estimator, normalize_advantages=False))
+            arguments_module.validate_algorithm_args(
+                _args(estimator, normalize_advantages=False, gdpo_reward_keys=None)
+            )
 
 
 def test_reinforce_family_passes_with_normalize_advantages(arguments_module):
-    args = _args("reinforce_plus_plus", normalize_advantages=True)
+    args = _args("reinforce_plus_plus", normalize_advantages=True, gdpo_reward_keys=None)
     arguments_module.validate_algorithm_args(args)
     assert args.use_critic is False
 
@@ -134,21 +219,21 @@ def test_reinforce_family_passes_with_normalize_advantages(arguments_module):
 def test_ppo_is_runnable_and_turns_on_the_critic(arguments_module):
     """PPO is enabled upstream again; `use_critic` is the switch that makes
     `relax/core/registry.py` bind the Critic component."""
-    args = _args("ppo", reward_key=None)
+    args = _args("ppo", gdpo_reward_keys=None, reward_key=None)
     arguments_module.validate_algorithm_args(args)
     assert args.use_critic is True
 
 
 @pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo"])
 def test_grpo_family_passes_with_defaults(arguments_module, estimator):
-    args = _args(estimator, reward_key=None)
+    args = _args(estimator, gdpo_reward_keys=None, reward_key=None)
     arguments_module.validate_algorithm_args(args)
     assert args.use_critic is False
 
 
-def test_algorithms_do_not_police_reward_key(arguments_module):
-    """No currently registered algorithm constrains --reward-key."""
-    args = _args("grpo", reward_key=None)
+def test_non_gdpo_algorithms_ignore_reward_key_and_component_options(arguments_module):
+    """Only multi-reward algorithms police --reward-key / --gdpo-*."""
+    args = _args("grpo", gdpo_reward_keys=None, gdpo_reward_weights=None, reward_key=None)
     arguments_module.validate_algorithm_args(args)
 
 
@@ -168,7 +253,7 @@ def _write_yaml(tmp_path, body):
 
 def _overridable_args(tmp_path, body, **overrides):
     """Args as they look when the YAML merge runs: already validated once."""
-    base = _args("grpo", reward_key=None)
+    base = _args("grpo", gdpo_reward_keys=None, reward_key=None)
     base.loss_type = "policy_loss"
     base.custom_config_path = _write_yaml(tmp_path, body)
     for key, value in overrides.items():
@@ -183,6 +268,29 @@ def test_yaml_cannot_switch_to_an_estimator_that_needs_a_critic(arguments_module
     args = _overridable_args(tmp_path, "advantage_estimator: ppo\n")
 
     with pytest.raises(ValueError, match="critic setup"):
+        arguments_module.apply_custom_config_overrides(args)
+
+
+def test_yaml_cannot_bypass_gdpo_requirements(arguments_module, tmp_path):
+    """Switching to GDPO from YAML must still demand its reward keys."""
+    args = _overridable_args(tmp_path, "advantage_estimator: gdpo\n")
+
+    with pytest.raises(ValueError, match="at least two reward keys"):
+        arguments_module.apply_custom_config_overrides(args)
+
+
+def test_yaml_cannot_enable_conflicting_whitening_under_gdpo(arguments_module, tmp_path):
+    """The dangerous case: silent double whitening rather than a crash."""
+    args = _overridable_args(
+        tmp_path,
+        "normalize_advantages: true\n",
+        advantage_estimator="gdpo",
+        gdpo_reward_keys=["correctness", "format"],
+        reward_key="score",
+        n_samples_per_prompt=8,
+    )
+
+    with pytest.raises(ValueError, match="normalize-advantages"):
         arguments_module.apply_custom_config_overrides(args)
 
 
@@ -271,7 +379,7 @@ def test_yaml_without_algorithm_changes_is_accepted(arguments_module, tmp_path):
 
 
 def test_no_yaml_is_a_no_op(arguments_module):
-    args = _args("grpo", reward_key=None)
+    args = _args("grpo", gdpo_reward_keys=None, reward_key=None)
     args.loss_type = "policy_loss"
     args.custom_config_path = None
     arguments_module.apply_custom_config_overrides(args)
@@ -304,13 +412,56 @@ def test_spec_with_an_unregistered_implementation_is_rejected_at_startup(argumen
     monkeypatch.setitem(ALGORITHM_SPECS, "grpo", broken)
 
     with pytest.raises(ValueError, match="typo_does_not_exist"):
-        arguments_module.validate_algorithm_args(_args("grpo", reward_key=None))
+        arguments_module.validate_algorithm_args(_args("grpo", gdpo_reward_keys=None, reward_key=None))
 
 
-# ---------------- fully-async ----------------
+# ---------------- fully-async is not a supported execution mode for GDPO ----------------
+
+
+def test_gdpo_is_rejected_under_fully_async(arguments_module):
+    """Otherwise it trains on one slice at a time and, at slice size 1, on
+    nothing."""
+    with pytest.raises(ValueError, match="not supported under --fully-async"):
+        arguments_module.validate_algorithm_args(_args(fully_async=True))
+
+
+def test_gdpo_is_allowed_under_hybrid(arguments_module):
+    """--hybrid sets fully_async later, but uses the colocate role set: advantages
+    are computed in the Megatron worker, where the DP group exists."""
+    arguments_module.validate_algorithm_args(_args(fully_async=True, hybrid=True))
+
+
+def test_gdpo_is_allowed_under_colocate(arguments_module):
+    arguments_module.validate_algorithm_args(_args(fully_async=False))
 
 
 @pytest.mark.parametrize("estimator", ["grpo", "gspo", "sapo", "cispo"])
 def test_other_estimators_are_unaffected_by_fully_async(arguments_module, estimator):
-    args = _args(estimator, fully_async=True, reward_key=None)
+    args = _args(estimator, fully_async=True, gdpo_reward_keys=None, reward_key=None)
     arguments_module.validate_algorithm_args(args)
+
+
+def test_supports_fully_async_defaults_to_true():
+    from relax.algorithms import get_algorithm, list_algorithm_names
+
+    unsupported = {n for n in list_algorithm_names() if not get_algorithm(n).supports_fully_async}
+    assert unsupported == {"gdpo"}
+
+
+def test_dynamic_sampling_filter_warns_for_multi_reward(arguments_module, caplog):
+    """The built-in filter judges a group by the single --reward-key scalar."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        arguments_module.validate_algorithm_args(_args(dynamic_sampling_filter_path="pkg.mod.fn"))
+
+    assert any("dynamic-sampling-filter-path" in r.message for r in caplog.records)
+
+
+def test_no_warning_without_a_filter(arguments_module, caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        arguments_module.validate_algorithm_args(_args())
+
+    assert not any("dynamic-sampling-filter-path" in r.message for r in caplog.records)

@@ -108,7 +108,7 @@ def test_sapo_taus_are_read_from_args():
     assert torch.equal(got[0], want[0])
 
 
-@pytest.mark.parametrize("estimator", ["grpo", "gspo", "ppo", "reinforce_plus_plus"])
+@pytest.mark.parametrize("estimator", ["grpo", "gspo", "gdpo", "reinforce_plus_plus"])
 def test_ppo_clip_family_share_one_loss(estimator):
     log_probs, ppo_kl, advantages = _tensors()
     reference = compute_policy_loss_for(_args("grpo"), log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)

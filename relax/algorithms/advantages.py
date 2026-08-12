@@ -17,7 +17,9 @@ runs, ``rewards`` already holds one normalised scalar per sample.
 from typing import Any, Callable
 
 import torch
+import torch.distributed as dist
 
+from relax.algorithms.numerics import GDPO_EPS, distributed_mean_std, is_collapsed
 from relax.algorithms.spec import get_algorithm
 from relax.utils.training.ppo_utils import (
     get_advantages_and_returns_batch,
@@ -25,6 +27,42 @@ from relax.utils.training.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+
+
+def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | None = None) -> torch.Tensor:
+    """Sequence-level whitening of one scalar per sample.
+
+    This is GDPO's batch-wise normalisation (arXiv 2601.05242, Eq. 6).  It is
+    deliberately *not* the token-level ``distributed_masked_whiten`` used by
+    ``--normalize-advantages``: weighting by token count would let long
+    responses dominate the statistics, which Eq. 6 does not do.
+
+    ``process_group`` must be supplied wherever the caller holds only a shard of
+    the values.  In the Megatron path each data-parallel rank owns
+    ``num_rollout_minis * global_batch_size / dp_size`` samples — its shard of
+    the whole rollout, merged before ``compute_advantages_and_returns`` runs — so
+    whitening locally would give every rank its own mean and scale, not the "one
+    global scale factor" the maths assumes.  ``None`` means "I own every value you
+    need"; note the single-replica ``Advantages`` deployment cannot be that caller
+    for GDPO, since ``supports_fully_async=False`` rejects the configuration that
+    would route here — so in practice ``None`` is the CPU-side and test callers.
+
+    Scope of one call: this whitens exactly the tensor it is handed.  When the
+    caller has merged several training batches, :func:`_whiten_by_segment` splits
+    them back and calls this once per optimizer batch, so each call stays aligned
+    with Eq. 6's per-batch statistic regardless of ``num_rollout_minis``.  Only
+    the un-segmented path (``mini_batch_sizes=None``) whitens a whole merged
+    tensor at once.
+
+    A batch where every value is identical returns exact zeros; see
+    :func:`relax.algorithms.numerics.is_collapsed`.
+    """
+    if is_collapsed(values, process_group=process_group):
+        return torch.zeros_like(values)
+    mean, std = distributed_mean_std(values, process_group=process_group)
+    if not torch.isfinite(std):
+        return torch.zeros_like(values)
+    return (values - mean) / (std + GDPO_EPS)
 
 
 def _as_reward_tensor(rewards: Any, kl: list[torch.Tensor]) -> torch.Tensor:
@@ -38,6 +76,51 @@ def advantage_grpo_broadcast(args: Any, *, rewards, kl, **_unused):
     reward_tensor = _as_reward_tensor(rewards, kl)
     returns = get_grpo_returns(reward_tensor, kl)
     advantages = list(returns)  # separate list so rebinding one does not move the other
+    return advantages, returns
+
+
+def _whiten_by_segment(values, mini_batch_sizes, process_group):
+    """Whiten each training batch separately, in the order they were merged.
+
+    Every rank runs the same number of segments -- ``num_rollout_minis`` comes
+    from the minibatch plan rather than from the data -- so the per-segment
+    collectives stay matched across the data-parallel group.
+    """
+    if mini_batch_sizes is None:
+        return whiten_scalar(values, process_group=process_group)
+    # Validate whatever was passed, including a single segment: treating an empty
+    # or malformed list as "fall back to one window" would silently restore the
+    # merged behaviour this function exists to replace.
+    if not mini_batch_sizes or any(not isinstance(n, int) or n <= 0 for n in mini_batch_sizes):
+        raise ValueError(f"mini_batch_sizes must be a non-empty list of positive ints, got {mini_batch_sizes}.")
+    if sum(mini_batch_sizes) != values.numel():
+        raise ValueError(
+            f"mini_batch_sizes {mini_batch_sizes} sum to {sum(mini_batch_sizes)}, "
+            f"but this rank holds {values.numel()} samples."
+        )
+    if len(mini_batch_sizes) == 1:
+        return whiten_scalar(values, process_group=process_group)
+    out, start = [], 0
+    for size in mini_batch_sizes:
+        out.append(whiten_scalar(values[start : start + size], process_group=process_group))
+        start += size
+    return torch.cat(out)
+
+
+def advantage_gdpo(args: Any, *, rewards, kl, process_group=None, mini_batch_sizes=None, **_unused):
+    """GDPO step 3: whiten the combined per-sample advantage, then broadcast.
+
+    Steps 1 and 2 (per-reward group standardisation and the weighted sum) ran
+    on the rollout side, so ``rewards`` already holds one ``A_sum`` per sample.
+    Doing step 3 here rather than there keeps it out of reach of ``--custom-
+    reward-post-process-path``, which short-circuits reward post-processing
+    entirely, and off the streaming transfer-batch boundary with its undersized
+    tail flushes.
+    """
+    reward_tensor = _as_reward_tensor(rewards, kl)
+    whitened = _whiten_by_segment(reward_tensor, mini_batch_sizes, process_group)
+    returns = get_grpo_returns(whitened, kl)
+    advantages = list(returns)
     return advantages, returns
 
 
@@ -123,6 +206,7 @@ def advantage_gae(
 
 ADVANTAGE_FNS: dict[str, Callable[..., tuple[list[torch.Tensor], list[torch.Tensor]]]] = {
     "grpo_broadcast": advantage_grpo_broadcast,
+    "gdpo": advantage_gdpo,
     "reinforce_plus_plus": advantage_reinforce_plus_plus,
     "reinforce_plus_plus_baseline": advantage_reinforce_plus_plus_baseline,
     "gae": advantage_gae,
@@ -139,8 +223,18 @@ def compute_advantages_and_returns(
     total_lengths: list[int] | None = None,
     values: list[torch.Tensor] | None = None,
     padded_total_lengths: list[int] | None = None,
+    process_group: dist.ProcessGroup | None = None,
+    mini_batch_sizes: list[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Dispatch to the estimator registered for ``args.advantage_estimator``.
+
+    ``mini_batch_sizes`` is this rank's per-training-batch sample counts, in the
+    order the caller merged them. Only estimators whose statistics are defined
+    per batch read it; the rest absorb it in ``**_unused`` and are unaffected.
+
+    ``process_group`` is the group across which the batch is sharded, or
+    ``None`` when the caller holds every sample. Estimators that compute batch-
+    level statistics need it to see the whole batch.
 
     ``padded_total_lengths`` is likewise call-site specific: only the Megatron
     path can compute it, and only GAE consumes it. Every parameter here is
@@ -158,4 +252,6 @@ def compute_advantages_and_returns(
         total_lengths=total_lengths,
         values=values,
         padded_total_lengths=padded_total_lengths,
+        process_group=process_group,
+        mini_batch_sizes=mini_batch_sizes,
     )

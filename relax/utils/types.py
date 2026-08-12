@@ -170,6 +170,26 @@ class Sample:
     def get_reward_value(self, args) -> float:
         return self.reward if not args.reward_key else self.reward[args.reward_key]
 
+    def get_reward_components(self, keys: list[str]) -> list[Any]:
+        """Return the named reward components, in ``keys`` order.
+
+        Multi-reward algorithms such as GDPO need the individual components,
+        which ``get_reward_value`` collapses to a single scalar. This is a
+        separate accessor rather than a change to that one because dynamic
+        sampling filters and rollout metrics depend on its current signature.
+        """
+        if not isinstance(self.reward, dict):
+            raise ValueError(
+                f"Sample.reward must be a dict to read components {keys}, "
+                f"got {type(self.reward).__name__}. Make the reward function return a dict of named rewards."
+            )
+        values = []
+        for key in keys:
+            if key not in self.reward:
+                raise ValueError(f"Reward key {key!r} missing from sample reward (available: {sorted(self.reward)}).")
+            values.append(self.reward[key])
+        return values
+
     @property
     def effective_response_length(self):
         return sum(self.loss_mask) if self.loss_mask is not None else self.response_length

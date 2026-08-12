@@ -38,11 +38,11 @@ Honestly: **not "one dict entry".**
 |---|---|
 | Reuses existing reward normalization / advantage / policy loss, just combined differently | 1 (`spec.py`) |
 | Needs new maths (a new advantage formula, say) | 2-3 (`spec.py` plus the implementation module) |
-| Also needs new command-line options | 4-6 (the above, plus the option and its validation in `arguments.py`, plus an example and docs) |
+| Also needs new command-line options (as GDPO needs `--gdpo-reward-keys`) | 4-6 (the above, plus the option and its validation in `arguments.py`, plus an example and docs) |
 
 What the registry removes is one algorithm name being interpreted in six
-scattered if/elif chains — not the cost of adding an algorithm. An algorithm
-that needs both new maths and new options lands in the last row.
+scattered if/elif chains — not the cost of adding an algorithm. GDPO is in the
+last row.
 
 The `ALGOS` role table is the one part that genuinely costs nothing: it derives
 itself from the registry.
@@ -81,6 +81,9 @@ Capability fields:
 | `forbids_reward_side_kl` | Demand `--kl-coef 0`; there is nowhere to put a reward-side KL term (`--use-kl-loss` is unaffected) |
 | `requires_global_token_loss` | Demand `--calculate-per-token-loss`; the per-sample token-mean reducer would reweight responses by `1 / response_length` |
 | `requires_on_policy_updates` | Rejects five knobs at once: `--fully-async` / `--hybrid`, `--max-staleness != 0`, `--num-steps-per-rollout != 1`, `rollout_batch_size * n_samples != global_batch_size`, and `--partial-rollout` / `--use-dynamic-global-batch-size`. For objectives with no importance-ratio correction |
+| `supports_fully_async` | Set `False` to reject `--fully-async`, where advantages are computed slice-by-slice in a single-replica service with no data-parallel group |
+| `allows_reward_post_process_hooks` | Set `False` to block both `--custom-reward-post-process-path` and `--agentic-custom-advantage-path`; each returns from `post_process_rewards` ahead of the normalizer and would silently skip your reward stage |
+| `uses_reward_components` | The algorithm consumes several named reward components rather than one scalar; drives the `--gdpo-reward-keys` validation |
 
 The four `validate_*` functions in `relax/utils/arguments.py` consume every
 field in that table except `kl_level`, `needs_full_log_probs` and
@@ -110,7 +113,7 @@ REWARD_NORMALIZERS["my_strategy"] = normalize_my_strategy
 ```
 
 The output must be **one scalar per sample**. That constraint is what keeps the
-TransferQueue schema fixed — an algorithm reading several reward components collapses them
+TransferQueue schema fixed — multi-reward algorithms such as GDPO collapse their
 components to a scalar here.
 
 **Advantage estimator** (`relax/algorithms/advantages.py`), signature
@@ -175,3 +178,5 @@ is exactly what this registry exists to remove.
 ## References
 
 - [Algorithm Reference](../examples/algorithms.md)
+- GDPO is the most recent algorithm to go through this process; read
+  `relax/algorithms/` alongside `examples/gdpo/`.

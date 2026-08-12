@@ -1750,6 +1750,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Temperature for negative advantages in SAPO (default: 1.05)",
             )
             parser.add_argument(
+                "--gdpo-reward-keys",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "Names of the reward components GDPO standardizes independently, e.g. "
+                    "`--gdpo-reward-keys correctness format`. The reward function must return a dict "
+                    "containing every key. At least two keys are required."
+                ),
+            )
+            parser.add_argument(
+                "--gdpo-reward-weights",
+                type=float,
+                nargs="+",
+                default=None,
+                help=(
+                    "Per-component weights for GDPO, matching --gdpo-reward-keys in length. "
+                    "Defaults to 1.0 each. The weights multiply the *normalized* advantages, "
+                    "not the raw rewards, so they express relative importance rather than units."
+                ),
+            )
+            parser.add_argument(
                 "--disable-compute-advantages-and-returns",
                 action="store_false",
                 dest="compute_advantages_and_returns",
@@ -3004,6 +3026,92 @@ def validate_algorithm_args(args) -> None:
         raise ValueError(
             f"The {spec.name!r} advantage estimator requires advantage normalization. "
             "Please add `--normalize-advantages` to your command."
+        )
+    if spec.forbids_normalize_advantages and args.normalize_advantages:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator already whitens advantages per sequence; "
+            "`--normalize-advantages` would apply a second, token-level whitening on top. "
+            "Please remove it."
+        )
+    if spec.requires_rewards_normalization and not args.rewards_normalization:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator needs reward normalization. "
+            "Please remove `--disable-rewards-normalization`."
+        )
+    if not spec.allows_reward_post_process_hooks:
+        # Both hooks return from post_process_rewards before the registry's
+        # normalizer runs, so either one silently skips this algorithm's reward
+        # stage while the run still reports itself as that algorithm.
+        for option, value in (
+            ("--custom-reward-post-process-path", args.custom_reward_post_process_path),
+            ("--agentic-custom-advantage-path", getattr(args, "agentic_custom_advantage_path", None)),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"`{option}` short-circuits reward post-processing, which would silently skip "
+                    f"{spec.name!r}'s reward normalization while the run still reports itself as "
+                    f"{spec.name!r}. Please drop one of the two."
+                )
+    if args.n_samples_per_prompt < spec.min_group_size:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator needs `--n-samples-per-prompt` >= "
+            f"{spec.min_group_size}, got {args.n_samples_per_prompt}."
+        )
+    # `--hybrid` also ends up with fully_async set, but only later in validation and
+    # only as an implementation detail: it uses the colocate role set, so advantages
+    # are computed in the Megatron worker rather than the Advantages deployment.
+    # Reading both raw flags here is what distinguishes the two.
+    if not spec.supports_fully_async and args.fully_async and not args.hybrid:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator is not supported under --fully-async. "
+            "Its advantages depend on batch-level statistics, but that mode computes them in a "
+            "single-replica service that sees one `global_batch_size / num_iters_per_train_update` "
+            "slice at a time — with a slice of one sample the advantages come out all zero and the "
+            "run trains on no signal without failing. Use --colocate or --hybrid."
+        )
+
+    if spec.uses_reward_components:
+        _validate_multi_reward_args(args, spec)
+
+
+def _validate_multi_reward_args(args, spec) -> None:
+    """Check the reward-component configuration for multi-reward algorithms."""
+    keys = args.gdpo_reward_keys or []
+    if len(keys) < 2:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator needs at least two reward keys; "
+            f"pass e.g. `--gdpo-reward-keys correctness format`. Got {keys}."
+        )
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"`--gdpo-reward-keys` contains duplicates: {duplicates}.")
+
+    weights = args.gdpo_reward_weights
+    if weights is not None and len(weights) != len(keys):
+        raise ValueError(
+            f"`--gdpo-reward-weights` has {len(weights)} entries but `--gdpo-reward-keys` has {len(keys)}."
+        )
+
+    # Components arrive as a dict; without --reward-key the raw_reward column
+    # would hold dicts, which the TransferQueue conversion cannot represent.
+    if not args.reward_key:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator needs `--reward-key` to select the scalar reward "
+            "used for metrics and for the raw_reward column."
+        )
+
+    if args.dynamic_sampling_filter_path:
+        # A warning rather than an error: the filter is opt-in and a custom one may
+        # well be component-aware. The built-in check_reward_nonzero_std is not — it
+        # reads the single --reward-key scalar, so a group where that component is
+        # flat but another still varies gets dropped, which is exactly the case this
+        # estimator exists to keep.
+        logger.warning(
+            "%r combines multiple reward components, but --dynamic-sampling-filter-path filters on the "
+            "single --reward-key scalar (%r). Groups carrying signal only in the other components may be "
+            "dropped before training sees them.",
+            spec.name,
+            args.reward_key,
         )
 
     if args.n_samples_per_prompt < spec.min_group_size:

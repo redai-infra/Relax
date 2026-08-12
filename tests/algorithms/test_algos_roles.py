@@ -87,9 +87,9 @@ def test_every_registered_algorithm_has_a_role_mapping():
 
 
 @requires_megatron
-@pytest.mark.parametrize("name", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
+@pytest.mark.parametrize("name", ["reinforce_plus_plus", "reinforce_plus_plus_baseline", "gdpo"])
 def test_previously_missing_algorithms_are_covered(name):
-    """These two are why the derivation exists."""
+    """These three are why the derivation exists."""
     assert name in ALGOS
 
 
@@ -115,7 +115,7 @@ def test_ppo_keeps_its_critic():
 
 @requires_megatron
 def test_policy_gradient_algorithms_have_no_critic():
-    for name in ("grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus"):
+    for name in ("grpo", "gspo", "sapo", "cispo", "gdpo", "reinforce_plus_plus"):
         assert ROLES.critic not in ALGOS[name], f"{name} would start a critic service it never uses"
 
 

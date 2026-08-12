@@ -139,8 +139,8 @@ def test_raw_reward_column_stays_scalar_when_metadata_overrides_some_samples():
     """Dict rewards plus a partial metadata override used to mix types.
 
     ``sample.reward`` is a dict for every run that uses --reward-key (and every
-    run using --reward-key), so falling back to it produced ``[0.8, {...}]``,
-    which blows up the TensorDict conversion.
+    GDPO run), so falling back to it produced ``[0.8, {...}]``, which blows up
+    the TensorDict conversion.
     """
     samples = [
         _real_sample(0, {"score": 1.0, "format": 0.5}, {"raw_reward": 0.8}),
