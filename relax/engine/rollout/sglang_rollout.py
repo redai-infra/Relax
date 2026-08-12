@@ -826,9 +826,9 @@ def _mark_group_done(state: "GenerateState", evaluation: bool) -> None:
     Only training-rollout submissions (evaluation=False) increment the counter,
     so only those decrement it here. Must be called exactly once per group,
     right when that group's dedup-relevant work settles (success, exception, or
-    the aborted early-return) — NOT after generation, or all_done_event
-    would only ever fire once the whole step is done, defeating the point of
-    firing the cross-step prefetch early (see _fire_prefetch).
+    the aborted early-return) — NOT after generation, or all_done_event would
+    only ever fire once the whole step is done, defeating the point of firing
+    the cross-step prefetch early (see _fire_prefetch).
     """
     if evaluation:
         return
