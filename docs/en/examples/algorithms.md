@@ -301,7 +301,9 @@ $$\hat{A}^{(i,j)} = \frac{A_\text{sum}^{(i,j)} - \mathrm{mean}_\text{batch}}{\ma
 
 **Why this beats GRPO:** summing first and standardizing once discards two things.
 
-*Relative strength between groups.* Per-group standardization forces every group to unit variance, so a group where only one component varies and a group where both vary come out identical. Standardizing each component first makes the latter twice the amplitude, and step 3 whitens across the *batch*, so the difference survives into the final advantage. Measured (G=2, two groups in one batch): GRPO gives both groups ±0.707; GDPO gives ±0.548 and ±1.095.
+*Correlation structure between components.* GRPO standardizes the sum, so every group comes out at unit variance whether its components corroborate or contradict each other. GDPO gives each component unit variance first, so the combined variance is `Σwᵢ² + 2Σwᵢwⱼρᵢⱼ` — `2 + 2ρ` for two equal weights — and is therefore **decided by the correlation**: `ρ→+1` amplifies (measured 2x), `ρ=0` gives √2, `ρ→−1` attenuates to zero. Step 3 whitens across the *batch*, so that between-group difference reaches the final advantage. Measured (G=2, ρ=+1, two groups in one batch): GRPO gives both ±0.707; GDPO gives ±0.548 and ±1.095.
+
+This is **not** "more varying components means more signal" — that holds only for `ρ>0`. At `ρ=−0.8` the combined signal is 0.63x a single component.
 
 *Scale disparity between components.* A `correctness` in {0, 1} added to a reward in the hundreds (the paper's maths setup scores response length) yields a sum whose variance is essentially the large component's, so GRPO's direction is decided by it alone. GDPO gives each component unit variance first, so a weight expresses relative importance rather than units.
 

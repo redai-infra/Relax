@@ -271,19 +271,27 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     :func:`relax.algorithms.advantages.advantage_gdpo`.
 
     What standardising per component actually buys, stated carefully because
-    it is easy to overclaim: the combined advantage is ``sum_k w_k * z_k``,
-    where each ``z_k`` has unit variance within the group. GRPO instead
-    standardises ``sum_k r_k``, so a component with a large spread dominates
-    the direction. When the components have comparable spread the two agree up
-    to a positive scalar; they diverge when the spreads differ, which is the
-    case GDPO is for -- a correctness reward in ``{0, 1}`` combined with a
-    length reward in the hundreds is decided almost entirely by length under
-    GRPO, and half by each under GDPO.
+    it is easy to overclaim in two opposite directions (this docstring has
+    managed both):
 
-    It does **not** rescue a group whose components sum to a constant. There
-    ``r_2 = C - r_1`` forces ``z_2 = -z_1``, so equal weights cancel to exactly
-    zero -- the same answer GRPO gives. Unequal weights break the tie; equal
-    weights cannot.
+    The combined advantage is ``sum_k w_k * z_k`` with each ``z_k`` at unit
+    variance, so its variance is ``sum_k w_k^2 + 2 sum_{i<j} w_i w_j rho_ij``
+    -- ``2 + 2*rho`` for two equal weights. GRPO standardises ``sum_k r_k``
+    instead and lands on unit variance for every group regardless. So what
+    GDPO preserves is the **correlation structure**: corroborating components
+    (``rho -> +1``) amplify, contradicting ones (``rho -> -1``) attenuate and
+    at the limit cancel.
+
+    Both claims this file got wrong earlier are special cases of that one
+    formula. 'Equal sums are rescued by GDPO' is ``rho = -1`` -- they cancel,
+    GDPO included. 'Two varying components mean a stronger signal' is
+    ``rho = +1`` -- true there, false at ``rho = -0.8``, where the combination
+    measures 0.63x a single component.
+
+    Separately and unconditionally: GRPO's direction is dominated by whichever
+    component has the largest spread, because it standardises the raw sum. A
+    correctness reward in ``{0, 1}`` added to a length reward in the hundreds
+    is decided almost entirely by length under GRPO, and half by each here.
     """
     keys = resolve_gdpo_keys(args)
     weights = resolve_gdpo_weights(args, keys)
