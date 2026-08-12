@@ -103,11 +103,26 @@ def _run(rank, world_size, port, mode, out):
         dist.destroy_process_group()
 
 
+def _free_port() -> int:
+    """Ask the OS for a port instead of deriving one from the mode name.
+
+    A fixed port per mode collides with any other test that happens to pick the
+    same one, and `hash()` on a str is salted per interpreter, so which port a
+    mode gets changes between runs -- the collision is intermittent and lands on
+    whichever test ran second. `tests/backends/megatron/test_gdn_cp_reassembly.py`
+    already does it this way.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def _spawn(mode, world_size=2):
     manager = mp.Manager()
     out = manager.dict()
-    port = 29500 + abs(hash(mode)) % 2000
-    mp.spawn(_run, args=(world_size, port, mode, out), nprocs=world_size, join=True)
+    mp.spawn(_run, args=(world_size, _free_port(), mode, out), nprocs=world_size, join=True)
     return dict(out)
 
 

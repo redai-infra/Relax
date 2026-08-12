@@ -3100,17 +3100,21 @@ def _validate_multi_reward_args(args, spec) -> None:
             "used for metrics and for the raw_reward column."
         )
 
-    if args.dynamic_sampling_filter_path:
-        # A warning rather than an error: the filter is opt-in and a custom one may
-        # well be component-aware. The built-in check_reward_nonzero_std is not — it
-        # reads the single --reward-key scalar, so a group where that component is
-        # flat but another still varies gets dropped, which is exactly the case this
-        # estimator exists to keep.
+    filter_path = args.dynamic_sampling_filter_path
+    if filter_path and not filter_path.endswith("check_reward_nonzero_std"):
+        # The built-in filter reads `group_carries_reward_signal`, so it judges a
+        # group by every component and needs no warning. A custom one is opaque
+        # from here: if it reduces the group to the single --reward-key scalar,
+        # it drops exactly the groups this estimator exists to keep. A warning
+        # rather than an error, because a custom filter may well be
+        # component-aware and we cannot tell.
         logger.warning(
-            "%r combines multiple reward components, but --dynamic-sampling-filter-path filters on the "
-            "single --reward-key scalar (%r). Groups carrying signal only in the other components may be "
-            "dropped before training sees them.",
+            "%r combines multiple reward components, but --dynamic-sampling-filter-path points at a "
+            "custom filter (%s). If it judges a group by the single --reward-key scalar (%r), groups "
+            "carrying signal only in the other components will be dropped before training sees them. "
+            "relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std handles this correctly.",
             spec.name,
+            filter_path,
             args.reward_key,
         )
 

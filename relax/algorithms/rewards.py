@@ -17,6 +17,7 @@ from typing import Any, Callable
 import torch
 
 from relax.algorithms.numerics import GDPO_EPS, STD_EPS, collapsed_columns
+from relax.algorithms.spec import get_algorithm
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
 
@@ -269,6 +270,41 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
 
     weight_tensor = torch.tensor(weights, dtype=torch.float32)
     return (normalized * weight_tensor).sum(dim=1).tolist()
+
+
+def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
+    """Whether one prompt group still carries signal for *this* algorithm.
+
+    Consumers upstream of the advantage stage -- the dynamic-sampling filter,
+    the zero-std metrics -- ask "did this group vary?" to decide whether it is
+    worth keeping or worth reporting. They have always answered it with the
+    single scalar ``--reward-key`` selects, which is the right question only
+    for an algorithm that consumes that scalar.
+
+    A multi-reward algorithm standardises each component separately, so a group
+    is dead only when *every* component is flat. Judging GDPO by the summed
+    scalar throws away exactly the groups it exists to keep: ``(1, 0)`` and
+    ``(0, 1)`` have identical sums and different components.
+
+    The two consumers did not previously agree on the single-reward test:
+    ``check_reward_nonzero_std`` used ``std > 0``, the zero-std metrics used
+    exact equality. This unifies them on exact equality, matching
+    :func:`relax.algorithms.numerics.is_collapsed` and for the same reason --
+    a tolerance wide enough to absorb float error also discards real signal,
+    and the two answers differ only for a group that is exactly flat yet whose
+    computed standard deviation is not exactly 0.
+    """
+    if not samples:
+        return False
+
+    spec = get_algorithm(args.advantage_estimator)
+    if not spec.uses_reward_components:
+        rewards = [sample.get_reward_value(args) for sample in samples]
+        return any(reward != rewards[0] for reward in rewards)
+
+    keys = resolve_gdpo_keys(args)
+    components = extract_reward_components(samples, keys)
+    return bool((~collapsed_columns(components, dim=0)).any())
 
 
 REWARD_NORMALIZERS: dict[str, Callable[[Any, list[Any], list[float]], list[float]]] = {

@@ -19,6 +19,8 @@ from relax.agentic.pipeline.runtime import (
     get_agentic_runtime_resources,
 )
 from relax.agentic.profile import TRACE_KEY
+from relax.algorithms import get_algorithm
+from relax.algorithms.rewards import group_carries_reward_signal
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -1293,19 +1295,19 @@ def _dict_add_prefix(d, prefix):
 
 
 def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, float]:
-    if args.advantage_estimator == "ppo":
+    if get_algorithm(args.advantage_estimator).needs_critic:
         return {}
 
     all_sample_groups = group_by(all_samples, lambda sample: sample.group_index)
-    reward_groups = [
-        [sample.get_reward_value(args) for sample in group if sample.reward is not None]
-        for group in all_sample_groups.values()
-    ]
-    interesting_rewards = [
-        str(round(rewards[0], 1))
-        for rewards in reward_groups
-        if rewards and all(rewards[0] == reward for reward in rewards)
-    ]
+    interesting_rewards = []
+    for group in all_sample_groups.values():
+        rewarded = [sample for sample in group if sample.reward is not None]
+        # Counted as flat only when it carries no signal *for this algorithm*:
+        # for a multi-reward one that means every component is flat, not that
+        # the --reward-key scalar happens to be.
+        if not rewarded or group_carries_reward_signal(args, rewarded):
+            continue
+        interesting_rewards.append(str(round(rewarded[0].get_reward_value(args), 1)))
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 
 

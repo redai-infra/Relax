@@ -21,6 +21,8 @@ import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
+from relax.algorithms import get_algorithm
+from relax.algorithms.rewards import group_carries_reward_signal
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
@@ -4051,12 +4053,16 @@ def compute_perf_metrics_from_samples(args, samples, rollout_time):
 
 def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     # only compute in GRPO-like algorithms where one prompt has multiple responses
-    if args.advantage_estimator == "ppo":
+    if get_algorithm(args.advantage_estimator).needs_critic:
         return {}
 
     def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
+        # Reads whichever notion of "signal" this algorithm uses: the
+        # --reward-key scalar for single-reward algorithms, every component for
+        # multi-reward ones. Counting a GDPO group as zero-std because its
+        # summed reward is flat overstates the count and reads as "most of the
+        # batch is dead" when it is not.
+        return not group_carries_reward_signal(args, samples)
 
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]

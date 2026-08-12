@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import torch
-
+from relax.algorithms.rewards import group_carries_reward_signal
 from relax.engine.filters.base_types import DynamicFilterOutput
 from relax.utils.types import Sample
 
@@ -10,9 +9,16 @@ __all__ = ["check_reward_nonzero_std"]
 
 
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
-    rewards = [sample.get_reward_value(args) for sample in samples]
-    keep = torch.tensor(rewards, dtype=torch.float).std() > 0.0
+    """Drop prompt groups whose rewards carry no signal for this algorithm.
+
+    "No signal" is algorithm-dependent, which is why the test is not spelled
+    out here. For a single-reward algorithm it is the standard deviation of the
+    ``--reward-key`` scalar, exactly as before. For a multi-reward algorithm it
+    is whether *every* component is flat -- judging those by the summed scalar
+    would drop the groups the algorithm exists to keep.
+    """
+    keep = group_carries_reward_signal(args, samples)
     return DynamicFilterOutput(
         keep=keep,
-        reason=None if keep else f"zero_std_{round(rewards[0], 1)}",
+        reason=None if keep else f"zero_std_{round(samples[0].get_reward_value(args), 1)}",
     )
