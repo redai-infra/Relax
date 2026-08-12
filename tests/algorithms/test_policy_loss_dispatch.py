@@ -164,9 +164,25 @@ def test_the_name_check_pattern_catches_every_spelling():
 
 
 def test_both_paths_delegate_to_the_shared_estimator():
+    """Delegation means the old kernels are gone, not that an import exists.
+
+    Asserting only on the import line is satisfied by a file that imports the
+    shared handler and then ignores it -- exactly what a botched revert looks
+    like. The load-bearing half is the second assertion: if either path grows
+    its own call to a `ppo_utils` kernel again, the estimator is being chosen
+    somewhere other than the registry.
+    """
+    direct_kernels = (
+        "get_grpo_returns",
+        "get_reinforce_plus_plus_returns",
+        "get_reinforce_plus_plus_baseline_advantages",
+        "get_advantages_and_returns_batch",
+    )
     for path in (LOSS_PATH, SERVE_PATH):
         src = path.read_text(encoding="utf-8")
-        assert "from relax.algorithms.advantages import" in src, f"{path.name} does not use the shared estimator"
+        assert "compute_advantages_and_returns" in src, f"{path.name} does not call the shared estimator"
+        for kernel in direct_kernels:
+            assert kernel not in src, f"{path.name} calls {kernel} directly instead of going through the registry"
 
 
 def test_loss_py_reads_kl_level_and_full_log_probs_from_the_spec():

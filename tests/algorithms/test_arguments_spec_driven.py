@@ -79,13 +79,33 @@ def test_no_hardcoded_estimator_choice_list():
     assert '"reinforce_plus_plus_baseline",\n                    "ppo",' not in src
 
 
-def test_no_estimator_name_comparisons_remain():
-    src = ARGS_PATH.read_text(encoding="utf-8")
-    for banned in (
-        'args.advantage_estimator == "ppo"',
-        'args.advantage_estimator in ["reinforce_plus_plus"',
-    ):
-        assert banned not in src, f"arguments.py still contains: {banned}"
+def test_spec_driven_validation_makes_no_name_comparisons():
+    """Scoped to `validate_algorithm_args`, and the name says so.
+
+    The previous version of this test claimed no name comparison remained
+    anywhere in arguments.py while only checking two literals -- and
+    `_validate_reinforce_plus_plus_args` does compare names, deliberately, as a
+    frozen contract. Asserting over the whole file would either fail or require
+    an exception list that hides the next real regression. Reading the one
+    function this PR owns is both honest and stricter: any name comparison
+    inside it fails, not just two spellings of one.
+    """
+    import ast
+
+    tree = ast.parse(ARGS_PATH.read_text(encoding="utf-8"))
+    fn = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "validate_algorithm_args"
+    )
+    # `ast.unparse` drops comments and, once the docstring node is skipped,
+    # prose. Reading the raw text instead would flag the docstring's own
+    # description of the pattern it removed.
+    statements = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    code = "\n".join(ast.unparse(node) for node in statements)
+
+    assert "get_algorithm(" in code, "sanity: validation should still resolve the spec"
+    for line in code.splitlines():
+        assert "advantage_estimator ==" not in line, f"name comparison in validate_algorithm_args: {line.strip()}"
+        assert "advantage_estimator in" not in line, f"name comparison in validate_algorithm_args: {line.strip()}"
 
 
 def test_validation_reads_spec_fields():
