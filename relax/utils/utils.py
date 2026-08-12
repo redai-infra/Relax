@@ -526,13 +526,8 @@ def process_args(args: Namespace, role: str) -> None:
             setattr(args, key, args.ref_actor_config[key])
     args.max_tokens_per_gpu = args.log_probs_max_tokens_per_gpu
     args.only_load_weight = True
-    if role == "reference":
+    if role in ("reference", "actor_fwd") and args.ref_load is not None:
         args.load = args.ref_load
-    if role == "actor_fwd":
-        # Zero-KL normalization may legitimately remove ``ref_load`` while an
-        # actor_fwd service is still required. Preserve the already-resolved
-        # actor checkpoint instead of overwriting it with ``None``.
-        args.load = args.ref_load or args.load or args.hf_checkpoint
 
 
 def get_serve_url(route_prefix: str = "") -> str:
