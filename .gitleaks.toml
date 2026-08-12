@@ -32,6 +32,12 @@ tags = ["internal", "env"]
     # QS_USER alone is just an env var name reference, not a leaked value
     '''^QS_USER$''',
   ]
+  # The internal Quicksilver upload hook and its tests intentionally reference
+  # QS_* env var names; those are identifiers, not secrets.
+  paths = [
+    '''scripts/tools/model_upload_hook\.py$''',
+    '''tests/tools/test_model_upload_hook\.py$''',
+  ]
 
 # Custom rule: MAAS token (MAAS prefix)
 [[rules]]

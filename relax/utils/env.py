@@ -161,6 +161,7 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
+    GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S = EnvProperty("GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S", float, 5.0)
 
     # ------------- Rollout -------------
     ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", int, 256)
@@ -200,6 +201,11 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Device / Training -------------
     RELAX_DEVICE_TYPE = EnvProperty("RELAX_DEVICE_TYPE", str, "")
     RELAX_EMPTY_POLL_SLEEP_MS = EnvProperty("RELAX_EMPTY_POLL_SLEEP_MS", float, 50.0)
+    RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
+
+    # ------------- S3 model cache cleanup -------------
+    RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S = EnvProperty("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", float, 600.0)
+    RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S = EnvProperty("RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S", float, 30.0)
 
     # ------------- LoRA -------------
     RELAX_LORA_LIVE_DIR = EnvProperty("RELAX_LORA_LIVE_DIR", str, None)

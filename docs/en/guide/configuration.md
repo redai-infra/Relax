@@ -208,7 +208,7 @@ For more parameters, refer to SGLang official documentation.
 | `--use-dynamic-batch-size` | flag | False | Enable dynamic batching. Dynamically packs samples by length so each micro-batch's total tokens approach `--max-tokens-per-gpu` limit |
 | `--max-tokens-per-gpu` | int | None | Maximum tokens per GPU. Must be set when dynamic batching is enabled. Should be set to approximately `max_response_len / cp_size` when using CP |
 | `--log-probs-max-tokens-per-gpu` | int | None | Maximum tokens per GPU when computing log probs. When None, equals `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | Use `karmarkar_karp` algorithm to balance token count across data parallel ranks. Only available in colocate mode; not supported with `--fully-async`. Note: different responses for the same prompt may be assigned to different training steps |
+| `--balance-data` | flag | False | Use `karmarkar_karp` to balance token count across data parallel ranks on the static/seqlen-balanced path. In fully async with `--use-dynamic-batch-size`, DP token balancing is automatic through `StreamingTokenBudgetSampler`; the flag is accepted but has no additional effect. Note: different responses for the same prompt may be assigned to different training steps |
 
 ---
 
