@@ -741,7 +741,11 @@ async def _dedup_encode_group(args: Namespace, group: list[Sample]) -> None:
 
     pre_train_inputs = None
     t_img = t_img_cpu = None
-    if state.processor and any(first_mm.get(k) for k in ("images", "videos", "audio")):
+    if (
+        getattr(args, "dedup_multimodal_preprocess", False)
+        and state.processor
+        and any(first_mm.get(k) for k in ("images", "videos", "audio"))
+    ):
         pre_prompt_ids, mm_train_inputs, t_img, t_img_cpu = await _run_image_processor(
             state, args, group[0].prompt, first_mm
         )
