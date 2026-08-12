@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.utils.test_arguments_helpers import _arguments_module  # noqa: F401
+
 
 def test_zero_kl_loss_is_disabled_before_reference_setup(arguments_module):
     args = SimpleNamespace(use_kl_loss=True, kl_loss_coef=0.0, kl_coef=0.0)
@@ -59,12 +61,14 @@ def test_interval_two_requires_behavior_policy_correction(arguments_module):
     args = SimpleNamespace(
         hybrid=True,
         update_weights_interval=2,
+        true_on_policy_mode=False,
         use_tis=False,
         use_rollout_logprobs=False,
         keep_old_actor=False,
+        max_staleness=0,
     )
 
-    with pytest.raises(ValueError, match="requires --use-tis"):
+    with pytest.raises(ValueError, match="old log-probs require correction"):
         arguments_module._validate_hybrid_weight_publication_args(args)
 
 
@@ -73,9 +77,59 @@ def test_interval_two_accepts_explicit_behavior_policy_correction(arguments_modu
     args = SimpleNamespace(
         hybrid=True,
         update_weights_interval=2,
+        true_on_policy_mode=False,
         use_tis=False,
         use_rollout_logprobs=False,
         keep_old_actor=False,
+        max_staleness=0,
+    )
+    setattr(args, correction, True)
+
+    arguments_module._validate_hybrid_weight_publication_args(args)
+
+
+@pytest.mark.parametrize("correction", ["keep_old_actor", "use_rollout_logprobs"])
+def test_true_on_policy_interval_requires_tis(arguments_module, correction):
+    args = SimpleNamespace(
+        hybrid=True,
+        update_weights_interval=2,
+        true_on_policy_mode=True,
+        use_tis=False,
+        use_rollout_logprobs=False,
+        keep_old_actor=False,
+        max_staleness=0,
+    )
+    setattr(args, correction, True)
+
+    with pytest.raises(ValueError, match="Enable --use-tis"):
+        arguments_module._validate_hybrid_weight_publication_args(args)
+
+
+def test_stale_interval_rejects_single_old_actor_snapshot(arguments_module):
+    args = SimpleNamespace(
+        hybrid=True,
+        update_weights_interval=2,
+        true_on_policy_mode=False,
+        use_tis=False,
+        use_rollout_logprobs=False,
+        keep_old_actor=True,
+        max_staleness=2,
+    )
+
+    with pytest.raises(ValueError, match="Enable --use-tis or --use-rollout-logprobs"):
+        arguments_module._validate_hybrid_weight_publication_args(args)
+
+
+@pytest.mark.parametrize("correction", ["use_tis", "use_rollout_logprobs"])
+def test_stale_interval_accepts_staleness_aware_correction(arguments_module, correction):
+    args = SimpleNamespace(
+        hybrid=True,
+        update_weights_interval=2,
+        true_on_policy_mode=False,
+        use_tis=False,
+        use_rollout_logprobs=False,
+        keep_old_actor=False,
+        max_staleness=2,
     )
     setattr(args, correction, True)
 

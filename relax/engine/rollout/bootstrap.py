@@ -32,21 +32,32 @@ def resolve_rl_num_rollout(config: Namespace, data_source: Any) -> None:
         return
 
     dataset_size = ray.get(data_source.lengths.remote())
+    if dataset_size <= 0:
+        raise ValueError("rollout_global_dataset requires a non-empty dataset")
     num_per_epoch = dataset_size // config.rollout_batch_size
     if num_per_epoch <= 0:
-        config.num_rollout_per_epoch = None
         if config.num_epoch is not None:
             raise ValueError(
-                f"Cannot derive num_rollout from num_epoch: dataset size {dataset_size} "
-                f"is smaller than rollout_batch_size {config.rollout_batch_size}"
+                f"Dataset size {dataset_size} must be at least rollout_batch_size {config.rollout_batch_size} "
+                "when num_epoch is configured"
             )
         if config.num_rollout is None or config.num_rollout <= 0:
-            raise ValueError("num_rollout must be positive when one full dataset epoch has no rollout batch")
-        logger.warning(
-            f"Dataset size {dataset_size} is smaller than rollout_batch_size {config.rollout_batch_size}; "
-            f"using explicit num_rollout={config.num_rollout} without epoch boundaries"
+            raise ValueError("num_rollout must be positive when a full rollout batch does not fit in one epoch")
+        # The data source can wrap across epochs to fill a batch. There is no
+        # step-aligned epoch boundary in this case, so disable that trigger.
+        config.num_rollout_per_epoch = None
+        logger.info(
+            f"RL num_rollout resolved before service creation: {config.num_rollout} "
+            f"(dataset_size={dataset_size} < rollout_batch_size={config.rollout_batch_size}; "
+            "batches wrap across epochs)"
         )
         return
+
+    if config.num_epoch is not None and dataset_size % config.rollout_batch_size != 0:
+        raise ValueError(
+            f"Dataset size {dataset_size} must be divisible by rollout_batch_size {config.rollout_batch_size} "
+            "when num_epoch is configured; use explicit num_rollout for cross-epoch batches"
+        )
 
     config.num_rollout_per_epoch = num_per_epoch
     if config.num_epoch is not None:
@@ -55,7 +66,10 @@ def resolve_rl_num_rollout(config: Namespace, data_source: Any) -> None:
             min(config.num_rollout, epoch_rollout) if config.num_rollout is not None else epoch_rollout
         )
     if config.num_rollout is None or config.num_rollout <= 0:
-        raise ValueError("num_rollout must resolve to a positive value")
+        raise ValueError(
+            f"num_rollout resolved to {config.num_rollout}; "
+            f"num_rollout_per_epoch={num_per_epoch}, num_epoch={config.num_epoch}"
+        )
     logger.info(
         f"RL num_rollout resolved before service creation: {config.num_rollout} "
         f"(num_rollout_per_epoch={num_per_epoch}, dataset_size={dataset_size})"

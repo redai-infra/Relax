@@ -233,3 +233,49 @@ def test_cross_version_kv_validation_accepts_interval_two_with_one_publication_g
             use_tis=True,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("use_tis", "use_rollout_logprobs", "keep_old_actor"),
+    [(False, False, False), (False, False, True)],
+)
+def test_cross_version_kv_requires_request_level_behavior_policy(
+    use_tis: bool,
+    use_rollout_logprobs: bool,
+    keep_old_actor: bool,
+) -> None:
+    with pytest.raises(ValueError, match="requires --use-tis or --use-rollout-logprobs"):
+        validate_cross_version_kv_args(
+            SimpleNamespace(
+                enable_cross_version_kv_continuation=True,
+                hybrid=True,
+                fully_async=True,
+                partial_rollout=True,
+                colocate=True,
+                offload_rollout=False,
+                update_weights_interval=1,
+                cross_version_kv_max_gap=2,
+                max_staleness=2,
+                use_tis=use_tis,
+                use_rollout_logprobs=use_rollout_logprobs,
+                keep_old_actor=keep_old_actor,
+            )
+        )
+
+
+def test_cross_version_kv_accepts_rollout_logprobs() -> None:
+    validate_cross_version_kv_args(
+        SimpleNamespace(
+            enable_cross_version_kv_continuation=True,
+            hybrid=True,
+            fully_async=True,
+            partial_rollout=True,
+            colocate=True,
+            offload_rollout=False,
+            update_weights_interval=1,
+            cross_version_kv_max_gap=2,
+            max_staleness=2,
+            use_tis=False,
+            use_rollout_logprobs=True,
+        )
+    )

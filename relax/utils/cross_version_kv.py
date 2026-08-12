@@ -122,6 +122,12 @@ def validate_cross_version_kv_args(args: object) -> None:
         raise ValueError("--enable-cross-version-kv-continuation currently requires colocated weight sync.")
     if getattr(args, "offload_rollout", False):
         raise ValueError("--enable-cross-version-kv-continuation is incompatible with rollout offload.")
+    if not (getattr(args, "use_tis", False) or getattr(args, "use_rollout_logprobs", False)):
+        raise ValueError(
+            "--enable-cross-version-kv-continuation requires --use-tis or --use-rollout-logprobs "
+            "to preserve the request-level behavior policy; --keep-old-actor cannot represent "
+            "a request that continues decoding across weight publications."
+        )
     update_weights_interval = int(getattr(args, "update_weights_interval", 1))
     if update_weights_interval < 1:
         raise ValueError("--update-weights-interval must be >= 1.")

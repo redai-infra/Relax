@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.utils.test_arguments_helpers import _arguments_module  # noqa: F401
+
 
 @pytest.mark.parametrize(
     ("argv", "expected"),
@@ -224,6 +226,7 @@ def test_hybrid_dcs_with_cross_version_kv_accepts_default_router(
     args.update_weights_interval = 1
     args.cross_version_kv_max_gap = 2
     args.max_staleness = 2
+    args.use_tis = True
 
     arguments_module.slime_validate_args(args)
 

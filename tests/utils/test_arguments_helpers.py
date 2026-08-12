@@ -7,8 +7,8 @@ from types import ModuleType
 import pytest
 
 
-@pytest.fixture()
-def arguments_module(monkeypatch):
+@pytest.fixture(name="arguments_module")
+def _arguments_module(monkeypatch):
     router_pkg = ModuleType("sglang_router")
     launch_router = ModuleType("sglang_router.launch_router")
     launch_router.RouterArgs = object

@@ -2831,17 +2831,33 @@ def _drop_unused_reference_resource(args) -> bool:
 
 
 def _validate_hybrid_weight_publication_args(args) -> None:
-    """Reject publication intervals that lose the behavior-policy baseline."""
+    """Require a valid behavior-policy reference when Hybrid skips
+    publications."""
     update_weights_interval = int(getattr(args, "update_weights_interval", 1))
     if update_weights_interval < 1:
         raise ValueError("--update-weights-interval must be >= 1.")
-    if not getattr(args, "hybrid", False) or update_weights_interval == 1:
+    if not getattr(args, "hybrid", False) or update_weights_interval <= 1:
         return
-    if any(bool(getattr(args, name, False)) for name in ("use_tis", "use_rollout_logprobs", "keep_old_actor")):
+
+    if getattr(args, "use_tis", False):
         return
+
+    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    if not true_on_policy and getattr(args, "use_rollout_logprobs", False):
+        return
+
+    if not true_on_policy and getattr(args, "max_staleness", 0) == 0 and getattr(args, "keep_old_actor", False):
+        return
+
+    if true_on_policy:
+        valid_options = "--use-tis"
+    elif getattr(args, "max_staleness", 0) > 0:
+        valid_options = "--use-tis or --use-rollout-logprobs"
+    else:
+        valid_options = "--use-tis, --keep-old-actor, or --use-rollout-logprobs"
     raise ValueError(
-        "Hybrid --update-weights-interval > 1 lets Rollout sample with an older published policy and "
-        "requires --use-tis, --use-rollout-logprobs, or --keep-old-actor."
+        "--hybrid with --update-weights-interval > 1 reuses previously published Rollout weights, so "
+        f"old log-probs require correction. Enable {valid_options}, or set --update-weights-interval 1."
     )
 
 

@@ -86,5 +86,35 @@ def test_num_epoch_rejects_small_global_dataset(monkeypatch) -> None:
     data_source = SimpleNamespace(lengths=SimpleNamespace(remote=Mock(return_value="length-ref")))
     monkeypatch.setattr(bootstrap.ray, "get", lambda ref: 8)
 
-    with pytest.raises(ValueError, match="Cannot derive num_rollout from num_epoch"):
+    with pytest.raises(ValueError, match="must be at least rollout_batch_size"):
+        bootstrap.resolve_rl_num_rollout(config, data_source)
+
+
+def test_empty_global_dataset_is_rejected(monkeypatch) -> None:
+    config = Namespace(
+        loss_type="grpo",
+        rollout_global_dataset=True,
+        rollout_batch_size=16,
+        num_epoch=None,
+        num_rollout=20,
+    )
+    data_source = SimpleNamespace(lengths=SimpleNamespace(remote=Mock(return_value="length-ref")))
+    monkeypatch.setattr(bootstrap.ray, "get", lambda ref: 0)
+
+    with pytest.raises(ValueError, match="non-empty dataset"):
+        bootstrap.resolve_rl_num_rollout(config, data_source)
+
+
+def test_num_epoch_rejects_non_divisible_global_dataset(monkeypatch) -> None:
+    config = Namespace(
+        loss_type="grpo",
+        rollout_global_dataset=True,
+        rollout_batch_size=6,
+        num_epoch=2,
+        num_rollout=None,
+    )
+    data_source = SimpleNamespace(lengths=SimpleNamespace(remote=Mock(return_value="length-ref")))
+    monkeypatch.setattr(bootstrap.ray, "get", lambda ref: 10)
+
+    with pytest.raises(ValueError, match="must be divisible"):
         bootstrap.resolve_rl_num_rollout(config, data_source)
