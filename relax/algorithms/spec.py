@@ -1,0 +1,226 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Declarative descriptions of the RL algorithms Relax supports.
+
+A single ``--advantage-estimator`` value used to be interpreted independently by
+six different files: role lookup, reward normalisation, the advantage formula,
+the policy loss formula, and two rounds of argument validation.  Adding an
+algorithm meant finding all of them.  ``AlgorithmSpec`` collects that metadata
+in one place, so a new algorithm is one dict entry plus its pure functions.
+
+Fields hold **string identifiers**, not callables.  The advantage formula runs
+inside the Ray Serve ``Advantages`` deployment while the policy loss runs inside
+the Megatron worker; those two processes import different module subsets, so we
+ship the algorithm name and let each process resolve the identifier against its
+own table.  That also keeps this module free of heavy imports, which is what
+makes the registry testable on a CPU-only runner.
+"""
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class AlgorithmSpec:
+    """Everything the training pipeline needs to know about one algorithm."""
+
+    name: str
+
+    # --- reward stage (rollout side, CPU, scalar in / scalar out) ---
+    reward_normalizer: str
+    """Key into :data:`relax.algorithms.rewards.REWARD_NORMALIZERS`."""
+
+    # --- advantage stage ---
+    advantage_fn: str
+    """Key into :data:`relax.algorithms.advantages.ADVANTAGE_FNS`."""
+
+    # --- policy loss stage ---
+    policy_loss_fn: str
+    """Key into :data:`relax.algorithms.policy.POLICY_LOSS_FNS`."""
+
+    kl_level: str = "token"
+    """``"token"`` or ``"sequence"``; GSPO constrains the sequence as a whole."""
+
+    advantage_normalization: str = "whiten"
+    """How ``--normalize-advantages`` normalises, read in
+    ``relax/backends/megatron/loss.py``.
+
+    ``"whiten"`` is the masked whitening every algorithm used before REINFORCE++
+    arrived. ``"token_global"`` is REINFORCE++'s global token-level
+    normalisation, which also requires the mask-safe loss reducer -- the two go
+    together, which is why one field drives both call sites rather than two.
+
+    Those two call sites were the last place a *maths* decision was still made
+    by comparing algorithm names, and unlike the remaining ``== "ppo"`` checks
+    this one is not expressible through an existing field: it is orthogonal to
+    ``needs_critic``.
+    """
+
+    needs_full_log_probs: bool = False
+    """Whether the loss needs CP-gathered full-response log probs."""
+
+    # --- orchestration and validation ---
+    needs_critic: bool = False
+    requires_normalize_advantages: bool = False
+    forbids_normalize_advantages: bool = False
+    """Set when the token-level ``--normalize-advantages`` pass would undo what
+    the estimator deliberately kept.
+
+    RLOO's advantage carries the reward scale on purpose; re-whitening it after
+    DP sharding puts back the standard-deviation division RLOO removes, and
+    makes the result depend on how the batch was partitioned.
+    """
+
+    requires_rewards_normalization: bool = False
+    """Set when the algorithm's reward stage is load-bearing rather than
+    optional, so ``--disable-rewards-normalization`` would silently skip it."""
+
+    min_group_size: int = 1
+    """Smallest ``--n-samples-per-prompt`` the reward stage is defined for."""
+
+    forbids_reward_side_kl: bool = False
+    """Set when the estimator has no place to put a reward-side KL penalty.
+
+    Both members here compute their advantage from a completion-level signal
+    that the ``--kl-coef`` shaping term never enters, so a nonzero coefficient
+    would be silently ignored rather than applied. ``--use-kl-loss`` with
+    ``--kl-loss-coef`` remains available: that one is a separate loss term, not
+    a reward modification.
+    """
+
+    requires_global_token_loss: bool = False
+    """Set when the objective is only correct under
+    ``--calculate-per-token-loss``.
+
+    The default per-sample token-mean reducer divides each sample by its own
+    response length, which reweights unequal-length responses by
+    ``1 / response_length``. An objective with no ratio correction has nothing
+    to absorb that reweighting, so it must be normalised by the global number
+    of valid response tokens instead.
+    """
+
+    requires_on_policy_updates: bool = False
+    """Set when every optimizer step must consume exactly the rollout that
+    produced it.
+
+    An objective without an importance-ratio correction cannot account for the
+    policy having moved, so *five* separate configuration knobs have to agree:
+    no ``--fully-async`` / ``--hybrid``, ``--max-staleness 0``,
+    ``--num-steps-per-rollout 1``, ``rollout_batch_size *
+    n_samples_per_prompt == global_batch_size``, and neither
+    ``--partial-rollout`` nor ``--use-dynamic-global-batch-size`` (both let the
+    effective batch size drift at runtime).
+
+    They are one field rather than five because they have one cause. RLOO is
+    currently the only member, so the bundling is a guess about the next
+    unclipped estimator; if one ever needs four of the five, split this field
+    then rather than adding an exception to it.
+
+    Note this is a *stronger* statement than "cannot run fully-async": an
+    algorithm can be sync-only for unrelated reasons (PPO's critic topology,
+    or an advantage that needs batch-level statistics the async deployment
+    only sees a slice of). Those get their own field; do not fold them here.
+    """
+
+    @property
+    def is_group_normalized(self) -> bool:
+        """Whether rewards get normalised per prompt group on the rollout
+        side."""
+        return self.reward_normalizer != "none"
+
+
+# NOTE(dev): explicit dict literal, deliberately not decorator-based registration.
+# The advantage formula and the policy loss execute in two different processes
+# whose import graphs differ; decorator registration depends on "was this module
+# imported?" and silently loses an algorithm when one side misses the import.
+ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
+    "grpo": AlgorithmSpec(
+        name="grpo",
+        reward_normalizer="group_mean_std",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="ppo_clip",
+    ),
+    "gspo": AlgorithmSpec(
+        name="gspo",
+        reward_normalizer="group_mean_std",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="ppo_clip",
+        kl_level="sequence",
+        needs_full_log_probs=True,
+    ),
+    "sapo": AlgorithmSpec(
+        name="sapo",
+        reward_normalizer="group_mean_std",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="sapo",
+    ),
+    "cispo": AlgorithmSpec(
+        name="cispo",
+        reward_normalizer="group_mean_std",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="cispo",
+    ),
+    "rloo": AlgorithmSpec(
+        name="rloo",
+        # REINFORCE leave-one-out (arXiv:2402.14740). The baseline is the mean
+        # of the *other* completions in the prompt group, so the reward stage
+        # differs from GRPO's while the advantage stage -- broadcast the scalar
+        # over the response tokens -- is the same one.
+        reward_normalizer="group_leave_one_out",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="rloo",
+        requires_rewards_normalization=True,
+        forbids_normalize_advantages=True,
+        min_group_size=2,
+        forbids_reward_side_kl=True,
+        requires_global_token_loss=True,
+        requires_on_policy_updates=True,
+    ),
+    "ppo": AlgorithmSpec(
+        name="ppo",
+        reward_normalizer="none",
+        advantage_fn="gae",
+        policy_loss_fn="ppo_clip",
+        needs_critic=True,
+    ),
+    "reinforce_plus_plus": AlgorithmSpec(
+        name="reinforce_plus_plus",
+        advantage_normalization="token_global",
+        reward_normalizer="none",
+        advantage_fn="reinforce_plus_plus",
+        policy_loss_fn="ppo_clip",
+        requires_normalize_advantages=True,
+    ),
+    "reinforce_plus_plus_baseline": AlgorithmSpec(
+        name="reinforce_plus_plus_baseline",
+        advantage_normalization="token_global",
+        reward_normalizer="group_mean",
+        advantage_fn="reinforce_plus_plus_baseline",
+        policy_loss_fn="ppo_clip",
+        requires_normalize_advantages=True,
+        # `_validate_reinforce_plus_plus_args` in `relax/utils/arguments.py`
+        # already enforces these by hand, and it is a frozen Task 29 contract
+        # that owns the wording its tests match on. Declaring them here is
+        # still not redundant: an undeclared field is not neutral, it asserts
+        # the default -- leaving them out would have this spec state that the
+        # estimator runs fine with `--disable-rewards-normalization` and a
+        # group of one, both false. The frozen function runs first on both
+        # validation paths, so its messages still win.
+        requires_rewards_normalization=True,
+        min_group_size=2,
+        forbids_reward_side_kl=True,
+    ),
+}
+
+
+def get_algorithm(name: str) -> AlgorithmSpec:
+    """Look up an algorithm spec by its ``--advantage-estimator`` value."""
+    try:
+        return ALGORITHM_SPECS[name]
+    except KeyError:
+        available = ", ".join(ALGORITHM_SPECS)
+        raise KeyError(f"Unknown advantage estimator {name!r}. Available: {available}") from None
+
+
+def list_algorithm_names() -> list[str]:
+    """All registered algorithm names, in definition order."""
+    return list(ALGORITHM_SPECS)
