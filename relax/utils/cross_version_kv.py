@@ -170,6 +170,51 @@ def cross_version_kv_group_ready_for_finalize(group: Sequence[object]) -> bool:
     return True
 
 
+def cross_version_kv_group_generation_indices(group: Sequence[object]) -> list[int]:
+    """Return non-terminal members that may enter generation.
+
+    A targeted-retirement fallback can contain completed/truncated siblings
+    alongside aborted requests. The terminal siblings must remain part of the
+    group for reward and transfer, but must not re-enter per-sample generation.
+    """
+    terminal_statuses = {"completed", "truncated"}
+    generation_indices: list[int] = []
+    for index, sample in enumerate(group):
+        status = getattr(sample, "status", None)
+        if getattr(status, "value", status) not in terminal_statuses:
+            generation_indices.append(index)
+    return generation_indices
+
+
+def prepare_cross_version_kv_strict_retry(group: Sequence[object]) -> tuple[list[int], int]:
+    """Reset only aborted members for strict regeneration.
+
+    Returns the retried member indices and their retained-prefix token count.
+    Terminal siblings stay unchanged until the full group is finalized.
+    """
+    status_values = []
+    for sample in group:
+        status = getattr(sample, "status", None)
+        status_values.append(getattr(status, "value", status))
+    unexpected_statuses = [status for status in status_values if status not in {"aborted", "completed", "truncated"}]
+    if unexpected_statuses:
+        raise RuntimeError(f"Strict retry group contains unexpected sample status: {unexpected_statuses[0]!r}")
+
+    retry_indices: list[int] = []
+    retained_prefix_tokens = 0
+    for index, (sample, status_value) in enumerate(zip(group, status_values, strict=True)):
+        if status_value in {"completed", "truncated"}:
+            continue
+        retry_indices.append(index)
+        retained_prefix_tokens += int(getattr(sample, "response_length"))
+        sample.abort_count += 1
+        sample.metadata.pop("targeted_retirement_aborted", None)
+        sample.metadata["cross_version_kv_carried"] = False
+        sample.metadata["cross_version_kv_carryovers"] = 0
+        sample.metadata["cross_version_kv_fallbacks"] = int(sample.metadata.get("cross_version_kv_fallbacks", 0)) + 1
+    return retry_indices, retained_prefix_tokens
+
+
 def cross_version_kv_group_requires_strict_retry(group: Sequence[object]) -> bool:
     return any(
         bool(

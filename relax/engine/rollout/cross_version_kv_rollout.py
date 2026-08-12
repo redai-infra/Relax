@@ -35,6 +35,7 @@ from relax.utils.cross_version_kv import (
     plan_baseline_window_fetch,
     plan_carry_aware_oversampling_seed,
     plan_dp_aligned_extra_groups,
+    prepare_cross_version_kv_strict_retry,
     validate_disjoint_rollout_groups,
 )
 from relax.utils.logging_utils import get_logger
@@ -323,18 +324,11 @@ async def generate_rollout_async_with_kv_continuation(
                 and cross_version_kv_group_requires_strict_retry(group)
             )
             if cross_version_fallback:
-                prefix_tokens = sum(sample.response_length for sample in group)
+                retry_indices, prefix_tokens = prepare_cross_version_kv_strict_retry(group)
+                if not retry_indices:
+                    raise RuntimeError("Cross-version strict fallback has no aborted samples to retry")
                 strict_fallback_groups += 1
                 strict_fallback_prefix_tokens += prefix_tokens
-                for sample in group:
-                    if sample.status == Sample.Status.ABORTED:
-                        sample.abort_count += 1
-                    sample.metadata.pop("targeted_retirement_aborted", None)
-                    sample.metadata["cross_version_kv_carried"] = False
-                    sample.metadata["cross_version_kv_carryovers"] = 0
-                    sample.metadata["cross_version_kv_fallbacks"] = (
-                        int(sample.metadata.get("cross_version_kv_fallbacks", 0)) + 1
-                    )
                 await _submit_generate_tasks_debt_first(
                     state,
                     args,
@@ -347,9 +341,10 @@ async def generate_rollout_async_with_kv_continuation(
                     debt_groups_inflight += 1
                 logger.info(
                     "CROSS_VERSION_KV event=strict_fallback rollout_id=%s "
-                    "origin=%s groups=1 retained_prefix_tokens=%s",
+                    "origin=%s groups=1 retry_samples=%s retained_prefix_tokens=%s",
                     rollout_id,
                     "old_debt" if group_is_debt else "fresh",
+                    len(retry_indices),
                     prefix_tokens,
                 )
                 continue

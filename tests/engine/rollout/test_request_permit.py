@@ -73,9 +73,9 @@ def _completed_sample() -> SimpleNamespace:
         response="done",
         response_length=1,
         reward=1.0,
-        loss_mask=None,
+        loss_mask=[1],
         session_id=None,
-        metadata={},
+        metadata={"terminal_sibling": True},
     )
 
 
@@ -125,6 +125,10 @@ async def test_group_rm_waits_for_cross_version_strict_retry(monkeypatch) -> Non
     assert reward_calls == [original_group]
     assert completed.reward == 1.0
     assert aborted.reward == 1.0
+    assert completed.response == "done"
+    assert completed.loss_mask == [1]
+    assert completed.session_id is None
+    assert completed.metadata == {"terminal_sibling": True}
 
 
 async def test_group_rm_skips_mixed_terminal_group(monkeypatch) -> None:

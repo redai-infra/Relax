@@ -28,6 +28,7 @@ from relax.engine.rollout.request_permit import GenerationAborted, InferencePerm
 from relax.utils.async_utils import run
 from relax.utils.cross_version_kv import (
     cross_version_kv_enabled,
+    cross_version_kv_group_generation_indices,
     cross_version_kv_group_ready_for_finalize,
     plan_dp_aligned_extra_groups,
 )
@@ -697,8 +698,20 @@ async def generate_and_rm_group(
             submitted_event.set()
         return group
 
-    # Generate a unique session_id for each sample in the group
-    for idx, sample in enumerate(group):
+    generation_indices = (
+        cross_version_kv_group_generation_indices(group) if cross_version_kv_enabled(args) else list(range(len(group)))
+    )
+    generation_index_set = set(generation_indices)
+    for group_index, sample in enumerate(group):
+        if group_index in generation_index_set:
+            continue
+        assert sample.response is not None
+        if not args.group_rm:
+            assert sample.reward is not None
+    generation_samples = [group[index] for index in generation_indices]
+
+    # Generate a unique session_id only for samples that will enter generation.
+    for sample in generation_samples:
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
@@ -706,38 +719,45 @@ async def generate_and_rm_group(
     # group share the same multimodal_inputs object (e.g. after shallow-copy in
     # data_source), encode once and attach the result to every sample so that
     # generate() picks up the pre-encoded data instead of re-encoding per sample.
-    first_mm = getattr(group[0], "multimodal_inputs", None)
-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+    first_mm = getattr(generation_samples[0], "multimodal_inputs", None) if generation_samples else None
+    if first_mm is not None and all(
+        getattr(sample, "multimodal_inputs", None) is first_mm for sample in generation_samples[1:]
+    ):
         encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
-        for sample in group:
+        for sample in generation_samples:
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
     tasks = []
-    dispatch_started_events = [asyncio.Event() for _ in group] if submitted_event is not None else None
-    for idx, sample in enumerate(group):
+    dispatch_started_events = [asyncio.Event() for _ in generation_samples] if submitted_event is not None else None
+    for task_index, (group_index, sample) in enumerate(zip(generation_indices, generation_samples, strict=True)):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
+            seed = state.group_sampling_seeds[group_index]
             current_sampling_params["sampling_seed"] = seed
+        dispatch_started_event = dispatch_started_events[task_index] if dispatch_started_events else None
         task = asyncio.create_task(
             generate_and_rm(
                 args,
                 sample,
                 current_sampling_params,
                 evaluation=evaluation,
-                dispatch_started_event=dispatch_started_events[idx] if dispatch_started_events else None,
+                dispatch_started_event=dispatch_started_event,
             )
         )
-        if dispatch_started_events is not None:
-            task.add_done_callback(lambda _task, event=dispatch_started_events[idx]: event.set())
+        if dispatch_started_event is not None:
+            task.add_done_callback(lambda _task, event=dispatch_started_event: event.set())
         tasks.append(task)
 
     if dispatch_started_events is not None:
         await asyncio.gather(*(event.wait() for event in dispatch_started_events))
         submitted_event.set()
 
-    group = await asyncio.gather(*tasks)
+    generated_samples = await asyncio.gather(*tasks)
+    result_group = list(group)
+    for group_index, generated_sample in zip(generation_indices, generated_samples, strict=True):
+        result_group[group_index] = generated_sample
+    group = result_group
 
     # A backend-side strict pause can abort only part of a group without
     # toggling state.aborted. Defer group reward and OPD prefill until every

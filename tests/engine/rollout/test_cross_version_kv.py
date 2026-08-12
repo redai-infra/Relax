@@ -8,6 +8,7 @@ from relax.utils.cross_version_kv import (
     clear_cross_version_kv_task_markers,
     cross_version_kv_abort_retry_interval_seconds,
     cross_version_kv_abort_timeout_seconds,
+    cross_version_kv_group_generation_indices,
     cross_version_kv_group_ready_for_finalize,
     cross_version_kv_group_requires_strict_retry,
     cross_version_kv_pause_mode,
@@ -17,6 +18,7 @@ from relax.utils.cross_version_kv import (
     plan_baseline_window_fetch,
     plan_carry_aware_oversampling_seed,
     plan_dp_aligned_extra_groups,
+    prepare_cross_version_kv_strict_retry,
     validate_cross_version_kv_args,
 )
 
@@ -100,6 +102,64 @@ def test_mixed_group_defers_group_finalize_until_retry_completes() -> None:
     aborted.status = "completed"
 
     assert cross_version_kv_group_ready_for_finalize([completed, aborted])
+
+
+def test_mixed_group_generation_selects_only_non_terminal_members() -> None:
+    completed = SimpleNamespace(status="completed")
+    aborted = SimpleNamespace(status="aborted")
+    truncated = SimpleNamespace(status="truncated")
+
+    assert cross_version_kv_group_generation_indices([completed, aborted, truncated]) == [1]
+
+
+def test_strict_retry_mutates_and_counts_only_aborted_member() -> None:
+    completed = SimpleNamespace(
+        status="completed",
+        response_length=7,
+        abort_count=0,
+        metadata={"cross_version_kv_carried": True, "cross_version_kv_carryovers": 2},
+    )
+    aborted = SimpleNamespace(
+        status="aborted",
+        response_length=5,
+        abort_count=0,
+        metadata={
+            "targeted_retirement_aborted": True,
+            "cross_version_kv_carried": True,
+            "cross_version_kv_carryovers": 2,
+            "cross_version_kv_fallbacks": 1,
+        },
+    )
+    completed_metadata = dict(completed.metadata)
+
+    retry_indices, retained_prefix_tokens = prepare_cross_version_kv_strict_retry([completed, aborted])
+
+    assert retry_indices == [1]
+    assert retained_prefix_tokens == 5
+    assert completed.abort_count == 0
+    assert completed.metadata == completed_metadata
+    assert aborted.abort_count == 1
+    assert aborted.metadata == {
+        "cross_version_kv_carried": False,
+        "cross_version_kv_carryovers": 0,
+        "cross_version_kv_fallbacks": 2,
+    }
+
+
+def test_strict_retry_rejects_non_terminal_non_aborted_member() -> None:
+    aborted = SimpleNamespace(
+        status="aborted",
+        response_length=3,
+        abort_count=0,
+        metadata={"targeted_retirement_aborted": True},
+    )
+    pending = SimpleNamespace(status="pending", response_length=0, abort_count=0, metadata={})
+
+    with pytest.raises(RuntimeError, match="unexpected sample status: 'pending'"):
+        prepare_cross_version_kv_strict_retry([aborted, pending])
+
+    assert aborted.abort_count == 0
+    assert aborted.metadata == {"targeted_retirement_aborted": True}
 
 
 def test_targeted_retirement_requires_strict_retry_before_carry_adoption() -> None:
