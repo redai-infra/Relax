@@ -58,7 +58,7 @@ def test_resolve_rl_num_rollout_requires_num_rollout_for_non_global_dataset() ->
         bootstrap.resolve_rl_num_rollout(config, SimpleNamespace())
 
 
-def test_explicit_num_rollout_can_cross_small_global_dataset_without_epoch_boundary(monkeypatch) -> None:
+def test_resolve_rl_num_rollout_allows_explicit_steps_when_batch_wraps_epochs(monkeypatch) -> None:
     config = Namespace(
         loss_type="grpo",
         rollout_global_dataset=True,
@@ -75,22 +75,7 @@ def test_explicit_num_rollout_can_cross_small_global_dataset_without_epoch_bound
     assert config.num_rollout == 20
 
 
-def test_num_epoch_rejects_small_global_dataset(monkeypatch) -> None:
-    config = Namespace(
-        loss_type="grpo",
-        rollout_global_dataset=True,
-        rollout_batch_size=16,
-        num_epoch=2,
-        num_rollout=None,
-    )
-    data_source = SimpleNamespace(lengths=SimpleNamespace(remote=Mock(return_value="length-ref")))
-    monkeypatch.setattr(bootstrap.ray, "get", lambda ref: 8)
-
-    with pytest.raises(ValueError, match="must be at least rollout_batch_size"):
-        bootstrap.resolve_rl_num_rollout(config, data_source)
-
-
-def test_empty_global_dataset_is_rejected(monkeypatch) -> None:
+def test_resolve_rl_num_rollout_rejects_empty_global_dataset(monkeypatch) -> None:
     config = Namespace(
         loss_type="grpo",
         rollout_global_dataset=True,
@@ -105,7 +90,22 @@ def test_empty_global_dataset_is_rejected(monkeypatch) -> None:
         bootstrap.resolve_rl_num_rollout(config, data_source)
 
 
-def test_num_epoch_rejects_non_divisible_global_dataset(monkeypatch) -> None:
+def test_resolve_rl_num_rollout_rejects_epoch_count_when_batch_wraps_epochs(monkeypatch) -> None:
+    config = Namespace(
+        loss_type="grpo",
+        rollout_global_dataset=True,
+        rollout_batch_size=16,
+        num_epoch=2,
+        num_rollout=None,
+    )
+    data_source = SimpleNamespace(lengths=SimpleNamespace(remote=Mock(return_value="length-ref")))
+    monkeypatch.setattr(bootstrap.ray, "get", lambda ref: 8)
+
+    with pytest.raises(ValueError, match="must be at least rollout_batch_size"):
+        bootstrap.resolve_rl_num_rollout(config, data_source)
+
+
+def test_resolve_rl_num_rollout_rejects_non_divisible_epoch_dataset(monkeypatch) -> None:
     config = Namespace(
         loss_type="grpo",
         rollout_global_dataset=True,

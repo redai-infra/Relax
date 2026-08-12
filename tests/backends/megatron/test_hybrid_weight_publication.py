@@ -119,11 +119,13 @@ def test_pause_request_classifier_keeps_unknown_connection_error_uncertain() -> 
     )
 
 
-def test_hybrid_weight_publication_resumes_rollout_when_recovery_fails(monkeypatch) -> None:
+def test_hybrid_weight_publication_resumes_then_degrades_when_recovery_fails(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
     actor._end_rollout_weight_update = Mock()
 
     can_update_response = Mock()
@@ -142,16 +144,50 @@ def test_hybrid_weight_publication_resumes_rollout_when_recovery_fails(monkeypat
 
     assert rollout_only is True
     assert actor_fwd_only is True
-    actor._end_rollout_weight_update.assert_called_once_with("http://rollout", 7)
+    actor._end_rollout_weight_update.assert_called_once()
+    assert actor._end_rollout_weight_update.call_args.args == ("http://rollout", 7)
+    assert actor._end_rollout_weight_update.call_args.kwargs["transaction_id"]
     assert request_get.call_args_list[0].kwargs["timeout"] == 30
-    assert "timeout" not in request_get.call_args_list[1].kwargs
+    assert request_get.call_args_list[1].kwargs["timeout"] == 1800
+
+
+def test_hybrid_weight_publication_reuses_one_transaction_within_a_poll_loop(monkeypatch) -> None:
+    from relax.backends.megatron import actor as actor_module
+
+    actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
+
+    not_ready_response = Mock()
+    not_ready_response.json.return_value = 0
+    ready_response = Mock()
+    ready_response.json.return_value = 1
+    recover_response = Mock()
+    request_get = Mock(side_effect=[not_ready_response, ready_response, recover_response])
+
+    monkeypatch.setattr(actor_module, "get_serve_url", lambda role: "http://rollout")
+    monkeypatch.setattr(actor_module.requests, "get", request_get)
+    monkeypatch.setattr(actor_module.time, "sleep", Mock())
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(actor_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(actor_module, "get_gloo_group", lambda: None)
+
+    actor._check_services_health(7)
+
+    first_transaction = request_get.call_args_list[0].kwargs["params"]["transaction_id"]
+    second_transaction = request_get.call_args_list[1].kwargs["params"]["transaction_id"]
+    assert first_transaction == second_transaction
+    assert actor._active_rollout_weight_update_transaction_id == second_transaction
 
 
 def test_hybrid_weight_publication_resumes_when_pause_result_is_uncertain(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
     actor._end_rollout_weight_update = Mock()
 
     can_update_response = Mock()
@@ -166,14 +202,18 @@ def test_hybrid_weight_publication_resumes_when_pause_result_is_uncertain(monkey
     _, actor_fwd_only = actor._check_services_health(7)
 
     assert actor_fwd_only is True
-    actor._end_rollout_weight_update.assert_called_once_with("http://rollout", 7)
+    actor._end_rollout_weight_update.assert_called_once()
+    assert actor._end_rollout_weight_update.call_args.args == ("http://rollout", 7)
+    assert actor._end_rollout_weight_update.call_args.kwargs["transaction_id"]
 
 
 def test_hybrid_weight_publication_does_not_resume_after_connection_refused(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
     actor._end_rollout_weight_update = Mock(side_effect=RuntimeError("rollout is unavailable"))
     new_connection_error = NewConnectionError(None, "connection refused")
     connection_error = actor_module.requests.exceptions.ConnectionError(
@@ -201,7 +241,9 @@ def test_hybrid_weight_publication_resumes_after_connection_reset(monkeypatch) -
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
     actor._end_rollout_weight_update = Mock()
     connection_error = actor_module.requests.exceptions.ConnectionError(
         ProtocolError("connection aborted", ConnectionResetError("connection reset by peer"))
@@ -217,14 +259,18 @@ def test_hybrid_weight_publication_resumes_after_connection_reset(monkeypatch) -
 
     assert rollout_only is True
     assert actor_fwd_only is True
-    actor._end_rollout_weight_update.assert_called_once_with("http://rollout", 7)
+    actor._end_rollout_weight_update.assert_called_once()
+    assert actor._end_rollout_weight_update.call_args.args == ("http://rollout", 7)
+    assert actor._end_rollout_weight_update.call_args.kwargs["transaction_id"]
 
 
 def test_hybrid_weight_publication_does_not_resume_before_pause_request(monkeypatch) -> None:
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
     actor._end_rollout_weight_update = Mock()
 
     monkeypatch.setattr(actor_module, "get_serve_url", Mock(side_effect=RuntimeError("url unavailable")))
@@ -375,7 +421,9 @@ def test_hybrid_weight_publication_aborts_all_ranks_when_resume_fails(monkeypatc
     from relax.backends.megatron import actor as actor_module
 
     actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
-    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=False, hybrid=True, rollout_http_timeout=30, rollout_engine_init_timeout=1800
+    )
     actor._end_rollout_weight_update = Mock(side_effect=RuntimeError("resume failed"))
 
     can_update_response = Mock()
@@ -393,3 +441,20 @@ def test_hybrid_weight_publication_aborts_all_ranks_when_resume_fails(monkeypatc
         actor._check_services_health(7)
 
     all_reduce.assert_called_once()
+
+
+def test_hybrid_weight_publication_nonzero_rank_observes_resume_failure(monkeypatch) -> None:
+    from relax.backends.megatron import actor as actor_module
+
+    actor = actor_module.MegatronTrainRayActor.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(true_on_policy_mode=False, hybrid=True)
+
+    def _broadcast_resume_failure(flags, **_kwargs):
+        flags[2] = 1
+
+    monkeypatch.setattr(actor_module.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(actor_module.dist, "all_reduce", _broadcast_resume_failure)
+    monkeypatch.setattr(actor_module, "get_gloo_group", lambda: None)
+
+    with pytest.raises(RuntimeError, match="Failed to resume Rollout"):
+        actor._check_services_health(7)

@@ -119,13 +119,21 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     elif not args.rollout_global_dataset:
         num_rollout_per_epoch = None
         logger.info("RolloutManager initialized successfully (non-global dataset; no epoch boundary).")
-    elif getattr(args, "num_rollout_per_epoch", None) is not None:
+    elif hasattr(args, "num_rollout_per_epoch"):
         num_rollout_per_epoch = args.num_rollout_per_epoch
         logger.info(
             f"RolloutManager initialized successfully. num_rollout_per_epoch={num_rollout_per_epoch} "
             "(pre-resolved by controller)."
         )
     else:
+        if args.num_epoch is not None and data_source is not None:
+            dataset_size = ray.get(data_source.lengths.remote())
+            if dataset_size % args.rollout_batch_size != 0:
+                raise ValueError(
+                    f"Dataset size {dataset_size} must be divisible by rollout_batch_size "
+                    f"{args.rollout_batch_size} when num_epoch is configured; "
+                    "use explicit num_rollout for cross-epoch batches"
+                )
         num_rollout_per_epoch = ray.get(
             rollout_manager.get_num_rollout_per_epoch.remote(),
         )
@@ -143,6 +151,15 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
             logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
 
     if getattr(args, "loss_type", None) != "sft":
+        if num_rollout_per_epoch is not None and num_rollout_per_epoch <= 0:
+            if args.num_epoch is not None:
+                raise ValueError(
+                    "num_rollout_per_epoch must be positive when num_epoch is configured; "
+                    "check dataset size vs rollout_batch_size"
+                )
+            if args.num_rollout is None or args.num_rollout <= 0:
+                raise ValueError("num_rollout must be positive when a full rollout batch does not fit in one epoch")
+            num_rollout_per_epoch = None
         args.num_rollout_per_epoch = num_rollout_per_epoch
         if num_rollout_per_epoch is not None and args.num_epoch is not None:
             epoch_rollout = num_rollout_per_epoch * args.num_epoch

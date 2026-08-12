@@ -22,6 +22,20 @@ from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 app = FastAPI()
 
 
+def _resolve_start_rollout_id(
+    configured_step: Optional[int],
+    backend_step: int,
+    *,
+    explicitly_set: bool,
+) -> int:
+    """Resolve the service step after the backend has loaded its checkpoint."""
+    if configured_step is None:
+        return backend_step
+    if not explicitly_set and configured_step == 0 and backend_step > 1:
+        return backend_step
+    return configured_step
+
+
 @serve.deployment(max_ongoing_requests=10, max_queued_requests=20)
 @serve.ingress(app)
 class Actor(Base):
@@ -70,8 +84,18 @@ class Actor(Base):
         )
 
         assert len(set(self.steps)) == 1
-        if self.config.start_rollout_id is None:
-            self.config.start_rollout_id = self.steps[0]
+        configured_step = self.config.start_rollout_id
+        self.config.start_rollout_id = _resolve_start_rollout_id(
+            configured_step,
+            self.steps[0],
+            explicitly_set=getattr(self.config, "_start_rollout_id_explicit", configured_step is not None),
+        )
+        if configured_step is not None and configured_step != self.config.start_rollout_id:
+            self._logger.warning(
+                "Checkpoint backend restored step %s; overriding auto-derived start_rollout_id=%s",
+                self.config.start_rollout_id,
+                configured_step,
+            )
         self.step = self.config.start_rollout_id
         self._logger.info(f"Actor initialized with starting step {self.step}")
 

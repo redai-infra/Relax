@@ -26,6 +26,46 @@ from relax.utils.misc import should_run_periodic_action
 app = FastAPI()
 
 
+class _WeightUpdateTransaction:
+    def __init__(self) -> None:
+        self.ready = asyncio.Event()
+        self.end_lock = asyncio.Lock()
+        self.cancel_requested = False
+        self.completed = False
+        self.health_monitoring_pause_attempted = False
+        self.recovery_required = False
+
+
+_MAX_RETAINED_WEIGHT_UPDATE_TRANSACTIONS = 1024
+_MAX_RETAINED_WEIGHT_UPDATE_SESSIONS = 1024
+_MAX_WEIGHT_UPDATE_TRANSACTION_ID_LENGTH = 128
+# Exact replay protection is retained beyond the longest expected in-flight
+# control request, while allowing completed Actor sessions to age out.
+_WEIGHT_UPDATE_SESSION_RETENTION_SECONDS = 24 * 60 * 60
+_WEIGHT_UPDATE_TRANSACTION_VERSION = "relax-v1"
+
+
+def _weight_update_transaction_sequence(transaction_id: str) -> tuple[str, int] | None:
+    try:
+        if len(transaction_id) > _MAX_WEIGHT_UPDATE_TRANSACTION_ID_LENGTH:
+            return None
+        version, session_id, sequence = transaction_id.split(":", 2)
+        if (
+            version != _WEIGHT_UPDATE_TRANSACTION_VERSION
+            or len(session_id) != 32
+            or any(character not in "0123456789abcdef" for character in session_id)
+            or not sequence
+            or any(character not in "0123456789" for character in sequence)
+        ):
+            return None
+        sequence_id = int(sequence)
+        if sequence != str(sequence_id):
+            return None
+        return session_id, sequence_id
+    except (TypeError, ValueError):
+        return None
+
+
 # ===================== Scale-Out API Models =====================
 
 
@@ -344,16 +384,13 @@ class Rollout(Base):
 
         self._stop_event = asyncio.Event()
         self._run_task: Optional[asyncio.Task] = None  # pyright: ignore[reportMissingTypeArgument]
-        # Set by can_do_update_weight_for_async when it finishes; end_update_weight waits on it.
-        self._weight_update_ready = asyncio.Event()
-        self._weight_update_ready.set()
-        # Operation-scoped coordination closes the timeout race where an
-        # /end_update_weight request could overtake a still-running prepare
-        # request on another HTTP connection.  The legacy event remains for
-        # callers that do not yet pass an operation_id.
+        self._weight_update_transactions: dict[str, _WeightUpdateTransaction] = {}
+        self._completed_weight_update_transaction_sequences: dict[str, int] = {}
+        self._weight_update_session_last_seen: dict[str, float] = {}
         self._weight_update_prepare_lock = asyncio.Lock()
-        self._weight_update_prepare_tasks: dict[str, asyncio.Task[int]] = {}
-        self._ended_weight_update_operations: dict[str, None] = {}
+        self._weight_update_idle = asyncio.Event()
+        self._weight_update_idle.set()
+        self._active_weight_update_transaction_id: str | None = None
         self.eval_handler = None
         self.status = "running"
 
@@ -592,85 +629,203 @@ class Rollout(Base):
 
         return await handle_predict(self, train_step)
 
-    async def _prepare_weight_update(self) -> int:
-        step = self.step
-        can_update = await self._async_check_production_for_update_weight(step)
-        if can_update:
-            self._weight_update_ready.clear()
-            self.status = "paused"
-            health_monitoring_paused = False
-            try:
-                await self.rollout_manager.health_monitoring_pause.remote()
-                health_monitoring_paused = True
-                await self.rollout_manager.set_weight_updating.remote(True)
-            except Exception:
-                self.status = "running"
-                try:
-                    await self.rollout_manager.set_weight_updating.remote(False)
-                except Exception:
-                    self._logger.exception("Failed to roll back Rollout weight-update state")
-                if health_monitoring_paused:
-                    try:
-                        await self.rollout_manager.health_monitoring_resume.remote()
-                    except Exception:
-                        self._logger.exception("Failed to resume Rollout health monitoring")
-                raise
-            finally:
-                # Always release the handshake gate: even if the remote calls
-                # above raise, end_update_weight must not block forever.
-                self._weight_update_ready.set()
-            return 1
-        return 0
-
-    def _ensure_weight_update_operation_state(self) -> None:
-        """Lazily initialise operation state for recovery/test shells."""
-        if not hasattr(self, "_weight_update_prepare_lock"):
-            self._weight_update_prepare_lock = asyncio.Lock()
-        if not hasattr(self, "_weight_update_prepare_tasks"):
-            self._weight_update_prepare_tasks = {}
-        if not hasattr(self, "_ended_weight_update_operations"):
-            self._ended_weight_update_operations = {}
-
-    def _mark_weight_update_operation_ended(self, operation_id: str) -> None:
-        self._ended_weight_update_operations[operation_id] = None
-        # A long-running job must not retain one tombstone per training step.
-        while len(self._ended_weight_update_operations) > 256:
-            oldest_operation = next(iter(self._ended_weight_update_operations))
-            self._ended_weight_update_operations.pop(oldest_operation, None)
-
     @app.get("/can_do_update_weight_for_async")
-    async def can_do_update_weight_for_async(self, operation_id: Optional[str] = None):
-        self._logger.debug(
-            "Handling can_do_update_weight_for_async request%s",
-            f" for operation {operation_id}" if operation_id is not None else "",
-        )
-        if operation_id is None:
-            return await self._prepare_weight_update()
+    async def can_do_update_weight_for_async(self, transaction_id: str | None = None):
+        if transaction_id is not None:
+            self._reserve_weight_update_transaction_session(transaction_id)
+        transaction_id = transaction_id or "legacy"
+        self._logger.debug(f"Handling can_do_update_weight_for_async transaction {transaction_id}")
+        transaction = self._weight_update_transactions.get(transaction_id)
+        if (
+            transaction_id == "legacy"
+            and transaction is not None
+            and transaction.completed
+            and transaction.cancel_requested
+            and not transaction.recovery_required
+            and self._active_weight_update_transaction_id != transaction_id
+        ):
+            self._weight_update_transactions.pop(transaction_id, None)
+            return 0
+        if transaction is None and self._weight_update_transaction_is_retired(transaction_id):
+            return 0
+        owns_request = transaction is None
+        if transaction is None:
+            self._ensure_weight_update_transaction_capacity()
+            transaction = _WeightUpdateTransaction()
+            self._weight_update_transactions[transaction_id] = transaction
 
-        self._ensure_weight_update_operation_state()
-        async with self._weight_update_prepare_lock:
-            if operation_id in self._ended_weight_update_operations:
-                # A cleanup request reached the service before a delayed
-                # prepare request.  Never let that late request pause rollout.
-                return 0
-            prepare_task = self._weight_update_prepare_tasks.get(operation_id)
-            if prepare_task is None:
-                prepare_task = asyncio.create_task(self._prepare_weight_update())
-                self._weight_update_prepare_tasks[operation_id] = prepare_task
+        if not owns_request:
+            await transaction.ready.wait()
+            return int(
+                self._active_weight_update_transaction_id == transaction_id and not transaction.cancel_requested
+            )
 
         try:
-            result = await asyncio.shield(prepare_task)
-        except Exception:
             async with self._weight_update_prepare_lock:
-                if self._weight_update_prepare_tasks.get(operation_id) is prepare_task:
-                    self._weight_update_prepare_tasks.pop(operation_id, None)
-            raise
+                while self._active_weight_update_transaction_id not in (None, transaction_id):
+                    await self._weight_update_idle.wait()
 
-        if result == 0:
-            async with self._weight_update_prepare_lock:
-                if self._weight_update_prepare_tasks.get(operation_id) is prepare_task:
-                    self._weight_update_prepare_tasks.pop(operation_id, None)
-        return result
+                if self._weight_update_transaction_is_retired(transaction_id):
+                    return 0
+                if transaction.cancel_requested:
+                    return 0
+
+                step = self.step
+                can_update = await self._async_check_production_for_update_weight(step)
+                if (
+                    not can_update
+                    or transaction.cancel_requested
+                    or self._weight_update_transaction_is_retired(transaction_id)
+                ):
+                    return 0
+
+                self.status = "paused"
+                try:
+                    transaction.health_monitoring_pause_attempted = True
+                    await self.rollout_manager.health_monitoring_pause.remote()
+                    await self.rollout_manager.set_weight_updating.remote(True)
+                except asyncio.CancelledError:
+                    await self._complete_weight_update_prepare_rollback(transaction)
+                    raise
+                except Exception:
+                    await self._complete_weight_update_prepare_rollback(transaction)
+                    raise
+
+                if transaction.cancel_requested or self._weight_update_transaction_is_retired(transaction_id):
+                    if not await self._complete_weight_update_prepare_rollback(transaction):
+                        raise RuntimeError(
+                            f"Failed to roll back superseded weight-update transaction {transaction_id}"
+                        )
+                    return 0
+
+                self._active_weight_update_transaction_id = transaction_id
+                self._weight_update_idle.clear()
+                return 1
+        finally:
+            if self._active_weight_update_transaction_id != transaction_id:
+                transaction.completed = True
+            transaction.ready.set()
+            if transaction.completed and not transaction.cancel_requested and not transaction.recovery_required:
+                self._weight_update_transactions.pop(transaction_id, None)
+            self._prune_weight_update_transactions()
+
+    async def _complete_weight_update_prepare_rollback(self, transaction: _WeightUpdateTransaction) -> bool:
+        rollback_task = asyncio.create_task(self._rollback_weight_update_prepare(transaction))
+        cancellation = None
+        while not rollback_task.done():
+            try:
+                await asyncio.shield(rollback_task)
+            except asyncio.CancelledError as error:
+                # Repeated cancellation must not interrupt rollback.
+                cancellation = error
+        rollback_succeeded = rollback_task.result()
+        transaction.recovery_required = not rollback_succeeded
+        if cancellation is not None:
+            raise cancellation
+        return rollback_succeeded
+
+    async def _rollback_weight_update_prepare(self, transaction: _WeightUpdateTransaction) -> bool:
+        rollback_succeeded = True
+        try:
+            await self.rollout_manager.set_weight_updating.remote(False)
+        except (Exception, asyncio.CancelledError):
+            rollback_succeeded = False
+            self._logger.exception("Failed to roll back Rollout weight-update state")
+        if transaction.health_monitoring_pause_attempted:
+            try:
+                await self.rollout_manager.health_monitoring_resume.remote()
+            except (Exception, asyncio.CancelledError):
+                rollback_succeeded = False
+                self._logger.exception("Failed to resume Rollout health monitoring")
+        self.status = "running" if rollback_succeeded else "paused"
+        return rollback_succeeded
+
+    def _prune_weight_update_transactions(self, max_retained: int = _MAX_RETAINED_WEIGHT_UPDATE_TRANSACTIONS) -> None:
+        excess = len(self._weight_update_transactions) - max_retained
+        if excess <= 0:
+            return
+        for retained_id, retained in list(self._weight_update_transactions.items()):
+            if excess <= 0:
+                break
+            if (
+                retained_id != self._active_weight_update_transaction_id
+                and retained.completed
+                and not retained.recovery_required
+                and self._weight_update_transaction_is_retired(retained_id)
+            ):
+                self._weight_update_transactions.pop(retained_id, None)
+                excess -= 1
+
+    def _ensure_weight_update_transaction_capacity(self) -> None:
+        self._prune_weight_update_transactions(_MAX_RETAINED_WEIGHT_UPDATE_TRANSACTIONS - 1)
+        if len(self._weight_update_transactions) >= _MAX_RETAINED_WEIGHT_UPDATE_TRANSACTIONS:
+            self._logger.warning("Rejecting weight-update transaction because the transaction limit was reached")
+            raise HTTPException(status_code=429, detail="Weight-update transaction limit reached")
+
+    def _retire_weight_update_transaction(self, transaction_id: str) -> None:
+        sequence = _weight_update_transaction_sequence(transaction_id)
+        if sequence is None:
+            return
+        session_id, sequence_id = sequence
+        completed_sequences = self._completed_weight_update_transaction_sequences
+        if session_id not in completed_sequences:
+            # A stale duplicate handler may finish after this completed session
+            # was reclaimed. It must not resurrect an orphan watermark.
+            return
+        completed_sequences[session_id] = max(completed_sequences.get(session_id, -1), sequence_id)
+        self._weight_update_session_last_seen[session_id] = time.monotonic()
+
+    def _reserve_weight_update_transaction_session(self, transaction_id: str) -> None:
+        sequence = _weight_update_transaction_sequence(transaction_id)
+        if sequence is None:
+            self._logger.warning("Rejecting unsupported weight-update transaction ID")
+            raise HTTPException(status_code=400, detail="Unsupported weight-update transaction ID")
+        session_id, _ = sequence
+        completed_sequences = self._completed_weight_update_transaction_sequences
+        session_last_seen = self._weight_update_session_last_seen
+        now = time.monotonic()
+        if session_id in completed_sequences:
+            session_last_seen[session_id] = now
+            return
+        if len(completed_sequences) >= _MAX_RETAINED_WEIGHT_UPDATE_SESSIONS:
+            self._prune_expired_weight_update_sessions(now)
+        if len(completed_sequences) >= _MAX_RETAINED_WEIGHT_UPDATE_SESSIONS:
+            self._logger.warning("Rejecting weight-update transaction because the session limit was reached")
+            raise HTTPException(status_code=429, detail="Weight-update transaction session limit reached")
+        completed_sequences[session_id] = -1
+        session_last_seen[session_id] = now
+
+    def _prune_expired_weight_update_sessions(self, now: float) -> None:
+        cutoff = now - _WEIGHT_UPDATE_SESSION_RETENTION_SECONDS
+        session_last_seen = self._weight_update_session_last_seen
+        for session_id, last_seen in sorted(session_last_seen.items(), key=lambda item: item[1]):
+            if last_seen > cutoff:
+                break
+            retained_transactions = [
+                (retained_id, retained)
+                for retained_id, retained in self._weight_update_transactions.items()
+                if (sequence := _weight_update_transaction_sequence(retained_id)) is not None
+                and sequence[0] == session_id
+            ]
+            if any(
+                retained_id == self._active_weight_update_transaction_id
+                or not retained.completed
+                or retained.recovery_required
+                for retained_id, retained in retained_transactions
+            ):
+                continue
+            for retained_id, _ in retained_transactions:
+                self._weight_update_transactions.pop(retained_id, None)
+            self._completed_weight_update_transaction_sequences.pop(session_id, None)
+            session_last_seen.pop(session_id, None)
+            return
+
+    def _weight_update_transaction_is_retired(self, transaction_id: str) -> bool:
+        sequence = _weight_update_transaction_sequence(transaction_id)
+        if sequence is None:
+            return False
+        session_id, sequence_id = sequence
+        return sequence_id <= self._completed_weight_update_transaction_sequences.get(session_id, -1)
 
     async def _async_check_production_for_update_weight(self, step: int) -> bool:
         # During final backfill the rollout service may have stepped past
@@ -711,42 +866,69 @@ class Rollout(Base):
         return {"done": len(ready) > 0}
 
     @app.get("/end_update_weight")
-    async def end_update_weight(self, operation_id: Optional[str] = None):
-        self._logger.info(
-            "Ending update weight, resuming rollout%s",
-            f" for operation {operation_id}" if operation_id is not None else "",
-        )
-        if operation_id is None:
-            await self._weight_update_ready.wait()
-            self.status = "running"
-            await self.rollout_manager.set_weight_updating.remote(False)
+    async def end_update_weight(self, transaction_id: str | None = None):
+        if transaction_id is not None:
+            self._reserve_weight_update_transaction_session(transaction_id)
+        legacy_request = transaction_id is None
+        if transaction_id is None:
+            transaction_id = "legacy"
+
+        self._logger.info(f"Ending weight-update transaction {transaction_id}, resuming rollout")
+        transaction = self._weight_update_transactions.get(transaction_id)
+        if transaction is None:
+            self._ensure_weight_update_transaction_capacity()
+            # A compensating end can be dispatched before its timed-out pause
+            # request reaches this replica. Leave a tombstone for that request.
+            transaction = _WeightUpdateTransaction()
+            transaction.cancel_requested = True
+            transaction.completed = True
+            transaction.ready.set()
+            self._weight_update_transactions[transaction_id] = transaction
+            self._retire_weight_update_transaction(transaction_id)
+            self._prune_weight_update_transactions()
             return
 
-        self._ensure_weight_update_operation_state()
-        async with self._weight_update_prepare_lock:
-            prepare_task = self._weight_update_prepare_tasks.get(operation_id)
-            if prepare_task is None:
-                # Tombstone an unknown operation so a delayed prepare request
-                # cannot pause rollout after this cleanup has returned.
-                self._mark_weight_update_operation_ended(operation_id)
+        if (
+            legacy_request
+            and transaction.completed
+            and transaction.cancel_requested
+            and not transaction.recovery_required
+            and self._active_weight_update_transaction_id != transaction_id
+        ):
+            # Retried compensating ends must preserve the one-shot tombstone
+            # until the corresponding late legacy pause consumes it.
+            return
+
+        transaction.cancel_requested = True
+        await transaction.ready.wait()
+        async with transaction.end_lock:
+            if self._active_weight_update_transaction_id != transaction_id:
+                if transaction.recovery_required:
+                    if not await self._complete_weight_update_prepare_rollback(transaction):
+                        raise RuntimeError(f"Failed to recover weight-update transaction {transaction_id}")
+                transaction.completed = True
+                self._retire_weight_update_transaction(transaction_id)
+                if legacy_request:
+                    self._weight_update_transactions.pop(transaction_id, None)
+                self._prune_weight_update_transactions()
                 return
 
-        prepare_succeeded = False
-        try:
-            prepare_succeeded = bool(await asyncio.shield(prepare_task))
-        except Exception:
-            # _prepare_weight_update already restores status/monitoring on its
-            # failure path.  Cleanup remains idempotent and successful.
-            self._logger.exception("Weight-update prepare failed before cleanup for operation %s", operation_id)
-
-        if prepare_succeeded:
-            self.status = "running"
             await self.rollout_manager.set_weight_updating.remote(False)
-
-        async with self._weight_update_prepare_lock:
-            if self._weight_update_prepare_tasks.get(operation_id) is prepare_task:
-                self._weight_update_prepare_tasks.pop(operation_id, None)
-            self._mark_weight_update_operation_ended(operation_id)
+            # A duplicate end handler may have completed the remote call while
+            # this handler was suspended. Only the active owner may commit the
+            # local resume state.
+            if self._active_weight_update_transaction_id != transaction_id:
+                transaction.completed = True
+                self._prune_weight_update_transactions()
+                return
+            self.status = "running"
+            self._active_weight_update_transaction_id = None
+            transaction.completed = True
+            self._retire_weight_update_transaction(transaction_id)
+            self._weight_update_idle.set()
+            if legacy_request:
+                self._weight_update_transactions.pop(transaction_id, None)
+            self._prune_weight_update_transactions()
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):

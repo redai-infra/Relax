@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
 
 from relax.utils.data.data_utils import check_sample_length
 from relax.utils.types import Sample
@@ -17,6 +16,10 @@ def qwen3_tokenizer():
     model_path = os.environ.get("RELAX_TEST_QWEN3_4B")
     if not model_path or not Path(model_path).is_dir():
         pytest.skip("Qwen3-4B is unavailable; set RELAX_TEST_QWEN3_4B to its local directory")
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        pytest.skip(f"transformers AutoTokenizer unavailable: {exc}")
     return AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
 
 
@@ -25,6 +28,10 @@ def qwen3_vl_processor():
     model_path = os.environ.get("RELAX_TEST_QWEN3_VL_4B")
     if not model_path or not Path(model_path).is_dir():
         pytest.skip("Qwen3-VL-4B-Instruct is unavailable; set RELAX_TEST_QWEN3_VL_4B to its local directory")
+    try:
+        from transformers import AutoProcessor
+    except ImportError as exc:
+        pytest.skip(f"transformers AutoProcessor unavailable: {exc}")
     return AutoProcessor.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
 
 

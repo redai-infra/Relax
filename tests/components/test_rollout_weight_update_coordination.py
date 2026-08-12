@@ -61,7 +61,13 @@ async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
     Base.__init__(rollout)
     rollout.step = 1
     rollout.status = "running"
-    rollout._weight_update_ready = asyncio.Event()
+    rollout._weight_update_transactions = {}
+    rollout._completed_weight_update_transaction_sequences = {}
+    rollout._weight_update_session_last_seen = {}
+    rollout._weight_update_prepare_lock = asyncio.Lock()
+    rollout._weight_update_idle = asyncio.Event()
+    rollout._weight_update_idle.set()
+    rollout._active_weight_update_transaction_id = None
     rollout._async_check_production_for_update_weight = AsyncMock(return_value=True)
     rollout.rollout_manager = SimpleNamespace(
         health_monitoring_pause=SimpleNamespace(remote=AsyncMock()),
@@ -72,75 +78,6 @@ async def test_weight_update_prepare_failure_restores_rollout_state() -> None:
         await rollout.can_do_update_weight_for_async()
 
     assert rollout.status == "running"
-    assert rollout._weight_update_ready.is_set()
+    assert "legacy" not in rollout._weight_update_transactions
     assert rollout.rollout_manager.set_weight_updating.remote.await_args_list[1].args == (False,)
     rollout.rollout_manager.health_monitoring_resume.remote.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_operation_cleanup_waits_for_inflight_prepare() -> None:
-    rollout = RolloutClass.__new__(RolloutClass)
-    Base.__init__(rollout)
-    rollout.step = 1
-    rollout.status = "running"
-    rollout._weight_update_ready = asyncio.Event()
-    rollout._weight_update_ready.set()
-    rollout._weight_update_prepare_lock = asyncio.Lock()
-    rollout._weight_update_prepare_tasks = {}
-    rollout._ended_weight_update_operations = {}
-    rollout._async_check_production_for_update_weight = AsyncMock(return_value=True)
-
-    prepare_started = asyncio.Event()
-    release_prepare = asyncio.Event()
-
-    async def pause_health_monitoring() -> None:
-        prepare_started.set()
-        await release_prepare.wait()
-
-    rollout.rollout_manager = SimpleNamespace(
-        health_monitoring_pause=SimpleNamespace(remote=AsyncMock(side_effect=pause_health_monitoring)),
-        health_monitoring_resume=SimpleNamespace(remote=AsyncMock()),
-        set_weight_updating=SimpleNamespace(remote=AsyncMock()),
-    )
-
-    prepare = asyncio.create_task(rollout.can_do_update_weight_for_async(operation_id="actor-step-7"))
-    await prepare_started.wait()
-    cleanup = asyncio.create_task(rollout.end_update_weight(operation_id="actor-step-7"))
-    await asyncio.sleep(0)
-    assert not cleanup.done()
-
-    release_prepare.set()
-    assert await prepare == 1
-    await cleanup
-
-    assert rollout.status == "running"
-    assert [call.args for call in rollout.rollout_manager.set_weight_updating.remote.await_args_list] == [
-        (True,),
-        (False,),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_late_prepare_cannot_overtake_operation_cleanup() -> None:
-    rollout = RolloutClass.__new__(RolloutClass)
-    Base.__init__(rollout)
-    rollout.step = 1
-    rollout.status = "running"
-    rollout._weight_update_ready = asyncio.Event()
-    rollout._weight_update_ready.set()
-    rollout._weight_update_prepare_lock = asyncio.Lock()
-    rollout._weight_update_prepare_tasks = {}
-    rollout._ended_weight_update_operations = {}
-    rollout._async_check_production_for_update_weight = AsyncMock(return_value=True)
-    rollout.rollout_manager = SimpleNamespace(
-        health_monitoring_pause=SimpleNamespace(remote=AsyncMock()),
-        health_monitoring_resume=SimpleNamespace(remote=AsyncMock()),
-        set_weight_updating=SimpleNamespace(remote=AsyncMock()),
-    )
-
-    await rollout.end_update_weight(operation_id="actor-step-9")
-    result = await rollout.can_do_update_weight_for_async(operation_id="actor-step-9")
-
-    assert result == 0
-    rollout._async_check_production_for_update_weight.assert_not_awaited()
-    rollout.rollout_manager.set_weight_updating.remote.assert_not_awaited()
