@@ -7,10 +7,10 @@ Relax writes a versioned experiment manifest for every training run. The manifes
 The default path is:
 
 ```text
-relax_runs/<experiment-name-or-UTC-time>/experiment-manifest.json
+relax_runs/<experiment-name>/<unique-run-id>/experiment-manifest.json
 ```
 
-Set `RELAX_MANIFEST_PATH` to choose a different file. Manifest creation is best effort: an I/O or collection error emits a warning and never blocks training.
+Each default run ID contains a UTC timestamp, process ID, and random suffix, so repeated runs do not overwrite earlier manifests. Set `RELAX_MANIFEST_PATH` to choose a specific file. Manifest creation is best effort: an I/O or collection error emits a warning and never blocks training.
 
 ## Schema v1
 

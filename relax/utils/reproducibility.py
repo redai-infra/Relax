@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,11 @@ _ADDRESS_KEY_RE = re.compile(
     r"(?:^|_)(?:address|addresses|addr|addrs|host|hostname|ip|endpoint|url)(?:$|_)", re.IGNORECASE
 )
 _IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
+_IPV6_RE = re.compile(r"(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?![0-9a-f:])", re.IGNORECASE)
+_INTERNAL_HOST_RE = re.compile(
+    r"(?<![\w.-])(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.(?:internal|local))(?::\d{1,5})?(?![\w.-])",
+    re.IGNORECASE,
+)
 _NETWORK_LOCATION_RE = re.compile(r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)(?P<location>[^/\s]+)", re.IGNORECASE)
 _ASSIGNMENT_SECRET_RE = re.compile(
     r"(?i)\b(token|password|passwd|secret|api[-_]?key|access[-_]?key|authorization)=([^\s&]+)"
@@ -97,6 +103,17 @@ def _redact_private_ip(match: re.Match[str]) -> str:
     return value
 
 
+def _redact_private_ipv6(match: re.Match[str]) -> str:
+    value = match.group(0)
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return value
+    if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
+        return REDACTED
+    return value
+
+
 def _redact_network_location(match: re.Match[str]) -> str:
     scheme = match.group("scheme")
     location = match.group("location")
@@ -115,10 +132,21 @@ def _redact_network_location(match: re.Match[str]) -> str:
 
 
 def _sanitize_string(value: str) -> str:
+    stripped = value.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            structured_value = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(structured_value, (Mapping, list)):
+                return json.dumps(sanitize_value(structured_value), ensure_ascii=False, separators=(",", ":"))
     value = _BEARER_RE.sub(f"Bearer {REDACTED}", value)
     value = _ASSIGNMENT_SECRET_RE.sub(lambda match: f"{match.group(1)}={REDACTED}", value)
     value = _NETWORK_LOCATION_RE.sub(_redact_network_location, value)
-    return _IPV4_RE.sub(_redact_private_ip, value)
+    value = _INTERNAL_HOST_RE.sub(REDACTED, value)
+    value = _IPV4_RE.sub(_redact_private_ip, value)
+    return _IPV6_RE.sub(_redact_private_ipv6, value)
 
 
 def sanitize_value(value: Any, *, key: Any = None) -> Any:
@@ -168,8 +196,22 @@ def sanitize_argv(argv: Sequence[str]) -> list[str]:
                     sanitized.append(option)
                     redact_next = True
                 continue
+            if separator:
+                sanitized.append(f"{option}={_sanitize_string(option_value)}")
+                continue
         sanitized.append(_sanitize_string(str(token)))
     return sanitized
+
+
+def _current_command_argv() -> list[str]:
+    """Keep ``python -m module`` portable instead of recording its resolved
+    file path."""
+    main_module = sys.modules.get("__main__")
+    module_spec = getattr(main_module, "__spec__", None)
+    module_name = getattr(module_spec, "name", None)
+    if module_name and sys.argv:
+        return [sys.executable, "-m", module_name, *sys.argv[1:]]
+    return [sys.executable, *sys.argv]
 
 
 def _run_git(arguments: Sequence[str], cwd: Path) -> str | None:
@@ -383,7 +425,7 @@ def build_manifest(
     dependencies."""
     started_at = time.perf_counter()
     working_directory = Path(cwd or Path.cwd()).resolve()
-    command = list(argv) if argv is not None else [sys.executable, *sys.argv]
+    command = list(argv) if argv is not None else _current_command_argv()
     config = vars(args) if args is not None and hasattr(args, "__dict__") else {}
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -415,6 +457,8 @@ def _schema_major(version: Any) -> int:
 def normalize_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Read any v1 manifest, accepting missing optional fields and future v1
     minors."""
+    if not isinstance(manifest, Mapping):
+        raise ManifestError("Manifest root must be a JSON object")
     if "schema_version" not in manifest:
         raise ManifestError("Manifest is missing schema_version")
     major = _schema_major(manifest["schema_version"])
@@ -425,7 +469,10 @@ def normalize_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(manifest)
     normalized["schema_version"] = str(manifest["schema_version"])
     for section in ("code", "command", "config", "environment", "hardware", "runtime", "inputs"):
-        normalized.setdefault(section, {})
+        value = normalized.setdefault(section, {})
+        if not isinstance(value, Mapping):
+            raise ManifestError(f"Manifest section {section!r} must be a JSON object")
+        normalized[section] = dict(value)
     return normalized
 
 
@@ -465,9 +512,11 @@ def default_manifest_path(args: Any = None) -> Path:
     run_name = None
     if args is not None:
         run_name = getattr(args, "tb_experiment_name", None) or getattr(args, "wandb_group", None)
-    run_name = run_name or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_name = run_name or "run"
     safe_run_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(run_name)).strip("-.") or "run"
-    return Path.cwd() / "relax_runs" / safe_run_name[:120] / "experiment-manifest.json"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    run_id = f"{timestamp}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    return Path.cwd() / "relax_runs" / safe_run_name[:120] / run_id / "experiment-manifest.json"
 
 
 def write_experiment_manifest(

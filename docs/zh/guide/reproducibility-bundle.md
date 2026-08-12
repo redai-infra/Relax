@@ -7,10 +7,10 @@ Relax 会为每次训练自动生成带版本号的 experiment manifest。它记
 默认路径为：
 
 ```text
-relax_runs/<实验名称或 UTC 时间>/experiment-manifest.json
+relax_runs/<实验名称>/<唯一运行 ID>/experiment-manifest.json
 ```
 
-可通过 `RELAX_MANIFEST_PATH` 指定其他文件。生成 manifest 采用 best-effort 语义：收集或写入失败只输出告警，不会阻塞训练。
+默认运行 ID 包含 UTC 时间、进程 ID 和随机后缀，因此重复运行不会覆盖之前的 manifest。可通过 `RELAX_MANIFEST_PATH` 指定固定文件。生成 manifest 采用 best-effort 语义：收集或写入失败只输出告警，不会阻塞训练。
 
 ## Schema v1
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 
 from relax.entrypoints.reproducibility import main
@@ -22,3 +23,12 @@ def test_manifest_reruns_minimal_cpu_task(tmp_path):
 
     assert exit_code == 0
     assert marker.read_text(encoding="utf-8") == "replayed"
+
+
+def test_cli_returns_invalid_manifest_exit_code_for_non_object_section(tmp_path):
+    manifest_path = tmp_path / "invalid-manifest.json"
+    manifest_path.write_text(json.dumps({"schema_version": "1.0", "command": None}), encoding="utf-8")
+
+    exit_code = main(["rerun", str(manifest_path)])
+
+    assert exit_code == 2

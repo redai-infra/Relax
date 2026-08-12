@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from relax.utils.reproducibility import (
     ManifestError,
     build_manifest,
     compare_environment,
+    default_manifest_path,
     load_manifest,
     replay_command,
     sanitize_argv,
@@ -127,6 +129,64 @@ def test_sanitize_argv_does_not_confuse_tokenizer_with_token():
     ]
 
 
+def test_serialized_manifest_redacts_json_arguments_internal_hosts_and_ipv6(tmp_path):
+    runtime_env_json = json.dumps(
+        {
+            "HF_TOKEN": "super-secret-value",
+            "workers": ["ray-head.prod.internal:6379", "fd00::1234"],
+        }
+    )
+    manifest = build_manifest(
+        argv=[
+            "python",
+            "train.py",
+            "--runtime-env-json",
+            runtime_env_json,
+            f"--worker-config={runtime_env_json}",
+        ],
+        cwd=tmp_path,
+    )
+
+    manifest_path = write_manifest(manifest, tmp_path / "experiment-manifest.json")
+    serialized = manifest_path.read_text(encoding="utf-8")
+
+    assert "super-secret-value" not in serialized
+    assert "ray-head.prod.internal" not in serialized
+    assert "fd00::1234" not in serialized
+    assert REDACTED in serialized
+
+
+def test_build_manifest_preserves_python_module_invocation(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["/tmp/ray/session/working_dir/train.py", "--epochs", "1"])
+    monkeypatch.setattr(
+        sys.modules["__main__"],
+        "__spec__",
+        SimpleNamespace(name="relax.entrypoints.train"),
+    )
+
+    manifest = build_manifest(cwd=tmp_path)
+
+    assert manifest["command"]["argv"] == [
+        sys.executable,
+        "-m",
+        "relax.entrypoints.train",
+        "--epochs",
+        "1",
+    ]
+
+
+def test_default_manifest_path_is_unique_within_experiment_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = SimpleNamespace(tb_experiment_name="same experiment")
+
+    first_path = default_manifest_path(args)
+    second_path = default_manifest_path(args)
+
+    assert first_path != second_path
+    assert first_path.parent.parent == tmp_path / "relax_runs" / "same-experiment"
+    assert first_path.name == "experiment-manifest.json"
+
+
 def test_runtime_mode_covers_local_and_single_node_ray(tmp_path):
     local_manifest = build_manifest(cwd=tmp_path)
     ray_manifest = build_manifest(cwd=tmp_path, ray_module=_SingleNodeRay)
@@ -153,6 +213,15 @@ def test_reader_rejects_unknown_major_version(tmp_path):
     path.write_text(json.dumps({"schema_version": "2.0"}), encoding="utf-8")
 
     with pytest.raises(ManifestError, match="Unsupported manifest schema"):
+        load_manifest(path)
+
+
+@pytest.mark.parametrize(("section", "value"), [("command", None), ("environment", []), ("runtime", "bad")])
+def test_reader_rejects_non_object_sections(tmp_path, section, value):
+    path = tmp_path / f"manifest-{section}.json"
+    path.write_text(json.dumps({"schema_version": "1.0", section: value}), encoding="utf-8")
+
+    with pytest.raises(ManifestError, match=rf"section '{section}' must be a JSON object"):
         load_manifest(path)
 
 
