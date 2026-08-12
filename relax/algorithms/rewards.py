@@ -25,6 +25,10 @@ logger = get_logger(__name__)
 
 GROUP_EPS = STD_EPS
 
+_FLOAT32_MAX = float(torch.finfo(torch.float32).max)
+"""Largest finite float32. Rewards are carried as float32 from here on, so a
+value above this is an overflow waiting to happen rather than a large reward."""
+
 
 def group_positions(samples: list[Any], expected_size: int) -> dict[int, list[int]]:
     """Map ``Sample.group_index`` to the positions it occupies in ``samples``.
@@ -193,9 +197,28 @@ def extract_reward_components(samples: list[Any], keys: list[str]) -> torch.Tens
             numeric = float(value)
             if not math.isfinite(numeric):
                 raise ValueError(f"Reward {key!r} of sample {position} is {numeric}, which is not finite.")
+            # Finite in float64 is not enough: the tensor below is float32, whose
+            # largest value is ~3.4e38. A reward of 1e300 passes `isfinite` here,
+            # becomes `inf` on cast, and then reads as a non-finite std one stage
+            # later -- where the batch is zeroed and the run trains on no signal
+            # without ever failing. Catching the overflow at the boundary keeps
+            # the diagnosis at the reward function that produced it.
+            if abs(numeric) > _FLOAT32_MAX:
+                raise ValueError(
+                    f"Reward {key!r} of sample {position} is {numeric!r}, which overflows float32 "
+                    f"(max {_FLOAT32_MAX:.6g}). Rescale the reward; casting it would silently produce inf."
+                )
             row.append(numeric)
         rows.append(row)
-    return torch.tensor(rows, dtype=torch.float32)
+
+    components = torch.tensor(rows, dtype=torch.float32)
+    # Belt and braces: the per-value check above is exact, but it only sees what
+    # `float()` returned. Anything that slips past it must not reach the
+    # normaliser, where non-finite input is indistinguishable from a collapse.
+    if not torch.isfinite(components).all():
+        bad = (~torch.isfinite(components)).nonzero()[0].tolist()
+        raise ValueError(f"Reward {keys[bad[1]]!r} of sample {bad[0]} is not finite after casting to float32.")
+    return components
 
 
 def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[float]) -> list[float]:

@@ -296,6 +296,26 @@ def test_nan_or_inf_reward_raises(bad):
         _normalize(_args(), samples)
 
 
+@pytest.mark.parametrize("huge", [1e300, -1e300, 3.5e38])
+def test_reward_that_overflows_float32_raises_rather_than_becoming_inf(huge):
+    """Finite in float64, `inf` after the cast — the gap `isfinite` misses.
+
+    Left unchecked this is silent, not loud: the cast produces `inf`, the group
+    std reads as non-finite one stage later, `whiten_scalar` returns zeros, and
+    the run trains on no signal while exiting cleanly.
+    """
+    samples = [_S(0, {"correctness": huge, "format": 1.0}) for _ in range(4)]
+    with pytest.raises(ValueError, match="overflows float32"):
+        _normalize(_args(), samples)
+
+
+def test_a_large_but_representable_reward_is_accepted():
+    """The bound is float32's range, not an opinion about reward magnitude."""
+    samples = _mk([0, 0, 0, 0], [1e30, 2e30, 3e30, 4e30], [1.0, 0.0, 1.0, 0.0])
+    out = _normalize(_args(), samples)
+    assert all(math.isfinite(v) for v in out), out
+
+
 def test_fewer_than_two_keys_raises():
     samples = _mk([0, 0, 0, 0], [1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0])
     with pytest.raises(ValueError, match="at least two"):

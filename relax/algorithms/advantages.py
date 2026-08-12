@@ -79,26 +79,87 @@ def advantage_grpo_broadcast(args: Any, *, rewards, kl, **_unused):
     return advantages, returns
 
 
+def _agree_on_segmentation(n_segments: int, local_error: str, values, process_group) -> None:
+    """Reach one verdict on the segmentation across the whole group.
+
+    Each segment costs one collective, so this has to agree *before* any of
+    them run. Two ways it can disagree, both of which deadlock rather than
+    fail:
+
+    * The segment counts differ. A rank expecting two segments and a rank
+      expecting three both block on the third collective -- no traceback, no
+      exit code, just a job that never finishes. ``num_rollout_minis`` comes
+      from the minibatch plan and is expected to be uniform, but "expected" is
+      not "checked".
+    * One rank's ``mini_batch_sizes`` is malformed. Raising locally is worse
+      than not checking at all: that rank leaves the collective sequence while
+      every other rank is still waiting inside it.
+
+    So the local verdict travels *with* the count, in one MAX reduction (the
+    low bound negated, the way :func:`~relax.algorithms.numerics.is_collapsed`
+    does it). Every rank reads the same three numbers and therefore raises
+    together, at the same call, with a message naming which failure it was.
+    """
+    if process_group is None:
+        if local_error:
+            raise ValueError(local_error)
+        return
+
+    # A rank that already failed contributes 0 segments: a neutral value that
+    # cannot be mistaken for a real count, and one that trips the mismatch
+    # branch too if the `any_bad` branch were ever removed.
+    flags = torch.tensor(
+        [-n_segments if not local_error else 0, n_segments if not local_error else 0, 1 if local_error else 0],
+        dtype=torch.int64,
+        device=values.device,
+    )
+    dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=process_group)
+    low, high, any_bad = -int(flags[0]), int(flags[1]), int(flags[2])
+
+    if any_bad:
+        raise ValueError(
+            local_error
+            or "another rank reported malformed mini_batch_sizes; every rank fails here so the "
+            "per-segment collectives cannot deadlock."
+        )
+    if low != high:
+        raise ValueError(
+            f"mini_batch_sizes describes {n_segments} segment(s) on this rank, but ranks in the group "
+            f"report between {low} and {high}. Every rank must whiten the same number of segments, "
+            "or the per-segment collectives deadlock."
+        )
+
+
 def _whiten_by_segment(values, mini_batch_sizes, process_group):
     """Whiten each training batch separately, in the order they were merged.
 
-    Every rank runs the same number of segments -- ``num_rollout_minis`` comes
-    from the minibatch plan rather than from the data -- so the per-segment
-    collectives stay matched across the data-parallel group.
+    ``num_rollout_minis`` comes from the minibatch plan rather than from the
+    data, so every rank is expected to run the same number of segments;
+    :func:`_agree_on_segmentation` is what turns that expectation into a
+    checked precondition rather than a deadlock.
     """
-    if mini_batch_sizes is None:
-        return whiten_scalar(values, process_group=process_group)
     # Validate whatever was passed, including a single segment: treating an empty
     # or malformed list as "fall back to one window" would silently restore the
-    # merged behaviour this function exists to replace.
-    if not mini_batch_sizes or any(not isinstance(n, int) or n <= 0 for n in mini_batch_sizes):
-        raise ValueError(f"mini_batch_sizes must be a non-empty list of positive ints, got {mini_batch_sizes}.")
-    if sum(mini_batch_sizes) != values.numel():
-        raise ValueError(
+    # merged behaviour this function exists to replace. The verdict is not acted
+    # on until the whole group has shared it.
+    local_error = ""
+    if mini_batch_sizes is None:
+        n_segments = 1
+    elif not mini_batch_sizes or any(not isinstance(n, int) or n <= 0 for n in mini_batch_sizes):
+        n_segments = 0
+        local_error = f"mini_batch_sizes must be a non-empty list of positive ints, got {mini_batch_sizes}."
+    elif sum(mini_batch_sizes) != values.numel():
+        n_segments = 0
+        local_error = (
             f"mini_batch_sizes {mini_batch_sizes} sum to {sum(mini_batch_sizes)}, "
             f"but this rank holds {values.numel()} samples."
         )
-    if len(mini_batch_sizes) == 1:
+    else:
+        n_segments = len(mini_batch_sizes)
+
+    _agree_on_segmentation(n_segments, local_error, values, process_group)
+
+    if mini_batch_sizes is None or n_segments == 1:
         return whiten_scalar(values, process_group=process_group)
     out, start = [], 0
     for size in mini_batch_sizes:

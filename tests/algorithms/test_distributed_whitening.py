@@ -24,6 +24,39 @@ import torch.distributed as dist  # noqa: E402
 SHARDS = [[-0.7, 0.7], [-1.4, 1.4]]
 
 
+def _t(values):
+    return torch.tensor(values, dtype=torch.float32)
+
+
+# Per-rank (values, mini_batch_sizes) for the segmented cases. The shard sizes
+# differ between ranks on purpose: a data-parallel split is balanced by tokens,
+# not by sample count, so equal-sized shards are the easy case rather than the
+# real one.
+_SEGMENT_MODES = {
+    # Two segments on both ranks, split 2+2 on rank 0 and 1+3 on rank 1.
+    # Segment 0 spans [1, 3 | 5] and segment 1 spans [10, 30 | 50, 70, 90], so a
+    # per-segment statistic and a whole-shard statistic give different answers.
+    "segmented_uneven": lambda rank: (
+        (_t([1.0, 3.0, 10.0, 30.0]), [2, 2]) if rank == 0 else (_t([5.0, 50.0, 70.0, 90.0]), [1, 3])
+    ),
+    # Rank 0 wants two segments, rank 1 wants one. Two collectives against one:
+    # the deadlock this check exists to prevent.
+    "segment_count_mismatch": lambda rank: (
+        (_t([1.0, 3.0, 10.0, 30.0]), [2, 2]) if rank == 0 else (_t([5.0, 50.0, 70.0, 90.0]), [4])
+    ),
+    # Rank 1's metadata does not describe its shard. Raising locally would strand
+    # rank 0 inside the collective sequence.
+    "malformed_on_one_rank": lambda rank: (
+        (_t([1.0, 3.0, 10.0, 30.0]), [2, 2]) if rank == 0 else (_t([5.0, 50.0, 70.0, 90.0]), [2, 99])
+    ),
+    # Rank 0 passes no segmentation at all (one whole-shard window) while rank 1
+    # asks for two. Same deadlock, reached through the `None` branch.
+    "none_versus_segmented": lambda rank: (
+        (_t([1.0, 3.0, 10.0, 30.0]), None) if rank == 0 else (_t([5.0, 50.0, 70.0, 90.0]), [2, 2])
+    ),
+}
+
+
 def _run(rank, world_size, port, mode, out):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -52,6 +85,18 @@ def _run(rank, world_size, port, mode, out):
             # Each shard is constant on its own but the batch is not.
             values = torch.tensor([0.7, 0.7] if rank == 0 else [1.4, 1.4], dtype=torch.float32)
             out[rank] = [is_collapsed(values, process_group=group)]
+        elif mode in _SEGMENT_MODES:
+            from relax.algorithms.advantages import _whiten_by_segment
+
+            values, sizes = _SEGMENT_MODES[mode](rank)
+            try:
+                out[rank] = _whiten_by_segment(values, sizes, group).tolist()
+            except ValueError as exc:
+                # Recorded rather than raised: the point of these cases is that
+                # *both* ranks come back, so a hang is distinguishable from a
+                # rejection. A propagating exception would look the same as a
+                # rank that never reached the collective.
+                out[rank] = f"ValueError: {exc}"
         else:  # pragma: no cover - guard against typos in the test itself
             raise AssertionError(mode)
     finally:
@@ -100,3 +145,56 @@ def test_collapse_is_decided_globally_not_per_shard():
 
     per_shard = _spawn("collapsed_only_locally")
     assert per_shard == {0: [False], 1: [False]}, "each shard is constant, the batch is not"
+
+
+# ---------------- segmented whitening (GDPO step 3 across merged batches) ----------------
+
+
+def test_each_segment_is_whitened_against_the_whole_group():
+    """Per-segment statistics, reduced across ranks, on unequal shards.
+
+    Segment 0 holds [1, 3] on rank 0 and [5] on rank 1; segment 1 holds [10,
+    30] and [50, 70, 90]. Whitening each segment against the group means each
+    segment's *joint* mean is 0 -- neither rank's own slice is centred, which
+    is what separates this from shard-local whitening.
+    """
+    out = _spawn("segmented_uneven")
+    assert isinstance(out[0], list) and isinstance(out[1], list), out
+
+    seg0 = torch.tensor(out[0][:2] + out[1][:1])
+    seg1 = torch.tensor(out[0][2:] + out[1][1:])
+    assert abs(seg0.mean().item()) < 1e-5, f"segment 0 not centred across ranks: {seg0}"
+    assert abs(seg1.mean().item()) < 1e-5, f"segment 1 not centred across ranks: {seg1}"
+
+    # And the two segments really were separate windows: whitening the merged
+    # shard instead would leave segment 0 (values 1-5) far below segment 1
+    # (values 10-90) rather than both centred on 0.
+    assert seg0.std().item() > 0.5, "segment 0 collapsed; it should carry its own spread"
+    assert seg1.std().item() > 0.5, "segment 1 collapsed; it should carry its own spread"
+
+
+def test_mismatched_segment_counts_fail_on_every_rank():
+    """The deadlock case: unequal collective counts must raise, not hang.
+
+    Both ranks returning at all is the assertion. If the check were removed,
+    this test would time out rather than fail.
+    """
+    out = _spawn("segment_count_mismatch")
+    for rank in (0, 1):
+        assert isinstance(out[rank], str), f"rank {rank} did not raise: {out[rank]!r}"
+        assert "same number of segments" in out[rank], out[rank]
+
+
+def test_no_segmentation_on_one_rank_is_also_a_mismatch():
+    out = _spawn("none_versus_segmented")
+    for rank in (0, 1):
+        assert isinstance(out[rank], str), f"rank {rank} did not raise: {out[rank]!r}"
+        assert "same number of segments" in out[rank], out[rank]
+
+
+def test_malformed_metadata_on_one_rank_fails_both():
+    """A local raise would strand the other rank inside the collectives."""
+    out = _spawn("malformed_on_one_rank")
+    assert isinstance(out[1], str) and "sum to" in out[1], out[1]
+    assert isinstance(out[0], str), f"rank 0 did not fail with its peer: {out[0]!r}"
+    assert "another rank reported malformed" in out[0], out[0]
