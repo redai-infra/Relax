@@ -176,8 +176,9 @@ class Qwen3ForCausalLM(SGLangQwen3ForCausalLM):
         if not targets.issubset(supported_targets):
             raise ValueError(f"Unsupported SGLang Mixture-of-LoRA targets: {sorted(targets - supported_targets)}")
         start_layer = getattr(self.model, "start_layer", 0)
-        for local_layer_id, layer in enumerate(self.model.layers):
-            layer_id = start_layer + local_layer_id
+        end_layer = getattr(self.model, "end_layer", len(self.model.layers))
+        for layer_id in range(start_layer, end_layer):
+            layer = self.model.layers[layer_id]
             attention = layer.self_attn
             if "linear_qkv" in targets:
                 site_id = f"decoder.layers.{layer_id}.self_attention.linear_qkv"

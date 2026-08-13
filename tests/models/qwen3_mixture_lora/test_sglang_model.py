@@ -183,6 +183,33 @@ def test_sglang_weight_loader_skips_layers_owned_by_another_pp_stage():
     assert loaded_names == set()
 
 
+def test_sglang_installs_adapters_only_on_layers_owned_by_pp_stage():
+    model = nn.Module()
+    model.mixture_lora_config = _config()
+    model.model = nn.Module()
+    model.model.start_layer = 1
+    model.model.end_layer = 2
+
+    missing_layer = nn.Module()
+    local_layer = nn.Module()
+    local_layer.self_attn = nn.Module()
+    local_layer.self_attn.qkv_proj = _TupleLinear(4, 6)
+    local_layer.self_attn.qkv_proj.input_size = 4
+    local_layer.self_attn.qkv_proj.output_size = 6
+    local_layer.self_attn.o_proj = _TupleLinear(6, 4)
+    local_layer.self_attn.o_proj.input_size = 6
+    local_layer.self_attn.o_proj.output_size = 4
+    model.model.layers = nn.ModuleList([missing_layer, local_layer])
+
+    EntryClass._install_mixture_lora(model)
+
+    assert not hasattr(missing_layer, "self_attn")
+    assert local_layer.self_attn.qkv_proj.mixture_lora.site_id == (
+        "decoder.layers.1.self_attention.linear_qkv"
+    )
+    assert local_layer.self_attn.o_proj.mixture_lora.site_id == "decoder.layers.1.self_attention.linear_proj"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_sglang_adapter_can_be_captured_by_cuda_graph():
     adapter = SGLangMixtureLoRA(
