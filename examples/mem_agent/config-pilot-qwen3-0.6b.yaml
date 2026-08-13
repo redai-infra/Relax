@@ -6,7 +6,6 @@ mem_agent_max_final_tokens: 64
 mem_agent_max_chunks: 4
 mem_agent_enable_thinking: false
 mem_agent_credit_assignment: split
-mem_agent_strict_alignment: true
 # Four memory turns plus one final turn is the maximum pilot expansion.
 custom_train_sample_expansion_factor: 5
 custom_train_data_group_size: 1

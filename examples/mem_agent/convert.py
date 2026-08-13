@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from examples.mem_agent.contracts import require_strict_alignment
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
 from relax.utils.utils import dict_to_tensordict, post_process_rewards
@@ -65,8 +66,7 @@ def convert_samples(args: Any, samples: list[Sample]):
     """Normalize trajectory rewards first, then expand every saved turn."""
     if not samples:
         raise ValueError("MemAgent converter received an empty sample list.")
-    if not getattr(args, "mem_agent_strict_alignment", True):
-        raise ValueError("MemAgent training requires mem_agent_strict_alignment=true.")
+    require_strict_alignment(args)
     for sample in samples:
         if sample.status in (Sample.Status.ABORTED, Sample.Status.FAILED):
             raise ValueError(f"Cannot train from sample index={sample.index} with status={sample.status.value}.")
@@ -116,8 +116,8 @@ def convert_samples(args: Any, samples: list[Sample]):
         zip(samples, validated_turns, raw_rewards, advantages, strict=True)
     ):
         turn_credit = float(advantage) / len(turns) if credit_assignment == "split" else float(advantage)
-        # This expansion is deliberately lossless. Unlike the fixed VIME
-        # helper, no tail rows are trimmed to a global-batch multiple.
+        # Expansion is lossless: every turn remains an independent row and no
+        # tail rows are trimmed merely to manufacture divisibility.
         for fallback_turn_index, turn in enumerate(turns):
             tokens = list(turn["tokens"])
             response_length = int(turn["response_length"])

@@ -12,6 +12,8 @@ Run with: pytest tests/engine/rollout/test_base_types.py -v
 
 from argparse import Namespace
 
+import pytest
+
 from relax.engine.rollout.base_types import (
     RolloutFnEvalOutput,
     RolloutFnTrainOutput,
@@ -44,6 +46,65 @@ _FILTER_MODULE = __name__
 
 def _build_groups(n: int) -> list[list[Sample]]:
     return [[Sample(index=i, response_length=1)] for i in range(n)]
+
+
+def test_train_output_keeps_metrics_and_transport_metadata_independent():
+    groups = _build_groups(2)
+    output = RolloutFnTrainOutput(
+        samples=groups,
+        metrics={"rollout/train_batch_row_count": 6},
+        train_row_count=6,
+    )
+
+    assert output.samples is groups
+    assert output.metrics == {"rollout/train_batch_row_count": 6}
+    assert output.train_row_count == 6
+
+
+def test_train_output_defaults_preserve_existing_callers():
+    output = RolloutFnTrainOutput(samples=_build_groups(1))
+
+    assert output.metrics is None
+    assert output.train_row_count is None
+
+
+def test_call_rollout_fn_adapts_legacy_row_count_metric():
+    groups = _build_groups(2)
+
+    def rollout_fn(args, evaluation):
+        return RolloutFnTrainOutput(samples=groups, metrics={"rollout/train_batch_row_count": 6})
+
+    output = call_rollout_fn(rollout_fn, Namespace(), evaluation=False)
+
+    assert output.metrics == {"rollout/train_batch_row_count": 6}
+    assert output.train_row_count == 6
+
+
+def test_call_rollout_fn_prefers_structured_row_count():
+    groups = _build_groups(2)
+
+    def rollout_fn(args, evaluation):
+        return RolloutFnTrainOutput(
+            samples=groups,
+            metrics={"rollout/train_batch_row_count": 6},
+            train_row_count=6,
+        )
+
+    output = call_rollout_fn(rollout_fn, Namespace(), evaluation=False)
+
+    assert output.train_row_count == 6
+
+
+def test_call_rollout_fn_rejects_conflicting_row_count_contracts():
+    def rollout_fn(args, evaluation):
+        return RolloutFnTrainOutput(
+            samples=_build_groups(2),
+            metrics={"rollout/train_batch_row_count": 5},
+            train_row_count=6,
+        )
+
+    with pytest.raises(ValueError, match="train_row_count conflicts"):
+        call_rollout_fn(rollout_fn, Namespace(), evaluation=False)
 
 
 class TestCallRolloutFnFilter:

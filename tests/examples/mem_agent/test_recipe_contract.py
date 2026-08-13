@@ -22,6 +22,7 @@ def test_custom_config_freezes_model_memory_and_expanded_batch_contract():
     assert config["mem_agent_max_final_tokens"] == 256
     assert config["mem_agent_max_chunks"] == 64
     assert config["mem_agent_credit_assignment"] == "split"
+    assert "mem_agent_strict_alignment" not in config
     assert config["custom_train_sample_expansion_factor"] == 65
     assert config["custom_train_data_group_size"] == 1
     assert config["custom_train_expanded_batch"] is True
@@ -53,6 +54,7 @@ def test_qwen06_pilot_is_short_context_single_gpu_and_pass_at_n_gated():
     assert config["mem_agent_max_final_tokens"] == 64
     assert config["mem_agent_max_chunks"] == 4
     assert config["mem_agent_enable_thinking"] is False
+    assert "mem_agent_strict_alignment" not in config
     assert config["custom_train_sample_expansion_factor"] == 5
     assert config["mem_agent_train_rows_multiple"] == 1
     assert "qwen3-0.6B.sh" in train

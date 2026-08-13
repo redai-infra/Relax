@@ -258,8 +258,9 @@ class Controller:
             * self.config.n_samples_per_prompt
             * get_train_sample_expansion_factor(self.config)
         )
-        # MemAgent completes GRPO normalization before turn expansion, so its
-        # converted rows opt into sampler group size 1.
+        # The grouping unit is a physical TransferQueue sampling contract.
+        # Custom converters that emit independently consumable rows may opt
+        # into size 1 without teaching the controller their reward semantics.
         train_data_group_size = get_train_data_group_size(self.config)
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path streams data per DP via token

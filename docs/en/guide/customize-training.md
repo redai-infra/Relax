@@ -211,6 +211,12 @@ generate.manages_inference_permit = True
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
 
+If you replace the higher-level function selected by `--rollout-function-path`, return
+`RolloutFnTrainOutput`. Its `metrics` member is for observability. A rollout that enables
+`custom_train_expanded_batch` and transfers a data-dependent number of rows must also set
+`train_row_count` to the exact post-conversion row count placed in the current training partition.
+Ordinary 1:1 rollout functions should leave `train_row_count` as `None`.
+
 ### Per-request concurrency scheduling for multi-turn rollout
 
 By default `generate_and_rm` holds one session-level concurrency permit (`GenerateState.semaphore`) for the entire custom `generate` call — a multi-turn rollout keeps the slot even while running env/tool steps, which hurts engine utilization.

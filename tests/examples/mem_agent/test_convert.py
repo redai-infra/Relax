@@ -115,3 +115,11 @@ def test_converter_rejects_structurally_invalid_or_overlong_turns():
     args.mem_agent_max_memory_tokens = 1
     with pytest.raises(ValueError, match="response_length=2 exceeds 1"):
         convert_samples(args, [overlong, _sample(6, 1.0, 2)])
+
+
+def test_converter_preserves_explicit_false_strict_alignment_compatibility():
+    args = _args()
+    args.mem_agent_strict_alignment = False
+
+    with pytest.raises(ValueError, match="mem_agent_strict_alignment=true"):
+        convert_samples(args, [_sample(3, 0.0, 1), _sample(4, 1.0, 1)])

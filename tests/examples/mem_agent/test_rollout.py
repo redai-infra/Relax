@@ -167,6 +167,16 @@ async def test_generate_trajectory_can_disable_qwen_thinking_for_small_pilot():
     assert tokenizer.template_kwargs == [{"enable_thinking": False}, {"enable_thinking": False}]
 
 
+@pytest.mark.asyncio
+async def test_generate_trajectory_preserves_explicit_false_strict_alignment_rejection():
+    args = _args()
+    args.mem_agent_strict_alignment = False
+    sample = Sample(index=0, group_index=0, prompt="Q", metadata={"context": "abc"})
+
+    with pytest.raises(ValueError, match="mem_agent_strict_alignment=true"):
+        await generate_trajectory(args, sample, {}, FakeTokenizer(), generator=lambda *args: None)
+
+
 def test_truncate_text_to_tokens_retokenizes_to_the_hard_limit():
     text, length = truncate_text_to_tokens(FakeTokenizer(), "MEMORY", 3)
     assert text == "MEM"
@@ -282,6 +292,31 @@ async def test_public_generate_entry_uses_sglang_state_and_turn_generator(monkey
     assert result.status == Sample.Status.COMPLETED
     assert result.response == r"\boxed{x}"
     assert [turn["kind"] for turn in result.train_metadata["mem_agent_turns"]] == ["memory", "final"]
+
+
+@pytest.mark.asyncio
+async def test_public_generate_preserves_false_strict_alignment_as_aborted(monkeypatch):
+    class FakeGenerateState:
+        def __init__(self, args):
+            del args
+            self.tokenizer = FakeTokenizer()
+
+    async def unused_generate(*args, **kwargs):
+        raise AssertionError("strict contract must reject before inference")
+
+    fake_module = ModuleType("relax.engine.rollout.sglang_rollout")
+    fake_module.GenerateState = FakeGenerateState
+    fake_module.generate = unused_generate
+    monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
+
+    args = _args()
+    args.mem_agent_strict_alignment = False
+    sample = Sample(index=3, group_index=0, prompt="Q", metadata={"context": "abc"})
+    result = await generate(args, sample, {"temperature": 1.0})
+
+    assert result.status == Sample.Status.ABORTED
+    assert result.train_metadata is None
+    assert result.rollout_log_probs == []
 
 
 @pytest.mark.asyncio

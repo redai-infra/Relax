@@ -1045,8 +1045,7 @@ class RolloutManager(ReloadableMixin):
                 # The transfer helper reports the exact rows it actually put.
                 # Re-converting output.samples here is unsafe because custom
                 # converters may filter rows or be stateful.
-                metrics = output.metrics or {}
-                row_count = metrics.get("rollout/train_batch_row_count")
+                row_count = output.train_row_count
                 if row_count is None:
                     raise RuntimeError("Expanded rollout did not report its transferred train row count.")
                 # This count controls TQ consumption only. global_batch_size

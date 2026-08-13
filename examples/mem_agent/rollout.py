@@ -7,6 +7,7 @@ from argparse import Namespace
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from examples.mem_agent.contracts import require_strict_alignment
 from examples.mem_agent.prompts import (
     NO_MEMORY,
     final_instruction,
@@ -126,8 +127,7 @@ async def generate_trajectory(
     max_final_tokens = int(getattr(args, "mem_agent_max_final_tokens", 256))
     max_chunks = int(getattr(args, "mem_agent_max_chunks", 64))
     enable_thinking = getattr(args, "mem_agent_enable_thinking", None)
-    if not getattr(args, "mem_agent_strict_alignment", True):
-        raise ValueError("MemAgent training requires mem_agent_strict_alignment=true.")
+    require_strict_alignment(args)
     if max_memory_tokens <= 0 or max_final_tokens <= 0:
         raise ValueError("MemAgent memory and final response limits must be positive.")
 

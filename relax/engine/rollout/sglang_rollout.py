@@ -1151,12 +1151,13 @@ async def generate_rollout_async(
     state.reset()
 
     metrics = metric_gatherer.collect()
+    train_row_count = None
     if getattr(args, "custom_train_expanded_batch", False):
-        # This private coordination metric is consumed by RolloutManager. It is
-        # emitted only for expanded converters so ordinary rollout metrics stay
-        # byte-for-byte compatible.
+        train_row_count = transferred_train_rows
+        # Retain the published metric key for external observers and return-shape
+        # compatibility. The structured field carries the control signal.
         metrics["rollout/train_batch_row_count"] = transferred_train_rows
-    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
+    return RolloutFnTrainOutput(samples=data, metrics=metrics, train_row_count=train_row_count), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
