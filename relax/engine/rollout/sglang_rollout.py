@@ -764,9 +764,26 @@ async def generate_and_rm_group(
     # member is terminal so a cross-version retry can reuse completed siblings.
     group_ready = evaluation or not cross_version_kv_enabled(args) or cross_version_kv_group_ready_for_finalize(group)
     if (not state.aborted or evaluation) and args.group_rm and group_ready:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+        # A fully completed oversampling surplus group is returned to the data
+        # source and can enter this function again in the next physical
+        # rollout. Its requests are already terminal, but group RM must also be
+        # idempotent: an external or stochastic RM must not run twice and
+        # overwrite the reward selected by the first rollout.
+        group_rm_finalized = (
+            cross_version_kv_enabled(args)
+            and not evaluation
+            and all(
+                sample.reward is not None and sample.metadata.get("_cross_version_kv_group_rm_finalized", False)
+                for sample in group
+            )
+        )
+        if not group_rm_finalized:
+            rewards = await batched_async_rm(args, group)
+            for sample, reward in zip(group, rewards, strict=False):
+                sample.reward = reward
+            if cross_version_kv_enabled(args) and not evaluation:
+                for sample in group:
+                    sample.metadata["_cross_version_kv_group_rm_finalized"] = True
 
         if state.opd_manager and not evaluation:
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)

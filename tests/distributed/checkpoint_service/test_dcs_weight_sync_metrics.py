@@ -68,11 +68,13 @@ def _backend(lock):
 def test_dcs_bucket_metrics_count_bytes_and_fanout(monkeypatch) -> None:
     lock = _Lock()
     backend = _backend(lock)
+    requests = []
+    backend._batch_request = lambda endpoint, payload: requests.append((endpoint, payload)) or [object(), object()]
     monkeypatch.setattr(module.ray, "get", lambda value, **_kwargs: value)
     monkeypatch.setattr(module.dist, "broadcast", lambda *_args, **_kwargs: _Handle())
 
     tensors = [("a", torch.ones(4, dtype=torch.float32)), ("b", torch.ones(3, dtype=torch.float16))]
-    backend._update_bucket_weights_from_distributed(tensors)
+    backend._update_bucket_weights_from_distributed(tensors, weight_version=8)
 
     assert lock.releases == 1
     assert not lock.locked
@@ -80,6 +82,8 @@ def test_dcs_bucket_metrics_count_bytes_and_fanout(monkeypatch) -> None:
     assert backend._weight_sync_metrics["broadcast_tensor_count"] == 2
     assert backend._weight_sync_metrics["broadcast_bytes"] == 22
     assert backend._weight_sync_metrics["fanout_bytes"] == 44
+    assert requests[0][0] == "/update_weights_from_distributed"
+    assert requests[0][1]["weight_version"] == "8"
 
 
 def test_dcs_bucket_releases_lock_when_broadcast_fails(monkeypatch) -> None:
@@ -89,7 +93,7 @@ def test_dcs_bucket_releases_lock_when_broadcast_fails(monkeypatch) -> None:
     monkeypatch.setattr(module.dist, "broadcast", lambda *_args, **_kwargs: _Handle(fail=True))
 
     with pytest.raises(RuntimeError, match="broadcast failed"):
-        backend._update_bucket_weights_from_distributed([("a", torch.ones(1))])
+        backend._update_bucket_weights_from_distributed([("a", torch.ones(1))], weight_version=8)
 
     assert lock.releases == 1
     assert not lock.locked
@@ -234,3 +238,71 @@ def test_targeted_publication_forwards_actor_step_to_backend_impl(monkeypatch) -
 
     assert result == {"target_actor_step": 4}
     assert captured == {"rollout_only": True, "actor_fwd_only": False, "target_actor_step": 4}
+
+
+def test_targeted_publication_prepare_failure_does_not_skip_next_version(monkeypatch) -> None:
+    backend = module.DeviceDirectBackend.__new__(module.DeviceDirectBackend)
+    backend.args = type(
+        "Args",
+        (),
+        {
+            "hybrid_dcs_weight_sync": True,
+            "enable_cross_version_kv_continuation": True,
+            "cross_version_kv_max_gap": 1,
+            "max_staleness": 2,
+            "targeted_retirement_timeout_seconds": 15.0,
+        },
+    )()
+    backend.weight_version = 7
+    backend._active_publication = None
+    backend._group_name = "test"
+    backend._is_pp_src_rank = False
+    backend._lora_merge_mode = False
+    backend._lora_adapter_mode = False
+    backend._lora_adapter_full = None
+    backend._lora_skip_rollout_base = False
+    backend._materialize_weight_source = lambda: []
+    backend._rollout_control = lambda *_args, **_kwargs: None
+
+    publication_calls = []
+    prepare_attempts = 0
+
+    def publication_control(action, payload):
+        nonlocal prepare_attempts
+        publication_calls.append((action, dict(payload)))
+        if action == "prepare":
+            prepare_attempts += 1
+            if prepare_attempts == 1:
+                raise TimeoutError("prepare response timed out")
+            return {
+                "publication_id": "pub-8",
+                "target_version": payload["target_version"],
+                "target_actor_step": payload["target_actor_step"],
+            }
+        return {"ok": True}
+
+    backend._publication_control = publication_control
+    monkeypatch.setattr(module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(module.dist, "barrier", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "get_gloo_group", lambda: object())
+    monkeypatch.setattr(module.device_utils, "empty_cache", lambda: None)
+
+    with pytest.raises(TimeoutError, match="prepare response timed out"):
+        backend.update_weights_for_rollout(rollout_only=True, target_actor_step=4)
+
+    assert backend.weight_version == 7
+
+    metrics = backend.update_weights_for_rollout(rollout_only=True, target_actor_step=4)
+
+    assert backend.weight_version == 8
+    assert metrics["weight_version"] == 8
+    prepare_calls = [payload for action, payload in publication_calls if action == "prepare"]
+    assert [payload["target_version"] for payload in prepare_calls] == [8, 8]
+    commit_calls = [payload for action, payload in publication_calls if action == "commit"]
+    assert commit_calls == [
+        {
+            "publication_id": "pub-8",
+            "target_version": 8,
+            "target_actor_step": 4,
+        }
+    ]

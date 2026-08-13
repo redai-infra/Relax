@@ -128,7 +128,10 @@ async def test_group_rm_waits_for_cross_version_strict_retry(monkeypatch) -> Non
     assert completed.response == "done"
     assert completed.loss_mask == [1]
     assert completed.session_id is None
-    assert completed.metadata == {"terminal_sibling": True}
+    assert completed.metadata == {
+        "terminal_sibling": True,
+        "_cross_version_kv_group_rm_finalized": True,
+    }
 
 
 async def test_group_rm_skips_mixed_terminal_group(monkeypatch) -> None:

@@ -736,9 +736,13 @@ class DeviceDirectBackend(CommBackend):
         then expert), then resume and commit the boundary.
         """
         update_started_at = time.monotonic()
-        self.weight_version += 1
+        # ``weight_version`` is the last successfully published version. Keep
+        # the next version transaction-local until the receivers and (when
+        # enabled) the Router ledger have committed it. Otherwise a failed
+        # prepare/broadcast permanently skips a version on the next attempt.
+        target_version = self.weight_version + 1
         self._weight_sync_metrics = {
-            "weight_version": self.weight_version,
+            "weight_version": target_version,
             "target_actor_step": -1 if target_actor_step is None else target_actor_step,
             "source_materialize_seconds": 0.0,
             "source_h2d_bytes": 0,
@@ -779,7 +783,7 @@ class DeviceDirectBackend(CommBackend):
                 publication = self._publication_control(
                     "prepare",
                     {
-                        "target_version": self.weight_version,
+                        "target_version": target_version,
                         "target_actor_step": target_actor_step,
                         "max_gap": int(self.args.cross_version_kv_max_gap),
                         "max_actor_step_gap": int(self.args.max_staleness),
@@ -828,6 +832,7 @@ class DeviceDirectBackend(CommBackend):
                 buffer_size,
                 rollout_only,
                 actor_fwd_only,
+                target_version=target_version,
                 pbar=pbar,
             )
 
@@ -835,7 +840,11 @@ class DeviceDirectBackend(CommBackend):
             if not rollout_only:
                 self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
             if converted_named_tensors and not actor_fwd_only:
-                self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+                self._update_bucket_weights_from_distributed(
+                    converted_named_tensors,
+                    weight_version=target_version,
+                    pbar=pbar,
+                )
                 converted_named_tensors.clear()
             origin_named_tensors.clear()
         dist.barrier(group=get_gloo_group())
@@ -846,12 +855,23 @@ class DeviceDirectBackend(CommBackend):
             if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
-                name, param, named_tensors, buffer_size, rollout_only, actor_fwd_only, pbar=pbar
+                name,
+                param,
+                named_tensors,
+                buffer_size,
+                rollout_only,
+                actor_fwd_only,
+                target_version=target_version,
+                pbar=pbar,
             )
 
         if named_tensors:
             self._update_expert_bucket_weights_from_distributed(
-                named_tensors, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar
+                named_tensors,
+                rollout_only=rollout_only,
+                actor_fwd_only=actor_fwd_only,
+                weight_version=target_version,
+                pbar=pbar,
             )
         dist.barrier(group=get_gloo_group())
         if not rollout_only:
@@ -894,7 +914,7 @@ class DeviceDirectBackend(CommBackend):
                     "commit",
                     {
                         "publication_id": publication["publication_id"],
-                        "target_version": self.weight_version,
+                        "target_version": target_version,
                         "target_actor_step": target_actor_step,
                     },
                 )
@@ -904,6 +924,10 @@ class DeviceDirectBackend(CommBackend):
             # group) when the topology is unchanged. They are torn down only when the
             # topology actually changes (inside init_process_group_for_rollout's
             # rebuild path).
+
+        # Reaching this point means every requested receiver path completed and,
+        # for targeted publication, the Router commit succeeded.
+        self.weight_version = target_version
 
         # Free the per-call merge-mode adapter cache (full tensors) before reclaiming CUDA memory.
         self._lora_adapter_full = None
@@ -928,6 +952,8 @@ class DeviceDirectBackend(CommBackend):
         buffer_size: int,
         rollout_only=False,
         actor_fwd_only=False,
+        *,
+        target_version: int,
         pbar: tqdm | None = None,
     ) -> int | None:
         """Gather parameter across TP, convert to HF format and buffer it.
@@ -947,7 +973,11 @@ class DeviceDirectBackend(CommBackend):
                 if not rollout_only:
                     self._update_bucket_weights_from_distributed_for_actor_fwd_ref(origin_named_tensors)
                 if converted_named_tensors and not actor_fwd_only:
-                    self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+                    self._update_bucket_weights_from_distributed(
+                        converted_named_tensors,
+                        weight_version=target_version,
+                        pbar=pbar,
+                    )
                     converted_named_tensors.clear()
                 origin_named_tensors.clear()
                 buffer_size = 0
@@ -982,6 +1012,8 @@ class DeviceDirectBackend(CommBackend):
         buffer_size: int,
         rollout_only: bool = False,
         actor_fwd_only: bool = False,
+        *,
+        target_version: int,
         pbar: tqdm | None = None,
     ) -> int:
         """Gather expert parameter across expert-parallel group and buffer it.
@@ -1004,7 +1036,11 @@ class DeviceDirectBackend(CommBackend):
         ) * mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size:
             if named_tensors:
                 self._update_expert_bucket_weights_from_distributed(
-                    named_tensors, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar
+                    named_tensors,
+                    rollout_only=rollout_only,
+                    actor_fwd_only=actor_fwd_only,
+                    weight_version=target_version,
+                    pbar=pbar,
                 )
                 buffer_size = 0
 
@@ -1017,6 +1053,8 @@ class DeviceDirectBackend(CommBackend):
         named_tensors: list[tuple[str, torch.Tensor]],
         rollout_only: bool = False,
         actor_fwd_only: bool = False,
+        *,
+        weight_version: int,
         pbar: tqdm | None = None,
     ) -> None:
         """Gather expert partitions, convert to HF format, and broadcast.
@@ -1061,12 +1099,20 @@ class DeviceDirectBackend(CommBackend):
                     converted_hf_tensors += convert_to_hf(
                         self.args, self.model_name, name, param, self.quantization_config
                     )
-            self._update_bucket_weights_from_distributed(converted_hf_tensors, pbar)
+            self._update_bucket_weights_from_distributed(
+                converted_hf_tensors,
+                weight_version=weight_version,
+                pbar=pbar,
+            )
             converted_hf_tensors.clear()
         all_gathered_params.clear()
 
     def _update_bucket_weights_from_distributed(
-        self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
+        self,
+        converted_named_tensors: list[tuple[str, torch.Tensor]],
+        *,
+        weight_version: int,
+        pbar: tqdm | None = None,
     ) -> None:
         """Broadcast a bucket of converted tensors to rollout nodes.
 
@@ -1100,7 +1146,7 @@ class DeviceDirectBackend(CommBackend):
                 "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
                 "shapes": [param.shape for _, param in converted_named_tensors],
                 "group_name": self._group_name,
-                "weight_version": str(self.weight_version),
+                "weight_version": str(weight_version),
                 "flush_cache": False,
             }
             # Send weight update to all rollout nodes via Ray actors
