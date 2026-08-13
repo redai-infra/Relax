@@ -352,6 +352,7 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        enable_mixture_lora_external_model: bool = False,
     ):
         self.args = args
         self.rank = rank
@@ -359,6 +360,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self.enable_mixture_lora_external_model = enable_mixture_lora_external_model
         self._evicted = threading.Event()
         self._is_weight_updating: bool = False
         self._router_worker_id: str | None = None
@@ -577,7 +579,7 @@ class SGLangEngine(RayActor):
         # Must be set before launch_server_process() spawns child process
         # (multiprocessing start_method='spawn'), because the child inherits
         # the parent's os.environ at spawn time.
-        mixture_lora_config = build_mixture_lora_config(self.args)
+        mixture_lora_config = build_mixture_lora_config(self.args) if self.enable_mixture_lora_external_model else None
         external_pkg = configure_mixture_lora_external_model(
             mixture_lora_config,
             getattr(self.args, "sglang_external_model_package", None),

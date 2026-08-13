@@ -51,7 +51,7 @@ def test_mixture_lora_configures_external_package_before_spawn(monkeypatch):
 
 
 def test_single_lora_does_not_enable_external_mixture_model(monkeypatch):
-    monkeypatch.delenv("RELAX_MIXTURE_LORA_CONFIG", raising=False)
+    monkeypatch.setenv("RELAX_MIXTURE_LORA_CONFIG", "stale-policy-config")
 
     package = configure_mixture_lora_external_model(
         None,
@@ -60,6 +60,40 @@ def test_single_lora_does_not_enable_external_mixture_model(monkeypatch):
 
     assert package == "custom.single_lora.package"
     assert "RELAX_MIXTURE_LORA_CONFIG" not in os.environ
+
+
+def test_sglang_engine_enables_mixture_external_model_only_for_policy_rollout(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from relax.backends.sglang import sglang_engine
+    from relax.backends.sglang.sglang_engine import SGLangEngine
+
+    args = SimpleNamespace(optimize_routing_replay=False, warm_hf_checkpoint_page_cache=False)
+    policy = SGLangEngine(args, rank=0, enable_mixture_lora_external_model=True)
+    auxiliary = SGLangEngine(args, rank=0)
+    for engine in (policy, auxiliary):
+        engine.server_host = "127.0.0.1"
+        engine.server_port = 30000
+        engine.worker_type = "regular"
+        engine._skip_router_registration = True
+
+    config = _config()
+    build_config = MagicMock(return_value=config)
+    configure_external = MagicMock(return_value=None)
+    monkeypatch.setattr(sglang_engine, "build_mixture_lora_config", build_config)
+    monkeypatch.setattr(sglang_engine, "configure_mixture_lora_external_model", configure_external)
+    monkeypatch.setattr(sglang_engine, "_apply_sglang_policy_load_plan", lambda server_args, _args: server_args)
+    monkeypatch.setattr(sglang_engine, "ServerArgs", lambda **kwargs: kwargs)
+    process = MagicMock()
+    process.is_alive.return_value = False
+    monkeypatch.setattr(sglang_engine, "launch_server_process", lambda _server_args: process)
+
+    policy._init_normal({})
+    auxiliary._init_normal({})
+
+    build_config.assert_called_once_with(args)
+    assert configure_external.call_args_list[0].args == (config, None)
+    assert configure_external.call_args_list[1].args == (None, None)
 
 
 def test_mixture_lora_rejects_conflicting_external_package():

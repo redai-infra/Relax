@@ -125,6 +125,7 @@ def configure_mixture_lora_external_model(
     """Set the validated rollout configuration before spawning SGLang."""
 
     if config is None:
+        os.environ.pop("RELAX_MIXTURE_LORA_CONFIG", None)
         return external_package
     mixture_external_package = "relax.models.qwen3_mixture_lora.sglang"
     if external_package not in (None, mixture_external_package):
