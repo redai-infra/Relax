@@ -218,6 +218,8 @@ def _hf_validate_args(args, hf_config):
     mixture_lora_enabled = getattr(args, "lora_num_experts", 1) > 1
     if mixture_lora_enabled and is_multimodal:
         errors.append("Mixture-of-LoRA currently supports text-only base models; multimodal models are unsupported.")
+    if mixture_lora_enabled and int(getattr(args, "mtp_num_layers", 0) or 0) > 0:
+        errors.append("Mixture-of-LoRA does not currently support MTP layers.")
     if is_multimodal and getattr(args, "apply_rope_fusion", False):
         errors.append(
             "Multimodal models use multi-axis RoPE (list of tensors) which is incompatible "

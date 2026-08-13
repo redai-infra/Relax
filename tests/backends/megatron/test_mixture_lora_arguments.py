@@ -26,3 +26,16 @@ def test_mixture_lora_rejects_moe_hf_config():
 
     with pytest.raises(AssertionError, match="dense base models"):
         _hf_validate_args(args, hf_config)
+
+
+def test_mixture_lora_rejects_mtp_layers():
+    args = SimpleNamespace(lora_num_experts=4, mtp_num_layers=1)
+
+    with pytest.raises(AssertionError, match="does not currently support MTP"):
+        _hf_validate_args(args, SimpleNamespace())
+
+
+def test_mixture_lora_accepts_disabled_mtp():
+    args = SimpleNamespace(lora_num_experts=4, mtp_num_layers=None)
+
+    _hf_validate_args(args, SimpleNamespace())
