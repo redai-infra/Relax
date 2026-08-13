@@ -29,6 +29,11 @@ def _inputs(lengths=(3, 2)):
         response_lengths=list(lengths),
         total_lengths=[n + 2 for n in lengths],
         values=None,
+        # One segment covering the whole shard. Estimators that do not whiten
+        # per batch absorb this in `**_unused`; GDPO requires it, because a
+        # caller that cannot say how the rollout was split cannot be given a
+        # default without silently changing which objective it optimises.
+        mini_batch_sizes=[len(lengths)],
     )
 
 

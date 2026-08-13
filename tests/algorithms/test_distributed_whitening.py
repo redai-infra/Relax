@@ -200,11 +200,22 @@ def test_mismatched_segment_counts_fail_on_every_rank():
         assert "same number of segments" in out[rank], out[rank]
 
 
-def test_no_segmentation_on_one_rank_is_also_a_mismatch():
+def test_no_segmentation_on_one_rank_fails_both_ranks():
+    """Absent counts are now rejected outright, and still fail the group as
+    one.
+
+    This used to surface as a segment-count mismatch (one rank planning a
+    single window against the other's two). Since `None` became an error in its
+    own right, rank 0 reports that directly -- but the property this test is
+    really for is unchanged and is the reason it cannot be a single-rank test:
+    rank 0 must not leave the collectives on its own while rank 1 waits inside
+    them, so rank 1 has to fail too.
+    """
     out = _spawn("none_versus_segmented")
     for rank in (0, 1):
         assert isinstance(out[rank], str), f"rank {rank} did not raise: {out[rank]!r}"
-        assert "same number of segments" in out[rank], out[rank]
+    assert "mini_batch_sizes is None" in out[0], out[0]
+    assert "another rank reported malformed" in out[1], out[1]
 
 
 def test_malformed_metadata_on_one_rank_fails_both():

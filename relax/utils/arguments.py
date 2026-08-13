@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -3103,6 +3104,26 @@ def _validate_multi_reward_args(args, spec) -> None:
         raise ValueError(
             f"`--gdpo-reward-weights` has {len(weights)} entries but `--gdpo-reward-keys` has {len(keys)}."
         )
+
+    # The same two conditions the reward stage rejects, asked here instead of at
+    # the first rollout. `type=float` accepts "nan" and "inf" from the command
+    # line, and 1e-50 is a perfectly good Python float that flushes to zero once
+    # it reaches float32. Neither depends on any rollout data, so waiting until
+    # one exists only means the cluster is up and the checkpoint is loaded
+    # before the typo is reported. The reward-stage checks stay: they also cover
+    # weights that arrive from a config override after this point.
+    if weights is not None:
+        import torch
+
+        unusable = [w for w in weights if not math.isfinite(w)]
+        if unusable:
+            raise ValueError(f"`--gdpo-reward-weights` contains non-finite values: {unusable}.")
+        survives_cast = torch.tensor(weights, dtype=torch.float32)
+        if not bool(survives_cast.abs().sum() > 0):
+            raise ValueError(
+                f"`--gdpo-reward-weights` {weights} are all zero in float32; the combined advantage "
+                "would be identically 0 and the run would train on no signal."
+            )
 
     # Components arrive as a dict; without --reward-key the raw_reward column
     # would hold dicts, which the TransferQueue conversion cannot represent.

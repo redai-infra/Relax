@@ -27,7 +27,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from relax.algorithms.rewards import group_carries_reward_signal, normalize_gdpo_decoupled  # noqa: E402
+from relax.algorithms.rewards import (  # noqa: E402
+    group_carries_reward_signal,
+    metrics_group_verdict,
+    normalize_gdpo_decoupled,
+)
 
 
 def _combined(args, group):
@@ -46,6 +50,14 @@ class _S:
         return self.reward if not args.reward_key else self.reward[args.reward_key]
 
     def get_reward_components(self, keys):
+        # Mirrors Sample.get_reward_components, including the error type: a
+        # double that raises KeyError where the real one raises ValueError
+        # cannot exercise any caller that distinguishes them.
+        if not isinstance(self.reward, dict):
+            raise ValueError(f"Sample.reward must be a dict to read components {keys}")
+        for key in keys:
+            if key not in self.reward:
+                raise ValueError(f"Reward key {key!r} missing from sample reward")
         return [self.reward[key] for key in keys]
 
 
@@ -207,3 +219,80 @@ def test_builtin_filter_is_unchanged_for_single_reward_algorithms():
 
     varied = _group(correctness=[1.0, 0.0, 1.0, 0.0], fmt=[1.0, 0.0, 1.0, 0.0])
     assert check_reward_nonzero_std(_grpo_args(), varied).keep is True
+
+
+# ---------------- the zero-std metrics (metrics_group_verdict) ----------------
+#
+# There are two copies of `_compute_zero_std_metrics`, and only the agentic one
+# is importable without `sglang`. Both now delegate the whole decision to
+# `metrics_group_verdict`, so testing it here covers the copy that cannot be
+# imported. That indirection is the point: the copies drifted apart once and
+# the drift was invisible precisely because neither had a test.
+
+
+def _scalar_args():
+    """GRPO reading the bare reward, not a dict key -- the common single-reward
+    setup."""
+    return SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=4, reward_key=None)
+
+
+def test_metrics_verdict_tolerates_an_unscored_sample():
+    """`reward=None` reaches the metrics under --group-rm when a rollout
+    aborts.
+
+    The scalar path builds a float32 tensor from these; a None in it is a
+    TypeError, raised from a logging helper on the rollout's way out. Before
+    the shared helper the distributed copy did exactly that.
+    """
+    group = [_S(0, None), _S(0, 1.0), _S(0, 1.0)]
+    assert metrics_group_verdict(_scalar_args(), group) is True
+
+
+def test_metrics_verdict_is_unknown_when_nothing_was_scored():
+    assert metrics_group_verdict(_scalar_args(), [_S(0, None), _S(0, None)]) is None
+
+
+def test_metrics_verdict_still_reads_variation():
+    assert metrics_group_verdict(_scalar_args(), [_S(0, 0.0), _S(0, 1.0)]) is False
+
+
+def test_metrics_verdict_is_unknown_when_the_reward_schema_does_not_fit():
+    """Eval may run a different reward model than training
+    (EvalConfig.rm_type).
+
+    Its rewards need not carry --gdpo-reward-keys, and nothing in eval consumes
+    them. The strict question has no correct answer here, so the observer must
+    not be the thing that enforces the training contract -- it took eval down.
+    """
+    args = SimpleNamespace(
+        advantage_estimator="gdpo",
+        gdpo_reward_keys=["a", "b"],
+        gdpo_reward_weights=None,
+        reward_key="score",
+        n_samples_per_prompt=2,
+    )
+    group = [_S(0, {"score": 1.0, "a": 1.0}), _S(0, {"score": 2.0, "a": 2.0})]
+
+    assert metrics_group_verdict(args, group) is None
+    # ...while the stage that actually consumes the components still refuses it.
+    with pytest.raises(ValueError, match="missing from sample reward"):
+        group_carries_reward_signal(args, group)
+
+
+def test_the_two_metrics_copies_both_delegate_the_decision():
+    """Neither copy may re-derive "is this group flat" for itself.
+
+    A source check because `relax/distributed/ray/rollout.py` imports `sglang`
+    and cannot be loaded here. It is weak -- it cannot tell whether the verdict
+    is *used* correctly -- so it is paired with the behavioural tests above
+    rather than standing in for them.
+    """
+    import pathlib
+
+    import relax
+
+    root = pathlib.Path(relax.__file__).parent
+    for path in ("agentic/rollout.py", "distributed/ray/rollout.py"):
+        src = (root / path).read_text()
+        assert "metrics_group_verdict" in src, path
+        assert "group_carries_reward_signal" not in src, f"{path} must not ask the strict question"

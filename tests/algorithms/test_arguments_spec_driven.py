@@ -476,7 +476,13 @@ def test_supports_fully_async_is_declared_wherever_it_is_false():
 
 
 def test_dynamic_sampling_filter_warns_for_multi_reward(arguments_module, caplog):
-    """The built-in filter judges a group by the single --reward-key scalar."""
+    """A *custom* filter is opaque, so a multi-reward run warns about it.
+
+    Not the built-in one, which this docstring used to describe: that reads
+    `group_carries_reward_signal` and judges the group by the combined
+    advantage. The warning exists because a custom filter may still reduce the
+    group to the single --reward-key scalar, and from here we cannot tell.
+    """
     import logging
 
     with caplog.at_level(logging.WARNING):
@@ -543,3 +549,33 @@ def test_a_typo_in_advantage_normalization_is_rejected(arguments_module):
     broken = dataclasses.replace(get_algorithm("grpo"), advantage_normalization="typo")
     with pytest.raises(ValueError, match="advantage_normalization"):
         arguments_module._assert_spec_implementations_resolve(broken)
+
+
+# ---------------- weights are checked before the cluster starts ----------------
+
+
+@pytest.mark.parametrize(
+    "weights, expected",
+    [
+        ([float("nan"), 1.0], "non-finite"),
+        ([float("inf"), 1.0], "non-finite"),
+        ([0.0, 0.0], "all zero in float32"),
+        ([1e-50, 1e-50], "all zero in float32"),
+    ],
+)
+def test_unusable_gdpo_weights_are_rejected_at_startup(arguments_module, weights, expected):
+    """`--gdpo-reward-weights nan 1` used to start the whole run first.
+
+    `type=float` accepts "nan" and "inf" from a shell, and 1e-50 is a real
+    Python float that flushes to zero in float32. None of it depends on rollout
+    data, so failing at the first rollout only means the placement groups are
+    up and the checkpoint is loaded before the typo is reported.
+    """
+    args = _args(gdpo_reward_weights=weights)
+    with pytest.raises(ValueError, match=expected):
+        arguments_module.validate_algorithm_args(args)
+
+
+def test_usable_gdpo_weights_still_pass(arguments_module):
+    """A weight may legitimately be zero, as long as they are not all zero."""
+    arguments_module.validate_algorithm_args(_args(gdpo_reward_weights=[0.0, 1.0]))

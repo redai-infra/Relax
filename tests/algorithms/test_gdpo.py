@@ -17,7 +17,17 @@ torch = pytest.importorskip("torch")
 
 from relax.algorithms import get_algorithm  # noqa: E402
 from relax.algorithms.advantages import whiten_scalar  # noqa: E402
-from relax.algorithms.rewards import REWARD_NORMALIZERS, extract_reward_components  # noqa: E402
+from relax.algorithms.rewards import (  # noqa: E402
+    REWARD_NORMALIZERS,
+    combine_group,
+    component_noise_scale,
+    extract_reward_components,
+    group_carries_reward_signal,
+    standardize_group_components,
+)
+
+
+_UNSET = object()
 
 
 def _args(keys=("correctness", "format"), weights=None, n=4):
@@ -185,7 +195,36 @@ def test_default_weights_are_all_ones():
     assert _normalize(_args(weights=None), samples) == _normalize(_args(weights=[1.0, 1.0]), samples)
 
 
-def test_grouping_uses_group_index():
+def test_grouping_follows_group_index_not_position():
+    """Interleave two groups so position and group_index disagree.
+
+    The previous version of this test only ever built the contiguous layout
+    [0,0,0,0,1,1,1,1], which an implementation that chopped the batch into
+    fixed-size runs would satisfy just as well -- it asserted nothing its own
+    name claimed. Here sample i belongs to group i % 2, so any position-based
+    grouping produces different numbers.
+    """
+    groups = [0, 1, 0, 1, 0, 1, 0, 1]
+    correctness = [1.0, 5.0, 0.0, 5.0, 1.0, 5.0, 0.0, 5.0]
+    fmt = [1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+
+    interleaved = _normalize(_args(n=4), _mk(groups, correctness, fmt))
+
+    # Group 1 (odd positions) has collapsed correctness, so only format acts there.
+    odd = [interleaved[i] for i in (1, 3, 5, 7)]
+    assert abs(sum(odd)) < 1e-5
+    # Reordering the samples so each group is contiguous must not change any
+    # sample's own advantage -- which is only true if group_index decides.
+    order = [0, 2, 4, 6, 1, 3, 5, 7]
+    contiguous = _normalize(
+        _args(n=4),
+        _mk([groups[i] for i in order], [correctness[i] for i in order], [fmt[i] for i in order]),
+    )
+    for new_position, original in enumerate(order):
+        assert abs(contiguous[new_position] - interleaved[original]) < 1e-5
+
+
+def test_collapsed_component_in_one_group_only():
     correctness = [1.0, 0.0, 1.0, 0.0, 5.0, 5.0, 5.0, 5.0]
     fmt = [1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
     contiguous = _normalize(_args(), _mk([0, 0, 0, 0, 1, 1, 1, 1], correctness, fmt))
@@ -369,7 +408,7 @@ def test_extract_reward_components_shape_and_dtype():
     samples = _mk([0, 0, 0, 0], [1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0])
     out = extract_reward_components(samples, ["correctness", "format"])
     assert out.shape == (4, 2)
-    assert out.dtype == torch.float32
+    assert out.dtype == torch.float64
 
 
 def test_extract_reward_components_preserves_key_order():
@@ -382,7 +421,7 @@ def test_extract_reward_components_preserves_key_order():
 def test_extract_accepts_python_ints():
     samples = [_S(0, {"correctness": 1, "format": 0}) for _ in range(2)]
     out = extract_reward_components(samples, ["correctness", "format"])
-    assert out.dtype == torch.float32
+    assert out.dtype == torch.float64
 
 
 def test_single_reward_gdpo_is_a_constant_positive_multiple_of_grpo():
@@ -424,7 +463,7 @@ def test_warns_once_when_every_component_collapses_in_every_group(caplog):
         out = _normalize(_args(), samples)
 
     assert out == [0.0] * 4
-    assert sum("all reward components collapsed" in r.message for r in caplog.records) == 1
+    assert sum("combined to exactly zero" in r.message for r in caplog.records) == 1
 
 
 def test_does_not_warn_when_some_signal_survives(caplog):
@@ -434,7 +473,7 @@ def test_does_not_warn_when_some_signal_survives(caplog):
     with caplog.at_level(logging.WARNING):
         _normalize(_args(), samples)
 
-    assert not any("all reward components collapsed" in r.message for r in caplog.records)
+    assert not any("combined to exactly zero" in r.message for r in caplog.records)
 
 
 def test_does_not_warn_when_only_some_groups_collapse(caplog):
@@ -448,7 +487,7 @@ def test_does_not_warn_when_only_some_groups_collapse(caplog):
     with caplog.at_level(logging.WARNING):
         _normalize(_args(), samples)
 
-    assert not any("all reward components collapsed" in r.message for r in caplog.records)
+    assert not any("combined to exactly zero" in r.message for r in caplog.records)
 
 
 # ---------------- reward value contract ----------------
@@ -465,7 +504,7 @@ def test_numpy_scalars_are_accepted():
             _S(0, {"correctness": dtype(0), "format": dtype(1)}),
         ]
         out = extract_reward_components(samples, ["correctness", "format"])
-        assert out.dtype == torch.float32, dtype
+        assert out.dtype == torch.float64, dtype
         assert out.shape == (2, 2), dtype
 
 
@@ -579,8 +618,10 @@ def test_whitening_scope_is_whatever_the_caller_passes_not_a_training_batch():
     statistics describe one training batch "matching the paper", and they do not.
     The Megatron caller merges `num_rollout_minis` windows before calling
     (actor.py: concat_rollout_batches, under the comment "we may need normalize
-    the whole rollout"), so with the shipped example's 4 * 8 against a
-    global_batch_size of 16 one whitening spans two optimizer steps.
+    the whole rollout"), so whether one whitening spans one optimizer step or
+    several is the caller's business, not this function's. The shipped example
+    runs 4 * 8 against a --global-batch-size of 32, i.e. one window; halving
+    that to 16 gives two, which is what `mini_batch_sizes` then separates.
 
     Concretely: whitening two batches together is not the same as whitening each.
     """
@@ -604,9 +645,17 @@ def test_whitening_scope_is_whatever_the_caller_passes_not_a_training_batch():
 # ---------------- step 3 now normalises per training batch ----------------
 
 
-def _gdpo_adv(rewards, mini_batch_sizes=None):
+def _gdpo_adv(rewards, mini_batch_sizes=_UNSET):
+    """`mini_batch_sizes` defaults to one segment covering everything.
+
+    Not `None`: that is now rejected outright, because a caller that fails to
+    say how the rollout was split is asking for a different objective without
+    knowing it. Tests that want the merged behaviour ask for it explicitly.
+    """
     from relax.algorithms.advantages import compute_advantages_and_returns
 
+    if mini_batch_sizes is _UNSET:
+        mini_batch_sizes = [len(rewards)]
     kl = [torch.zeros(1) for _ in rewards]
     adv, _ = compute_advantages_and_returns(
         SimpleNamespace(advantage_estimator="gdpo", kl_coef=0.0),
@@ -641,7 +690,10 @@ def test_merging_the_batches_would_flip_signs_not_just_rescale():
     """
     first, second = [0.9, 1.1, 0.8, 1.2], [-1.2, -0.8, -1.1, -0.9]
     per_batch = _gdpo_adv(first + second, mini_batch_sizes=[4, 4])
-    merged = _gdpo_adv(first + second, mini_batch_sizes=None)
+    # `[8]`, not `None`: one segment spanning the merged rollout is exactly the
+    # behaviour a missing count would have produced, and it is now the only way
+    # to ask for it -- which is the point of this test.
+    merged = _gdpo_adv(first + second, mini_batch_sizes=[8])
 
     assert int((per_batch.sign() != merged.sign()).sum()) == 4
 
@@ -649,7 +701,19 @@ def test_merging_the_batches_would_flip_signs_not_just_rescale():
 def test_a_single_batch_is_unchanged_by_the_counts():
     """num_rollout_minis == 1 is the common case and must not move."""
     rewards = [1.0, 2.0, 3.0, 4.0]
-    torch.testing.assert_close(_gdpo_adv(rewards, [4]), _gdpo_adv(rewards, None))
+    torch.testing.assert_close(_gdpo_adv(rewards, [4]), _gdpo_adv(rewards, [len(rewards)]))
+
+
+def test_absent_counts_are_rejected_rather_than_merged():
+    """The caller must say how the rollout was split; there is no default.
+
+    Falling back to one window looks like a conservative default and is not:
+    `test_merging_the_batches_would_flip_signs_not_just_rescale` shows it
+    changing the sign of half the advantages. A caller that forgot the metadata
+    would have trained on a different objective with every metric finite.
+    """
+    with pytest.raises(ValueError, match="mini_batch_sizes is None"):
+        _gdpo_adv([1.0, 2.0, 3.0, 4.0], mini_batch_sizes=None)
 
 
 def test_counts_that_do_not_cover_the_shard_are_rejected():
@@ -702,3 +766,92 @@ def test_a_single_segment_is_still_size_checked():
     window."""
     with pytest.raises(ValueError, match="sum to"):
         _gdpo_adv([1.0, 2.0, 3.0, 4.0, 5.0], mini_batch_sizes=[4])
+
+
+# ---------------- the noise floor (see combine_group) ----------------
+
+
+_CONSTANT_SUM_C = 308.95172119140625
+_CONSTANT_SUM_R = [-75.74329876632146, -75.74330217449115, -75.7432989215475]
+"""Three samples whose two components sum to exactly the same float32 value.
+
+Found by search, not by hand: the pair has to round to an identical sum while
+the individual values still differ, which needs the components to sit far
+enough from zero that their ulp exceeds the spread being represented.
+"""
+
+
+def _constant_sum_group():
+    return torch.tensor([[r, _CONSTANT_SUM_C - r] for r in _CONSTANT_SUM_R], dtype=torch.float64)
+
+
+def test_components_that_cancel_produce_exactly_zero_not_amplified_rounding():
+    """Equal weights on two components summing to a constant must cancel.
+
+    In float32 this group came out of step 2 at [-0.086, 0.173, -0.086] and out
+    of step 3 -- which divides by the std of that very residue -- at [-0.577,
+    1.154, -0.577]. Finite, plausible, and pointing wherever the last bits of
+    the reward happened to fall.
+    """
+    combined = combine_group(_constant_sum_group(), torch.tensor([0.5, 0.5]))
+    assert combined.tolist() == [0.0, 0.0, 0.0]
+    assert whiten_scalar(combined).tolist() == [0.0, 0.0, 0.0]
+
+
+def test_float32_columns_are_what_made_the_residue_dangerous():
+    """The dtype is the half that stops a full-scale fake advantage.
+
+    Pins the claim `combine_group` makes about the split of responsibility. If
+    someone narrows `extract_reward_components` back to float32 on the grounds
+    that "the floor handles it", the residue returns to being larger than the
+    signal and this fails.
+    """
+    weights = torch.tensor([0.5, 0.5])
+    narrow = _constant_sum_group().float().double()
+
+    residue = (standardize_group_components(narrow).double() * weights.double()).sum(dim=1)
+    assert residue.abs().amax() > 1e-3
+    assert whiten_scalar(residue).abs().amax() > 0.5
+
+
+def test_float64_alone_leaves_a_residue_small_but_not_zero():
+    """The floor's job is exact detectability, not magnitude.
+
+    Also pins that it is `GDPO_EPS` capping step 3, not luck: without it the
+    residue would be divided by its own std and come back to order 1.
+    """
+    group = _constant_sum_group()
+    weights = torch.tensor([0.5, 0.5])
+    unfloored = (standardize_group_components(group).double() * weights.double()).sum(dim=1)
+
+    assert 0.0 < float(unfloored.abs().amax()) < 1e-8
+    assert float(whiten_scalar(unfloored).abs().amax()) < 1e-4
+
+
+def test_the_floor_leaves_a_well_conditioned_group_alone():
+    """The margin is fifteen orders of magnitude, so nothing real is
+    suppressed."""
+    group = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]], dtype=torch.float64)
+    weights = torch.tensor([0.5, 0.5])
+
+    combined = combine_group(group, weights)
+    floor = component_noise_scale(group)
+
+    assert combined.abs().amax() > 0.1
+    assert float(floor.amax()) < 1e-14
+
+
+def test_noise_scale_is_zero_for_a_collapsed_column():
+    """A collapsed column contributes exact zeros, so it contributes no
+    error."""
+    group = torch.tensor([[1.0, 5.0], [0.0, 5.0], [1.0, 5.0]], dtype=torch.float64)
+    assert component_noise_scale(group)[1].item() == 0.0
+
+
+def test_the_filter_agrees_with_the_normalizer_on_a_cancelling_group():
+    """Both go through `combine_group`, so they cannot disagree about this."""
+    samples = [_S(0, {"correctness": r, "format": _CONSTANT_SUM_C - r}) for r in _CONSTANT_SUM_R]
+    args = _args(weights=[0.5, 0.5], n=3)
+
+    assert group_carries_reward_signal(args, samples) is False
+    assert REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3) == [0.0, 0.0, 0.0]

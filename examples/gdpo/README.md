@@ -89,17 +89,24 @@ GDPO_ARGS=(
 
 ## 已知偏差
 
-1. **第三步的 batch 边界（已正确处理）**。调用方为效率会先合并多个训练批再调用 advantage，但 `_whiten_by_segment` 用 `mini_batch_sizes` 把它们切回**每个 optimizer 训练批各自白化**，因此 `num_rollout_minis > 1` 时仍对齐论文 Eq. 6，**不要求** `rollout_batch_size × n_samples_per_prompt == global_batch_size`。本脚本把 `4 × 8` 与 `--global-batch-size 32` 设成相等只是让例子最简单，并非必需。跨 DP 的 all-reduce 保证统计量覆盖全部 rank。**`--fully-async` 会在参数校验阶段被拒绝**——那条路径的切片可能小到只有一个样本，白化输出恒为 0。
+1. **第三步的 batch 边界（已正确处理）**。调用方为效率会先合并多个训练批再调用 advantage，但 `_whiten_by_segment` 用 `mini_batch_sizes` 把它们切回**每个 optimizer 训练批各自白化**，因此 `num_rollout_minis > 1` 时仍对齐论文 Eq. 6，**不要求** `rollout_batch_size × n_samples_per_prompt == global_batch_size`。本脚本把 `4 × 8` 与 `--global-batch-size 32` 设成相等只是让例子最简单，并非必需——把 `--global-batch-size` 改成 16 就会跑出两段。跨 DP 的 all-reduce 保证统计量覆盖全部 rank。**`--fully-async` 会在参数校验阶段被拒绝**——那条路径的切片可能小到只有一个样本，白化输出恒为 0。
+
+   调用方**必须**提供这份切分（`rollout_mini_local_sample_counts`）。缺失时 GDPO 直接报错，不回退到「整个 rollout 白化一次」：那不是同一个目标的粗糙版本，而是另一个目标——`test_merging_the_batches_would_flip_signs_not_just_rescale` 里 8 个样本有 4 个符号翻转，而 loss、grad_norm、advantage 均值全都正常。
 
 2. **单个奖励时 GDPO 不等于 GRPO**。step1 除以 `std_g + 1e-4`、GRPO 除以 `std_g + 1e-6`，各组 `std_g` 不同 → 尺度因子逐组不同，step3 还会再做一次 batch 白化，所以不是「差一个正标量」那么简单。要 GRPO 语义就用 `--advantage-estimator grpo`。
 
 3. **`--n-samples-per-prompt 2` 时幅度信息丢失**：任意两个不同值标准化后恒为 ±0.7071。示例用 8 就是为了避开这一点。
 
-4. **恒和分量在大量级下会产生数值假信号**。若两个分量恰好满足 `r₂ = C − r₁`，数学上应完全抵消为零（见上文「GDPO 不能做什么」）。但奖励在进入归一化前会被 cast 成 float32，而 `C − r` 这种值不一定能被 float32 精确表示——两者相加仍舍回 `C`（看起来恒和），各自却已偏离，标准化后留下约 `1e-4` 的残差。第三步再用同量级的 batch 标准差去除它，输出就变成 O(1) 的 advantage：**一个本无信号的组拿到了方向由舍入决定的梯度**。实测一组和为 `308.95172119140625` 的奖励，最终 advantage 为 `[-0.4344, 0.5251, -0.0908]`。
+4. **恒和分量的数值假信号（已修复，记录在此因为它解释了两处实现选择）**。若两个分量恰好满足 `r₂ = C − r₁`，数学上应完全抵消为零（见上文「GDPO 不能做什么」）。这里的标准化在这种输入下是**病态**的：它要除以一个接近零的 std，相对误差被放大 `max|x| / std` 倍。
+
+   奖励曾经在进入归一化前被 cast 成 float32，而 `C − r` 这种值不一定能被 float32 精确表示——两者相加仍舍回 `C`（看起来恒和），各自却已偏离。残差量级约 `1e-1`，**比信号本身还大**，第三步再除以同量级的 batch 标准差，输出就是 O(1) 的 advantage：一个本无信号的组拿到了方向由舍入决定的梯度。实测一组和为 `308.95172119140625` 的奖励，最终 advantage 为 `[-0.5770, 1.1539, -0.5770]`。
+
+   现在两处一起挡住它，各管一半：
+
+   - **分量全链路用 float64**（`extract_reward_components`）。残差降到 `1e-10` 量级，第三步分母里的 `GDPO_EPS = 1e-4` 又钳住了放大倍数，最坏输出已经只有 `1e-6`。**假梯度问题到这一步就没了。**
+   - **`combine_group` 的噪声地板**。`1e-6` 毕竟不是零，而下游好几处是按「等于零」判断的——filter 会保留一个不贡献梯度的组，「整批无信号」的告警也永远不会触发。地板把它归成精确的零。阈值由 `component_noise_scale` 从 `eps · max|x| / (std + GDPO_EPS)` 算出，不是拍的：良态输入下它比信号低十五个数量级。
 
    GRPO 没有这个问题：它归一化的是**和**，而和在 float32 下确实恒定，塌缩检测会直接置零。
-
-   触发需要「恒和 + 分量绝对值远大于其组内差异」同时成立，实践中少见；彻底解决要么把奖励全链路加宽到 float64，要么在第三步引入噪声下限，两者都超出本 PR 范围。若你的奖励设计天然满足恒和，请直接用不等权重（此时不再抵消，也就不存在这个残差被放大的问题）。
 
 ## 冲突项
 

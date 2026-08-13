@@ -339,7 +339,7 @@ GDPO_ARGS=(
 
 以下两点是实现与论文之间的实际差异，训练前请确认可以接受。第三步的 batch 边界曾经也在此列，现已修正——见下。
 
-**第三步的 batch 边界（已对齐）**。论文 Eq. 6 在**一个训练批**上归一化。调用方会先把 `num_rollout_minis` 个训练批用 `concat_rollout_batches` 合并再进 advantage 阶段，所以第三步必须知道批边界。边界由 `ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY` 携带（colocate 与 hybrid 三条路径都写入），`loss.py` 作为 `mini_batch_sizes` 传给 advantage 分发器，**只有 GDPO 消费**——其余估计器由 `**_unused` 吞掉，逐位不变。每段各自跨 DP all-reduce，所以统计量既覆盖完整训练批、也覆盖全部 rank。这一点为什么重要：合并白化会把两个批都对着共同均值中心化，实测 8 个样本里有 4 个**符号翻转**——那是另一个优化目标，不是精度差异。
+**第三步的 batch 边界（已对齐）**。论文 Eq. 6 在**一个训练批**上归一化。调用方会先把 `num_rollout_minis` 个训练批用 `concat_rollout_batches` 合并再进 advantage 阶段，所以第三步必须知道批边界。边界由 `ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY` 携带（colocate 与 hybrid 三条路径都写入），`loss.py` 作为 `mini_batch_sizes` 传给 advantage 分发器，**只有 GDPO 消费**——其余估计器由 `**_unused` 吞掉，逐位不变。每段各自跨 DP all-reduce，所以统计量既覆盖完整训练批、也覆盖全部 rank。这一点为什么重要：合并白化会把两个批都对着共同均值中心化，实测 8 个样本里有 4 个**符号翻转**——那是另一个优化目标，不是精度差异。正因如此，边界缺失时 GDPO **直接报错**而不是退回合并白化：一个漏写这份元数据的调用方会在 loss、grad_norm 全部正常的情况下优化错误的目标。
 
 **`--fully-async` 仍不受支持**，参数校验阶段直接拒绝：那条路径把 advantage 计算交给单副本的 Advantages 服务，它没有数据并行通信域，也拿不到批边界，且每次只消费 `global_batch_size / num_iters_per_train_update` 的一个切片；当这个商为 1 时白化输出恒为 0，训练会安静地在零信号上跑完。
 

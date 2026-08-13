@@ -556,3 +556,139 @@ def test_loss_py_actually_forwards_the_mini_batch_boundaries():
         "loss.py must pass the per-training-batch counts; without them GDPO's step 3 "
         "normalises over the whole merged rollout again"
     )
+
+
+# ---------------- advantage_normalization ----------------
+#
+# This field is read on every optimizer step of every algorithm, and until
+# these tests existed nothing pinned its value: the only test naming it
+# rejected an invalid string. Dropping `"token_global"` from a REINFORCE++ spec
+# (silently reverting it to the `"whiten"` default) or flipping the comparison
+# in loss.py left the whole suite green.
+
+
+@pytest.mark.parametrize("name", MAIN_ALGORITHMS)
+def test_advantage_normalization_matches_main(name):
+    expected = "token_global" if name in MAIN_TOKEN_GLOBAL else "whiten"
+    assert get_algorithm(name).advantage_normalization == expected
+
+
+def test_exactly_mains_algorithms_take_the_token_global_path():
+    """Pins the set, not just the members.
+
+    A per-algorithm check cannot fail when a *new* algorithm defaults into the
+    wrong branch, and the default is the branch every existing algorithm but
+    two takes -- so the mistake it would miss is the likely one.
+    """
+    token_global = {n for n in list_algorithm_names() if get_algorithm(n).advantage_normalization == "token_global"}
+    assert token_global == MAIN_TOKEN_GLOBAL
+
+
+def test_loss_py_selects_both_behaviours_from_the_field():
+    """Both of main's call sites must read the spec, not the algorithm name.
+
+    Source-level because importing `loss.py` needs Megatron. It is paired with
+    the value tests above: those pin what the field says, this pins that the
+    two branches still ask it.
+    """
+    import pathlib
+
+    import relax
+
+    src = (pathlib.Path(relax.__file__).parent / "backends/megatron/loss.py").read_text()
+
+    assert src.count('advantage_normalization == "token_global"') == 2
+    for literal in MAIN_TOKEN_GLOBAL:
+        assert f'"{literal}"' not in src, f"loss.py still names {literal} directly"
+
+
+def test_gae_adapter_reproduces_mains_reward_shaping(cp_disabled):
+    """PPO's adapter, run against a transcription of main's inline branch.
+
+    The only estimator adapter with no numerical check: `advantage_gae` had a
+    co_names test, which cannot see a dropped argument, a sign flip on the KL
+    coefficient, or the terminal-reward injection landing on the wrong token.
+    PPO is also the algorithm whose surroundings this refactor changed most
+    (it is the one with a critic) and the one with no GPU smoke, so a bug here
+    would have had the least chance of being caught anywhere else.
+
+    main @ 98a1274 loss.py:584-602, transcribed rather than imported:
+
+        old_rewards = rewards
+        rewards = []
+        kl_coef = -args.kl_coef
+        cp_rank = mpu.get_context_parallel_rank()
+        for reward, k in zip(old_rewards, kl, strict=False):
+            k *= kl_coef
+            if cp_rank == 0:
+                k[-1] += reward
+            rewards.append(k)
+        advantages, returns = get_advantages_and_returns_batch(
+            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd,
+            padded_total_lengths=padded_total_lengths,
+        )
+    """
+    from relax.algorithms.advantages import compute_advantages_and_returns
+
+    def _inputs():
+        return dict(
+            rewards=[1.5, -2.0],
+            kl=[torch.tensor([0.1, 0.2, 0.3]), torch.tensor([0.4, 0.5])],
+            values=[torch.tensor([0.7, 0.8, 0.9]), torch.tensor([1.1, 1.2])],
+            response_lengths=[3, 2],
+            total_lengths=[5, 4],
+        )
+
+    args = _args("ppo", kl_coef=0.3, gamma=0.95, lambd=0.9)
+
+    # main's branch, on its own copy of the tensors -- the shaping mutates `kl`
+    # in place (`k *= kl_coef`), so the two runs must not share them.
+    ref = _inputs()
+    shaped = []
+    for reward, k in zip(ref["rewards"], ref["kl"], strict=False):
+        k *= -args.kl_coef
+        k[-1] += reward  # cp_rank == 0 under `cp_disabled`
+        shaped.append(k)
+    want_adv, want_ret = ppo_utils.get_advantages_and_returns_batch(
+        ref["total_lengths"],
+        ref["response_lengths"],
+        ref["values"],
+        shaped,
+        args.gamma,
+        args.lambd,
+        padded_total_lengths=None,
+    )
+
+    got_adv, got_ret = compute_advantages_and_returns(args, **_inputs())
+
+    for left, right in zip(got_adv, want_adv, strict=True):
+        assert torch.equal(left, right)
+    for left, right in zip(got_ret, want_ret, strict=True):
+        assert torch.equal(left, right)
+
+
+def test_gae_adapter_actually_uses_kl_coef_and_gamma(cp_disabled):
+    """Guards the transcription above from agreeing by coincidence.
+
+    If the adapter ignored either argument, the test above would still pass as
+    long as the reference ignored it too.
+    """
+    from relax.algorithms.advantages import compute_advantages_and_returns
+
+    def _run(**overrides):
+        knobs = dict(kl_coef=0.3, gamma=0.95, lambd=0.9)
+        knobs.update(overrides)
+        adv, _ = compute_advantages_and_returns(
+            _args("ppo", **knobs),
+            rewards=[1.5, -2.0],
+            kl=[torch.tensor([0.1, 0.2, 0.3]), torch.tensor([0.4, 0.5])],
+            values=[torch.tensor([0.7, 0.8, 0.9]), torch.tensor([1.1, 1.2])],
+            response_lengths=[3, 2],
+            total_lengths=[5, 4],
+        )
+        return torch.cat(adv)
+
+    baseline = _run()
+    assert not torch.allclose(baseline, _run(kl_coef=0.9))
+    assert not torch.allclose(baseline, _run(gamma=0.5))
+    assert not torch.allclose(baseline, _run(lambd=0.1))

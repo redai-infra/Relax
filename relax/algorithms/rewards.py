@@ -30,6 +30,14 @@ _FLOAT32_MAX = float(torch.finfo(torch.float32).max)
 """Largest finite float32. Rewards are carried as float32 from here on, so a
 value above this is an overflow waiting to happen rather than a large reward."""
 
+_NOISE_FLOOR_SAFETY = 8.0
+"""Headroom on :func:`component_noise_scale`'s first-order error bound.
+
+The bound is an estimate, not a proof, so it gets an order of magnitude. It can
+afford to: on well-conditioned rewards the bound sits fifteen orders of
+magnitude below the signal, so any value in this neighbourhood suppresses
+exactly the same things."""
+
 
 def group_positions(samples: list[Any], expected_size: int) -> dict[int, list[int]]:
     """Map ``Sample.group_index`` to the positions it occupies in ``samples``.
@@ -212,13 +220,23 @@ def extract_reward_components(samples: list[Any], keys: list[str]) -> torch.Tens
             row.append(numeric)
         rows.append(row)
 
-    components = torch.tensor(rows, dtype=torch.float32)
+    # float64, not float32. The rewards arrive as Python floats and the
+    # standardisation that follows is ill-conditioned exactly when two
+    # components cancel: `C - r` loses the low bits on a float32 cast, and
+    # dividing what is left by a near-zero std turns those lost bits into a
+    # full-scale advantage. Keeping the width here is what makes the residue
+    # small enough for `combine_group`'s noise floor to be able to tell signal
+    # from rounding at all -- in float32 the residue is larger than the signal.
+    # The float32 range check above still stands: the combined reward is cast
+    # back down further along, so a value that cannot survive that cast is
+    # still a bug worth reporting at the reward function that produced it.
+    components = torch.tensor(rows, dtype=torch.float64)
     # Belt and braces: the per-value check above is exact, but it only sees what
     # `float()` returned. Anything that slips past it must not reach the
     # normaliser, where non-finite input is indistinguishable from a collapse.
     if not torch.isfinite(components).all():
         bad = (~torch.isfinite(components)).nonzero()[0].tolist()
-        raise ValueError(f"Reward {keys[bad[1]]!r} of sample {bad[0]} is not finite after casting to float32.")
+        raise ValueError(f"Reward {keys[bad[1]]!r} of sample {bad[0]} is not finite as a tensor.")
     return components
 
 
@@ -233,24 +251,12 @@ def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
     :func:`relax.algorithms.numerics.distributed_mean_std` does: the means and
     stds are the part where cancellation bites, and widening them is cheap.
 
-    It does **not** fix the related failure worth knowing about. Two columns
-    that sum to a constant should standardise to exact opposites and cancel,
-    and in float64 they do -- exactly. But the columns arrive already cast to
-    float32 by :func:`extract_reward_components`, and a value like
-    ``C - r`` does not survive that cast unchanged. The pair still *sums* to
-    ``C`` in float32 (the addition rounds back), so the group looks flat, while
-    the individual values have drifted enough to leave a residue of order 1e-4
-    after standardisation. Step 3 then divides that residue by a batch std of
-    the same order and returns advantages of order 1: a group with no signal
-    gets a confident gradient whose direction is decided by rounding.
-
-    Measured on rewards summing to 308.95172119140625, the batch comes out as
-    [-0.4344, 0.5251, -0.0908]. GRPO does not have this failure, because it
-    standardises the sum, which *is* exactly constant, and its collapse check
-    catches it. Raising the precision here does not help -- the information was
-    lost before this function saw it. Documented in examples/gdpo/README.md
-    under the deviations; fixing it needs either a wider reward dtype end to
-    end or a noise floor in step 3, neither of which belongs in this PR.
+    Standardising is ill-conditioned when a column barely varies: it divides
+    by a std that is near zero, so the *relative* error in the result grows
+    like ``max|x| / std``. That is not a corner case here -- it is precisely
+    what two columns summing to a constant look like, and it is why
+    :func:`component_noise_scale` exists and why the columns now arrive in
+    float64. See :func:`combine_group` for what is done with the estimate.
     """
     work = group.double()
     centered = work - work.mean(dim=0, keepdim=True)
@@ -259,6 +265,78 @@ def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
     scaled = centered / (std + GDPO_EPS)
     scaled = torch.where(collapsed.unsqueeze(0), torch.zeros_like(scaled), scaled)
     return scaled.to(group.dtype)
+
+
+def component_noise_scale(group: torch.Tensor) -> torch.Tensor:
+    """Per-column bound on how much of :func:`standardize_group_components` is
+    rounding.
+
+    Returns one value per column: the magnitude below which that column's
+    standardised values are indistinguishable from the arithmetic that
+    produced them.
+
+    The bound is the condition number of the standardisation. Each input
+    carries a relative representation error of about ``eps``, i.e. an absolute
+    error of ``eps * max|x|``. Dividing by ``std + GDPO_EPS`` scales that error
+    up by the same factor it scales the signal, so the error in the output is
+    ``eps * max|x| / (std + GDPO_EPS)``.
+
+    Two properties make this usable rather than a tuning knob:
+
+    * On a well-conditioned column it is negligible. Rewards around 1.0 with a
+      std of 0.1 give ``2.2e-16 * 1 / 0.1 ~ 2e-15`` against signal of order 1
+      -- fifteen orders of margin, so nothing real is ever suppressed.
+    * On the pathological column it matches what actually happens. For the
+      constant-sum group in ``test_gdpo.py`` the bound comes to ~5.1e-10 and
+      the residue measures 4.1e-10.
+
+    A collapsed column contributes exactly zero (not ``0/eps`` noise), so it
+    contributes no error either.
+    """
+    work = group.double()
+    eps = torch.finfo(work.dtype).eps
+    std = work.std(dim=0)
+    scale = work.abs().amax(dim=0)
+    noise = eps * scale / (std + GDPO_EPS)
+    return torch.where(collapsed_columns(group, dim=0), torch.zeros_like(noise), noise)
+
+
+def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """GDPO steps 1 and 2 for one ``[G, K]`` prompt group, with a noise floor.
+
+    Two components summing to a constant should standardise to exact opposites
+    and cancel. What is left instead is the rounding error of an
+    ill-conditioned division, and it does not stay small: step 3 divides by the
+    std of that very residue.
+
+    Two separate things keep that from becoming a gradient, and it is worth
+    being exact about which does what, because the tempting summary -- "the
+    floor stops a full-scale fake advantage" -- is not true:
+
+    * **The float64 columns do the heavy lifting.** In float32 the residue was
+      of order 1e-1, larger than the signal itself, and step 3 returned
+      advantages of order 1. In float64 it is of order 1e-10, and ``GDPO_EPS``
+      in step 3's denominator caps the amplification, so the worst case is
+      already down to ~1e-6. No floor is needed to avoid a fake gradient.
+    * **The floor makes the cancellation exactly detectable.** 1e-6 is not
+      zero, and several consumers test for zero:
+      :func:`group_carries_reward_signal` would keep a group contributing
+      nothing, and the all-groups-silent warning would never fire. Rounding a
+      residue to the zero it mathematically is turns a "too small to matter"
+      into a "recognisably absent".
+
+    The comparison is per group and all-or-nothing, matching how a collapsed
+    column is already handled. ``_NOISE_FLOOR_SAFETY`` is the one judgement
+    call; given the fifteen orders of margin on well-conditioned input, its
+    exact value changes nothing that is not already noise.
+    """
+    standardized = standardize_group_components(group)
+    combined = (standardized.double() * weights.double()).sum(dim=1)
+
+    floor = _NOISE_FLOOR_SAFETY * float((weights.double().abs() * component_noise_scale(group)).sum())
+    if float(combined.abs().amax()) <= floor:
+        return torch.zeros_like(combined)
+    return combined
 
 
 def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[float]) -> list[float]:
@@ -299,28 +377,6 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     components = extract_reward_components(samples, keys)
     positions_by_group = group_positions(samples, args.n_samples_per_prompt)
 
-    normalized = torch.zeros_like(components)
-    fully_collapsed_groups = 0
-    for positions in positions_by_group.values():
-        group = components[positions]
-        normalized[positions] = standardize_group_components(group)
-        if bool(collapsed_columns(group, dim=0).all()):
-            fully_collapsed_groups += 1
-
-    if fully_collapsed_groups == len(positions_by_group):
-        # Every component collapsed in every group, so this batch produces no
-        # gradient at all. Usually the reward function is constant for these
-        # prompts (e.g. a format reward when nothing in the prompt asks for a
-        # format). Worth one line, because the symptom downstream is simply
-        # "loss does not move".
-        logger.warning(
-            "GDPO: all reward components collapsed in all %d groups of this batch (keys=%s); "
-            "the batch contributes no gradient. Check that each of these rewards actually varies "
-            "across rollouts of the same prompt.",
-            fully_collapsed_groups,
-            keys,
-        )
-
     weight_tensor = torch.tensor(weights, dtype=torch.float32)
     if not torch.isfinite(weight_tensor).all():
         # `resolve_gdpo_weights` checked `math.isfinite` on the Python floats.
@@ -339,16 +395,41 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
             "the combined advantage would be identically 0."
         )
 
-    combined = (normalized * weight_tensor).sum(dim=1)
+    combined = torch.zeros(len(samples), dtype=torch.float64)
+    silent_groups = 0
+    for positions in positions_by_group.values():
+        combined[positions] = combine_group(components[positions], weight_tensor)
+        if not bool(combined[positions].any()):
+            silent_groups += 1
+
+    if silent_groups == len(positions_by_group):
+        # Every group came out at exactly zero, so this batch produces no
+        # gradient at all. Usually the reward function is constant for these
+        # prompts (e.g. a format reward when nothing in the prompt asks for a
+        # format); the other way in is components that cancel. Worth one line,
+        # because the symptom downstream is simply "loss does not move".
+        logger.warning(
+            "GDPO: all %d groups of this batch combined to exactly zero (keys=%s); the batch "
+            "contributes no gradient. Either these rewards do not vary across rollouts of the "
+            "same prompt, or they cancel under the configured weights (weights=%s).",
+            silent_groups,
+            keys,
+            weights,
+        )
+
     if not torch.isfinite(combined).all():
         # Every individual reward fit in float32 (checked in
         # `extract_reward_components`), but the arithmetic between them need
-        # not: a group of [3e38, 2e38, 1e38, 0] overflows while computing its
-        # own mean. Left unchecked the `inf` reaches `whiten_scalar`, reads as
-        # a non-finite std, and the batch is silently zeroed -- the exact
-        # failure the per-value check was added to prevent, one stage later.
+        # not. The mean itself no longer overflows -- the columns and the
+        # standardisation are float64 now, so [3e38, 2e38, 1e38, 0] averages
+        # fine, and the earlier version of this comment claiming otherwise is
+        # out of date. What can still reach infinity is the weighting: float64
+        # weights near its own maximum, or a reward near float64's range rather
+        # than float32's. Left unchecked the `inf` reaches `whiten_scalar`,
+        # reads as a non-finite std, and the batch is silently zeroed -- the
+        # exact failure the per-value check exists to prevent, one stage later.
         raise ValueError(
-            "GDPO produced a non-finite combined advantage from finite inputs; the float32 "
+            "GDPO produced a non-finite combined advantage from finite inputs; the "
             f"arithmetic overflowed. Rescale the rewards (keys={keys}) or their weights."
         )
     return combined.tolist()
@@ -405,8 +486,80 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
     keys = resolve_gdpo_keys(args)
     weights = torch.tensor(resolve_gdpo_weights(args, keys), dtype=torch.float32)
     components = extract_reward_components(samples, keys)
-    combined = (standardize_group_components(components) * weights).sum(dim=1)
-    return bool((combined != 0).any())
+    # `combine_group`, not steps 1 and 2 open-coded: this has to answer the
+    # same question `normalize_gdpo_decoupled` will, including the noise floor.
+    # Open-coding it is how the two came apart before.
+    return bool(combine_group(components, weights).any())
+
+
+def observed_reward_signal(args: Any, samples: list[Any]) -> bool | None:
+    """:func:`group_carries_reward_signal` for callers that only report.
+
+    Returns ``None`` -- "cannot tell" -- where the strict version raises.
+
+    This is not the strict check with its errors swallowed; it is a different
+    question, and the difference is not cosmetic. The strict version is asked
+    by the dynamic-sampling filter, which decides whether a group enters
+    *training*, so a reward it cannot read is a bug that should stop the run.
+    The zero-std metrics are asked by the logger, and two things follow:
+
+    * A metric must not decide whether training proceeds. Making observation
+      the first enforcer of a contract means a broken reward function is
+      reported at the log line rather than at the stage that consumes it, and
+      it takes the rollout down on the way.
+    * The contract is not even in force everywhere the metrics run. Eval may
+      use a different reward model (``EvalConfig.rm_type``), so an eval reward
+      legitimately need not carry the ``--gdpo-reward-keys`` that training
+      needs -- nothing in eval consumes them. The strict question has no
+      correct answer there; ``None`` is the honest one.
+
+    During training the same violation is still raised, by
+    :func:`normalize_gdpo_decoupled`, which is the stage that actually reads
+    the components. Nothing is hidden -- but it is logged here too, because a
+    group the metrics could not read is worth knowing about either way.
+    """
+    try:
+        return group_carries_reward_signal(args, samples)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "zero-std metrics: skipping a group whose reward could not be read (%s). "
+            "For a training rollout the reward stage will raise on this; for eval it may just "
+            "mean the eval reward model returns a different schema, which is fine.",
+            exc,
+        )
+        return None
+
+
+def metrics_group_verdict(args: Any, samples: list[Any]) -> bool | None:
+    """Is this prompt group flat, for zero-std reporting? ``None`` if
+    unanswerable.
+
+    ``True`` flat, ``False`` varying, ``None`` neither -- nothing in the group
+    was scored, or the reward could not be read.
+
+    This lives here rather than in the two rollout modules because there are
+    *two* copies of ``_compute_zero_std_metrics``, one in
+    ``relax/agentic/rollout.py`` and one in ``relax/distributed/ray/rollout.py``,
+    and they have already drifted apart once: the agentic one dropped unscored
+    samples and the distributed one did not, which turned a `reward=None` into
+    a ``TypeError`` on the rollout's way out. Only the agentic one is reachable
+    from a CPU test -- the other pulls in ``sglang`` at import -- so a shared
+    helper is the only version of this logic that can be tested at all.
+
+    ``reward=None`` is a real state, not a defensive check: under ``--group-rm``
+    the group reward is assigned in one shot that is skipped entirely when the
+    rollout aborts, which is why the "reward is not None" assert in
+    ``sglang_rollout.py`` exempts ``group_rm`` in the first place.
+
+    Callers still differ on what to do with ``None``, and that difference is
+    deliberate -- each preserves what its own metric reported before. See the
+    call sites.
+    """
+    rewarded = [sample for sample in samples if sample.reward is not None]
+    if not rewarded:
+        return None
+    signal = observed_reward_signal(args, rewarded)
+    return None if signal is None else not signal
 
 
 REWARD_NORMALIZERS: dict[str, Callable[[Any, list[Any], list[float]], list[float]]] = {

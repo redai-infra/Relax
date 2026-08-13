@@ -68,13 +68,22 @@ def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | No
 def _as_reward_tensor(rewards: Any, kl: list[torch.Tensor]) -> torch.Tensor:
     """Rewards as a detached float32 tensor on the KL tensors' device.
 
-    ``detach()`` is load-bearing, not defensive. The pre-registry code built
-    this with ``torch.tensor(rewards, ...)``, which copies and drops autograd
-    history even when handed a tensor. ``.to()`` returns the *same* object when
-    dtype and device already match, so without the detach a caller passing a
-    reward tensor with ``requires_grad=True`` would get advantages that carry
-    grad history into the policy loss -- a path that did not exist before and
-    that no caller asks for. Rewards are data, not something to backprop into.
+    ``detach()`` is defensive, and worth being precise about because the
+    comment here used to call it load-bearing, which overstates it.
+
+    Both production call sites pass ``list[float]`` -- ``loss.py`` reads
+    ``rollout_data["rewards"]`` and the Advantages deployment reads the same
+    column off the TransferQueue -- so the tensor branch below is not currently
+    reached by anything, and removing the detach would change no observable
+    behaviour today.
+
+    It stays because the refactor did quietly widen what this accepts. The
+    pre-registry code built the tensor with ``torch.tensor(rewards, ...)``,
+    which copies and drops autograd history even when handed a tensor;
+    ``.to()`` returns the *same* object when dtype and device already match. So
+    a future caller passing a reward tensor with ``requires_grad=True`` would,
+    without the detach, get advantages carrying grad history into the policy
+    loss. Rewards are data, not something to backprop into.
     """
     if isinstance(rewards, torch.Tensor):
         return rewards.detach().to(dtype=torch.float32, device=kl[0].device)
@@ -171,7 +180,19 @@ def _whiten_by_segment(values, mini_batch_sizes, process_group):
     # on until the whole group has shared it.
     local_error = ""
     if mini_batch_sizes is None:
-        n_segments = 1
+        # Not a fallback. Whitening the merged rollout as one window is a
+        # different optimisation target, not a coarser version of the same one:
+        # `test_merging_the_batches_would_flip_signs_not_just_rescale` shows
+        # half the advantages changing sign. Every Megatron producer writes
+        # these counts today, so a missing one means a new or changed caller,
+        # and the only thing worse than that caller failing is that caller
+        # training on the wrong objective while every metric stays finite.
+        n_segments = 0
+        local_error = (
+            "mini_batch_sizes is None: the caller did not supply "
+            "`rollout_mini_local_sample_counts`. GDPO whitens per training batch, so there is no "
+            "safe default -- whitening the merged rollout instead optimises a different objective."
+        )
     elif not mini_batch_sizes or any(not isinstance(n, int) or n <= 0 for n in mini_batch_sizes):
         n_segments = 0
         local_error = f"mini_batch_sizes must be a non-empty list of positive ints, got {mini_batch_sizes}."
@@ -186,7 +207,7 @@ def _whiten_by_segment(values, mini_batch_sizes, process_group):
 
     _agree_on_segmentation(n_segments, local_error, values, process_group)
 
-    if mini_batch_sizes is None or n_segments == 1:
+    if n_segments == 1:
         return whiten_scalar(values, process_group=process_group)
     out, start = [], 0
     for size in mini_batch_sizes:
