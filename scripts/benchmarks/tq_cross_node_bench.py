@@ -17,9 +17,13 @@ comparable:
   * C1 ``tcp``    -- MooncakeStore / mooncake / TCP
   * C2 ``rdma``   -- MooncakeStore / mooncake / RDMA
 
-Both synthetic tensors and production-shaped multimodal payloads are tested;
-every fetched field is compared byte-for-byte via a SHA-256 digest before a
-throughput result is accepted. Every payload tier's transport is proven by
+Three payload profiles: synthetic tensors, production-shaped multimodal
+tensors, and ``real-multimodal`` — a replay of REAL images through the
+production Qwen-VL processor (fixture from make_multimodal_fixture.py) with
+``multimodal_train_inputs`` as a NonTensorStack column, i.e. the storage
+backends' non-tensor slow path that real VL training exercises.  Every fetched
+field is compared byte-for-byte via a SHA-256 digest before a throughput
+result is accepted. Every payload tier's transport is proven by
 reading the IB ``port_rcv_data`` and bond0 ``rx_bytes`` counters around each
 get: RDMA must show IB moving and bond0 flat; TCP the reverse. There is no
 "thought it was RDMA but was TCP" ambiguity.
@@ -78,8 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--payload-profiles",
         nargs="+",
         default=["synthetic", "multimodal"],
-        choices=["synthetic", "multimodal"],
-        help="Payload layouts to benchmark. Multimodal uses production field names, shapes, and dtypes.",
+        choices=["synthetic", "multimodal", "real-multimodal"],
+        help="Payload layouts to benchmark. 'multimodal' is production-shaped dense tensors; "
+        "'real-multimodal' replays a fixture from make_multimodal_fixture.py (real images through the "
+        "production processor, multimodal_train_inputs as list[dict] == storage non-tensor slow path).",
+    )
+    p.add_argument(
+        "--fixture-path",
+        default="",
+        help="Fixture .pt for real-multimodal (default: $RELAX_MM_FIXTURE, else tests/fixtures/"
+        "tq_multimodal_fixture.pt). Generate with scripts/benchmarks/make_multimodal_fixture.py.",
     )
     p.add_argument(
         "--repeats",
@@ -168,15 +180,86 @@ def make_multimodal_payload(num_samples: int, total_mib: int):
     )
 
 
-def make_profile_payload(profile: str, num_samples: int, num_fields: int, total_mib: int):
+_FIXTURE_CACHE: dict[str, Any] = {}
+
+
+def resolve_fixture_path(cli_value: str) -> str:
+    """--fixture-path > $RELAX_MM_FIXTURE > repo default."""
+    import os
+
+    if cli_value:
+        return cli_value
+    if os.environ.get("RELAX_MM_FIXTURE"):
+        return os.environ["RELAX_MM_FIXTURE"]
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(repo_root, "tests", "fixtures", "tq_multimodal_fixture.pt")
+
+
+def make_real_multimodal_payload(total_mib: int, fixture_path: str):
+    """Replay REAL processor outputs at the requested payload tier.
+
+    Fixture samples (real dataset images through the production Qwen-VL chain)
+    are tiled cyclically until the multimodal payload reaches ``total_mib``.
+    The payload is assembled by the production ``dict_to_tensordict``, so
+    ``multimodal_train_inputs`` ships as a ``NonTensorStack`` column —
+    MooncakeStore's msgpack non-tensor slow path and SimpleStorage's pickled-
+    object path, exactly like a training job. Rows are shared references
+    (transport serializes each row anyway), so tiling does not multiply driver
+    RAM.
+    """
+    import torch
+
+    from relax.utils.payload_digest import total_leaf_bytes
+    from relax.utils.utils import dict_to_tensordict
+
+    if fixture_path not in _FIXTURE_CACHE:
+        _FIXTURE_CACHE[fixture_path] = torch.load(fixture_path, map_location="cpu", weights_only=False)
+    bundle = _FIXTURE_CACHE[fixture_path]
+    base_tokens = bundle["train_data"]["tokens"]
+    base_mm = bundle["train_data"]["multimodal_train_inputs"]
+
+    target_bytes = total_mib * 1024**2
+    tokens: list[list[int]] = []
+    multimodal: list[dict] = []
+    accumulated = 0
+    index = 0
+    while accumulated < target_bytes or len(tokens) < 1:
+        source = index % len(base_mm)
+        tokens.append(base_tokens[source])
+        multimodal.append(base_mm[source])
+        accumulated += total_leaf_bytes(base_mm[source])
+        index += 1
+    num_samples = len(tokens)
+    train_data = {
+        "sample_id": list(range(num_samples)),
+        "tokens": tokens,
+        "multimodal_train_inputs": multimodal,
+    }
+    return dict_to_tensordict(train_data, batch_size=num_samples)
+
+
+def make_profile_payload(profile: str, num_samples: int, num_fields: int, total_mib: int, fixture_path: str = ""):
+    if profile == "real-multimodal":
+        return make_real_multimodal_payload(total_mib, fixture_path)
     if profile == "multimodal":
         return make_multimodal_payload(num_samples, total_mib)
     return make_payload(num_samples, num_fields, total_mib)
 
 
+def profile_field_counts(profile: str, num_fields: list[int]) -> list[int]:
+    """Field-count sweep per profile: synthetic sweeps --num-fields; the
+    multimodal profiles have fixed production schemas."""
+    if profile == "synthetic":
+        return num_fields
+    return [7] if profile == "multimodal" else [3]
+
+
 def payload_bytes(payload) -> int:
-    """Total bytes across all tensor fields."""
-    return sum(payload[k].nelement() * payload[k].element_size() for k in payload.keys())
+    """Total payload bytes across all fields (tensor, NestedTensor, or
+    NonTensorStack columns)."""
+    from relax.utils.payload_digest import total_leaf_bytes
+
+    return sum(total_leaf_bytes(payload[k]) for k in payload.keys())
 
 
 def field_byte_digests(payload, fields: list[str]) -> dict[str, tuple[str, int, str]]:
@@ -195,6 +278,55 @@ def field_byte_digests(payload, fields: list[str]) -> dict[str, tuple[str, int, 
         flat = flat.detach().cpu().contiguous()
         raw = flat.view(torch.uint8).numpy().tobytes()
         out[field] = (str(flat.dtype), flat.numel(), hashlib.sha256(raw).hexdigest())
+    return out
+
+
+def _column_rows(column) -> list:
+    """Rows of a TensorDict column: jagged NestedTensor, NonTensorStack, dense
+    tensor, or plain list."""
+    import torch
+
+    if isinstance(column, torch.Tensor) and column.is_nested:
+        return list(column.unbind())
+    if type(column).__name__ == "NonTensorStack":
+        return column.tolist()
+    return [column[i] for i in range(len(column))]
+
+
+def field_multiset_digests(payload, fields: list[str]) -> dict[str, tuple[int, str]]:
+    """Order-insensitive per-field digest: hash of sorted per-row digests.
+
+    Used for the real-multimodal profile, where columns include a
+    ``NonTensorStack`` of per-sample dicts: the sampler is free to reorder
+    rows, so the byte-exact contract is "the returned multiset of rows is
+    byte-identical to the put multiset".
+
+    Dict rows (multimodal_train_inputs) are digested leaf-by-leaf with full
+    dtype+shape+bytes via relax.utils.payload_digest.  Tensor rows are
+    digested as (dtype, numel, bytes) — same contract as ``_flat_values`` in
+    the dataplane tests — because backends legitimately differ in scalar-row
+    representation (SimpleStorage returns dense columns whose rows index as
+    0-D; MooncakeStore reconstructs rows as shape ``[1]``; bytes and dtype
+    are identical).
+    """
+    import torch
+
+    from relax.utils.payload_digest import leaf_digests
+
+    def _row_digest(row) -> str:
+        if isinstance(row, torch.Tensor) and not row.is_nested:
+            flat = row.detach().cpu().contiguous().reshape(-1)
+            raw = flat.view(torch.uint8).numpy().tobytes() if flat.numel() else b""
+            token = f"{flat.dtype}|{flat.numel()}|{hashlib.sha256(raw).hexdigest()}"
+        else:
+            token = repr(sorted(leaf_digests(row).items()))
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    out: dict[str, tuple[int, str]] = {}
+    for field in fields:
+        rows = _column_rows(payload[field])
+        row_hashes = sorted(_row_digest(row) for row in rows)
+        out[field] = (len(rows), hashlib.sha256("".join(row_hashes).encode()).hexdigest())
     return out
 
 
@@ -340,7 +472,7 @@ class TQConsumer:
             except Exception:  # pragma: no cover - best effort
                 pass
 
-    def fetch(self, fields, batch_size: int, partition: str, expected_digests):
+    def fetch(self, fields, batch_size: int, partition: str, expected_digests, order_insensitive: bool = False):
         """One cross-node get; return (ms, ib_mb, tcp_mb, ib_tail_mb,
         tcp_tail_mb).
 
@@ -349,6 +481,10 @@ class TQConsumer:
         finished (async), the tail keeps flowing and ``ib_tail`` > 0 -- a
         definitive async-completion detector that does not need a costly full-
         data touch.
+
+        ``order_insensitive`` selects the row-multiset digest (real-multimodal
+        profile: NonTensorStack columns, sampler may reorder rows); the
+        default column digest requires identical row order.
         """
         before = read_counters()
         t0 = time.perf_counter()
@@ -366,7 +502,10 @@ class TQConsumer:
         settled = read_counters()
         # Digesting occurs outside the timed interval.  A mismatch is fatal:
         # throughput from a corrupt or truncated transfer is never reported.
-        actual_digests = field_byte_digests(got, list(fields))
+        if order_insensitive:
+            actual_digests = field_multiset_digests(got, list(fields))
+        else:
+            actual_digests = field_byte_digests(got, list(fields))
         if actual_digests != expected_digests:
             mismatch = [field for field in fields if actual_digests.get(field) != expected_digests.get(field)]
             raise AssertionError(f"byte-exact mismatch after TQ get: fields={mismatch}")
@@ -393,6 +532,15 @@ def main() -> None:
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     args = parse_args()
+    fixture_path = resolve_fixture_path(args.fixture_path)
+    if "real-multimodal" in args.payload_profiles:
+        import os
+
+        if not os.path.isfile(fixture_path):
+            raise SystemExit(
+                f"real-multimodal profile needs a fixture at {fixture_path}; generate one with "
+                "scripts/benchmarks/make_multimodal_fixture.py (see its docstring), or pass --fixture-path."
+            )
     ray.init(ignore_reinit_error=True, address="auto", logging_level="ERROR")
 
     nodeb = next(n for n in ray.nodes() if n["NodeManagerAddress"] == args.nodeb_ip and n.get("Alive"))
@@ -438,14 +586,18 @@ def main() -> None:
             results[protocol].setdefault(profile, {})
             for total_mib in args.payload_mib:
                 results[protocol][profile].setdefault(total_mib, {})
-                # Multimodal has a fixed production schema; synthetic uses the
-                # requested field-count sweep.
-                field_counts = args.num_fields if profile == "synthetic" else [7]
+                # Multimodal profiles have fixed production schemas; synthetic
+                # uses the requested field-count sweep.
+                field_counts = profile_field_counts(profile, args.num_fields)
+                order_insensitive = profile == "real-multimodal"
                 for nf in field_counts:
-                    payload = make_profile_payload(profile, args.num_samples, nf, total_mib)
+                    payload = make_profile_payload(profile, args.num_samples, nf, total_mib, fixture_path)
                     nf = len(list(payload.keys()))
                     fields = sorted(payload.keys())
-                    expected_digests = field_byte_digests(payload, fields)
+                    if order_insensitive:
+                        expected_digests = field_multiset_digests(payload, fields)
+                    else:
+                        expected_digests = field_byte_digests(payload, fields)
                     nbytes = payload_bytes(payload)
                     put_times: list[float] = []
                     get_times: list[float] = []
@@ -454,13 +606,14 @@ def main() -> None:
                     ib_tails: list[float] = []  # async-completion detector (~0 == sync get)
                     tcp_tails: list[float] = []
                     # repeat 0 is a warm-up: first transfer pays RDMA endpoint handshake.
+                    batch_rows = payload.batch_size[0] if payload.batch_size else args.num_samples
                     for r in range(args.repeats + 1):
                         part = f"xfer_{protocol}_{profile}_{total_mib}_{nf}_{r}"
                         t0 = time.perf_counter()
                         producer.put(payload, partition_id=part)
                         put_ms = (time.perf_counter() - t0) * 1000
                         get_ms, ib, tcp, ib_tail, tcp_tail, byte_exact = ray.get(
-                            consumer.fetch.remote(fields, args.num_samples, part, expected_digests)
+                            consumer.fetch.remote(fields, batch_rows, part, expected_digests, order_insensitive)
                         )
                         producer.clear_partition(part)
                         if r == 0:
@@ -534,7 +687,7 @@ def main() -> None:
                     }
                     results[protocol][profile][total_mib][nf] = rec
                     print(
-                        f"  {profile:<10} {str(total_mib) + 'M':<9} f={nf} "
+                        f"  {profile:<16} {str(total_mib) + 'M':<9} f={nf} "
                         f"put_mean={rec['put_mean_gbs']:6.2f} "
                         f"GB/s get_mean={rec['get_mean_gbs']:6.2f} (med {rec['get_med_gbs']:.2f}, "
                         f"std {rec['get_std_gbs']:.2f}) GB/s byte_exact=PASS "
@@ -551,18 +704,18 @@ def main() -> None:
     # ---- Summary (mean-based, all requested protocols) ----
     print("\n===== SUMMARY: TQ-layer cross-node, same topology (get, MEAN of N runs) =====", flush=True)
     header = (
-        f"{'Profile':<11}{'Payload':<9}{'f':<4}{'C0 mean':>9}{'C1 mean':>9}{'C2 mean':>9}"
+        f"{'Profile':<16}{'Payload':<9}{'f':<4}{'C0 mean':>9}{'C1 mean':>9}{'C2 mean':>9}"
         f"{'C1/C0':>8}{'C2/C1':>8}{'C2 std':>8}{'>=20%':>7}{'wire C0/C1/C2':>18}"
     )
     print(header, flush=True)
     for profile in args.payload_profiles:
-        field_counts = args.num_fields if profile == "synthetic" else [7]
+        field_counts = profile_field_counts(profile, args.num_fields)
         for total_mib in args.payload_mib:
             for nf in field_counts:
                 c0 = results.get("simple", {}).get(profile, {}).get(total_mib, {}).get(nf)
                 c1 = results.get("tcp", {}).get(profile, {}).get(total_mib, {}).get(nf)
                 c2 = results.get("rdma", {}).get(profile, {}).get(total_mib, {}).get(nf)
-                prefix = f"{profile:<11}{str(total_mib) + 'M':<9}{nf:<4}"
+                prefix = f"{profile:<16}{str(total_mib) + 'M':<9}{nf:<4}"
                 if not (c0 and c1 and c2):
                     # A protocol was skipped (--protocols subset) -- print what we have.
                     parts = []

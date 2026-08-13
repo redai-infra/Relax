@@ -123,9 +123,23 @@ Mock/本机测试和真实双节点 RDMA 测试必须分别报告，前者不能
 | 层级 | 验证内容 | 通过标准 |
 |---|---|---|
 | CI/mock | 参数矩阵、节点 AND 归约、master 不可达、owner 超时/清理/token、auto/required、有限重试、写失败不发布状态 | `tests/utils/test_rdma_probe.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
-| 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性 | `tests/utils/test_tq_dataplane_behavior.py` 通过 |
-| 真实 Mooncake | TCP/RDMA direct-client 多模态字段与混合 dtype 逐字节一致 | `TestMooncakeByteExact` 的 TCP/RDMA 两档均通过，不得 skip |
-| 真实双节点 | 同一拓扑的 SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic 与 production-shaped multimodal；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的逐字段 SHA-256 全部 PASS；`--require-wire-proof` 证明 RDMA 档 IB counter 增长且 TCP 档网络 counter 增长；CSV 留档并报告均值、median、stddev |
+| 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性；`multimodal_train_inputs` 以生产容器（`list[dict]` / NonTensorStack，存储层非张量路径）全链路逐叶子 SHA-256 一致 | `tests/utils/test_tq_dataplane_behavior.py` 通过（含 `TestRealMultimodalFullLink`） |
+| 真实 Mooncake | TCP/RDMA direct-client：混合 dtype 稠密张量逐字节一致；`list[dict]` 非张量 msgpack 慢路径逐叶子一致（每协议独立 spawn 子进程，规避 0.3.10 会话内协议切换问题） | `TestMooncakeByteExact` 的 TCP/RDMA 各两档均通过，不得 skip |
+| 真实多模态载荷 | 真实数据集图像走完整生产预处理链（`build_messages` → `apply_chat_template` → `process_vision_info` → HF processor → `remap_mm_train_inputs`）生成 fixture；上述两级多模态用例检测到 fixture 后自动升级为真实载荷档 | fixture 存在时以 `[real]` 档通过；无 fixture 环境回退 `[synthetic]`（生产同构状，CI 兜底）；交付报告须注明真实档在何处跑过 |
+| 真实双节点 | 同一拓扑的 SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic、production-shaped multimodal、real-multimodal 三种 profile；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的逐字段 SHA-256 全部 PASS；`--require-wire-proof` 证明 RDMA 档 IB counter 增长且 TCP 档网络 counter 增长；CSV 留档并报告均值、median、stddev |
+
+真实多模态 fixture 生成（需要本地数据集 parquet 与 Qwen-VL 模型目录；产物写入 `tests/fixtures/`，已 gitignore，不入库）：
+
+```bash
+PYTHONPATH=. python scripts/benchmarks/make_multimodal_fixture.py \
+  --dataset <path>/<multimodal-dataset>.parquet \
+  --model <path>/<qwen-vl-model-dir> \
+  --num-prompts 6 --n-samples-per-prompt 2 \
+  --output tests/fixtures/tq_multimodal_fixture.pt \
+  --manifest-json tests/fixtures/tq_multimodal_fixture.manifest.json
+```
+
+生成时自动做 processor 双跑字节一致性校验（以真实数据验证 F4 组共享假设）；fixture 载入时按叶子清单自校验，损坏即报错。测试与 bench 通过 `RELAX_MM_FIXTURE`（或默认路径 `tests/fixtures/tq_multimodal_fixture.pt`）发现 fixture。逐叶子指纹的规范实现在 `relax/utils/payload_digest.py`（哈希原始存储字节，对 NaN 也成立，严格强于 `torch.equal`）。
 
 双节点验收命令（master 与 Ray 集群需由部署侧预先准备）：
 
@@ -134,11 +148,13 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
   --master <master-host>:50051 \
   --nodeb-ip <consumer-node-ip> \
   --device <rdma-device> \
-  --payload-profiles synthetic multimodal \
+  --payload-profiles synthetic multimodal real-multimodal \
   --payload-mib 256 1024 2048 4096 \
   --repeats 5 --require-wire-proof \
   --csv tq_cross_node_acceptance.csv
 ```
+
+`real-multimodal` profile 按目标档位循环平铺 fixture 样本，`multimodal_train_inputs` 列以 NonTensorStack 走存储层非张量路径（SimpleStorage pickle / Mooncake msgpack），字节校验用行多重集指纹（采样器可重排行序；张量行按 dtype+字节比较以兼容后端间标量行 `()` 与 `[1]` 的表示差异，dict 叶子仍全形状校验）。
 
 若本次开发环境没有两个 RDMA 节点，交付结论必须写成“真机验收未执行”，不能用 mock 通过推导真机已经通过。
 
@@ -151,6 +167,7 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 | `setup failed with error code: -1` | master 不可达 | 检查 master 进程与 `MC_MASTER_ADDRESS` |
 | `Failed to open segment ... Connection refused` | 上一轮客户端异常退出，死 segment 仍在 master 注册 | 等 `client_ttl`（30 s）过期后重试 |
 | `batch_get_into failed ... error codes [-800, ...]` | 会话内切换协议（0.3.10 上更敏感），或对端不可达 | 每个协议单独进程跑；确认对端存活 |
+| bench 的 Mooncake/TCP 档在单机回环下原生 SIGSEGV | mooncake 0.3.10 TCP transport 在单节点回环、64 MiB 级批量下崩溃（同机 direct-client 小批量正常，RDMA/SimpleStorage 同规模正常；响亮崩溃，非静默损坏） | C1 档在真实双节点拓扑上跑；单机开发环境用 simple/rdma 档验证 |
 | 多网卡机器跨节点建连失败 | 自动选卡选到了不通的网卡 | 显式 `--tq-rdma-device`；必要时用 `MC_TCP_BIND_ADDRESS` 指定 TCP 侧绑定地址 |
 | 训练卡在启动、无日志推进 | 半初始化的 controller（TQ 的 `_init_from_existing` 会无限轮询 config） | 本特性已加自动回收；若仍出现，确认 `[dataplane] ... reaping it` 是否打出 |
 

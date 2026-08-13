@@ -9,7 +9,10 @@ Covers the four gaps the maintainer review called out, which the existing
 * timeout -- controller ``get_config`` timeout and probe-task timeout
 * disconnect -- store errors surface instead of returning corrupt data
 * retry -- ``batch_get_into`` / ``batch_upsert_from`` retry-then-raise
-* byte-exactness on **MooncakeStore** (SimpleStorage-only before)
+* byte-exactness on **MooncakeStore** (SimpleStorage-only before), including
+  the non-tensor msgpack slow path that production ``multimodal_train_inputs``
+  (``list[dict]`` / NonTensorStack) actually takes — real Qwen-VL fixture when
+  available, production-structured synthetic otherwise
 * automatic degradation as pytest (was a manual two-node script)
 * the controller reaper / teardown helpers (now in ``relax.utils.tq_lifecycle``)
 
@@ -114,6 +117,54 @@ def _real_capacity_worker(result_queue, segment_mib: int, payload_mib: int) -> N
     finally:
         if client is not None:
             client.close()
+
+
+def _mm_slow_path_worker(result_queue, protocol: str) -> None:
+    """Child-process target: multimodal list[dict] slow-path roundtrip.
+
+    Runs in its own process (one mooncake session per protocol) because
+    mooncake 0.3.10 is unstable when one process re-creates clients across
+    protocols (see scripts/benchmarks/tq_cross_node_bench.py docstring); a
+    child also keeps a real engine hang externally bounded.  Reports either
+    ("ok", ...), ("mismatch", ...) for data corruption, or ("error", ...) for
+    engine failures — the parent treats anything but "ok" as a hard failure.
+    """
+    try:
+        from relax.utils.payload_digest import diff_digests, leaf_digests
+        from tests.utils.mm_payload_fixtures import mm_train_data
+
+        train_data, source = mm_train_data(4)
+        samples = train_data["multimodal_train_inputs"]
+        client = TestMooncakeByteExact._client(protocol)
+        try:
+            keys = [f"mmslow_{protocol}_{index}@multimodal_train_inputs" for index in range(len(samples))]
+            put_meta = client.put(keys, samples)
+            if not all(isinstance(meta, dict) and meta.get("packed_size") for meta in put_meta):
+                result_queue.put(
+                    ("error", f"[{source}] dict payloads did not take the non-tensor path, put meta: {put_meta}")
+                )
+                return
+            got = client.get(
+                keys,
+                shapes=[[] for _ in keys],
+                dtypes=[None] * len(keys),
+                custom_backend_meta=put_meta,
+            )
+            problems: list[str] = []
+            for index, (want, have) in enumerate(zip(samples, got, strict=True)):
+                problems += [
+                    f"sample {index}: {line}" for line in diff_digests(leaf_digests(want), leaf_digests(have))
+                ]
+            if problems:
+                result_queue.put(("mismatch", f"[{source}] {problems[:6]}"))
+            else:
+                leaves = sum(len(leaf_digests(sample)) for sample in samples)
+                packed = sum(meta["packed_size"] for meta in put_meta)
+                result_queue.put(("ok", f"[{source}] {len(samples)} samples, {leaves} leaves, {packed} packed bytes"))
+        finally:
+            client.close()
+    except BaseException as error:  # pragma: no cover - transport/env failures
+        result_queue.put(("error", f"{type(error).__name__}: {error}"))
 
 
 # ---------------------------------------------------------------------------
@@ -880,3 +931,31 @@ class TestMooncakeByteExact:
                 assert torch.equal(have, want.contiguous()), f"{name} is not byte-exact"
         finally:
             client.close()
+
+    @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
+    def test_multimodal_list_dict_slow_path_roundtrip_is_byte_exact(self, protocol):
+        """The container production actually ships: one dict per sample.
+
+        ``multimodal_train_inputs`` reaches MooncakeStore as non-tensor values
+        (tensordict NonTensorStack rows), which take the msgpack pack ->
+        registered-buffer memcpy slow path — a completely different code path
+        from the dense-tensor test above.  Uses the REAL Qwen-VL fixture when
+        available (see tests/utils/mm_payload_fixtures.py), else
+        production-structured synthetic dicts; the payload source is part of
+        the reported result for acceptance auditing.
+
+        Runs in a spawn child so each protocol gets a pristine mooncake
+        session (mooncake 0.3.10 misbehaves when one process cycles clients
+        across protocols) and a wedged engine cannot hang the suite.
+        """
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(target=_mm_slow_path_worker, args=(result_queue, protocol))
+        process.start()
+        process.join(timeout=240)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail(f"multimodal slow-path roundtrip ({protocol}) did not finish within 240 seconds")
+        status, detail = result_queue.get(timeout=2)
+        assert status == "ok", f"{status}: {detail}"

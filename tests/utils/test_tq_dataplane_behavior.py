@@ -20,6 +20,11 @@ Behaviors verified (mapped to the RFC's six required behaviors):
   5. retry       -- re-putting the same partition overwrites; get returns latest.
   6. cleanup     -- clear_partition empties data; close+reinit yields a fresh,
                     isolated controller (exercises the F10 anti-hang path).
+  7. multimodal  -- ``multimodal_train_inputs`` as ``list[dict]`` (the
+                    production NonTensorStack container, storage's non-tensor
+                    slow path) survives the full link byte-exactly; runs on the
+                    REAL Qwen-VL fixture when present, production-structured
+                    synthetic otherwise (see tests/utils/mm_payload_fixtures.py).
 
 A true cross-node disconnect (consumer node death mid-get) is NOT covered here
 -- it requires multi-node GPU hardware and is skipped per project rules.
@@ -110,6 +115,18 @@ def _flat_values(t):
     if type(t).__name__ == "NestedTensor":
         return t.values().reshape(-1)
     return t.reshape(-1)
+
+
+def _row_value(column, row_position: int):
+    """Extract one sample's value from a returned TensorDict column.
+
+    Handles the three container types TQ can hand back: jagged ``NestedTensor``
+    (variable-length tensor fields), ``NonTensorStack`` (list[dict] fields),
+    and plain dense tensors.
+    """
+    if isinstance(column, torch.Tensor) and column.is_nested:
+        return column.unbind()[row_position]
+    return column[row_position]
 
 
 def _payload(n: int, fields: list[str], cols: int, dtype: str = "float32", seed: int = 0):
@@ -294,3 +311,57 @@ class TestTqDataPlaneBehavior:
         client2 = tq_factory(capacity=16)
         meta3 = client2.get_meta(data_fields=["a"], batch_size=4, partition_id="cp", mode="fetch", task_name="cp3")
         assert getattr(meta3, "size", None) == 0
+
+
+class TestRealMultimodalFullLink:
+    """Byte-exactness for the production multimodal container, full link.
+
+    Production ships ``multimodal_train_inputs`` as one dict per sample
+    (``relax/utils/utils.py::dict_to_tensordict`` keeps the raw list ->
+    tensordict ``NonTensorStack``).  That column takes the storage backends'
+    *non-tensor* path (SimpleStorage: pickled objects; MooncakeStore: msgpack
+    pack/unpack), which none of the dense-tensor tests above touch.
+
+    Payload source is reported in every assertion: ``real`` (fixture from
+    ``scripts/benchmarks/make_multimodal_fixture.py`` — actual dataset images
+    through the production Qwen-VL processor chain) or ``synthetic``
+    (production-structured fallback, CI-safe).
+    """
+
+    def test_multimodal_list_dict_full_link_byte_exact(self, tq_factory):
+        """Real assembly (dict_to_tensordict) -> tq put/get -> leaf-level
+        SHA-256 equality for every sample, aligned by sample_id (the sampler
+        may reorder rows)."""
+        from relax.utils.payload_digest import diff_digests, leaf_digests
+        from relax.utils.utils import dict_to_tensordict
+        from tests.utils.mm_payload_fixtures import mm_train_data
+
+        num_samples = 4
+        train_data, source = mm_train_data(num_samples)
+        train_data = dict(train_data)
+        train_data["sample_id"] = list(range(num_samples))
+        batch = dict_to_tensordict(train_data, batch_size=num_samples)
+        assert type(batch.get("multimodal_train_inputs")).__name__ == "NonTensorStack", (
+            "precondition: the multimodal column must be the production NonTensorStack container"
+        )
+
+        want_mm = [leaf_digests(sample) for sample in train_data["multimodal_train_inputs"]]
+        want_tokens = [leaf_digests(torch.tensor(row, dtype=torch.int64)) for row in train_data["tokens"]]
+
+        client = tq_factory()
+        fields = ["sample_id", "tokens", "multimodal_train_inputs"]
+        got = _round_trip(client, batch, "mmreal", fields, num_samples)
+
+        got_ids = [int(v) for v in _flat_values(got["sample_id"])]
+        assert sorted(got_ids) == list(range(num_samples)), f"[{source}] sample_id set mismatch: {got_ids}"
+        for row_position, sample_id in enumerate(got_ids):
+            mm_problems = diff_digests(
+                want_mm[sample_id], leaf_digests(_row_value(got["multimodal_train_inputs"], row_position))
+            )
+            assert not mm_problems, (
+                f"[{source}] sample {sample_id} multimodal leaves not byte-exact: {mm_problems[:4]}"
+            )
+            token_problems = diff_digests(
+                want_tokens[sample_id], leaf_digests(_row_value(got["tokens"], row_position))
+            )
+            assert not token_problems, f"[{source}] sample {sample_id} tokens not byte-exact: {token_problems[:4]}"
