@@ -45,29 +45,6 @@ from .cp_utils import (
 )
 
 
-def normalize_reduced_loss_metrics(keys: list[str], values: list[float]) -> dict[str, float]:
-    """Normalize all-reduced metric numerators without dividing by zero.
-
-    Per-token training can legitimately produce a batch with no effective loss
-    tokens (for example, all responses are empty or fully masked). Such a batch
-    has zero metric numerators and represents a no-signal step, so report
-    zeros. A nonzero numerator with a zero denominator indicates an
-    inconsistent reducer and must fail loudly.
-    """
-    if len(keys) + 1 != len(values):
-        raise ValueError(f"Expected one denominator plus {len(keys)} metric values, got {len(values)} values.")
-
-    denominator = values[0]
-    numerators = values[1:]
-    if denominator == 0:
-        nonzero_keys = [key for key, value in zip(keys, numerators, strict=True) if value != 0]
-        if nonzero_keys:
-            raise RuntimeError(f"Zero loss-metric denominator with nonzero numerator(s): {nonzero_keys}.")
-        return dict.fromkeys(keys, 0.0)
-
-    return {key: value / denominator for key, value in zip(keys, numerators, strict=True)}
-
-
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -136,11 +113,7 @@ def get_responses(
             else:
                 end += total_length
                 start = end - response_length
-            if response_length == 0:
-                # ``tokens[-0:]`` is the full prompt, not an empty slice.
-                logits_chunk = logits[0:0]
-                tokens_chunk = tokens[0:0]
-            elif response_length == total_length:
+            if response_length == total_length:
                 # SFT branch; see relax.utils.sft_utils.compute_sft_response_chunk.
                 from relax.utils.sft_utils import compute_sft_response_chunk
 
