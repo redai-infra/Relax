@@ -220,6 +220,9 @@ def _hf_validate_args(args, hf_config):
         errors.append("Mixture-of-LoRA currently supports text-only base models; multimodal models are unsupported.")
     if mixture_lora_enabled and int(getattr(args, "mtp_num_layers", 0) or 0) > 0:
         errors.append("Mixture-of-LoRA does not currently support MTP layers.")
+    low_precision_training = bool(getattr(args, "fp8", None) or getattr(args, "fp4", None))
+    if mixture_lora_enabled and low_precision_training and getattr(args, "recompute_granularity", None) == "full":
+        errors.append("Mixture-of-LoRA does not currently support FP8/FP4 training with full recompute.")
     if is_multimodal and getattr(args, "apply_rope_fusion", False):
         errors.append(
             "Multimodal models use multi-axis RoPE (list of tensors) which is incompatible "

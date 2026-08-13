@@ -39,3 +39,28 @@ def test_mixture_lora_accepts_disabled_mtp():
     args = SimpleNamespace(lora_num_experts=4, mtp_num_layers=None)
 
     _hf_validate_args(args, SimpleNamespace())
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_mixture_lora_rejects_low_precision_full_recompute(precision):
+    args = SimpleNamespace(
+        lora_num_experts=4,
+        recompute_granularity="full",
+        fp8="e4m3" if precision == "fp8" else None,
+        fp4="nvfp4" if precision == "fp4" else None,
+    )
+
+    with pytest.raises(AssertionError, match="FP8/FP4 training with full recompute"):
+        _hf_validate_args(args, SimpleNamespace())
+
+
+def test_mixture_lora_accepts_fp8_without_full_recompute():
+    args = SimpleNamespace(lora_num_experts=4, recompute_granularity="selective", fp8="e4m3", fp4=None)
+
+    _hf_validate_args(args, SimpleNamespace())
+
+
+def test_mixture_lora_accepts_bf16_full_recompute():
+    args = SimpleNamespace(lora_num_experts=4, recompute_granularity="full", fp8=None, fp4=None)
+
+    _hf_validate_args(args, SimpleNamespace())
