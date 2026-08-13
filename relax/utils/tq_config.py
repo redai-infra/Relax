@@ -20,6 +20,7 @@ from typing import Any
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.rdma_probe import EffectiveConfig
+from relax.utils.tq_correctness import ensure_mooncake_correctness_guards
 
 
 logger = get_logger(__name__)
@@ -41,23 +42,16 @@ def resolve_mooncake_master_address() -> str:
 
 
 def validate_mooncake_runtime_contract() -> None:
-    """Fail fast unless installed TransferQueue has the loss-prevention fixes.
+    """Install and validate the Mooncake loss-prevention contract.
 
-    The RDMA integration depends on per-key put/get result validation and on
-    notifying production readiness only after storage succeeds. A version
-    number alone is insufficient for development builds, so validate the
-    concrete runtime capabilities before probing or creating a controller.
+    A version number alone is insufficient for development builds. Relax
+    therefore installs process-local guards that validate every batch response,
+    propagate removal failures, and require a positive production-status ACK.
+    Every process calls this before creating or attaching a Mooncake client.
     """
-    try:
-        from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
-        from transfer_queue.storage.managers.base import KVStorageManager
-    except ImportError as e:
-        raise RuntimeError("Installed TransferQueue has no MooncakeStore support") from e
+    ensure_mooncake_correctness_guards()
 
-    required_methods = ("_batch_upsert_with_retry", "_batch_get_into_with_retry")
-    missing = [name for name in required_methods if not callable(getattr(MooncakeStoreClient, name, None))]
-    if missing:
-        raise RuntimeError("Installed TransferQueue lacks required Mooncake failure handling: " + ", ".join(missing))
+    from transfer_queue.storage.managers.base import KVStorageManager
 
     put_source = inspect.getsource(KVStorageManager.put_data)
     storage_call = put_source.find("self.storage_client.put")
@@ -73,9 +67,12 @@ def validate_mooncake_runtime_contract() -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_simple_storage_config(total_storage_size: int, num_data_storage_units: int) -> dict[str, Any]:
-    """Build the ``backend`` dict for SimpleStorage (current default
-    behavior)."""
+def build_simple_storage_config(total_storage_size: int | None, num_data_storage_units: int) -> dict[str, Any]:
+    """Build the SimpleStorage backend config.
+
+    ``total_storage_size=None`` preserves TransferQueue's unlimited-capacity
+    benchmark semantics; production Relax jobs pass a concrete sample count.
+    """
     return {
         # ``tq.init`` selects the manager from this key alone (TQ config.yaml:22
         # defaults it to SimpleStorage); a backend section without it is ignored.

@@ -61,6 +61,66 @@ class TqCleanupTimeout(TimeoutError):
     """Raised when a TQ controller cannot be confirmed gone after cleanup."""
 
 
+class TqConfigurationMismatch(RuntimeError):
+    """Raised when an existing controller uses a different backend config."""
+
+
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _backend_signature(conf: Any) -> tuple[Any, ...]:
+    """Return the backend fields that must agree for a safe attach."""
+    backend = _get_config_value(conf, "backend", {})
+    storage_backend = _get_config_value(backend, "storage_backend", "SimpleStorage")
+    if storage_backend == "MooncakeStore":
+        mooncake = _get_config_value(backend, "MooncakeStore", {})
+        return (
+            storage_backend,
+            _get_config_value(mooncake, "protocol", "tcp"),
+            _get_config_value(mooncake, "device_name", "") or "",
+            _get_config_value(mooncake, "master_server_address", ""),
+            _get_config_value(mooncake, "metadata_server", ""),
+            _get_config_value(mooncake, "global_segment_size"),
+            _get_config_value(mooncake, "local_buffer_size"),
+            bool(_get_config_value(mooncake, "hard_pin", False)),
+            bool(_get_config_value(mooncake, "use_gdr", False)),
+        )
+    simple = _get_config_value(backend, "SimpleStorage", {})
+    return (
+        "SimpleStorage",
+        _get_config_value(simple, "total_storage_size"),
+        _get_config_value(simple, "num_data_storage_units"),
+    )
+
+
+def _backend_description(conf: Any) -> str:
+    """Describe the backend without logging endpoints or host information."""
+    backend = _get_config_value(conf, "backend", {})
+    storage_backend = _get_config_value(backend, "storage_backend", "SimpleStorage")
+    if storage_backend != "MooncakeStore":
+        return "SimpleStorage"
+    mooncake = _get_config_value(backend, "MooncakeStore", {})
+    return f"MooncakeStore/{_get_config_value(mooncake, 'protocol', 'tcp')}"
+
+
+def _uses_mooncake(conf: Any) -> bool:
+    backend = _get_config_value(conf, "backend", {})
+    return _get_config_value(backend, "storage_backend", "SimpleStorage") == "MooncakeStore"
+
+
+def _prepare_mooncake_runtime(conf: Any) -> None:
+    if not _uses_mooncake(conf):
+        return
+    from relax.utils.tq_config import validate_mooncake_runtime_contract
+
+    validate_mooncake_runtime_contract()
+
+
 def kill_tq_controller_and_wait(timeout: float = 20.0) -> None:
     """Kill the TransferQueueController named actor, then wait for GCS
     deregistration.
@@ -218,6 +278,7 @@ def log_tq_gdr_runtime_status(*, requested: bool, role: str) -> str:
 def attach_tq_client(conf: Any, *, requested_gdr: bool, role: str) -> Any:
     """Attach a component process and report its local experimental GDR
     state."""
+    _prepare_mooncake_runtime(conf)
     tq.init(conf=conf)
     client = tq.get_client()
     log_tq_gdr_runtime_status(requested=requested_gdr, role=role)
@@ -264,6 +325,7 @@ class _TransferQueueOwner:
         self._owns_controller = False
 
     def initialize(self, conf: Any, owner_token: str) -> tuple[Any, bool]:
+        _prepare_mooncake_runtime(conf)
         _set_owner_token(conf, owner_token)
         tq.init(conf=conf)
         stored_conf = _get_stored_config()
@@ -335,10 +397,17 @@ def _start_owner(conf: Any, *, timeout: float) -> TqInitResult:
 
     # A concurrent initializer won the named-actor race. This process is only
     # attached and must never retain an actor capable of global tq.close().
+    config_mismatch = _backend_signature(stored_conf) != _backend_signature(conf)
     try:
         ray.get(owner.detach.remote(), timeout=10.0)
     finally:
         _stop_owner_actor(owner)
+    if config_mismatch:
+        raise TqConfigurationMismatch(
+            "A concurrent TransferQueue initializer won with a different backend config "
+            f"(requested={_backend_description(conf)}, stored={_backend_description(stored_conf)}). "
+            "Detached without modifying the winning controller."
+        )
     return TqInitResult(config=stored_conf, owner=None)
 
 
@@ -381,13 +450,20 @@ def initialize_tq_with_fallback(
         if _controller_exists():
             # Attach semantics: use the controller's actual config. Upstream
             # tq.init(conf) returns the caller-provided config even when ignored.
-            return TqInitResult(config=_get_stored_config(), owner=None)
+            stored_conf = _get_stored_config()
+            if _backend_signature(stored_conf) != _backend_signature(attempt_conf):
+                raise TqConfigurationMismatch(
+                    "Refusing to attach to an existing TransferQueueController with a different backend config "
+                    f"(requested={_backend_description(attempt_conf)}, stored={_backend_description(stored_conf)}). "
+                    "Only the owner may close the existing controller."
+                )
+            return TqInitResult(config=stored_conf, owner=None)
         return _start_owner(attempt_conf, timeout=timeout)
 
     try:
         return _attempt(conf)
     except Exception as primary_error:
-        if mode != "auto" or fallback_conf is None:
+        if isinstance(primary_error, TqConfigurationMismatch) or mode != "auto" or fallback_conf is None:
             raise
 
         reason = f"mooncake_init_failed:{type(primary_error).__name__}"

@@ -335,7 +335,8 @@ class Controller:
         mode = getattr(self.config, "tq_rdma_mode", "off")
 
         # 2. SimpleStorage short-circuit (default, zero behavior change).
-        if backend == "simple" or mode == "off":
+        #    ``mooncake + off`` is MooncakeStore/TCP, not SimpleStorage.
+        if backend == "simple":
             from relax.utils.tq_config import build_simple_storage_config
 
             return build_simple_storage_config(
@@ -351,9 +352,9 @@ class Controller:
         try:
             validate_mooncake_runtime_contract()
         except RuntimeError as e:
-            if mode == "required":
+            if mode != "auto":
                 raise RuntimeError(
-                    "--tq-rdma-mode=required but the installed TransferQueue "
+                    f"--tq-rdma-mode={mode} but the installed TransferQueue "
                     f"does not satisfy the Mooncake correctness contract: {e}"
                 ) from e
             from relax.utils.tq_config import build_simple_storage_config
@@ -367,7 +368,7 @@ class Controller:
                 num_data_storage_units=self.config.num_data_storage_units,
             )
         master_address = resolve_mooncake_master_address()
-        probe_results = probe_cluster_nodes(device, master_address)
+        probe_results = probe_cluster_nodes(device, master_address, probe_rdma=mode != "off")
         for r in probe_results:
             logger.debug(r.summary())
 
@@ -376,13 +377,16 @@ class Controller:
             requested_backend=backend,
             requested_device=device,
             use_gdr=getattr(self.config, "tq_use_gdr", False),
+            rdma_mode=mode,
         )
 
-        # 4. required mode: fail fast instead of silently degrading (probe level).
-        if mode == "required" and effective.fallback_reason:
+        # 4. Only auto mode may degrade. ``off`` explicitly requests
+        #    Mooncake/TCP, while ``required`` explicitly requires RDMA.
+        if mode != "auto" and effective.fallback_reason:
             detail = "\n".join(r.summary() for r in probe_results)
             raise RuntimeError(
-                f"--tq-rdma-mode=required but RDMA probe failed: {effective.fallback_reason}.\n"
+                f"--tq-rdma-mode={mode} but the requested Mooncake path is unavailable: "
+                f"{effective.fallback_reason}.\n"
                 f"Probe details:\n{detail}"
             )
 
@@ -390,9 +394,10 @@ class Controller:
         backend_dict, cap_error = build_backend_config(self.config, effective, total_storage_size=total_storage_size)
         actual_backend = "MooncakeStore" if "MooncakeStore" in backend_dict else "SimpleStorage"
 
-        # 6. required mode: also fail fast on capacity-induced fallback.
-        if mode == "required" and cap_error:
-            raise RuntimeError(f"--tq-rdma-mode=required but segment capacity insufficient: {cap_error}")
+        # 6. Capacity fallback is also auto-only. Explicit Mooncake/TCP and
+        #    required-RDMA requests fail instead of silently changing backend.
+        if mode != "auto" and cap_error:
+            raise RuntimeError(f"--tq-rdma-mode={mode} but segment capacity insufficient: {cap_error}")
 
         # 7. GDR is EXPERIMENTAL in this phase: --tq-rdma-mode=required only
         #    covers the *transport* (MooncakeStore + RDMA), not GDR.  The probe

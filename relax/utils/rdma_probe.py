@@ -238,30 +238,31 @@ def _check_health_check() -> CheckResult:  # pragma: no cover - retained for ad-
 # Per-node probe
 # ---------------------------------------------------------------------------
 
+
 # NOTE: ``health_check()`` is intentionally NOT probed because it depends on
 # local Mooncake client initialization. External-master reachability is checked
 # directly with a bounded TCP connect, then authoritatively by ``tq.init``.
-_CHECK_FUNCS_NO_DEVICE = [
-    _check_mooncake_import,
-    _check_rdma_devices,
-    _check_memlock,
-]
-
-
-def probe_node(device: str = "", master_address: str = "") -> ProbeResult:
+def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool = True) -> ProbeResult:
     """Run all capability checks on the current node.
 
     Parameters
     ----------
     device
         Explicit RDMA device name; empty = auto-detect first available.
+    probe_rdma
+        When ``False``, validate only Mooncake importability and master
+        reachability, then select TCP. Used by ``--tq-rdma-mode=off`` so an
+        explicitly requested Mooncake/TCP backend never depends on RDMA
+        hardware.
     """
     node = socket.gethostname()
     checks: list[CheckResult] = []
     errors: list[str] = []
 
-    for fn in _CHECK_FUNCS_NO_DEVICE:
-        checks.append(fn())
+    checks.append(_check_mooncake_import())
+    if probe_rdma:
+        checks.append(_check_rdma_devices())
+        checks.append(_check_memlock())
 
     # Mooncake is externally managed by Relax deployments. When an endpoint is
     # supplied, it must already be reachable from every data-plane node before
@@ -269,9 +270,10 @@ def probe_node(device: str = "", master_address: str = "") -> ProbeResult:
     if master_address:
         checks.append(_check_master_reachable(master_address))
 
-    # Device-dependent checks.
-    checks.append(_check_port_active(device))
-    checks.append(_check_gid_available(device))
+    # Device-dependent checks are irrelevant when RDMA is explicitly off.
+    if probe_rdma:
+        checks.append(_check_port_active(device))
+        checks.append(_check_gid_available(device))
 
     # Determine effective protocol via graded degradation.
     mooncake_ok = any(c.name == "mooncake_import" and c.ok for c in checks)
@@ -282,13 +284,15 @@ def probe_node(device: str = "", master_address: str = "") -> ProbeResult:
     master_ok = not master_address or any(c.name == "master_reachable" and c.ok for c in checks)
 
     effective_protocol: str | None
-    effective_device = device
+    effective_device = device if probe_rdma else ""
     if not mooncake_ok:
         effective_protocol = None
         errors.append("mooncake not importable")
     elif not master_ok:
         effective_protocol = None
         errors.append("master unreachable")
+    elif not probe_rdma:
+        effective_protocol = "tcp"
     elif rdma_dev_ok and port_ok and gid_ok and memlock_ok:
         effective_protocol = "rdma"
         if not effective_device:
@@ -382,6 +386,7 @@ def probe_cluster_nodes(
     master_address: str = "",
     *,
     timeout: float = 60.0,
+    probe_rdma: bool = True,
 ) -> list[ProbeResult]:
     """Probe every alive GPU-bearing node and return one result per node.
 
@@ -402,7 +407,9 @@ def probe_cluster_nodes(
     driver result when no GPU workers are discoverable (single-node/local dev).
     """
     node_ids = _alive_gpu_nodes()
-    driver_result = probe_node(device, master_address)
+    driver_result = (
+        probe_node(device, master_address) if probe_rdma else probe_node(device, master_address, probe_rdma=False)
+    )
     if not node_ids:
         logger.debug("No alive GPU nodes discovered; probing driver node only.")
         return [driver_result]
@@ -411,16 +418,16 @@ def probe_cluster_nodes(
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     @ray.remote(num_cpus=0.001)
-    def _probe_on_node(dev: str, master: str) -> ProbeResult:
+    def _probe_on_node(dev: str, master: str, should_probe_rdma: bool) -> ProbeResult:
         from relax.utils.rdma_probe import probe_node as _probe
 
-        return _probe(dev, master)
+        return _probe(dev, master, probe_rdma=should_probe_rdma)
 
     refs: list[Any] = []
     id_by_ref: dict[Any, str] = {}
     for node_id in node_ids:
         strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        ref = _probe_on_node.options(scheduling_strategy=strategy).remote(device, master_address)
+        ref = _probe_on_node.options(scheduling_strategy=strategy).remote(device, master_address, probe_rdma)
         refs.append(ref)
         id_by_ref[ref] = node_id
 
@@ -454,6 +461,7 @@ def reduce_results(
     requested_device: str,
     use_gdr: bool,
     fallback_backend: str = "SimpleStorage",
+    rdma_mode: str = "auto",
 ) -> EffectiveConfig:
     """AND-reduce per-node results into a single job-level effective config.
 
@@ -469,6 +477,10 @@ def reduce_results(
         ``--tq-use-gdr`` value.
     fallback_backend
         Backend to degrade to when probe fails in auto mode.
+    rdma_mode
+        ``off`` selects Mooncake/TCP after validating Mooncake and master
+        availability. ``auto`` and ``required`` reduce the probed RDMA
+        capability normally; the caller decides whether a fallback is fatal.
     """
     # SimpleStorage short-circuits: no probing needed.
     if requested_backend == "simple":
@@ -508,6 +520,15 @@ def reduce_results(
             device="",
             gdr=False,
             fallback_reason=reason,
+        )
+
+    if rdma_mode == "off":
+        return EffectiveConfig(
+            backend="MooncakeStore",
+            protocol="tcp",
+            device="",
+            gdr=False,
+            fallback_reason="",
         )
 
     if all_rdma:

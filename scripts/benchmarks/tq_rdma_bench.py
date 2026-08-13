@@ -205,6 +205,11 @@ def run_one(config_name: str, payload: dict, args: argparse.Namespace) -> dict:
     """Run put/get once and return timing."""
     import transfer_queue as tq
 
+    if CONFIG_MAP[config_name]["backend"] == "MooncakeStore":
+        from relax.utils.tq_config import validate_mooncake_runtime_contract
+
+        validate_mooncake_runtime_contract()
+
     # Close any prior controller and wait for GCS deregistration so this config
     # gets a fresh backend (tq.init otherwise attaches to the existing one).
     close_tq_and_wait()
@@ -299,11 +304,9 @@ def run_config(config_name: str, payload: dict, args: argparse.Namespace) -> dic
 # --------------------------------------------------------------------------- #
 
 
-def main():
+def run_benchmark(args: argparse.Namespace) -> None:
     """Run the benchmark across all requested payload/field/config
     combinations."""
-    args = parse_args()
-
     print("=" * 80)
     print("TransferQueue RDMA Benchmark")
     print(f"  configs: {args.configs}")
@@ -386,10 +389,24 @@ def main():
                 writer.writerows(all_results)
         print(f"\nCSV written to {args.output_csv}")
 
-    # Final cleanup: tear down the last config's controller so a subsequent
-    # benchmark run starts from a clean slate.
-    close_tq_and_wait()
     print("\n[dataplane] benchmark complete")
+
+
+def main() -> None:
+    """Initialize Ray before touching named actors and always clean up."""
+    import ray
+
+    args = parse_args()
+    ray.init(ignore_reinit_error=True)
+    try:
+        run_benchmark(args)
+    finally:
+        # Tear down the last config's controller so a subsequent benchmark run
+        # starts from a clean slate, then release the local Ray runtime.
+        try:
+            close_tq_and_wait()
+        finally:
+            ray.shutdown()
 
 
 if __name__ == "__main__":

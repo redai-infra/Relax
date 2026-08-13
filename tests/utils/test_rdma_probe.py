@@ -10,7 +10,10 @@ branch of the probe, reduction, and config validation logic.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from unittest import mock
+
+import pytest
 
 import relax.utils.rdma_probe as rdma_probe
 from relax.utils.rdma_probe import (
@@ -38,6 +41,16 @@ from relax.utils.tq_config import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _has_real_tq_storage() -> bool:
+    try:
+        return importlib.util.find_spec("transfer_queue.storage.clients.mooncake_client") is not None
+    except (ImportError, TypeError, ValueError):
+        return False
+
+
+_REAL_TQ_STORAGE = _has_real_tq_storage()
 
 
 def _make_probe(
@@ -187,6 +200,28 @@ class TestReduceResults:
         )
         assert eff.backend == "SimpleStorage"
 
+    def test_off_mode_keeps_mooncake_and_selects_tcp(self):
+        eff = reduce_results(
+            [_make_probe(protocol="rdma"), _make_probe(protocol="tcp", node="node-B")],
+            requested_backend="mooncake",
+            requested_device="rdma0",
+            use_gdr=False,
+            rdma_mode="off",
+        )
+        assert (eff.backend, eff.protocol, eff.device) == ("MooncakeStore", "tcp", "")
+        assert eff.fallback_reason == ""
+
+    def test_off_mode_reports_mooncake_unavailable(self):
+        eff = reduce_results(
+            [_make_probe(protocol=None)],
+            requested_backend="mooncake",
+            requested_device="",
+            use_gdr=False,
+            rdma_mode="off",
+        )
+        assert eff.backend == "SimpleStorage"
+        assert "mooncake_unavailable" in eff.fallback_reason
+
 
 # ---------------------------------------------------------------------------
 # probe_node (mocked filesystem)
@@ -244,6 +279,22 @@ class TestProbeNode:
     def test_master_reachability_is_bounded_failure(self):
         result = _check_master_reachable("127.0.0.1:1", timeout=0.01)
         assert result.ok is False
+
+    def test_off_mode_probe_does_not_touch_rdma_hardware(self, monkeypatch):
+        monkeypatch.setattr(rdma_probe, "_check_mooncake_import", lambda: CheckResult("mooncake_import", True))
+        monkeypatch.setattr(
+            rdma_probe,
+            "_check_master_reachable",
+            lambda address: CheckResult("master_reachable", True, address),
+        )
+        monkeypatch.setattr(
+            rdma_probe,
+            "_check_rdma_devices",
+            lambda: (_ for _ in ()).throw(AssertionError("RDMA probe must not run")),
+        )
+        result = probe_node("", "master.example:50051", probe_rdma=False)
+        assert result.effective_protocol == "tcp"
+        assert {check.name for check in result.checks} == {"mooncake_import", "master_reachable"}
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +385,10 @@ class TestTqConfigBuilder:
             "SimpleStorage": {"total_storage_size": 1000, "num_data_storage_units": 2},
         }
 
+    def test_simple_storage_config_allows_unlimited_capacity(self):
+        cfg = build_simple_storage_config(total_storage_size=None, num_data_storage_units=2)
+        assert cfg["SimpleStorage"]["total_storage_size"] is None
+
     def test_storage_backend_key_selects_the_manager(self):
         """``tq.init`` reads ``backend.storage_backend``; omitting it silently
         keeps SimpleStorage."""
@@ -359,6 +414,10 @@ class TestTqConfigBuilder:
         cfg = build_mooncake_config(eff)
         assert cfg["MooncakeStore"]["use_gdr"] is True
 
+    @pytest.mark.skipif(
+        not _REAL_TQ_STORAGE,
+        reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
+    )
     def test_installed_tq_satisfies_loss_prevention_contract(self):
         validate_mooncake_runtime_contract()
 

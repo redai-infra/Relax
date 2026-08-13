@@ -277,12 +277,17 @@ def build_conf(protocol: str, master: str, device: str, segment_gib: int):
     from transfer_queue import GRPOGroupNSampler
 
     from relax.utils.rdma_probe import EffectiveConfig
-    from relax.utils.tq_config import build_mooncake_config, build_simple_storage_config
+    from relax.utils.tq_config import (
+        build_mooncake_config,
+        build_simple_storage_config,
+        validate_mooncake_runtime_contract,
+    )
 
     if protocol == "simple":
         # total_storage_size=None == unlimited sample count (TQ config.yaml default).
         backend = build_simple_storage_config(total_storage_size=None, num_data_storage_units=2)
     else:
+        validate_mooncake_runtime_contract()
         eff = EffectiveConfig(backend="MooncakeStore", protocol=protocol, device=device, gdr=False, fallback_reason="")
         backend = build_mooncake_config(eff, master_address=master, global_segment_size=segment_gib * 1024**3)
     return OmegaConf.create(

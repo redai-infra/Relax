@@ -24,6 +24,7 @@ import importlib.util
 import multiprocessing
 import os
 import socket
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,6 +32,7 @@ import torch
 
 from relax.utils import tq_lifecycle
 from relax.utils.rdma_probe import ProbeResult, reduce_results
+from relax.utils.tq_correctness import _strict_notify_and_wait, _StrictMooncakeStoreProxy
 
 
 def _has_real_submodule(dotted: str) -> bool:
@@ -180,11 +182,7 @@ class TestCloseTqAndUnmount:
     def _fake_tq(monkeypatch, store_client):
         calls: list[str] = []
         fake = MagicMock()
-        manager = MagicMock()
-        if store_client is None:
-            del manager.storage_client  # SimpleStorage manager has no storage_client
-        else:
-            manager.storage_client = store_client
+        manager = SimpleNamespace() if store_client is None else SimpleNamespace(storage_client=store_client)
         fake.get_client.return_value = MagicMock(storage_manager=manager)
         fake.close.side_effect = lambda: calls.append("tq.close")
         monkeypatch.setattr(tq_lifecycle, "tq", fake)
@@ -266,6 +264,20 @@ class TestInitializeTqWithFallback:
         return {"controller": {}, "backend": {"storage_backend": backend}}
 
     @staticmethod
+    def _mooncake_conf(protocol: str) -> dict:
+        return {
+            "controller": {},
+            "backend": {
+                "storage_backend": "MooncakeStore",
+                "MooncakeStore": {
+                    "protocol": protocol,
+                    "master_server_address": "master.invalid:50051",
+                    "hard_pin": True,
+                },
+            },
+        }
+
+    @staticmethod
     def _patch_transaction(monkeypatch, *, existed: bool, init_effects: list[object], stored_conf=None):
         calls: dict[str, list] = {"reap": [], "attempts": []}
         effects = iter(init_effects)
@@ -298,6 +310,35 @@ class TestInitializeTqWithFallback:
         result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
         assert result.owns_controller is False
         assert result.config is stored
+        assert calls["attempts"] == []
+
+    def test_attach_rejects_different_backend_without_closing_owner(self, monkeypatch):
+        requested = self._mooncake_conf("rdma")
+        stored = self._conf("SimpleStorage")
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="different backend config"):
+            tq_lifecycle.initialize_tq_with_fallback(
+                requested,
+                mode="auto",
+                fallback_conf=self._conf("SimpleStorage"),
+            )
+        assert calls["attempts"] == []
+
+    def test_attach_rejects_different_mooncake_protocol(self, monkeypatch):
+        requested = self._mooncake_conf("rdma")
+        stored = self._mooncake_conf("tcp")
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="requested=MooncakeStore/rdma"):
+            tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
+        assert calls["attempts"] == []
+
+    def test_attach_accepts_matching_mooncake_config(self, monkeypatch):
+        requested = self._mooncake_conf("rdma")
+        stored = self._mooncake_conf("rdma")
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
+        assert result.config is stored
+        assert result.owns_controller is False
         assert calls["attempts"] == []
 
     def test_auto_cleans_failed_mooncake_then_retries_simple_once(self, monkeypatch):
@@ -375,6 +416,23 @@ class TestOwnerProcessBoundary:
             tq_lifecycle._start_owner({"controller": {}}, timeout=0.1)
         assert cleaned[0][0] is owner
         assert cleaned[0][1]
+
+    def test_concurrent_initializer_with_different_config_detaches_and_fails(self, monkeypatch):
+        owner = _FakeOwner()
+        stopped: list[object] = []
+        requested = TestInitializeTqWithFallback._mooncake_conf("rdma")
+        stored = TestInitializeTqWithFallback._conf("SimpleStorage")
+        monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "remote", lambda: owner)
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "get",
+            lambda ref, timeout: (stored, False) if ref == "initialize-ref" else None,
+        )
+        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle: stopped.append(handle))
+
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="concurrent TransferQueue initializer"):
+            tq_lifecycle._start_owner(requested, timeout=1)
+        assert stopped == [owner]
 
     @pytest.mark.parametrize("stored_token,should_kill", [("ours", True), ("theirs", False)])
     def test_failed_owner_cleanup_respects_controller_owner_token(self, monkeypatch, stored_token, should_kill):
@@ -457,6 +515,113 @@ def _client_with_store(store) -> object:
     client._store = store
     client.replica_config = None
     return client
+
+
+class _SequenceStore:
+    """Return a configured result sequence from low-level Mooncake calls."""
+
+    def __init__(self, results: list[list[int]]) -> None:
+        self.results = iter(results)
+
+    def batch_upsert_from(self, keys, ptrs, sizes, config=None):
+        return next(self.results)
+
+    def batch_get_into(self, keys, ptrs, sizes):
+        return next(self.results)
+
+    def batch_remove(self, keys, force=True):
+        return next(self.results)
+
+
+class _FakeNotifySocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def setsockopt(self, *args, **kwargs) -> None:
+        pass
+
+    def connect(self, *args, **kwargs) -> None:
+        pass
+
+    async def send_multipart(self, request) -> None:
+        pass
+
+    async def recv_multipart(self, copy=False):
+        return [b"ack"]
+
+    def close(self, linger=0) -> None:
+        self.closed = True
+
+
+class TestMooncakeCorrectnessGuardPrimitives:
+    """Low-level response validation stays runnable on the CPU-only CI stub."""
+
+    def test_upsert_short_result_is_raised(self):
+        store = _StrictMooncakeStoreProxy(_SequenceStore([[0]]))
+        with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
+            store.batch_upsert_from(["k0", "k1"], [1, 2], [8, 8])
+
+    def test_remove_failure_is_raised(self):
+        store = _StrictMooncakeStoreProxy(_SequenceStore([[0, -704]]))
+        with pytest.raises(RuntimeError, match="batch_remove failed"):
+            store.batch_remove(["k0", "k1"], force=True)
+
+
+@pytest.mark.skipif(
+    not _REAL_MOONCAKE_CLIENT,
+    reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
+)
+class TestMooncakeCorrectnessGuards:
+    """Integration with real TransferQueue internals; no GPU/master needed."""
+
+    def test_retry_short_result_is_never_treated_as_success(self, monkeypatch):
+        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
+        store = _StrictMooncakeStoreProxy(_SequenceStore([[-1, -1], [0]]))
+        client = _client_with_store(store)
+        with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
+            client._batch_upsert_with_retry(["k0", "k1"], [1, 2], [8, 8])
+
+    @pytest.mark.asyncio
+    async def test_negative_production_status_ack_is_raised(self, monkeypatch):
+        from transfer_queue.utils import zmq_utils
+
+        socket = _FakeNotifySocket()
+        monkeypatch.setattr(zmq_utils, "create_zmq_socket", lambda **kwargs: socket)
+        monkeypatch.setattr(
+            zmq_utils.ZMQMessage,
+            "deserialize",
+            staticmethod(
+                lambda messages: SimpleNamespace(
+                    request_type=zmq_utils.ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+                    body={"success": False, "partition_id": "p0"},
+                )
+            ),
+        )
+        manager = SimpleNamespace(
+            storage_manager_id="guard-test",
+            zmq_context=object(),
+            controller_info=SimpleNamespace(ip="redacted", to_addr=lambda name: "inproc://controller"),
+        )
+        with pytest.raises(RuntimeError, match="rejected the production-status update"):
+            await _strict_notify_and_wait(manager, [b"request"])
+        assert socket.closed is True
+
+    @pytest.mark.asyncio
+    async def test_missing_production_status_ack_is_bounded(self, monkeypatch):
+        from transfer_queue.storage.managers import base as tq_base
+        from transfer_queue.utils import zmq_utils
+
+        socket = _FakeNotifySocket()
+        monkeypatch.setattr(zmq_utils, "create_zmq_socket", lambda **kwargs: socket)
+        monkeypatch.setattr(tq_base, "TQ_DATA_UPDATE_RESPONSE_TIMEOUT", 0)
+        manager = SimpleNamespace(
+            storage_manager_id="guard-test",
+            zmq_context=object(),
+            controller_info=SimpleNamespace(ip="redacted", to_addr=lambda name: "inproc://controller"),
+        )
+        with pytest.raises(TimeoutError, match="production-status ACK"):
+            await _strict_notify_and_wait(manager, [b"request"])
+        assert socket.closed is True
 
 
 class _InlineExecutorLoop:
