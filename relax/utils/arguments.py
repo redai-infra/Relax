@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 from typing import Any
 
@@ -391,6 +392,51 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "and to genrm / teacher SGLang engines. Coordinated per node per checkpoint path, "
                     "so each unique checkpoint is streamed at most once per node."
                 ),
+            )
+            parser.add_argument(
+                "--disable-s3-model-download",
+                action="store_true",
+                default=False,
+                help="Disable Relax-managed S3-to-SHM model materialization",
+            )
+            parser.add_argument(
+                "--disable-s3-model-cleanup",
+                action="store_true",
+                default=False,
+                help="Keep downloaded S3 model weight shards in SHM after service initialization",
+            )
+            parser.add_argument(
+                "--s3-model-download-workers",
+                type=int,
+                default=20,
+                help="Number of concurrent workers used to download an S3 model to SHM",
+            )
+            parser.add_argument(
+                "--s3-model-shm-root",
+                type=str,
+                default="/dev/shm",
+                help=(
+                    "S3 model SHM root; it must already exist on every model consumer node, "
+                    "otherwise loading fails without falling back to disk"
+                ),
+            )
+            parser.add_argument(
+                "--s3-model-endpoint",
+                type=str,
+                default=None,
+                help="Optional endpoint URL for an S3-compatible model store",
+            )
+            parser.add_argument(
+                "--s3-model-use-placeholder-credentials",
+                action="store_true",
+                default=False,
+                help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+            )
+            parser.add_argument(
+                "--s3-model-use-path-style",
+                action="store_true",
+                default=False,
+                help="Use path-style addressing for an S3-compatible model store",
             )
             parser.add_argument(
                 "--custom-model-provider-path",
@@ -1582,6 +1628,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The model will be saved to `save_hf.format(rollout_id)`. "
                 ),
             )
+            parser.add_argument(
+                "--save-hf-dtype",
+                type=str,
+                choices=["bf16", "fp8"],
+                default="bf16",
+                help=(
+                    "Precision for online --save-hf export. 'bf16' (default) preserves prior "
+                    "behavior; 'fp8' streams e4m3 quantized shards. FP8 requires --save-hf and "
+                    "an --hf-checkpoint backed by safetensors."
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-fp8-quant-mode",
+                type=str,
+                choices=["block", "channel", "tensor"],
+                default="block",
+                help="FP8 quantization strategy for --save-hf-dtype fp8 (default: block).",
+            )
+            parser.add_argument(
+                "--save-hf-fp8-block-size",
+                type=int,
+                nargs=2,
+                default=None,
+                metavar=("ROWS", "COLS"),
+                help="Block shape for block FP8; defaults to (128, 128) when quant-mode=block.",
+            )
+            parser.add_argument(
+                "--save-hf-post-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Dotted path (module.func) to a callable invoked on WORLD rank 0 after each "
+                    "HF checkpoint is written. Signature: "
+                    "`hook(args, hf_path: str, rollout_id: int, *, dtype: str, is_lora: bool) -> None`. "
+                    "Called synchronously; heavy work (uploads, RPCs) must be enqueued to a background "
+                    "thread by the hook itself. Exceptions are logged and swallowed."
+                ),
+            )
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
@@ -2044,6 +2128,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
+            parser.add_argument(
+                "--load-forge-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Path (or {rollout_id} template) to a dumped rollout .pt replayed by "
+                    "relax.engine.rollout.forge_load.generate_rollout. A path without the placeholder is "
+                    "a literal file reused for every rollout; a path with {rollout_id} loads a per-rollout "
+                    "file. Unlike --load-debug-rollout-data, this does NOT set skip_sglang, so sglang, "
+                    "router, weight sync and the colocate offload/onload dance stay live (the point: "
+                    "measuring real colocate memory at long context)."
+                ),
+            )
             parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
@@ -2549,8 +2646,62 @@ def _pre_parse_mode():
     return temp_args
 
 
+def _pre_parse_cli_model_source():
+    """Build a serializable model source from the generic CLI."""
+    from relax.utils.model_source import ModelSource
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--hf-checkpoint", help="Hugging Face checkpoint path or model URI")
+    parser.add_argument(
+        "--disable-s3-model-download",
+        action="store_true",
+        help="Disable Relax-managed S3-to-SHM model materialization",
+    )
+    parser.add_argument(
+        "--s3-model-endpoint",
+        help="Optional endpoint URL for an S3-compatible model store",
+    )
+    parser.add_argument(
+        "--s3-model-use-placeholder-credentials",
+        action="store_true",
+        help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+    )
+    parser.add_argument(
+        "--s3-model-use-path-style",
+        action="store_true",
+        help="Use path-style addressing for an S3-compatible model store",
+    )
+    pre, _ = parser.parse_known_args()
+    if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
+        return None
+    return ModelSource(
+        uri=pre.hf_checkpoint,
+        endpoint=pre.s3_model_endpoint,
+        credential_mode="placeholder" if pre.s3_model_use_placeholder_credentials else "default",
+        addressing_style="path" if pre.s3_model_use_path_style else "auto",
+    )
+
+
 def parse_args(add_custom_arguments=None):
+    """Parse Relax arguments with an optional registered model source."""
+    from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
+
+    original_argv = sys.argv
+    provider_source = resolve_model_source(original_argv)
+    if provider_source is not None:
+        sys.argv = apply_model_source_to_argv(original_argv, provider_source)
+    try:
+        return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+    finally:
+        sys.argv = original_argv
+
+
+def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    model_source = provider_source or _pre_parse_cli_model_source()
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2573,7 +2724,11 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
+        skip_hf_validate=(
+            pre.debug_rollout_only
+            or pre.skip_hf_validate
+            or (model_source is not None and is_s3_uri(model_source.uri))
+        ),
     )
 
     # Merge pre-parsed args into the main namespace
@@ -2588,6 +2743,15 @@ def parse_args(add_custom_arguments=None):
     if teacher_sglang_ns is not None:
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
+
+    # Preserve whether the user explicitly requested a rollout start before
+    # validation derives 0 for an apparent HF/cold-start load. Actor init uses
+    # this provenance to recover from a checkpoint-readiness race without
+    # overriding an intentional --start-rollout-id.
+    args._start_rollout_id_explicit = args.start_rollout_id is not None
+
+    # Serialize the driver-derived descriptor with args to every Ray actor.
+    args.model_source = model_source
 
     slime_validate_args(args)
 
@@ -2669,6 +2833,41 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
     elif timeout <= 0:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
+
+
+def validate_save_hf_fp8_args(args) -> None:
+    """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
+    default."""
+    dtype = getattr(args, "save_hf_dtype", "bf16")
+    if dtype != "fp8":
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
+
+    from relax.utils.quant_cast.fp8 import validate_fp8_options
+
+    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
+    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    if strategy == "block" and block_size is None:
+        block_size = [128, 128]
+        args.save_hf_fp8_block_size = block_size
+    validate_fp8_options(strategy, block_size)
+
+
+def validate_save_hf_post_hook_args(args) -> None:
+    """Validate --save-hf-post-hook-path resolves and is paired with --save-
+    hf."""
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
+
+    from relax.utils.misc import load_function
+
+    hook = load_function(hook_path)
+    if not callable(hook):
+        raise TypeError(f"--save-hf-post-hook-path {hook_path!r} is not callable: got {type(hook).__name__}")
 
 
 def _validate_agentic_rollout_args(args) -> None:
@@ -2964,6 +3163,8 @@ def slime_validate_args(args):
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
+    validate_save_hf_fp8_args(args)
+    validate_save_hf_post_hook_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
@@ -3296,8 +3497,6 @@ def slime_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-            if args.use_critic:
-                args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
     elif args.colocate and genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True

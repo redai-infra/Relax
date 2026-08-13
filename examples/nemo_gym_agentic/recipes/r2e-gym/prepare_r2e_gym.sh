@@ -23,6 +23,7 @@ R2E_GYM_LIMIT="${R2E_GYM_LIMIT:-1}"
 R2E_GYM_BUILD_SIFS="${R2E_GYM_BUILD_SIFS:-1}"
 R2E_GYM_AGENT_NAME="${R2E_GYM_AGENT_NAME:-swe_agents}"
 R2E_GYM_BUILD_TMPDIR="${R2E_GYM_BUILD_TMPDIR:-${TMPDIR:-/tmp}}"
+R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"
 
 case "${R2E_GYM_OUTPUT_DIR}" in
     /*) ;;
@@ -33,6 +34,10 @@ case "${R2E_GYM_OUTPUT_DIR}" in
 esac
 if ! [[ "${R2E_GYM_LIMIT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "task-limit must be a positive integer" >&2
+    exit 2
+fi
+if [[ "${R2E_GYM_SIF_PREFIX}" == */* ]]; then
+    echo "R2E_GYM_SIF_PREFIX must be a filename prefix without '/'" >&2
     exit 2
 fi
 
@@ -74,6 +79,8 @@ echo "  dataset=${R2E_GYM_DATASET}"
 echo "  split=${R2E_GYM_SPLIT}"
 echo "  limit=${R2E_GYM_LIMIT}"
 echo "  output_dir=${R2E_GYM_OUTPUT_DIR}"
+echo "  sif_dir=${SIF_DIR}"
+echo "  sif_prefix=${R2E_GYM_SIF_PREFIX:-<none>}"
 
 "${GYM_ROOT}/.venv/bin/python" \
     "${SCRIPT_DIR}/prepare_r2e_gym.py" \
@@ -91,7 +98,7 @@ echo "  output_dir=${R2E_GYM_OUTPUT_DIR}"
 
 if [ "${R2E_GYM_BUILD_SIFS}" = "1" ]; then
     while IFS=$'\t' read -r docker_image sif_name; do
-        sif_path="${SIF_DIR}/${sif_name}"
+        sif_path="${SIF_DIR}/${R2E_GYM_SIF_PREFIX}${sif_name}"
         if [ -s "${sif_path}" ]; then
             echo "Reusing ${sif_path}"
             continue

@@ -6,16 +6,53 @@ Imports are deferred to a fixture because processing_utils pulls in the heavy
 imageio / soundfile / transformers / torch stack at module level.
 """
 
+import importlib
 import os
+import sys
+from types import ModuleType
 
 import pytest
 
 
 @pytest.fixture()
-def pu():
+def pu(monkeypatch):
     """processing_utils with encode-executor + env state reset around each
     test."""
-    from relax.utils.data import processing_utils as mod
+    transformers = ModuleType("transformers")
+
+    class AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class AutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class PreTrainedTokenizerBase:
+        pass
+
+    class ProcessorMixin:
+        pass
+
+    transformers.AutoProcessor = AutoProcessor
+    transformers.AutoTokenizer = AutoTokenizer
+    transformers.PreTrainedTokenizerBase = PreTrainedTokenizerBase
+    transformers.ProcessorMixin = ProcessorMixin
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    module_name = "relax.utils.data.processing_utils"
+    original_module = sys.modules.get(module_name)
+    module_was_loaded = module_name in sys.modules
+    data_module = sys.modules.get("relax.utils.data")
+    processing_attr_was_set = data_module is not None and hasattr(data_module, "processing_utils")
+    original_processing_attr = getattr(data_module, "processing_utils", None) if processing_attr_was_set else None
+
+    sys.modules.pop(module_name, None)
+    if data_module is not None and processing_attr_was_set:
+        delattr(data_module, "processing_utils")
+    mod = importlib.import_module(module_name)
 
     saved_env = os.environ.get(mod._ENCODE_MAX_WORKERS_ENV)
     saved_executor = mod._encode_executor
@@ -34,6 +71,14 @@ def pu():
             os.environ.pop(mod._ENCODE_MAX_WORKERS_ENV, None)
         else:
             os.environ[mod._ENCODE_MAX_WORKERS_ENV] = saved_env
+        sys.modules.pop(module_name, None)
+        if module_was_loaded:
+            sys.modules[module_name] = original_module
+        if data_module is not None:
+            if processing_attr_was_set:
+                setattr(data_module, "processing_utils", original_processing_attr)
+            elif hasattr(data_module, "processing_utils"):
+                delattr(data_module, "processing_utils")
 
 
 def test_default_uses_affinity_aware_cpu_count(pu):

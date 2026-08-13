@@ -215,6 +215,10 @@ def test_launch_server_always_receives_picklable_scheduler_wrapper(monkeypatch, 
     )
 
 
+def test_missing_load_format_choices_uses_legacy_remote(sglang_engine_module):
+    assert sglang_engine_module._preferred_s3_stream_load_format() == "remote"
+
+
 def test_unregister_uses_registration_worker_id_once(monkeypatch, sglang_engine_module):
     requests = _RouterRequests()
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
