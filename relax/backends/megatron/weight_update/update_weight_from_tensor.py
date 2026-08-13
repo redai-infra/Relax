@@ -661,6 +661,7 @@ class UpdateWeightFromTensor:
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
                 weight_version=resolved_weight_version,
+                use_host_tensors=(self.mixture_lora_enabled and getattr(self.args, "sglang_pp_size", 1) > 1),
             )
             all_refs.extend(refs_colocated)
 
@@ -685,6 +686,7 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     weight_version: int | None,
+    use_host_tensors: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -700,7 +702,10 @@ def _send_to_colocated_engine(
     # devices. Synchronous copy: this runs on the weight-update path (not the
     # rollout/train hot path) and FlattenedTensorBucket may flatten on a
     # different stream — correctness over a few µs.
-    cur_device = make_current_torch_device()
+    # SGLang indexes serialized buckets by TP rank. Pipeline stages therefore
+    # share one entry when TP=1, so device IPC handles would point every stage
+    # at the first stage's GPU. Host tensors are safe for all PP stages to read.
+    cur_device = torch.device("cpu") if use_host_tensors else make_current_torch_device()
     hf_named_tensors = [
         (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
     ]
@@ -726,7 +731,12 @@ def _send_to_colocated_engine(
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        serialized_tensors.append(
+            _serialize_flattened_tensor_data(
+                flattened_tensor_data,
+                use_file_system_sharing=use_host_tensors,
+            )
+        )
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -755,7 +765,10 @@ def _send_to_colocated_engine(
                 if empty_serialized_tensor is None:
                     empty_tensor_data = _empty_flattened_tensor_data(cur_device)
                     long_live_tensors.append(empty_tensor_data)
-                    empty_serialized_tensor = MultiprocessingSerializer.serialize(empty_tensor_data, output_str=True)
+                    empty_serialized_tensor = _serialize_flattened_tensor_data(
+                        empty_tensor_data,
+                        use_file_system_sharing=use_host_tensors,
+                    )
                 serialized_tensors_for_bucket.append(empty_serialized_tensor)
             kwargs = {
                 "serialized_named_tensors": serialized_tensors_for_bucket,
@@ -765,6 +778,23 @@ def _send_to_colocated_engine(
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _serialize_flattened_tensor_data(flattened_tensor_data, *, use_file_system_sharing: bool):
+    if not use_file_system_sharing:
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+
+    # CPU storage serialized with the default file-descriptor strategy is tied
+    # to the producer process's multiprocessing auth key. SGLang PP workers run
+    # in separate processes, so use named shared-memory files for this path.
+    from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
+
+    previous_strategy = get_sharing_strategy()
+    try:
+        set_sharing_strategy("file_system")
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+    finally:
+        set_sharing_strategy(previous_strategy)
 
 
 def _empty_flattened_tensor_data(device):

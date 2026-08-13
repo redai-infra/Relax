@@ -3,7 +3,7 @@
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -23,10 +23,48 @@ from relax.backends.megatron.weight_update.mixture_lora_sync import (  # noqa: E
     merge_mixture_lora_tp_shards,
 )
 from relax.backends.megatron.weight_update.update_weight_from_tensor import (  # noqa: E402
+    _send_to_colocated_engine,
     iter_mixture_weight_updates,
 )
 from relax.utils.mixture_lora import MixtureLoraStateSpec  # noqa: E402
 from relax.utils.types import ParamInfo  # noqa: E402
+
+
+@pytest.mark.parametrize(("use_host_tensors", "device_lookup_calls"), [(False, 1), (True, 0)])
+def test_colocated_mixture_transfer_selects_device_by_sglang_pipeline_mode(
+    use_host_tensors,
+    device_lookup_calls,
+):
+    tensor = torch.ones(2)
+    engine = MagicMock()
+    engine.update_weights_from_tensor.remote.return_value = "ref"
+
+    module = "relax.backends.megatron.weight_update.update_weight_from_tensor"
+    with (
+        patch(f"{module}.dist.get_rank", return_value=0),
+        patch(f"{module}.dist.get_world_size", return_value=1),
+        patch(
+            f"{module}.dist.gather_object",
+            side_effect=lambda value, object_gather_list, **_: object_gather_list.__setitem__(0, value),
+        ),
+        patch(f"{module}.make_current_torch_device", return_value=torch.device("cpu")) as current_device,
+        patch(f"{module}.torch.multiprocessing.get_sharing_strategy", return_value="file_descriptor"),
+        patch(f"{module}.torch.multiprocessing.set_sharing_strategy") as set_sharing_strategy,
+    ):
+        refs, long_lived = _send_to_colocated_engine(
+            [("weight", tensor)],
+            ipc_engine=engine,
+            ipc_gather_src=0,
+            ipc_gather_group="group",
+            weight_version=1,
+            use_host_tensors=use_host_tensors,
+        )
+
+    assert refs == ["ref"]
+    assert long_lived
+    assert current_device.call_count == device_lookup_calls
+    expected_sharing_calls = [call("file_system"), call("file_descriptor")] if use_host_tensors else []
+    assert set_sharing_strategy.call_args_list == expected_sharing_calls
 
 
 def test_selective_offload_uses_cpu_copy_only_after_live_storage_is_released():
