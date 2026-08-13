@@ -61,13 +61,10 @@ def _packed_seq_params(cu: torch.Tensor) -> PackedSeqParams:
 def _apply_route_across_ranks(
     x: torch.Tensor, cu: torch.Tensor, cp_size: int, source: str, target: str
 ) -> list[torch.Tensor]:
-    """Run the route-driven swap for every rank, emulating the all-to-all locally."""
-    source_by_rank = [
-        cpl.get_thd_context_parallel_rank_indices(cu, cp_size, r, source) for r in range(cp_size)
-    ]
-    routes = [
-        cpl.build_thd_cp_partition_route(cu, cp_size, r, source, target) for r in range(cp_size)
-    ]
+    """Run the route-driven swap for every rank, emulating the all-to-all
+    locally."""
+    source_by_rank = [cpl.get_thd_context_parallel_rank_indices(cu, cp_size, r, source) for r in range(cp_size)]
+    routes = [cpl.build_thd_cp_partition_route(cu, cp_size, r, source, target) for r in range(cp_size)]
 
     send_bufs = []
     for rank, route in enumerate(routes):
@@ -123,13 +120,9 @@ def test_route_rejects_lengths_not_divisible_by_two_cp():
 
 def test_route_rejects_malformed_cu_seqlens():
     with pytest.raises(ValueError, match="must start at 0"):
-        cpl.build_thd_cp_partition_route(
-            torch.tensor([8, 16], dtype=torch.int64), 2, 0, "zigzag", "contiguous"
-        )
+        cpl.build_thd_cp_partition_route(torch.tensor([8, 16], dtype=torch.int64), 2, 0, "zigzag", "contiguous")
     with pytest.raises(ValueError, match="nondecreasing"):
-        cpl.build_thd_cp_partition_route(
-            torch.tensor([0, 16, 8], dtype=torch.int64), 2, 0, "zigzag", "contiguous"
-        )
+        cpl.build_thd_cp_partition_route(torch.tensor([0, 16, 8], dtype=torch.int64), 2, 0, "zigzag", "contiguous")
 
 
 def test_route_rejects_unknown_layout():
@@ -163,7 +156,8 @@ def test_both_directions_are_cached_separately():
 
 
 def test_route_is_rebuilt_for_new_packed_boundaries():
-    """Packed boundaries move every micro-batch; a stale route would corrupt tokens."""
+    """Packed boundaries move every micro-batch; a stale route would corrupt
+    tokens."""
     cu = _cu([3, 1], unit=8)
     psp = _packed_seq_params(cu)
     first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
