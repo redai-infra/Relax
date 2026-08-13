@@ -238,6 +238,8 @@ def _hf_validate_args(args, hf_config):
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
 
+    if mixture_lora_enabled and getattr(hf_config, "model_type", None) != "qwen3":
+        errors.append("Mixture-of-LoRA currently supports Qwen3 base models only.")
     if mixture_lora_enabled and _is_moe_config(hf_config):
         errors.append("Mixture-of-LoRA currently supports dense base models; MoE base models are unsupported.")
 
