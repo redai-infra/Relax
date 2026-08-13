@@ -94,7 +94,7 @@ $$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorna
 - `rollout/rloo/zero_adv_group_frac`：所有 advantage 都为零的完整组比例
 - `rollout/rloo/dropped_group_frac`：因组大小不完整而未纳入诊断的已观察组比例
 
-这些诊断只用于训练 rollout。Eval 使用独立的采样组大小，不会记录具有误导性的 `eval/*/rloo/*` 全零指标。当自定义 reward post-processor 或 agentic custom-advantage hook 替换标准 RLOO 信号时，也会省略这些指标，因为此时无法仅靠 raw reward 重建 optimizer 的真实输入。
+这些诊断只用于训练 rollout，属于纯观测统计，不影响训练路径。Eval 使用独立的采样组大小，不会记录具有误导性的 `eval/*/rloo/*` 全零指标。当自定义 reward post-processor 或 agentic custom-advantage hook 替换标准 RLOO 信号时，也会省略这些指标，因为此时无法仅靠 raw reward 重建 optimizer 的真实输入。
 
 ### 快速开始
 

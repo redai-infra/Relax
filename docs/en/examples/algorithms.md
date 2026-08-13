@@ -97,7 +97,7 @@ Training rollout logs publish the following final metric names:
 - `rollout/rloo/zero_adv_group_frac`: fraction of complete groups with zero advantages throughout
 - `rollout/rloo/dropped_group_frac`: fraction of observed groups omitted from diagnostics because their size is incomplete
 
-These diagnostics are training-only. Evaluation uses its own sampling group size and does not emit misleading `eval/*/rloo/*` values. They are also omitted when a custom reward post-processor or agentic custom-advantage hook replaces the standard RLOO signal, because raw rewards cannot reconstruct the optimizer input in those modes.
+These diagnostics are training-only, purely observational rollout statistics; they do not affect the training path. Evaluation uses its own sampling group size and does not emit misleading `eval/*/rloo/*` values. They are also omitted when a custom reward post-processor or agentic custom-advantage hook replaces the standard RLOO signal, because raw rewards cannot reconstruct the optimizer input in those modes.
 
 ### Quick Start
 

@@ -116,10 +116,13 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     These keys are returned with an ``rloo/`` prefix. The training rollout
     logger adds the outer ``rollout/`` prefix before publishing them.
 
-    ``no_signal_frac`` uses effective loss-token counts, because masked response
-    tokens cannot contribute gradients. ``empty_response_frac`` intentionally
-    uses the literal response length and therefore remains distinct from a
-    sample whose response exists but is fully masked.
+    These are purely observational rollout statistics and do not feed back into
+    the training path. ``no_signal_frac`` here means effective loss tokens whose
+    RLOO advantage is exactly zero (the leave-one-out baseline is zero whenever
+    all rewards in a group are equal); it is not a zero-token training-step
+    concept. ``empty_response_frac`` intentionally uses the literal response
+    length and therefore remains distinct from a sample whose response exists
+    but is fully masked.
     """
     if getattr(args, "advantage_estimator", None) != "rloo":
         return {}
