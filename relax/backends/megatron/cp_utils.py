@@ -649,24 +649,32 @@ def dynamic_cp_merge_output(
             # 1. reconstruct each sample's full response from its CP-local zig-zag shards.
             if dynamic_cp_size > 1:
                 dynamic_cp_group = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
-                ptls = padded_total_lengths if padded_total_lengths is not None else [None] * len(values)
+                padded_total_lengths_for_values = (
+                    padded_total_lengths if padded_total_lengths is not None else [None] * len(values)
+                )
                 _validate_metadata_lengths(
                     values=values,
                     total_lengths=total_lengths,
                     response_lengths=response_lengths,
-                    padded_total_lengths=ptls,
+                    padded_total_lengths=padded_total_lengths_for_values,
                 )
                 values = [
                     all_gather_with_cp(
-                        v,
-                        tl,
-                        rl,
-                        padded_total_length=ptl,
+                        value,
+                        total_length,
+                        response_length,
+                        padded_total_length=padded_total_length,
                         dynamic_cp_size=dynamic_cp_size,
                         dynamic_cp_rank=dynamic_cp_rank,
                         dynamic_cp_group=dynamic_cp_group,
                     )
-                    for v, tl, rl, ptl in zip(values, total_lengths, response_lengths, ptls, strict=True)
+                    for value, total_length, response_length, padded_total_length in zip(
+                        values,
+                        total_lengths,
+                        response_lengths,
+                        padded_total_lengths_for_values,
+                        strict=True,
+                    )
                 ]
 
             # 2. collect all sub-groups' samples across the static CP group and reorder.
