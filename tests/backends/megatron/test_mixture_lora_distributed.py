@@ -780,3 +780,103 @@ def _tensor_parallel_worker(rank: int, world_size: int, init_method: str) -> Non
 def test_tensor_parallel_forward_and_backward_match_single_rank_reference(tmp_path):
     init_method = f"file://{tmp_path / 'mixture-lora-tp-gloo-init'}"
     mp.spawn(_tensor_parallel_worker, args=(2, init_method), nprocs=2, join=True)
+
+
+def _tensor_parallel_initialization_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(1234)
+        config = MixtureLoraConfig(
+            num_experts=2,
+            rank=4,
+            top_k=1,
+            temperature=1.0,
+            aux_loss_coef=0.01,
+            alpha=4.0,
+            target_modules=("linear_qkv",),
+        )
+        adapter = MixtureLoRAAdapter(
+            config,
+            "linear_qkv",
+            input_size=8,
+            output_size=8,
+            dropout=0.0,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            tp_group=dist.group.WORLD,
+            tp_rank=rank,
+            tp_world_size=world_size,
+            use_cpu_initialization=True,
+        )
+        shards = [torch.empty_like(adapter.experts.lora_A) for _ in range(world_size)]
+        dist.all_gather(shards, adapter.experts.lora_A)
+        full_a = torch.cat(shards, dim=1)
+        assert full_a.shape == (config.num_experts, config.rank, 8)
+        assert not torch.equal(shards[0], shards[1])
+    finally:
+        dist.destroy_process_group()
+
+
+def test_tensor_parallel_lora_a_initialization_uses_distinct_rank_blocks(tmp_path):
+    init_method = f"file://{tmp_path / 'mixture-lora-tp-init-gloo'}"
+    mp.spawn(_tensor_parallel_initialization_worker, args=(2, init_method), nprocs=2, join=True)
+
+
+def _tensor_parallel_cuda_initialization_worker(rank: int, world_size: int, init_method: str) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    try:
+        model_parallel_cuda_manual_seed(
+            1234,
+            tp_rank=rank,
+            ep_rank=0,
+            etp_rank=0,
+            force_reset_rng=True,
+        )
+        config = MixtureLoraConfig(
+            num_experts=2,
+            rank=4,
+            top_k=1,
+            temperature=1.0,
+            aux_loss_coef=0.01,
+            alpha=4.0,
+            target_modules=("linear_qkv",),
+        )
+        adapter = MixtureLoRAAdapter(
+            config,
+            "linear_qkv",
+            input_size=8,
+            output_size=8,
+            dropout=0.0,
+            device=torch.device("cuda", rank),
+            dtype=torch.float32,
+            tp_group=dist.group.WORLD,
+            tp_rank=rank,
+            tp_world_size=world_size,
+            use_cpu_initialization=False,
+        )
+        shards = [torch.empty_like(adapter.experts.lora_A) for _ in range(world_size)]
+        dist.all_gather(shards, adapter.experts.lora_A)
+        assert not torch.equal(shards[0], shards[1])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_tensor_parallel_cuda_lora_a_initialization_uses_model_parallel_rng(tmp_path):
+    init_method = f"file://{tmp_path / 'mixture-lora-tp-init-nccl'}"
+    mp.spawn(_tensor_parallel_cuda_initialization_worker, args=(2, init_method), nprocs=2, join=True)

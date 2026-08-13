@@ -555,6 +555,10 @@ class MixtureLoRAExperts(nn.Module):
         local_output_size: int | None = None,
         device: torch.device,
         dtype: torch.dtype,
+        input_is_parallel: bool = False,
+        tp_rank: int = 0,
+        tp_world_size: int = 1,
+        use_cpu_initialization: bool | None = None,
     ) -> None:
         super().__init__()
         local_rank = config.rank if local_rank is None else local_rank
@@ -566,12 +570,48 @@ class MixtureLoRAExperts(nn.Module):
         self.lora_B = nn.Parameter(
             torch.empty(config.num_experts, local_output_size, config.rank, device=device, dtype=dtype)
         )
+        self._full_rank = config.rank
+        self._full_input_size = input_size
+        self._input_is_parallel = input_is_parallel
+        self._tp_rank = tp_rank
+        self._tp_world_size = tp_world_size
+        self._use_cpu_initialization = (
+            device.type == "cpu" if use_cpu_initialization is None else use_cpu_initialization
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Match the current Bridge LoRA initialization independently for each expert.
-        for expert_weight in self.lora_A:
-            nn.init.xavier_uniform_(expert_weight)
+        if self._tp_world_size == 1:
+            for expert_weight in self.lora_A:
+                nn.init.xavier_uniform_(expert_weight)
+        else:
+            from megatron.core.tensor_parallel.layers import (
+                _initialize_affine_weight_cpu,
+                _initialize_affine_weight_gpu,
+            )
+
+            partition_dim = 1 if self._input_is_parallel else 0
+            per_partition_size = self.lora_A.shape[partition_dim + 1]
+            for expert_weight in self.lora_A:
+                if self._use_cpu_initialization:
+                    _initialize_affine_weight_cpu(
+                        expert_weight,
+                        self._full_rank,
+                        self._full_input_size,
+                        per_partition_size,
+                        partition_dim,
+                        nn.init.xavier_uniform_,
+                        params_dtype=expert_weight.dtype,
+                        rank=self._tp_rank,
+                        world_size=self._tp_world_size,
+                        skip_set_tensor_parallel_attributes=True,
+                    )
+                else:
+                    _initialize_affine_weight_gpu(
+                        expert_weight,
+                        nn.init.xavier_uniform_,
+                        partition_dim=partition_dim,
+                    )
         nn.init.zeros_(self.lora_B)
 
 
@@ -612,6 +652,7 @@ class MixtureLoRAAdapter(nn.Module):
         tp_group: Any = None,
         tp_rank: int = 0,
         tp_world_size: int = 1,
+        use_cpu_initialization: bool | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(site_id, str) or not site_id.strip():
@@ -650,6 +691,10 @@ class MixtureLoRAAdapter(nn.Module):
             local_output_size=local_output_size,
             device=device,
             dtype=dtype,
+            input_is_parallel=input_is_parallel,
+            tp_rank=tp_rank,
+            tp_world_size=tp_world_size,
+            use_cpu_initialization=use_cpu_initialization,
         )
         self.router = MixtureLoRARouter(config.num_experts, local_input_size, device=device, dtype=dtype)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
@@ -799,6 +844,7 @@ class MixtureParallelLinearAdapter(nn.Module):
             tp_group=tp_group,
             tp_rank=tp_rank,
             tp_world_size=tp_world_size,
+            use_cpu_initialization=getattr(getattr(to_wrap, "config", None), "use_cpu_initialization", None),
         )
         self._adapter_enabled = True
 
