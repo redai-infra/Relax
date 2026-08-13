@@ -46,6 +46,13 @@ class _TupleLinear(nn.Module):
         return F.linear(x, self.weight), None
 
 
+class _QuantizedTupleLinear(nn.Module):
+    def __init__(self, params_dtype):
+        super().__init__()
+        self.weight_packed = nn.Parameter(torch.ones(4, 4, dtype=torch.int32), requires_grad=False)
+        self.params_dtype = params_dtype
+
+
 def _fake_qwen_model_with_routed_qkv():
     model = nn.Module()
     model.model = nn.Module()
@@ -130,6 +137,22 @@ def test_attached_adapter_preserves_base_parameter_name_and_adds_delta():
     parameter_names = set(dict(model.named_parameters()))
     assert "model.layers.0.self_attn.qkv_proj.weight" in parameter_names
     assert "model.layers.0.self_attn.qkv_proj.mixture_lora.router.weight" in parameter_names
+
+
+def test_attached_adapter_uses_quantized_linear_params_dtype():
+    linear = _QuantizedTupleLinear(torch.bfloat16)
+
+    attach_sglang_mixture_lora(linear, _config(), "decoder.layers.0.self_attention.linear_qkv", 4, 6)
+
+    assert {parameter.dtype for parameter in linear.mixture_lora.parameters()} == {torch.bfloat16}
+    assert linear.mixture_lora.experts.lora_A.device == linear.weight_packed.device
+
+
+def test_attached_adapter_rejects_missing_floating_point_params_dtype():
+    linear = _QuantizedTupleLinear(torch.int32)
+
+    with pytest.raises(TypeError, match="floating-point params_dtype"):
+        attach_sglang_mixture_lora(linear, _config(), "decoder.layers.0.self_attention.linear_qkv", 4, 6)
 
 
 def test_sglang_weight_loader_maps_training_names_and_validates_tensors():

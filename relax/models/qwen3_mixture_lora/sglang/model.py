@@ -100,6 +100,12 @@ def attach_sglang_mixture_lora(
         base_parameter = next(linear.parameters())
     except StopIteration as error:
         raise ValueError(f"SGLang linear {site_id} has no parameters") from error
+    adapter_dtype = getattr(linear, "params_dtype", base_parameter.dtype)
+    if not isinstance(adapter_dtype, torch.dtype) or not adapter_dtype.is_floating_point:
+        raise TypeError(
+            f"SGLang linear {site_id} must expose a floating-point params_dtype for Mixture-of-LoRA, "
+            f"got {adapter_dtype}"
+        )
     linear.add_module(
         "mixture_lora",
         SGLangMixtureLoRA(
@@ -108,7 +114,7 @@ def attach_sglang_mixture_lora(
             input_size,
             output_size,
             device=base_parameter.device,
-            dtype=base_parameter.dtype,
+            dtype=adapter_dtype,
         ),
     )
     linear._relax_mixture_lora_base_forward = linear.forward
