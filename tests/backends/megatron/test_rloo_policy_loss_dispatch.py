@@ -96,8 +96,8 @@ def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
 
 
 def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkeypatch):
-    """Exercise the production reducer and returned Megatron token
-    normalizer with unequal non-empty responses."""
+    """Exercise the production reducer and returned Megatron token normalizer
+    with unequal non-empty responses."""
     response_lengths = [2, 4]
     masks = [
         torch.tensor([1.0, 1.0], dtype=torch.float64),
