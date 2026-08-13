@@ -16,6 +16,28 @@ def _identity_compile(*, dynamic):
     return lambda function: function
 
 
+def _install_fake_sglang_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    sampler: ModuleType,
+    hash_module: ModuleType,
+) -> None:
+    sglang = ModuleType("sglang")
+    srt = ModuleType("sglang.srt")
+    layers = ModuleType("sglang.srt.layers")
+    utils = ModuleType("sglang.srt.layers.utils")
+    sglang.srt = srt
+    srt.layers = layers
+    layers.sampler = sampler
+    layers.utils = utils
+    utils.hash = hash_module
+    monkeypatch.setitem(sys.modules, "sglang", sglang)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt)
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers", layers)
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.sampler", sampler)
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils", utils)
+    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils.hash", hash_module)
+
+
 def test_uniform_hash_endpoint_has_finite_upstream_gumbel_cap():
     values = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64)
 
@@ -53,8 +75,7 @@ def test_apply_patch_is_version_gated_and_idempotent(monkeypatch):
     sampler.multinomial_with_seed = original
     hash_module = ModuleType("sglang.srt.layers.utils.hash")
     hash_module.murmur_hash32 = object()
-    monkeypatch.setitem(sys.modules, "sglang.srt.layers.sampler", sampler)
-    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils.hash", hash_module)
+    _install_fake_sglang_modules(monkeypatch, sampler, hash_module)
     monkeypatch.setattr(patch, "_installed_sglang_version", lambda: "0.5.12.post1")
     replacement = lambda *_args: None
     monkeypatch.setattr(patch, "_build_safe_multinomial_with_seed", lambda _hash: replacement)
@@ -82,8 +103,7 @@ def test_affected_signature_drift_fails_closed(monkeypatch):
     sampler.multinomial_with_seed = lambda inputs, seed: (inputs, seed)
     hash_module = ModuleType("sglang.srt.layers.utils.hash")
     hash_module.murmur_hash32 = object()
-    monkeypatch.setitem(sys.modules, "sglang.srt.layers.sampler", sampler)
-    monkeypatch.setitem(sys.modules, "sglang.srt.layers.utils.hash", hash_module)
+    _install_fake_sglang_modules(monkeypatch, sampler, hash_module)
     monkeypatch.setattr(patch, "_installed_sglang_version", lambda: "0.5.12.post1")
 
     with pytest.raises(RuntimeError, match="signature changed"):

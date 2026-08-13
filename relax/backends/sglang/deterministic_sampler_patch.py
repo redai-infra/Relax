@@ -3,11 +3,11 @@
 """Backport SGLang's deterministic-sampler uint32 endpoint fix.
 
 SGLang 0.5.12.post1 maps a 32-bit hash to ``[0, 1]`` by dividing by
-``uint32.max``.  A hash equal to ``0xffffffff`` therefore produces exactly
-``x == 1`` and Gumbel noise ``-log(-log(x)) == +inf``.  That token then wins
-the argmax regardless of its model probability.  Upstream clamps ``log(x)``
-away from zero by one hash bucket; this module applies the same correction in
-the scheduler subprocess for the affected local runtime.
+``uint32.max``.  A hash equal to ``0xffffffff`` therefore produces exactly ``x
+== 1`` and Gumbel noise ``-log(-log(x)) == +inf``.  That token then wins the
+argmax regardless of its model probability.  Upstream clamps ``log(x)`` away
+from zero by one hash bucket; this module applies the same correction in the
+scheduler subprocess for the affected local runtime.
 """
 
 from __future__ import annotations
