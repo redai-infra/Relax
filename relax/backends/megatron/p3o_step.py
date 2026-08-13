@@ -161,7 +161,7 @@ def compute_p3o_step_context(
         iterator: DataIterator,
         model_chunk: torch.nn.Module,
         return_schedule_plan: bool = False,
-    ):
+    ) -> tuple[torch.Tensor, callable]:
         if return_schedule_plan:
             raise ValueError("P3O ESS pre-pass does not support schedule plan generation")
         batch = get_batch(
@@ -195,6 +195,13 @@ def compute_p3o_step_context(
         # pass never sees. The VL bridge (Qwen3VLModel.forward) does its own
         # CP+SP splitting, so it takes unsplit tokens and no caller-side
         # packed_seq_params.
+        #
+        # NOTE: This logic is intentionally duplicated from model.py::train_one_step
+        # rather than extracted to a shared helper. The duplication ensures that
+        # any future changes to model.py's forward input preparation are immediately
+        # visible as a diff here, preventing silent drift between the stats pass
+        # and the training pass. If this block and model.py diverge, the ESS cap
+        # is computed from different logits than the gradient, breaking P3O.
         mm_kwargs = batch.get("multimodal_train_inputs") or {}
         needs_unsplit = (
             getattr(args, "is_vl_model", False)
@@ -246,7 +253,7 @@ def compute_p3o_step_context(
             if orig_cp_group is not None:
                 inner.pg_collection.cp = orig_cp_group
 
-        def collect(logits: torch.Tensor):
+        def collect(logits: torch.Tensor) -> tuple[torch.Tensor, int, dict[str, list | torch.Tensor]]:
             # Only the pipeline last stage sees real logits; earlier stages just
             # participate in the schedule.
             if mpu.is_pipeline_last_stage():

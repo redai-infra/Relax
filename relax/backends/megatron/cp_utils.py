@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable, Sequence
 
 import torch

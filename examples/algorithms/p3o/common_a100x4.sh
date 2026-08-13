@@ -130,7 +130,7 @@ if [[ "${P3O_ENABLE_TEMPERATURE_OVERRIDE}" != "0" && "${P3O_ENABLE_TEMPERATURE_O
     exit 2
 fi
 if [[ "${P3O_ENABLE_TEMPERATURE_OVERRIDE}" == "1" ]]; then
-    python - "${P3O_BEHAVIOR_TEMPERATURE}" <<'PY'
+    python3 - "${P3O_BEHAVIOR_TEMPERATURE}" <<'PY'
 import math
 import sys
 

@@ -947,7 +947,11 @@ def p3o_loss_function(
 
     score_loss = sum_of_sample_mean(terms.score_loss)
     adaptive_kl_loss = sum_of_sample_mean(terms.adaptive_kl_loss)
+    # behavior_kl_proxy: sampled-token k3 proxy (1-ESS), not full-vocabulary KL.
+    # Measures concentration of importance ratios via ESS, not distributional shift.
     behavior_kl_proxy = sum_of_sample_mean(terms.behavior_kl_proxy)
+    # cap_fraction: fraction of tokens where adaptive cap binds (ratio > ESS).
+    # Different from PPO's clip_fraction which measures fixed-interval clipping.
     cap_fraction = sum_of_sample_mean(terms.cap_hits)
     clip_fraction = sum_of_sample_mean(terms.clip_hits)
 
