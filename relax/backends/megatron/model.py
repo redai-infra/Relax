@@ -4,6 +4,7 @@ import dataclasses
 import gc
 import math
 import os
+import string
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
@@ -29,7 +30,9 @@ from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
@@ -81,8 +84,12 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
 
 
 @contextmanager
-def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
-    """Make output_layer a passthrough so model() returns hidden_states.
+def _bypass_output_layer(
+    model: torch.nn.Module,
+    *,
+    mtp_output_layer_calls: int = 0,
+) -> Iterator[Callable | None]:
+    """Defer the main output_layer so model() returns hidden_states.
 
     With ``--sequence-parallel`` the decoder emits ``[S/TP, B, H]`` and the
     original lm_head would AG before the matmul; we do that AG here so
@@ -90,8 +97,14 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
     the *original* lm_head forward with ``sequence_parallel=False`` (input
     already gathered) so it emits ``[chunk, 1, V/TP]`` per call.
 
+    MTP invokes the same output layer once per prediction depth before the
+    main head. ``mtp_output_layer_calls`` lets those calls use the real head;
+    only the following main-head call becomes a passthrough. This preserves
+    MTP loss computation while still deferring the main SFT logits.
+
     No-op on PP stages with no output layer (the loss never runs there).
     """
+    assert mtp_output_layer_calls >= 0, f"{mtp_output_layer_calls=}"
     output_layer = _find_lm_output_layer(model)
     if output_layer is None:
         yield None
@@ -100,11 +113,27 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
     original_forward = output_layer.forward
     sp_enabled = bool(getattr(output_layer, "sequence_parallel", False))
     tp_group = getattr(output_layer, "tp_group", None) or mpu.get_tensor_model_parallel_group()
+    remaining_mtp_calls = mtp_output_layer_calls
+    deferred_weight = None
+    main_head_deferred = False
 
     if sp_enabled:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
-    def _passthrough(input_, weight=None, runtime_gather_output=None):
+    def _passthrough(input_, weight=None, runtime_gather_output=None, **kwargs):
+        nonlocal deferred_weight, main_head_deferred, remaining_mtp_calls
+        if remaining_mtp_calls > 0:
+            remaining_mtp_calls -= 1
+            return original_forward(
+                input_,
+                weight=weight,
+                runtime_gather_output=runtime_gather_output,
+                **kwargs,
+            )
+        if main_head_deferred:
+            raise RuntimeError("output_layer was called more than once after all MTP head calls")
+        main_head_deferred = True
+        deferred_weight = weight
         if sp_enabled:
             input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=False, group=tp_group)
         return input_, None
@@ -113,19 +142,28 @@ def _bypass_output_layer(model: torch.nn.Module) -> Iterator[Callable | None]:
         # ColumnParallelLinear's cuBLAS matmul requires input.dtype == weight.dtype.
         # The VL bridge upcasts hidden_states to fp32 before output_layer; downcast
         # here so matmul stays bf16/bf16. The caller upcasts logits back to fp32.
-        w = weight if weight is not None else output_layer.weight
+        call_weight = weight if weight is not None else deferred_weight
+        w = call_weight if call_weight is not None else output_layer.weight
+        if w is None:
+            raise RuntimeError("Unable to resolve lm_head weight for chunked SFT loss")
         if input_.dtype != w.dtype:
             input_ = input_.to(w.dtype)
         prev_sp = output_layer.sequence_parallel
         output_layer.sequence_parallel = False
         try:
-            return original_forward(input_, weight=weight, runtime_gather_output=runtime_gather_output)
+            return original_forward(input_, weight=call_weight, runtime_gather_output=runtime_gather_output)
         finally:
             output_layer.sequence_parallel = prev_sp
 
     output_layer.forward = _passthrough
     try:
         yield _chunked_call
+        if not main_head_deferred:
+            observed_mtp_calls = mtp_output_layer_calls - remaining_mtp_calls
+            raise RuntimeError(
+                "The main output_layer was not reached after the configured MTP head calls: "
+                f"{mtp_output_layer_calls=}, {observed_mtp_calls=}"
+            )
     finally:
         try:
             del output_layer.forward
@@ -140,7 +178,7 @@ def _should_use_sft_chunked(args: Namespace) -> bool:
     - SFT mode (loss_type == "sft")
     - User explicitly opted in via --sft-chunked-logits
 
-    All incompatibilities (tied embeddings, MTP, combined-1f1b) are enforced
+    Remaining incompatibilities (tied embeddings, combined-1f1b) are enforced
     earlier as hard AssertionErrors in arguments.py.slime_validate_args, so
     by the time we reach this gate sft_chunked_logits=True is guaranteed safe.
     """
@@ -231,6 +269,20 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     return opt_param_scheduler
 
 
+def _build_optimizer_config_kwargs(args: Namespace) -> dict[str, object]:
+    """Build optimizer kwargs from normalized runtime arguments."""
+    kwargs = {}
+    for field in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, field.name):
+            kwargs[field.name] = getattr(args, field.name)
+    if args.fp16:
+        kwargs["bf16"] = False
+        kwargs["fp16"] = True
+        kwargs["params_dtype"] = torch.float16
+        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
+    return kwargs
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -272,7 +324,7 @@ def setup_model_and_optimizer(
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
     # the actual model modules to remove stale (orphaned) entries.
-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+    if Envs.ENABLE_ROUTING_REPLAY:
         from relax.utils.training.routing_replay import RoutingReplay
 
         active_replays = []
@@ -292,19 +344,7 @@ def setup_model_and_optimizer(
     if args.only_load_weight:
         return model, None, None
     # Optimizer
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    if args.fp16:
-        kwargs["bf16"] = False
-        kwargs["fp16"] = True
-        kwargs["params_dtype"] = torch.float16
-        kwargs["initial_loss_scale"] = 32768
-        kwargs["min_loss_scale"] = 1
-        kwargs["use_precision_aware_optimizer"] = True
-        kwargs["store_param_remainders"] = False
-        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
+    kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
@@ -664,6 +704,7 @@ def forward_only(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     store_prefix: str = "",
+    per_sample_output: bool = True,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -683,6 +724,10 @@ def forward_only(
         data_iterator (Sequence[DataIterator]): Iterable(s) yielding batches for inference.
         num_microbatches (Sequence[int]): Number of microbatches per rollout step.
         store_prefix (str): Prefix to prepend to stored output keys.
+        per_sample_output (bool): Whether the callback returns one tensor per
+            sample. Dynamic CP reconstructs and reorders only per-sample
+            outputs; per-microbatch aggregates remain CP-local and are reduced
+            by their caller.
 
     Returns:
         dict[str, list[torch.Tensor]]: Aggregated outputs keyed by ``store_prefix + key``.
@@ -805,7 +850,7 @@ def forward_only(
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
 
-        if getattr(args, "dynamic_context_parallel", False):
+        if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
             # Carry per-mb dynamic-CP metadata on the result so
             # dynamic_cp_merge_output can reconstruct the full mb (CP
             # all-gather + cross-sub-group gather + reorder) before the write-back.
@@ -860,7 +905,7 @@ def forward_only(
     rollout_data = {}
     # Store the results on the last stage
     if mpu.is_pipeline_last_stage():
-        if getattr(args, "dynamic_context_parallel", False):
+        if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
             # Reconstruct each mb's full sample set (CP all-gather + cross-sub-group
             # gather + reorder) so the per-sample outputs line up with the full
             # micro_batch_indices used by the write-back below.
@@ -879,7 +924,7 @@ def forward_only(
                 assert isinstance(value[key], list)
                 values += value[key]
 
-            if args.use_dynamic_batch_size:
+            if args.use_dynamic_batch_size and per_sample_output:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
                 origin_indices = sum(data_iterator[0].micro_batch_indices, [])
@@ -994,7 +1039,7 @@ def train_one_step(
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
@@ -1061,12 +1106,18 @@ def train_one_step(
             # SFT: defer lm_head into the loss (sft_loss_function_chunked)
             # so the full [B, S, V/TP] fp32 logits tensor never materializes.
             if sft_chunked:
-                with _bypass_output_layer(model) as lm_head_forward:
+                mtp_output_layer_calls = (
+                    int(getattr(args, "mtp_num_layers", 0) or 0) if getattr(args, "enable_mtp_training", False) else 0
+                )
+                with _bypass_output_layer(
+                    model,
+                    mtp_output_layer_calls=mtp_output_layer_calls,
+                ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
                 output_tensor = model(**forward_kwargs)
 
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+        if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
         # Always dispatch via loss_function. lm_head_forward is None unless the
@@ -1483,23 +1534,120 @@ def save(
         enable_forward_pre_hook(model)
 
 
-def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
+def _install_streaming_fp8_writer(bridge, strategy, block_size):
+    """Monkey-patch the bridge source's save_generator with a
+    StreamingFP8Writer.
+
+    Returns (writer, restore_fn). Caller MUST invoke restore_fn in a finally
+    block so subsequent BF16 exports on the same bridge instance are not
+    hijacked.
+    """
+    from relax.utils.quant_cast.fp8_checkpoint import StreamingFP8Writer
+
+    state = getattr(bridge.hf_pretrained, "state", None)
+    source = getattr(state, "source", None) if state is not None else None
+    if source is None or not hasattr(source, "key_to_filename_map"):
+        raise ValueError("Online FP8 export requires --hf-checkpoint to point to a safetensors-backed HF directory.")
+
+    writer = StreamingFP8Writer(
+        source.key_to_filename_map,
+        strategy,
+        block_size,
+        device="cuda",
+    )
+    original_save_generator = source.save_generator
+    source.save_generator = writer.save_generator
+
+    def restore() -> None:
+        source.save_generator = original_save_generator
+
+    return writer, restore
+
+
+def _apply_fp8_quantization_config(config_path, strategy, block_size, modules_to_not_convert):
+    """Merge FP8 `quantization_config` into an already-written HF
+    config.json."""
+    import json
+
+    from relax.utils.quant_cast.fp8 import build_quantization_config
+
+    if not os.path.isfile(config_path):
+        return
+    with open(config_path) as f:
+        cfg = json.load(f)
+    cfg["quantization_config"] = build_quantization_config(strategy, block_size, modules_to_not_convert)
+    with open(config_path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def _invoke_save_hf_post_hook(args, hf_path, rollout_id, *, is_lora, force_sync=False):
+    """Invoke the user-supplied post-save hook; log-and-swallow exceptions.
+
+    Called on WORLD rank 0 only, after every HF shard + LoRA adapter + FP8
+    config patch have hit disk. Sync-return-fast contract: hooks that need to
+    do heavy I/O (uploads, RPCs) must enqueue to their own background pool and
+    return immediately.
+
+    When ``force_sync=True`` (final save), also invokes the hook module's
+    optional module-level ``flush()`` so the container does not exit while
+    background work is still in flight. ``flush()`` is best-effort: absent
+    attr is a no-op, and exceptions are swallowed.
+    """
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    try:
+        from relax.utils.misc import load_function
+
+        hook = load_function(hook_path)
+        hook(
+            args,
+            str(hf_path),
+            rollout_id,
+            dtype=getattr(args, "save_hf_dtype", "bf16"),
+            is_lora=is_lora,
+        )
+    except Exception:
+        logger.exception(f"save-hf post-hook {hook_path!r} raised; training continues")
+
+    if force_sync:
+        try:
+            import importlib
+
+            module_path = hook_path.rpartition(".")[0]
+            hook_module = importlib.import_module(module_path)
+            flush = getattr(hook_module, "flush", None)
+            if callable(flush):
+                logger.info(f"save-hf post-hook: draining {module_path}.flush() on final save")
+                flush()
+        except Exception:
+            logger.exception(f"save-hf post-hook flush for {hook_path!r} raised; training continues")
+
+
+def _resolve_save_hf_path(save_hf: str, rollout_id: int) -> Path:
+    """Resolve an HF checkpoint path while preserving legacy templates."""
+    has_rollout_id = any(field_name == "rollout_id" for _, field_name, _, _ in string.Formatter().parse(save_hf))
+    path = Path(save_hf.format(rollout_id=rollout_id))
+    if not has_rollout_id:
+        path /= f"iter_{rollout_id:07d}"
+    return path
+
+
+def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bool = False) -> None:
     """Save Megatron model in HuggingFace format.
 
     Args:
         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.
         rollout_id (int): Rollout ID for path formatting.
     """
-    should_log = (
+    should_log = not torch.distributed.is_initialized() or (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
     )
 
     try:
         from megatron.bridge import AutoBridge
 
-        from relax.utils.megatron_bridge_utils import patch_megatron_model
-
-        path = Path(args.save_hf.format(rollout_id=rollout_id))
+        path = _resolve_save_hf_path(args.save_hf, rollout_id)
 
         if should_log:
             logger.info(f"Saving model in HuggingFace format to {path}")
@@ -1521,12 +1669,30 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         allow_missing_mtp_keys = reference_expects_mtp(args.hf_checkpoint) and not model_has_mtp
         strict = not allow_missing_mtp_keys
 
-        with patch_megatron_model(model):
-            bridge.save_hf_pretrained(
-                model,
-                path=path,
-                strict=strict,
+        save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
+        fp8_writer = None
+        restore_save_generator = None
+        if save_fp8:
+            fp8_writer, restore_save_generator = _install_streaming_fp8_writer(
+                bridge,
+                args.save_hf_fp8_quant_mode,
+                args.save_hf_fp8_block_size,
             )
+            # StreamingFP8Writer runs its own strict check against the source
+            # safetensors index and doesn't understand the "MTP is expected but
+            # missing" case; drop strict so Bridge yields whatever it has.
+            strict = strict and not allow_missing_mtp_keys
+
+        try:
+            with patch_megatron_model(model):
+                bridge.save_hf_pretrained(
+                    model,
+                    path=path,
+                    strict=strict,
+                )
+        finally:
+            if restore_save_generator is not None:
+                restore_save_generator()
 
         # When MTP keys are tolerated as missing (strict=False above), Megatron-Bridge's
         # non-distributed save still lists those mtp.* keys in model.safetensors.index.json
@@ -1534,18 +1700,31 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         # absent. Reconcile: rebuild the index from the tensors actually written and
         # supplement MTP from the base HF model, so the checkpoint loads cleanly (incl.
         # EAGLE speculative decoding). The bridge writes on WORLD rank 0, so run the
-        # reconcile there too (the output lives on shared storage).
+        # reconcile there too (the output lives on shared storage). The FP8 path uses a
+        # separate streaming writer with its own index and is skipped here (mirrors
+        # scripts/tools/convert_torch_dist_to_hf_bridge.py).
         is_export_writer = (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         )
-        if allow_missing_mtp_keys and is_export_writer:
+        if allow_missing_mtp_keys and is_export_writer and not save_fp8:
             reconcile_hf_export_index(str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=True)
+
+        if save_fp8 and is_export_writer and fp8_writer is not None:
+            _apply_fp8_quantization_config(
+                str(path / "config.json"),
+                args.save_hf_fp8_quant_mode,
+                args.save_hf_fp8_block_size,
+                fp8_writer.result.modules_to_not_convert,
+            )
 
         if is_lora_enabled(args):
             _save_lora_to_checkpoint(model, str(path), args, bridge=bridge)
         if should_log:
             logger.info(f"Successfully saved HuggingFace model to {path}")
+
+        if is_export_writer:
+            _invoke_save_hf_post_hook(args, path, rollout_id, is_lora=is_lora_enabled(args), force_sync=force_sync)
     except Exception as e:
         if should_log:
             logger.error(f"Failed to save HuggingFace format: {e}")
@@ -1594,7 +1773,5 @@ def initialize_model_and_optimizer(
         )
         install_critic_value_head_runtime_check(model)
     clear_memory()
-    if opt_param_scheduler is not None:
-        opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
     return model, optimizer, opt_param_scheduler, iteration

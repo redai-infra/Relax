@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import ray
 import requests
@@ -16,18 +16,120 @@ import sglang_router
 from packaging.version import parse
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from urllib3.exceptions import NewConnectionError
+
+
+try:
+    from sglang.srt.server_args import LOAD_FORMAT_CHOICES
+except ImportError:
+    # Older SGLang releases expose the legacy remote loader but not the shared
+    # choices constant. Keep module import compatible with those releases.
+    LOAD_FORMAT_CHOICES = ("remote",)
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run
-from relax.utils.http_utils import get_host_info
+from relax.utils.env import Envs
+from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.model_source import ModelSource, SGLangLoadPlan
+from relax.utils.s3_model_loader import (
+    get_s3_model_cached_path,
+    is_s3_uri,
+    maybe_resolve_s3_model_to_shm,
+    resolve_s3_model_metadata_to_shm,
+)
 
 
 logger = get_logger(__name__)
+
+
+# GenRM colocate offload drain: bound every HTTP round-trip and the whole drain
+# by a wall-clock deadline so a wedged SGLang scheduler surfaces as a
+# TimeoutError instead of blocking rank-0 in ray.get() (and every other rank at
+# the downstream offload barrier) indefinitely.
+_GENRM_OFFLOAD_DRAIN_TIMEOUT_S = 120.0
+_GENRM_OFFLOAD_RELEASE_TIMEOUT_S = 120.0
+_SGLANG_HTTP_ATTEMPT_TIMEOUT_S = 30.0
+_MIN_HTTP_TIMEOUT_S = 1.0
+
+
+def _preferred_s3_stream_load_format() -> str:
+    if "runai_streamer" in LOAD_FORMAT_CHOICES:
+        return "runai_streamer"
+    if "remote" in LOAD_FORMAT_CHOICES:
+        logger.warning("SGLang does not expose runai_streamer; falling back to the legacy remote loader")
+        return "remote"
+    raise RuntimeError("The installed SGLang does not support runai_streamer or the legacy remote loader")
+
+
+def _configure_runai_streamer_env(args) -> None:
+    model_source = args.model_source
+    if model_source.endpoint:
+        os.environ["AWS_ENDPOINT_URL"] = model_source.endpoint
+        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = model_source.endpoint
+    if model_source.addressing_style == "path":
+        os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = "0"
+    else:
+        os.environ.pop("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", None)
+    if model_source.credential_mode == "placeholder":
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+        os.environ["AWS_ACCESS_KEY_ID"] = "mock"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "mock"
+        os.environ.pop("AWS_SESSION_TOKEN", None)
+
+
+def build_sglang_load_plan(server_args: dict, args) -> SGLangLoadPlan:
+    """Build one policy loading decision for an SGLang engine group."""
+    model_source = getattr(args, "model_source", None)
+    model_path = server_args["model_path"]
+    load_format = server_args.get("load_format", "auto")
+    if model_source is None:
+        return SGLangLoadPlan(
+            model_path=model_path,
+            load_format=load_format,
+            source=ModelSource(uri=model_path),
+        )
+    if model_path != model_source.uri or not is_s3_uri(model_source.uri):
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    if load_format in {"runai_streamer", "remote"}:
+        _configure_runai_streamer_env(args)
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    cached_path = get_s3_model_cached_path(model_source.uri, args)
+    if load_format == "dummy":
+        model_path = cached_path or resolve_s3_model_metadata_to_shm(model_source.uri, args)
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    if load_format == "auto":
+        # A multi-node engine group must not make node-local cache decisions
+        # independently. Until group-wide readiness coordination is available,
+        # all ranks use streaming. Single-node groups may reuse ready SHM.
+        if server_args.get("nnodes", 1) == 1 and cached_path is not None:
+            return SGLangLoadPlan(model_path=cached_path, load_format=load_format, source=model_source)
+        load_format = _preferred_s3_stream_load_format()
+        _configure_runai_streamer_env(args)
+        return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+    model_path = maybe_resolve_s3_model_to_shm(model_source.uri, args)
+    return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+
+
+def _apply_sglang_policy_load_plan(server_args: dict, args) -> dict:
+    """Apply the policy model load plan to a copied ServerArgs dictionary."""
+    plan = build_sglang_load_plan(server_args, args)
+    resolved = dict(server_args)
+    resolved["model_path"] = plan.model_path
+    resolved["load_format"] = plan.load_format
+    return resolved
+
+
+# Consecutive connection failures that mean "the server process is gone" rather
+# than "the server is briefly busy". Bail out instead of retrying until the
+# drain deadline: a dead engine will never answer.
+_MAX_CONSECUTIVE_CONNECT_ERRORS = 3
 
 
 def get_base_gpu_id(args, rank):
@@ -88,12 +190,12 @@ def _launch_server_with_patches(server_args: ServerArgs):
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
-    if os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1":
+    if Envs.RELAX_OPD_PREEXPANDED_PATCH:
         from relax.utils.opd.opd_sglang_patch import apply_opd_preexpanded_patch
 
         apply_opd_preexpanded_patch()
 
-    if os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1":
+    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -138,9 +240,9 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     #   - RELAX_OPTIMIZE_ROUTING_REPLAY : async D→H routing-replay patch (runtime)
     #   - RELAX_OPD_PREEXPANDED_PATCH   : OPD pre-expanded multimodal patch (runtime)
     #   - RELAX_OPD_PER_POS_TOKEN_IDS   : OPD per-position token_ids logprob;
-    optimize = os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1"
-    opd_patch = os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1"
-    per_pos = os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1"
+    optimize = Envs.RELAX_OPTIMIZE_ROUTING_REPLAY
+    opd_patch = Envs.RELAX_OPD_PREEXPANDED_PATCH
+    per_pos = Envs.RELAX_OPD_PER_POS_TOKEN_IDS
     logger.info(
         "Launching SGLang server with independently-gated patches: "
         f"routing_replay={optimize}, opd_preexpanded={opd_patch}, per_pos_token_ids={per_pos}"
@@ -239,6 +341,8 @@ class SGLangEngine(RayActor):
         self.num_gpus_per_engine = num_gpus_per_engine
         self._evicted = threading.Event()
         self._is_weight_updating: bool = False
+        self._router_worker_id: str | None = None
+        self._router_unregister_submitted = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -430,19 +534,22 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router()
 
-    def _init_normal(self, server_args_dict):
+    def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
+        if apply_policy_load_plan:
+            server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
             os.environ["RELAX_OPTIMIZE_ROUTING_REPLAY"] = "1"
 
-        if os.environ.get("RELAX_OPD_PER_POS_TOKEN_IDS", "0") == "1":
+        if Envs.RELAX_OPD_PER_POS_TOKEN_IDS:
             os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"
             top_k = getattr(self.args, "opd_log_prob_top_k", 0)
             if top_k:
                 os.environ["RELAX_OPD_TOKEN_IDS_LOGPROB_K"] = str(top_k)
             logger.info(
                 "Set RELAX_FORCE_LOGPROBS_BASE64=1, RELAX_OPD_TOKEN_IDS_LOGPROB_K=%s (topk enabled)",
-                os.environ.get("RELAX_OPD_TOKEN_IDS_LOGPROB_K", "0"),
+                Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
             )
 
         # Set SGLang external model/processor package env vars so the spawned
@@ -477,13 +584,16 @@ class SGLangEngine(RayActor):
         if not self._skip_router_registration:
             self.register_to_router(bootstrap_port=bootstrap_port)
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
         payload.
 
         Args:
             endpoint: The API endpoint to call
             payload: The JSON payload to send (default: empty dict)
+            timeout: Optional per-request timeout in seconds. Defaults to None
+                (no timeout) to preserve behaviour for existing callers; pass a
+                bound on paths that must not hang (e.g. colocate offload).
 
         Returns:
             The JSON response from the server
@@ -491,7 +601,7 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -607,24 +717,64 @@ class SGLangEngine(RayActor):
         """
         return self._make_request("unload_lora_adapter", {"lora_name": lora_name})
 
-    def flush_cache(self):
+    def abort_requests(self, timeout: float = _SGLANG_HTTP_ATTEMPT_TIMEOUT_S):
+        """Best-effort abort of all in-flight requests on the engine.
+
+        Called while draining before offload (``release_memory_occupation``) so
+        lingering requests do not block ``flush_cache``: SGLang returns HTTP
+        400 from ``/flush_cache`` while the scheduler still has pending/running
+        requests. A GenRM judge/summary ``/generate`` left over from a partial
+        rollout can keep decoding for minutes, which otherwise times out the
+        offload and kills the job. Aborting drains the scheduler so the
+        subsequent flush + memory release proceed. Never raises — abort failure
+        must not block the offload path.
+        """
+        if self.node_rank != 0:
+            return
+        try:
+            requests.post(
+                f"http://{self.server_host}:{self.server_port}/abort_request",
+                json={"abort_all": True},
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort, keep offloading
+            logger.info(f"abort_requests failed (continuing to flush): {e}")
+
+    def flush_cache(self, timeout_s: float = 120.0, max_connect_errors: int = _MAX_CONSECUTIVE_CONNECT_ERRORS):
         """Flush the cache of the server."""
         if self.node_rank != 0:
             return
+        deadline = time.monotonic() + timeout_s
+        connect_errors = 0
         # flush cache will not return status_code 200 when there are pending requests
-        for _ in range(60):
+        while True:
             try:
-                response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
+                response = requests.get(
+                    f"http://{self.server_host}:{self.server_port}/flush_cache",
+                    timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S,
+                )
                 if response.status_code == 200:
                     break
-            except NewConnectionError as e:
-                raise e
+                # 400 = running/waiting requests present; wait and retry below.
+                connect_errors = 0
+            except requests.exceptions.ConnectionError as e:
+                connect_errors += 1
+                logger.warning(
+                    f"Cannot reach {self.server_host}:{self.server_port}/flush_cache "
+                    f"({connect_errors}/{max_connect_errors}): {e}"
+                )
+                if connect_errors >= max_connect_errors:
+                    raise ConnectionError(
+                        f"Engine {self.server_host}:{self.server_port} unreachable while "
+                        f"flushing cache ({connect_errors} consecutive connection errors) "
+                        f"— the server process is most likely dead."
+                    ) from e
             except Exception as e:
+                connect_errors = 0
                 logger.info(f"Error flushing cache: {e}")
-                time.sleep(1)
-                continue
-        else:
-            raise TimeoutError("Timeout while flushing cache.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timeout while flushing cache.")
+            time.sleep(1)
 
     def shutdown(self):
         if self.args.rollout_external:
@@ -701,45 +851,136 @@ class SGLangEngine(RayActor):
                     timeout=30,
                 )
             response.raise_for_status()
+            self._router_worker_id = None
+            if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
+                try:
+                    response_payload = response.json()
+                except ValueError:
+                    response_payload = {}
+                if isinstance(response_payload, dict):
+                    worker_id = response_payload.get("worker_id")
+                    if worker_id is not None and str(worker_id):
+                        self._router_worker_id = str(worker_id)
+                if self._router_worker_id is None:
+                    location = response.headers.get("Location")
+                    if not location and isinstance(response_payload, dict):
+                        location = response_payload.get("location")
+                    try:
+                        location_path = urlsplit(location).path.rstrip("/")
+                    except (TypeError, ValueError):
+                        location_path = ""
+                    parent_path, separator, worker_id = location_path.rpartition("/")
+                    if separator and parent_path.endswith("/workers") and worker_id:
+                        self._router_worker_id = worker_id
+                if self._router_worker_id is None:
+                    logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
+            self._router_unregister_submitted = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
             logger.warning(f"Failed to register engine to router: {e}")
             return False
 
-    def unregister_from_router(self) -> bool:
+    def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        last_error = None
+        while True:
+            try:
+                response = requests.get(
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    timeout=min(5.0, max(1.0, deadline - time.monotonic())),
+                )
+                response.raise_for_status()
+                workers = response.json().get("workers", [])
+                if not any(
+                    isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
+                    for worker in workers
+                ):
+                    return True
+                last_error = None
+            except Exception as e:
+                last_error = e
+
+            if time.monotonic() >= deadline:
+                error_suffix = f": {last_error}" if last_error is not None else ""
+                logger.warning(f"Timed out waiting for worker {worker_url} to leave the router{error_suffix}")
+                return False
+            time.sleep(0.5)
+
+    def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
-
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        router_version = parse(sglang_router.__version__)
+        if self._router_unregister_submitted:
+            if not wait_for_removal or router_version < parse("0.3.0"):
+                return True
+            removed = self._wait_for_router_removal(worker_url, timeout)
+            if not removed:
+                self._router_unregister_submitted = False
+            return removed
+
         try:
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
+            if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
                     timeout=30,
                 )
-            elif parse(sglang_router.__version__) < parse("0.3.0"):
+            elif router_version < parse("0.3.0"):
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
                     timeout=30,
                 )
+            elif self._router_worker_id is not None:
+                response = requests.delete(
+                    f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}",
+                    timeout=30,
+                )
             else:
-                all_workers = requests.get(
+                workers_response = requests.get(
                     f"http://{self.router_ip}:{self.router_port}/workers",
                     timeout=30,
-                ).json()["workers"]
+                )
+                workers_response.raise_for_status()
+                all_workers = workers_response.json().get("workers", [])
+                exact_worker = None
+                dp_worker_found = False
                 for worker in all_workers:
-                    if worker["url"] == worker_url:
-                        worker_id = worker["id"]
-                        response = requests.delete(
-                            f"http://{self.router_ip}:{self.router_port}/workers/{worker_id}",
-                            timeout=30,
-                        )
-                        break
-                else:
+                    if not isinstance(worker, dict):
+                        continue
+                    listed_worker_url = worker.get("url")
+                    if listed_worker_url == worker_url:
+                        exact_worker = worker
+                    elif (
+                        isinstance(listed_worker_url, str) and router_worker_base_url(listed_worker_url) == worker_url
+                    ):
+                        dp_worker_found = True
+
+                if dp_worker_found:
+                    logger.warning(
+                        f"Cannot unregister DP-aware engine {worker_url} without its registration worker ID."
+                    )
+                    return False
+                if exact_worker is None:
                     logger.warning(f"Worker {worker_url} not found in router during unregister.")
                     return False
-            response.raise_for_status()
+
+                worker_id = exact_worker.get("id")
+                if worker_id is None or str(worker_id) == "":
+                    logger.warning(f"Router worker {worker_url} did not have a worker ID during unregister.")
+                    return False
+                response = requests.delete(
+                    f"http://{self.router_ip}:{self.router_port}/workers/{quote(str(worker_id), safe='')}",
+                    timeout=30,
+                )
+            if response.status_code != 404:
+                response.raise_for_status()
+            self._router_unregister_submitted = True
+            if wait_for_removal and router_version >= parse("0.3.0"):
+                removed = self._wait_for_router_removal(worker_url, timeout)
+                if not removed:
+                    self._router_unregister_submitted = False
+                    return False
             logger.info(f"Unregistered engine {worker_url} from router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -839,13 +1080,17 @@ class SGLangEngine(RayActor):
             },
         )
 
-    def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+    def pause_generation(self, timeout: float | None = None):
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, timeout=timeout
+        )
         response.raise_for_status()
         return response
 
-    def continue_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
+    def continue_generation(self, timeout: float | None = None):
+        response = requests.post(
+            f"http://{self.server_host}:{self.server_port}/continue_generation", json={}, timeout=timeout
+        )
         response.raise_for_status()
         return response
 
@@ -934,7 +1179,91 @@ class GenRMEngine(SGLangEngine):
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
         else:
-            self._init_normal(server_args_dict)
+            self._init_normal(server_args_dict, apply_policy_load_plan=False)
+
+    def release_memory_occupation(self):
+        # GenRM is colocated on the training GPUs, so it must offload at the
+        # rollout->train transition. Two failure modes are defended against here:
+        #
+        # 1. Admission race. SGLang's release_memory_occupation asserts the
+        #    scheduler is idle (``_is_no_request``); a straggler agentic
+        #    /generate admitted between our flush and the release crashes the
+        #    scheduler. relax has no hard barrier guaranteeing all agentic
+        #    sessions are quiesced before offload, so /pause_generation
+        #    (mode="abort", the default) is issued first: it stops the scheduler
+        #    from admitting new requests for the whole offloaded window AND
+        #    aborts everything in flight. Admission is re-opened by
+        #    continue_generation in resume_memory_occupation, after weights + KV
+        #    cache are back. We still abort on each retry as a fallback in case
+        #    the pause did not take (best-effort). Safe because the batch's
+        #    reward/judge is already computed by offload time — no in-flight
+        #    GenRM request needs to survive.
+        #
+        # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
+        #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
+        #    scheduler blocks rank-0 in ray.get() forever and every other rank
+        #    stalls at the downstream offload barrier — a silent training hang.
+        if self.node_rank == 0:
+            deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
+            self._pause_generation_for_offload(deadline)
+            connect_errors = 0
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timeout while draining GenRM before release.")
+                self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+                try:
+                    resp = requests.get(
+                        f"http://{self.server_host}:{self.server_port}/flush_cache",
+                        timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()),
+                    )
+                    if resp.status_code == 200:
+                        break
+                    connect_errors = 0
+                except requests.exceptions.ConnectionError as e:
+                    # requests wraps urllib3's NewConnectionError, so catching the
+                    # latter here would never fire and a dead engine would be
+                    # retried until the drain deadline.
+                    connect_errors += 1
+                    logger.warning(
+                        f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
+                        f"draining GenRM ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
+                    )
+                    if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
+                        raise ConnectionError(
+                            f"GenRM engine {self.server_host}:{self.server_port} unreachable while "
+                            f"draining before release ({connect_errors} consecutive connection "
+                            f"errors) — the server process is most likely dead."
+                        ) from e
+                except Exception as e:  # noqa: BLE001
+                    connect_errors = 0
+                    logger.info(f"Error flushing GenRM cache: {e}")
+                time.sleep(1)
+        return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
+
+    def resume_memory_occupation(self, tags: list[str] = None):
+        result = super().resume_memory_occupation(tags=tags)
+        # Re-open admission that release_memory_occupation closed via
+        # /pause_generation. Only after a full resume (weights + KV cache back):
+        # GenRM always full-resumes, but the ``not tags`` guard prevents
+        # re-enabling generation before KV cache exists if a partial
+        # (weights-only) resume is ever introduced. Not swallowed — if the
+        # engine stays paused, GenRM silently stops serving, so fail loudly.
+        if self.node_rank == 0 and not tags:
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+        return result
+
+    def _pause_generation_for_offload(self, deadline: float) -> None:
+        """Best-effort /pause_generation (abort mode) before draining for
+        offload.
+
+        Never raises: if the pause does not take, the per-retry abort in
+        release_memory_occupation still drains the engine — the pause only
+        additionally closes the flush->release admission window.
+        """
+        try:
+            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
 def _compute_genrm_server_args(
@@ -962,8 +1291,9 @@ def _compute_genrm_server_args(
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
 
+    hf_model_path = args.genrm_model_path
     kwargs = {
-        "model_path": os.path.normpath(args.genrm_model_path),
+        "model_path": hf_model_path if is_s3_uri(hf_model_path) else os.path.normpath(hf_model_path),
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
@@ -996,8 +1326,10 @@ def _compute_genrm_server_args(
         "enable_draft_weights_cpu_backup": True,
         # GenRM Only
         "enable_weights_cpu_backup": True,
+        # The global load format belongs to policy rollout engines. GenRM must
+        # load real weights unless its own engine config explicitly overrides it.
+        "load_format": "auto",
     }
-
     # Allow per-genrm SGLang mem_fraction_static via --genrm-engine-config; this overrides
     # the global --sglang-mem-fraction-static below so rollout and genrm can share GPUs.
     if "mem_fraction_static" in args.genrm_engine_config:
@@ -1072,8 +1404,10 @@ def _compute_server_args(
     node_rank = rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
+
+    hf_model_path = args.hf_checkpoint
     kwargs = {
-        "model_path": os.path.normpath(args.hf_checkpoint),
+        "model_path": hf_model_path if is_s3_uri(hf_model_path) else os.path.normpath(hf_model_path),
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
@@ -1133,8 +1467,10 @@ def _compute_server_args(
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
+    server_arg_fields = dataclasses.fields(ServerArgs)
+    server_arg_field_names = {attr.name for attr in server_arg_fields}
     unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
+    for attr in server_arg_fields:
         if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
             continue
         if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
@@ -1149,6 +1485,14 @@ def _compute_server_args(
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value
             unused_keys.discard(key)
+
+    if (
+        "cuda_graph_backend_prefill" in server_arg_field_names
+        and kwargs.get("enable_memory_saver")
+        and kwargs.get("cuda_graph_backend_prefill") is None
+    ):
+        # Breakable is SGLang's default prefill backend on CUDA, but it is incompatible with memory saver mode.
+        kwargs["cuda_graph_backend_prefill"] = "disabled"
 
     # for compatibility with old args
     if len(unused_keys) > 0:

@@ -38,6 +38,7 @@ from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingData
 from relax.engine.sft.debug_print import print_first_sample
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
 
@@ -95,6 +96,7 @@ class SFT(Base):
     def _init_data_pipeline(self) -> None:
         if self._dataset is not None:
             return
+        prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
             self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
@@ -112,6 +114,7 @@ class SFT(Base):
         seed = getattr(self.config, "seed", 42)
 
         oversize_strategy = getattr(self.config, "sft_oversize_strategy", "keep")
+        invalid_multimodal_strategy = getattr(self.config, "sft_invalid_multimodal_strategy", "error")
         oversize_custom_path = getattr(self.config, "sft_oversize_custom_function_path", None)
         oversize_custom_fn = None
         if oversize_strategy == "custom":
@@ -121,6 +124,7 @@ class SFT(Base):
             self._logger.info(f"SFT oversize strategy: custom (loaded {oversize_custom_path})")
         else:
             self._logger.info(f"SFT oversize strategy: {oversize_strategy}")
+        self._logger.info(f"SFT invalid multimodal strategy: {invalid_multimodal_strategy}")
 
         dataset_cls = _load_custom_dataset_class(getattr(self.config, "custom_dataset_class_path", None))
         if dataset_cls is None:
@@ -143,6 +147,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 oversize_strategy=oversize_strategy,
                 oversize_custom_fn=oversize_custom_fn,
+                invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
             )
         else:
@@ -202,6 +207,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 oversize_strategy=oversize_strategy,
                 oversize_custom_fn=oversize_custom_fn,
+                invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
             )
 
@@ -320,10 +326,12 @@ class SFT(Base):
         # path (already parallel via background threads). When prefetch is off,
         # it parallelises multimodal preprocess via asyncio.gather over the pool.
         samples, crossed_epoch = await self._dataset.get_batch_async(self.config.global_batch_size)
-        if not samples:
-            self._logger.warning(f"SFT step {self.step}: get_batch returned 0 samples; skipping push.")
-            self.step += 1
-            return
+        if len(samples) != self.config.global_batch_size:
+            raise RuntimeError(
+                f"SFT step {self.step}: dataset returned {len(samples)}/{self.config.global_batch_size} samples "
+                "after bounded refill attempts. Refusing to push a partial TQ partition because the Megatron "
+                "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
+            )
         self._maybe_print_first_sample(samples)
         backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
         assert backend_batch is not None
@@ -370,8 +378,11 @@ class SFT(Base):
         if samples is None:
             return
         if not samples:
-            self._logger.warning("Eval source produced 0 valid samples; skipping eval push.")
-            return
+            raise RuntimeError(
+                f"Eval @ step {self.step}: source produced 0 valid samples. Refusing to skip the eval push because "
+                "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
+                "skip warnings."
+            )
 
         # Pad sub-gbs eval pools with random resamples so the eval set always
         # forms at least one full ``global_batch_size`` chunk. Without this the
@@ -411,11 +422,10 @@ class SFT(Base):
         n_chunks = n_samples // chunk_size
         n_dropped = n_samples - n_chunks * chunk_size
         if n_chunks == 0:
-            self._logger.warning(
+            raise RuntimeError(
                 f"Eval @ step {self.step}: eval pool of {n_samples} samples is smaller than "
-                f"global_batch_size ({chunk_size}); cannot push any chunk, skipping eval."
+                f"global_batch_size ({chunk_size}); cannot push the full partition expected by the consumer."
             )
-            return
         if n_dropped > 0:
             self._logger.warning(
                 f"Eval @ step {self.step}: dropping {n_dropped} trailing sample(s) so eval "
@@ -456,9 +466,7 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
-            for _ in range(self.config.num_rollout):
-                if self._stop_event.is_set():
-                    break
+            while self.step < self.config.num_rollout and not self._stop_event.is_set():
                 await self._produce_one_step()
         except Exception as exc:
             error_msg = f"SFT producer crashed at step {self.step}: {type(exc).__name__}: {str(exc)}"

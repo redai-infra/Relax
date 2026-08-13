@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 from typing import Any
 
@@ -12,6 +13,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
@@ -65,6 +67,14 @@ def check_transfer_queue_version() -> None:
         )
 
 
+def _positive_int(value: str) -> int:
+    """argparse type that rejects non-positive integers at parse time."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -79,6 +89,55 @@ def reset_arg(parser, name, **kwargs):
             break
     else:
         parser.add_argument(name, **kwargs)
+
+
+def _add_fp16_optimizer_arguments(parser):
+    """Expose FP16 optimizer settings while preserving an unset sentinel."""
+    reset_arg(
+        parser,
+        "--initial-loss-scale",
+        type=float,
+        default=None,
+        help="Initial loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--min-loss-scale",
+        type=float,
+        default=None,
+        help="Minimum loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--use-precision-aware-optimizer",
+        action="store_true",
+        default=None,
+        help="Use TransformerEngine's precision-aware optimizer.",
+    )
+    if "--no-use-precision-aware-optimizer" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-use-precision-aware-optimizer",
+            action="store_false",
+            dest="use_precision_aware_optimizer",
+            default=None,
+            help="Disable TransformerEngine's precision-aware optimizer.",
+        )
+    reset_arg(
+        parser,
+        "--store-param-remainders",
+        action="store_true",
+        default=None,
+        help="Store parameter remainders in the distributed optimizer.",
+    )
+    if "--no-store-param-remainders" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-store-param-remainders",
+            action="store_false",
+            dest="store_param_remainders",
+            default=None,
+            help="Do not store parameter remainders in the distributed optimizer.",
+        )
+    return parser
 
 
 def get_slime_extra_args_provider(add_custom_arguments=None):
@@ -301,6 +360,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
             )
             parser.add_argument(
+                "--selective-offload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Offload the training actor to CPU during colocate sleep/wake by copying only the "
+                    "live train state (weights + optimizer state) instead of torch_memory_saver's "
+                    "whole-pool pause. Default is torch_memory_saver; use this on backends where "
+                    "its VMM pause() is unavailable/unsafe (e.g. Kunlunxin P800)."
+                ),
+            )
+            parser.add_argument(
                 "--disable-weights-backuper",
                 action="store_false",
                 dest="enable_weights_backuper",
@@ -322,6 +392,51 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "and to genrm / teacher SGLang engines. Coordinated per node per checkpoint path, "
                     "so each unique checkpoint is streamed at most once per node."
                 ),
+            )
+            parser.add_argument(
+                "--disable-s3-model-download",
+                action="store_true",
+                default=False,
+                help="Disable Relax-managed S3-to-SHM model materialization",
+            )
+            parser.add_argument(
+                "--disable-s3-model-cleanup",
+                action="store_true",
+                default=False,
+                help="Keep downloaded S3 model weight shards in SHM after service initialization",
+            )
+            parser.add_argument(
+                "--s3-model-download-workers",
+                type=int,
+                default=20,
+                help="Number of concurrent workers used to download an S3 model to SHM",
+            )
+            parser.add_argument(
+                "--s3-model-shm-root",
+                type=str,
+                default="/dev/shm",
+                help=(
+                    "S3 model SHM root; it must already exist on every model consumer node, "
+                    "otherwise loading fails without falling back to disk"
+                ),
+            )
+            parser.add_argument(
+                "--s3-model-endpoint",
+                type=str,
+                default=None,
+                help="Optional endpoint URL for an S3-compatible model store",
+            )
+            parser.add_argument(
+                "--s3-model-use-placeholder-credentials",
+                action="store_true",
+                default=False,
+                help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+            )
+            parser.add_argument(
+                "--s3-model-use-path-style",
+                action="store_true",
+                default=False,
+                help="Use path-style addressing for an S3-compatible model store",
             )
             parser.add_argument(
                 "--custom-model-provider-path",
@@ -409,9 +524,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
                 "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
-                "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
-                "when --enable-mtp-training is set (MTP head needs the real output_layer; "
-                "bypass would break it) or when embeddings are tied "
+                "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
+                "continue to use the real output_layer before the main head is deferred. "
+                "Incompatible when embeddings are tied "
                 "(--untie-embeddings-and-output-weights not set: output_layer is built with "
                 "skip_weight_param_allocation=True so output_layer.weight is None and the "
                 "chunked path's lm_head matmul has nothing to multiply against; tied models "
@@ -546,6 +661,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-invalid-multimodal-strategy",
+                type=str,
+                default="error",
+                choices=["error", "skip"],
+                help=(
+                    "How to handle SFT samples where a rendered image/video/audio marker cannot resolve to "
+                    "exactly one inline or top-level media source, or duplicate sources are supplied. "
+                    "`error` (default) fails before model forward; `skip` emits a WARNING and refills the batch."
+                ),
+            )
+            parser.add_argument(
                 "--sft-tq-timeout-minutes",
                 type=int,
                 default=None,
@@ -567,6 +693,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
+            parser = _add_fp16_optimizer_arguments(parser)
             return parser
 
         # rollout
@@ -888,6 +1015,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
             )
             parser.add_argument(
+                "--rollout-http-timeout",
+                type=float,
+                default=120.0,
+                help="Timeout in seconds for actor HTTP probes to rollout and actor_fwd services.",
+            )
+            parser.add_argument(
                 "--rollout-health-check-first-wait",
                 type=float,
                 default=0,
@@ -1138,6 +1271,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "0 (default) disables the processor pool and uses ThreadPoolExecutor instead. "
                     "When set to a positive integer, creates a ProcessPoolExecutor with the specified number of workers "
                     "for true parallelism without GIL contention."
+                ),
+            )
+            parser.add_argument(
+                "--encode-max-workers",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Worker threads for the shared media-encoding thread pool (image/video/audio "
+                    "encoding offloaded from the asyncio event loop). Positive integer. If unset, "
+                    "falls back to $RELAX_ENCODE_MAX_WORKERS, then to min(32, usable CPU count)."
                 ),
             )
             parser.add_argument(
@@ -1483,6 +1626,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Path to save the model in HuggingFace format when using Megatron backend. "
                     "The model will be saved to `save_hf.format(rollout_id)`. "
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-dtype",
+                type=str,
+                choices=["bf16", "fp8"],
+                default="bf16",
+                help=(
+                    "Precision for online --save-hf export. 'bf16' (default) preserves prior "
+                    "behavior; 'fp8' streams e4m3 quantized shards. FP8 requires --save-hf and "
+                    "an --hf-checkpoint backed by safetensors."
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-fp8-quant-mode",
+                type=str,
+                choices=["block", "channel", "tensor"],
+                default="block",
+                help="FP8 quantization strategy for --save-hf-dtype fp8 (default: block).",
+            )
+            parser.add_argument(
+                "--save-hf-fp8-block-size",
+                type=int,
+                nargs=2,
+                default=None,
+                metavar=("ROWS", "COLS"),
+                help="Block shape for block FP8; defaults to (128, 128) when quant-mode=block.",
+            )
+            parser.add_argument(
+                "--save-hf-post-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Dotted path (module.func) to a callable invoked on WORLD rank 0 after each "
+                    "HF checkpoint is written. Signature: "
+                    "`hook(args, hf_path: str, rollout_id: int, *, dtype: str, is_lora: bool) -> None`. "
+                    "Called synchronously; heavy work (uploads, RPCs) must be enqueued to a background "
+                    "thread by the hook itself. Exceptions are logged and swallowed."
                 ),
             )
             reset_arg(parser, "--seed", type=int, default=1234)
@@ -1920,6 +2101,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(
+                "--load-forge-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Path (or {rollout_id} template) to a dumped rollout .pt replayed by "
+                    "relax.engine.rollout.forge_load.generate_rollout. A path without the placeholder is "
+                    "a literal file reused for every rollout; a path with {rollout_id} loads a per-rollout "
+                    "file. Unlike --load-debug-rollout-data, this does NOT set skip_sglang, so sglang, "
+                    "router, weight sync and the colocate offload/onload dance stay live (the point: "
+                    "measuring real colocate memory at long context)."
+                ),
+            )
+            parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
                 default=None,
@@ -2020,6 +2214,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Type of the reward model",
+            )
+            parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default=None,
+                help=(
+                    "Fallback for samples whose reward type is unknown or missing. "
+                    "None (default) keeps the current behavior of raising. 'zero' scores "
+                    "the sample 0.0 (reward-key aware) with a warning. Any registered "
+                    "reward type name routes degraded samples to that reward instead."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-infer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Infer the reward type from the sample label via registered label "
+                    "matchers when neither sample metadata nor --rm-type provides one. "
+                    "Also enables conflict detection (warn; the explicit type wins)."
+                ),
             )
             parser.add_argument(
                 "--reward-key",
@@ -2315,6 +2530,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: --autoscaler-config relax/utils/autoscaler/autoscaler.yaml"
                 ),
             )
+            parser.add_argument(
+                "--enable-affinity",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether baseline roles (actor / rollout-seed / colocate shared PG) require the "
+                    "'stable' worker-group node-group affinity markers, keeping elastic "
+                    "(autoscaler-enabled) jobs' baseline off elastic workers (which get reclaimed -> "
+                    "whole-job restart). Defaults to True. This flag is forwarded to "
+                    "create_placement_group(node_group_affinity=...); passing --no-enable-affinity "
+                    "opts every baseline placement group out of the marker requirement (escape valve) "
+                    "-- use it on plain/local clusters that don't declare the "
+                    "'{group}_gpu'/'{group}_cpu' custom resources so placement stays unconstrained "
+                    "and never hangs waiting for the markers. (Whether the job is elastic at all is "
+                    "gated separately by --autoscaler-config + its YAML 'enabled'.)"
+                ),
+            )
             return parser
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
@@ -2386,8 +2618,62 @@ def _pre_parse_mode():
     return temp_args
 
 
+def _pre_parse_cli_model_source():
+    """Build a serializable model source from the generic CLI."""
+    from relax.utils.model_source import ModelSource
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--hf-checkpoint", help="Hugging Face checkpoint path or model URI")
+    parser.add_argument(
+        "--disable-s3-model-download",
+        action="store_true",
+        help="Disable Relax-managed S3-to-SHM model materialization",
+    )
+    parser.add_argument(
+        "--s3-model-endpoint",
+        help="Optional endpoint URL for an S3-compatible model store",
+    )
+    parser.add_argument(
+        "--s3-model-use-placeholder-credentials",
+        action="store_true",
+        help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+    )
+    parser.add_argument(
+        "--s3-model-use-path-style",
+        action="store_true",
+        help="Use path-style addressing for an S3-compatible model store",
+    )
+    pre, _ = parser.parse_known_args()
+    if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
+        return None
+    return ModelSource(
+        uri=pre.hf_checkpoint,
+        endpoint=pre.s3_model_endpoint,
+        credential_mode="placeholder" if pre.s3_model_use_placeholder_credentials else "default",
+        addressing_style="path" if pre.s3_model_use_path_style else "auto",
+    )
+
+
 def parse_args(add_custom_arguments=None):
+    """Parse Relax arguments with an optional registered model source."""
+    from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
+
+    original_argv = sys.argv
+    provider_source = resolve_model_source(original_argv)
+    if provider_source is not None:
+        sys.argv = apply_model_source_to_argv(original_argv, provider_source)
+    try:
+        return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+    finally:
+        sys.argv = original_argv
+
+
+def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    model_source = provider_source or _pre_parse_cli_model_source()
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2410,7 +2696,11 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
+        skip_hf_validate=(
+            pre.debug_rollout_only
+            or pre.skip_hf_validate
+            or (model_source is not None and is_s3_uri(model_source.uri))
+        ),
     )
 
     # Merge pre-parsed args into the main namespace
@@ -2425,6 +2715,15 @@ def parse_args(add_custom_arguments=None):
     if teacher_sglang_ns is not None:
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
+
+    # Preserve whether the user explicitly requested a rollout start before
+    # validation derives 0 for an apparent HF/cold-start load. Actor init uses
+    # this provenance to recover from a checkpoint-readiness race without
+    # overriding an intentional --start-rollout-id.
+    args._start_rollout_id_explicit = args.start_rollout_id is not None
+
+    # Serialize the driver-derived descriptor with args to every Ray actor.
+    args.model_source = model_source
 
     slime_validate_args(args)
 
@@ -2508,6 +2807,41 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
 
 
+def validate_save_hf_fp8_args(args) -> None:
+    """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
+    default."""
+    dtype = getattr(args, "save_hf_dtype", "bf16")
+    if dtype != "fp8":
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
+
+    from relax.utils.quant_cast.fp8 import validate_fp8_options
+
+    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
+    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    if strategy == "block" and block_size is None:
+        block_size = [128, 128]
+        args.save_hf_fp8_block_size = block_size
+    validate_fp8_options(strategy, block_size)
+
+
+def validate_save_hf_post_hook_args(args) -> None:
+    """Validate --save-hf-post-hook-path resolves and is paired with --save-
+    hf."""
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
+
+    from relax.utils.misc import load_function
+
+    hook = load_function(hook_path)
+    if not callable(hook):
+        raise TypeError(f"--save-hf-post-hook-path {hook_path!r} is not callable: got {type(hook).__name__}")
+
+
 def _validate_agentic_rollout_args(args) -> None:
     if not args.use_agentic_rollout:
         return
@@ -2538,6 +2872,80 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
+    """Validate the frozen Task 29 REINFORCE++ algorithm contracts."""
+    if is_sft:
+        return
+
+    estimator = getattr(args, "advantage_estimator", None)
+    variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+    if estimator not in variants:
+        return
+
+    if not getattr(args, "normalize_advantages", False):
+        raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        raise ValueError(
+            f"--advantage-estimator {estimator} supports synchronous colocate training only; "
+            "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
+        )
+    if not getattr(args, "colocate", False):
+        raise ValueError(f"--advantage-estimator {estimator} currently requires --colocate.")
+    if getattr(args, "context_parallel_size", 1) != 1:
+        raise ValueError(f"--advantage-estimator {estimator} currently requires --context-parallel-size 1.")
+    if getattr(args, "calculate_per_token_loss", False):
+        raise ValueError(
+            f"--advantage-estimator {estimator} uses response-mean loss reduction; "
+            "--calculate-per-token-loss is not supported."
+        )
+
+    kl_coef = getattr(args, "kl_coef", 0.0)
+    kl_loss_coef = getattr(args, "kl_loss_coef", 0.0)
+    kl_loss_type = getattr(args, "kl_loss_type", "k1")
+    use_kl_loss = getattr(args, "use_kl_loss", False)
+
+    if estimator == "reinforce_plus_plus":
+        if kl_coef <= 0:
+            raise ValueError("reinforce_plus_plus requires --kl-coef > 0 for token-level KL reward shaping.")
+        if kl_loss_type != "k1":
+            raise ValueError("reinforce_plus_plus requires --kl-loss-type k1 for token-level KL reward shaping.")
+        if use_kl_loss or kl_loss_coef != 0:
+            raise ValueError(
+                "reinforce_plus_plus uses KL reward shaping and does not support a separate --use-kl-loss."
+            )
+        return
+
+    if getattr(args, "n_samples_per_prompt", 1) <= 1:
+        raise ValueError("reinforce_plus_plus_baseline requires --n-samples-per-prompt > 1.")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--custom-reward-post-process-path is not supported."
+        )
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--agentic-custom-advantage-path is not supported."
+        )
+    if not getattr(args, "rewards_normalization", True):
+        raise ValueError(
+            "reinforce_plus_plus_baseline requires group-mean centering; "
+            "--disable-rewards-normalization is not supported."
+        )
+    if kl_coef != 0:
+        raise ValueError("reinforce_plus_plus_baseline does not put token KL in the advantage; set --kl-coef 0.")
+    if not use_kl_loss or kl_loss_coef <= 0:
+        raise ValueError(
+            "reinforce_plus_plus_baseline requires an independent k2 penalty via --use-kl-loss and --kl-loss-coef > 0."
+        )
+    if kl_loss_type != "k2":
+        raise ValueError("reinforce_plus_plus_baseline requires --kl-loss-type k2.")
+    if getattr(args, "use_unbiased_kl", False):
+        raise ValueError(
+            "reinforce_plus_plus_baseline uses the plain k2 estimator; --use-unbiased-kl is not supported."
+        )
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -2559,13 +2967,6 @@ def slime_validate_args(args):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
-    if is_sft and getattr(args, "dynamic_context_parallel", False) and args.eval_interval is not None:
-        raise ValueError(
-            "--dynamic-context-parallel cannot be used with SFT eval (--eval-interval) yet: "
-            "this combination can hang and has not been fixed. "
-            "Disable --eval-interval or --dynamic-context-parallel."
-        )
-
     if is_sft:
         # Force-disable RL-only state so SFT users don't have to pass
         # `--disable-compute-advantages-and-returns` and friends.
@@ -2615,31 +3016,37 @@ def slime_validate_args(args):
             )
             args.lora_merge_mode = True
 
-    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
-    # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
-    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
-    # response_length=1 for every sample and training silently degenerates.
-    if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
+    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding on SGLang <= 0.5.9.
+    # There, spec_v2 routes requests through EAGLEWorkerV2.verify(), which does
+    # not populate output_token_logprobs — rollout sees response_length=1 for
+    # every sample and training silently degenerates. Fixed after 0.5.9, so
+    # newer builds may combine the two freely.
+    if getattr(args, "sglang_speculative_algorithm", None) and Envs.SGLANG_ENABLE_SPEC_V2.lower() in (
         "1",
         "true",
         "yes",
         "y",
     ):
-        raise ValueError(
-            "SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
-            "--sglang-speculative-algorithm in this build: spec_v2 EAGLE worker "
-            "does not populate output_token_logprobs, which collapses rollout "
-            "response_length to 1 and silently breaks training. "
-            "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
-            "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
-            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
-            "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
-            "spec_v2."
-        )
+        import sglang
+        from packaging.version import parse
+
+        if parse(sglang.__version__) <= parse("0.5.9"):
+            raise ValueError(
+                f"SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
+                f"--sglang-speculative-algorithm on sglang {sglang.__version__}: the spec_v2 "
+                f"EAGLE worker does not populate output_token_logprobs, which collapses "
+                f"rollout response_length to 1 and silently breaks training. Unset "
+                f"SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the spec_v1 EAGLE "
+                f"worker, or upgrade past 0.5.9. For Qwen3.5-MoE-style hybrid models, keep "
+                f"--sglang-mamba-scheduler-strategy extra_buffer — that flag alone satisfies "
+                f"SGLang's mamba radix-cache check and does NOT auto-enable spec_v2."
+            )
 
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
+    validate_save_hf_fp8_args(args)
+    validate_save_hf_post_hook_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
@@ -2724,13 +3131,9 @@ def slime_validate_args(args):
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
-    if not is_sft:
-        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
-            assert args.normalize_advantages, (
-                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
-                "require advantage normalization. Please add `--normalize-advantages` to your command."
-            )
+    _validate_reinforce_plus_plus_args(args, is_sft)
 
+    if not is_sft:
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
@@ -2817,6 +3220,17 @@ def slime_validate_args(args):
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
+
+    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    if rm_type_fallback is not None and rm_type_fallback != "zero":
+        # Lazy import: only pay for the rewards package when the flag is set.
+        from relax.engine.rewards.registry import list_reward_types
+
+        if rm_type_fallback not in list_reward_types():
+            raise ValueError(
+                f"--rm-type-fallback {rm_type_fallback!r} is not a registered reward type. "
+                f"Use 'zero' or one of: {list_reward_types()}"
+            )
 
     if hasattr(args, "rollout_result_dir"):
         if args.rollout_result_dir is None and getattr(args, "save", None):
@@ -2965,8 +3379,6 @@ def slime_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-            if args.use_critic:
-                args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
     elif args.colocate and genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True
@@ -3014,6 +3426,27 @@ def slime_validate_args(args):
 
     if args.use_critic:
         args.offload_train = True
+
+    # expandable_segments cannot coexist with torch_memory_saver, the default mechanism
+    # behind --offload-train. TMS's hook is armed from TMS_INIT_ENABLE inside the
+    # LD_PRELOAD'ed .so before any Python runs, so neither its own sanity check nor any
+    # in-process guard can intervene — the actor just dies with a bare
+    # "CUresult error: 1 (invalid argument)" from cu_mem_create. Fail here instead, while
+    # the message can still be read. Only the CUDA variable names are checked on purpose:
+    # NPU uses a different torch_memory_saver build and its scripts already combine
+    # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True with offload successfully.
+    if args.offload_train and not getattr(args, "selective_offload", False):
+        alloc_conf_sources = {
+            **{name: os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
+            **{key: str(value) for key, value in getattr(args, "train_env_vars", {}).items()},
+        }
+        for name, value in alloc_conf_sources.items():
+            if "expandable_segments:True" in value:
+                raise ValueError(
+                    f"{name} enables expandable_segments, which torch_memory_saver cannot track. "
+                    "Add --selective-offload to use the application-level offload instead, "
+                    "or drop expandable_segments."
+                )
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
@@ -3075,10 +3508,10 @@ def slime_validate_args(args):
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. All three are flagged here so
+    # --sft-chunked-logits incompatibilities. Both are flagged here so
     # downstream (model.py _should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # Both are hard asserts — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
         # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
@@ -3095,14 +3528,7 @@ def slime_validate_args(args):
             "multiply against). Remove --sft-chunked-logits; the chunked "
             "memory win is marginal on tied-weight models."
         )
-        # 2) MTP. MTP's _postprocess reaches for self.output_layer directly;
-        #    _bypass_output_layer's passthrough would break the MTP head.
-        assert not getattr(args, "enable_mtp_training", False), (
-            "--sft-chunked-logits is incompatible with --enable-mtp-training "
-            "(MTP head needs the real output_layer; the chunked path's "
-            "passthrough would break it). Remove one of the two flags."
-        )
-        # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.

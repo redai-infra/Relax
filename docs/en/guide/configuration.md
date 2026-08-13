@@ -208,7 +208,7 @@ For more parameters, refer to SGLang official documentation.
 | `--use-dynamic-batch-size` | flag | False | Enable dynamic batching. Dynamically packs samples by length so each micro-batch's total tokens approach `--max-tokens-per-gpu` limit |
 | `--max-tokens-per-gpu` | int | None | Maximum tokens per GPU. Must be set when dynamic batching is enabled. Should be set to approximately `max_response_len / cp_size` when using CP |
 | `--log-probs-max-tokens-per-gpu` | int | None | Maximum tokens per GPU when computing log probs. When None, equals `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | Use `karmarkar_karp` algorithm to balance token count across data parallel ranks. Only available in colocate mode; not supported with `--fully-async`. Note: different responses for the same prompt may be assigned to different training steps |
+| `--balance-data` | flag | False | Use `karmarkar_karp` to balance token count across data parallel ranks on the static/seqlen-balanced path. In fully async with `--use-dynamic-batch-size`, DP token balancing is automatic through `StreamingTokenBudgetSampler`; the flag is accepted but has no additional effect. Note: different responses for the same prompt may be assigned to different training steps |
 
 ---
 
@@ -254,6 +254,33 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--overlap-grad-reduce` | flag | - | Overlap backward compute with grad reduce-scatter (native Megatron parameter) |
 | `--overlap-param-gather` | flag | - | Overlap reduce-scatter with next-step param all-gather; requires `--overlap-grad-reduce` (native Megatron parameter) |
 | `--calculate-per-token-loss` | flag | False | Calculate loss per token (native Megatron parameter) |
+
+### FP16 Optimizer Compatibility Defaults
+
+| Parameter | FP16 compatibility fallback | Native non-FP16 default | Description |
+|-----------|-------------------------------|--------------------------|-------------|
+| `--initial-loss-scale` | `32768` | `2**32` | Initial scale used by dynamic loss scaling |
+| `--min-loss-scale` | `1` | `1` | Minimum scale used by dynamic loss scaling |
+| `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | enabled | disabled | Enable or disable TransformerEngine's precision-aware optimizer |
+| `--store-param-remainders` / `--no-store-param-remainders` | disabled | enabled | Control parameter-remainder storage in the distributed optimizer |
+
+With dynamic FP16 loss scaling (`--loss-scale` omitted), Relax preserves its historical values for omitted options and
+emits one warning listing the applied fallbacks. With a static `--loss-scale`, `--initial-loss-scale` and
+`--min-loss-scale` are inactive, so Relax does not fill, validate, or warn about them; the two boolean optimizer options
+still use their FP16 compatibility fallbacks when omitted. Pass the active options explicitly to silence the warning.
+In dynamic mode, both scale values must be finite and greater than zero, and `--min-loss-scale` must not exceed
+`--initial-loss-scale`. Non-FP16 defaults come directly from Megatron's `OptimizerConfig`.
+
+The Qwen3-4B FP16 recipe configures all four values explicitly. Extra arguments passed to the shell script are appended
+to the training command, so a later value can override the recipe without editing it:
+
+```bash
+bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
+  --initial-loss-scale 65536 \
+  --min-loss-scale 2 \
+  --no-use-precision-aware-optimizer \
+  --store-param-remainders
+```
 
 ### Optimizer Flag Compatibility
 
@@ -433,7 +460,11 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--rm-type` | str | None | Built-in reward model type |
-| `--custom-rm-path` | str | None | Custom reward function path. Function signature: `def custom_rm(args, sample) -> float` |
+| `--rm-type-fallback` | str | None | Fallback for unknown/missing reward types: `zero` scores 0.0 with a warning, a registered type name routes there. None keeps the error behavior |
+| `--rm-type-infer` | flag | False | Infer the reward type from the sample label via registered matchers when no explicit type is set; conflicts warn and the explicit type wins |
+| `--custom-rm-path` | str | None | Custom reward function path. A single-sample function receives one sample; a batched/group function receives the complete sample list and returns one result per sample. Bypasses format-aware routing |
+| `--reward-max-concurrency` | int | 64 | Maximum concurrent reward calls in each caller process. One custom batch/group invocation counts as one call |
+| `--reward-num-workers` | int | 16 | Number of Ray actors used to run synchronous rewards. Async custom rewards do not use these workers |
 | `--reward-key` | str | None | Key to extract reward value when reward function returns dict |
 | `--eval-reward-key` | str | None | Reward key for evaluation. When None, equals `--reward-key` |
 | `--group-rm` | flag | False | Whether to compute reward for entire group |

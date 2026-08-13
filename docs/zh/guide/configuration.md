@@ -208,7 +208,7 @@
 | `--use-dynamic-batch-size` | flag | False | 启用动态批处理。根据样本长度动态打包，使每个 micro-batch 的总 Token 数接近 `--max-tokens-per-gpu` 限制 |
 | `--max-tokens-per-gpu` | int | None | 每个 GPU 的最大 Token 数。启用动态批处理时必须设置。使用 CP 时应设为约 `max_response_len / cp_size` |
 | `--log-probs-max-tokens-per-gpu` | int | None | 计算 log probs 时每个 GPU 的最大 Token 数。None 时等于 `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | 使用 `karmarkar_karp` 算法在数据并行 rank 间平衡 Token 数量。仅在 colocate 模式下可用，不支持 `--fully-async`。注意同一 Prompt 的不同响应可能被分到不同训练步 |
+| `--balance-data` | flag | False | 在静态/序列长度均衡路径上使用 `karmarkar_karp` 在数据并行 rank 间平衡 Token 数量。全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡；该 flag 可传入但不会额外改变行为。注意同一 Prompt 的不同响应可能被分到不同训练步 |
 
 ---
 
@@ -254,6 +254,33 @@
 | `--overlap-grad-reduce` | flag | - | 反向计算与 grad reduce-scatter 重叠（Megatron 原生参数） |
 | `--overlap-param-gather` | flag | - | reduce-scatter 与下一步 param all-gather 重叠，强制配合 `--overlap-grad-reduce`（Megatron 原生参数） |
 | `--calculate-per-token-loss` | flag | False | 按 Token 计算损失（Megatron 原生参数） |
+
+### FP16 优化器兼容默认值
+
+| 参数 | FP16 兼容 fallback | 非 FP16 的 Megatron 原生默认值 | 说明 |
+|------|--------------------|--------------------------------|------|
+| `--initial-loss-scale` | `32768` | `2**32` | 动态 loss scaling 的初始 scale |
+| `--min-loss-scale` | `1` | `1` | 动态 loss scaling 的最小 scale |
+| `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | 开启 | 关闭 | 开启或关闭 TransformerEngine 精度感知优化器 |
+| `--store-param-remainders` / `--no-store-param-remainders` | 关闭 | 开启 | 控制分布式优化器是否保存参数余数 |
+
+使用动态 FP16 loss scaling（未设置 `--loss-scale`）时，Relax 会为缺省选项保留历史兼容值，并用一条
+warning 列出实际采用的 fallback。设置静态 `--loss-scale` 后，`--initial-loss-scale` 和
+`--min-loss-scale` 不再生效，因此 Relax 不会为它们补默认值、执行校验或发出 warning；两个布尔优化器选项
+缺省时仍使用 FP16 兼容值。显式传入当前生效的选项即可消除 warning。动态模式下，两个 scale 必须为大于零
+的有限值，且 `--min-loss-scale` 不能大于 `--initial-loss-scale`。非 FP16 默认值直接取自 Megatron 的
+`OptimizerConfig`。
+
+Qwen3-4B FP16 脚本会显式配置全部四项。传给脚本的额外参数会追加到训练命令末尾，因此可以覆盖脚本值而
+无需修改文件：
+
+```bash
+bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
+  --initial-loss-scale 65536 \
+  --min-loss-scale 2 \
+  --no-use-precision-aware-optimizer \
+  --store-param-remainders
+```
 
 ### 优化器 Flag 兼容性
 
@@ -433,7 +460,11 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
-| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
+| `--rm-type-fallback` | str | None | 未知/缺失 Reward 类型的回退策略：`zero` 记 0 分并告警，注册名则路由到该 Reward；None 保持报错行为 |
+| `--rm-type-infer` | flag | False | 无显式类型时按注册的 label matcher 推断 Reward 类型；与显式类型冲突时告警并以显式类型优先 |
+| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。单样本函数接收一个样本；batch/group 函数接收完整样本列表，并为每个样本返回一个结果。会绕过格式感知路由 |
+| `--reward-max-concurrency` | int | 64 | 每个调用方进程内同时执行的 Reward 调用数上限。一次自定义 batch/group 调用计为一个调用 |
+| `--reward-num-workers` | int | 16 | 用于执行同步 Reward 的 Ray Actor 数量。异步自定义 Reward 不使用这些 worker |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |
 | `--group-rm` | flag | False | 是否对整个 group 做 Reward 计算 |

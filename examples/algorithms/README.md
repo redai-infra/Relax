@@ -8,13 +8,15 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 
 ## 支持的算法
 
-| 算法      | 启用参数                      | 推荐场景                   |
-| --------- | ----------------------------- | -------------------------- |
-| **PPO**   | `--advantage-estimator ppo`   | Actor-Critic、token 级 GAE |
-| **GRPO**  | `--advantage-estimator grpo`  | 默认、大多数场景           |
-| **CISPO** | `--advantage-estimator cispo` | 保留梯度方向、需要更高精度 |
-| **GSPO**  | `--advantage-estimator gspo`  | 序列级约束、稳定训练       |
-| **SAPO**  | `--advantage-estimator sapo`  | 平滑优化、soft 信任域      |
+| 算法                     | 启用参数                                             | 推荐场景                    |
+| ------------------------ | ---------------------------------------------------- | --------------------------- |
+| **PPO**                  | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE  |
+| **GRPO**                 | `--advantage-estimator grpo`                         | 默认、大多数场景            |
+| **REINFORCE++**          | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化 |
+| **REINFORCE++-baseline** | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL |
+| **CISPO**                | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度  |
+| **GSPO**                 | `--advantage-estimator gspo`                         | 序列级约束、稳定训练        |
+| **SAPO**                 | `--advantage-estimator sapo`                         | 平滑优化、soft 信任域       |
 
 ## 选择建议
 
@@ -31,6 +33,14 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - 默认算法，特性平衡，大多数场景可用
 - 对超出信任域的 token 直接置零梯度
 - 适合大多数强化学习场景
+
+### REINFORCE++ 两个变体
+
+- `reinforce_plus_plus` 使用 token 级 k1 KL reward shaping、KL-to-go return 和跨 DP rank 的有效 token 全局归一化
+- `reinforce_plus_plus_baseline` 先减去包含自身的 prompt group mean，不除 group std，再做相同的全局归一化
+- baseline 变体不把 token KL 放入 advantage，而是使用独立的 k2 KL loss
+- 两个变体当前只支持同步 colocate、CP=1 和 response-mean reduction
+- 完整公式、mask 与边界行为参见[REINFORCE++ 设计文档](../../docs/zh/guide/reinforce-plus-plus.md)
 
 ### CISPO（保留梯度信号）
 

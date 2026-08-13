@@ -6,7 +6,6 @@ import random
 import socket
 import time
 from argparse import Namespace
-from contextlib import nullcontext
 from functools import partial
 from typing import Any, List
 
@@ -25,7 +24,6 @@ except ImportError:
     repatch = None
 
 from tensordict import TensorDict
-from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from relax.distributed.checkpoint_service.client.engine import create_client
@@ -50,6 +48,7 @@ from relax.utils.data.stream_dataloader import (
     post_process_rollout_data,
 )
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.env import Envs
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.opd.opd_utils import (
@@ -60,6 +59,7 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.rotate_ckpt import rotate_ckpt
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
@@ -78,6 +78,7 @@ from relax.utils.utils import (
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
+from .collective_utils import _agree_drained
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
@@ -93,6 +94,7 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .weight_update.common import named_params_and_buffers
+from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
@@ -175,6 +177,11 @@ class MegatronTrainRayActor(TrainRayActor):
             process_args(args, role)
         super().init(args, role, with_ref, with_opd_teacher)
 
+        # Materialize an S3 checkpoint on this node before Megatron init(args)
+        # reads model metadata or weights.
+        # Leaf actor with private args, safe to remap in place.
+        prepare_model_maybe_update_args(args)
+
         self.genrm_manager = None
 
         init(args)
@@ -213,23 +220,6 @@ class MegatronTrainRayActor(TrainRayActor):
         }
         dist.barrier(group=get_gloo_group())
 
-        self._torch_memory_saver_enabled = False
-        if args.offload_train:
-            x = max(int(args.train_memory_margin_bytes), 0)
-            try:
-                torch_memory_saver.memory_margin_bytes = x
-                self._torch_memory_saver_enabled = True
-                if x > 0:
-                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-            except (RuntimeError, NotImplementedError) as e:
-                if "expandable_segments is not supported" in str(e) or "Only setter is supported" in str(e):
-                    logger.warning(
-                        "torch_memory_saver is unavailable in the current allocator mode; "
-                        "skip memory saver hooks and continue with offload_train."
-                    )
-                else:
-                    raise
-
         if role == "critic":
             self.args.load = self.args.critic_load
             self.args.save = self.args.critic_save
@@ -239,6 +229,11 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+
+        # Train-state offload for colocate sleep/wake. Picks torch_memory_saver
+        # (VMM pause) or manual selective CPU offload based on TMS availability;
+        # both implementations live in the offloader. No-op when offload_train is off.
+        self._train_state_offloader = MegatronTrainStateOffloader(self.model, self.optimizer, args)
 
         start_rollout_id = loaded_rollout_id + 1
 
@@ -400,8 +395,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        if self._torch_memory_saver_enabled:
-            torch_memory_saver.pause()
+        self._train_state_offloader.offload()
 
         print_memory("after offload model")
 
@@ -410,8 +404,7 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        if self._torch_memory_saver_enabled:
-            torch_memory_saver.resume()
+        self._train_state_offloader.reload()
 
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
@@ -588,15 +581,29 @@ class MegatronTrainRayActor(TrainRayActor):
         # (see Rollout._run_eval_with_mark), so we don't emit them here.
         if not has_rollout:
             return
+        rollout_serve_url = get_serve_url("rollout")
         try:
-            rollout_serve_url = get_serve_url("rollout")
+            # NOTE: /evaluate runs rollout-side inference and can legitimately
+            # take much longer than a short RPC, so it is intentionally left
+            # without an HTTP timeout -- a fixed timeout would falsely abort a
+            # long eval. This block's failure is non-fatal (logged, training
+            # continues).
             response = requests.get(f"{rollout_serve_url}/evaluate", params={"train_step": rollout_id})
             response.raise_for_status()
-            if end_update_weight:
-                response = requests.get(f"{rollout_serve_url}/end_update_weight")
-                response.raise_for_status()
         except Exception as e:
             logger.warning(f"Error during actor post-train evaluation for rollout_id {rollout_id}: {e}")
+        finally:
+            # Cleanup MUST run even if /evaluate failed, otherwise rollout + health
+            # monitoring stay paused forever. Short call -> keep the timeout;
+            # swallow its own errors independently.
+            if end_update_weight:
+                try:
+                    response = requests.get(
+                        f"{rollout_serve_url}/end_update_weight", timeout=self.args.rollout_http_timeout
+                    )
+                    response.raise_for_status()
+                except Exception as e:
+                    logger.warning(f"Error ending update weight for rollout_id {rollout_id}: {e}")
 
     def _request_rollout_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         """Backward-compatible name kept for existing internal call sites."""
@@ -704,10 +711,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
-            empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
             rollout_mini_batches: list[RolloutBatch] = []
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
+            empty_poll_sleep_s = Envs.RELAX_EMPTY_POLL_SLEEP_MS / 1000.0
             fetch_iter = 0
             while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
                 consumer = "critic" if self.role == "critic" else "actor"
@@ -1229,7 +1236,7 @@ class MegatronTrainRayActor(TrainRayActor):
             token_budget=token_budget,
             loss_scale=1.0,  # forward-only: __loss_scale__ is unused
             # streaming=True drained predicate; PP=1 here (see _use_streaming_fwd) so
-            # all_consumed's PP broadcast is harmless.
+            # all_consumed's PP reduction is harmless.
             all_consumed_fn=lambda: self.all_consumed(
                 task_name, rollout_id, partition_id=f"train_{rollout_id}", streaming=True
             ),
@@ -1634,7 +1641,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model
 
-            save_hf_model(self.args, rollout_id, self.model)
+            save_hf_model(self.args, rollout_id, self.model, force_sync=force_sync)
 
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()
@@ -1691,11 +1698,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        with (
-            torch_memory_saver.disable()
-            if self.args.offload_train and self._torch_memory_saver_enabled
-            else nullcontext()
-        ):
+        with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
@@ -1765,7 +1768,10 @@ class MegatronTrainRayActor(TrainRayActor):
             try:
                 rollout_serve_url = get_serve_url("rollout")
                 while True:
-                    response = requests.get(f"{rollout_serve_url}/can_do_update_weight_for_async")
+                    response = requests.get(
+                        f"{rollout_serve_url}/can_do_update_weight_for_async",
+                        timeout=self.args.rollout_http_timeout,
+                    )
                     response.raise_for_status()
                     res = response.json()
                     if res:
@@ -1790,7 +1796,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 try:
                     actor_fwd_serve_url = get_serve_url("actor_fwd")
-                    response = requests.get(f"{actor_fwd_serve_url}/get_step")
+                    response = requests.get(f"{actor_fwd_serve_url}/get_step", timeout=self.args.rollout_http_timeout)
                     response.raise_for_status()
                 except Exception as e:
                     logger.warning(
@@ -1920,8 +1926,8 @@ class MegatronTrainRayActor(TrainRayActor):
         #
         # streaming=True uses the producer-driven drained predicate (check_stream_drained)
         # instead of the tensor-wide .all() check, which is unreliable without a preset
-        # partition size. This is the lockstep-across-PP drain path, so the PP broadcast
-        # below is safe (unlike the 1F1B schedule — see all_consumed_streaming).
+        # partition size. This is the lockstep-across-PP drain path, so including the PP
+        # group below is safe (unlike the 1F1B schedule — see all_consumed_streaming).
         if partition_id is None:
             partition_id = sft_partition_id(self.args, rollout_id)
         if (
@@ -1930,38 +1936,34 @@ class MegatronTrainRayActor(TrainRayActor):
             and mpu.get_context_parallel_rank() == 0
         ):
             if streaming:
-                status = [run(self.data_system_client.async_check_stream_drained(task_name, partition_id))]
+                status = run(self.data_system_client.async_check_stream_drained(task_name, partition_id))
             else:
-                status = [run(self.data_system_client.async_check_consumption_status(task_name, partition_id))]
+                status = run(self.data_system_client.async_check_consumption_status(task_name, partition_id))
         else:
-            status = [True]
-        status = torch.tensor(status, device=device_utils.make_current_torch_device())
-        dist.broadcast(status, group=mpu.get_context_parallel_group(), group_src=0)
-        dist.broadcast(status, group=mpu.get_tensor_model_parallel_group(), group_src=0)
-        dist.broadcast(status, group=mpu.get_pipeline_model_parallel_group(), group_src=0)
+            status = True
 
-        return status[0]
+        return _agree_drained(status, include_pipeline=True)
 
     def all_consumed_streaming(self, task_name, rollout_id, window_id=None, window_quota=None):
         """End-of-stream check for the streaming PP schedule — NO pipeline-
         group collective.
 
-        ``all_consumed`` broadcasts the consumption flag across the PP group.
+        ``all_consumed`` reduces the consumption flag across the PP group.
         That is FATAL for the streaming iterator: each PP stage pulls from its
         own ``StreamingTQIterator`` at different points in the 1F1B schedule
         (warmup / steady / cooldown), so stage A may call this check (because its
         sampler returned empty) while stage B is busy in fwd/bwd compute and not
-        calling it.  A PP-group broadcast then blocks stage A forever waiting for
+        calling it.  A PP-group collective then blocks stage A forever waiting for
         the others to join → the hang observed at long sequences (PP>1, any DP).
 
         The sampler result cache guarantees every PP stage sees the SAME data
         sequence per ``batch_index``, so each stage independently reaches
         end-of-stream at the same micro-batch count.  We therefore query the
-        controller WITHOUT any PP/CP broadcast.  Within a PP stage the TP ranks
+        controller WITHOUT any PP collective.  Within a PP stage the TP ranks
         are in lockstep (only tp_rank==0 fetches; the get_data TP broadcast keeps
-        them aligned on the "data is None" branch), so we broadcast the flag over
-        the TP group ONLY to give tp_rank>0 the same answer.  CP ranks within a
-        stage are likewise in lockstep, so a CP-group broadcast is safe too.
+        them aligned on the "data is None" branch), so we reduce the flag over
+        the tensor-and-context-parallel group ONLY to give tp_rank>0 / cp_rank>0
+        the same answer — those ranks are in lockstep within a stage.
 
         When ``window_id`` is given (multi-mini train path) the check is PER
         WINDOW: the sampler reports drained once it has globally dispatched
@@ -1975,25 +1977,20 @@ class MegatronTrainRayActor(TrainRayActor):
             # to be consumed, rather than a tensor-wide .all() over (possibly dynamic)
             # rows. See TransferQueue check_stream_drained / check_window_drained.
             if window_id is not None:
-                status = [
-                    run(
-                        self.data_system_client.async_check_window_drained(
-                            task_name, f"train_{rollout_id}", window_id, window_quota
-                        )
+                status = run(
+                    self.data_system_client.async_check_window_drained(
+                        task_name, f"train_{rollout_id}", window_id, window_quota
                     )
-                ]
+                )
             else:
-                status = [run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))]
+                status = run(self.data_system_client.async_check_stream_drained(task_name, f"train_{rollout_id}"))
         else:
-            status = [True]
-        status = torch.tensor(status, device=device_utils.make_current_torch_device())
-        # Intra-PP-stage groups only (CP then TP, matching all_consumed's order
-        # minus the PP broadcast) — these ranks call __next__ in lockstep.
-        # Crucially NO pipeline-group broadcast: PP stages are NOT in lockstep
-        # during 1F1B, so a PP collective here would deadlock.
-        dist.broadcast(status, group=mpu.get_context_parallel_group(), group_src=0)
-        dist.broadcast(status, group=mpu.get_tensor_model_parallel_group(), group_src=0)
-        return status[0]
+            status = True
+
+        # Intra-PP-stage group only (TP x CP in a single collective). Crucially NO
+        # pipeline-group reduction: PP stages are NOT in lockstep during 1F1B, so a
+        # PP collective here would deadlock.
+        return _agree_drained(status, include_pipeline=False)
 
     def _drain_dynamic_batch_rollout(self, rollout_id, data_fields):
         """Build data iterators for the fully-async + dynamic-batch train path.
@@ -2190,10 +2187,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # Per-rank fetch (opt-in via --per-rank-fetch) lets every TP/PP
         # rank pull its own copy from TQ in parallel instead of paying one
         # rank-0 pickle + one TP/PP broadcast.  Cross-rank consistency relies
-        # on the TQ sampler's ``(partition_id, task_name, dp_rank, batch_index)``
-        # cache (transfer_queue/sampler/{base,grpo_group_n,seqlen_balanced}.py),
-        # which is PP/TP-invariant, so all ranks within a DP group receive
-        # byte-identical sample ids regardless of PP world size.  The only
+        # on every model-parallel rank presenting the same logical
+        # ``dp_rank``/``batch_index`` to the TQ sampler, so sampler replay
+        # returns byte-identical sample ids regardless of PP/TP world size. The only
         # remaining incompatibility is ``rollout_routed_experts`` — it relies on
         # the NestedTensor jagged bcast path that this mode bypasses.
         per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields

@@ -3,6 +3,7 @@
 import datetime
 import os
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta
 
@@ -36,7 +37,7 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
         tb_project_name = args.tb_project_name
         tb_experiment_name = args.tb_experiment_name
         save_dir = getattr(args, "save", None)
-        if tb_project_name is None and not os.environ.get("TENSORBOARD_DIR", None) and not save_dir:
+        if tb_project_name is None and not Envs.TENSORBOARD_DIR and not save_dir:
             # Nothing user-supplied to locate the run — fall back to a defaulted
             # project + timestamped experiment so tensorboard just works.
             tb_project_name = "relax"
@@ -51,7 +52,7 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
     def _initialize(self, tb_project_name, tb_experiment_name, save_dir):
         """Actual initialization logic."""
         # Priority: TENSORBOARD_DIR env > args.save > default project/experiment path
-        tensorboard_dir = os.environ.get("TENSORBOARD_DIR")
+        tensorboard_dir = Envs.TENSORBOARD_DIR
         if not tensorboard_dir:
             if save_dir:
                 tensorboard_dir = os.path.join(save_dir, "tensorboard_log")

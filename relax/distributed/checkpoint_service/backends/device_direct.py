@@ -40,6 +40,8 @@ from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
 from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.env import Envs
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     LORA_ADAPTER_NAME,
@@ -208,6 +210,10 @@ class DeviceDirectBackend(CommBackend):
         return futures
 
     def _healthcheck_rollout_engines(self, timeout_seconds: int = 5) -> set[int]:
+        # Allow raising the cold-start healthcheck timeout via env for slow starts.
+        env_timeout = Envs.RELAX_ROLLOUT_HEALTHCHECK_TIMEOUT
+        if env_timeout is not None:
+            timeout_seconds = env_timeout
         failed_ranks = set()
         futures_to_rank = {}
 
@@ -267,7 +273,7 @@ class DeviceDirectBackend(CommBackend):
                 logger.warning(f"Error killing RolloutEngine #{rank}: {e}")
         self.rollout_engines.clear()
 
-    def _update_rollout_engines(self, max_retries: int = 30, retry_interval: float = 10.0):
+    def _update_rollout_engines(self, max_retries: int = 30, retry_interval: float = 10.0) -> None:
         """Wait for rollout engines to be ready with retries.
 
         In fully-async mode, Rollout engines may still be initializing (loading model)
@@ -276,10 +282,12 @@ class DeviceDirectBackend(CommBackend):
 
         Args:
             max_retries: Maximum number of retry attempts (default: 30).
-            retry_interval: Seconds to wait between retries (default: 2.0).
+            retry_interval: Seconds to wait between retries (default: 10.0).
 
         Raises:
-            RuntimeError: If no healthy engines are available after all retries.
+            RuntimeError: Only if **no** healthy engine remains after all
+                retries. Engines that stay unhealthy are pruned and the weight
+                sync proceeds with whatever engines are still healthy.
         """
         if not self.rollout_topology:
             raise RuntimeError("No rollout engines configured")
@@ -298,11 +306,27 @@ class DeviceDirectBackend(CommBackend):
             )
             time.sleep(retry_interval)
 
-        # All retries exhausted, remove failed engines and report error
-        logger.error(f"Removing failed engines after {max_retries} retries: {failed_ranks}")
-        self._remove_failed_engines(failed_ranks)
+        # All retries exhausted. Prune whatever is still unhealthy and continue
+        # with the engines that remain healthy, instead of unconditionally
+        # raising. Only give up (and let the caller trigger recovery) when *no*
+        # healthy engine is left. Previously this raised even when healthy
+        # engines remained (e.g. a dead scale-out engine while the seed was
+        # fine), which failed the actor weight sync and escalated to a full
+        # global restart -- losing all training progress. Pruning here also
+        # updates ``self.rollout_topology`` (via ``_remove_failed_engines``), so
+        # the caller rebuilds the weight-update group over the surviving set.
+        final_failed = self._healthcheck_rollout_engines()
+        if final_failed:
+            logger.error(f"Pruning engines still unhealthy after {max_retries} retries: {final_failed}")
+            self._remove_failed_engines(final_failed)
 
-        raise RuntimeError(f"No healthy rollout engines available after {max_retries} retries")
+        if not self.rollout_engines:
+            raise RuntimeError(f"No healthy rollout engines available after {max_retries} retries")
+
+        if final_failed:
+            logger.warning(
+                f"Proceeding with {len(self.rollout_engines)} healthy rollout engine(s) after pruning {final_failed}"
+            )
 
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
@@ -420,7 +444,7 @@ class DeviceDirectBackend(CommBackend):
                 try:
                     self._model_update_groups = init_process_group(
                         backend=self.backend_type,
-                        init_method=f"tcp://{master_address}:{master_port}",
+                        init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
                         world_size=world_size,
                         rank=0,
                         group_name=self._group_name,
@@ -449,9 +473,14 @@ class DeviceDirectBackend(CommBackend):
                     f"Failed to init process group for rollout after {max_retries} attempts"
                 ) from last_error
 
-            # Group successfully (re)built — remember the topology it serves so the
-            # next update with the same topology takes the reuse fast path above.
-            self._rollout_topology_signature = new_sig
+            # Group successfully (re)built — remember the topology it actually
+            # serves so the next update with the same topology takes the reuse
+            # fast path above. Recompute from ``self.rollout_topology`` rather
+            # than the pre-check ``new_sig`` because ``_update_rollout_engines``
+            # may have pruned dead engines from it; storing the stale full
+            # signature would let the fast path reuse a group that is missing a
+            # since-recovered engine (orphaning it).
+            self._rollout_topology_signature = self._rollout_topology_signature_of(self.rollout_topology)
 
     def init_process_groups_for_actor_fwd_ref(self, topology_data) -> None:
         """Initialize process groups used for actor -> actor_fwd weight sync.

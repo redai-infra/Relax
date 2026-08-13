@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
-from relax.utils.distributed_utils import distributed_masked_whiten
+from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -53,6 +53,7 @@ def get_responses(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    apply_temperature: bool = True,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -174,13 +175,14 @@ def get_responses(
 
         # Apply temperature per-chunk instead of on the full [T, V] logits to avoid
         # a single ~16GiB allocation that OOMs under fragmentation.
-        # Skip when SFT chunked path is on (--sft-chunked-logits): in that mode
-        # `logits_chunk` here is actually `hidden_states` (shape [R, H], not
-        # [R, V]) — dividing hidden activations by a softmax-distribution
-        # temperature is mathematically meaningless. That caller applies
-        # temperature on the real per-sub-chunk logits after lm_head instead.
-        if args.rollout_temperature != 1.0 and not (
-            args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False)
+        # Skipped when apply_temperature is False (value head: scalar predictions
+        # must not be temperature-scaled), and on the SFT chunked path where
+        # `logits_chunk` is hidden_states [R, H] not logits (that caller applies
+        # temperature on the real per-sub-chunk logits after lm_head instead).
+        if (
+            apply_temperature
+            and args.rollout_temperature != 1.0
+            and not (args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False))
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -236,12 +238,18 @@ def _allgather_cp_redistribute(
             e = min(logit_global_end, chunk_end)
 
             if e <= s:
-                # This rank has no response logprobs for this sample
+                # This rank has no response logprobs for this sample. Match the
+                # placeholder's requires_grad to the real data (`value`): forcing
+                # requires_grad=True makes the concatenated all_reduce input require
+                # grad on ranks with an empty chunk while non-empty ranks (F.pad of
+                # a no-grad `value`) do not, so the differentiable dist.nn.all_reduce
+                # below builds a backward graph on some CP ranks but not others and
+                # the collective deadlocks.
                 full_resp = torch.zeros(
                     response_length,
                     dtype=value.dtype,
                     device=value.device,
-                    requires_grad=True,
+                    requires_grad=value.requires_grad,
                 )
             else:
                 resp_start = s - logit_global_start
@@ -465,8 +473,8 @@ def get_values(
 
     Args:
         logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
+        args: Configuration passed to `get_responses`; temperature scaling is
+            disabled for value outputs.
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
@@ -488,6 +496,7 @@ def get_values(
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        apply_temperature=False,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
@@ -611,7 +620,6 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             rewards=rewards,
             kl=kl,
             loss_masks=loss_masks,
-            kl_coef=args.kl_coef,
         )
         returns = advantages
 
@@ -676,18 +684,44 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
             all_masks = torch.cat(mask_chunks)
 
-        if all_masks.numel() > 0:
-            assert all_advs.size() == all_masks.size(), (
-                f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-            )
+        assert all_advs.size() == all_masks.size(), (
+            f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
+        )
+        is_reinforce_plus_plus = args.advantage_estimator in {
+            "reinforce_plus_plus",
+            "reinforce_plus_plus_baseline",
+        }
+        if is_reinforce_plus_plus or all_masks.numel() > 0:
             dp_group = mpu.get_data_parallel_group()
 
-            whitened_advs_flat = distributed_masked_whiten(
-                all_advs,
-                all_masks,
-                process_group=dp_group,
-                shift_mean=True,
-            )
+            if is_reinforce_plus_plus:
+                whitened_advs_flat, raw_mean, raw_variance, valid_count = distributed_masked_normalize(
+                    all_advs,
+                    all_masks,
+                    process_group=dp_group,
+                )
+                variance_floor = torch.tensor(1e-8, device=raw_variance.device, dtype=raw_variance.dtype)
+                normalized_variance = raw_variance / torch.maximum(raw_variance, variance_floor)
+                num_samples = len(advantages)
+                raw_mean = raw_mean.detach()
+                raw_std = raw_variance.sqrt().detach()
+                normalized_mean = torch.zeros_like(raw_mean)
+                normalized_std = normalized_variance.sqrt().detach()
+                valid_count = valid_count.detach()
+                zero_variance = (raw_variance == 0).to(dtype=raw_variance.dtype).detach()
+                rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean] * num_samples
+                rollout_data["reinforce_pp_advantage_raw_std"] = [raw_std] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_mean"] = [normalized_mean] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_std"] = [normalized_std] * num_samples
+                rollout_data["reinforce_pp_valid_token_count"] = [valid_count] * num_samples
+                rollout_data["reinforce_pp_zero_variance"] = [zero_variance] * num_samples
+            else:
+                whitened_advs_flat = distributed_masked_whiten(
+                    all_advs,
+                    all_masks,
+                    process_group=dp_group,
+                    shift_mean=True,
+                )
             chunk_lengths = [chunk.size(0) for chunk in advantages]
             advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
@@ -758,6 +792,26 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _get_reinforce_plus_plus_mask_safe_reducer(
+    reducer: Callable[[torch.Tensor], torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Exclude masked non-finite values before a REINFORCE++ reduction."""
+    flat_valid_mask = torch.cat([mask.reshape(-1) != 0 for mask in loss_masks], dim=0)
+
+    def reduce_valid_tokens(values: torch.Tensor) -> torch.Tensor:
+        valid_mask = flat_valid_mask.to(device=values.device)
+        if values.shape[0] != valid_mask.numel():
+            raise ValueError(
+                "REINFORCE++ reducer expected one value per response token, "
+                f"got {values.shape[0]} values for {valid_mask.numel()} mask elements."
+            )
+        safe_values = torch.where(valid_mask, values, torch.zeros_like(values))
+        return reducer(safe_values)
+
+    return reduce_valid_tokens
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -792,6 +846,14 @@ def policy_loss_function(
         advantages = torch.cat(batch["advantages"], dim=0)
     else:
         advantages = batch["advantages"]
+
+    is_reinforce_plus_plus = args.advantage_estimator in {
+        "reinforce_plus_plus",
+        "reinforce_plus_plus_baseline",
+    }
+
+    if is_reinforce_plus_plus:
+        sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
 
     true_on_policy = getattr(args, "true_on_policy_mode", False)
     # In true on-policy mode, actor_fwd is absent so batch["log_probs"] is missing;
@@ -972,6 +1034,10 @@ def policy_loss_function(
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
+        if is_reinforce_plus_plus:
+            sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
+                sum_of_sample_mean, modified_response_masks
+            )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
@@ -981,6 +1047,8 @@ def policy_loss_function(
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
+        if is_reinforce_plus_plus:
+            pg_loss_reducer = _get_reinforce_plus_plus_mask_safe_reducer(pg_loss_reducer, pg_loss_masks)
     else:
         pg_loss_reducer = sum_of_sample_mean
 
@@ -1028,9 +1096,22 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        # Train/inference mismatch = |train-engine logprob - rollout-engine logprob| for
+        # the SAME tokens+weights. old_log_probs is the wrong reference under
+        # --use-rollout-logprobs: there old_log_probs IS rollout_log_probs (see the
+        # assignment above), so the diff would collapse to 0. Use the actor-fwd
+        # train-side recompute (batch["log_probs"], populated when --get-mismatch-metrics
+        # forces the extra forward) and fall back to this step's fresh forward log_probs
+        # otherwise (colocate on-policy: rollout weights == current weights).
+        if not args.use_rollout_logprobs:
+            train_side_log_probs = old_log_probs
+        elif batch.get("log_probs"):
+            train_side_log_probs = torch.cat(batch["log_probs"], dim=0)
+        else:
+            train_side_log_probs = log_probs.detach()
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((train_side_log_probs - rollout_log_probs).abs())
         train_rollout_prob_abs_diff = sum_of_sample_mean(
-            (torch.exp(old_log_probs) - torch.exp(rollout_log_probs)).abs()
+            (torch.exp(train_side_log_probs) - torch.exp(rollout_log_probs)).abs()
         )
 
     reported_loss = {

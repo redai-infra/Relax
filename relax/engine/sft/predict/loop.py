@@ -18,6 +18,7 @@ from pathlib import Path
 
 from relax.engine.sft.dataset.sample import CanonicalSample
 from relax.utils.logging_utils import get_logger
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 
 
@@ -92,6 +93,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
 
     from relax.engine.sft.dataset.streaming import SFTStreamingDataset
 
+    prepare_model_maybe_update_args(config, completeness="metadata")
     tokenizer = AutoTokenizer.from_pretrained(config.hf_checkpoint, trust_remote_code=True)
     cp_size = max(1, getattr(config, "context_parallel_size", 1) or 1)
     capacity = config.max_tokens_per_gpu * cp_size
@@ -116,6 +118,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         n_avail = len(dataset)
@@ -143,6 +146,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         start, n_eval = 0, len(dataset)

@@ -675,6 +675,11 @@ Scale-in is triggered only when **ALL** conditions are met:
 | `scale_in_cooldown_secs`  | 300s    | Wait after scale-in before next operation  |
 | `condition_window_secs`   | 60s     | Time window for condition history          |
 
+Conditions must remain satisfied for `condition_duration_secs`. Missing metrics, insufficient coverage, or an
+observation gap longer than twice the evaluation interval resets the duration. Scale-out permits partial coverage
+through `min_coverage_scale_out`; scale-in uses the stricter `min_coverage_scale_in` because removing capacity with
+missing engine metrics is unsafe. A histogram quantile in the Prometheus `+Inf` bucket is treated as high latency.
+
 ### Configuration
 
 #### Enable Autoscaler
@@ -687,6 +692,13 @@ ray job submit -- python3 relax/entrypoints/train.py \
     --autoscaler-config relax/utils/autoscaler/autoscaler.yaml \
     ... # other training arguments
 ```
+
+#### Baseline Node-Group Affinity
+
+When the autoscaler configuration is enabled, Relax pins baseline actor, critic, reference, rollout-seed, and
+colocated placement groups to the `stable` worker group. Elastic rollout engines remain unpinned. The cluster must
+publish `stable_gpu` and `stable_cpu` Ray custom resources; Relax fails fast if they are unavailable. Use
+`--no-enable-affinity` to disable this constraint.
 
 #### Configuration File Format
 

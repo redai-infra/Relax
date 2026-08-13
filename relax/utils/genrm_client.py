@@ -49,7 +49,14 @@ class GenRMClient:
 
         self.service_url = service_url.rstrip("/")
         self.timeout = timeout
-        self._async_client = httpx.AsyncClient(timeout=timeout)
+        # Raise pool limits above httpx's default 100 — a reward step can fire
+        # thousands of concurrent judge calls and a small pool serializes them;
+        # keepalive_expiry >> the default 5s so reused connections aren't reaped
+        # mid-burst.
+        self._async_client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=2048, max_keepalive_connections=2048, keepalive_expiry=600),
+        )
         # Keep a sync client for health checks during init and non-async contexts
         self._sync_client = httpx.Client(timeout=timeout)
 
