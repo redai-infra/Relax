@@ -291,9 +291,9 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
                 else:
                     local_infos[name] = info
 
-    # Exchange across EP so every rank has all expert indices.
-    # Only expert params need src_rank update — non-expert params are
-    # replicated across EP and already have the correct PP-local src_rank.
+    # Exchange across EP so every rank has all expert indices. Replicated
+    # non-expert params also need one canonical source: the converted-tensor
+    # broadcast protocol requires at most one owner for each parameter slot.
     if ep_size > 1:
         ep_infos_list: list[None | tuple[int, dict]] = [None] * ep_size
         dist.all_gather_object(
@@ -305,7 +305,7 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
             for name, info in infos.items():
                 if name not in local_infos:
                     local_infos[name] = dataclasses.replace(info, src_rank=src_rank)
-                elif ".experts." in name and info.src_rank < local_infos[name].src_rank:
+                elif info.src_rank < local_infos[name].src_rank:
                     local_infos[name] = dataclasses.replace(local_infos[name], src_rank=info.src_rank)
 
     # Sort deterministically and split expert / non-expert.

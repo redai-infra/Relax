@@ -1,10 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from dataclasses import replace
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 
 # These tests exercise the real Megatron Bridge weight conversion and
@@ -291,6 +295,110 @@ def test_bridge_hf_iterator_excludes_mixture_parameters():
     assert [[info.name for info in bucket] for bucket in base_buckets] == [
         ["module.module.decoder.layers.0.self_attention.linear_qkv.weight"]
     ]
+
+
+def test_bridge_ep_metadata_selects_one_owner_for_replicated_non_expert_params():
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _build_param_info_buckets
+
+    non_expert_name = "module.module.decoder.layers.0.self_attention.linear_qkv.weight"
+    local_expert_name = "module.module.decoder.layers.0.mlp.experts.linear_fc1.weight1"
+    remote_expert_name = "module.module.decoder.layers.0.mlp.experts.linear_fc1.weight0"
+    local_params = [
+        (non_expert_name, torch.nn.Parameter(torch.zeros(4, 4))),
+        (local_expert_name, torch.nn.Parameter(torch.zeros(4, 4))),
+    ]
+    args = SimpleNamespace(update_weight_buffer_size=1024, num_experts=2)
+
+    def gather_ep(obj, object_list, group=None):
+        rank, local_infos = obj
+        assert rank == 3
+        assert group == "ep-group"
+        remote_infos = {
+            non_expert_name: replace(local_infos[non_expert_name], src_rank=2),
+            remote_expert_name: replace(local_infos[local_expert_name], name=remote_expert_name, src_rank=2),
+        }
+        object_list[:] = [obj, (2, remote_infos)]
+
+    with (
+        patch(
+            "relax.backends.megatron.weight_update.hf_weight_iterator_bridge.named_params_and_buffers",
+            side_effect=[iter(local_params), iter(local_params)],
+        ),
+        patch("torch.distributed.get_rank", return_value=3),
+        patch("torch.distributed.all_gather_object", side_effect=gather_ep),
+        patch("megatron.core.mpu.get_pipeline_model_parallel_world_size", return_value=1),
+        patch("megatron.core.mpu.get_expert_model_parallel_world_size", return_value=2),
+        patch("megatron.core.mpu.get_expert_model_parallel_group", return_value="ep-group"),
+        patch("megatron.core.mpu.get_tensor_model_parallel_world_size", return_value=1),
+        patch("megatron.core.mpu.get_expert_tensor_parallel_world_size", return_value=1),
+    ):
+        expert_buckets, non_expert_buckets, _, _ = _build_param_info_buckets(args, model=[])
+
+    expert_infos = {info.name: info for bucket in expert_buckets for info in bucket}
+    non_expert_infos = {info.name: info for bucket in non_expert_buckets for info in bucket}
+    assert non_expert_infos[non_expert_name].src_rank == 2
+    assert expert_infos[local_expert_name].src_rank == 3
+    assert expert_infos[remote_expert_name].src_rank == 2
+
+
+def _bridge_ep_owner_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    from megatron.core import parallel_state
+
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (
+        _broadcast_converted_phase,
+        _build_param_info_buckets,
+    )
+
+    parallel_state.initialize_model_parallel(expert_model_parallel_size=world_size)
+    try:
+        non_expert_name = "module.module.decoder.layers.0.self_attention.linear_qkv.weight"
+        expert_name = f"module.module.decoder.layers.0.mlp.experts.linear_fc1.weight{rank}"
+        local_params = [
+            (non_expert_name, torch.nn.Parameter(torch.zeros(4, 4))),
+            (expert_name, torch.nn.Parameter(torch.zeros(4, 4))),
+        ]
+        args = SimpleNamespace(update_weight_buffer_size=1024, num_experts=world_size)
+        with patch(
+            "relax.backends.megatron.weight_update.hf_weight_iterator_bridge.named_params_and_buffers",
+            side_effect=[iter(local_params), iter(local_params)],
+        ):
+            expert_buckets, non_expert_buckets, _, _ = _build_param_info_buckets(args, model=[])
+
+        expert_infos = {info.name: info for bucket in expert_buckets for info in bucket}
+        non_expert_infos = {info.name: info for bucket in non_expert_buckets for info in bucket}
+        assert set(expert_infos) == {
+            "module.module.decoder.layers.0.mlp.experts.linear_fc1.weight0",
+            "module.module.decoder.layers.0.mlp.experts.linear_fc1.weight1",
+        }
+        info = non_expert_infos[non_expert_name]
+        assert info.src_rank == 0
+
+        converted = [("model.layers.0.self_attn.qkv_proj.weight", torch.full((2, 2), 7.0))]
+        local_converted = [converted if rank == info.src_rank else None]
+        result = _broadcast_converted_phase(
+            [info],
+            local_converted,
+            torch.device("cpu"),
+            rank,
+            parallel_state.get_expert_model_parallel_group(),
+        )
+        assert result[0][0][0] == converted[0][0]
+        torch.testing.assert_close(result[0][0][1], converted[0][1])
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+
+
+def test_bridge_ep_replicated_non_expert_has_one_real_collective_owner(tmp_path):
+    init_method = f"file://{tmp_path / 'bridge-ep-owner-gloo-init'}"
+    mp.spawn(_bridge_ep_owner_worker, args=(2, init_method), nprocs=2, join=True)
 
 
 def test_first_sync_sends_base_then_routes_and_versions_only_the_final_chunk():
