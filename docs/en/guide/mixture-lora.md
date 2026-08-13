@@ -72,7 +72,7 @@ Use the per-site post-Top-K weights, selection shares, and entropy to detect col
 
 Relax starts the Qwen3 SGLang external model automatically when Mixture mode is enabled. The first colocate update sends the frozen base plus all expert and router tensors. Later updates send all current expert and router tensors without resending the base. A weight version is published only after the final routed tensor is accepted.
 
-If an update fails, Relax resumes generation, keeps the previous weight version, and reports the failed update instead of silently serving a partial policy.
+If an update fails, Relax keeps generation paused, preserves the previous weight version, and reports the failure. Restart or fully resynchronize the rollout engines before serving requests again, because some unversioned chunks may already have been transferred. The final versioned chunk is sent only after every rank confirms that the preceding chunks succeeded.
 
 ## Checkpoints
 

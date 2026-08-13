@@ -403,7 +403,7 @@ def test_update_lifecycle_keeps_call_order_and_skips_base_after_first_sync():
     assert updater._mixture_lora_sync.base_sync_done is True
 
 
-def test_update_failure_resumes_generation_and_keeps_previous_version():
+def test_update_failure_keeps_generation_paused_and_preserves_version():
     from relax.backends.megatron.weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
     events = []
@@ -446,12 +446,12 @@ def test_update_failure_resumes_generation_and_keeps_previous_version():
     ):
         updater._update_weights_mixture_lora()
 
-    assert events == ["pause", "flush", "update", "continue"]
+    assert events == ["pause", "flush", "update"]
     assert updater.weight_version == 4
     assert updater._mixture_lora_sync.base_sync_done is False
 
 
-def test_stream_failure_reaches_chunk_barrier_before_raising():
+def test_stream_failure_does_not_publish_the_final_versioned_chunk():
     from relax.backends.megatron.weight_update.update_weight_from_tensor import UpdateWeightFromTensor
 
     updater = UpdateWeightFromTensor.__new__(UpdateWeightFromTensor)
@@ -465,9 +465,13 @@ def test_stream_failure_reaches_chunk_barrier_before_raising():
             "relax.backends.megatron.weight_update.update_weight_from_tensor."
             "device_utils.maybe_backend_barrier_on_weight_chunk"
         ) as chunk_barrier,
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.all_reduce"),
         patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
         pytest.raises(RuntimeError, match="engine update failed"),
     ):
         updater._send_weight_update_stream([([("first", torch.ones(1))], None), ([("second", torch.ones(1))], 5)])
 
-    assert chunk_barrier.call_count == 2
+    updater._send_hf_params.assert_called_once()
+    assert updater._send_hf_params.call_args.kwargs["weight_version"] is None
+    assert chunk_barrier.call_count == 1

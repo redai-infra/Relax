@@ -362,14 +362,11 @@ class UpdateWeightFromTensor:
             if not phase_failed:
                 continue
 
-            cleanup_error, _ = self._run_synchronized_weight_update_phase(
-                lambda: resume_generation(finish_quantization=True)
+            logger.error(
+                "Mixture-of-LoRA weight update failed during %s; rollout generation remains paused "
+                "until the engines are restarted or fully resynchronized",
+                phase_name,
             )
-            if cleanup_error is not None:
-                logger.error(
-                    "Failed to resume rollout generation after Mixture-of-LoRA update failure",
-                    exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
-                )
             if local_error is not None:
                 raise local_error
             raise RuntimeError(f"Mixture-of-LoRA weight update phase {phase_name!r} failed on another rank")
@@ -408,7 +405,22 @@ class UpdateWeightFromTensor:
 
         previous_refs: list[ObjectRef] = []
         previous_tensors = None
+        has_previous_chunk = False
         for named_tensors, weight_version in updates:
+            # The versioned final chunk makes the whole update visible. Confirm
+            # the preceding chunk on every rank before publishing that version.
+            if weight_version is not None and has_previous_chunk:
+                previous_error, previous_failed = self._run_synchronized_weight_update_phase(
+                    lambda: ray.get(previous_refs) if previous_refs else None
+                )
+                del previous_tensors
+                previous_refs = []
+                previous_tensors = None
+                if previous_failed:
+                    if previous_error is not None:
+                        raise previous_error
+                    raise RuntimeError("A preceding Mixture-of-LoRA weight chunk failed on another rank")
+
             refs, long_lived_tensors = self._send_hf_params(named_tensors, weight_version=weight_version)
             previous_error = None
             if previous_refs:
@@ -419,6 +431,7 @@ class UpdateWeightFromTensor:
             del previous_tensors
             previous_refs = refs
             previous_tensors = long_lived_tensors
+            has_previous_chunk = True
             device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
             if previous_error is not None:
                 raise previous_error

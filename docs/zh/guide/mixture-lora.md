@@ -72,7 +72,7 @@ Prompt、padding 和 dummy token 不参与 balance loss 与路由指标。静态
 
 启用 Mixture 后，Relax 会自动启动 Qwen3 SGLang external model。第一次 colocate 更新发送冻结的基座参数以及全部 expert/router 参数；后续更新只发送当前全部 expert/router 参数。最后一组 routed tensor 加载成功后才发布新的 weight version。
 
-更新失败时会恢复 generation、保留原 weight version，并报告错误，不会静默使用只加载了一部分的新策略。
+更新失败时会保持 generation 暂停、保留原 weight version，并报告错误。由于部分未带版本号的分块可能已经传输，需要重启或完整重同步 rollout engine 后才能继续提供服务。只有所有 rank 都确认前序分块成功后，才会发送带新版本号的最后一个分块。
 
 ## Checkpoint
 
