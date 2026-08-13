@@ -26,9 +26,12 @@ ARGUMENTS_PATH = Path(__file__).resolve().parents[2] / "relax" / "utils" / "argu
 
 def _load_validator():
     """Extract ``_validate_p3o_args`` without importing arguments.py."""
+    import argparse
+
     tree = ast.parse(ARGUMENTS_PATH.read_text(encoding="utf-8"))
     func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_validate_p3o_args")
     module = types.ModuleType("_p3o_args")
+    module.argparse = argparse  # Inject argparse for type annotation
     exec(compile(ast.Module(body=[func], type_ignores=[]), str(ARGUMENTS_PATH), "exec"), module.__dict__)
     return module._validate_p3o_args
 

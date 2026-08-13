@@ -2900,7 +2900,7 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
-def _validate_p3o_args(args: Any) -> None:
+def _validate_p3o_args(args: argparse.Namespace) -> None:
     """Reject P3O configurations whose ESS scope or replay would be wrong.
 
     These are hard errors, not warnings. Every condition below silently changes
