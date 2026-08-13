@@ -14,6 +14,7 @@ internal defaults or the deployment environment, per maintainer guidance.
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Any
 
@@ -32,6 +33,39 @@ _DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024**3  # 4 GiB per client (config.yaml:52)
 _DEFAULT_LOCAL_BUFFER_SIZE = 1 * 1024**3  # 1 GiB per client (config.yaml:54)
 _DEFAULT_GDR_STAGING_MB = 1024  # config.yaml:103
 _DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"  # config.yaml:42-43
+
+
+def resolve_mooncake_master_address() -> str:
+    """Return the externally managed Mooncake master endpoint."""
+    return os.environ.get("MC_MASTER_ADDRESS", "localhost:50051")
+
+
+def validate_mooncake_runtime_contract() -> None:
+    """Fail fast unless installed TransferQueue has the loss-prevention fixes.
+
+    The RDMA integration depends on per-key put/get result validation and on
+    notifying production readiness only after storage succeeds. A version
+    number alone is insufficient for development builds, so validate the
+    concrete runtime capabilities before probing or creating a controller.
+    """
+    try:
+        from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
+        from transfer_queue.storage.managers.base import KVStorageManager
+    except ImportError as e:
+        raise RuntimeError("Installed TransferQueue has no MooncakeStore support") from e
+
+    required_methods = ("_batch_upsert_with_retry", "_batch_get_into_with_retry")
+    missing = [name for name in required_methods if not callable(getattr(MooncakeStoreClient, name, None))]
+    if missing:
+        raise RuntimeError("Installed TransferQueue lacks required Mooncake failure handling: " + ", ".join(missing))
+
+    put_source = inspect.getsource(KVStorageManager.put_data)
+    storage_call = put_source.find("self.storage_client.put")
+    ready_notify = put_source.find("self.notify_data_update")
+    if storage_call < 0 or ready_notify < 0 or storage_call > ready_notify:
+        raise RuntimeError(
+            "Installed TransferQueue does not guarantee storage success before production-status notification"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +108,7 @@ def build_mooncake_config(
         pass a larger value (e.g. 8 GiB) to avoid staging-buffer pressure.
     """
     if master_address is None:
-        master_address = os.environ.get("MC_MASTER_ADDRESS", "localhost:50051")
+        master_address = resolve_mooncake_master_address()
 
     cfg: dict[str, Any] = {
         # Selects the manager inside ``tq.init`` (interface.py reads

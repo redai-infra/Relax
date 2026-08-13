@@ -13,7 +13,6 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
-import transfer_queue as tq
 from megatron.core import mpu
 
 
@@ -61,6 +60,7 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
+from relax.utils.tq_lifecycle import attach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
@@ -187,8 +187,9 @@ class MegatronTrainRayActor(TrainRayActor):
         init(args)
         if repatch is not None:
             repatch(args)
-        tq.init(args.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            args.tq_config, requested_gdr=getattr(args, "tq_use_gdr", False), role=role
+        )
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
 

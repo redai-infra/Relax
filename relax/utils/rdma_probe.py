@@ -94,9 +94,12 @@ class EffectiveConfig:
     def log_line(self) -> str:
         """Return the single-line startup log string for this effective
         config."""
-        gdr_str = "on" if self.gdr else "off"
+        gdr_status = "unknown" if self.gdr else "off"
         dev = self.device or "auto"
-        base = f"[dataplane] backend={self.backend} protocol={self.protocol} device={dev} gdr={gdr_str}"
+        base = (
+            f"[dataplane] backend={self.backend} protocol={self.protocol} device={dev} "
+            f"gdr_requested={str(self.gdr).lower()} gdr_status={gdr_status}"
+        )
         if self.fallback_reason:
             return f"{base} fallback={self.fallback_reason}"
         return base
@@ -179,12 +182,39 @@ def _check_memlock() -> CheckResult:
         return CheckResult("memlock", False, str(e))
 
 
+def _split_host_port(address: str) -> tuple[str, int]:
+    """Parse ``host:port`` and bracketed IPv6 endpoints."""
+    value = address.strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0 or end + 2 > len(value) or value[end + 1] != ":":
+            raise ValueError(f"invalid bracketed endpoint: {address!r}")
+        return value[1:end], int(value[end + 2 :])
+    host, separator, port = value.rpartition(":")
+    if not separator or not host or not port:
+        raise ValueError(f"expected host:port, got {address!r}")
+    return host, int(port)
+
+
+def _check_master_reachable(address: str, timeout: float = 2.0) -> CheckResult:
+    """Verify that this node can establish a bounded TCP connection to
+    master."""
+    try:
+        host, port = _split_host_port(address)
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+        return CheckResult("master_reachable", True, address)
+    except (OSError, ValueError) as e:
+        return CheckResult("master_reachable", False, f"{address}: {e}")
+
+
 def _check_health_check() -> CheckResult:  # pragma: no cover - retained for ad-hoc use
     """Call mooncake's native ``health_check()`` (NOT used by ``probe_node``).
 
     Returns 0=healthy, 1=not initialized/closed, 2=master unreachable.  Kept as
-    a utility for post-init diagnostics; intentionally excluded from the pre-
-    init probe because the master is not running at probe time.
+    a utility for post-init diagnostics. The pre-init path uses a bounded TCP
+    reachability check instead because the global health API is process-state
+    dependent before a local Mooncake client has been initialized.
     """
     try:
         import mooncake
@@ -208,10 +238,9 @@ def _check_health_check() -> CheckResult:  # pragma: no cover - retained for ad-
 # Per-node probe
 # ---------------------------------------------------------------------------
 
-# NOTE: ``health_check()`` is intentionally NOT probed -- it queries the
-# mooncake master, which is not yet running at probe time (auto_init=False),
-# so it would always report failure and force a spurious SimpleStorage
-# fallback.  Master reachability is authoritatively checked by ``tq.init``.
+# NOTE: ``health_check()`` is intentionally NOT probed because it depends on
+# local Mooncake client initialization. External-master reachability is checked
+# directly with a bounded TCP connect, then authoritatively by ``tq.init``.
 _CHECK_FUNCS_NO_DEVICE = [
     _check_mooncake_import,
     _check_rdma_devices,
@@ -219,7 +248,7 @@ _CHECK_FUNCS_NO_DEVICE = [
 ]
 
 
-def probe_node(device: str = "") -> ProbeResult:
+def probe_node(device: str = "", master_address: str = "") -> ProbeResult:
     """Run all capability checks on the current node.
 
     Parameters
@@ -234,6 +263,12 @@ def probe_node(device: str = "") -> ProbeResult:
     for fn in _CHECK_FUNCS_NO_DEVICE:
         checks.append(fn())
 
+    # Mooncake is externally managed by Relax deployments. When an endpoint is
+    # supplied, it must already be reachable from every data-plane node before
+    # the job creates a global TransferQueue controller.
+    if master_address:
+        checks.append(_check_master_reachable(master_address))
+
     # Device-dependent checks.
     checks.append(_check_port_active(device))
     checks.append(_check_gid_available(device))
@@ -244,12 +279,16 @@ def probe_node(device: str = "") -> ProbeResult:
     port_ok = any(c.name.startswith("port_active") and c.ok for c in checks)
     gid_ok = any(c.name.startswith("gid") and c.ok for c in checks)
     memlock_ok = any(c.name == "memlock" and c.ok for c in checks)
+    master_ok = not master_address or any(c.name == "master_reachable" and c.ok for c in checks)
 
     effective_protocol: str | None
     effective_device = device
     if not mooncake_ok:
         effective_protocol = None
         errors.append("mooncake not importable")
+    elif not master_ok:
+        effective_protocol = None
+        errors.append("master unreachable")
     elif rdma_dev_ok and port_ok and gid_ok and memlock_ok:
         effective_protocol = "rdma"
         if not effective_device:
@@ -338,7 +377,12 @@ def _degenerate_result(node: str, error: str) -> ProbeResult:
     )
 
 
-def probe_cluster_nodes(device: str = "", *, timeout: float = 60.0) -> list[ProbeResult]:
+def probe_cluster_nodes(
+    device: str = "",
+    master_address: str = "",
+    *,
+    timeout: float = 60.0,
+) -> list[ProbeResult]:
     """Probe every alive GPU-bearing node and return one result per node.
 
     The driver fans the probe out as a short-lived Ray remote task pinned to
@@ -353,33 +397,35 @@ def probe_cluster_nodes(device: str = "", *, timeout: float = 60.0) -> list[Prob
     as a degenerate ``effective_protocol=None`` result so the reducer degrades
     the whole job rather than silently omitting the node.
 
-    Returns ``[probe_node(device)]`` when no GPU workers are discoverable
-    (single-node / local dev), preserving backward-compatible behavior.
+    The driver is always included because the first ``tq.init`` creates a local
+    Mooncake client there even when the Ray head is CPU-only. Returns only the
+    driver result when no GPU workers are discoverable (single-node/local dev).
     """
     node_ids = _alive_gpu_nodes()
+    driver_result = probe_node(device, master_address)
     if not node_ids:
         logger.debug("No alive GPU nodes discovered; probing driver node only.")
-        return [probe_node(device)]
+        return [driver_result]
 
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     @ray.remote(num_cpus=0.001)
-    def _probe_on_node(dev: str) -> ProbeResult:
+    def _probe_on_node(dev: str, master: str) -> ProbeResult:
         from relax.utils.rdma_probe import probe_node as _probe
 
-        return _probe(dev)
+        return _probe(dev, master)
 
     refs: list[Any] = []
     id_by_ref: dict[Any, str] = {}
     for node_id in node_ids:
         strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        ref = _probe_on_node.options(scheduling_strategy=strategy).remote(device)
+        ref = _probe_on_node.options(scheduling_strategy=strategy).remote(device, master_address)
         refs.append(ref)
         id_by_ref[ref] = node_id
 
     ready, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout)
-    results: list[ProbeResult] = []
+    results: list[ProbeResult] = [driver_result]
     for ref in ready:
         node_id = id_by_ref[ref]
         try:
@@ -450,12 +496,18 @@ def reduce_results(
 
     if any_no_mooncake:
         failed_nodes = [r.node for r in results if r.effective_protocol is None]
+        master_failed_nodes = [r.node for r in results if "master unreachable" in r.errors]
+        reason = (
+            f"master_unreachable:{','.join(master_failed_nodes)}"
+            if master_failed_nodes
+            else f"mooncake_unavailable:{','.join(failed_nodes)}"
+        )
         return EffectiveConfig(
             backend=fallback_backend,
             protocol="tcp",
             device="",
             gdr=False,
-            fallback_reason=f"mooncake_unavailable:{','.join(failed_nodes)}",
+            fallback_reason=reason,
         )
 
     if all_rdma:

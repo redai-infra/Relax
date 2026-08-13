@@ -17,15 +17,19 @@ comparable:
   * C1 ``tcp``    -- MooncakeStore / mooncake / TCP
   * C2 ``rdma``   -- MooncakeStore / mooncake / RDMA
 
-Every payload档's transport is proven on the wire by reading the IB
-``port_rcv_data`` and bond0 ``rx_bytes`` counters around each get: RDMA档 must
-show IB moving and bond0 flat; TCP档 the reverse.  There is no "thought it was
-RDMA but was TCP" ambiguity.
+Both synthetic tensors and production-shaped multimodal payloads are tested;
+every fetched field is compared byte-for-byte via a SHA-256 digest before a
+throughput result is accepted. Every payload tier's transport is proven by
+reading the IB ``port_rcv_data`` and bond0 ``rx_bytes`` counters around each
+get: RDMA must show IB moving and bond0 flat; TCP the reverse. There is no
+"thought it was RDMA but was TCP" ambiguity.
 
 Usage (node A driver; node B already in the Ray cluster):
 
   PYTHONPATH=<Relax> python -u scripts/benchmarks/tq_cross_node_bench.py \\
-      --payload-mib 256 1024 2048 4096 --repeats 5 --csv tq_cross_node_gib.csv
+      --payload-profiles synthetic multimodal \\
+      --payload-mib 256 1024 2048 4096 --repeats 5 \\
+      --require-wire-proof --csv tq_cross_node_gib.csv
 
 On mooncake 0.3.10, switching protocols inside one driver session can make the
 third protocol's ``batch_get_into`` return -800 (see task-26-dev-log §7.11).
@@ -40,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import statistics
 import time
 from typing import Any
@@ -70,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-samples", type=int, default=256, help="Rows per put (rollout-batch-like)")
     p.add_argument("--num-fields", nargs="+", type=int, default=[1], help="Tensor fields per put")
     p.add_argument(
+        "--payload-profiles",
+        nargs="+",
+        default=["synthetic", "multimodal"],
+        choices=["synthetic", "multimodal"],
+        help="Payload layouts to benchmark. Multimodal uses production field names, shapes, and dtypes.",
+    )
+    p.add_argument(
         "--repeats",
         type=int,
         default=5,
@@ -90,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         help="Subset of configs to run (use one per process to dodge the 0.3.10 -800 issue).",
     )
     p.add_argument("--csv", default="", help="Optional path to write per-run rows + summary")
+    p.add_argument(
+        "--require-wire-proof",
+        action="store_true",
+        help="Fail unless counters prove RDMA traffic for rdma and TCP traffic for tcp/simple.",
+    )
     return p.parse_args()
 
 
@@ -110,9 +127,75 @@ def make_payload(num_samples: int, num_fields: int, total_mib: int):
     return TensorDict(data, batch_size=[num_samples])
 
 
+def make_multimodal_payload(num_samples: int, total_mib: int):
+    """Build a production-shaped vision-language rollout TensorDict.
+
+    ``pixel_values`` follows the Qwen-VL hidden width (1176) and BF16 dtype;
+    token, mask, grid, reward, and sample-id fields exercise the mixed dtypes
+    present in real Relax batches.  Patch count scales to the requested size,
+    so the same layout is validated at every benchmark tier.
+    """
+    import torch
+    from tensordict import TensorDict
+
+    target_bytes = total_mib * 1024 * 1024
+    seq_len = min(4096, max(128, target_bytes // max(1, num_samples * 128 * 1024)))
+    fixed_bytes = num_samples * (seq_len * (8 + 8 + 8) + 3 * 8 + 8 + 4)
+    pixel_budget = max(num_samples * 1176 * 2, target_bytes - fixed_bytes)
+    patches = max(1, pixel_budget // (num_samples * 1176 * 2))
+
+    pixel_values = torch.arange(num_samples * patches * 1176, dtype=torch.int32)
+    pixel_values = (pixel_values.remainder(2048).to(torch.float32) / 128).to(torch.bfloat16)
+    pixel_values = pixel_values.reshape(num_samples, patches, 1176)
+    token_row = torch.arange(seq_len, dtype=torch.int64)
+    input_ids = token_row.repeat(num_samples, 1)
+    response_ids = (token_row + 100_000).repeat(num_samples, 1)
+    attention_mask = torch.ones((num_samples, seq_len), dtype=torch.int64)
+    image_grid_thw = torch.tensor([1, 1, patches], dtype=torch.int64).repeat(num_samples, 1, 1)
+    sample_id = torch.arange(num_samples, dtype=torch.int64).reshape(num_samples, 1)
+    rewards = torch.linspace(-1.0, 1.0, num_samples, dtype=torch.float32).reshape(num_samples, 1)
+    return TensorDict(
+        {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "input_ids": input_ids,
+            "response_ids": response_ids,
+            "attention_mask": attention_mask,
+            "sample_id": sample_id,
+            "rewards": rewards,
+        },
+        batch_size=[num_samples],
+    )
+
+
+def make_profile_payload(profile: str, num_samples: int, num_fields: int, total_mib: int):
+    if profile == "multimodal":
+        return make_multimodal_payload(num_samples, total_mib)
+    return make_payload(num_samples, num_fields, total_mib)
+
+
 def payload_bytes(payload) -> int:
     """Total bytes across all tensor fields."""
     return sum(payload[k].nelement() * payload[k].element_size() for k in payload.keys())
+
+
+def field_byte_digests(payload, fields: list[str]) -> dict[str, tuple[str, int, str]]:
+    """Return per-field byte digests normalized to TQ's row-major storage.
+
+    TQ reconstructs dense input columns as jagged ``NestedTensor`` columns.
+    Comparing flattened values makes the digest representation-independent
+    while still checking every dtype bit and every payload byte.
+    """
+    import torch
+
+    out: dict[str, tuple[str, int, str]] = {}
+    for field in fields:
+        value = payload[field]
+        flat = value.values().reshape(-1) if type(value).__name__ == "NestedTensor" else value.reshape(-1)
+        flat = flat.detach().cpu().contiguous()
+        raw = flat.view(torch.uint8).numpy().tobytes()
+        out[field] = (str(flat.dtype), flat.numel(), hashlib.sha256(raw).hexdigest())
+    return out
 
 
 def wait_actor_gone(name: str = "TransferQueueController", timeout: float = 30.0) -> None:
@@ -252,7 +335,7 @@ class TQConsumer:
             except Exception:  # pragma: no cover - best effort
                 pass
 
-    def fetch(self, fields, batch_size: int, partition: str):
+    def fetch(self, fields, batch_size: int, partition: str, expected_digests):
         """One cross-node get; return (ms, ib_mb, tcp_mb, ib_tail_mb,
         tcp_tail_mb).
 
@@ -276,15 +359,17 @@ class TQConsumer:
         after = read_counters()
         time.sleep(0.005)  # let any async RDMA tail register on the counters
         settled = read_counters()
-        # Touch the data so the get is not optimized away and to sanity-check shape.
-        for f in fields:
-            v = got[f]
-            _ = v.values().reshape(-1) if type(v).__name__ == "NestedTensor" else v.reshape(-1)
+        # Digesting occurs outside the timed interval.  A mismatch is fatal:
+        # throughput from a corrupt or truncated transfer is never reported.
+        actual_digests = field_byte_digests(got, list(fields))
+        if actual_digests != expected_digests:
+            mismatch = [field for field in fields if actual_digests.get(field) != expected_digests.get(field)]
+            raise AssertionError(f"byte-exact mismatch after TQ get: fields={mismatch}")
         ib = sum(after[k] - before.get(k, 0) for k in after if k.startswith("ib:")) / 1e6
         tcp = sum(after[k] - before.get(k, 0) for k in after if k.startswith("tcp:")) / 1e6
         ib_tail = sum(settled[k] - after.get(k, 0) for k in settled if k.startswith("ib:")) / 1e6
         tcp_tail = sum(settled[k] - after.get(k, 0) for k in settled if k.startswith("tcp:")) / 1e6
-        return ms, ib, tcp, ib_tail, tcp_tail
+        return ms, ib, tcp, ib_tail, tcp_tail, True
 
 
 def _mean(values: list[float]) -> float:
@@ -316,9 +401,9 @@ def main() -> None:
     )
 
     labels = {"simple": "C0 SimpleStorage", "tcp": "C1 Mooncake/TCP", "rdma": "C2 Mooncake/RDMA"}
-    # results[protocol][total_mib][num_fields] = {
+    # results[protocol][profile][total_mib][num_fields] = {
     #   "put_mean_gbs","get_mean_gbs","get_med_gbs","get_std_gbs","wire", "per_run":[...]}
-    results: dict[str, dict[int, dict[int, dict[str, Any]]]] = {}
+    results: dict[str, dict[str, dict[int, dict[int, dict[str, Any]]]]] = {}
     csv_rows: list[dict[str, Any]] = []
 
     for protocol in args.protocols:
@@ -344,87 +429,115 @@ def main() -> None:
         )
 
         results.setdefault(protocol, {})
-        for total_mib in args.payload_mib:
-            results[protocol].setdefault(total_mib, {})
-            for nf in args.num_fields:
-                payload = make_payload(args.num_samples, nf, total_mib)
-                fields = sorted(payload.keys())
-                nbytes = payload_bytes(payload)
-                put_times: list[float] = []
-                get_times: list[float] = []
-                ibs: list[float] = []
-                tcps: list[float] = []
-                ib_tails: list[float] = []  # async-completion detector (~0 == sync get)
-                tcp_tails: list[float] = []
-                # repeat 0 is a warm-up: first transfer pays RDMA endpoint handshake.
-                for r in range(args.repeats + 1):
-                    part = f"xfer_{protocol}_{total_mib}_{nf}_{r}"
-                    t0 = time.perf_counter()
-                    producer.put(payload, partition_id=part)
-                    put_ms = (time.perf_counter() - t0) * 1000
-                    get_ms, ib, tcp, ib_tail, tcp_tail = ray.get(consumer.fetch.remote(fields, args.num_samples, part))
-                    producer.clear_partition(part)
-                    if r == 0:
-                        print(
-                            f"  {total_mib}M f={nf} (warmup, not counted): "
-                            f"put={put_ms:.0f}ms get={get_ms:.0f}ms "
-                            f"ib_tail={ib_tail:.0f}MB",
-                            flush=True,
+        for profile in args.payload_profiles:
+            results[protocol].setdefault(profile, {})
+            for total_mib in args.payload_mib:
+                results[protocol][profile].setdefault(total_mib, {})
+                # Multimodal has a fixed production schema; synthetic uses the
+                # requested field-count sweep.
+                field_counts = args.num_fields if profile == "synthetic" else [7]
+                for nf in field_counts:
+                    payload = make_profile_payload(profile, args.num_samples, nf, total_mib)
+                    nf = len(list(payload.keys()))
+                    fields = sorted(payload.keys())
+                    expected_digests = field_byte_digests(payload, fields)
+                    nbytes = payload_bytes(payload)
+                    put_times: list[float] = []
+                    get_times: list[float] = []
+                    ibs: list[float] = []
+                    tcps: list[float] = []
+                    ib_tails: list[float] = []  # async-completion detector (~0 == sync get)
+                    tcp_tails: list[float] = []
+                    # repeat 0 is a warm-up: first transfer pays RDMA endpoint handshake.
+                    for r in range(args.repeats + 1):
+                        part = f"xfer_{protocol}_{profile}_{total_mib}_{nf}_{r}"
+                        t0 = time.perf_counter()
+                        producer.put(payload, partition_id=part)
+                        put_ms = (time.perf_counter() - t0) * 1000
+                        get_ms, ib, tcp, ib_tail, tcp_tail, byte_exact = ray.get(
+                            consumer.fetch.remote(fields, args.num_samples, part, expected_digests)
                         )
-                        continue
-                    put_times.append(put_ms)
-                    get_times.append(get_ms)
-                    ibs.append(ib)
-                    tcps.append(tcp)
-                    ib_tails.append(ib_tail)
-                    tcp_tails.append(tcp_tail)
-                    csv_rows.append(
-                        {
-                            "protocol": protocol,
-                            "payload_mib": total_mib,
-                            "num_fields": nf,
-                            "run": r,
-                            "put_ms": round(put_ms, 2),
-                            "get_ms": round(get_ms, 2),
-                            "put_gbs": round(_gbs(nbytes, put_ms), 3),
-                            "get_gbs": round(_gbs(nbytes, get_ms), 3),
-                            "ib_mb": round(ib, 1),
-                            "tcp_mb": round(tcp, 1),
-                            "ib_tail_mb": round(ib_tail, 1),
-                            "tcp_tail_mb": round(tcp_tail, 1),
-                        }
-                    )
+                        producer.clear_partition(part)
+                        if r == 0:
+                            print(
+                                f"  {profile} {total_mib}M f={nf} (warmup, not counted): "
+                                f"put={put_ms:.0f}ms get={get_ms:.0f}ms "
+                                f"ib_tail={ib_tail:.0f}MB byte_exact={byte_exact}",
+                                flush=True,
+                            )
+                            continue
+                        put_times.append(put_ms)
+                        get_times.append(get_ms)
+                        ibs.append(ib)
+                        tcps.append(tcp)
+                        ib_tails.append(ib_tail)
+                        tcp_tails.append(tcp_tail)
+                        run_wire = "RDMA" if ib > tcp else "TCP"
+                        run_wire_proven = (protocol == "rdma" and ib > 0 and ib > tcp) or (
+                            protocol != "rdma" and tcp > 0 and tcp >= ib
+                        )
+                        csv_rows.append(
+                            {
+                                "protocol": protocol,
+                                "profile": profile,
+                                "payload_mib": total_mib,
+                                "actual_mib": round(nbytes / 1024**2, 2),
+                                "num_fields": nf,
+                                "run": r,
+                                "byte_exact": byte_exact,
+                                "wire_observed": run_wire,
+                                "wire_proven": run_wire_proven,
+                                "put_ms": round(put_ms, 2),
+                                "get_ms": round(get_ms, 2),
+                                "put_gbs": round(_gbs(nbytes, put_ms), 3),
+                                "get_gbs": round(_gbs(nbytes, get_ms), 3),
+                                "ib_mb": round(ib, 1),
+                                "tcp_mb": round(tcp, 1),
+                                "ib_tail_mb": round(ib_tail, 1),
+                                "tcp_tail_mb": round(tcp_tail, 1),
+                            }
+                        )
 
-                put_mean = _mean(put_times)
-                get_mean = _mean(get_times)
-                get_med = statistics.median(get_times)
-                # Std-dev of the per-run THROUGHPUT values (not of latency): converting a
-                # latency stddev via _gbs(nbytes, std_ms) would be a meaningless number.
-                get_gbs_runs = [_gbs(nbytes, ms) for ms in get_times]
-                get_std_gbs = statistics.pstdev(get_gbs_runs) if len(get_gbs_runs) > 1 else 0.0
-                ib_med = statistics.median(ibs)
-                tcp_med = statistics.median(tcps)
-                ib_tail_med = statistics.median(ib_tails) if ib_tails else 0.0
-                wire = "RDMA" if ib_med > tcp_med else "TCP"
-                rec = {
-                    "put_mean_gbs": _gbs(nbytes, put_mean),
-                    "get_mean_gbs": _gbs(nbytes, get_mean),
-                    "get_med_gbs": _gbs(nbytes, get_med),
-                    "get_std_gbs": get_std_gbs,
-                    "wire": wire,
-                    "ib_tail_med_mb": ib_tail_med,
-                    "per_run_get_gbs": [round(g, 2) for g in get_gbs_runs],
-                }
-                results[protocol][total_mib][nf] = rec
-                print(
-                    f"  {str(total_mib) + 'M':<9} f={nf} put_mean={rec['put_mean_gbs']:6.2f} "
-                    f"GB/s get_mean={rec['get_mean_gbs']:6.2f} (med {rec['get_med_gbs']:.2f}, "
-                    f"std {rec['get_std_gbs']:.2f}) GB/s "
-                    f"[wire: IB {ib_med:.0f}MB / bond0 {tcp_med:.0f}MB -> {wire}; "
-                    f"tail {ib_tail_med:.0f}MB] "
-                    f"runs={rec['per_run_get_gbs']}",
-                    flush=True,
-                )
+                    put_mean = _mean(put_times)
+                    get_mean = _mean(get_times)
+                    get_med = statistics.median(get_times)
+                    # Std-dev of per-run throughput, not latency.
+                    get_gbs_runs = [_gbs(nbytes, ms) for ms in get_times]
+                    get_std_gbs = statistics.pstdev(get_gbs_runs) if len(get_gbs_runs) > 1 else 0.0
+                    ib_med = statistics.median(ibs)
+                    tcp_med = statistics.median(tcps)
+                    ib_tail_med = statistics.median(ib_tails) if ib_tails else 0.0
+                    wire = "RDMA" if ib_med > tcp_med else "TCP"
+                    wire_proven = (protocol == "rdma" and ib_med > 0 and ib_med > tcp_med) or (
+                        protocol != "rdma" and tcp_med > 0 and tcp_med >= ib_med
+                    )
+                    if args.require_wire_proof and not wire_proven:
+                        raise RuntimeError(
+                            f"wire proof failed for protocol={protocol} profile={profile} "
+                            f"payload={total_mib}MiB: IB={ib_med:.1f}MB TCP={tcp_med:.1f}MB"
+                        )
+                    rec = {
+                        "put_mean_gbs": _gbs(nbytes, put_mean),
+                        "get_mean_gbs": _gbs(nbytes, get_mean),
+                        "get_med_gbs": _gbs(nbytes, get_med),
+                        "get_std_gbs": get_std_gbs,
+                        "wire": wire,
+                        "wire_proven": wire_proven,
+                        "byte_exact": True,
+                        "ib_tail_med_mb": ib_tail_med,
+                        "per_run_get_gbs": [round(g, 2) for g in get_gbs_runs],
+                    }
+                    results[protocol][profile][total_mib][nf] = rec
+                    print(
+                        f"  {profile:<10} {str(total_mib) + 'M':<9} f={nf} "
+                        f"put_mean={rec['put_mean_gbs']:6.2f} "
+                        f"GB/s get_mean={rec['get_mean_gbs']:6.2f} (med {rec['get_med_gbs']:.2f}, "
+                        f"std {rec['get_std_gbs']:.2f}) GB/s byte_exact=PASS "
+                        f"[wire: IB {ib_med:.0f}MB / bond0 {tcp_med:.0f}MB -> {wire}; "
+                        f"proof={'PASS' if wire_proven else 'UNKNOWN'}; tail {ib_tail_med:.0f}MB] "
+                        f"runs={rec['per_run_get_gbs']}",
+                        flush=True,
+                    )
 
         ray.get(consumer.shutdown.remote())  # unmount before kill, else the segment lingers
         ray.kill(consumer)
@@ -433,32 +546,35 @@ def main() -> None:
     # ---- Summary (mean-based, all requested protocols) ----
     print("\n===== SUMMARY: TQ-layer cross-node, same topology (get, MEAN of N runs) =====", flush=True)
     header = (
-        f"{'Payload':<9}{'f':<4}{'C0 mean':>9}{'C1 mean':>9}{'C2 mean':>9}"
+        f"{'Profile':<11}{'Payload':<9}{'f':<4}{'C0 mean':>9}{'C1 mean':>9}{'C2 mean':>9}"
         f"{'C1/C0':>8}{'C2/C1':>8}{'C2 std':>8}{'>=20%':>7}{'wire C0/C1/C2':>18}"
     )
     print(header, flush=True)
-    for total_mib in args.payload_mib:
-        for nf in args.num_fields:
-            c0 = results.get("simple", {}).get(total_mib, {}).get(nf)
-            c1 = results.get("tcp", {}).get(total_mib, {}).get(nf)
-            c2 = results.get("rdma", {}).get(total_mib, {}).get(nf)
-            if not (c0 and c1 and c2):
-                # A protocol was skipped (--protocols subset) -- print what we have.
-                parts = []
-                for name, c in (("C0", c0), ("C1", c1), ("C2", c2)):
-                    parts.append(f"{name}={c['get_mean_gbs']:.2f}" if c else f"{name}=-")
-                print(f"{str(total_mib) + 'M':<9}{nf:<4}" + "  ".join(parts) + "  (subset run)", flush=True)
-                continue
-            g0, g1, g2 = c0["get_mean_gbs"], c1["get_mean_gbs"], c2["get_mean_gbs"]
-            back_pct = (g1 - g0) / g0 * 100 if g0 > 0 else 0.0
-            rdma_pct = (g2 - g1) / g1 * 100 if g1 > 0 else 0.0
-            wire = f"{c0['wire']}/{c1['wire']}/{c2['wire']}"
-            print(
-                f"{str(total_mib) + 'M':<9}{nf:<4}{g0:>9.2f}{g1:>9.2f}{g2:>9.2f}"
-                f"{f'{back_pct:+.0f}%':>8}{f'{rdma_pct:+.0f}%':>8}{c2['get_std_gbs']:>8.2f}"
-                f"{('PASS' if rdma_pct >= 20 else 'no'):>7}{wire:>18}",
-                flush=True,
-            )
+    for profile in args.payload_profiles:
+        field_counts = args.num_fields if profile == "synthetic" else [7]
+        for total_mib in args.payload_mib:
+            for nf in field_counts:
+                c0 = results.get("simple", {}).get(profile, {}).get(total_mib, {}).get(nf)
+                c1 = results.get("tcp", {}).get(profile, {}).get(total_mib, {}).get(nf)
+                c2 = results.get("rdma", {}).get(profile, {}).get(total_mib, {}).get(nf)
+                prefix = f"{profile:<11}{str(total_mib) + 'M':<9}{nf:<4}"
+                if not (c0 and c1 and c2):
+                    # A protocol was skipped (--protocols subset) -- print what we have.
+                    parts = []
+                    for name, c in (("C0", c0), ("C1", c1), ("C2", c2)):
+                        parts.append(f"{name}={c['get_mean_gbs']:.2f}" if c else f"{name}=-")
+                    print(prefix + "  ".join(parts) + "  (subset run)", flush=True)
+                    continue
+                g0, g1, g2 = c0["get_mean_gbs"], c1["get_mean_gbs"], c2["get_mean_gbs"]
+                back_pct = (g1 - g0) / g0 * 100 if g0 > 0 else 0.0
+                rdma_pct = (g2 - g1) / g1 * 100 if g1 > 0 else 0.0
+                wire = f"{c0['wire']}/{c1['wire']}/{c2['wire']}"
+                print(
+                    f"{prefix}{g0:>9.2f}{g1:>9.2f}{g2:>9.2f}"
+                    f"{f'{back_pct:+.0f}%':>8}{f'{rdma_pct:+.0f}%':>8}{c2['get_std_gbs']:>8.2f}"
+                    f"{('PASS' if rdma_pct >= 20 else 'no'):>7}{wire:>18}",
+                    flush=True,
+                )
     print("  C1/C0 = MooncakeStore vs SimpleStorage (backend effect)", flush=True)
     print("  C2/C1 = RDMA vs TCP on the same backend (transport effect, gate target, mean-based)", flush=True)
     print("  std = population stddev of C2 get across the N runs (run-to-run variance)", flush=True)
@@ -466,9 +582,14 @@ def main() -> None:
     if args.csv:
         cols = [
             "protocol",
+            "profile",
             "payload_mib",
+            "actual_mib",
             "num_fields",
             "run",
+            "byte_exact",
+            "wire_observed",
+            "wire_proven",
             "put_ms",
             "get_ms",
             "put_gbs",

@@ -8,7 +8,6 @@ from argparse import Namespace
 from typing import Any
 
 import ray
-import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -49,8 +48,12 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate_config
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
-from relax.utils.tq_config import build_backend_config
-from relax.utils.tq_lifecycle import close_tq_and_unmount, kill_tq_controller_and_wait, reap_unusable_tq_controller
+from relax.utils.tq_config import (
+    build_backend_config,
+    resolve_mooncake_master_address,
+    validate_mooncake_runtime_contract,
+)
+from relax.utils.tq_lifecycle import close_tq_owner, initialize_tq_with_fallback
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
@@ -134,6 +137,7 @@ class Controller:
             self._pending_task_refs_lock = threading.Lock()
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
+        self._tq_owner = None
 
         # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
         # is launched (RL is resolved later in placement_group.py).
@@ -274,18 +278,44 @@ class Controller:
         else:
             sampler = GRPOGroupNSampler(n_samples_per_prompt=self.config.n_samples_per_prompt)
 
+        controller_config = {
+            "sampler": sampler,
+            "polling_mode": self.config.polling_mode,
+        }
+        backend_config = self._resolve_tq_backend(total_storage_size)
         tq_config = OmegaConf.create(
             {
-                "controller": {
-                    "sampler": sampler,
-                    "polling_mode": self.config.polling_mode,
-                },
-                "backend": self._resolve_tq_backend(total_storage_size),
+                "controller": controller_config,
+                "backend": backend_config,
             },
             flags={"allow_objects": True},
         )
-        tq_config = tq.init(conf=tq_config) or tq_config
-        self.config.tq_config = tq_config
+
+        fallback_config = None
+        if backend_config.get("storage_backend") == "MooncakeStore":
+            from relax.utils.tq_config import build_simple_storage_config
+
+            fallback_config = OmegaConf.create(
+                {
+                    "controller": controller_config,
+                    "backend": build_simple_storage_config(
+                        total_storage_size=total_storage_size,
+                        num_data_storage_units=self.config.num_data_storage_units,
+                    ),
+                },
+                flags={"allow_objects": True},
+            )
+
+        init_result = initialize_tq_with_fallback(
+            tq_config,
+            mode=getattr(self.config, "tq_rdma_mode", "off"),
+            fallback_conf=fallback_config,
+        )
+        self._tq_owner = init_result.owner
+        self.config.tq_config = init_result.config
+        if init_result.fallback_reason:
+            logger.warning(f"[dataplane] effective backend=SimpleStorage fallback={init_result.fallback_reason}")
+        logger.info(f"[dataplane] controller ownership={'owner' if init_result.owns_controller else 'attached'}")
 
     def _resolve_tq_backend(self, total_storage_size: int) -> dict:
         """Resolve the TransferQueue ``backend`` config dict.
@@ -318,7 +348,26 @@ class Controller:
         #    (probe_cluster_nodes), then AND-reduces to a single job-level
         #    effective config so all data-plane workers converge identically.
         device = getattr(self.config, "tq_rdma_device", "")
-        probe_results = probe_cluster_nodes(device)
+        try:
+            validate_mooncake_runtime_contract()
+        except RuntimeError as e:
+            if mode == "required":
+                raise RuntimeError(
+                    "--tq-rdma-mode=required but the installed TransferQueue "
+                    f"does not satisfy the Mooncake correctness contract: {e}"
+                ) from e
+            from relax.utils.tq_config import build_simple_storage_config
+
+            logger.warning(
+                "[dataplane] Installed TransferQueue does not satisfy the Mooncake "
+                f"correctness contract; auto fallback to SimpleStorage: {e}"
+            )
+            return build_simple_storage_config(
+                total_storage_size=total_storage_size,
+                num_data_storage_units=self.config.num_data_storage_units,
+            )
+        master_address = resolve_mooncake_master_address()
+        probe_results = probe_cluster_nodes(device, master_address)
         for r in probe_results:
             logger.debug(r.summary())
 
@@ -364,14 +413,7 @@ class Controller:
                 "--tq-rdma-mode=required does NOT fail fast on unavailable GDR."
             )
 
-        # 8. F10 anti-hang: reap a half-initialised controller before tq.init,
-        #    for every backend (a stale MooncakeStore controller used to survive
-        #    because the guard only ran on the SimpleStorage fallback path).
-        #    Only unusable controllers are killed -- a healthy one belongs to
-        #    whoever created it and tq.init legitimately attaches to it.
-        self._reap_unusable_tq_controller()
-
-        # 9. Log requested vs effective so the startup log alone explains the
+        # 8. Log requested vs effective so the startup log alone explains the
         #    decision, plus one summary block per probed node.
         logger.info(
             f"[dataplane] requested: backend={backend} rdma_mode={mode} device={device or 'auto'} gdr={use_gdr}"
@@ -385,21 +427,11 @@ class Controller:
             logger.info(effective.log_line())
         return backend_dict
 
-    def _reap_unusable_tq_controller(self) -> None:
-        """Delegate to
-        :func:`relax.utils.tq_lifecycle.reap_unusable_tq_controller`."""
-        reap_unusable_tq_controller()
-
-    def _kill_stale_tq_controller(self) -> None:
-        """Delegate to
-        :func:`relax.utils.tq_lifecycle.kill_tq_controller_and_wait`."""
-        kill_tq_controller_and_wait()
-
-    @staticmethod
-    def _close_data_system() -> None:
+    def _close_data_system(self) -> None:
         """Delegate to
         :func:`relax.utils.tq_lifecycle.close_tq_and_unmount`."""
-        close_tq_and_unmount()
+        close_tq_owner(self._tq_owner)
+        self._tq_owner = None
 
     def _deploy_metrics_service(self):
         """Deploy the MetricsService as a lightweight Ray Serve deployment.
@@ -917,6 +949,11 @@ class Controller:
         shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
+
+        try:
+            self._close_data_system()
+        except Exception as e:
+            logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
 
         logger.info("Controller shutdown complete.")
 

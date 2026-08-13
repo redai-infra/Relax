@@ -21,25 +21,25 @@ Relax 的数据面（rollout ↔ train 之间的样本传输）默认走 Transfe
 
 ### GDR 为实验性
 
-GDR 的可用性无法在启动时探测：探测跑在独立的 Ray task 里，该进程没有初始化 CUDA context，`torch.cuda.is_initialized()` 恒为 False，若在此判定会让 GDR 永远不可达。真实判定发生在每个 worker 的 TQ 客户端内部（`mooncake_client.py`），没有 CUDA context 时**静默回退到 host RDMA**并打 WARNING。
+GDR 的可用性无法由 driver 的启动探测代表：探测跑在独立 Ray task 中，该进程没有初始化 CUDA context；真正创建 staging buffer 的是每个 worker 的 TQ 客户端。因此首期不宣称 job 级 GDR 已验证，`required` 也不对 GDR 做 fail-fast。
 
-因此首期：`--tq-use-gdr` 标记为实验性，`required` 不对 GDR 做 fail-fast。要把 GDR 纳入分级降级，需要补一条 worker → driver 的能力回报通道，属于后续工作。
+每个 worker 附加 TQ 后都会记录两层信息：`requested=true` 表示用户请求开启；`status=host_rdma_fallback/enabled_unverified/inactive/unknown` 表示该 worker 的本地观察。即使本地 staging buffer 已创建也只记为 `enabled_unverified`，不等同于线上流量已经证明走 GDR。
 
 ## 启动流程与降级
 
 driver 在**第一次 `tq.init` 之前**完成探测并生成 job 级唯一的 effective config，其余组件（actor / critic / rollout / sft / advantages / actor_fwd）都读同一份，不各自决策。
 
 1. 校验参数组合（例如 `simple` + `rdma-mode` 会被拒绝）
-2. `probe_cluster_nodes()` 通过 Ray 把探测任务绑定到每个**存活且有 GPU** 的节点，各自读本机 `/sys` 与 mooncake 状态；超时或崩溃的节点转为退化结果，不静默丢弃
+2. `probe_cluster_nodes()` 通过 Ray 把探测任务绑定到每个**存活且有 GPU** 的节点，并额外探测 driver（driver 也会创建 Mooncake owner client）；各节点读取本机 `/sys`、mooncake 状态，并在 2 秒上限内检查外部 master 的 TCP 可达性；超时或崩溃的节点转为退化结果，不静默丢弃
 3. `reduce_results()` 做 AND 归约：整个作业只能跑在最低共同能力上
 4. `required` 模式下若发生任何回退，直接抛异常并打印每个节点的探测明细
 
 降级阶梯：
 
 ```
-GDR → host RDMA        （worker 运行时判定，静默回退 + WARNING）
+GDR → host RDMA        （worker 运行时判定，记录 requested 与实际状态）
 RDMA → Mooncake/TCP    （任一节点无 RDMA 能力，或指定设备缺失）
-Mooncake → SimpleStorage（任一节点 mooncake 不可导入，或 segment 容量不足）
+Mooncake → SimpleStorage（任一节点 mooncake/master 不可用、运行时正确性契约不满足，或 segment 预检不足）
 ```
 
 ## 启动日志怎么读
@@ -55,7 +55,7 @@ Mooncake → SimpleStorage（任一节点 mooncake 不可导入，或 segment �
   [ok] port_state: ACTIVE
   [ok] gid: ...
   [ok] memlock: unlimited
-[dataplane] backend=MooncakeStore protocol=rdma device=mlx5_bond_0 gdr=off
+[dataplane] backend=MooncakeStore protocol=rdma device=mlx5_bond_0 gdr_requested=false gdr_status=off
 ```
 
 第三段带 `fallback=...` 就说明发生了降级，原因直接写在里面（例如 `fallback=mooncake_unavailable:<node-id>`）。
@@ -72,12 +72,15 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 
 然后给作业设置 `MC_MASTER_ADDRESS=<master-host>:50051`。未设置时内部默认 `localhost:50051`，仅适用于单节点开发。
 
+启动前置条件：部署侧必须先启动 master，所有 GPU 节点和 driver 都能解析并连接 `MC_MASTER_ADDRESS`，防火墙允许 master RPC 端口；作业镜像中的 TQ 必须包含本文“正确性依赖”所列修复。Relax 不负责拉起、重启或终止 master。
+
 三种情形下的行为：
 
 | 情形 | 表现 | 处理 |
 |---|---|---|
-| **初始化失败**（master 不可达） | TQ 客户端 `setup` 返回 `-1`，抛 `Mooncake store setup failed with error code: -1`。`required` 模式下作业直接失败；`auto` 模式下这一步已过了探测，不会自动回退——探测只验证本机能力，不验证 master 连通性 | 先确认 master 进程与 `MC_MASTER_ADDRESS`，再重启作业 |
-| **正常退出**（作业结束或全局重启） | Relax 在拆数据面时调用 `close_tq_and_unmount()`：先 `tq.close()`（它内部还要用 store 做 `remove_all()`），再显式 `storage_client.close()` 卸载 segment 并从 master 注销。master 本身不动 | 无需操作 |
+| **master 在探测时不可达** | `auto` 统一降级到 SimpleStorage；`required` 启动失败并列出失败节点 | 先确认 master、DNS/路由和 `MC_MASTER_ADDRESS` |
+| **master 探测通过、但 `tq.init` 时失败/超时** | 第一次初始化在独立 owner actor 中执行，driver 最多等待 60 秒。失败后回收该 actor 及其拥有的半初始化 controller；`auto` 只重试一次 SimpleStorage，`required` 清理后抛出原始错误 | 查看 `mooncake_init_failed:*`、master 日志和 owner 清理日志 |
+| **正常退出**（作业结束或全局重启） | 只有 owner actor 调用全局 `tq.close()`，随后显式 `storage_client.close()` 卸载 segment；附加 worker 只关闭本地 client，不能删除全局数据或 controller。master 本身不动 | 无需操作 |
 | **异常退出**（worker 被 kill / OOM / 节点掉线） | Python 层不执行，segment 仍在 master 注册。master 要等 `client_ttl`（默认 30 s）才判定客户端过期，期间新作业的 put 会打到死端点并报 `Failed to open segment ... Connection refused` | 等 30 s 后重启，或部署侧调小 `-client_ttl` |
 
 ## 资源所有权与安全清理
@@ -88,7 +91,56 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 
 - 不使用任何 `pkill` / `killall`
 - `tq.init` 之前会检查已存在的 `TransferQueueController` 命名 actor：**只有取不到 config（半初始化）或 actor 已死时才回收**，健康的 controller 保持不动并正常 attach
+- 首次初始化在专用 owner actor 中执行，config 内保存随机 owner token；清理只有在 token 匹配或 controller 确认不可用时才回收全局 actor，避免初始化竞争中的附加者误杀所有者
+- 全局 `tq.close()` 只能由 owner actor 调用；actor、critic、rollout 等附加 worker 只能做本地 detach
 - master 进程始终不被 Relax 触碰
+
+## 容量不足与正确性依赖
+
+Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经生产但尚未消费的数据。启动前还会按 rollout batch、采样数、staleness 和多模态 payload 的固定启发式估算检查 4 GiB client segment；`auto` 预检不足时回退 SimpleStorage，`required` 直接失败。该估算只是早期保护，不能替代运行时错误处理，因为真实图片 patch 数会变化。
+
+运行时依赖固定到 TransferQueue commit `58054a33834aadbcf76aacd6b1e32e25c030f2c9`，并在 Mooncake 启动前检查以下能力：
+
+- `batch_upsert_from` / `batch_get_into` 对每个 key 的返回码做有限次数重试，耗尽后抛异常，不能把失败当成功或无限重试；
+- `KVStorageManager.put_data` 必须先等待 storage put 成功，之后才能更新 production-ready 状态；写入失败时不通知消费者；
+- Relax 的契约测试用失败 store 验证“写失败、production 状态不更新”，并用隔离 master 的真机故障注入验证物理容量溢出在 30 秒内显式失败。
+
+因此，上游曾出现的“返回码未检查导致静默丢数据”不是已知限制，而是 Mooncake 启用的硬门槛：`auto` 在契约不满足时禁用 Mooncake 并回退，`required` 拒绝启动。Docker 镜像固定上述修复 commit，运行时检查用于防止环境被旧包覆盖。
+
+真机容量故障注入会故意创建 64 MiB segment 并写入 96 MiB，仅允许在独立、可丢弃的 master 上运行：
+
+```bash
+MC_MASTER_ADDRESS=<isolated-master>:50051 \
+RELAX_RUN_REAL_MOONCAKE_CAPACITY_TEST=1 \
+pytest -q tests/utils/test_tq_failure_paths.py \
+  -k real_mooncake_capacity_overflow
+```
+
+## 验收分层
+
+Mock/本机测试和真实双节点 RDMA 测试必须分别报告，前者不能替代后者。
+
+| 层级 | 验证内容 | 通过标准 |
+|---|---|---|
+| CI/mock | 参数矩阵、节点 AND 归约、master 不可达、owner 超时/清理/token、auto/required、有限重试、写失败不发布状态 | `tests/utils/test_rdma_probe.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
+| 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性 | `tests/utils/test_tq_dataplane_behavior.py` 通过 |
+| 真实 Mooncake | TCP/RDMA direct-client 多模态字段与混合 dtype 逐字节一致 | `TestMooncakeByteExact` 的 TCP/RDMA 两档均通过，不得 skip |
+| 真实双节点 | 同一拓扑的 SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic 与 production-shaped multimodal；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的逐字段 SHA-256 全部 PASS；`--require-wire-proof` 证明 RDMA 档 IB counter 增长且 TCP 档网络 counter 增长；CSV 留档并报告均值、median、stddev |
+
+双节点验收命令（master 与 Ray 集群需由部署侧预先准备）：
+
+```bash
+PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
+  --master <master-host>:50051 \
+  --nodeb-ip <consumer-node-ip> \
+  --device <rdma-device> \
+  --payload-profiles synthetic multimodal \
+  --payload-mib 256 1024 2048 4096 \
+  --repeats 5 --require-wire-proof \
+  --csv tq_cross_node_acceptance.csv
+```
+
+若本次开发环境没有两个 RDMA 节点，交付结论必须写成“真机验收未执行”，不能用 mock 通过推导真机已经通过。
 
 ## 排障表
 

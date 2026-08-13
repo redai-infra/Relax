@@ -17,8 +17,10 @@ from relax.utils.rdma_probe import (
     CheckResult,
     EffectiveConfig,
     ProbeResult,
+    _check_master_reachable,
     _degenerate_result,
     _select_dataplane_node_ids,
+    _split_host_port,
     probe_cluster_nodes,
     probe_node,
     reduce_results,
@@ -28,6 +30,7 @@ from relax.utils.tq_config import (
     build_mooncake_config,
     build_simple_storage_config,
     estimate_payload_bytes,
+    validate_mooncake_runtime_contract,
     validate_segment_capacity,
 )
 
@@ -223,6 +226,25 @@ class TestProbeNode:
         assert result.effective_protocol == "rdma"
         assert result.ok
 
+    def test_unreachable_external_master_disables_mooncake(self, monkeypatch):
+        monkeypatch.setattr(rdma_probe, "_check_mooncake_import", lambda: CheckResult("mooncake_import", True))
+        monkeypatch.setattr(
+            rdma_probe,
+            "_check_master_reachable",
+            lambda address: CheckResult("master_reachable", False, address),
+        )
+        result = probe_node("", "master.invalid:50051")
+        assert result.effective_protocol is None
+        assert "master unreachable" in result.errors
+
+    def test_master_endpoint_parser(self):
+        assert _split_host_port("master.example:50051") == ("master.example", 50051)
+        assert _split_host_port("[2001:db8::1]:50051") == ("2001:db8::1", 50051)
+
+    def test_master_reachability_is_bounded_failure(self):
+        result = _check_master_reachable("127.0.0.1:1", timeout=0.01)
+        assert result.ok is False
+
 
 # ---------------------------------------------------------------------------
 # probe_cluster_nodes (multi-node fan-out) + helpers
@@ -256,7 +278,7 @@ class TestProbeClusterNodes:
         never touching Ray remote scheduling."""
         monkeypatch.setattr(rdma_probe, "_alive_gpu_nodes", lambda: [])
         local = _make_probe(protocol="rdma", node="local-driver")
-        monkeypatch.setattr(rdma_probe, "probe_node", lambda dev: local)
+        monkeypatch.setattr(rdma_probe, "probe_node", lambda dev, master="": local)
         results = probe_cluster_nodes("")
         assert len(results) == 1
         assert results[0] is local
@@ -276,6 +298,24 @@ class TestProbeClusterNodes:
         )
         assert eff.backend == "SimpleStorage"
         assert "n1" in eff.fallback_reason
+
+    def test_reduce_reports_master_unreachable_distinctly(self):
+        unavailable = ProbeResult(
+            node="n1",
+            checks=(CheckResult("master_reachable", False),),
+            effective_protocol=None,
+            effective_device="",
+            gdr_eligible=False,
+            errors=("master unreachable",),
+        )
+        eff = reduce_results(
+            [_make_probe(protocol="rdma", node="n0"), unavailable],
+            requested_backend="mooncake",
+            requested_device="",
+            use_gdr=False,
+        )
+        assert eff.backend == "SimpleStorage"
+        assert eff.fallback_reason == "master_unreachable:n1"
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +358,9 @@ class TestTqConfigBuilder:
         eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=True, fallback_reason="")
         cfg = build_mooncake_config(eff)
         assert cfg["MooncakeStore"]["use_gdr"] is True
+
+    def test_installed_tq_satisfies_loss_prevention_contract(self):
+        validate_mooncake_runtime_contract()
 
     def test_segment_capacity_text_only_passes(self):
         args = _make_args(multimodal_keys=None)
