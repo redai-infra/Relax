@@ -101,12 +101,12 @@ reduction 分块。这两个设置对 P3O 和 GRPO 完全一致，都会记录�
 
 ## 场景
 
-| 场景 | 更新间隔 | 温度 override | 含义 |
-| --- | ---: | ---: | --- |
-| `on_policy` | 1 | 关闭 | 以正常采样配置在每个 rollout 后同步。 |
-| `periodic_sync_interval_3` | 3 | 关闭 | 只引入周期性的 rollout-policy 陈旧性。 |
-| `temperature_0p6` | 1 | 0.6 | 只改变行为策略温度。 |
-| `temperature_1p2` | 1 | 1.2 | 只改变行为策略温度。 |
+| 场景                       | 更新间隔 | 温度 override | 含义                                   |
+| -------------------------- | -------: | ------------: | -------------------------------------- |
+| `on_policy`                |        1 |          关闭 | 以正常采样配置在每个 rollout 后同步。  |
+| `periodic_sync_interval_3` |        3 |          关闭 | 只引入周期性的 rollout-policy 陈旧性。 |
+| `temperature_0p6`          |        1 |           0.6 | 只改变行为策略温度。                   |
+| `temperature_1p2`          |        1 |           1.2 | 只改变行为策略温度。                   |
 
 同一场景中的 P3O 和 GRPO 启动器共享所有非算法配置。温度场景会保持 `top_p`、
 `top_k`、response 限制和评估采样设置不变。
