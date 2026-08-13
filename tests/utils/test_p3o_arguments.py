@@ -55,6 +55,8 @@ def _p3o_args(**overrides) -> Namespace:
         fp8=None,
         attention_dropout=0.0,
         hidden_dropout=0.0,
+        lora_rank=0,
+        lora_dropout=0.0,
         fully_async=False,
         get_mismatch_metrics=False,
         use_opsm=False,
@@ -87,6 +89,7 @@ def test_p3o_arguments_rejects_exact_kl_before_training():
         dict(fp8="hybrid"),
         dict(attention_dropout=0.1),
         dict(hidden_dropout=0.1),
+        dict(lora_rank=8, lora_dropout=0.1),
         dict(fully_async=True),
     ],
 )
@@ -100,12 +103,17 @@ def test_p3o_arguments_micro_batch_scope_accepts_replay_sensitive_features(overr
         dict(fp8="hybrid"),
         dict(attention_dropout=0.1),
         dict(hidden_dropout=0.1),
+        dict(lora_rank=8, lora_dropout=0.1),
         dict(fully_async=True),
     ],
 )
 def test_p3o_arguments_step_scope_rejects_replay_sensitive_features(overrides):
     with pytest.raises(ValueError):
         validate_p3o_args(_p3o_args(p3o_ess_scope="step", **overrides))
+
+
+def test_p3o_arguments_step_scope_accepts_inactive_lora_dropout():
+    validate_p3o_args(_p3o_args(p3o_ess_scope="step", lora_rank=0, lora_dropout=0.1))
 
 
 @pytest.mark.parametrize(

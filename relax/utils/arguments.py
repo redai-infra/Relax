@@ -2975,11 +2975,12 @@ def _validate_p3o_args(args: argparse.Namespace) -> None:
         dropout = max(
             getattr(args, "attention_dropout", 0.0) or 0.0,
             getattr(args, "hidden_dropout", 0.0) or 0.0,
+            (getattr(args, "lora_dropout", 0.0) or 0.0) if getattr(args, "lora_rank", 0) > 0 else 0.0,
         )
         if dropout > 0.0:
             raise ValueError(
                 f"P3O step scope requires deterministic replay, but dropout is enabled (max rate {dropout}). "
-                "Set both dropout rates to 0.0 or use --p3o-ess-scope micro-batch."
+                "Set attention, hidden, and LoRA dropout rates to 0.0 or use --p3o-ess-scope micro-batch."
             )
 
         if getattr(args, "fully_async", False):

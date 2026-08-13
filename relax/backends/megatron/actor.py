@@ -1379,6 +1379,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            self.args.rollout_policy_snapshot_rollout = self.get_rollout_policy_snapshot_rollout()
             with timer("actor_train"):
                 train(
                     rollout_id,

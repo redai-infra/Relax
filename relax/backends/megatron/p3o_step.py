@@ -38,7 +38,7 @@ from relax.utils.training.p3o_utils import (
     finalize_p3o_step_context,
 )
 
-from .cp_utils import get_cp_local_valid_mask, maybe_padded_total_lengths
+from .cp_utils import get_cp_local_valid_mask
 from .data import DataIterator, get_batch
 
 
@@ -181,14 +181,6 @@ def compute_p3o_step_context(
             args.allgather_cp,
             getattr(args, "is_vl_model", False),
         )
-        batch["padded_total_lengths"] = maybe_padded_total_lengths(
-            batch["total_lengths"],
-            args.qkv_format,
-            getattr(args, "is_vl_model", False)
-            or batch.get("multimodal_train_inputs") is not None
-            or getattr(args, "uses_unsplit_forward", False),
-        )
-
         # The forward inputs must be selected exactly as the training pass in
         # model.py::train_one_step does, or the two passes read different token
         # layouts and the frozen cap would be computed from logits the gradient
@@ -202,7 +194,8 @@ def compute_p3o_step_context(
         # visible as a diff here, preventing silent drift between the stats pass
         # and the training pass. If this block and model.py diverge, the ESS cap
         # is computed from different logits than the gradient, breaking P3O.
-        mm_kwargs = batch.get("multimodal_train_inputs") or {}
+        mm_inputs = batch.get("multimodal_train_inputs")
+        mm_kwargs = mm_inputs if getattr(args, "is_vl_model", False) and mm_inputs else {}
         needs_unsplit = (
             getattr(args, "is_vl_model", False)
             or batch.get("multimodal_train_inputs") is not None

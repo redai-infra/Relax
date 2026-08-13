@@ -2,6 +2,9 @@
 
 """Behavior tests for P3O rollout-policy age observability."""
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from relax.backends.megatron.rollout_policy_lag import (
@@ -108,3 +111,31 @@ def test_final_rollout_forces_refresh_away_from_interval_boundary():
 
     assert maybe_refresh_rollout_policy(backuper, rollout_id=4, update_weights_interval=3, num_rollout=5)
     assert backuper.copies == [("actor", ROLLOUT_POLICY_TAG)]
+
+
+def test_hybrid_training_publishes_snapshot_rollout_before_train():
+    actor_path = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "actor.py"
+    tree = ast.parse(actor_path.read_text(encoding="utf-8"))
+    actor_class = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor"
+    )
+    train_hybrid = next(
+        node for node in actor_class.body if isinstance(node, ast.FunctionDef) and node.name == "train_hybrid"
+    )
+
+    snapshot_assignment = next(
+        node
+        for node in ast.walk(train_hybrid)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "rollout_policy_snapshot_rollout"
+            for target in node.targets
+        )
+    )
+    train_call = next(
+        node
+        for node in ast.walk(train_hybrid)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "train"
+    )
+
+    assert snapshot_assignment.lineno < train_call.lineno
