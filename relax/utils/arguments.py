@@ -710,6 +710,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="the temperature for the inference engine during rollout.",
             )
             parser.add_argument(
+                "--sglang-native-group-sampling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use one SGLang /generate request with sampling_params.n equal to the prompt group size "
+                    "for standard first-turn group-RM rollouts."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-top-p", type=float, default=1.0, help="the top-p for the inference engine during rollout."
             )
             parser.add_argument(

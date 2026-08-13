@@ -52,6 +52,69 @@ __all__ = ["generate_rollout"]
 logger = get_logger(__name__)
 
 
+def _native_group_sampling_outputs(output: Any, expected_count: int) -> list[dict[str, Any]]:
+    """Validate and normalize the non-streaming SGLang ``n`` response."""
+    if not isinstance(output, list):
+        raise TypeError(f"Native group sampling must return a list, got {type(output)!r}")
+    if len(output) != expected_count:
+        raise ValueError(
+            "Native group sampling returned an unexpected number of outputs: "
+            f"expected {expected_count}, got {len(output)}"
+        )
+    if not all(isinstance(item, dict) for item in output):
+        raise TypeError("Native group sampling responses must be dictionaries")
+    return output
+
+
+def _native_group_sampling_params(sampling_params: dict[str, Any], group_size: int) -> dict[str, Any]:
+    """Create request-local sampling parameters for one prompt group."""
+    if group_size < 2:
+        raise ValueError(f"Native group sampling requires at least two samples, got {group_size}")
+    params = sampling_params.copy()
+    params["n"] = group_size
+    return params
+
+
+def _native_group_sampling_media_payload(encoded_mm: dict[str, list]) -> dict[str, list[list]]:
+    """Wrap one prompt's media as a batch-of-one for SGLang ``n > 1``.
+
+    SGLang promotes a single input to batch mode for parallel sampling. Without
+    this outer batch dimension, a prompt containing multiple images is
+    interpreted as a batch with one prompt per image and fails validation.
+    """
+    return {key: [value] for key, value in encoded_mm.items()}
+
+
+def _native_group_sampling_eligible(args: Namespace, group: list[Sample], evaluation: bool) -> bool:
+    """Limit native ``n`` to standard first-turn group-RM rollouts."""
+    if not getattr(args, "sglang_native_group_sampling", False):
+        return False
+    if evaluation or len(group) < 2 or not getattr(args, "group_rm", False):
+        return False
+    if getattr(args, "partial_rollout", False) or getattr(args, "use_slime_router", False):
+        return False
+    if getattr(args, "use_opd", False) or getattr(args, "use_rollout_routing_replay", False):
+        return False
+    if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+        return False
+    if getattr(args, "sglang_enable_deterministic_inference", False):
+        return False
+    if getattr(args, "custom_generate_function_path", None) is not None:
+        return False
+    if any(getattr(sample, "generate_function_path", None) is not None for sample in group):
+        return False
+    first = group[0]
+    if any(sample.prompt != first.prompt for sample in group[1:]):
+        return False
+    if any(sample.multimodal_inputs is not first.multimodal_inputs for sample in group[1:]):
+        return False
+    if any(sample.tokens or sample.rollout_tokens or sample.response for sample in group):
+        return False
+    if any(sample.loss_mask is not None for sample in group):
+        return False
+    return all(sample.status in (Sample.Status.PENDING, Sample.Status.ABORTED) for sample in group)
+
+
 # Misuse guard for the per-request permit contract. Set while the session-level
 # lock (GenerateState.semaphore) is held so that a legacy custom function that
 # wrongly calls inference_permit()/post_generate() fails loudly instead of
@@ -294,6 +357,79 @@ async def _encode_multimodal_inputs(multimodal_inputs: dict) -> tuple[dict[str, 
     return encoded, monotonic() - t_start
 
 
+def _apply_sglang_output_tokens(
+    args: Namespace,
+    state: "GenerateState",
+    sample: Sample,
+    output: dict[str, Any],
+    evaluation: bool,
+) -> None:
+    """Apply the token-level part of a standard SGLang response."""
+    if "output_token_logprobs" in output["meta_info"]:
+        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+    else:
+        new_response_tokens = list(output["output_ids"])
+        new_response_log_probs = []
+
+    if state.opd_manager and not evaluation:
+        new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
+            output["meta_info"], new_response_tokens, new_response_log_probs
+        )
+
+    while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.image_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop "
+            "condition to stop at image_token_id if you want to avoid this."
+        )
+
+    while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.audio_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop "
+            "condition to stop at audio_token_id if you want to avoid this."
+        )
+
+    while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.video_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop "
+            "condition to stop at video_token_id if you want to avoid this."
+        )
+
+    if state.processor is not None:
+        from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
+
+        sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
+        if sanitized is not new_response_tokens:
+            replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
+            if replaced:
+                logger.warning(
+                    f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
+                )
+            new_response_tokens = sanitized
+
+    sample.tokens = sample.tokens + new_response_tokens
+    sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
+    sample.response_length += len(new_response_tokens)
+    sample.response += output["text"]
+
+    if sample.loss_mask is not None:
+        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+        sample.loss_mask += [1] * len(new_response_tokens)
+
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+    sample.rollout_log_probs += new_response_log_probs
+
+    if state.opd_manager and not evaluation:
+        state.opd_manager.after_rollout(sample, output)
+
+
 async def generate(
     args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
 ) -> Sample:
@@ -400,73 +536,7 @@ async def generate(
 
         sample = await postprocess_sample_with_radix_tree(args, sample, output)
     else:
-        if "output_token_logprobs" in output["meta_info"]:
-            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-        else:
-            new_response_tokens = output["output_ids"]
-            new_response_log_probs = []
-
-        if state.opd_manager and not evaluation:
-            new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
-                output["meta_info"], new_response_tokens, new_response_log_probs
-            )
-
-        while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.image_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at image_token_id if you want to avoid this."
-            )
-
-        while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.audio_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at audio_token_id if you want to avoid this."
-            )
-
-        while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.video_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
-            )
-
-        # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
-        # for vision input slots. A hallucinated <|media_pad|> in the response
-        # inflates num_placeholders past sum(feature_lengths) in the bridge,
-        # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
-        # so positional accounting matches sglang's per-token logprobs.
-        if state.processor is not None:
-            from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
-
-            sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
-            if sanitized is not new_response_tokens:
-                replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
-                if replaced:
-                    logger.warning(
-                        f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
-                    )
-                new_response_tokens = sanitized
-
-        # Update sample with tokens directly - avoiding re-tokenization
-        sample.tokens = sample.tokens + new_response_tokens
-        sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
-        sample.response_length += len(new_response_tokens)
-        sample.response += output["text"]
-
-        # When partial rollout and masking off policy is enabled, update the loss mask
-        if sample.loss_mask is not None:
-            assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
-            sample.loss_mask += [1] * len(new_response_tokens)
-
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
-
-        if state.opd_manager and not evaluation:
-            state.opd_manager.after_rollout(sample, output)
+        _apply_sglang_output_tokens(args, state, sample, output, evaluation)
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(
@@ -489,6 +559,105 @@ async def generate(
     sample.metadata["_timing"] = _timing
 
     return sample
+
+
+async def _generate_native_group(
+    args: Namespace,
+    state: "GenerateState",
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+) -> list[Sample]:
+    """Generate one first-turn group with SGLang's native parallel sampling."""
+    first = group[0]
+    tokenizer_prompt_ids = state.tokenizer.encode(first.prompt, add_special_tokens=False)
+    processor_prompt_ids = tokenizer_prompt_ids
+    image_processor_time = 0.0
+    has_media = first.multimodal_inputs is not None and any(
+        first.multimodal_inputs.get(key) for key in ("images", "videos", "audio")
+    )
+    if state.processor and has_media:
+        processor_prompt_ids, train_inputs, image_processor_time = await _run_image_processor(
+            state, args, first.prompt, first.multimodal_inputs
+        )
+        for sample in group:
+            sample.multimodal_train_inputs = train_inputs
+
+    params = _native_group_sampling_params(sampling_params, len(group))
+    if params["max_new_tokens"] == 0:
+        for sample in group:
+            sample.status = Sample.Status.TRUNCATED
+        return group
+
+    payload: dict[str, Any] = {
+        "sampling_params": params,
+        "return_logprob": True,
+        "input_ids": tokenizer_prompt_ids,
+    }
+
+    mm_encode_time = 0.0
+    if has_media:
+        encoded_mm = getattr(first, "_pre_encoded_mm", None)
+        if encoded_mm is None:
+            encoded_mm, mm_encode_time = await _encode_multimodal_inputs(first.multimodal_inputs)
+        else:
+            mm_encode_time = getattr(first, "_pre_encoded_mm_elapsed", 0.0)
+        payload.update(_native_group_sampling_media_payload(encoded_mm))
+
+    for sample in group:
+        sample.tokens = list(processor_prompt_ids)
+        sample.rollout_tokens = list(tokenizer_prompt_ids)
+
+    headers = None
+    if args.sglang_router_policy == "consistent_hashing" and first.session_id:
+        headers = {"X-SMG-Routing-Key": first.session_id}
+    elif getattr(args, "slime_router_sticky", False) and first.group_index is not None:
+        headers = {"X-SMG-Routing-Key": str(first.group_index)}
+
+    request_start = monotonic()
+    try:
+        async with state.semaphore:
+            token = _holding_session_lock.set(True)
+            try:
+                if state.aborted:
+                    for sample in group:
+                        sample.status = Sample.Status.ABORTED
+                    return group
+                with state.dp_rank_context() as _:
+                    output = await post(
+                        f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
+                        payload,
+                        headers=headers,
+                    )
+            finally:
+                _holding_session_lock.reset(token)
+    except GenerationAborted:
+        for sample in group:
+            sample.status = Sample.Status.ABORTED
+        return group
+    request_time = monotonic() - request_start
+
+    outputs = _native_group_sampling_outputs(output, len(group))
+    for sample, sample_output in zip(group, outputs, strict=True):
+        post_start = monotonic()
+        _apply_sglang_output_tokens(args, state, sample, sample_output, evaluation=False)
+        if "routed_experts" in sample_output["meta_info"]:
+            sample.rollout_routed_experts = np.frombuffer(
+                pybase64.b64decode(sample_output["meta_info"]["routed_experts"].encode("ascii")),
+                dtype=np.int32,
+            ).reshape(len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
+        sample.update_from_meta_info(args, sample_output["meta_info"])
+        sample.metadata["_timing"] = {
+            "generate": request_time,
+            "post_generate": monotonic() - post_start,
+            **({"image_processor": image_processor_time} if image_processor_time else {}),
+            **({"mm_encode": mm_encode_time} if mm_encode_time else {}),
+        }
+
+    for sample in group:
+        for attr in ("_pre_encoded_mm", "_pre_encoded_mm_elapsed"):
+            if hasattr(sample, attr):
+                delattr(sample, attr)
+    return group
 
 
 async def _dispatch_generate(
@@ -657,17 +826,20 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
-    tasks = []
-    for idx, sample in enumerate(group):
-        current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
+    if _native_group_sampling_eligible(args, group, evaluation):
+        group = await _generate_native_group(args, state, group, sampling_params)
+    else:
+        tasks = []
+        for idx, sample in enumerate(group):
+            current_sampling_params = sampling_params.copy()
+            if getattr(args, "sglang_enable_deterministic_inference", False):
+                seed = state.group_sampling_seeds[idx]
+                current_sampling_params["sampling_seed"] = seed
+            tasks.append(
+                asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+            )
 
-    group = await asyncio.gather(*tasks)
+        group = await asyncio.gather(*tasks)
 
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm:
