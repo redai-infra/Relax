@@ -60,6 +60,7 @@ def _routing_context(site_id: str, mask: torch.Tensor, *, num_sites: int, object
         calculate_per_token_loss=False,
         objective_scale=objective_scale,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     with activate_mixture_lora_routing_context(context):
         adapter(torch.ones(mask.shape[1], mask.shape[0], 4))
@@ -239,6 +240,7 @@ def _new_routing_context(
         calculate_per_token_loss=False,
         objective_scale=1.0,
         main_loss_backward_scale=torch.tensor([main_loss_backward_scale]),
+        activation_layout="bshd",
     )
 
 
@@ -480,6 +482,7 @@ def _context_parallel_balance_worker(rank: int, world_size: int, init_method: st
                     calculate_per_token_loss=calculate_per_token_loss,
                     objective_scale=objective_scale,
                     main_loss_backward_scale=torch.ones(1),
+                    activation_layout="bshd",
                     context_parallel_group=dist.group.WORLD,
                     context_parallel_world_size=world_size,
                 )
@@ -692,6 +695,7 @@ def _assert_tp_aux_loss_matches_reference(rank: int, *, input_is_parallel: bool,
         calculate_per_token_loss=False,
         objective_scale=1.0,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     with activate_mixture_lora_routing_context(reference_context):
         reference_output = reference(full_x)
@@ -739,6 +743,7 @@ def _assert_tp_aux_loss_matches_reference(rank: int, *, input_is_parallel: bool,
         calculate_per_token_loss=False,
         objective_scale=1.0,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     with activate_mixture_lora_routing_context(context):
         output = adapter(local_x)

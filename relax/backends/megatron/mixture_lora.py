@@ -62,6 +62,7 @@ class MixtureLoRARoutingContext:
     calculate_per_token_loss: bool
     objective_scale: float
     main_loss_backward_scale: torch.Tensor
+    activation_layout: str
     context_parallel_group: Any = None
     context_parallel_world_size: int = 1
     is_dummy: bool = False
@@ -82,20 +83,35 @@ class MixtureLoRARoutingContext:
             raise ValueError("context_parallel_world_size must be positive")
         if self.context_parallel_world_size > 1 and self.context_parallel_group is None:
             raise ValueError("context_parallel_group is required when context parallelism is enabled")
+        if self.activation_layout not in ("bshd", "thd"):
+            raise ValueError(f"unsupported activation_layout: {self.activation_layout!r}")
 
     def response_mask_for(self, x: torch.Tensor) -> torch.Tensor:
         """Align a batch-first mask with Megatron's activation layout."""
 
         activation_shape = tuple(x.shape[:-1])
         mask = self.response_mask
-        if tuple(mask.shape) == activation_shape:
-            aligned = mask
-        elif x.ndim == 3 and mask.ndim == 2 and tuple(mask.shape) == (x.shape[1], x.shape[0]):
+        if x.ndim != 3 or mask.ndim != 2:
+            raise ValueError(
+                f"{self.activation_layout} response_mask shape {tuple(mask.shape)} does not match "
+                f"activation token layout {activation_shape}"
+            )
+        if self.activation_layout == "bshd":
+            expected_mask_shape = (x.shape[1], x.shape[0])
+            if tuple(mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    f"bshd response_mask shape {tuple(mask.shape)} does not match "
+                    f"sequence-first activation shape {activation_shape}"
+                )
             aligned = mask.transpose(0, 1)
         else:
-            raise ValueError(
-                f"response_mask shape {tuple(mask.shape)} does not match activation token layout {activation_shape}"
-            )
+            expected_mask_shape = (1, x.shape[0])
+            if x.shape[1] != 1 or tuple(mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    f"thd response_mask shape {tuple(mask.shape)} does not match "
+                    f"packed activation shape {activation_shape}"
+                )
+            aligned = mask.transpose(0, 1)
         if aligned.device != x.device:
             raise ValueError("response_mask and routed activation must be on the same device")
         if self.is_dummy:

@@ -368,6 +368,7 @@ def test_routing_context_aligns_batch_first_response_mask_and_records_site():
         calculate_per_token_loss=False,
         objective_scale=0.25,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     x = torch.randn(3, 2, 4)
 
@@ -384,6 +385,46 @@ def test_routing_context_aligns_batch_first_response_mask_and_records_site():
         expected_statistics.balance_loss * adapter.config.aux_loss_coef / 2 * 2 * 0.25,
     )
     assert get_mixture_lora_routing_context() is None
+
+
+def test_bshd_square_response_mask_is_always_transposed():
+    response_mask = torch.tensor([[1, 0], [1, 1]], dtype=torch.bool)
+    context = MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=0,
+        response_mask=response_mask,
+        num_microbatches=1,
+        num_sites=1,
+        num_samples=2,
+        calculate_per_token_loss=False,
+        objective_scale=1.0,
+        main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
+    )
+
+    aligned = context.response_mask_for(torch.zeros(2, 2, 4))
+
+    torch.testing.assert_close(aligned, response_mask.transpose(0, 1).reshape(-1))
+
+
+def test_thd_response_mask_aligns_with_packed_activation():
+    response_mask = torch.tensor([[1, 0, 1]], dtype=torch.bool)
+    context = MixtureLoRARoutingContext(
+        optimizer_step=0,
+        microbatch_id=0,
+        response_mask=response_mask,
+        num_microbatches=1,
+        num_sites=1,
+        num_samples=1,
+        calculate_per_token_loss=False,
+        objective_scale=1.0,
+        main_loss_backward_scale=torch.ones(1),
+        activation_layout="thd",
+    )
+
+    aligned = context.response_mask_for(torch.zeros(3, 1, 4))
+
+    torch.testing.assert_close(aligned, response_mask.reshape(-1))
 
 
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
@@ -409,6 +450,7 @@ def test_routing_context_attaches_expected_router_gradient(calculate_per_token_l
         calculate_per_token_loss=calculate_per_token_loss,
         objective_scale=objective_scale,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     x = torch.randn(3, 2, 4)
 
@@ -444,6 +486,7 @@ def test_dummy_routing_context_records_zero_aux_loss():
         calculate_per_token_loss=False,
         objective_scale=0.0,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
         is_dummy=True,
     )
 
@@ -482,6 +525,7 @@ def test_routing_records_pack_and_report_step_metrics(calculate_per_token_loss):
         calculate_per_token_loss=calculate_per_token_loss,
         objective_scale=1.0 if calculate_per_token_loss else 0.25,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     x = torch.randn(3, 2, 4)
     with activate_mixture_lora_routing_context(context):
@@ -551,6 +595,7 @@ def test_recompute_replaces_routing_record_instead_of_counting_twice():
         calculate_per_token_loss=False,
         objective_scale=1.0,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
 
     with activate_mixture_lora_routing_context(context):
@@ -611,6 +656,7 @@ def test_checkpoint_wrapper_restores_captured_routing_context(monkeypatch):
         calculate_per_token_loss=False,
         objective_scale=1.0,
         main_loss_backward_scale=torch.ones(1),
+        activation_layout="bshd",
     )
     observed_contexts = []
 
@@ -800,6 +846,7 @@ def test_mixture_lora_peft_wraps_real_column_parallel_linear_when_available(tmp_
             calculate_per_token_loss=False,
             objective_scale=1.0,
             main_loss_backward_scale=torch.ones(1),
+            activation_layout="bshd",
         )
         with activate_mixture_lora_routing_context(routing_context):
             output, bias = transformed.linear_qkv(torch.randn(3, 1, 4))

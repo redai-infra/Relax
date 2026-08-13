@@ -227,9 +227,7 @@ def test_sglang_installs_adapters_only_on_layers_owned_by_pp_stage():
     EntryClass._install_mixture_lora(model)
 
     assert not hasattr(missing_layer, "self_attn")
-    assert local_layer.self_attn.qkv_proj.mixture_lora.site_id == (
-        "decoder.layers.1.self_attention.linear_qkv"
-    )
+    assert local_layer.self_attn.qkv_proj.mixture_lora.site_id == ("decoder.layers.1.self_attention.linear_qkv")
     assert local_layer.self_attn.o_proj.mixture_lora.site_id == "decoder.layers.1.self_attention.linear_proj"
 
 
