@@ -266,6 +266,7 @@ class SlimeRouter:
         max_gap = int(payload.get("max_gap", -1))
         max_actor_step_gap = int(payload.get("max_actor_step_gap", -1))
         timeout_seconds = float(payload.get("timeout_seconds", 15.0))
+        publication_id = str(payload.get("publication_id", "")) or None
         started_at = time.monotonic()
 
         async def abort_request(worker: str, rid: str) -> None:
@@ -280,6 +281,7 @@ class SlimeRouter:
             max_actor_step_gap=max_actor_step_gap,
             abort_request=abort_request,
             timeout_seconds=timeout_seconds,
+            publication_id=publication_id,
         )
         result = plan.to_dict()
         result["prepare_seconds"] = time.monotonic() - started_at

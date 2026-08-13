@@ -17,6 +17,7 @@ import asyncio
 import logging
 import socket
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -55,6 +56,8 @@ from relax.utils.megatron_peft_utils import (
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
+
+_PUBLICATION_TERMINAL_ATTEMPTS = 2
 
 
 class DeviceDirectBackend(CommBackend):
@@ -155,6 +158,7 @@ class DeviceDirectBackend(CommBackend):
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
         self._weight_sync_metrics: dict[str, float | int] | None = None
         self._active_publication: dict[str, Any] | None = None
+        self._publication_irreversible = False
 
     def _targeted_publication_enabled(self) -> bool:
         return bool(
@@ -182,13 +186,80 @@ class DeviceDirectBackend(CommBackend):
         response.raise_for_status()
         return response.json()
 
+    def _router_publication_state_request(self) -> dict[str, Any]:
+        base_url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
+        response = self.http_client.get(
+            f"{base_url}/_relax/weight_publication/state",
+            timeout=min(float(self.timeout_seconds), 30.0),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _publication_identity_matches(value: Any, payload: dict[str, Any]) -> bool:
+        return bool(
+            isinstance(value, dict)
+            and value.get("publication_id") == payload.get("publication_id")
+            and value.get("target_version") == payload.get("target_version")
+            and value.get("target_actor_step") == payload.get("target_actor_step")
+        )
+
+    @classmethod
+    def _publication_response_matches(cls, action: str, value: Any, payload: dict[str, Any]) -> bool:
+        if not cls._publication_identity_matches(value, payload):
+            return False
+        if action == "prepare":
+            return True
+        expected_status = "committed" if action == "commit" else "failed"
+        return value.get("status") == expected_status
+
+    def _router_publication_request_resolved(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve ambiguous Router control results without reopening stale
+        admission."""
+        attempts = _PUBLICATION_TERMINAL_ATTEMPTS if action in {"commit", "fail"} else 1
+        errors: list[Exception] = []
+        for _ in range(attempts):
+            try:
+                result = self._router_publication_request(action, payload)
+                if self._publication_response_matches(action, result, payload):
+                    return result
+                errors.append(RuntimeError(f"Router publication {action} returned a mismatched response"))
+            except Exception as exc:
+                errors.append(exc)
+
+        try:
+            state = self._router_publication_state_request()
+        except Exception as state_exc:
+            errors.append(state_exc)
+            detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+            raise RuntimeError(f"Router publication {action} outcome is unconfirmed: {detail}") from errors[0]
+
+        if action == "prepare":
+            active = state.get("publication")
+            if self._publication_identity_matches(active, payload) and state.get("publication_prepared") is True:
+                return {"status": "prepared", **active}
+        else:
+            terminal = state.get("last_publication")
+            if self._publication_identity_matches(terminal, payload) and terminal.get("status") == (
+                "committed" if action == "commit" else "failed"
+            ):
+                return terminal
+
+        active = state.get("publication")
+        active_id = active.get("publication_id") if isinstance(active, dict) else None
+        detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+        raise RuntimeError(
+            f"Router publication {action} outcome is unconfirmed; active_publication={active_id!r}, "
+            f"current_version={state.get('current_version')!r}, errors=[{detail}]"
+        ) from errors[0]
+
     def _publication_control(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Run one router transaction on rank 0 and propagate its result."""
         result: dict[str, Any] | None = None
         error: str | None = None
         if dist.get_rank() == 0:
             try:
-                result = self._router_publication_request(action, payload)
+                result = self._router_publication_request_resolved(action, payload)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
         objects = [{"result": result, "error": error}]
@@ -696,6 +767,7 @@ class DeviceDirectBackend(CommBackend):
             if target_actor_step is None or target_actor_step < 0:
                 raise ValueError("targeted DCS publication requires a non-negative target_actor_step")
         self._active_publication = None
+        self._publication_irreversible = False
         try:
             return self._update_weights_for_rollout_impl(
                 rollout_only,
@@ -704,9 +776,9 @@ class DeviceDirectBackend(CommBackend):
             )
         except BaseException as exc:
             publication = self._active_publication
-            if publication is not None and dist.get_rank() == 0:
+            if publication is not None and dist.get_rank() == 0 and not self._publication_irreversible:
                 try:
-                    self._router_publication_request(
+                    self._router_publication_request_resolved(
                         "fail",
                         {
                             "publication_id": publication["publication_id"],
@@ -717,9 +789,16 @@ class DeviceDirectBackend(CommBackend):
                     )
                 except Exception:
                     logger.exception("Failed to poison the targeted publication after a DCS error")
+            elif publication is not None and self._publication_irreversible and dist.get_rank() == 0:
+                logger.error(
+                    "DCS publication failed after entering an irreversible pause/weight-update phase; "
+                    "not issuing fail for Router publication %s; admission remains fenced unless commit already applied",
+                    publication["publication_id"],
+                )
             raise
         finally:
             self._active_publication = None
+            self._publication_irreversible = False
 
     @torch.no_grad()
     def _update_weights_for_rollout_impl(
@@ -733,7 +812,7 @@ class DeviceDirectBackend(CommBackend):
 
         Sequence: materialize weights, prepare the publication boundary, pause
         rollout generation, gather and broadcast model parameters (non-expert
-        then expert), then resume and commit the boundary.
+        then expert), commit the Router version, then resume generation.
         """
         update_started_at = time.monotonic()
         # ``weight_version`` is the last successfully published version. Keep
@@ -780,9 +859,11 @@ class DeviceDirectBackend(CommBackend):
 
         if not actor_fwd_only:
             if targeted_publication:
+                publication_id = uuid.uuid4().hex
                 publication = self._publication_control(
                     "prepare",
                     {
+                        "publication_id": publication_id,
                         "target_version": target_version,
                         "target_actor_step": target_actor_step,
                         "max_gap": int(self.args.cross_version_kv_max_gap),
@@ -801,6 +882,10 @@ class DeviceDirectBackend(CommBackend):
                     len(publication.get("actor_step_gap_expired_rids", ()))
                 )
                 self._weight_sync_metrics["targeted_safe_requests"] = int(publication.get("safe_count", 0))
+                # From the first pause attempt onward, rollout state may differ
+                # across receivers. A later error must keep the Router fence in
+                # place instead of reopening admission under the old version.
+                self._publication_irreversible = True
             pause_started_at = time.monotonic()
             if dist.get_rank() == 0:
                 logger.info("Pausing generation on all rollout nodes...")
@@ -902,12 +987,6 @@ class DeviceDirectBackend(CommBackend):
             self._lora_sync.base_sync_done = True
 
         if not actor_fwd_only:
-            continue_started_at = time.monotonic()
-            if dist.get_rank() == 0:
-                logger.info("Resuming generation on all rollout nodes...")
-            continue_payload = {"torch_empty_cache": False} if targeted_publication else None
-            self._rollout_control("/continue_generation", continue_payload)
-            self._weight_sync_metrics["continue_seconds"] = time.monotonic() - continue_started_at
             if targeted_publication:
                 assert publication is not None
                 self._publication_control(
@@ -918,16 +997,29 @@ class DeviceDirectBackend(CommBackend):
                         "target_actor_step": target_actor_step,
                     },
                 )
+                # Router and rollout receivers now agree on the target version.
+                # Persist the local version before reopening generation so a
+                # continue failure cannot make the next call republish it.
+                self.weight_version = target_version
                 self._active_publication = None
+
+            continue_started_at = time.monotonic()
+            if dist.get_rank() == 0:
+                logger.info("Resuming generation on all rollout nodes...")
+            continue_payload = {"torch_empty_cache": False} if targeted_publication else None
+            self._rollout_control("/continue_generation", continue_payload)
+            self._weight_sync_metrics["continue_seconds"] = time.monotonic() - continue_started_at
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
             # group) when the topology is unchanged. They are torn down only when the
             # topology actually changes (inside init_process_group_for_rollout's
             # rebuild path).
 
-        # Reaching this point means every requested receiver path completed and,
-        # for targeted publication, the Router commit succeeded.
-        self.weight_version = target_version
+        # The targeted path records its version immediately after Router commit
+        # and before continue. Other paths keep the existing successful-return
+        # behavior.
+        if not targeted_publication:
+            self.weight_version = target_version
 
         # Free the per-call merge-mode adapter cache (full tensors) before reclaiming CUDA memory.
         self._lora_adapter_full = None

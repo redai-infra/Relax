@@ -58,6 +58,9 @@ __all__ = ["generate_rollout"]
 
 logger = get_logger(__name__)
 
+_GROUP_RM_FINALIZED_KEY = "_cross_version_kv_group_rm_finalized"
+_GROUP_OPD_FINALIZED_KEY = "_cross_version_kv_group_opd_finalized"
+
 
 # Misuse guard for the per-request permit contract. Set while the session-level
 # lock (GenerateState.semaphore) is held so that a legacy custom function that
@@ -773,8 +776,7 @@ async def generate_and_rm_group(
             cross_version_kv_enabled(args)
             and not evaluation
             and all(
-                sample.reward is not None and sample.metadata.get("_cross_version_kv_group_rm_finalized", False)
-                for sample in group
+                sample.reward is not None and sample.metadata.get(_GROUP_RM_FINALIZED_KEY, False) for sample in group
             )
         )
         if not group_rm_finalized:
@@ -783,10 +785,17 @@ async def generate_and_rm_group(
                 sample.reward = reward
             if cross_version_kv_enabled(args) and not evaluation:
                 for sample in group:
-                    sample.metadata["_cross_version_kv_group_rm_finalized"] = True
+                    sample.metadata[_GROUP_RM_FINALIZED_KEY] = True
 
         if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+            opd_finalized = cross_version_kv_enabled(args) and all(
+                sample.metadata.get(_GROUP_OPD_FINALIZED_KEY, False) for sample in group
+            )
+            if not opd_finalized:
+                await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+                if cross_version_kv_enabled(args):
+                    for sample in group:
+                        sample.metadata[_GROUP_OPD_FINALIZED_KEY] = True
 
     return group
 
@@ -1338,7 +1347,6 @@ EVAL_PROMPT_DATASET = {}
 
 
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
-
     state = GenerateState(args)
     # Increment evaluating counter so that abort() knows to wait for eval to finish.
     # This prevents abort_all from killing in-flight eval requests on SGLang workers.

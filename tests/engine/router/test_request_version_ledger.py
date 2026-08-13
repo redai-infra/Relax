@@ -220,6 +220,65 @@ async def test_failed_publication_ends_current_transaction_without_poisoning_rou
     assert failed_state["failed_reason"] == "DCS broadcast failed"
 
 
+async def test_publication_terminal_operations_are_idempotent_and_mutually_exclusive() -> None:
+    ledger = RequestVersionLedger(initial_version=2)
+
+    async def abort_request(_worker: str, _rid: str) -> None:
+        return None
+
+    committed = await ledger.prepare(
+        target_version=3,
+        target_actor_step=1,
+        max_gap=2,
+        max_actor_step_gap=2,
+        abort_request=abort_request,
+        timeout_seconds=1,
+    )
+    first_commit = await ledger.commit(committed.publication_id, committed.target_version, committed.target_actor_step)
+    second_commit = await ledger.commit(
+        committed.publication_id, committed.target_version, committed.target_actor_step
+    )
+    assert first_commit == second_commit == committed
+    with pytest.raises(PublicationError, match="already committed"):
+        await ledger.fail(
+            committed.publication_id,
+            committed.target_version,
+            committed.target_actor_step,
+            "late failure",
+        )
+    with pytest.raises(PublicationError, match="already finalized"):
+        await ledger.prepare(
+            publication_id=committed.publication_id,
+            target_version=4,
+            target_actor_step=2,
+            max_gap=2,
+            max_actor_step_gap=2,
+            abort_request=abort_request,
+            timeout_seconds=1,
+        )
+
+    failed = await ledger.prepare(
+        target_version=4,
+        target_actor_step=2,
+        max_gap=2,
+        max_actor_step_gap=2,
+        abort_request=abort_request,
+        timeout_seconds=1,
+    )
+    first_fail = await ledger.fail(failed.publication_id, failed.target_version, failed.target_actor_step, "failed")
+    second_fail = await ledger.fail(
+        failed.publication_id, failed.target_version, failed.target_actor_step, "duplicate"
+    )
+    assert first_fail == second_fail == failed
+    with pytest.raises(PublicationError, match="already failed"):
+        await ledger.commit(failed.publication_id, failed.target_version, failed.target_actor_step)
+
+    state = await ledger.snapshot()
+    assert state["current_version"] == 3
+    assert state["last_publication"]["status"] == "failed"
+    assert state["last_publication"]["publication_id"] == failed.publication_id
+
+
 async def test_publication_version_must_advance_exactly_once() -> None:
     ledger = RequestVersionLedger(initial_version=2)
 

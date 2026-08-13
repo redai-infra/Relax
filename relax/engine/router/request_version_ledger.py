@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 class PublicationError(RuntimeError):
@@ -49,8 +49,20 @@ class PublicationPlan:
         return value
 
 
+@dataclass(frozen=True)
+class TerminalPublication:
+    status: Literal["committed", "failed"]
+    plan: PublicationPlan
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": self.status, "reason": self.reason, **self.plan.to_dict()}
+
+
 class RequestVersionLedger:
     """Track active request KV epochs and serialize weight publications."""
+
+    _TERMINAL_HISTORY_LIMIT = 32
 
     def __init__(self, *, initial_version: int = 0, initial_actor_step: int = 0) -> None:
         if initial_version < 0:
@@ -62,6 +74,8 @@ class RequestVersionLedger:
         self.active: dict[str, ActiveRequestVersion] = {}
         self._condition = asyncio.Condition()
         self._publication: PublicationPlan | None = None
+        self._publication_prepared = False
+        self._terminal_publications: OrderedDict[str, TerminalPublication] = OrderedDict()
         # Diagnostic only: publication failures never become a process-lifetime request gate.
         self._failed_reason: str | None = None
 
@@ -106,6 +120,7 @@ class RequestVersionLedger:
         max_actor_step_gap: int,
         abort_request: Callable[[str, str], Awaitable[None]],
         timeout_seconds: float,
+        publication_id: str | None = None,
     ) -> PublicationPlan:
         if max_gap < 1:
             raise ValueError("max_gap must be positive")
@@ -113,10 +128,14 @@ class RequestVersionLedger:
             raise ValueError("max_actor_step_gap must be non-negative")
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if publication_id is not None and not publication_id:
+            raise ValueError("publication_id must be non-empty when supplied")
 
         async with self._condition:
             if self._publication is not None:
                 raise PublicationError(f"publication already active: {self._publication.publication_id}")
+            if publication_id is not None and publication_id in self._terminal_publications:
+                raise PublicationError(f"publication id was already finalized: {publication_id}")
             if target_version != self.current_version + 1:
                 raise PublicationError(
                     f"target_version must advance exactly once: current={self.current_version}, target={target_version}"
@@ -140,7 +159,7 @@ class RequestVersionLedger:
                 if publication_gap_expired or actor_step_gap_expired:
                     expired[request.worker].append(request.rid)
             plan = PublicationPlan(
-                publication_id=uuid.uuid4().hex,
+                publication_id=publication_id or uuid.uuid4().hex,
                 previous_version=self.current_version,
                 target_version=target_version,
                 previous_actor_step=self.current_actor_step,
@@ -153,6 +172,7 @@ class RequestVersionLedger:
                 active_request_count=len(self.active),
             )
             self._publication = plan
+            self._publication_prepared = False
 
         try:
             worker_by_rid = {rid: worker for worker, rids in plan.expired_by_worker.items() for rid in rids}
@@ -204,17 +224,29 @@ class RequestVersionLedger:
                 if self._publication == plan:
                     self._failed_reason = f"targeted retirement failed: {type(exc).__name__}: {exc}"
                     self._publication = None
+                    self._publication_prepared = False
                     self._condition.notify_all()
             raise
+        async with self._condition:
+            if self._publication != plan:
+                raise PublicationError(f"publication changed while prepare was completing: {plan.publication_id}")
+            self._publication_prepared = True
         return plan
 
     async def commit(self, publication_id: str, target_version: int, target_actor_step: int) -> PublicationPlan:
         async with self._condition:
+            terminal = self._require_terminal(publication_id, target_version, target_actor_step, "committed")
+            if terminal is not None:
+                return terminal.plan
             plan = self._require_publication(publication_id, target_version, target_actor_step)
+            if not self._publication_prepared:
+                raise PublicationError(f"publication prepare is not complete: {publication_id}")
             self.current_version = target_version
             self.current_actor_step = target_actor_step
             self._publication = None
+            self._publication_prepared = False
             self._failed_reason = None
+            self._remember_terminal(TerminalPublication(status="committed", plan=plan))
             self._condition.notify_all()
             return plan
 
@@ -226,11 +258,46 @@ class RequestVersionLedger:
         reason: str,
     ) -> PublicationPlan:
         async with self._condition:
+            terminal = self._require_terminal(publication_id, target_version, target_actor_step, "failed")
+            if terminal is not None:
+                return terminal.plan
             plan = self._require_publication(publication_id, target_version, target_actor_step)
             self._failed_reason = reason or "weight publication failed"
             self._publication = None
+            self._publication_prepared = False
+            self._remember_terminal(TerminalPublication(status="failed", plan=plan, reason=self._failed_reason))
             self._condition.notify_all()
             return plan
+
+    def _remember_terminal(self, terminal: TerminalPublication) -> None:
+        publication_id = terminal.plan.publication_id
+        self._terminal_publications[publication_id] = terminal
+        self._terminal_publications.move_to_end(publication_id)
+        while len(self._terminal_publications) > self._TERMINAL_HISTORY_LIMIT:
+            self._terminal_publications.popitem(last=False)
+
+    def _require_terminal(
+        self,
+        publication_id: str,
+        target_version: int,
+        target_actor_step: int,
+        expected_status: Literal["committed", "failed"],
+    ) -> TerminalPublication | None:
+        terminal = self._terminal_publications.get(publication_id)
+        if terminal is None:
+            return None
+        plan = terminal.plan
+        if plan.target_version != target_version or plan.target_actor_step != target_actor_step:
+            raise PublicationError(
+                "terminal publication target mismatch: "
+                f"stored=({plan.target_version}, {plan.target_actor_step}), "
+                f"supplied=({target_version}, {target_actor_step})"
+            )
+        if terminal.status != expected_status:
+            raise PublicationError(
+                f"publication {publication_id} is already {terminal.status}; cannot mark it {expected_status}"
+            )
+        return terminal
 
     def _require_publication(
         self,
@@ -257,10 +324,13 @@ class RequestVersionLedger:
     async def snapshot(self) -> dict[str, Any]:
         async with self._condition:
             publication = self._publication.to_dict() if self._publication is not None else None
+            last_publication = next(reversed(self._terminal_publications.values()), None)
             return {
                 "current_version": self.current_version,
                 "current_actor_step": self.current_actor_step,
                 "publication": publication,
+                "publication_prepared": self._publication_prepared,
+                "last_publication": last_publication.to_dict() if last_publication is not None else None,
                 "failed_reason": self._failed_reason,
                 "active": {
                     rid: {
