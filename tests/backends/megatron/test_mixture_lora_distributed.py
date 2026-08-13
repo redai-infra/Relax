@@ -783,6 +783,7 @@ def _tensor_parallel_worker(rank: int, world_size: int, init_method: str) -> Non
 
 
 def test_tensor_parallel_forward_and_backward_match_single_rank_reference(tmp_path):
+    pytest.importorskip("megatron.core.tensor_parallel.layers")
     init_method = f"file://{tmp_path / 'mixture-lora-tp-gloo-init'}"
     mp.spawn(_tensor_parallel_worker, args=(2, init_method), nprocs=2, join=True)
 
@@ -829,6 +830,7 @@ def _tensor_parallel_initialization_worker(rank: int, world_size: int, init_meth
 
 
 def test_tensor_parallel_lora_a_initialization_uses_distinct_rank_blocks(tmp_path):
+    pytest.importorskip("megatron.core.tensor_parallel.layers")
     init_method = f"file://{tmp_path / 'mixture-lora-tp-init-gloo'}"
     mp.spawn(_tensor_parallel_initialization_worker, args=(2, init_method), nprocs=2, join=True)
 
@@ -883,5 +885,6 @@ def _tensor_parallel_cuda_initialization_worker(rank: int, world_size: int, init
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 def test_tensor_parallel_cuda_lora_a_initialization_uses_model_parallel_rng(tmp_path):
+    pytest.importorskip("megatron.core.tensor_parallel.layers")
     init_method = f"file://{tmp_path / 'mixture-lora-tp-init-nccl'}"
     mp.spawn(_tensor_parallel_cuda_initialization_worker, args=(2, init_method), nprocs=2, join=True)
