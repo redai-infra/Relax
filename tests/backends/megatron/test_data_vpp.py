@@ -47,6 +47,78 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
     assert rounded.tolist() == [4, 4, 4, 8]
 
 
+def test_build_rl_forward_kwargs_uses_packed_text_inputs(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    tokens = object()
+    packed_seq_params = object()
+    full_loss_masks = object()
+
+    forward_kwargs, needs_unsplit = data_module.build_rl_forward_kwargs(
+        Namespace(is_vl_model=False, uses_unsplit_forward=False),
+        {
+            "tokens": tokens,
+            "packed_seq_params": packed_seq_params,
+            "full_loss_masks": full_loss_masks,
+        },
+    )
+
+    assert not needs_unsplit
+    assert forward_kwargs["input_ids"] is tokens
+    assert forward_kwargs["packed_seq_params"] is packed_seq_params
+    assert forward_kwargs["attention_mask"] is None
+    assert forward_kwargs["loss_mask"] is full_loss_masks
+
+
+def test_build_rl_forward_kwargs_uses_vl_thd_bridge_inputs(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    unsplit_tokens = object()
+    attention_mask = object()
+    vlm_packed_seq_params = object()
+    pixel_values = object()
+
+    forward_kwargs, needs_unsplit = data_module.build_rl_forward_kwargs(
+        Namespace(is_vl_model=True, uses_unsplit_forward=False),
+        {
+            "tokens": object(),
+            "unsplit_tokens": unsplit_tokens,
+            "packed_seq_params": object(),
+            "vlm_packed_seq_params": vlm_packed_seq_params,
+            "unsplit_attention_mask": attention_mask,
+            "full_loss_masks": object(),
+            "multimodal_train_inputs": {"pixel_values": pixel_values},
+        },
+    )
+
+    assert needs_unsplit
+    assert forward_kwargs["input_ids"] is unsplit_tokens
+    assert forward_kwargs["attention_mask"] is attention_mask
+    assert forward_kwargs["packed_seq_params"] is vlm_packed_seq_params
+    assert forward_kwargs["loss_mask"] is None
+    assert forward_kwargs["pixel_values"] is pixel_values
+
+
+def test_build_rl_forward_kwargs_matches_custom_multimodal_gate(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    unsplit_tokens = object()
+    pixel_values = object()
+
+    forward_kwargs, needs_unsplit = data_module.build_rl_forward_kwargs(
+        Namespace(is_vl_model=False, uses_unsplit_forward=False),
+        {
+            "tokens": object(),
+            "unsplit_tokens": unsplit_tokens,
+            "packed_seq_params": object(),
+            "full_loss_masks": object(),
+            "multimodal_train_inputs": {"pixel_values": pixel_values},
+        },
+    )
+
+    assert needs_unsplit
+    assert forward_kwargs["input_ids"] is unsplit_tokens
+    assert forward_kwargs["packed_seq_params"] is None
+    assert "pixel_values" not in forward_kwargs
+
+
 def test_rollout_minibatch_plan_derives_from_global_batch(monkeypatch):
     data_module = _load_data_module(monkeypatch)
     args = Namespace(

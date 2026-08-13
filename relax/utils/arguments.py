@@ -1735,6 +1735,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "p3o",
                 ],
                 default="grpo",
                 help=(
@@ -1833,6 +1834,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to use the rollout logprobs when calculating the importance sampling ratios. "
                     "If not set, we will use the logprobs from the actor model."
                 ),
+            )
+            parser.add_argument(
+                "--p3o-ess-scope",
+                choices=["micro-batch", "step"],
+                default="micro-batch",
+                help="P3O ESS scope: paper-compatible micro-batch (default) or optimizer step.",
+            )
+            parser.add_argument(
+                "--p3o-kl-mode",
+                choices=["proxy", "proxy_safe"],
+                default="proxy",
+                help="P3O behavior-KL implementation: proxy or proxy_safe.",
+            )
+            parser.add_argument(
+                "--clip-low",
+                type=float,
+                default=0.2,
+                help="Lower ratio margin used only for P3O clip-fraction monitoring.",
+            )
+            parser.add_argument(
+                "--clip-high",
+                type=float,
+                default=0.2,
+                help="Upper ratio margin used only for P3O clip-fraction monitoring.",
             )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
@@ -2872,6 +2897,92 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _validate_p3o_args(args: argparse.Namespace) -> None:
+    """Reject P3O configurations whose ESS scope or replay would be wrong.
+
+    These are hard errors, not warnings. Every condition below silently changes
+    the objective (not just performance), and the failure mode is a plausible
+    loss curve that does not implement P3O.
+    """
+    # These are raises rather than asserts on purpose: `python -O` strips
+    # asserts, and every condition here silently changes the objective rather
+    # than crashing, so a stripped check would let a non-P3O run masquerade as
+    # one for its entire duration.
+    scope = getattr(args, "p3o_ess_scope", "micro-batch")
+    if scope not in {"micro-batch", "step"}:
+        raise ValueError(f"--p3o-ess-scope must be micro-batch or step, got {scope!r}.")
+    kl_mode = getattr(args, "p3o_kl_mode", "proxy")
+    if kl_mode not in {"proxy", "proxy_safe"}:
+        raise ValueError(f"--p3o-kl-mode must be proxy or proxy_safe, got {kl_mode!r}.")
+    clip_low = getattr(args, "clip_low", 0.2)
+    clip_high = getattr(args, "clip_high", 0.2)
+    if clip_low < 0.0 or clip_high < 0.0:
+        raise ValueError(f"--clip-low/--clip-high must be non-negative, got {clip_low}, {clip_high}.")
+
+    if not args.use_rollout_logprobs:
+        raise ValueError(
+            "P3O requires the rollout sampling distribution as its behavior policy. "
+            "Add --use-rollout-logprobs; without it there is no importance ratio to correct."
+        )
+    if not args.calculate_per_token_loss:
+        raise ValueError(
+            "P3O requires --calculate-per-token-loss. Per-sample-mean normalization "
+            "reintroduces a per-micro-batch denominator, so the loss would depend on "
+            "how the optimizer step is split into micro-batches."
+        )
+    if args.use_tis:
+        raise ValueError(
+            "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
+            "rollout/training mismatch, and stacking them double-corrects the ratio."
+        )
+    if getattr(args, "use_critic", False):
+        raise ValueError(
+            "P3O does not use a critic; it is a score-function estimator over group-relative "
+            "advantages. Drop --use-critic."
+        )
+
+    incompatible_flags = {
+        "get_mismatch_metrics": "--get-mismatch-metrics",
+        "use_opsm": "--use-opsm",
+        "enable_mtp_training": "--enable-mtp-training",
+        "use_routing_replay": "--use-routing-replay",
+        "use_rollout_routing_replay": "--use-rollout-routing-replay",
+        "overlap_moe_expert_parallel_comm": "--overlap-moe-expert-parallel-comm",
+    }
+    for attr, flag in incompatible_flags.items():
+        if getattr(args, attr, False):
+            raise ValueError(f"P3O does not support {flag} in the replayed two-pass optimizer step.")
+    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        raise ValueError("P3O requires token-sum normalization and does not support a custom PG-loss reducer.")
+
+    if scope == "step":
+        # The ESS pre-pass replays the same micro-batch window under no_grad. Ops
+        # that mutate state on a forward would make the two passes disagree.
+        if getattr(args, "fp8", None) is not None:
+            raise ValueError(
+                "P3O's ESS pre-pass runs a second forward over the same window, which would "
+                "advance FP8 amax history and make the training forward non-reproducible. "
+                "Disable FP8 or use --p3o-ess-scope micro-batch."
+            )
+        dropout = max(
+            getattr(args, "attention_dropout", 0.0) or 0.0,
+            getattr(args, "hidden_dropout", 0.0) or 0.0,
+            (getattr(args, "lora_dropout", 0.0) or 0.0) if getattr(args, "lora_rank", 0) > 0 else 0.0,
+        )
+        if dropout > 0.0:
+            raise ValueError(
+                f"P3O step scope requires deterministic replay, but dropout is enabled (max rate {dropout}). "
+                "Set attention, hidden, and LoRA dropout rates to 0.0 or use --p3o-ess-scope micro-batch."
+            )
+
+        if getattr(args, "fully_async", False):
+            raise ValueError(
+                "P3O's optimizer-step ESS scope requires the whole micro-batch window to be "
+                "available before the training pass. Fully-async mode streams micro-batches; "
+                "use --p3o-ess-scope micro-batch instead."
+            )
+
+
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
     """Validate the frozen Task 29 REINFORCE++ algorithm contracts."""
     if is_sft:
@@ -3582,3 +3693,10 @@ def slime_validate_args(args):
     if args.genrm_model_path:
         args.genrm_engine_config = args.genrm_engine_config or {}
         args.genrm_sampling_config = args.genrm_sampling_config or {}
+
+    # Validate the final effective values. Several execution flags are derived
+    # above (hybrid and routing replay), and custom YAML is applied near the end;
+    # validating earlier would let those paths silently bypass P3O's replay
+    # contract.
+    if args.advantage_estimator == "p3o":
+        _validate_p3o_args(args)

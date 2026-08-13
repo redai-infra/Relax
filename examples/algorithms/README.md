@@ -8,15 +8,16 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 
 ## 支持的算法
 
-| 算法                     | 启用参数                                             | 推荐场景                    |
-| ------------------------ | ---------------------------------------------------- | --------------------------- |
-| **PPO**                  | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE  |
-| **GRPO**                 | `--advantage-estimator grpo`                         | 默认、大多数场景            |
-| **REINFORCE++**          | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化 |
-| **REINFORCE++-baseline** | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL |
-| **CISPO**                | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度  |
-| **GSPO**                 | `--advantage-estimator gspo`                         | 序列级约束、稳定训练        |
-| **SAPO**                 | `--advantage-estimator sapo`                         | 平滑优化、soft 信任域       |
+| 算法                     | 启用参数                                             | 推荐场景                         |
+| ------------------------ | ---------------------------------------------------- | -------------------------------- |
+| **PPO**                  | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE       |
+| **P3O**                  | `--advantage-estimator p3o`                          | 行为策略失配校正、ESS 自适应上限 |
+| **GRPO**                 | `--advantage-estimator grpo`                         | 默认、大多数场景                 |
+| **REINFORCE++**          | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化      |
+| **REINFORCE++-baseline** | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL      |
+| **CISPO**                | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度       |
+| **GSPO**                 | `--advantage-estimator gspo`                         | 序列级约束、稳定训练             |
+| **SAPO**                 | `--advantage-estimator sapo`                         | 平滑优化、soft 信任域            |
 
 ## 选择建议
 
@@ -33,6 +34,13 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - 默认算法，特性平衡，大多数场景可用
 - 对超出信任域的 token 直接置零梯度
 - 适合大多数强化学习场景
+
+### P3O（行为策略失配校正）
+
+- 使用 rollout 时记录的行为策略 log-probability 计算重要性比率，并以 ESS 自适应地限制策略更新
+- 生产模式只支持 `--p3o-kl-mode proxy` 与 `proxy_safe`；全词表 `exact` 仅供验证辅助函数使用，不是命令行模式
+- 与 `--use-opd` 互斥，且需要 `--use-rollout-logprobs` 与 `--calculate-per-token-loss`
+- A100×4 的成对 P3O/GRPO 场景与环境变量说明参见 [P3O 配置](p3o/README_zh.md)
 
 ### REINFORCE++ 两个变体
 

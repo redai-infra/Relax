@@ -28,6 +28,7 @@ from relax.engine.rollout.request_permit import GenerationAborted, InferencePerm
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
+    _sanitize_response_tokens_for_logprobs,
     async_encode_audio_for_rollout_engine,
     async_encode_image_for_rollout_engine,
     async_encode_video_tensor_for_rollout_engine,
@@ -414,43 +415,20 @@ async def generate(
                 output["meta_info"], new_response_tokens, new_response_log_probs
             )
 
-        while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.image_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at image_token_id if you want to avoid this."
+        if len(new_response_log_probs) > 0 and len(new_response_log_probs) != len(new_response_tokens):
+            raise ValueError(
+                "rollout response token/log-prob length mismatch: "
+                f"{len(new_response_tokens)} tokens vs {len(new_response_log_probs)} log-probs"
             )
 
-        while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.audio_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
+        new_response_tokens, new_rollout_log_probs_mask, replacement_counts = _sanitize_response_tokens_for_logprobs(
+            state.tokenizer, state.processor, new_response_tokens
+        )
+        for label, replaced in replacement_counts.items():
             logger.warning(
-                "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at audio_token_id if you want to avoid this."
+                f"Replaced {replaced} stray {label} token(s) in rollout response with pad_token_id; "
+                "the corresponding behavior log-probs will be masked from training."
             )
-
-        while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.video_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
-            )
-
-        # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
-        # for vision input slots. A hallucinated <|media_pad|> in the response
-        # inflates num_placeholders past sum(feature_lengths) in the bridge,
-        # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
-        # so positional accounting matches sglang's per-token logprobs.
-        if state.processor is not None:
-            from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
-
-            sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
-            if sanitized is not new_response_tokens:
-                replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
-                if replaced:
-                    logger.warning(
-                        f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
-                    )
-                new_response_tokens = sanitized
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
@@ -463,9 +441,23 @@ async def generate(
             assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
             sample.loss_mask += [1] * len(new_response_tokens)
 
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
+        if len(new_response_log_probs) > 0:
+            if sample.rollout_log_probs is None:
+                sample.rollout_log_probs = []
+            if sample.rollout_log_probs_mask is None:
+                sample.rollout_log_probs_mask = [True] * len(sample.rollout_log_probs)
+            sample.rollout_log_probs += new_response_log_probs
+            sample.rollout_log_probs_mask += new_rollout_log_probs_mask
+        else:
+            if sample.rollout_log_probs:
+                raise ValueError("rollout log-probs disappeared during a multi-turn response")
+            if sample.rollout_log_probs is None:
+                sample.rollout_log_probs = []
+
+        if sample.rollout_log_probs_mask is not None and len(sample.rollout_log_probs_mask) != len(
+            sample.rollout_log_probs
+        ):
+            raise ValueError("accumulated rollout log-prob mask is not aligned with rollout log-probs")
 
         if state.opd_manager and not evaluation:
             state.opd_manager.after_rollout(sample, output)

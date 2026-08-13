@@ -17,6 +17,10 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+GRPO_STYLE_ADVANTAGE_ESTIMATORS = frozenset({"grpo", "gspo", "sapo", "cispo", "p3o"})
+GROUP_REWARD_NORMALIZATION_ESTIMATORS = GRPO_STYLE_ADVANTAGE_ESTIMATORS | {"reinforce_plus_plus_baseline"}
+
+
 def validate_ppo_config(config: Namespace) -> None:
     if getattr(config, "advantage_estimator", None) != "ppo":
         return

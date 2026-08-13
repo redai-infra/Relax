@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -17,8 +19,16 @@ from relax.utils.opd.opd_utils import (
     compute_policy_opd_loss,
     resolve_opd_gather_topk_token_ids,
     validate_opd_topk_gather,
+    validate_p3o_opd_compatibility,
+)
+from relax.utils.training.p3o_utils import (
+    P3OStepContext,
+    compute_p3o_sufficient_stats_unchecked,
+    compute_p3o_token_terms,
+    finalize_p3o_step_context,
 )
 from relax.utils.training.ppo_utils import (
+    GRPO_STYLE_ADVANTAGE_ESTIMATORS,
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_cispo_loss,
@@ -37,11 +47,13 @@ from relax.utils.types import RolloutBatch
 from .cp_utils import (
     all_gather_with_cp,
     get_cp_local_num_tokens,
+    get_cp_local_valid_mask,
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .p3o_step import synchronize_p3o_stats
 
 
 def get_responses(
@@ -575,7 +587,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
+    if args.advantage_estimator in GRPO_STYLE_ADVANTAGE_ESTIMATORS:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
@@ -790,6 +802,208 @@ def icepop_function(
     }
     pg_loss = pg_loss * ice_weight
     return pg_loss, loss_masks, metrics
+
+
+def get_p3o_step_context(args: Namespace) -> P3OStepContext:
+    """Fetch the frozen P3O context for the optimizer step in progress.
+
+    The context is published by the Megatron backend's ESS pre-pass
+    (``model.py::compute_p3o_step_context``) before the training
+    forward/backward schedule starts, and is deliberately not passed through
+    the micro-batch dict: every micro-batch of the step must see the exact same
+    cap.
+    """
+    step_context = getattr(args, "_p3o_step_context", None)
+    if step_context is None:
+        raise RuntimeError(
+            "P3O: no optimizer-step context available. The ESS pre-pass must run "
+            "before the training forward/backward schedule."
+        )
+    return step_context
+
+
+def get_p3o_context(
+    args: Namespace,
+    log_probs: torch.Tensor,
+    behavior_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> P3OStepContext:
+    """Resolve the configured P3O ESS scope for one loss micro-batch."""
+    scope = getattr(args, "p3o_ess_scope", "micro-batch")
+    if scope == "step":
+        return get_p3o_step_context(args)
+    if scope != "micro-batch":
+        raise ValueError(f"P3O ESS scope must be 'micro-batch' or 'step', got {scope!r}")
+
+    stats, invalid_count = compute_p3o_sufficient_stats_unchecked(
+        log_probs,
+        behavior_log_probs,
+        valid_mask,
+    )
+    distributed = dist.is_available() and dist.is_initialized()
+    stats = synchronize_p3o_stats(
+        stats,
+        invalid_count,
+        dp_cp_group=mpu.get_data_parallel_group(with_context_parallel=True) if distributed else None,
+        pp_group=None,
+        is_pipeline_last_stage=True,
+    )
+    return finalize_p3o_step_context(stats)
+
+
+def p3o_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute the P3O loss and metrics for one micro-batch.
+
+    P3O is kept out of :func:`policy_loss_function` on purpose. Its objective is
+    a score-function update whose ratio coefficient is fully detached and capped
+    by the optimizer-step ESS, so none of the PPO machinery applies: no
+    advantage-sign branch, no lower clip bound, and ``eps_clip`` has no effect.
+    Mixing it into the PPO branch would mean threading a "which clipping regime"
+    flag through code that assumes a two-sided surrogate.
+
+    The behavior policy is the rollout sampling distribution
+    (``rollout_log_probs``), never a detached copy of the current forward:
+    substituting the latter would erase exactly the policy lag / temperature
+    mismatch P3O exists to absorb.
+
+    Args:
+        args: Configuration. Reads ``entropy_coef``, ``use_kl_loss`` /
+            ``kl_loss_coef`` (frozen-reference regularization, reported
+            separately from the adaptive behavior KL), and the P3O step context.
+        batch: Mini-batch with "advantages", "rollout_log_probs",
+            "unconcat_tokens", "total_lengths", "response_lengths", "loss_masks".
+        logits: Policy logits with shape ``[1, T, V]``.
+        sum_of_sample_mean: Reduction over this micro-batch's tokens. P3O
+            requires the token-sum variant (``--calculate-per-token-loss``) so
+            that per-micro-batch denominators do not re-enter the objective.
+
+    Returns:
+        Tuple of ``(loss, metrics)``. Metric keys are prefixed ``p3o/`` except
+        the shared ``loss`` / ``pg_loss`` / ``entropy_loss`` keys kept for
+        dashboard compatibility. Global scalars (ESS, cap, ratio moments) are
+        pre-multiplied by this rank's valid-token count, because the caller
+        divides every reported metric by the globally reduced token count.
+    """
+    if isinstance(batch["advantages"], list):
+        advantages = torch.cat(batch["advantages"], dim=0)
+    else:
+        advantages = batch["advantages"]
+
+    # Raise, not assert: under `python -O` a stripped check would fall through to
+    # a KeyError deep in the loss, or worse, a silently wrong behavior policy.
+    if batch.get("rollout_log_probs") is None:
+        raise ValueError(
+            "P3O requires actual rollout log-probs as the behavior policy; run with --use-rollout-logprobs."
+        )
+
+    total_lengths = batch["total_lengths"]
+    response_lengths = batch["response_lengths"]
+    max_seq_lens = batch.get("max_seq_lens", None)
+    padded_total_lengths = batch.get("padded_total_lengths", None)
+
+    _, log_probs_and_entropy = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        with_entropy=True,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
+
+    log_probs = torch.cat(log_probs_and_entropy["log_probs"], dim=0)
+    behavior_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
+
+    valid_mask = get_cp_local_valid_mask(
+        total_lengths,
+        response_lengths,
+        batch["loss_masks"],
+        args.qkv_format,
+        max_seq_lens,
+        padded_total_lengths,
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
+    step_context = get_p3o_context(args, log_probs, behavior_log_probs, valid_mask)
+
+    terms = compute_p3o_token_terms(
+        log_probs=log_probs,
+        behavior_log_probs=behavior_log_probs,
+        advantages=advantages,
+        valid_mask=valid_mask,
+        step_context=step_context,
+        kl_mode=getattr(args, "p3o_kl_mode", "proxy"),
+        clip_low=getattr(args, "clip_low", 0.2),
+        clip_high=getattr(args, "clip_high", 0.2),
+    )
+
+    score_loss = sum_of_sample_mean(terms.score_loss)
+    adaptive_kl_loss = sum_of_sample_mean(terms.adaptive_kl_loss)
+    # behavior_kl_proxy: sampled-token k3 proxy (1-ESS), not full-vocabulary KL.
+    # Measures concentration of importance ratios via ESS, not distributional shift.
+    behavior_kl_proxy = sum_of_sample_mean(terms.behavior_kl_proxy)
+    # cap_fraction: fraction of tokens where adaptive cap binds (ratio > ESS).
+    # Different from PPO's clip_fraction which measures fixed-interval clipping.
+    cap_fraction = sum_of_sample_mean(terms.cap_hits)
+    clip_fraction = sum_of_sample_mean(terms.clip_hits)
+
+    entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
+    entropy_loss = sum_of_sample_mean(entropy)
+
+    loss = score_loss + adaptive_kl_loss - args.entropy_coef * entropy_loss
+
+    reference_kl_loss = None
+    reference_kl_metric = loss.detach().new_zeros(())
+    if args.use_kl_loss:
+        # Optional frozen-reference regularization. Orthogonal to the adaptive
+        # behavior KL above and reported under its own key.
+        ref_log_probs = torch.cat(batch["ref_log_probs"], dim=0)
+        reference_kl = compute_approx_kl(log_probs, ref_log_probs, kl_loss_type=args.kl_loss_type)
+        reference_kl_loss = sum_of_sample_mean(reference_kl)
+        reference_kl_metric = reference_kl_loss.clone().detach()
+        loss = loss + args.kl_loss_coef * reference_kl_loss
+
+    if log_probs.numel() == 0:
+        loss += 0 * logits.sum()
+
+    # Global step scalars are reported as scalar * local_valid_tokens so that the
+    # caller's divide-by-global-token-count recovers the scalar itself.
+    local_valid_tokens = valid_mask.sum().to(torch.float32)
+
+    def scaled(value: torch.Tensor) -> torch.Tensor:
+        return (value.to(torch.float32) * local_valid_tokens).clone().detach()
+
+    reported_loss = {
+        "loss": loss.clone().detach(),
+        "pg_loss": score_loss.clone().detach(),
+        "entropy_loss": entropy_loss.clone().detach(),
+        "p3o/score_loss": score_loss.clone().detach(),
+        "p3o/behavior_kl_proxy": behavior_kl_proxy.clone().detach(),
+        "p3o/adaptive_kl_loss": adaptive_kl_loss.clone().detach(),
+        "p3o/reference_kl": reference_kl_metric,
+        "p3o/entropy": entropy_loss.clone().detach(),
+        "p3o/cap_fraction": cap_fraction.clone().detach(),
+        "p3o/clip_fraction": clip_fraction.clone().detach(),
+        "p3o/total_loss": loss.clone().detach(),
+        "p3o/normalized_ess": scaled(step_context.normalized_ess),
+        "p3o/adaptive_cap": scaled(step_context.adaptive_cap),
+        "p3o/ratio_mean": scaled(step_context.ratio_mean),
+        "p3o/ratio_std": scaled(step_context.ratio_std),
+        "p3o/valid_tokens": scaled(step_context.valid_token_count),
+    }
+
+    if reference_kl_loss is not None:
+        reported_loss["kl_loss"] = reference_kl_loss.clone().detach()
+
+    return loss, reported_loss
 
 
 def _get_reinforce_plus_plus_mask_safe_reducer(
@@ -1304,6 +1518,24 @@ def sft_loss_function_chunked(
     return loss, {"loss": loss.clone().detach()}
 
 
+def _select_policy_loss_function(
+    args: Namespace,
+) -> Callable[..., tuple[torch.Tensor, dict[str, torch.Tensor]]]:
+    """Select one policy objective without composing unrelated algorithm
+    families.
+
+    P3O has a dedicated score-function/trust-region objective and therefore
+    bypasses :func:`policy_loss_function`, including its optional
+    :func:`compute_policy_opd_loss` term. The compatibility guard is repeated
+    here so callers that bypass normal argument validation still fail before a
+    hybrid loss can be computed.
+    """
+    validate_p3o_opd_compatibility(args)
+    if getattr(args, "advantage_estimator", None) == "p3o":
+        return p3o_loss_function
+    return policy_loss_function
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1347,16 +1579,26 @@ def loss_function(
     # normalizer is correct even when CP differs across micro-batches (dynamic CP).
     # Under static CP it equals the old full-sample count distributed across ranks,
     # so the final loss/grad/metric are unchanged after all-reduce.
-    num_tokens = get_cp_local_num_tokens(
+    token_count_args = (
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
         args.qkv_format,
         batch.get("max_seq_lens", None),
         batch.get("padded_total_lengths", None),
-        dynamic_cp_size=batch.get("dynamic_cp_size", None),
-        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
+    token_count_kwargs = {
+        "dynamic_cp_size": batch.get("dynamic_cp_size", None),
+        "dynamic_cp_rank": batch.get("dynamic_cp_rank", None),
+    }
+    if getattr(args, "advantage_estimator", None) == "p3o":
+        # P3O's optimizer-step objective is normalized by the exact global count
+        # used for ESS. The generic helper preserves a historical clamp-to-one
+        # for fully masked samples when CP=1, which would create phantom tokens
+        # and make the final loss depend on the CP partition.
+        num_tokens = get_cp_local_valid_mask(*token_count_args, **token_count_kwargs).sum()
+    else:
+        num_tokens = get_cp_local_num_tokens(*token_count_args, **token_count_kwargs)
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
@@ -1373,7 +1615,7 @@ def loss_function(
 
     match args.loss_type:
         case "policy_loss":
-            func = policy_loss_function
+            func = _select_policy_loss_function(args)
         case "value_loss":
             func = value_loss_function
         case "sft":

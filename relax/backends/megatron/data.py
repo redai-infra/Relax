@@ -250,6 +250,46 @@ def pad_and_flatten(
     return torch.cat(padded_list, dim=0), num_items
 
 
+def build_rl_forward_kwargs(args: Namespace, batch: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Build policy-forward inputs shared by training and the P3O stats pass.
+
+    The returned flag identifies layouts that require unsplit tokens, so
+    callers can select the matching dynamic-CP process group around their own
+    forward. Keeping that process-group mutation outside this pure helper
+    preserves each caller's distinct lifetime while keeping the model inputs
+    identical.
+    """
+    is_vl_model = bool(getattr(args, "is_vl_model", False))
+    multimodal_inputs = batch.get("multimodal_train_inputs")
+    needs_unsplit = is_vl_model or multimodal_inputs is not None or getattr(args, "uses_unsplit_forward", False)
+    use_unsplit = needs_unsplit and "unsplit_tokens" in batch
+
+    forward_kwargs = {
+        "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
+        "position_ids": None,
+        "attention_mask": None,
+        "labels": None,
+        "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
+        "loss_mask": batch["full_loss_masks"],
+    }
+
+    # THD VL+CP uses the bridge-specific attention mask and packed layout. The
+    # external RL loss consumes full_loss_masks, so GPTModel must not compute an
+    # internal loss for this bridge path.
+    if needs_unsplit and "vlm_packed_seq_params" in batch:
+        forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
+        forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
+        forward_kwargs["loss_mask"] = None
+
+    # Text-only batches for a VL checkpoint deliberately carry no multimodal
+    # kwargs. Custom multimodal data with is_vl_model=False follows the same
+    # gate in both the stats and gradient passes.
+    if is_vl_model and multimodal_inputs:
+        forward_kwargs.update(multimodal_inputs)
+
+    return forward_kwargs, needs_unsplit
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -701,6 +741,24 @@ class DataIterator:
         """Reset internal offset to the start and return self."""
         self.offset = 0
         return self
+
+    def snapshot_position(self) -> int:
+        """Return the current offset so it can be restored later.
+
+        ``reset()`` rewinds to the start of the whole rollout, which is wrong
+        for replaying a single optimizer window that begins mid-rollout. P3O's
+        ESS pre-pass consumes the window once and must hand the iterator back
+        exactly where it found it.
+        """
+        return self.offset
+
+    def restore_position(self, position: int) -> None:
+        """Restore an offset previously returned by :meth:`snapshot_position`.
+
+        Works for both the fixed micro-batch-size and the explicit
+        ``micro_batch_indices`` schedule, including non-zero start offsets.
+        """
+        self.offset = position
 
 
 def get_data_iterator(

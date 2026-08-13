@@ -204,11 +204,43 @@ SAPO_ARGS=(
 
 ---
 
+## P3O
+
+P3O 使用 rollout 中记录的已选 token 行为策略 log-probability 校正
+rollout-policy mismatch。它由重要性比率计算有效样本量
+（ESS），并将 detach 后的 ESS 用作单侧自适应策略更新上限。
+
+P3O 与 `--use-opd` 互斥：把 P3O 目标与 OPD teacher loss 或 OPD advantage
+replacement 组合会形成未经验证的混合目标。
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--advantage-estimator p3o` | — | 启用 P3O |
+| `--use-rollout-logprobs` | 必需 | 使用 rollout 行为策略 log-probability 计算重要性比率 |
+| `--calculate-per-token-loss` | 必需 | 保持 P3O 的 token-sum 归一化 |
+| `--p3o-ess-scope` | `micro-batch` | 每个 micro-batch 计算自适应上限；`step` 用于 replay 验证 |
+| `--p3o-kl-mode` | `proxy` | 行为 KL 近似：`proxy` 或 `proxy_safe` |
+| `--clip-low`、`--clip-high` | `0.2` | P3O clip-fraction 监控边距 |
+
+全词表 `exact` KL 计算是纯验证辅助函数，并非生产命令行模式：rollout 记录的是
+已选 token 的行为策略 log-probability，而非完整行为 logits。
+
+### 配置示例
+
+A100×4 配置会以相同的 on-policy、周期同步和温度失配场景成对比较 P3O 与 GRPO。
+请从 `examples/algorithms/p3o/README_zh.md` 开始；一轮 rollout 的冒烟检查使用
+`examples/algorithms/p3o/run_p3o_smoke.sh`。
+
+---
+
 ## 算法对比
 
 | 算法 | Advantage 计算 | 策略损失 | KL 约束方式 |
 |------|---------------|---------|-----------|
 | **PPO** | Critic value + GAE | PPO-Clip（硬裁剪） | 当前同步拓扑中禁用 |
+| **P3O** | Rollout 行为策略 log-probability + ESS | detach 的单侧自适应上限 | 已选 token 行为 KL proxy |
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
 | **REINFORCE++** | Token KL-to-go return + 全局 token 归一化 | PPO-Clip（硬裁剪） | shaped reward 中的 k1 KL |
 | **REINFORCE++-baseline** | Inclusive group mean + 全局 token 归一化 | PPO-Clip（硬裁剪） | 独立 k2 KL loss |
@@ -221,5 +253,6 @@ SAPO_ARGS=(
 - [PPO 训练](../guide/ppo-training.md)
 - [REINFORCE++ 训练](../guide/reinforce-plus-plus.md)
 - [快速开始](../guide/quick-start.md)
+- `examples/algorithms/p3o/README_zh.md`
 - [在线策略蒸馏](./on-policy-distillation.md)
 - [生成式奖励模型](./generative-reward-model.md)
