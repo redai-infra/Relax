@@ -145,42 +145,55 @@ class Controller:
 
         # Initialize data management system
         self._initialize_data_system()
-        self.dcs, self.config.coordinator_url = create_dcs_deployment()
-
-        self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
-        if self._metrics_service_enabled:
-            self._deploy_metrics_service()
-
-        if self.config.use_agentic_rollout and not self.config.debug_train_only:
-            deploy_agentic_chat_api_services(
-                config=self.config,
-                runtime_env=self.runtime_env,
-            )
-        self._autoscaler_config = None
         try:
-            self.register_all_serve()
-        except Exception as e:
-            self._report_error_to_metrics_service(e)
+            self.dcs, self.config.coordinator_url = create_dcs_deployment()
+
+            self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
+            if self._metrics_service_enabled:
+                self._deploy_metrics_service()
+
+            if self.config.use_agentic_rollout and not self.config.debug_train_only:
+                deploy_agentic_chat_api_services(
+                    config=self.config,
+                    runtime_env=self.runtime_env,
+                )
+            self._autoscaler_config = None
+            try:
+                self.register_all_serve()
+            except Exception as e:
+                self._report_error_to_metrics_service(e)
+                raise
+
+            autoscaler_config_path = getattr(config, "autoscaler_config", None)
+            if autoscaler_config_path:
+                from relax.utils.autoscaler.config import AutoscalerConfig
+                from relax.utils.utils import get_serve_url
+
+                rollout_service_url = get_serve_url("/rollout")
+                self._autoscaler_config = AutoscalerConfig.from_yaml(autoscaler_config_path, rollout_service_url)
+                self._deploy_autoscaler_service()
+
+            # Start health management with service restart callback
+            if self._health_check_enabled:
+                self._health_manager.start(
+                    on_unhealthy=self._on_service_unhealthy,
+                    on_fatal=self._on_service_fatal,
+                )
+                logger.info("Global health check system enabled")
+            else:
+                logger.info("Global health check system disabled (use --use-health-check to enable)")
+        except Exception:
+            # Past this point a failed construction means Controller() never
+            # returns: train.main() cannot install its signal/atexit cleanup,
+            # so the TQ owner (and any TransferQueueController it owns) would
+            # be orphaned and the next launch would attach with owner=None,
+            # making its shutdown a no-op. Close what this job created.
+            logger.error("Controller construction failed after TQ initialization; closing TQ owner.")
+            try:
+                self._close_data_system()
+            except Exception as cleanup_error:  # pragma: no cover - best effort
+                logger.warning(f"TQ owner cleanup during failed construction failed: {cleanup_error}")
             raise
-
-        autoscaler_config_path = getattr(config, "autoscaler_config", None)
-        if autoscaler_config_path:
-            from relax.utils.autoscaler.config import AutoscalerConfig
-            from relax.utils.utils import get_serve_url
-
-            rollout_service_url = get_serve_url("/rollout")
-            self._autoscaler_config = AutoscalerConfig.from_yaml(autoscaler_config_path, rollout_service_url)
-            self._deploy_autoscaler_service()
-
-        # Start health management with service restart callback
-        if self._health_check_enabled:
-            self._health_manager.start(
-                on_unhealthy=self._on_service_unhealthy,
-                on_fatal=self._on_service_fatal,
-            )
-            logger.info("Global health check system enabled")
-        else:
-            logger.info("Global health check system disabled (use --use-health-check to enable)")
 
     def _cleanup_s3_model_weights_after_init(self) -> None:
         """Remove policy weight shards after every startup consumer is

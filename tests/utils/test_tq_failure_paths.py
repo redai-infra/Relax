@@ -268,6 +268,41 @@ class TestCloseTqAndUnmount:
 
 
 # ---------------------------------------------------------------------------
+# Worker detach (attach-only inverse used by every worker teardown hook)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerDetach:
+    """detach_tq_client and the teardown hooks that must invoke it."""
+
+    def test_detach_delegates_to_local_close(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(tq_lifecycle, "_close_local_tq_client", lambda: calls.append(True))
+        tq_lifecycle.detach_tq_client()
+        assert calls == [True]
+
+    def test_component_del_detaches_attached_client(self, monkeypatch):
+        from relax.components.base import Base
+
+        calls = []
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
+        component = Base()
+        component.data_system_client = object()
+        component.__del__()
+        assert calls == [True]
+        component.data_system_client = None  # keep GC-time __del__ a no-op
+
+    def test_component_del_without_client_is_noop(self, monkeypatch):
+        from relax.components.base import Base
+
+        calls = []
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
+        component = Base()
+        component.__del__()
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # GDR requested-vs-runtime status
 # ---------------------------------------------------------------------------
 

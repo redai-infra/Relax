@@ -285,6 +285,21 @@ def attach_tq_client(conf: Any, *, requested_gdr: bool, role: str) -> Any:
     return client
 
 
+def detach_tq_client() -> None:
+    """Detach this worker's TQ client (attach-only inverse of
+    :func:`attach_tq_client`).
+
+    Closes the attached Mooncake storage client so its segment deregisters
+    from the master immediately instead of lingering until ``client_ttl``
+    expires — a stale endpoint breaks fast restarts with "Failed to open
+    segment".  Only process-local handles are touched (never the named
+    controller or globally stored data), so every worker teardown hook may
+    call this unconditionally; force-killed workers still fall back to the
+    master-side TTL.
+    """
+    _close_local_tq_client()
+
+
 def close_tq_and_unmount(*, is_owner: bool) -> None:
     """Close TransferQueue and unmount the MooncakeStore segment.
 

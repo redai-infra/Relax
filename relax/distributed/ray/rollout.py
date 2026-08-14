@@ -51,7 +51,7 @@ from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
-from relax.utils.tq_lifecycle import attach_tq_client
+from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -920,6 +920,9 @@ class RolloutManager(ReloadableMixin):
         for monitor in self._health_monitors:
             monitor.stop()
         self._shutdown_all_engines()
+        # Deregister this worker's Mooncake segment before the actor dies so a
+        # fast restart does not hit stale endpoints until client_ttl expires.
+        detach_tq_client()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
