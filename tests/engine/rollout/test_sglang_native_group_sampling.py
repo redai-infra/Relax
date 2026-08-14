@@ -16,6 +16,7 @@ try:
     from sglang.srt.managers.io_struct import GenerateReqInput
 
     from relax.engine.rollout import sglang_rollout
+    from relax.engine.rollout.request_permit import GenerationAborted
     from relax.engine.rollout.sglang_rollout import (
         _generate_native_group,
         _holding_session_lock,
@@ -194,6 +195,7 @@ def test_qwen3_vl_launcher_couples_native_sampling_with_group_rm_and_balanced_ro
         {"use_rollout_routing_replay": True},
         {"lora_rank": 1, "lora_adapter_mode": True},
         {"sglang_enable_deterministic_inference": True},
+        {"sglang_speculative_algorithm": "EAGLE"},
         {"custom_generate_function_path": "custom.generate"},
     ],
 )
@@ -368,3 +370,156 @@ async def test_generate_native_group_rejects_wrong_response_cardinality(monkeypa
 
     assert not state.semaphore.locked()
     assert _holding_session_lock.get() is False
+
+
+async def test_generate_native_group_abort_before_post_keeps_group_native_eligible(monkeypatch) -> None:
+    state = _NativeState(aborted=True)
+    args = _native_args()
+    group = [Sample(prompt="same") for _ in range(2)]
+
+    async def unexpected_post(url, payload, headers=None):
+        raise AssertionError("aborted group must not issue a request")
+
+    monkeypatch.setattr(sglang_rollout, "post", unexpected_post)
+
+    result = await _generate_native_group(args, state, group, {"max_new_tokens": 32})
+
+    for sample in result:
+        assert sample.status == Sample.Status.ABORTED
+        assert sample.tokens == []
+        assert sample.rollout_tokens == []
+        assert sample.multimodal_train_inputs is None
+    assert _native_group_sampling_eligible(args, result, evaluation=False)
+
+
+async def test_generate_native_group_reverts_group_when_request_is_aborted(monkeypatch) -> None:
+    state = _NativeState()
+    args = _native_args()
+    group = [Sample(prompt="same") for _ in range(2)]
+
+    async def aborted_post(url, payload, headers=None):
+        raise GenerationAborted("router draining")
+
+    monkeypatch.setattr(sglang_rollout, "post", aborted_post)
+
+    result = await _generate_native_group(args, state, group, {"max_new_tokens": 32})
+
+    assert not state.semaphore.locked()
+    assert _holding_session_lock.get() is False
+    for sample in result:
+        assert sample.status == Sample.Status.ABORTED
+        assert sample.tokens == []
+        assert sample.rollout_tokens == []
+    assert _native_group_sampling_eligible(args, result, evaluation=False)
+
+
+async def test_generate_native_group_maps_mid_flight_abort_outputs(monkeypatch) -> None:
+    state = _NativeState()
+    args = _native_args()
+    group = [Sample(prompt="same") for _ in range(2)]
+
+    async def fake_post(url, payload, headers=None):
+        return [
+            _response(101, "partial-a", finish_reason="abort"),
+            _response(102, "partial-b", finish_reason="abort"),
+        ]
+
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+
+    result = await _generate_native_group(args, state, group, {"max_new_tokens": 32})
+
+    for index, sample in enumerate(result):
+        assert sample.status == Sample.Status.ABORTED
+        assert sample.tokens == [11, 12, 101 + index]
+        assert sample.response == ("partial-a", "partial-b")[index]
+    # Partially generated samples keep their tokens and must retry per-sample.
+    assert not _native_group_sampling_eligible(args, result, evaluation=False)
+
+
+async def test_generate_and_rm_group_strips_pre_encoded_media_on_success(monkeypatch) -> None:
+    state = _NativeState(processor=object())
+    args = _native_args()
+    shared_media = {"images": [object()], "videos": [], "audio": []}
+    group = [Sample(prompt="same", multimodal_inputs=shared_media) for _ in range(2)]
+    calls = {"encode": 0}
+
+    async def fake_processor(state_arg, args_arg, prompt, multimodal_inputs):
+        return [21, 22], {"pixel_values": object()}, 0.25
+
+    async def fake_encode(multimodal_inputs):
+        calls["encode"] += 1
+        return {"image_data": ["encoded"]}, 0.5
+
+    async def fake_post(url, payload, headers=None):
+        assert payload["image_data"] == [["encoded"]]
+        return [_response(101, "a"), _response(102, "b")]
+
+    async def fake_rm(args_arg, group_arg):
+        return [1.0] * len(group_arg)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_run_image_processor", fake_processor)
+    monkeypatch.setattr(sglang_rollout, "_encode_multimodal_inputs", fake_encode)
+    monkeypatch.setattr(sglang_rollout, "post", fake_post)
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_rm)
+
+    result = await sglang_rollout.generate_and_rm_group(args, group, {"max_new_tokens": 32})
+
+    assert calls["encode"] == 1
+    for sample in result:
+        assert sample.reward == 1.0
+        assert not hasattr(sample, "_pre_encoded_mm")
+        assert not hasattr(sample, "_pre_encoded_mm_elapsed")
+        assert "_pre_encoded_mm" not in sample.to_dict()
+
+
+async def test_generate_and_rm_group_strips_pre_encoded_media_when_fallback_fails(monkeypatch) -> None:
+    state = _NativeState()
+    args = _native_args(sglang_native_group_sampling=False)
+    shared_media = {"images": [object()], "videos": [], "audio": []}
+    group = [Sample(prompt="same", multimodal_inputs=shared_media)]
+
+    async def fake_encode(multimodal_inputs):
+        return {"image_data": ["encoded"]}, 0.5
+
+    async def failing_generate_and_rm(args_arg, sample, sampling_params, evaluation=False):
+        raise RuntimeError("worker exploded")
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_encode_multimodal_inputs", fake_encode)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", failing_generate_and_rm)
+
+    with pytest.raises(RuntimeError, match="worker exploded"):
+        await sglang_rollout.generate_and_rm_group(args, group, {"max_new_tokens": 32})
+
+    for sample in group:
+        assert not hasattr(sample, "_pre_encoded_mm")
+        assert not hasattr(sample, "_pre_encoded_mm_elapsed")
+
+
+async def test_generate_and_rm_group_warns_once_for_ineligible_groups(monkeypatch) -> None:
+    state = _NativeState()
+    args = _native_args(partial_rollout=True)
+    calls = {"generate": 0}
+    warnings = []
+
+    async def fake_generate_and_rm(args_arg, sample, sampling_params, evaluation=False):
+        calls["generate"] += 1
+        return sample
+
+    async def fake_rm(args_arg, group_arg):
+        return [0.0] * len(group_arg)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_rm)
+    monkeypatch.setattr(sglang_rollout, "_NATIVE_GROUP_SAMPLING_LOGGED", set())
+    monkeypatch.setattr(sglang_rollout.logger, "warning", lambda message, *a, **k: warnings.append(message))
+
+    for _ in range(2):
+        group = [Sample(prompt="same"), Sample(prompt="same")]
+        await sglang_rollout.generate_and_rm_group(args, group, {"max_new_tokens": 32})
+
+    assert calls["generate"] == 4
+    assert len(warnings) == 1
+    assert "ineligible" in warnings[0]

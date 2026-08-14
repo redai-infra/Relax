@@ -99,6 +99,11 @@ def _native_group_sampling_eligible(args: Namespace, group: list[Sample], evalua
         return False
     if getattr(args, "sglang_enable_deterministic_inference", False):
         return False
+    # Speculative decoding: SGLang serves n>1 by internally duplicating the
+    # request, and the draft/verify path is not validated with parallel
+    # sampling here, so keep the well-tested per-sample fanout.
+    if getattr(args, "sglang_speculative_algorithm", None):
+        return False
     if getattr(args, "custom_generate_function_path", None) is not None:
         return False
     if any(getattr(sample, "generate_function_path", None) is not None for sample in group):
@@ -113,6 +118,17 @@ def _native_group_sampling_eligible(args: Namespace, group: list[Sample], evalua
     if any(sample.loss_mask is not None for sample in group):
         return False
     return all(sample.status in (Sample.Status.PENDING, Sample.Status.ABORTED) for sample in group)
+
+
+_NATIVE_GROUP_SAMPLING_LOGGED: set[str] = set()
+
+
+def _log_native_group_sampling_once(key: str, message: str, warn: bool = False) -> None:
+    """Log the native-path activation/fallback decision once per process."""
+    if key in _NATIVE_GROUP_SAMPLING_LOGGED:
+        return
+    _NATIVE_GROUP_SAMPLING_LOGGED.add(key)
+    (logger.warning if warn else logger.info)(message)
 
 
 # Misuse guard for the per-request permit contract. Set while the session-level
@@ -607,6 +623,17 @@ async def _generate_native_group(
         sample.tokens = list(processor_prompt_ids)
         sample.rollout_tokens = list(tokenizer_prompt_ids)
 
+    def _revert_to_fresh_group() -> None:
+        # Nothing was generated: restore the pre-call state (empty tokens, no
+        # train inputs) so the aborted group still passes
+        # _native_group_sampling_eligible when it is retried, instead of
+        # silently degrading to the per-sample fallback.
+        for sample in group:
+            sample.tokens = []
+            sample.rollout_tokens = []
+            sample.multimodal_train_inputs = None
+            sample.status = Sample.Status.ABORTED
+
     headers = None
     if args.sglang_router_policy == "consistent_hashing" and first.session_id:
         headers = {"X-SMG-Routing-Key": first.session_id}
@@ -615,12 +642,15 @@ async def _generate_native_group(
 
     request_start = monotonic()
     try:
+        # NOTE: one session permit covers the whole group here, while the
+        # per-sample path holds one permit per in-flight sample. With the same
+        # --sglang-server-concurrency the native path therefore admits up to
+        # len(group) times more concurrent decode streams.
         async with state.semaphore:
             token = _holding_session_lock.set(True)
             try:
                 if state.aborted:
-                    for sample in group:
-                        sample.status = Sample.Status.ABORTED
+                    _revert_to_fresh_group()
                     return group
                 with state.dp_rank_context() as _:
                     output = await post(
@@ -631,8 +661,7 @@ async def _generate_native_group(
             finally:
                 _holding_session_lock.reset(token)
     except GenerationAborted:
-        for sample in group:
-            sample.status = Sample.Status.ABORTED
+        _revert_to_fresh_group()
         return group
     request_time = monotonic() - request_start
 
@@ -640,23 +669,17 @@ async def _generate_native_group(
     for sample, sample_output in zip(group, outputs, strict=True):
         post_start = monotonic()
         _apply_sglang_output_tokens(args, state, sample, sample_output, evaluation=False)
-        if "routed_experts" in sample_output["meta_info"]:
-            sample.rollout_routed_experts = np.frombuffer(
-                pybase64.b64decode(sample_output["meta_info"]["routed_experts"].encode("ascii")),
-                dtype=np.int32,
-            ).reshape(len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
         sample.update_from_meta_info(args, sample_output["meta_info"])
+        # NOTE: "generate", "image_processor" and "mm_encode" are shared by the
+        # whole group but recorded on every sample, so perf_detail sums count
+        # each shared phase len(group) times; compare against the per-sample
+        # baseline accordingly.
         sample.metadata["_timing"] = {
             "generate": request_time,
             "post_generate": monotonic() - post_start,
             **({"image_processor": image_processor_time} if image_processor_time else {}),
             **({"mm_encode": mm_encode_time} if mm_encode_time else {}),
         }
-
-    for sample in group:
-        for attr in ("_pre_encoded_mm", "_pre_encoded_mm_elapsed"):
-            if hasattr(sample, attr):
-                delattr(sample, attr)
     return group
 
 
@@ -826,20 +849,40 @@ async def generate_and_rm_group(
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
-    if _native_group_sampling_eligible(args, group, evaluation):
-        group = await _generate_native_group(args, state, group, sampling_params)
-    else:
-        tasks = []
-        for idx, sample in enumerate(group):
-            current_sampling_params = sampling_params.copy()
-            if getattr(args, "sglang_enable_deterministic_inference", False):
-                seed = state.group_sampling_seeds[idx]
-                current_sampling_params["sampling_seed"] = seed
-            tasks.append(
-                asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+    try:
+        if _native_group_sampling_eligible(args, group, evaluation):
+            _log_native_group_sampling_once(
+                "active",
+                f"Native group sampling active: one n={len(group)} request per prompt group.",
             )
+            group = await _generate_native_group(args, state, group, sampling_params)
+        else:
+            if getattr(args, "sglang_native_group_sampling", False) and not evaluation:
+                _log_native_group_sampling_once(
+                    "fallback",
+                    "Native group sampling is enabled but this group is ineligible; using the "
+                    "per-sample fallback (see _native_group_sampling_eligible for the gating).",
+                    warn=True,
+                )
+            tasks = []
+            for idx, sample in enumerate(group):
+                current_sampling_params = sampling_params.copy()
+                if getattr(args, "sglang_enable_deterministic_inference", False):
+                    seed = state.group_sampling_seeds[idx]
+                    current_sampling_params["sampling_seed"] = seed
+                tasks.append(
+                    asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+                )
 
-        group = await asyncio.gather(*tasks)
+            group = await asyncio.gather(*tasks)
+    finally:
+        # The pre-encoded blobs are only a hint for generate(); drop them so the
+        # base64 payloads can never leak into Sample.to_dict() (data buffer /
+        # transfer queue) via __dict__, on success, abort and error paths alike.
+        for sample in group:
+            for attr in ("_pre_encoded_mm", "_pre_encoded_mm_elapsed"):
+                if hasattr(sample, attr):
+                    delattr(sample, attr)
 
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm:
