@@ -54,6 +54,27 @@ def resolve_mooncake_master_address() -> str:
     return address
 
 
+def resolve_global_segment_size() -> int:
+    """Per-client Mooncake segment size in bytes.
+
+    Defaults to 4 GiB (TQ config.yaml:52).  Deployments whose worst-case in-
+    flight payload exceeds that (see :func:`estimate_payload_bytes`) set
+    ``RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB`` instead of editing code; capacity
+    validation and the client config read the same value so the check can never
+    pass a size the client does not actually mount.
+    """
+    raw = os.environ.get("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "").strip()
+    if not raw:
+        return _DEFAULT_GLOBAL_SEGMENT_SIZE
+    try:
+        gib = float(raw)
+    except ValueError as error:
+        raise RuntimeError(f"RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB={raw!r} must be a positive number of GiB") from error
+    if gib <= 0:
+        raise RuntimeError(f"RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB={raw!r} must be a positive number of GiB")
+    return int(gib * 1024**3)
+
+
 def validate_mooncake_runtime_contract() -> None:
     """Install and validate the Mooncake loss-prevention contract.
 
@@ -114,8 +135,10 @@ def build_mooncake_config(
         ``MC_MASTER_ADDRESS`` env var (see
         :func:`resolve_mooncake_master_address`).
     global_segment_size
-        Override the per-client segment size (default 4 GiB).  Benchmarks may
-        pass a larger value (e.g. 8 GiB) to avoid staging-buffer pressure.
+        Override the per-client segment size.  ``None`` resolves from
+        ``RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB`` (default 4 GiB, see
+        :func:`resolve_global_segment_size`).  Benchmarks may pass a larger
+        value (e.g. 8 GiB) to avoid staging-buffer pressure.
     """
     if master_address is None:
         master_address = resolve_mooncake_master_address()
@@ -136,7 +159,7 @@ def build_mooncake_config(
             "metadata_server": _DEFAULT_METADATA_SERVER,
             "local_hostname": "",  # empty = auto-detect via Ray node IP
             # Memory
-            "global_segment_size": global_segment_size or _DEFAULT_GLOBAL_SEGMENT_SIZE,
+            "global_segment_size": global_segment_size or resolve_global_segment_size(),
             "local_buffer_size": _DEFAULT_LOCAL_BUFFER_SIZE,
             # Do NOT silently evict produced-but-unconsumed data.
             "hard_pin": True,
@@ -153,19 +176,38 @@ def build_mooncake_config(
 # ---------------------------------------------------------------------------
 
 
-def estimate_payload_bytes(args: Any) -> int:
-    """Rough estimate of per-step multimodal payload size in bytes.
+# Worst-case payload factors used by the segment-capacity pre-check.
+# Vision: a ViT-style processor (Qwen-VL family: patch 14x14, spatial merge
+# 2x2) maps one schedulable token to at most (14*2)^2 = 784 pixels, and
+# ``pixel_values`` is float32 RGB, so vision bytes <= seq_length * 784 * 12.
+_PIXELS_PER_VISION_TOKEN = 28 * 28
+_BYTES_PER_PIXEL_VALUE = 3 * 4
+# Text: token ids, logprobs, masks and rewards; 32 B/token rounds them up.
+_TEXT_BYTES_PER_TOKEN = 32
 
-    Used only for segment-capacity pre-check.  The real payload depends on
-    image resolution and patch count; this is a conservative lower bound based
-    on ``--multimodal-keys`` presence and ``n_samples_per_prompt``.
+
+def estimate_payload_bytes(args: Any) -> int:
+    """Worst-case per-step payload upper bound in bytes.
+
+    Derived from the token budget instead of a fixed per-sample constant: the
+    processor cannot emit more vision tokens than ``--seq-length`` allows, so
+    the pixel payload of one sample is bounded by
+    ``seq_length * _PIXELS_PER_VISION_TOKEN * _BYTES_PER_PIXEL_VALUE``
+    (e.g. 77 MiB at seq_length=8192) rather than the old 8 MiB guess that
+    passed configurations which later failed puts mid-training.
     """
     n_samples = args.n_samples_per_prompt
     rollout_batch = args.rollout_batch_size
-    # Conservative: 8 MiB per sample when multimodal is enabled (real range
-    # 7.4 MiB for a 400-token image to hundreds of MiB at max token budget).
-    per_sample_mb = 8 if getattr(args, "multimodal_keys", None) is not None else 0
-    return rollout_batch * n_samples * per_sample_mb * 1024 * 1024
+    seq_length = int(getattr(args, "seq_length", 0) or 0)
+    if seq_length <= 0:
+        raise RuntimeError(
+            "MooncakeStore segment-capacity validation needs args.seq_length to bound "
+            "the per-sample payload; got a missing or non-positive value."
+        )
+    per_sample = seq_length * _TEXT_BYTES_PER_TOKEN
+    if getattr(args, "multimodal_keys", None) is not None:
+        per_sample += seq_length * _PIXELS_PER_VISION_TOKEN * _BYTES_PER_PIXEL_VALUE
+    return rollout_batch * n_samples * per_sample
 
 
 def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | None:
@@ -182,15 +224,15 @@ def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | No
     max_staleness = getattr(args, "max_staleness", 0)
     payload = estimate_payload_bytes(args)
     needed = payload * (max_staleness + 1)
-    available = _DEFAULT_GLOBAL_SEGMENT_SIZE
+    available = resolve_global_segment_size()
 
     if needed > available:
         return (
-            f"MooncakeStore segment capacity insufficient: estimated in-flight payload "
+            f"MooncakeStore segment capacity insufficient: worst-case in-flight payload "
             f"{needed / 1024**3:.1f} GiB (rollout_batch={args.rollout_batch_size} × "
             f"n_samples={args.n_samples_per_prompt} × staleness+1={max_staleness + 1}) "
             f"exceeds global_segment_size {available / 1024**3:.1f} GiB. "
-            f"Reduce batch size, increase global_segment_size, or reduce max_staleness."
+            f"Reduce batch size / max_staleness, or raise RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB."
         )
     return None
 

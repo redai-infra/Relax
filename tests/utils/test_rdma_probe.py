@@ -81,6 +81,7 @@ def _make_args(**kwargs) -> argparse.Namespace:
         n_samples_per_prompt=1,
         rollout_batch_size=32,
         multimodal_keys=None,
+        seq_length=8192,
     )
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -556,6 +557,49 @@ class TestTqConfigBuilder:
         assert err is not None
         assert "insufficient" in err.lower()
 
-    def test_estimate_payload_text_only_is_zero(self):
+    def test_estimate_payload_text_only_is_small_but_nonzero(self):
+        # Text payloads (ids/logprobs/masks) flow through the store too; the
+        # bound is seq_length * 32 B per sample.
         args = _make_args(multimodal_keys=None)
-        assert estimate_payload_bytes(args) == 0
+        assert estimate_payload_bytes(args) == 32 * 1 * 8192 * 32
+
+    def test_estimate_payload_multimodal_is_token_budget_bound(self):
+        # One sample may not exceed seq_length vision tokens; at 784 pixels
+        # per token and 12 B per pixel that is ~77 MiB for seq_length=8192.
+        args = _make_args(multimodal_keys=["pixel_values"], rollout_batch_size=1, n_samples_per_prompt=1)
+        per_sample = estimate_payload_bytes(args)
+        assert per_sample == 8192 * (32 + 784 * 12)
+        assert 70 * 1024**2 < per_sample < 80 * 1024**2
+
+    def test_estimate_payload_requires_seq_length(self):
+        args = _make_args(seq_length=None)
+        with pytest.raises(RuntimeError, match="seq_length"):
+            estimate_payload_bytes(args)
+
+    def test_segment_capacity_multimodal_staleness_no_longer_passes(self):
+        # Review (Codex P1): 32 in-flight samples x ~77 MiB x (staleness+1)=2
+        # needs ~4.9 GiB and previously passed the 8 MiB/sample guess.
+        args = _make_args(
+            multimodal_keys=["pixel_values"], rollout_batch_size=32, n_samples_per_prompt=1, max_staleness=1
+        )
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        err = validate_segment_capacity(args, eff)
+        assert err is not None and "RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB" in err
+
+    def test_segment_capacity_env_override_raises_the_ceiling(self, monkeypatch):
+        args = _make_args(
+            multimodal_keys=["pixel_values"], rollout_batch_size=32, n_samples_per_prompt=1, max_staleness=1
+        )
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "8")
+        assert validate_segment_capacity(args, eff) is None
+
+    def test_segment_size_env_override_rejects_garbage(self, monkeypatch):
+        from relax.utils.tq_config import resolve_global_segment_size
+
+        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "four")
+        with pytest.raises(RuntimeError, match="RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB"):
+            resolve_global_segment_size()
+        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "-1")
+        with pytest.raises(RuntimeError, match="positive"):
+            resolve_global_segment_size()
