@@ -158,6 +158,31 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 
 若本次开发环境没有两个 RDMA 节点，交付结论必须写成“真机验收未执行”，不能用 mock 通过推导真机已经通过。
 
+### 双节点实测记录（2026-08，2 节点 × 8 GPU，mooncake 0.3.10.post2）
+
+同一拓扑下三配置全矩阵：每档 1 轮预热 + 5 轮测量，`--require-wire-proof`，全部 36 个测量点逐字节 SHA-256 PASS。C1 数值为 `MC_STORE_MEMCPY=0` 守卫生效后的诚实基线（守卫前的 TCP 读数混入了损坏路径，见排障表）。get 均值（GB/s）：
+
+| profile | 档位 | C0 Simple | C1 Mooncake/TCP | C2 Mooncake/RDMA | C2/C1 |
+|---|---|---|---|---|---|
+| synthetic | 256M | 2.26 | 0.93 | 2.12 | 2.3× |
+| synthetic | 1G | 1.25 | 0.93 | 2.25 | 2.4× |
+| synthetic | 2G | 1.32 | 0.91 | 2.36 | 2.6× |
+| synthetic | 4G | 1.33 | 0.93 | 4.61 | 5.0× |
+| multimodal | 256M | 1.73 | 0.78 | 1.61 | 2.1× |
+| multimodal | 1G | 1.40 | 0.82 | 2.26 | 2.8× |
+| multimodal | 2G | 1.49 | 0.86¹ | 2.51 | 2.9× |
+| multimodal | 4G | 1.35 | 0.90¹ | 2.60 | 2.9× |
+| real-multimodal | 256M | 1.93 | 1.10 | 2.83 | 2.6× |
+| real-multimodal | 1G | 2.57 | 1.10 | 3.11 | 2.8× |
+| real-multimodal | 2G | 3.21 | 1.03 | 2.91 | 2.8× |
+| real-multimodal | 4G | 1.98 | 1.00 | 8.36 | 8.4× |
+
+- put 均值区间：C2 4.1–12.9 GB/s，C1 1.5–2.6 GB/s，C0 1.4–2.5 GB/s（写侧收益显著，与“已知限制”第一条一致）。
+- wire-proof：C2 各档对端 IB counter 增量 ≈ 载荷字节且 bond0 ≈ 0；C1/C0 反之，两类证明全部 PASS。
+- C2 在 4G 档吞吐跃升（synthetic 4.61、real-multimodal 8.36）：大批量摊薄了每 key 的 MR 注册开销。
+- 轮间波动：5 轮 std 绝大多数 ≤ 0.2 GB/s；C0 的 real-multimodal 256M/1G 档偶发波动（std 1.01/0.64）。
+- ¹ C1 multimodal 2G/4G 于重启 master 后的会话补测（长时间会话反复异常退出后 master 出现批量 `-800`，见排障表）；同会话其余档位与其他配置未受影响。
+
 ## 排障表
 
 | 现象 | 可能原因 | 处理 |
@@ -167,7 +192,9 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 | `setup failed with error code: -1` | master 不可达 | 检查 master 进程与 `MC_MASTER_ADDRESS` |
 | `Failed to open segment ... Connection refused` | 上一轮客户端异常退出，死 segment 仍在 master 注册 | 等 `client_ttl`（30 s）过期后重试 |
 | `batch_get_into failed ... error codes [-800, ...]` | 会话内切换协议（0.3.10 上更敏感），或对端不可达 | 每个协议单独进程跑；确认对端存活 |
-| bench 的 Mooncake/TCP 档在单机回环下原生 SIGSEGV | mooncake 0.3.10 TCP transport 在单节点回环、64 MiB 级批量下崩溃（同机 direct-client 小批量正常，RDMA/SimpleStorage 同规模正常；响亮崩溃，非静默损坏） | C1 档在真实双节点拓扑上跑；单机开发环境用 simple/rdma 档验证 |
+| TCP 档 get 回来的行“尾部全零”但所有批量码报成功（逐字节校验 FAIL） | mooncake 0.3.10 在 TCP-only 环境自动启用 `MC_STORE_MEMCPY` 快拷贝路径（`transfer_task.cpp` "auto-detected: TCP-only environment, memcpy enabled"），该路径跨节点静默截断：双节点取证探针中约半数全新会话的首次传输命中，坏行自 64 KiB 对齐偏移起全零，且不限于首传（金丝雀小传输不能完全预防）；`MC_STORE_MEMCPY=0` 下 12/12 会话干净 | 已修复：`ensure_mooncake_correctness_guards` 默认 `MC_STORE_MEMCPY=0`（RDMA 会话本就自动禁用 memcpy，无影响；运维可显式设 `MC_STORE_MEMCPY=1` 覆盖）。守卫后的 C1 吞吐是诚实基线，此前更高的 TCP 读数混入了未走网络的损坏路径 |
+| bench 的 Mooncake/TCP 档在单机回环下原生 SIGSEGV | 与上一行同源：memcpy 快拷贝路径在单机回环、64 MiB 级批量下由静默损坏变为响亮崩溃 | 同上，`MC_STORE_MEMCPY=0` 守卫后已实测消除（回环 multimodal 256M 档干净跑完且逐字节 PASS） |
+| 长时间反复起停会话后 `batch_upsert_from ... error codes [-800, ...]`，重试 3 次全败（响亮失败，非静默） | master 长期吸收异常退出的客户端后状态劣化（实测同一 master 连续两个全新会话在同一档位复现，master metrics 仍报 serving） | 重启 mooncake master 后同档位全过；长跑验收前先起新 master |
 | 多网卡机器跨节点建连失败 | 自动选卡选到了不通的网卡 | 显式 `--tq-rdma-device`；必要时用 `MC_TCP_BIND_ADDRESS` 指定 TCP 侧绑定地址 |
 | 训练卡在启动、无日志推进 | 半初始化的 controller（TQ 的 `_init_from_existing` 会无限轮询 config） | 本特性已加自动回收；若仍出现，确认 `[dataplane] ... reaping it` 是否打出 |
 
@@ -195,5 +222,6 @@ RDMA 生效时前者按 payload 增长、后者基本不动；反之则说明落
 
 - 写侧（put）收益明显，读侧（get）收益有限：get 每次调用都会注册/注销 MR，且 key 粒度是 `样本 × 字段`，碎片化开销盖过了传输收益。MR 常驻注册与读路径零拷贝成型不在首期范围。
 - 跨节点 RDMA vs TCP 的收益在多轮之间波动较大，验收结论应基于多轮分布而非单轮数据。
+- Mooncake/TCP（C1）在 0.3.10 上必须依赖 `MC_STORE_MEMCPY=0` 守卫才能保证字节正确（见排障表）；守卫后 C1 get 吞吐低于 SimpleStorage（C0），TCP 档只作为 RDMA 不可用时的正确性兜底而非性能选项。
 - 消费端节点在 get 过程中中途死亡的端到端行为需要双节点真机验证，未做成自动化测试。
 - Mooncake 传输层自身的超时参数不由 Relax 控制。

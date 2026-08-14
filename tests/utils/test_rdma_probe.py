@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from unittest import mock
 
 import pytest
@@ -420,6 +421,26 @@ class TestTqConfigBuilder:
     )
     def test_installed_tq_satisfies_loss_prevention_contract(self):
         validate_mooncake_runtime_contract()
+
+    @pytest.mark.skipif(
+        not _REAL_TQ_STORAGE,
+        reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
+    )
+    def test_contract_defaults_mooncake_memcpy_off(self, monkeypatch):
+        # mooncake 0.3.10 memcpy fast path silently truncates TCP transfers;
+        # the correctness guards must force it off when the operator is silent.
+        monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+        validate_mooncake_runtime_contract()
+        assert os.environ["MC_STORE_MEMCPY"] == "0"
+
+    @pytest.mark.skipif(
+        not _REAL_TQ_STORAGE,
+        reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
+    )
+    def test_contract_respects_explicit_memcpy_override(self, monkeypatch):
+        monkeypatch.setenv("MC_STORE_MEMCPY", "1")
+        validate_mooncake_runtime_contract()
+        assert os.environ["MC_STORE_MEMCPY"] == "1"
 
     def test_segment_capacity_text_only_passes(self):
         args = _make_args(multimodal_keys=None)

@@ -6,7 +6,10 @@ The TransferQueue revision currently pinned by Relax validates the first
 Mooncake batch result, but not every retry result, logs removal failures
 without raising, and treats a missing/negative production-status ACK as a
 successful notification.  Those behaviours can turn an explicit storage or
-controller failure into silent data loss.
+controller failure into silent data loss.  The pinned mooncake 0.3.10
+additionally corrupts TCP-protocol transfers through its auto-enabled memcpy
+fast path, so that path is disabled here by default (see
+:func:`_enforce_safe_memcpy_default`).
 
 Keep the compatibility guards here, close to Relax's integration boundary,
 until the equivalent checks are available in the pinned TransferQueue
@@ -17,6 +20,7 @@ creates or attaches a Mooncake client installs them before ``tq.init``.
 from __future__ import annotations
 
 import asyncio
+import os
 from functools import wraps
 from typing import Any
 from uuid import uuid4
@@ -71,7 +75,6 @@ class _StrictMooncakeStoreProxy:
 async def _strict_notify_and_wait(self: Any, request_msg: list) -> None:
     """Notify the controller and require a positive ACK within the deadline."""
     import zmq
-
     from transfer_queue.storage.managers import base as tq_base
     from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
@@ -159,8 +162,26 @@ def _install_notification_guards(manager_cls: type) -> None:
     setattr(manager_cls, _PATCH_MARKER, True)
 
 
+def _enforce_safe_memcpy_default() -> None:
+    """Disable mooncake's memcpy fast path unless the operator overrides it.
+
+    mooncake 0.3.10 auto-enables ``MC_STORE_MEMCPY`` in TCP-only environments
+    (``transfer_task.cpp`` "auto-detected: TCP-only environment, memcpy
+    enabled") and that path silently truncates cross-node gets: roughly half of
+    fresh-session first transfers returned rows whose tails were zero bytes
+    from a 64 KiB-aligned offset onward while every batch code reported success
+    (two-node forensic probes, 2026-08; 12/12 sessions clean with
+    ``MC_STORE_MEMCPY=0`` vs ~50% corrupt without).  The same code path
+    SIGSEGVs on single-node loopback.  RDMA-capable sessions auto-disable
+    memcpy anyway, so this default is a no-op there; ``setdefault`` keeps an
+    explicit operator override (e.g. ``MC_STORE_MEMCPY=1``) possible.
+    """
+    os.environ.setdefault("MC_STORE_MEMCPY", "0")
+
+
 def ensure_mooncake_correctness_guards() -> None:
     """Install and validate all guards required for safe Mooncake operation."""
+    _enforce_safe_memcpy_default()
     try:
         from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
         from transfer_queue.storage.managers.base import StorageManager
