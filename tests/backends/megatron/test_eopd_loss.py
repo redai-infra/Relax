@@ -53,8 +53,7 @@ def _make_batch(torch, teacher_entropy_vals, response_lengths, teacher_topk_lp, 
     batch = {
         "response_lengths": response_lengths,
         "total_lengths": [r + 2 for r in response_lengths],
-        "loss_masks": loss_masks
-        or [torch.ones(r, dtype=torch.float32) for r in response_lengths],
+        "loss_masks": loss_masks or [torch.ones(r, dtype=torch.float32) for r in response_lengths],
         "teacher_entropy": [torch.tensor(e, dtype=torch.float32) for e in teacher_entropy_vals],
         "opd_topk_teacher_log_probs": [torch.tensor(lp, dtype=torch.float32) for lp in teacher_topk_lp],
     }
@@ -161,9 +160,7 @@ def test_eopd_fkl_loss_normalization(opd_utils_module):
         ],
     }
 
-    loss, _ = opd_utils.compute_eopd_fkl_loss(
-        args=args, batch=batch, log_probs_and_entropy=log_probs_and_entropy
-    )
+    loss, _ = opd_utils.compute_eopd_fkl_loss(args=args, batch=batch, log_probs_and_entropy=log_probs_and_entropy)
     assert loss is not None
     assert loss.item() > 0.0
 
@@ -172,9 +169,7 @@ def test_eopd_fkl_loss_disabled(opd_utils_module):
     opd_utils, torch = opd_utils_module
     args = _make_args(use_eopd=False)
 
-    loss, reported = opd_utils.compute_eopd_fkl_loss(
-        args=args, batch={}, log_probs_and_entropy={}
-    )
+    loss, reported = opd_utils.compute_eopd_fkl_loss(args=args, batch={}, log_probs_and_entropy={})
     assert loss is None
     assert reported == {}
 
@@ -192,9 +187,7 @@ def test_eopd_reported_metrics(opd_utils_module):
         "topk_log_probs": [torch.tensor(student_topk_lp[0], dtype=torch.float32)],
     }
 
-    _, reported = opd_utils.compute_eopd_fkl_loss(
-        args=args, batch=batch, log_probs_and_entropy=log_probs_and_entropy
-    )
+    _, reported = opd_utils.compute_eopd_fkl_loss(args=args, batch=batch, log_probs_and_entropy=log_probs_and_entropy)
     assert "eopd_fkl_loss" in reported
     assert "eopd_high_entropy_frac" in reported
     assert "eopd_teacher_entropy_mean" in reported

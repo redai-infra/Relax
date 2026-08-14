@@ -68,9 +68,9 @@ def test_eopd_accepts_sglang_type(opd_utils_module, monkeypatch):
 
 
 def test_eopd_requires_loss_mode(opd_utils_module, monkeypatch):
-    args = _base_args(opd_kl_coef=1.0, opd_loss_coef=0.0)
+    args = _base_args(opd_kl_coef=1.0, opd_loss_coef=1.0)
     monkeypatch.setattr("os.path.exists", lambda p: True)
-    with pytest.raises(ValueError, match="opd-loss-coef"):
+    with pytest.raises(ValueError, match="opd-kl-coef"):
         opd_utils_module.validate_opd_args(args, is_sft=False)
 
 
