@@ -18,6 +18,7 @@ from relax.utils.training.p3o_utils import (
     compute_p3o_behavior_kl_proxy,
     compute_p3o_exact_kl,
     compute_p3o_sufficient_stats,
+    compute_p3o_sufficient_stats_unchecked,
     compute_p3o_token_terms,
     finalize_p3o_step_context,
 )
@@ -263,6 +264,39 @@ def test_p3o_utils_non_finite_valid_token_raises(log_prob, behavior_log_prob):
 
     with pytest.raises(ValueError, match="non-finite importance ratio"):
         compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask)
+
+
+@pytest.mark.parametrize("log_ratio", [500.0, -500.0])
+def test_p3o_utils_extreme_finite_log_ratio_flags_moment_overflow_or_underflow(log_ratio):
+    behavior_log_probs = torch.zeros(1, 2, dtype=torch.float32)
+    log_probs = torch.tensor([[log_ratio, 0.0]], dtype=torch.float32)
+    valid_mask = torch.tensor([[True, False]])
+
+    stats, invalid_flag = compute_p3o_sufficient_stats_unchecked(
+        log_probs,
+        behavior_log_probs,
+        valid_mask,
+    )
+
+    assert float(invalid_flag) == 1.0
+    torch.testing.assert_close(stats.as_vector(), torch.zeros(3, dtype=torch.float64), rtol=0.0, atol=0.0)
+    with pytest.raises(ValueError, match="non-finite importance ratio"):
+        compute_p3o_sufficient_stats(log_probs, behavior_log_probs, valid_mask)
+
+
+def test_p3o_utils_finite_per_token_squares_reject_overflowing_local_sum():
+    behavior_log_probs = torch.zeros(2, dtype=torch.float32)
+    log_probs = torch.full((2,), 354.8, dtype=torch.float32)
+    valid_mask = torch.ones(2, dtype=torch.bool)
+
+    stats, invalid_flag = compute_p3o_sufficient_stats_unchecked(
+        log_probs,
+        behavior_log_probs,
+        valid_mask,
+    )
+
+    assert float(invalid_flag) == 1.0
+    torch.testing.assert_close(stats.as_vector(), torch.zeros(3, dtype=torch.float64), rtol=0.0, atol=0.0)
 
 
 def test_p3o_utils_all_masked_poison_produces_fp64_zero_stats():

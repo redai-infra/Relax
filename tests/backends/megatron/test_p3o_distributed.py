@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 from relax.utils.training.p3o_utils import (
     P3OSufficientStats,
     compute_p3o_sufficient_stats,
+    compute_p3o_sufficient_stats_unchecked,
     compute_p3o_token_terms,
     finalize_p3o_step_context,
 )
@@ -52,19 +53,24 @@ def _init_gloo(rank: int, world_size: int, port: int) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
 
-def _nonfinite_worker(rank: int, world_size: int, port: int) -> None:
+def _extreme_ratio_worker(rank: int, world_size: int, port: int, log_ratio: float) -> None:
     _init_gloo(rank, world_size, port)
     try:
         p3o_step.mpu.is_pipeline_last_stage = lambda ignore_virtual=True: True
         p3o_step.mpu.get_data_parallel_group = lambda with_context_parallel=True: dist.group.WORLD
         p3o_step.mpu.get_pipeline_model_parallel_world_size = lambda: 1
 
-        stats = (
-            P3OSufficientStats.zeros()
-            if rank == 0
-            else P3OSufficientStats.from_vector(torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64))
-        )
-        invalid_count = torch.tensor(float(rank == 0), dtype=torch.float64)
+        if rank == 0:
+            stats, invalid_count = compute_p3o_sufficient_stats_unchecked(
+                torch.tensor([log_ratio], dtype=torch.float32),
+                torch.zeros(1, dtype=torch.float32),
+                torch.ones(1, dtype=torch.bool),
+            )
+        else:
+            # Model a dummy micro-batch: it contributes neither moments nor an
+            # invalid flag, but must still observe the real rank's failure.
+            stats = P3OSufficientStats.zeros()
+            invalid_count = torch.zeros((), dtype=torch.float64)
 
         try:
             synchronize_p3o_stats(
@@ -319,9 +325,14 @@ def _real_dummy_dp_worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_p3o_distributed_nonfinite_fails_synchronously():
+def test_p3o_distributed_positive_extreme_ratio_fails_synchronously_with_dummy_rank():
     world_size = 2
-    mp.spawn(_nonfinite_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+    mp.spawn(_extreme_ratio_worker, args=(world_size, _free_port(), 500.0), nprocs=world_size, join=True)
+
+
+def test_p3o_distributed_negative_extreme_ratio_fails_synchronously_with_dummy_rank():
+    world_size = 2
+    mp.spawn(_extreme_ratio_worker, args=(world_size, _free_port(), -500.0), nprocs=world_size, join=True)
 
 
 def test_p3o_distributed_pipeline_broadcasts_last_stage_stats():

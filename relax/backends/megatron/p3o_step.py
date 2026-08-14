@@ -46,7 +46,7 @@ logger = get_logger(__name__)
 
 P3O_STEP_CONTEXT_ATTR = "_p3o_step_context"
 P3O_NONFINITE_RATIO_ERROR = (
-    "P3O: non-finite importance ratio at a valid response token on at least one rank; "
+    "P3O: non-finite importance ratio or unrepresentable squared ratio at a valid response token on at least one rank; "
     "refusing to silently fall back to ESS=1. Check rollout log-probs and mask alignment."
 )
 
@@ -119,14 +119,17 @@ def synchronize_p3o_stats(
                 group_src=torch.distributed.get_world_size(group=pp_group) - 1,
             )
 
-    valid = vector[3] <= 0
-    if valid.device.type == "cpu":
-        if not bool(valid):
-            raise ValueError(P3O_NONFINITE_RATIO_ERROR)
-    else:
-        # Keep the accelerator hot path asynchronous. Every rank observes the
-        # globally reduced invalid flag, so they all fail consistently.
-        torch._assert_async(valid, P3O_NONFINITE_RATIO_ERROR)
+    # A collective can overflow even when every rank contributed finite local
+    # moments, so validate the reduced S1/S2/N in addition to the synchronized
+    # per-rank invalid flag before finalization can fall back to ESS=1.
+    valid = (vector[3] <= 0) & torch.isfinite(vector[:3]).all()
+    # This is one host check per optimizer step (or micro-batch ESS scope),
+    # after every rank has received the same reduced verdict. A CUDA
+    # ``torch._assert_async`` would turn this expected input error into a
+    # device-side assert, poison NCCL, and abort Ray workers instead of raising
+    # a catchable all-rank exception.
+    if not bool(valid):
+        raise ValueError(P3O_NONFINITE_RATIO_ERROR)
     return P3OSufficientStats.from_vector(vector[:3])
 
 

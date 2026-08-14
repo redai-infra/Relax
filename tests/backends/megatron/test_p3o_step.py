@@ -104,6 +104,27 @@ def test_p3o_step_raises_only_after_global_invalid_flag_is_visible(monkeypatch):
         )
 
 
+def test_p3o_step_raises_when_collective_overflows_finite_local_stats(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    dp_cp_group = object()
+
+    def all_reduce(vector, *, op, group):
+        assert group is dp_cp_group
+        vector[1] = float("inf")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    with pytest.raises(ValueError, match="unrepresentable squared ratio"):
+        synchronize_p3o_stats(
+            _stats((1.0, torch.finfo(torch.float64).max * 0.75, 1.0)),
+            torch.zeros((), dtype=torch.float64),
+            dp_cp_group=dp_cp_group,
+            pp_group=None,
+            is_pipeline_last_stage=True,
+        )
+
+
 def test_compute_p3o_step_context_plain_text_forward_kwargs(monkeypatch):
     """ESS pre-pass forward_step must use tokens+packed_seq_params for plain
     text."""

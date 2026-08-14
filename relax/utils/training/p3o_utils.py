@@ -34,7 +34,7 @@ BEHAVIOR_KL_EXP_CLAMP = 10.0
 # Shared by the checked and unchecked sufficient-statistics paths so the message
 # a user sees does not depend on which one detected the non-finite ratio.
 NONFINITE_RATIO_MESSAGE = (
-    "P3O: non-finite importance ratio at a valid response token; refusing to "
+    "P3O: non-finite importance ratio or unrepresentable squared ratio at a valid response token; refusing to "
     "silently fall back to ESS=1. Check rollout log-probs and mask alignment."
 )
 
@@ -188,7 +188,8 @@ def compute_p3o_sufficient_stats(
         Local :class:`P3OSufficientStats` in float64.
 
     Raises:
-        ValueError: If a valid position produced a non-finite ratio.
+        ValueError: If a valid position produced a non-finite ratio or a
+            squared ratio that overflowed or underflowed in float64.
     """
     stats, invalid_flag = compute_p3o_sufficient_stats_unchecked(log_probs, behavior_log_probs, valid_mask)
     # This convenience wrapper is used outside the micro-batch hot path, so an
@@ -221,9 +222,10 @@ def compute_p3o_sufficient_stats_unchecked(
 
     Returns:
         ``(stats, invalid_flag)``. ``invalid_flag`` is ``1.0`` when any valid
-        position produced a non-finite ratio, else ``0.0``. When it is set, the
-        statistics are zeroed so a caller that defers the check cannot poison
-        ``S1/S2`` with ``inf``/``nan`` in the meantime.
+        position produced a non-finite ratio or a squared ratio that cannot be
+        represented in float64, else ``0.0``. When it is set, the statistics
+        are zeroed so a caller that defers the check cannot poison ``S1/S2``
+        with ``inf``/``nan`` in the meantime.
     """
     with torch.no_grad():
         mask_bool = valid_mask.bool()
@@ -231,19 +233,44 @@ def compute_p3o_sufficient_stats_unchecked(
 
         ratio = torch.exp(log_ratio.to(torch.float64))
         ratio = torch.where(mask_bool, ratio, torch.zeros_like(ratio))
+        ratio_sq = ratio.square()
 
-        # Both checks stay on device. log_ratio is already zeroed outside the
-        # mask, so a global isfinite() over it is equivalent to masking first.
-        invalid_flag = (~(torch.isfinite(log_ratio).all() & torch.isfinite(ratio).all())).to(torch.float64)
+        # All checks stay on device. A finite ratio can still overflow when
+        # squared (for example exp(500)), while a very small finite ratio can
+        # produce an exact-zero square (for example exp(-500)). Either would
+        # corrupt S2 and must fail through the synchronized invalid flag. Zero
+        # squares outside the valid-token mask remain harmless.
+        ratio_sq_representable = torch.where(mask_bool, ratio_sq > 0.0, torch.ones_like(mask_bool)).all()
+        token_invalid = (
+            ~(
+                torch.isfinite(log_ratio).all()
+                & torch.isfinite(ratio).all()
+                & torch.isfinite(ratio_sq).all()
+                & ratio_sq_representable
+            )
+        ).to(torch.float64)
+
+        # Per-token finiteness is not sufficient: summing several large but
+        # finite squares can overflow locally before the collective.
+        local_sums = torch.stack(
+            (
+                ratio.sum(),
+                ratio_sq.sum(),
+                mask_bool.sum().to(torch.float64),
+            )
+        )
+        invalid_flag = torch.maximum(token_invalid, (~torch.isfinite(local_sums).all()).to(torch.float64))
 
         # Zero the contribution when invalid, so deferring the host-side check
-        # cannot let inf/nan reach the reduced moments.
-        keep = 1.0 - invalid_flag
+        # cannot let inf/nan reach the reduced moments. torch.where is required
+        # here: multiplying an infinite S2 by zero would still produce NaN.
+        keep = invalid_flag <= 0.0
+        safe_local_sums = torch.where(keep, local_sums, torch.zeros_like(local_sums))
         return (
             P3OSufficientStats(
-                sum_ratio=ratio.sum() * keep,
-                sum_ratio_sq=ratio.pow(2).sum() * keep,
-                valid_token_count=mask_bool.sum().to(torch.float64) * keep,
+                sum_ratio=safe_local_sums[0],
+                sum_ratio_sq=safe_local_sums[1],
+                valid_token_count=safe_local_sums[2],
             ),
             invalid_flag,
         )

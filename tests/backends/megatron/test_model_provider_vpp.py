@@ -183,6 +183,17 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+def test_bridge_provider_uses_fp32_when_precision_flags_are_disabled(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    module.get_model_provider_func(_bridge_args(fp16=False, bf16=False), role="actor")
+
+    assert provider.fp16 is False
+    assert provider.bf16 is False
+    assert provider.params_dtype is torch.float32
+    assert provider.finalized
+
+
 def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     module, provider = _load_model_provider(monkeypatch)
 
