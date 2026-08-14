@@ -229,6 +229,16 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_TGD_PROFILE = EnvProperty("RELAX_TGD_PROFILE", bool, False)
     RELAX_TGD_PROFILE_EVERY = EnvProperty("RELAX_TGD_PROFILE_EVERY", int, 50)
 
+    # ------------- Trajectory replay capture -------------
+    # Opt-in production capture. MegatronTrainRayActor.init calls
+    # maybe_enable_from_env — no CLI argument-parsing change.
+    RELAX_REPLAY_CAPTURE = EnvProperty("RELAX_REPLAY_CAPTURE", bool, False)
+    RELAX_REPLAY_CAPTURE_DIR = EnvProperty("RELAX_REPLAY_CAPTURE_DIR", str, None)
+    # Comma-separated actor steps as ROLLOUT_ID:STEP_ID (e.g. "0:0,0:1"). Unset = all.
+    RELAX_REPLAY_CAPTURE_STEPS = EnvProperty("RELAX_REPLAY_CAPTURE_STEPS", str, None)
+    # Comma-separated rollout ids (e.g. "0,1"). Unset = all.
+    RELAX_REPLAY_CAPTURE_ROLLOUTS = EnvProperty("RELAX_REPLAY_CAPTURE_ROLLOUTS", str, None)
+
     # ------------- SGLang Speculative Decoding & External Packages -----------
     SGLANG_ENABLE_SPEC_V2 = EnvProperty("SGLANG_ENABLE_SPEC_V2", str, "")
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvProperty("SGLANG_EXTERNAL_MODEL_PACKAGE", str, None)

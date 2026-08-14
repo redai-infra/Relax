@@ -18,6 +18,7 @@ from relax.utils.opd.opd_utils import (
     resolve_opd_gather_topk_token_ids,
     validate_opd_topk_gather,
 )
+from relax.utils.replay import capture_hooks
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -1121,6 +1122,19 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+
+    # Trajectory-replay capture: record the loss.policy stage. No-op unless
+    # capture is enabled and this step is selected (single global read).
+    capture_hooks.capture_policy_loss(
+        old_log_probs=old_log_probs,
+        log_probs=log_probs,
+        entropy=entropy,
+        advantages=advantages,
+        loss_masks=batch["loss_masks"],
+        response_lengths=response_lengths,
+        total_lengths=total_lengths,
+        reported_loss=reported_loss,
+    )
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()

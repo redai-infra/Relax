@@ -106,6 +106,9 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         # we could use key to select the reward.
         "rewards": rewards,
         "raw_reward": raw_rewards,
+        # Semantic group index (prompt group for GRPO reward normalization); needed
+        # by the per-rollout replay capture to recompute reward.post_process.
+        "group_index": [sample.group_index if sample.group_index is not None else 0 for sample in samples],
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": [sample.index for sample in samples],
     }

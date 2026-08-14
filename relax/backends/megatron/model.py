@@ -36,6 +36,7 @@ from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
+from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
@@ -974,6 +975,10 @@ def train_one_step(
     """
     args = get_args()
 
+    # Trajectory-replay capture: open a per-step accumulator (no-op unless
+    # capture is enabled and this step is selected).
+    capture_hooks.begin_step_for(args, rollout_id, step_id)
+
     # Set grad to zero.
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
@@ -1256,7 +1261,9 @@ def train_one_step(
             # CP degree under dynamic CP (and is a no-op under static CP, where the
             # count previously carried the cancelling cp factor).
             loss_reduced[key] = value / num_samples_or_tokens
+        capture_hooks.end_step_for()
         return loss_reduced, grad_norm
+    capture_hooks.end_step_for()
     return {}, grad_norm
 
 
