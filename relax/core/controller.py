@@ -8,6 +8,7 @@ from argparse import Namespace
 from typing import Any
 
 import ray
+import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -53,7 +54,14 @@ from relax.utils.tq_config import (
     resolve_mooncake_master_address,
     validate_mooncake_runtime_contract,
 )
-from relax.utils.tq_lifecycle import close_tq_owner, initialize_tq_with_fallback
+from relax.utils.tq_lifecycle import (
+    TqInitResult,
+    close_tq_owner,
+    initialize_tq_with_fallback,
+    reap_unusable_tq_controller,
+    uses_mooncake,
+    verify_cluster_attach,
+)
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
@@ -138,6 +146,7 @@ class Controller:
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
         self._tq_owner = None
+        self._tq_legacy_init = False
 
         # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
         # is launched (RL is resolved later in placement_group.py).
@@ -304,6 +313,20 @@ class Controller:
             flags={"allow_objects": True},
         )
 
+        if getattr(self.config, "tq_storage_backend", "simple") == "simple":
+            # Zero-behavior-change default path (review PR#256): identical to
+            # upstream, the first tq.init runs inside the Controller process
+            # and no _TransferQueueOwner actor is created.  The only addition
+            # is the F10 reaper, which acts solely on a provably
+            # half-initialised leftover controller that would otherwise make
+            # this tq.init poll get_config forever.
+            reap_unusable_tq_controller()
+            self._tq_owner = None
+            self._tq_legacy_init = True
+            self.config.tq_config = tq.init(conf=tq_config) or tq_config
+            logger.info("[dataplane] backend=SimpleStorage (default in-process init, no owner actor)")
+            return
+
         fallback_config = None
         if backend_config.get("storage_backend") == "MooncakeStore":
             from relax.utils.tq_config import build_simple_storage_config
@@ -324,11 +347,54 @@ class Controller:
             mode=getattr(self.config, "tq_rdma_mode", "off"),
             fallback_conf=fallback_config,
         )
+        if uses_mooncake(init_result.config):
+            init_result = self._confirm_mooncake_attach(init_result, fallback_config)
         self._tq_owner = init_result.owner
         self.config.tq_config = init_result.config
         if init_result.fallback_reason:
             logger.warning(f"[dataplane] effective backend=SimpleStorage fallback={init_result.fallback_reason}")
         logger.info(f"[dataplane] controller ownership={'owner' if init_result.owns_controller else 'attached'}")
+
+    def _confirm_mooncake_attach(self, init_result: TqInitResult, fallback_config) -> TqInitResult:
+        """Bounded attach handshake on every alive node before the job-level
+        Mooncake config is confirmed.
+
+        The RDMA probe cannot cover this: TQ clients live in Ray Serve replicas
+        and 0-CPU actors with no placement binding, so they may land on nodes
+        the GPU-only probe never saw, and a worker-side ``tq.init`` has no
+        timeout of its own.  The handshake attaches (bounded) from every alive
+        node and reports failures back here, so ``auto`` degrades the whole job
+        to one backend instead of hanging or failing a single replica mid-
+        deployment.
+        """
+        failures = verify_cluster_attach(init_result.config)
+        if not failures:
+            logger.info("[dataplane] Mooncake attach handshake passed on all alive nodes.")
+            return init_result
+
+        detail = "; ".join(failures)
+        mode = getattr(self.config, "tq_rdma_mode", "off")
+        if mode != "auto" or not init_result.owns_controller or fallback_config is None:
+            # off/required must fail loudly, and a job that merely attached to
+            # a foreign controller must never tear it down or replace its
+            # backend unilaterally.
+            if init_result.owns_controller:
+                close_tq_owner(init_result.owner)
+            raise RuntimeError(
+                f"Mooncake attach handshake failed on {len(failures)} node(s) (--tq-rdma-mode={mode}): {detail}"
+            )
+
+        logger.warning(
+            f"[dataplane] Mooncake attach handshake failed on {len(failures)} node(s) ({detail}); "
+            "closing Mooncake state and converging the whole job to SimpleStorage."
+        )
+        close_tq_owner(init_result.owner)
+        fallback_result = initialize_tq_with_fallback(fallback_config, mode="auto")
+        return TqInitResult(
+            config=fallback_result.config,
+            owner=fallback_result.owner,
+            fallback_reason=f"attach_handshake_failed:{len(failures)}_nodes",
+        )
 
     def _resolve_tq_backend(self, total_storage_size: int) -> dict:
         """Resolve the TransferQueue ``backend`` config dict.
@@ -446,8 +512,16 @@ class Controller:
         return backend_dict
 
     def _close_data_system(self) -> None:
-        """Delegate to
-        :func:`relax.utils.tq_lifecycle.close_tq_and_unmount`."""
+        """Tear down the data system.
+
+        Default in-process path keeps upstream's plain ``tq.close()``;
+        owner-mediated runs delegate to
+        :func:`relax.utils.tq_lifecycle.close_tq_owner`.
+        """
+        if self._tq_legacy_init:
+            self._tq_legacy_init = False
+            tq.close()
+            return
         close_tq_owner(self._tq_owner)
         self._tq_owner = None
 

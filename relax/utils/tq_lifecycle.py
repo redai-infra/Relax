@@ -21,6 +21,8 @@ Two problems these helpers exist for:
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -38,6 +40,7 @@ CONTROLLER_NAME = "TransferQueueController"
 CONTROLLER_NAMESPACE = "transfer_queue"
 OWNER_TOKEN_FIELD = "relax_owner_token"
 DEFAULT_TQ_INIT_TIMEOUT_SECONDS = 60.0
+DEFAULT_TQ_ATTACH_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,10 @@ class TqInitResult:
 
 class TqInitializationTimeout(TimeoutError):
     """Raised when ``tq.init`` does not finish within the bounded timeout."""
+
+
+class TqAttachTimeout(TimeoutError):
+    """Raised when a worker cannot attach to TransferQueue within the bound."""
 
 
 class TqCleanupTimeout(TimeoutError):
@@ -111,6 +118,15 @@ def _backend_description(conf: Any) -> str:
 def _uses_mooncake(conf: Any) -> bool:
     backend = _get_config_value(conf, "backend", {})
     return _get_config_value(backend, "storage_backend", "SimpleStorage") == "MooncakeStore"
+
+
+def uses_mooncake(conf: Any) -> bool:
+    """True when ``conf`` selects the MooncakeStore backend.
+
+    Public so the Controller can decide whether the cluster-wide attach
+    handshake is required for the stored job-level config.
+    """
+    return _uses_mooncake(conf)
 
 
 def _prepare_mooncake_runtime(conf: Any) -> None:
@@ -275,11 +291,96 @@ def log_tq_gdr_runtime_status(*, requested: bool, role: str) -> str:
     return status
 
 
-def attach_tq_client(conf: Any, *, requested_gdr: bool, role: str) -> Any:
-    """Attach a component process and report its local experimental GDR
-    state."""
+def _resolve_attach_timeout() -> float:
+    """Attach deadline in seconds; override via
+    ``RELAX_TQ_ATTACH_TIMEOUT_SECONDS``."""
+    raw = os.environ.get("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_TQ_ATTACH_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise RuntimeError(f"RELAX_TQ_ATTACH_TIMEOUT_SECONDS={raw!r} must be a positive number of seconds") from error
+    if value <= 0:
+        raise RuntimeError(f"RELAX_TQ_ATTACH_TIMEOUT_SECONDS={raw!r} must be a positive number of seconds")
+    return value
+
+
+def _await_controller_config(deadline: float) -> None:
+    """Bounded wait until the named controller serves a non-``None`` config.
+
+    ``tq.init`` polls ``get_config`` forever while it returns ``None`` (the F10
+    hang), so a worker refuses to enter that loop unless a config is provably
+    served before the deadline.
+    """
+    last_error = "TransferQueueController named actor not found"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TqAttachTimeout(f"TransferQueue attach timed out: {last_error}")
+        try:
+            controller = ray.get_actor(CONTROLLER_NAME, namespace=CONTROLLER_NAMESPACE)
+        except ValueError:
+            time.sleep(min(0.5, remaining))
+            continue
+        try:
+            conf = ray.get(controller.get_config.remote(), timeout=max(min(remaining, 10.0), 0.1))
+        except Exception as e:
+            last_error = f"get_config failed: {e}"
+            time.sleep(min(0.5, max(deadline - time.monotonic(), 0.0)))
+            continue
+        if conf is not None:
+            return
+        last_error = "controller exists but has stored no config yet"
+        time.sleep(min(0.5, max(deadline - time.monotonic(), 0.0)))
+
+
+def _bounded_tq_init(conf: Any, deadline: float, *, role: str) -> None:
+    """Run ``tq.init`` under the remaining deadline.
+
+    ``tq.init`` takes no timeout and its mooncake client setup blocks in native
+    code, so it runs on a daemon watchdog thread.  On expiry the caller fails
+    fast with :class:`TqAttachTimeout`; the abandoned thread dies with the
+    failed worker process (Serve tears the replica down).
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TqAttachTimeout(f"TransferQueue attach for role={role} timed out before tq.init")
+    error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            tq.init(conf=conf)
+        except BaseException as e:  # propagated to the attaching caller below
+            error.append(e)
+
+    thread = threading.Thread(target=_run, name=f"tq-attach-{role}", daemon=True)
+    thread.start()
+    thread.join(remaining)
+    if thread.is_alive():
+        raise TqAttachTimeout(
+            f"tq.init for role={role} did not finish within {remaining:.0f}s "
+            "(mooncake setup or controller poll hung); failing this worker fast."
+        )
+    if error:
+        raise error[0]
+
+
+def attach_tq_client(conf: Any, *, requested_gdr: bool, role: str, timeout: float | None = None) -> Any:
+    """Attach a component process within a bounded deadline and report its
+    local experimental GDR state.
+
+    The deadline covers both waiting for a served controller config and
+    ``tq.init`` itself, because either phase can hang unboundedly (get_config
+    polling and mooncake endpoint setup respectively).  ``None`` resolves the
+    deadline from ``RELAX_TQ_ATTACH_TIMEOUT_SECONDS`` (default 60 s).
+    """
+    if timeout is None:
+        timeout = _resolve_attach_timeout()
+    deadline = time.monotonic() + timeout
     _prepare_mooncake_runtime(conf)
-    tq.init(conf=conf)
+    _await_controller_config(deadline)
+    _bounded_tq_init(conf, deadline, role=role)
     client = tq.get_client()
     log_tq_gdr_runtime_status(requested=requested_gdr, role=role)
     return client
@@ -298,6 +399,58 @@ def detach_tq_client() -> None:
     master-side TTL.
     """
     _close_local_tq_client()
+
+
+def _alive_node_ids() -> list[str]:
+    """Every alive node: TQ endpoints (Serve replicas and 0-CPU actors) carry
+    no placement binding, so any alive node may end up hosting one."""
+    return [n["NodeID"] for n in ray.nodes() if n.get("Alive")]
+
+
+def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[str]:
+    """Bounded attach handshake from every alive node; returns failure
+    summaries.
+
+    Each task performs the same bounded :func:`attach_tq_client` a worker would
+    perform (real stored config, real storage client) and detaches immediately,
+    so it validates the *actual endpoints* instead of a ``/sys`` capability
+    heuristic on a node the scheduler may never use.  An empty return means
+    every alive node attached within the deadline; the driver aggregates
+    failures and decides one job-level outcome.
+    """
+    if timeout is None:
+        timeout = _resolve_attach_timeout()
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    @ray.remote(num_cpus=0, max_retries=0)
+    def _handshake(handshake_conf: Any) -> None:
+        from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
+
+        attach_tq_client(handshake_conf, requested_gdr=False, role="attach-handshake")
+        detach_tq_client()
+
+    refs: list[Any] = []
+    id_by_ref: dict[Any, str] = {}
+    for node_id in _alive_node_ids():
+        strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+        ref = _handshake.options(scheduling_strategy=strategy).remote(conf)
+        refs.append(ref)
+        id_by_ref[ref] = node_id
+
+    # Grace beyond the per-node attach deadline covers task scheduling and
+    # worker startup on a busy cluster.
+    wait_bound = timeout + 30.0
+    ready, pending = ray.wait(refs, num_returns=len(refs), timeout=wait_bound)
+    failures: list[str] = []
+    for ref in ready:
+        try:
+            ray.get(ref)
+        except Exception as e:
+            failures.append(f"node {id_by_ref[ref][:12]}: {e}")
+    for ref in pending:
+        ray.cancel(ref, force=True)
+        failures.append(f"node {id_by_ref[ref][:12]}: handshake did not return within {wait_bound:.0f}s")
+    return failures
 
 
 def close_tq_and_unmount(*, is_owner: bool) -> None:

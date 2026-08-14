@@ -268,6 +268,51 @@ class TestCloseTqAndUnmount:
 
 
 # ---------------------------------------------------------------------------
+# Bounded attach (worker-side tq.init used to hang forever)
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedAttach:
+    """attach_tq_client: one deadline for get_config wait and tq.init."""
+
+    def test_attach_timeout_env_rejects_garbage(self, monkeypatch):
+        monkeypatch.setenv("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", "soon")
+        with pytest.raises(RuntimeError, match="RELAX_TQ_ATTACH_TIMEOUT_SECONDS"):
+            tq_lifecycle._resolve_attach_timeout()
+
+    def test_attach_timeout_env_override_is_used(self, monkeypatch):
+        monkeypatch.setenv("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", "12.5")
+        assert tq_lifecycle._resolve_attach_timeout() == 12.5
+
+    def test_bounded_init_times_out_on_hung_tq_init(self, monkeypatch):
+        import time
+
+        monkeypatch.setattr(tq_lifecycle.tq, "init", lambda conf: time.sleep(5))
+        with pytest.raises(tq_lifecycle.TqAttachTimeout, match="did not finish"):
+            tq_lifecycle._bounded_tq_init({}, time.monotonic() + 0.2, role="test")
+
+    def test_bounded_init_propagates_worker_error(self, monkeypatch):
+        import time
+
+        def boom(conf):
+            raise ValueError("bad conf")
+
+        monkeypatch.setattr(tq_lifecycle.tq, "init", boom)
+        with pytest.raises(ValueError, match="bad conf"):
+            tq_lifecycle._bounded_tq_init({}, time.monotonic() + 5.0, role="test")
+
+    def test_await_controller_config_times_out_without_actor(self, monkeypatch):
+        import time
+
+        def no_actor(name, namespace=None):
+            raise ValueError("actor not found")
+
+        monkeypatch.setattr(tq_lifecycle.ray, "get_actor", no_actor)
+        with pytest.raises(tq_lifecycle.TqAttachTimeout, match="attach timed out"):
+            tq_lifecycle._await_controller_config(time.monotonic() + 0.3)
+
+
+# ---------------------------------------------------------------------------
 # Worker detach (attach-only inverse used by every worker teardown hook)
 # ---------------------------------------------------------------------------
 
