@@ -62,3 +62,9 @@ def ensure_mooncake_correctness_guards() -> None:
     missing = [name for name in required_methods if not callable(getattr(MooncakeStoreClient, name, None))]
     if missing:
         raise RuntimeError("Installed TransferQueue lacks required Mooncake retry APIs: " + ", ".join(missing))
+
+    # Version-gated runtime patches for the pinned revision's remaining gaps;
+    # see relax/utils/tq_mooncake_patches.py for scope and removal condition.
+    from relax.utils.tq_mooncake_patches import install_mooncake_loss_guards
+
+    install_mooncake_loss_guards()
