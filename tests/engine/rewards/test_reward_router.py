@@ -68,20 +68,19 @@ def _make_sample(response: str, label: str, metadata: dict | None = None) -> "Sa
 
 
 def _kill_executor_workers():
-    """Kill named Ray actors held by the current RewardExecutor singleton.
+    """Synchronously terminate named actors held by the executor singleton.
 
-    Without this, dropping ``RewardExecutor._instance`` only releases the
-    Python actor handles; on Python 3.10 the next test can reach
-    ``options(get_if_exists=True)`` before Ray finishes evicting the named
-    actors, get a handle to a dying actor, and hit ActorDiedError.
+    ``ray.kill`` is asynchronous, so the next test can reach
+    ``options(get_if_exists=True)`` before Ray evicts a same-named actor and
+    receive a handle that is about to die.
     """
     inst = RewardExecutor._instance
     if inst is None:
         return
     for w in inst._workers:
         try:
-            ray.kill(w)
-        except Exception:
+            ray.get(w.__ray_terminate__.remote())
+        except ray.exceptions.RayError:
             pass
     inst._workers = []
 
