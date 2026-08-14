@@ -68,12 +68,7 @@ def _make_sample(response: str, label: str, metadata: dict | None = None) -> "Sa
 
 
 def _kill_executor_workers():
-    """Synchronously terminate named actors held by the executor singleton.
-
-    ``ray.kill`` is asynchronous, so the next test can reach
-    ``options(get_if_exists=True)`` before Ray evicts a same-named actor and
-    receive a handle that is about to die.
-    """
+    """Synchronously terminate actors held by the executor singleton."""
     inst = RewardExecutor._instance
     if inst is None:
         return
