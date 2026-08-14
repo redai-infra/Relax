@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 
+import os
+
 import ray
 from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
