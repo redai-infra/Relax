@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import warnings
 from typing import Any
@@ -73,6 +74,52 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
     return parsed
+
+
+def _is_megatron_checkpoint_source(path: Any) -> bool:
+    """Return whether ``path`` is a non-empty native Megatron checkpoint.
+
+    Megatron accepts either a checkpoint root with its latest-iteration
+    sentinel or a direct ``iter_0000000`` directory. Keep this lightweight
+    validation-time predicate aligned with the backend loader so a direct
+    iteration path is never silently downgraded to a HuggingFace cold start.
+    """
+    if path is None or not os.path.isdir(path):
+        return False
+    try:
+        with os.scandir(path) as entries:
+            if next(entries, None) is None:
+                return False
+    except OSError:
+        return False
+    return os.path.isfile(os.path.join(path, "latest_checkpointed_iteration.txt")) or bool(
+        re.fullmatch(r"iter_\d{7}", os.path.basename(os.path.normpath(path)))
+    )
+
+
+def _configure_megatron_checkpoint_loading(args: argparse.Namespace) -> None:
+    """Preserve native checkpoints and configure cold loads consistently."""
+    is_megatron_checkpoint = _is_megatron_checkpoint_source(args.load)
+    if args.megatron_to_hf_mode == "bridge":
+        if is_megatron_checkpoint:
+            # Native checkpoints are loaded directly by Megatron rather than
+            # through the HuggingFace bridge.
+            return
+        if args.load is None:
+            args.load = args.ref_load or args.hf_checkpoint
+        # A HuggingFace/cold load starts the rollout service at zero.
+        args.start_rollout_id = 0
+        return
+
+    if is_megatron_checkpoint:
+        return
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    args.load = args.ref_load
+    if args.ref_ckpt_step is not None:
+        args.ckpt_step = args.ref_ckpt_step
+    args.start_rollout_id = 0
 
 
 def reset_arg(parser, name, **kwargs):
@@ -1839,7 +1886,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--p3o-ess-scope",
                 choices=["micro-batch", "step"],
                 default="micro-batch",
-                help="P3O ESS scope: paper-compatible micro-batch (default) or optimizer step.",
+                help=(
+                    "P3O ESS scope: paper-compatible but topology-dependent micro-batch (default), "
+                    "or optimizer step for a partition-invariant adaptive cap."
+                ),
             )
             parser.add_argument(
                 "--p3o-kl-mode",
@@ -2930,6 +2980,14 @@ def _validate_p3o_args(args: argparse.Namespace) -> None:
             "reintroduces a per-micro-batch denominator, so the loss would depend on "
             "how the optimizer step is split into micro-batches."
         )
+    rollout_top_p = getattr(args, "rollout_top_p", 1.0)
+    rollout_top_k = getattr(args, "rollout_top_k", -1)
+    if rollout_top_p != 1.0 or rollout_top_k != -1:
+        raise ValueError(
+            "P3O requires behavior log-probs from the untruncated rollout distribution. "
+            "Use --rollout-top-p 1.0 and --rollout-top-k -1; truncated sampling changes the behavior policy "
+            "unless its exact normalized log-probs are explicitly supported."
+        )
     if args.use_tis:
         raise ValueError(
             "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
@@ -2954,6 +3012,12 @@ def _validate_p3o_args(args: argparse.Namespace) -> None:
             raise ValueError(f"P3O does not support {flag} in the replayed two-pass optimizer step.")
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         raise ValueError("P3O requires token-sum normalization and does not support a custom PG-loss reducer.")
+
+    if scope == "micro-batch" and getattr(args, "recompute_loss_function", False):
+        raise ValueError(
+            "P3O micro-batch ESS reduces statistics inside the loss callback, which checkpoint replay would execute "
+            "again during backward. Disable --recompute-loss-function or use --p3o-ess-scope step."
+        )
 
     if scope == "step":
         # The ESS pre-pass replays the same micro-batch window under no_grad. Ops
@@ -3178,32 +3242,7 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
-            args.start_rollout_id = 0
-    else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+    _configure_megatron_checkpoint_loading(args)
 
     if args.eval_interval is not None:
         if args.loss_type == "sft":

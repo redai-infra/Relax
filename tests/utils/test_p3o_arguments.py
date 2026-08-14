@@ -13,10 +13,14 @@ available in the unit-test environment, so the validator is extracted from the
 module source by AST rather than imported.
 """
 
+import argparse
 import ast
+import os
+import re
 import types
 from argparse import Namespace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,8 +30,6 @@ ARGUMENTS_PATH = Path(__file__).resolve().parents[2] / "relax" / "utils" / "argu
 
 def _load_validator():
     """Extract ``_validate_p3o_args`` without importing arguments.py."""
-    import argparse
-
     tree = ast.parse(ARGUMENTS_PATH.read_text(encoding="utf-8"))
     func = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_validate_p3o_args")
     module = types.ModuleType("_p3o_args")
@@ -37,6 +39,24 @@ def _load_validator():
 
 
 validate_p3o_args = _load_validator()
+
+
+def _load_checkpoint_loading_helpers():
+    """Extract checkpoint-loading helpers without importing optional
+    backends."""
+    tree = ast.parse(ARGUMENTS_PATH.read_text(encoding="utf-8"))
+    names = {"_is_megatron_checkpoint_source", "_configure_megatron_checkpoint_loading"}
+    funcs = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    module = types.ModuleType("_checkpoint_loading_args")
+    module.Any = Any
+    module.argparse = argparse
+    module.os = os
+    module.re = re
+    exec(compile(ast.Module(body=funcs, type_ignores=[]), str(ARGUMENTS_PATH), "exec"), module.__dict__)
+    return module
+
+
+checkpoint_loading_helpers = _load_checkpoint_loading_helpers()
 
 
 def _p3o_kl_mode_choices() -> list[str]:
@@ -67,6 +87,9 @@ def _p3o_args(**overrides) -> Namespace:
         clip_high=0.2,
         use_rollout_logprobs=True,
         calculate_per_token_loss=True,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        recompute_loss_function=False,
         use_tis=False,
         true_on_policy_mode=False,
         use_critic=False,
@@ -136,6 +159,76 @@ def test_p3o_arguments_step_scope_rejects_replay_sensitive_features(overrides):
 
 def test_p3o_arguments_step_scope_accepts_inactive_lora_dropout():
     validate_p3o_args(_p3o_args(p3o_ess_scope="step", lora_rank=0, lora_dropout=0.1))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(rollout_top_p=0.9),
+        dict(rollout_top_k=32),
+    ],
+)
+def test_p3o_arguments_rejects_truncated_rollout_behavior_logprobs(overrides):
+    with pytest.raises(ValueError, match="untruncated rollout distribution"):
+        validate_p3o_args(_p3o_args(**overrides))
+
+
+def test_p3o_arguments_rejects_micro_batch_ess_with_recomputed_loss():
+    with pytest.raises(ValueError, match="checkpoint replay"):
+        validate_p3o_args(_p3o_args(recompute_loss_function=True))
+
+
+def test_p3o_arguments_step_scope_allows_recomputed_loss():
+    validate_p3o_args(_p3o_args(p3o_ess_scope="step", recompute_loss_function=True))
+
+
+def test_megatron_checkpoint_source_recognizes_root_and_direct_iteration_paths(tmp_path):
+    checkpoint_root = tmp_path / "checkpoint"
+    checkpoint_root.mkdir()
+    (checkpoint_root / "latest_checkpointed_iteration.txt").write_text("12", encoding="utf-8")
+    assert checkpoint_loading_helpers._is_megatron_checkpoint_source(checkpoint_root)
+
+    iteration_checkpoint = tmp_path / "iter_0000000"
+    iteration_checkpoint.mkdir()
+    (iteration_checkpoint / "common.pt").write_bytes(b"checkpoint")
+    assert checkpoint_loading_helpers._is_megatron_checkpoint_source(iteration_checkpoint)
+
+    hf_checkpoint = tmp_path / "hf"
+    hf_checkpoint.mkdir()
+    (hf_checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    empty_checkpoint = tmp_path / "iter_0000001"
+    empty_checkpoint.mkdir()
+    assert not checkpoint_loading_helpers._is_megatron_checkpoint_source(hf_checkpoint)
+    assert not checkpoint_loading_helpers._is_megatron_checkpoint_source(empty_checkpoint)
+    assert not checkpoint_loading_helpers._is_megatron_checkpoint_source(tmp_path / "missing")
+
+
+@pytest.mark.parametrize("megatron_to_hf_mode", ["bridge", "raw"])
+def test_megatron_checkpoint_loading_preserves_direct_native_iteration_resume(tmp_path, megatron_to_hf_mode):
+    iteration_checkpoint = tmp_path / "iter_0000000"
+    iteration_checkpoint.mkdir()
+    (iteration_checkpoint / "common.pt").write_bytes(b"checkpoint")
+    args = Namespace(
+        megatron_to_hf_mode=megatron_to_hf_mode,
+        load=str(iteration_checkpoint),
+        ref_load="ref-checkpoint",
+        hf_checkpoint="hf-checkpoint",
+        start_rollout_id=None,
+        no_load_optim=False,
+        no_load_rng=False,
+        finetune=False,
+        ref_ckpt_step=9,
+        ckpt_step=None,
+    )
+
+    checkpoint_loading_helpers._configure_megatron_checkpoint_loading(args)
+
+    assert args.load == str(iteration_checkpoint)
+    assert args.start_rollout_id is None
+    assert not args.no_load_optim
+    assert not args.no_load_rng
+    assert not args.finetune
+    assert args.ckpt_step is None
 
 
 @pytest.mark.parametrize(

@@ -60,6 +60,13 @@ logger = get_logger(__name__)
 # deadlocking on the same non-reentrant semaphore. A ContextVar is task-local
 # and propagates down the await chain (including create_task children).
 _holding_session_lock: contextvars.ContextVar[bool] = contextvars.ContextVar("holding_session_lock", default=False)
+_P3O_TRUNCATION_SAMPLING_KEYS = (
+    "min_p",
+    "top_a",
+    "typical_p",
+    "epsilon_cutoff",
+    "eta_cutoff",
+)
 
 
 def _ensure_not_holding_session_lock() -> None:
@@ -70,6 +77,35 @@ def _ensure_not_holding_session_lock() -> None:
             "per-request permits; without it the function runs under the session lock (the same "
             "non-reentrant semaphore) and acquiring a permit would deadlock. "
             "See docs/{zh,en}/guide/customize-training.md."
+        )
+
+
+def _validate_p3o_behavior_sampling_params(
+    args: Namespace,
+    sampling_params: dict[str, Any],
+    *,
+    evaluation: bool,
+) -> None:
+    """Reject sampling modes whose returned log-probs are not P3O behavior
+    policy.
+
+    The built-in generator receives only the CLI-derived parameters, but custom
+    generation functions can add SGLang's additional distribution-truncation
+    knobs. Validate the common dispatch boundary before handing parameters to
+    either path. A custom function additionally declares its contract below.
+    """
+    if evaluation or getattr(args, "advantage_estimator", None) != "p3o":
+        return
+    if sampling_params.get("top_p", 1.0) != 1.0 or sampling_params.get("top_k", -1) != -1:
+        raise ValueError(
+            "P3O behavior sampling requires top_p=1.0 and top_k=-1 so rollout log-probs describe "
+            "the untruncated distribution."
+        )
+    unsupported = sorted(key for key in _P3O_TRUNCATION_SAMPLING_KEYS if key in sampling_params)
+    if unsupported:
+        raise ValueError(
+            "P3O behavior sampling does not support additional distribution-truncation parameters: "
+            f"{', '.join(unsupported)}."
         )
 
 
@@ -509,8 +545,19 @@ async def _dispatch_generate(
     exception would crash the whole rollout step. It is contained here and mapped
     to an ABORTED sample (mirroring the legacy in-lock abort check).
     """
+    _validate_p3o_behavior_sampling_params(args, sampling_params, evaluation=evaluation)
     custom_func_path = getattr(sample, "generate_function_path", None) or args.custom_generate_function_path
     custom_generate_func = load_function(custom_func_path) if custom_func_path is not None else None
+    if (
+        not evaluation
+        and getattr(args, "advantage_estimator", None) == "p3o"
+        and custom_generate_func is not None
+        and not getattr(custom_generate_func, "p3o_behavior_logprob_contract", False)
+    ):
+        raise ValueError(
+            "P3O custom generation must declare p3o_behavior_logprob_contract = True and preserve exact "
+            "untruncated behavior-policy log-probs for every training token."
+        )
     manages_permit = bool(getattr(custom_generate_func, "manages_inference_permit", False))
 
     async def _run() -> Sample | list[Sample]:

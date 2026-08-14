@@ -47,11 +47,49 @@ def compute_rollout_policy_age_rollouts(
     return current_rollout_id - snapshot_rollout_id
 
 
-def initial_rollout_policy_snapshot_rollout(start_rollout_id: int) -> int:
-    """Return the snapshot version aligned with a fresh or resumed run."""
-    if start_rollout_id < 0:
+def initial_rollout_policy_snapshot_rollout(
+    backend_start_rollout_id: int,
+    *,
+    configured_start_rollout_id: int | None = None,
+    is_megatron_resume: bool = False,
+) -> int:
+    """Return the snapshot version aligned with the rollout service.
+
+    A cold HuggingFace load reports Megatron iteration zero, so the backend's
+    next-step value is one while the service correctly starts at its configured
+    rollout zero. For a cold load, prefer that configured service value; a
+    native Megatron resume keeps its backend-derived value.
+    """
+    snapshot_rollout_id = (
+        backend_start_rollout_id
+        if is_megatron_resume or configured_start_rollout_id is None
+        else configured_start_rollout_id
+    )
+    if snapshot_rollout_id < 0:
         raise ValueError("start_rollout_id must be non-negative")
-    return start_rollout_id
+    return snapshot_rollout_id
+
+
+def validate_p3o_periodic_snapshot_resume(
+    *,
+    advantage_estimator: str | None,
+    update_weights_interval: int,
+    is_megatron_resume: bool,
+) -> None:
+    """Reject P3O resumes that cannot restore the behavior-policy snapshot.
+
+    A periodic rollout-policy snapshot is held only in the in-memory
+    ``TensorBackuper``. Resuming currently reconstructs it from the current
+    actor, which changes the behavior policy for the first resumed rollout.
+    P3O's importance ratio cannot silently absorb that semantic change.
+    """
+    interval = validate_update_weights_interval(update_weights_interval)
+    if advantage_estimator == "p3o" and interval > 1 and is_megatron_resume:
+        raise ValueError(
+            "P3O cannot resume exactly with update_weights_interval > 1 because the periodic rollout-policy "
+            "snapshot is not checkpointed. Start a fresh run, use update_weights_interval=1, or add "
+            "snapshot checkpointing."
+        )
 
 
 def build_rollout_policy_age_metrics(

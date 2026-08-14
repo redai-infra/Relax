@@ -190,6 +190,91 @@ def _preserved_dynamic_cp_group(args: Namespace, model: Sequence[torch.nn.Module
         inner.pg_collection.cp = original_cp_group
 
 
+P3O_NO_VALID_TOKENS_ERROR = (
+    "P3O: optimizer step has no valid response tokens globally; refusing optimizer and scheduler advancement."
+)
+
+
+def _require_p3o_global_valid_tokens(
+    num_tokens: torch.Tensor | int | None,
+    device: torch.device,
+) -> None:
+    """Fail a P3O step before gradient normalization can divide by zero.
+
+    The pipeline schedule supplies its exact CP-local token total to
+    ``finalize_model_grads_func`` after all micro-batches. Reduce it over DP x
+    CP on the pipeline-last stage, then publish the result to all pipeline
+    stages so every rank takes the same failure path. The single host read is
+    intentionally at this optimizer-step boundary rather than in the per-micro-
+    batch loss hot path.
+    """
+    valid_token_count = torch.zeros((), dtype=torch.float64, device=device)
+    is_pipeline_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+    if is_pipeline_last_stage and num_tokens is not None:
+        if isinstance(num_tokens, torch.Tensor):
+            local_num_tokens = num_tokens.detach().to(device=device, dtype=torch.float64)
+        else:
+            local_num_tokens = torch.tensor(num_tokens, device=device, dtype=torch.float64)
+        if local_num_tokens.numel() != 1:
+            raise ValueError(f"P3O valid-token count must be scalar, got shape {tuple(local_num_tokens.shape)}")
+        valid_token_count += local_num_tokens.reshape(())
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if distributed and is_pipeline_last_stage:
+        torch.distributed.all_reduce(
+            valid_token_count,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=True),
+        )
+
+    if distributed and mpu.get_pipeline_model_parallel_world_size() > 1:
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        torch.distributed.broadcast(
+            valid_token_count,
+            group=pp_group,
+            group_src=torch.distributed.get_world_size(group=pp_group) - 1,
+        )
+
+    if valid_token_count.item() <= 0.0:
+        raise RuntimeError(P3O_NO_VALID_TOKENS_ERROR)
+
+
+@contextmanager
+def _p3o_valid_token_finalizer(args: Namespace, model: Sequence[torch.nn.Module]) -> Iterator[None]:
+    """Install P3O's zero-token guard immediately before gradient
+    finalization."""
+    if getattr(args, "advantage_estimator", None) != "p3o":
+        yield
+        return
+
+    config = get_model_config(model[0])
+    original_finalize_model_grads = config.finalize_model_grads_func
+    if original_finalize_model_grads is None:
+        raise RuntimeError("P3O requires Megatron's gradient finalizer to be configured before training")
+    device = next(model[0].parameters()).device
+
+    def finalize_with_p3o_token_guard(
+        finalizer_model: Sequence[torch.nn.Module],
+        num_tokens: torch.Tensor | int | None = None,
+        **kwargs: object,
+    ) -> None:
+        _require_p3o_global_valid_tokens(num_tokens, device)
+        original_finalize_model_grads(finalizer_model, num_tokens, **kwargs)
+
+    config.finalize_model_grads_func = finalize_with_p3o_token_guard
+    try:
+        yield
+    finally:
+        config.finalize_model_grads_func = original_finalize_model_grads
+
+
+def _require_p3o_step_context_tokens(step_context: object) -> None:
+    """Reject a globally empty P3O step before its training schedule starts."""
+    valid_token_count = getattr(step_context, "valid_token_count")
+    if valid_token_count.item() <= 0.0:
+        raise RuntimeError(P3O_NO_VALID_TOKENS_ERROR)
+
+
 def _should_use_sft_chunked(args: Namespace) -> bool:
     """Gate for the SFT chunked-logits path.
 
@@ -1163,9 +1248,10 @@ def train_one_step(
                 model=model,
                 num_microbatches=num_microbatches,
             )
+            _require_p3o_step_context_tokens(p3o_step_context)
             p3o_context_manager = p3o_step_context_published(args, p3o_step_context)
 
-        with p3o_context_manager:
+        with _p3o_valid_token_finalizer(args, model), p3o_context_manager:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=data_iterator,

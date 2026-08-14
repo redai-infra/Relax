@@ -10,6 +10,15 @@ from typing import Any
 from relax.utils.types import Sample
 
 
+_P3O_TRUNCATION_SAMPLING_KEYS = (
+    "min_p",
+    "top_a",
+    "typical_p",
+    "epsilon_cutoff",
+    "eta_cutoff",
+)
+
+
 async def _sglang_generate(*args: Any, **kwargs: Any) -> Sample:
     """Import the heavyweight rollout backend only when generation starts."""
     from relax.engine.rollout.sglang_rollout import generate
@@ -34,6 +43,17 @@ def behavior_sampling_params(sampling_params: dict[str, Any], *, evaluation: boo
     """Return isolated sampling parameters for P3O rollout generation."""
     updated = sampling_params.copy()
     if not evaluation:
+        if updated.get("top_p", 1.0) != 1.0 or updated.get("top_k", -1) != -1:
+            raise ValueError(
+                "P3O behavior sampling requires top_p=1.0 and top_k=-1 so rollout log-probs describe "
+                "the untruncated distribution"
+            )
+        unsupported = sorted(key for key in _P3O_TRUNCATION_SAMPLING_KEYS if key in updated)
+        if unsupported:
+            raise ValueError(
+                "P3O behavior sampling does not support additional distribution-truncation parameters: "
+                f"{', '.join(unsupported)}"
+            )
         updated["temperature"] = _behavior_temperature()
     return updated
 
@@ -52,3 +72,9 @@ async def generate(
         behavior_sampling_params(sampling_params, evaluation=evaluation),
         evaluation=evaluation,
     )
+
+
+# _dispatch_generate checks this explicit opt-in before running custom P3O
+# generation. The wrapper above rejects known truncation knobs and delegates to
+# the built-in SGLang path, which returns sampled-token behavior log-probs.
+generate.p3o_behavior_logprob_contract = True

@@ -16,7 +16,7 @@ import torch
 from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
 
 
-with stubbed_megatron_modules(("megatron", "ray")):
+with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
     from relax.backends.megatron import loss as loss_module
 
 from relax.utils.training.p3o_utils import P3OStepContext
@@ -50,6 +50,28 @@ def test_get_p3o_context_computes_micro_batch_scope_without_prepass():
     assert context.valid_token_count.item() == 2
     assert 0.0 < context.normalized_ess.item() <= 1.0
     assert torch.equal(context.normalized_ess, context.adaptive_cap)
+
+
+def test_get_p3o_context_zeroes_dummy_micro_batch_before_collective(monkeypatch):
+    captured = {}
+
+    def capture_stats(stats, invalid_count, **kwargs):
+        captured["stats"] = stats.as_vector()
+        captured["invalid_count"] = invalid_count
+        return stats
+
+    monkeypatch.setattr(loss_module, "synchronize_p3o_stats", capture_stats)
+    context = loss_module.get_p3o_context(
+        Namespace(p3o_ess_scope="micro-batch"),
+        torch.tensor([float("nan")]),
+        torch.tensor([0.0]),
+        torch.tensor([True]),
+        is_dummy=True,
+    )
+
+    assert torch.equal(captured["stats"], torch.zeros(3, dtype=torch.float64))
+    assert torch.equal(captured["invalid_count"], torch.zeros((), dtype=torch.float64))
+    assert context.valid_token_count.item() == 0
 
 
 def test_get_p3o_context_rejects_unknown_scope():
@@ -91,21 +113,34 @@ def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
         "get_cp_local_valid_mask",
         lambda *args, **kwargs: torch.tensor([True, True]),
     )
+    dummy_masks = []
+    dummy_flags = []
+
+    def capture_context(*args, is_dummy=False):
+        dummy_masks.append(args[3])
+        dummy_flags.append(is_dummy)
+        return step_context
+
+    monkeypatch.setattr(loss_module, "get_p3o_context", capture_context)
     batch = {
         "advantages": torch.tensor([1.0, -1.0]),
-        "rollout_log_probs": [log_probs.detach().clone()],
+        "rollout_log_probs": [torch.full_like(log_probs.detach(), float("nan"))],
         "unconcat_tokens": [torch.tensor([1, 2])],
         "total_lengths": [2],
         "response_lengths": [2],
         "loss_masks": [torch.ones(2)],
+        "__is_dummy__": True,
     }
 
-    _, metrics = loss_module.p3o_loss_function(args, batch, torch.zeros(1), torch.sum)
+    loss, metrics = loss_module.p3o_loss_function(args, batch, torch.zeros(1), torch.sum)
 
     assert REQUIRED_P3O_METRICS <= metrics.keys()
     assert not any(metric.startswith("opd/") for metric in metrics)
     assert torch.equal(metrics["p3o/reference_kl"], torch.zeros(()))
     assert not metrics["p3o/reference_kl"].requires_grad
+    assert torch.isfinite(loss)
+    assert torch.equal(dummy_masks[0], torch.zeros(2, dtype=torch.bool))
+    assert dummy_flags == [True]
 
 
 def test_p3o_loss_function_normalizes_by_true_valid_tokens(monkeypatch):

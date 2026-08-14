@@ -9,14 +9,26 @@ import pytest
 from examples.algorithms.p3o import rollout
 
 
-def test_behavior_sampling_params_overrides_only_temperature(monkeypatch):
+def test_behavior_sampling_params_overrides_temperature_for_untruncated_sampling(monkeypatch):
     monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", "0.6")
-    original = {"temperature": 1.0, "top_p": 0.9, "max_new_tokens": 64}
+    original = {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 64}
 
     updated = rollout.behavior_sampling_params(original, evaluation=False)
 
-    assert updated == {"temperature": 0.6, "top_p": 0.9, "max_new_tokens": 64}
-    assert original == {"temperature": 1.0, "top_p": 0.9, "max_new_tokens": 64}
+    assert updated == {"temperature": 0.6, "top_p": 1.0, "top_k": -1, "max_new_tokens": 64}
+    assert original == {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 64}
+
+
+@pytest.mark.parametrize("sampling_params", [{"top_p": 0.9}, {"top_k": 32}, {"min_p": 0.1}])
+def test_behavior_sampling_params_rejects_truncated_training_sampling(monkeypatch, sampling_params):
+    monkeypatch.setenv("P3O_BEHAVIOR_TEMPERATURE", "0.6")
+
+    with pytest.raises(ValueError, match="P3O behavior sampling"):
+        rollout.behavior_sampling_params(sampling_params, evaluation=False)
+
+
+def test_p3o_rollout_declares_behavior_logprob_contract():
+    assert rollout.generate.p3o_behavior_logprob_contract is True
 
 
 @pytest.mark.parametrize(("raw_value", "expected"), [("0.6", 0.6), ("1.2", 1.2), ("2.0", 2.0)])
@@ -77,7 +89,7 @@ async def test_generate_delegates_with_isolated_behavior_params(monkeypatch):
     monkeypatch.setattr(rollout, "_sglang_generate", fake_generate)
     args = SimpleNamespace()
     sample = object()
-    original = {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 32}
+    original = {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 32}
 
     result = await rollout.generate(args, sample, original, evaluation=False)
 
@@ -85,7 +97,7 @@ async def test_generate_delegates_with_isolated_behavior_params(monkeypatch):
     assert captured == {
         "args": args,
         "sample": sample,
-        "sampling_params": {"temperature": 1.2, "top_p": 0.95, "max_new_tokens": 32},
+        "sampling_params": {"temperature": 1.2, "top_p": 1.0, "top_k": -1, "max_new_tokens": 32},
         "evaluation": False,
     }
-    assert original == {"temperature": 1.0, "top_p": 0.95, "max_new_tokens": 32}
+    assert original == {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 32}

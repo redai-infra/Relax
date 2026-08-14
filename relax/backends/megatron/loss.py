@@ -23,6 +23,7 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.training.p3o_utils import (
     P3OStepContext,
+    P3OSufficientStats,
     compute_p3o_sufficient_stats_unchecked,
     compute_p3o_token_terms,
     finalize_p3o_step_context,
@@ -827,6 +828,8 @@ def get_p3o_context(
     log_probs: torch.Tensor,
     behavior_log_probs: torch.Tensor,
     valid_mask: torch.Tensor,
+    *,
+    is_dummy: bool = False,
 ) -> P3OStepContext:
     """Resolve the configured P3O ESS scope for one loss micro-batch."""
     scope = getattr(args, "p3o_ess_scope", "micro-batch")
@@ -835,11 +838,19 @@ def get_p3o_context(
     if scope != "micro-batch":
         raise ValueError(f"P3O ESS scope must be 'micro-batch' or 'step', got {scope!r}")
 
-    stats, invalid_count = compute_p3o_sufficient_stats_unchecked(
-        log_probs,
-        behavior_log_probs,
-        valid_mask,
-    )
+    if is_dummy:
+        # Dynamic batching pads shorter DP ranks with dummy micro-batches to
+        # keep their collective schedule aligned. They still enter the
+        # collective below, but must add neither ESS moments nor a non-finite
+        # flag from their placeholder payload.
+        stats = P3OSufficientStats.zeros(device=log_probs.device)
+        invalid_count = torch.zeros((), dtype=torch.float64, device=log_probs.device)
+    else:
+        stats, invalid_count = compute_p3o_sufficient_stats_unchecked(
+            log_probs,
+            behavior_log_probs,
+            valid_mask,
+        )
     distributed = dist.is_available() and dist.is_initialized()
     stats = synchronize_p3o_stats(
         stats,
@@ -932,7 +943,19 @@ def p3o_loss_function(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
-    step_context = get_p3o_context(args, log_probs, behavior_log_probs, valid_mask)
+    is_dummy = batch.get("__is_dummy__", False)
+    if is_dummy:
+        # A dummy batch may carry placeholder behavior log-probs. Exclude every
+        # token before constructing P3O terms so masking it later with
+        # ``0.0 * loss`` cannot turn a placeholder NaN into a NaN gradient.
+        valid_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+    step_context = get_p3o_context(
+        args,
+        log_probs,
+        behavior_log_probs,
+        valid_mask,
+        is_dummy=is_dummy,
+    )
 
     terms = compute_p3o_token_terms(
         log_probs=log_probs,

@@ -7,17 +7,13 @@ from __future__ import annotations
 import math
 import os
 import socket
+import sys
+from types import ModuleType
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-
-from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
-
-
-with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
-    from relax.backends.megatron import p3o_step
-    from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 
 from relax.utils.training.p3o_utils import (
     P3OSufficientStats,
@@ -25,6 +21,20 @@ from relax.utils.training.p3o_utils import (
     compute_p3o_token_terms,
     finalize_p3o_step_context,
 )
+from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
+
+
+stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
+stream_dataloader.StreamingTQIterator = object
+
+with (
+    patch.dict(sys.modules, {"relax.utils.data.stream_dataloader": stream_dataloader}),
+    stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
+):
+    from relax.backends.megatron import loss as loss_module
+    from relax.backends.megatron import model as model_module
+    from relax.backends.megatron import p3o_step
+    from relax.backends.megatron.p3o_step import synchronize_p3o_stats
 
 
 def _free_port() -> int:
@@ -197,6 +207,115 @@ def _partition_worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _zero_token_finalizer_worker(rank: int, world_size: int, port: int) -> None:
+    _init_gloo(rank, world_size, port)
+    try:
+        pp_groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+        dp_first_group = dist.new_group([0, 2])
+        dp_last_group = dist.new_group([1, 3])
+        is_last_stage = rank in {1, 3}
+        model_module.mpu.is_pipeline_last_stage = lambda ignore_virtual=True: is_last_stage
+        model_module.mpu.get_pipeline_model_parallel_world_size = lambda: 2
+        model_module.mpu.get_pipeline_model_parallel_group = lambda: pp_groups[rank // 2]
+        model_module.mpu.get_data_parallel_group = lambda with_context_parallel=True: (
+            dp_last_group if is_last_stage else dp_first_group
+        )
+
+        def assert_outcome(num_tokens: float, *, should_raise: bool) -> None:
+            raised = False
+            try:
+                model_module._require_p3o_global_valid_tokens(
+                    torch.tensor(num_tokens),
+                    torch.device("cpu"),
+                )
+            except RuntimeError as error:
+                assert "no valid response tokens globally" in str(error)
+                raised = True
+
+            outcomes = torch.tensor(float(raised))
+            dist.all_reduce(outcomes)
+            assert outcomes.item() == (world_size if should_raise else 0)
+
+            healthy = torch.ones(())
+            dist.all_reduce(healthy)
+            assert healthy.item() == world_size
+
+        # Both DP shards have no tokens: every PP stage must fail before the
+        # Megatron finalizer can normalize gradients by zero.
+        assert_outcome(0.0, should_raise=True)
+        # Only one DP shard contributes valid tokens; the DP reduction must
+        # publish a positive count to every PP stage.
+        assert_outcome(2.0 if rank == 3 else 0.0, should_raise=False)
+    finally:
+        dist.destroy_process_group()
+
+
+def _real_dummy_dp_worker(rank: int, world_size: int, port: int) -> None:
+    _init_gloo(rank, world_size, port)
+    try:
+        loss_module.mpu.is_pipeline_last_stage = lambda ignore_virtual=True: True
+        loss_module.mpu.get_data_parallel_group = lambda with_context_parallel=True: dist.group.WORLD
+        loss_module.mpu.get_pipeline_model_parallel_world_size = lambda: 1
+
+        behavior = torch.full((4,), -2.0)
+        ratios = torch.tensor([1.0, 2.0, 0.5, 4.0])
+        real_log_probs = behavior + ratios.log()
+        advantages = torch.tensor([1.0, -1.0, 0.5, 2.0])
+        real_mask = torch.tensor([True, True, False, True])
+        args = type("Args", (), {"p3o_ess_scope": "micro-batch"})()
+
+        oracle_context = finalize_p3o_step_context(compute_p3o_sufficient_stats(real_log_probs, behavior, real_mask))
+        oracle_log_probs = real_log_probs.clone().requires_grad_(True)
+        oracle_terms = compute_p3o_token_terms(
+            oracle_log_probs,
+            behavior,
+            advantages,
+            real_mask,
+            oracle_context,
+        )
+        oracle_loss = (oracle_terms.score_loss + oracle_terms.adaptive_kl_loss).sum()
+        oracle_loss = oracle_loss / oracle_context.valid_token_count
+        oracle_loss.backward()
+
+        is_dummy = rank == 1
+        local_log_probs = real_log_probs.clone().requires_grad_(True)
+        local_behavior = torch.full_like(behavior, float("nan")) if is_dummy else behavior
+        local_mask = torch.zeros_like(real_mask) if is_dummy else real_mask
+        context = loss_module.get_p3o_context(
+            args,
+            local_log_probs,
+            local_behavior,
+            real_mask,
+            is_dummy=is_dummy,
+        )
+        torch.testing.assert_close(context.adaptive_cap, oracle_context.adaptive_cap)
+
+        local_terms = compute_p3o_token_terms(
+            local_log_probs,
+            local_behavior,
+            advantages,
+            local_mask,
+            context,
+        )
+        local_loss = (local_terms.score_loss + local_terms.adaptive_kl_loss).sum()
+        local_loss = local_loss / context.valid_token_count + 0.0 * local_log_probs.sum()
+        assert torch.isfinite(local_loss)
+        local_loss.backward()
+
+        reduced_loss = local_loss.detach().clone()
+        reduced_gradient = local_log_probs.grad.detach().clone()
+        dist.all_reduce(reduced_loss)
+        dist.all_reduce(reduced_gradient)
+        torch.testing.assert_close(reduced_loss, oracle_loss.detach())
+        torch.testing.assert_close(reduced_gradient, oracle_log_probs.grad.detach())
+
+        healthy = torch.ones(())
+        dist.all_reduce(healthy)
+        assert healthy.item() == world_size
+    finally:
+        dist.destroy_process_group()
+
+
 def test_p3o_distributed_nonfinite_fails_synchronously():
     world_size = 2
     mp.spawn(_nonfinite_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
@@ -210,3 +329,13 @@ def test_p3o_distributed_pipeline_broadcasts_last_stage_stats():
 def test_p3o_distributed_partition_and_objective_invariance():
     world_size = 4
     mp.spawn(_partition_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def test_p3o_distributed_finalizer_guard_is_pp_and_dp_symmetric():
+    world_size = 4
+    mp.spawn(_zero_token_finalizer_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+
+
+def test_p3o_distributed_real_and_dummy_dp_match_real_only_oracle():
+    world_size = 2
+    mp.spawn(_real_dummy_dp_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)

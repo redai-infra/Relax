@@ -78,7 +78,7 @@ from relax.utils.utils import (
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
-from .checkpoint import load_checkpoint
+from .checkpoint import is_megatron_checkpoint_resume, load_checkpoint
 from .collective_utils import _agree_drained
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
@@ -99,6 +99,7 @@ from .rollout_policy_lag import (
     initial_rollout_policy_snapshot_rollout,
     maybe_refresh_rollout_policy,
     rollout_weights_tag,
+    validate_p3o_periodic_snapshot_resume,
     validate_update_weights_interval,
 )
 from .weight_update.common import named_params_and_buffers
@@ -189,6 +190,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # reads model metadata or weights.
         # Leaf actor with private args, safe to remap in place.
         prepare_model_maybe_update_args(args)
+        is_megatron_resume = is_megatron_checkpoint_resume(args.load) and not getattr(args, "finetune", False)
 
         self.genrm_manager = None
 
@@ -257,6 +259,11 @@ class MegatronTrainRayActor(TrainRayActor):
         # UpdateWeightFromTensor instead of DCS.
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
         update_weights_interval = validate_update_weights_interval(self.args.update_weights_interval)
+        validate_p3o_periodic_snapshot_resume(
+            advantage_estimator=getattr(self.args, "advantage_estimator", None),
+            update_weights_interval=update_weights_interval,
+            is_megatron_resume=is_megatron_resume,
+        )
         if update_weights_interval > 1 and not use_tensor_backuper:
             raise ValueError(
                 "update_weights_interval > 1 requires the synchronous or hybrid TensorBackuper weight-update path"
@@ -276,7 +283,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("actor")
             self._rollout_weights_tag = rollout_weights_tag(update_weights_interval)
             # Track the rollout at which rollout policy snapshot was created (for observability)
-            self._rollout_policy_snapshot_rollout = initial_rollout_policy_snapshot_rollout(start_rollout_id)
+            self._rollout_policy_snapshot_rollout = initial_rollout_policy_snapshot_rollout(
+                start_rollout_id,
+                configured_start_rollout_id=self.args.start_rollout_id,
+                is_megatron_resume=is_megatron_resume,
+            )
             if use_rollout_policy_snapshot:
                 self.weights_backuper.backup(ROLLOUT_POLICY_TAG)
 
