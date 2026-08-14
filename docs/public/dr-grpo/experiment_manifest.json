@@ -1,0 +1,94 @@
+{
+  "experiment": "Qwen3.5-4B GSM8K paired GRPO vs Dr.GRPO",
+  "reported_range": "optimizer step 0..199 (200 steps)",
+  "hardware": "4 x NVIDIA H20",
+  "model": {
+    "repo": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "revision_source": "huggingface_hub download metadata of the local checkpoint; all 13 file metadata entries, including both safetensors shards, carry the same commit hash",
+    "precision": "BF16",
+    "update": "full parameter update"
+  },
+  "dataset": {
+    "source_repo": "openai/gsm8k",
+    "source_revision": "740312add88f781978c0658806c59bc2815b9866",
+    "config": "main",
+    "split": "train",
+    "source_rows": 7473,
+    "conversion": [
+      "read the (question, answer) columns of the pinned source parquet",
+      "shuffle with Python random.Random(42)",
+      "keep the first 256 rows",
+      "label = the text after the '####' marker of the answer, with commas removed and whitespace stripped",
+      "prompt = single user turn: 'Solve the following math problem step by step. The last line of your response must be exactly Answer: \\boxed{answer}.\\n\\n' + question",
+      "write one JSON object per line as {\"prompt\": [{\"role\": \"user\", \"content\": ...}], \"label\": ...}"
+    ],
+    "output_rows": 256,
+    "output_sha256": "8f8580875e50e5da2828ad586f97ee20e55f3ac1dfd7a6f019103ddad1a0f9d1",
+    "verified": "re-running this conversion against the pinned source parquet reproduces the byte-identical JSONL; sampled prompts from both runs' rollout results were matched against that file"
+  },
+  "parallelism": {
+    "tensor_model_parallel_size": 2,
+    "pipeline_model_parallel_size": 1,
+    "context_parallel_size": 1,
+    "data_parallel_size": 2
+  },
+  "training": {
+    "num_rollout": 200,
+    "global_batch_size": 16,
+    "rollout_batch_size": 4,
+    "n_samples_per_prompt": 4,
+    "rollout_max_response_len": 4096,
+    "lr": "1e-6",
+    "lr_decay_style": "constant",
+    "optimizer": "adam",
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.98,
+    "clip_grad": 1.0,
+    "kl_coef": 0.0,
+    "kl_loss_coef": 0.0,
+    "use_kl_loss": true,
+    "rewards_normalization": true
+  },
+  "sampling": {
+    "rollout_temperature": 0.7,
+    "rollout_top_p": 0.8
+  },
+  "seeds": {
+    "train_seed": 1234,
+    "rollout_seed": 42,
+    "dataset_shuffle_seed": 42
+  },
+  "relax_commit": "346bb53",
+  "versions": {
+    "python": "3.12.3",
+    "torch": "2.11.0+cu129",
+    "cuda": "12.9",
+    "nccl": "2.28.9",
+    "transformers": "5.6.0",
+    "megatron-core": "0.18.0",
+    "megatron-bridge": "0.5.0",
+    "transformer-engine": "2.14.1",
+    "flash-attn": "2.7.4.post1",
+    "sglang": "0.5.12.post1",
+    "ray": "2.56.0"
+  },
+  "table_semantics": {
+    "note": "how every number in the PR body's two tables is derived from training_metrics_long.csv, so the tables can be rebuilt without any additional script",
+    "window": "mean = all 200 steps; last20 = the final 20 steps",
+    "reward": "arithmetic mean of rollout/raw_reward over the window",
+    "accuracy": "sum(rollout/response_counts/correct) / sum(correct + incorrect) over all 200 steps",
+    "length": "pooled: sum(per-step mean length * per-step count) / sum(count), skipping steps whose count for that class is 0",
+    "incorrect_truncation": "sum(rollout/truncated_counts/incorrect) / sum(rollout/response_counts/incorrect)",
+    "kl_loss": "train/kl_loss is each algorithm's own objective-normalized component and is NOT comparable across algorithms: Dr.GRPO's value is sum(KL) / (N * B) because the optimizer-window scale T / (N * B) is applied before the metric reduction divides by T, while GRPO's is sum(KL) / T",
+    "reference_kl": "train/reference_kl restates both runs as sum(KL) / T. Dr.GRPO's logged value is multiplied back by N * B (16 * 4096) and divided by that step's train/response_tokens; GRPO's logged value is already sum(KL) / T and is carried through unchanged",
+    "response_tokens": "train/response_tokens is the per-step sum of response_length over the 16 responses, used as a proxy for sum(loss_mask); this recipe is single-turn text-only with no tool masking, and the proxy can only over-estimate T, never under-estimate it",
+    "grad_norm": "mean and max of train/grad_norm over all 200 steps; p95 is the linearly interpolated 95th percentile of the sorted values",
+    "train_rollout_prob_abs_diff": "per-step train/inference engine mismatch, |train prob - rollout prob| over the same tokens. Carried in the CSV as a health check on the paired runs; not used by any PR body table"
+  },
+  "excluded_from_git": {
+    "training logs": "pinned by sha256 in evidence_index.csv",
+    "rollout_result JSONL": "pinned by a rollup sha256 over the 200 files used, in evidence_index.csv",
+    "checkpoints": "not retained"
+  }
+}

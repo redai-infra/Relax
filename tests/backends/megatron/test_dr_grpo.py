@@ -1,6 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
+import os
+import socket
 from argparse import Namespace
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +12,9 @@ import torch
 
 
 pytest.importorskip("megatron.core")
+
+import torch.distributed as dist  # noqa: E402
+import torch.multiprocessing as mp  # noqa: E402
 
 from relax.backends.megatron import cp_utils as cp_utils_module  # noqa: E402
 from relax.backends.megatron import data as data_module  # noqa: E402
@@ -227,7 +234,6 @@ def _distributed_dr_grpo_metadata_worker(rank: int, world_size: int, port: int, 
 
 
 def _free_port() -> int:
-    import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -460,3 +466,629 @@ def test_optimizer_window_metadata_binding_resets_metadata_offset():
 
     assert iterator.microbatch_offset == 0
     assert torch.isclose(iterator.get_next(["loss_masks"])["__test_metadata__"], torch.tensor(9.0))
+
+
+# ===========================================================================
+# Frozen mixed-length reduction oracle
+#
+# The window holds 16 responses with lengths 1024/256/64/16 (four each),
+# irregular prompt lengths and three loss-mask shapes, giving N = 16 responses
+# and T = 4930 loss-contributing tokens. With ppo_kl == 0 (old log probs equal
+# the current ones, as on the first optimizer step) the production PPO clip
+# degenerates to -advantage per token, so the raw actor numerator is exactly
+# S = 402 and the reductions are integer-exact:
+#
+#     alpha    = T / (N * B) = 4930 / 16384
+#     Dr.GRPO  = S / (N * B) = 402 / 16384 = 0.0245361328125
+#     GRPO     = S_grpo / T                = 0.031580906737842154
+#
+# Every DP/CP topology and micro-batch size must hit the same numbers.
+#
+# Production code under test: the optimizer-window metadata provider, the CP
+# slice/reducer pair, compute_policy_loss, loss_function's per-token scaling and
+# logging vector, and the metric reduction formula from model.py::train_one_step.
+# The single stubbed step is get_log_probs_and_entropy (logits -> log probs),
+# which needs a TP group and real model logits; ppo_kl == 0 pins its
+# contribution analytically.
+#
+# Not covered: model forward numerics, Megatron DDP finalize_model_grads,
+# optimizer step, and BF16/TE kernel behaviour.
+# ===========================================================================
+
+RESPONSE_LENGTH_BLOCKS = (1024, 256, 64, 16)
+PROMPT_LENGTHS = (31, 63, 127, 255)
+REWARD_VALUES = (-3.0, -1.0, 1.0, 3.0)
+GROUP_SIZE = 4
+NUM_RESPONSES = 16
+RESPONSE_BUDGET = 1024
+
+# Frozen oracle. Derived by hand from the window below, never from the reducers.
+FROZEN_RESPONSE_TOKENS = 4930
+FROZEN_DR_GRPO_NUMERATOR = 402
+FROZEN_DR_GRPO_ALPHA = Fraction(FROZEN_RESPONSE_TOKENS, NUM_RESPONSES * RESPONSE_BUDGET)
+FROZEN_DR_GRPO_LOSS = Fraction(FROZEN_DR_GRPO_NUMERATOR, NUM_RESPONSES * RESPONSE_BUDGET)
+FROZEN_GRPO_LOSS = 0.031580906737842154
+# GRPO divides by ``group_rewards.std() + 1e-6``; that epsilon alone shifts the
+# token mean by ~1.2e-8, which is what the reported tolerance accounts for.
+GRPO_ORACLE_ATOL = 1.7e-8
+
+TOPOLOGIES = ((1, 1), (2, 1), (4, 1), (1, 2), (2, 2), (1, 4))
+MICRO_BATCH_SIZES = (1, 2)
+
+# OPSM with a negative delta masks every negative-advantage sample (seq_kl == 0
+# here, and 0 > -1), leaving only the advantage >= 0 tokens.
+OPSM_FORCING_DELTA = -1.0
+FROZEN_OPSM_KEPT_TOKENS = 2390
+FROZEN_OPSM_MASKED_TOKENS = FROZEN_RESPONSE_TOKENS - FROZEN_OPSM_KEPT_TOKENS  # 2540
+FROZEN_OPSM_NUMERATOR = -4774
+FROZEN_OPSM_LOSS = Fraction(FROZEN_OPSM_NUMERATOR, NUM_RESPONSES * RESPONSE_BUDGET)
+
+# Emulated Qwen3.5 bridge layout: maybe_padded_total_lengths aligns to tp * cp * 2.
+BRIDGE_TENSOR_PARALLEL_SIZE = 2
+
+ENTROPY_COEF = 0.01
+KL_LOSS_COEF = 0.01
+REFERENCE_LOG_PROB = -0.5
+
+# Four responses that share advantage -3 but differ ~73x in valid token count.
+# Their gradients must stay proportional to those counts, which is the
+# long-vs-short weighting claim at a far wider spread than a toy two-sample
+# batch can express.
+SAME_ADVANTAGE_INDICES = (0, 7, 10, 13)
+SAME_ADVANTAGE_VALID_TOKENS = (1024, 224, 56, 14)
+
+# With ppo_kl == 0 the per-token derivative is -advantage, so a response
+# contributes -advantage * valid_tokens, and the window's total gradient is
+# alpha * S. Freezing the absolute value matters: a ratio-only check still
+# passes if every gradient is scaled by the same wrong constant (alpha applied
+# twice, say).
+FROZEN_DR_GRPO_GRADIENT_TOTAL = Fraction(FROZEN_DR_GRPO_NUMERATOR * FROZEN_RESPONSE_TOKENS, 16384)
+
+
+def _build_loss_mask(response_length: int, variant: int) -> list[int]:
+    """Tail / interior-span / strided masks, one shape per group member."""
+    loss_mask = [1] * response_length
+    if variant == 1:
+        loss_mask[-max(response_length // 8, 1) :] = [0] * max(response_length // 8, 1)
+    elif variant == 2:
+        start = response_length // 3
+        width = max(response_length // 8, 1)
+        loss_mask[start : start + width] = [0] * width
+    elif variant == 3:
+        loss_mask[::8] = [0] * len(loss_mask[::8])
+    return loss_mask
+
+
+def _build_window() -> list[dict]:
+    """16 responses ordered so contiguous DP shards are token-imbalanced."""
+    window = []
+    for length_block, response_length in enumerate(RESPONSE_LENGTH_BLOCKS):
+        for group_index in range(GROUP_SIZE):
+            offset = (length_block + group_index) % GROUP_SIZE
+            window.append(
+                {
+                    "index": length_block * GROUP_SIZE + group_index,
+                    "group_index": group_index,
+                    "prompt_length": PROMPT_LENGTHS[offset],
+                    "response_length": response_length,
+                    "reward": REWARD_VALUES[offset],
+                    "loss_mask": _build_loss_mask(response_length, group_index),
+                }
+            )
+    return window
+
+
+def _independent_oracle(advantage_estimator: str) -> tuple[int, float]:
+    """Recompute ``(T, S)`` with plain Python arithmetic.
+
+    Deliberately does not call ``post_process_rewards`` or any reducer, so a
+    bug that is shared between the production advantage path and the reduction
+    path cannot make the oracle agree with itself.
+    """
+    window = _build_window()
+    groups: dict[int, list[dict]] = {}
+    for response in window:
+        groups.setdefault(response["group_index"], []).append(response)
+
+    response_tokens = sum(sum(response["loss_mask"]) for response in window)
+    numerator = 0.0
+    for members in groups.values():
+        rewards = [member["reward"] for member in members]
+        mean = sum(rewards) / len(rewards)
+        advantages = [reward - mean for reward in rewards]
+        if advantage_estimator != "dr_grpo":
+            variance = sum(advantage**2 for advantage in advantages) / (len(advantages) - 1)
+            scale = math.sqrt(variance) + 1e-6
+            advantages = [advantage / scale for advantage in advantages]
+        for member, advantage in zip(members, advantages, strict=True):
+            # compute_policy_loss yields -ratio * advantage, and ratio == 1 here.
+            numerator += -advantage * sum(member["loss_mask"])
+    return response_tokens, numerator
+
+
+def _production_advantages(advantage_estimator: str) -> dict[int, float]:
+    """Per-response advantage from the production reward post-processing."""
+    window = _build_window()
+    samples = [
+        Sample(group_index=response["group_index"], index=response["index"], reward=response["reward"])
+        for response in window
+    ]
+    args = Namespace(
+        advantage_estimator=advantage_estimator,
+        custom_reward_post_process_path=None,
+        agentic_custom_advantage_path=None,
+        rewards_normalization=True,
+        grpo_std_normalization=True,
+        n_samples_per_prompt=GROUP_SIZE,
+        reward_key=None,
+    )
+    _, advantages = post_process_rewards(args, samples)
+    return {response["index"]: advantage for response, advantage in zip(window, advantages, strict=True)}
+
+
+def _loss_args(advantage_estimator: str, **overrides) -> Namespace:
+    args = Namespace(
+        advantage_estimator=advantage_estimator,
+        loss_type="policy_loss",
+        recompute_loss_function=False,
+        qkv_format="thd",
+        calculate_per_token_loss=True,
+        allgather_cp=False,
+        global_batch_size=NUM_RESPONSES,
+        rollout_max_response_len=RESPONSE_BUDGET,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        opsm_delta=0.0,
+        opd_token_selection="none",
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        entropy_coef=0.0,
+        use_kl_loss=False,
+        kl_loss_type="low_var_kl",
+        use_unbiased_kl=False,
+        kl_loss_coef=0.0,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _install_cpu_parallel_state(cp_size, cp_rank, cp_group, dp_without_cp_group) -> None:
+    """Point the Megatron accessors at the Gloo groups built by this worker."""
+
+    def _data_parallel_group(with_context_parallel: bool = False):
+        # Freezes the contract: Dr.GRPO's (N, T) must never be reduced on a group
+        # that carries CP replicas, or every sample would be counted cp_size times.
+        assert with_context_parallel is False, "Dr.GRPO metadata must use the DP-without-CP group"
+        return dp_without_cp_group
+
+    loss_module.device_utils.make_current_torch_device = lambda: torch.device("cpu")
+    loss_module.mpu.get_data_parallel_group = _data_parallel_group
+    cp_utils_module.mpu.get_context_parallel_world_size = lambda: cp_size
+    cp_utils_module.mpu.get_context_parallel_rank = lambda: cp_rank
+    cp_utils_module.mpu.get_context_parallel_group = lambda: cp_group
+
+
+def _bridge_padded_total_lengths(total_lengths: list[int]) -> list[int] | None:
+    """Explicit ``tp * cp * 2`` padded lengths, as the Qwen3.5 bridge path emits.
+
+    The plain THD path leaves ``padded_total_lengths=None`` and lets the CP
+    helpers derive ``ceil(total_length / (2 * cp))`` implicitly. The bridge path
+    instead pads every sample up front, so both layouts must be exercised.
+    """
+    original = cp_utils_module.mpu.get_tensor_model_parallel_world_size
+    cp_utils_module.mpu.get_tensor_model_parallel_world_size = lambda: BRIDGE_TENSOR_PARALLEL_SIZE
+    try:
+        return cp_utils_module.maybe_padded_total_lengths(total_lengths, "thd", is_vl_model=True)
+    finally:
+        cp_utils_module.mpu.get_tensor_model_parallel_world_size = original
+
+
+def _cp_local_slice(tensor, total_length, response_length, padded_total_length):
+    return cp_utils_module.slice_log_prob_with_cp(
+        tensor, total_length, response_length, "thd", None, padded_total_length
+    )
+
+
+def _cp_local_response_shapes(total_lengths, response_lengths, padded_total_lengths) -> list[int]:
+    """CP-local response lengths, taken from the production slicing helper."""
+    padded = padded_total_lengths if padded_total_lengths is not None else [None] * len(total_lengths)
+    return [
+        _cp_local_slice(
+            torch.zeros(response_length, dtype=torch.float64), total_length, response_length, padded_total_length
+        ).numel()
+        for total_length, response_length, padded_total_length in zip(
+            total_lengths, response_lengths, padded, strict=True
+        )
+    ]
+
+
+def _stub_log_probs_and_entropy(entropy_value: float, theta_sink: list | None = None):
+    """Stand in for the logits -> log-prob step (needs a TP group and real
+    logits).
+
+    Without ``theta_sink`` it returns zeros, so ``ppo_kl == 0`` and the PPO ratio
+    is exactly 1 -- the first-optimizer-step condition the oracle assumes. With a
+    sink it returns ``theta_i * ones(...)`` per response, still zero-valued, so
+    the ratio is unchanged but each response gains a differentiable handle for
+    the per-response weighting assertions.
+    """
+
+    def _stub(logits, **kwargs):
+        shapes = _cp_local_response_shapes(
+            kwargs["total_lengths"], kwargs["response_lengths"], kwargs.get("padded_total_lengths")
+        )
+        if theta_sink is None:
+            log_probs = [torch.zeros(size, dtype=torch.float64) for size in shapes]
+        else:
+            thetas = [torch.zeros((), dtype=torch.float64, requires_grad=True) for _ in shapes]
+            theta_sink.clear()
+            theta_sink.extend(thetas)
+            log_probs = [
+                theta * torch.ones(size, dtype=torch.float64) for theta, size in zip(thetas, shapes, strict=True)
+            ]
+        entropy = [torch.full((size,), entropy_value, dtype=torch.float64) for size in shapes]
+        return None, {"log_probs": log_probs, "entropy": entropy}
+
+    return _stub
+
+
+def _build_micro_batch(members, advantages, extra_fields, use_bridge_padding, needs_reference):
+    total_lengths = [member["prompt_length"] + member["response_length"] for member in members]
+    response_lengths = [member["response_length"] for member in members]
+    loss_masks = [torch.tensor(member["loss_mask"], dtype=torch.float64) for member in members]
+
+    padded_total_lengths = _bridge_padded_total_lengths(total_lengths) if use_bridge_padding else None
+    padded = padded_total_lengths if padded_total_lengths is not None else [None] * len(members)
+
+    cp_local_advantages = []
+    for member, total_length, response_length, padded_total_length in zip(
+        members, total_lengths, response_lengths, padded, strict=True
+    ):
+        full = torch.full((response_length,), advantages[member["index"]], dtype=torch.float64)
+        cp_local_advantages.append(_cp_local_slice(full, total_length, response_length, padded_total_length))
+
+    batch = {
+        "total_lengths": total_lengths,
+        "response_lengths": response_lengths,
+        "loss_masks": loss_masks,
+        "advantages": cp_local_advantages,
+        "log_probs": [torch.zeros_like(tensor) for tensor in cp_local_advantages],
+        "unconcat_tokens": [None] * len(members),
+    }
+    if padded_total_lengths is not None:
+        batch["padded_total_lengths"] = padded_total_lengths
+    if needs_reference:
+        batch["ref_log_probs"] = [torch.full_like(tensor, REFERENCE_LOG_PROB) for tensor in cp_local_advantages]
+    batch.update(extra_fields)
+    return batch
+
+
+def _split_micro_batches(local, micro_batch_size, micro_batch_groups):
+    """Fixed-size chunks, or an explicitly irregular dynamic-batching
+    grouping."""
+    if micro_batch_groups is None:
+        return [local[start : start + micro_batch_size] for start in range(0, len(local), micro_batch_size)]
+    grouped = [[local[position] for position in group] for group in micro_batch_groups]
+    assert sorted(position for group in micro_batch_groups for position in group) == list(range(len(local)))
+    return grouped
+
+
+def _reduce_window(
+    *,
+    advantage_estimator,
+    dp_size,
+    dp_rank,
+    cp_size,
+    dp_with_cp_group,
+    micro_batch_size=1,
+    micro_batch_groups=None,
+    entropy_value=0.0,
+    arg_overrides=None,
+    batch_fields=None,
+    use_bridge_padding=False,
+    collect_gradients=False,
+    cp_group=None,
+):
+    """Run one optimizer window end to end and return the reported metrics."""
+    window = _build_window()
+    advantages = _production_advantages(advantage_estimator)
+    shard = NUM_RESPONSES // dp_size
+    local = window[dp_rank * shard : (dp_rank + 1) * shard]
+
+    args = _loss_args(advantage_estimator, **(arg_overrides or {}))
+    metadata = loss_module.prepare_policy_optimizer_window_metadata(
+        args,
+        {"loss_masks": [torch.tensor(member["loss_mask"], dtype=torch.float64) for member in local]},
+        [len(local)],
+    )
+
+    micro_batches = _split_micro_batches(local, micro_batch_size, micro_batch_groups)
+    theta_sink = [] if collect_gradients else None
+    loss_module.get_log_probs_and_entropy = _stub_log_probs_and_entropy(entropy_value, theta_sink)
+
+    keys = None
+    values = None
+    gradients: dict[int, torch.Tensor] = {}
+    for members in micro_batches:
+        extra = dict(batch_fields or {})
+        if metadata is not None:
+            extra["__dr_grpo_window_scale__"] = metadata[0]["__dr_grpo_window_scale__"]
+        batch = _build_micro_batch(members, advantages, extra, use_bridge_padding, args.use_kl_loss)
+        loss, _, logging = loss_module.loss_function(args, batch, len(micro_batches), torch.zeros(1))
+        keys = logging["keys"]
+        values = logging["values"] if values is None else values + logging["values"]
+        if collect_gradients:
+            loss.backward()
+            for member, theta in zip(members, theta_sink, strict=True):
+                gradients[member["index"]] = theta.grad.clone()
+
+    # Same reduction as model.py::train_one_step: sum the logging vectors across
+    # micro-batches, all-reduce over DP-with-CP, then divide by the global token
+    # count that rides in slot 0.
+    dist.all_reduce(values, group=dp_with_cp_group)
+    values = values.tolist()
+    reported = {key: value / values[0] for key, value in zip(keys, values[1:], strict=True)}
+    reported["__response_tokens__"] = values[0]
+    if metadata is not None:
+        reported["__alpha__"] = float(metadata[0]["__dr_grpo_window_scale__"])
+    if collect_gradients:
+        # Each rank holds only its CP shard of every response; sum to recover the
+        # per-response gradient the optimizer would actually see.
+        for index, gradient in gradients.items():
+            if cp_size > 1:
+                dist.all_reduce(gradient, group=cp_group)
+            reported.setdefault("__gradients__", {})[index] = gradient.item()
+    return reported
+
+
+def test_dr_grpo_window_fixture_matches_frozen_constants():
+    window = _build_window()
+    valid_token_counts = [sum(response["loss_mask"]) for response in window]
+
+    assert len(window) == NUM_RESPONSES
+    assert valid_token_counts == [1024, 896, 896, 896, 256, 224, 224, 224, 64, 56, 56, 56, 16, 14, 14, 14]
+    assert sum(valid_token_counts) == FROZEN_RESPONSE_TOKENS
+
+    dr_grpo_tokens, dr_grpo_numerator = _independent_oracle("dr_grpo")
+    assert dr_grpo_tokens == FROZEN_RESPONSE_TOKENS
+    assert dr_grpo_numerator == pytest.approx(FROZEN_DR_GRPO_NUMERATOR, abs=0.0)
+    assert float(FROZEN_DR_GRPO_LOSS) == 0.0245361328125
+
+    _, grpo_numerator = _independent_oracle("grpo")
+    assert grpo_numerator / FROZEN_RESPONSE_TOKENS == pytest.approx(FROZEN_GRPO_LOSS, abs=GRPO_ORACLE_ATOL)
+
+
+def test_dr_grpo_production_advantages_only_center_within_group():
+    dr_grpo = _production_advantages("dr_grpo")
+    grpo = _production_advantages("grpo")
+
+    # Each group holds one of every reward, so centering alone leaves the raw values.
+    assert sorted(round(value, 6) for value in dr_grpo.values()) == sorted(
+        round(float(reward), 6) for reward in REWARD_VALUES * GROUP_SIZE
+    )
+    # GRPO additionally divides by the group std, shrinking every magnitude.
+    assert all(abs(grpo[index]) < abs(dr_grpo[index]) for index in dr_grpo)
+
+
+def _topology_worker(rank: int, dp_size: int, cp_size: int, port: int) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=dp_size * cp_size)
+    try:
+        dp_rank, cp_rank = divmod(rank, cp_size)
+
+        # Every rank creates every group in the same order, or group creation
+        # itself can mismatch or hang.
+        cp_groups = [
+            dist.new_group([replica * cp_size + index for index in range(cp_size)]) for replica in range(dp_size)
+        ]
+        dp_without_cp_groups = [
+            dist.new_group([replica * cp_size + index for replica in range(dp_size)]) for index in range(cp_size)
+        ]
+        _install_cpu_parallel_state(cp_size, cp_rank, cp_groups[dp_rank], dp_without_cp_groups[cp_rank])
+
+        for advantage_estimator in ("dr_grpo", "grpo"):
+            expected = float(FROZEN_DR_GRPO_LOSS) if advantage_estimator == "dr_grpo" else FROZEN_GRPO_LOSS
+            for micro_batch_size in MICRO_BATCH_SIZES:
+                reported = _reduce_window(
+                    advantage_estimator=advantage_estimator,
+                    dp_size=dp_size,
+                    dp_rank=dp_rank,
+                    cp_size=cp_size,
+                    micro_batch_size=micro_batch_size,
+                    dp_with_cp_group=dist.group.WORLD,
+                )
+                context = f"{advantage_estimator} DP{dp_size}/CP{cp_size}/MBS{micro_batch_size}"
+
+                assert reported["__response_tokens__"] == FROZEN_RESPONSE_TOKENS, context
+                if advantage_estimator == "dr_grpo":
+                    assert reported["__alpha__"] == float(FROZEN_DR_GRPO_ALPHA), context
+                    assert reported["loss"] == expected, context
+                    assert reported["pg_loss"] == expected, context
+                else:
+                    assert "__alpha__" not in reported, context
+                    assert abs(reported["loss"] - expected) < GRPO_ORACLE_ATOL, context
+                assert reported["pg_clipfrac"] == 0.0, context
+                assert reported["ppo_kl"] == 0.0, context
+
+            # The window's configured B happens to equal max(response_lengths), so
+            # the numbers above cannot tell a configured budget from an observed
+            # maximum. Doubling only the configured budget must halve Dr.GRPO
+            # exactly and leave the GRPO token mean untouched.
+            doubled = _reduce_window(
+                advantage_estimator=advantage_estimator,
+                dp_size=dp_size,
+                dp_rank=dp_rank,
+                cp_size=cp_size,
+                micro_batch_size=1,
+                dp_with_cp_group=dist.group.WORLD,
+                arg_overrides={"rollout_max_response_len": 2 * RESPONSE_BUDGET},
+            )
+            context = f"{advantage_estimator} DP{dp_size}/CP{cp_size} with B={2 * RESPONSE_BUDGET}"
+            if advantage_estimator == "dr_grpo":
+                assert doubled["__alpha__"] == float(FROZEN_DR_GRPO_ALPHA) / 2, context
+                assert doubled["loss"] == expected / 2, context
+            else:
+                assert abs(doubled["loss"] - expected) < GRPO_ORACLE_ATOL, context
+
+        _assert_dynamic_batching(dp_size, dp_rank, cp_size)
+        _assert_bridge_padding(dp_size, dp_rank, cp_size)
+        _assert_entropy_and_kl_combination(dp_size, dp_rank, cp_size)
+        _assert_opsm_forced_branch(dp_size, dp_rank, cp_size)
+        _assert_response_weight_tracks_valid_tokens(dp_size, dp_rank, cp_size, cp_groups[dp_rank])
+    finally:
+        dist.destroy_process_group()
+
+
+def _dynamic_micro_batch_groups(local_size: int) -> list[list[int]]:
+    """Irregular groupings like the ``max_tokens_per_gpu`` dynamic batcher
+    emits.
+
+    Fixed-size chunking can hide a window scale that drifts with micro-batch
+    membership, because every micro-batch then holds the same sample count.
+    """
+    groupings = {
+        16: [[3], [2, 14], [5, 7, 8, 9, 13], [1, 11], [0, 15], [4, 6, 10, 12]],
+        8: [[5], [0, 3, 6], [2, 7], [1, 4]],
+        4: [[2], [0, 1, 3]],
+    }
+    return groupings[local_size]
+
+
+def _assert_dynamic_batching(dp_size: int, dp_rank: int, cp_size: int) -> None:
+    """Section 3.5: uneven micro-batch membership must not move the oracle."""
+    reported = _reduce_window(
+        advantage_estimator="dr_grpo",
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        cp_size=cp_size,
+        dp_with_cp_group=dist.group.WORLD,
+        micro_batch_groups=_dynamic_micro_batch_groups(NUM_RESPONSES // dp_size),
+    )
+    context = f"dynamic batching DP{dp_size}/CP{cp_size}"
+    assert reported["__response_tokens__"] == FROZEN_RESPONSE_TOKENS, context
+    assert reported["__alpha__"] == float(FROZEN_DR_GRPO_ALPHA), context
+    assert reported["loss"] == float(FROZEN_DR_GRPO_LOSS), context
+
+
+def _assert_bridge_padding(dp_size: int, dp_rank: int, cp_size: int) -> None:
+    """Section 3.3: explicit ``tp * cp * 2`` padding must hit the same oracle."""
+    if cp_size == 1:
+        return  # maybe_padded_total_lengths only applies to the CP>1 bridge path.
+    reported = _reduce_window(
+        advantage_estimator="dr_grpo",
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        cp_size=cp_size,
+        dp_with_cp_group=dist.group.WORLD,
+        use_bridge_padding=True,
+    )
+    context = f"bridge padding DP{dp_size}/CP{cp_size}"
+    # Padding tokens must not reach T, the numerator, or the reported loss.
+    assert reported["__response_tokens__"] == FROZEN_RESPONSE_TOKENS, context
+    assert reported["loss"] == float(FROZEN_DR_GRPO_LOSS), context
+
+
+def _assert_entropy_and_kl_combination(dp_size: int, dp_rank: int, cp_size: int) -> None:
+    """Section 3.6: entropy and explicit KL ride the same fixed-budget
+    scale."""
+    reported = _reduce_window(
+        advantage_estimator="dr_grpo",
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        cp_size=cp_size,
+        dp_with_cp_group=dist.group.WORLD,
+        entropy_value=0.75,
+        arg_overrides={
+            "entropy_coef": ENTROPY_COEF,
+            "use_kl_loss": True,
+            "kl_loss_coef": KL_LOSS_COEF,
+        },
+    )
+    context = f"entropy+KL DP{dp_size}/CP{cp_size}"
+    combined = reported["pg_loss"] - ENTROPY_COEF * reported["entropy_loss"] + KL_LOSS_COEF * reported["kl_loss"]
+    assert abs(reported["loss"] - combined) < 1e-12, context
+    # pg_loss keeps its own oracle, so entropy/KL did not leak into it.
+    assert reported["pg_loss"] == float(FROZEN_DR_GRPO_LOSS), context
+    # Every objective component carries alpha: an unscaled entropy mean would be
+    # the raw 0.75, not 0.75 * alpha.
+    assert abs(reported["entropy_loss"] - 0.75 * float(FROZEN_DR_GRPO_ALPHA)) < 1e-12, context
+    # compute_approx_kl casts its inputs to float32, so this term cannot carry the
+    # float64 tolerance used above. The margin still dwarfs the failure being
+    # guarded against: a missing alpha would report the raw 0.1065, not 0.0321.
+    reference_kl = math.exp(REFERENCE_LOG_PROB) - REFERENCE_LOG_PROB - 1
+    assert abs(reported["kl_loss"] - reference_kl * float(FROZEN_DR_GRPO_ALPHA)) < 1e-6, context
+
+
+def _assert_opsm_forced_branch(dp_size: int, dp_rank: int, cp_size: int) -> None:
+    """Section 3.7: OPSM masking keeps the Dr.GRPO fixed denominator."""
+    reported = _reduce_window(
+        advantage_estimator="dr_grpo",
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        cp_size=cp_size,
+        dp_with_cp_group=dist.group.WORLD,
+        arg_overrides={"use_opsm": True, "opsm_delta": OPSM_FORCING_DELTA},
+    )
+    context = f"OPSM DP{dp_size}/CP{cp_size}"
+    # The denominator stays the full T even though only 2390 tokens survive.
+    assert reported["__response_tokens__"] == FROZEN_RESPONSE_TOKENS, context
+    assert reported["opsm_clipfrac"] == FROZEN_OPSM_MASKED_TOKENS / FROZEN_RESPONSE_TOKENS, context
+    assert reported["pg_loss"] == float(FROZEN_OPSM_LOSS), context
+    assert reported["loss"] == float(FROZEN_OPSM_LOSS), context
+
+
+def _assert_response_weight_tracks_valid_tokens(dp_size, dp_rank, cp_size, cp_group) -> None:
+    """A response's gradient weight must scale with its valid token count.
+
+    Uses the four fixture responses that share advantage -3 but span 1024 -> 14
+    valid tokens (~73x), instead of a two-sample batch whose lengths differ by
+    a small factor. Only meaningful when one rank owns all four, i.e. DP=1.
+    """
+    if dp_size != 1:
+        return
+    reported = _reduce_window(
+        advantage_estimator="dr_grpo",
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        cp_size=cp_size,
+        dp_with_cp_group=dist.group.WORLD,
+        collect_gradients=True,
+        cp_group=cp_group,
+    )
+    gradients = reported["__gradients__"]
+    context = f"response weighting DP{dp_size}/CP{cp_size}"
+
+    # Absolute oracle first: each response contributes -advantage * valid_tokens,
+    # scaled by the window's alpha. Expected values come from the fixture, not
+    # from a reducer.
+    alpha = float(FROZEN_DR_GRPO_ALPHA)
+    window = {response["index"]: response for response in _build_window()}
+    for index, gradient in gradients.items():
+        response = window[index]
+        # Dr.GRPO centers within a group whose four rewards sum to zero, so the
+        # advantage equals the raw reward.
+        expected = -response["reward"] * sum(response["loss_mask"]) * alpha
+        assert abs(gradient - expected) < 1e-9, f"{context} index={index}"
+    assert abs(sum(gradients.values()) - float(FROZEN_DR_GRPO_GRADIENT_TOTAL)) < 1e-9, context
+
+    # Then the relative claim, over responses that share an advantage but span
+    # ~73x in valid token count.
+    reference_index = SAME_ADVANTAGE_INDICES[0]
+    reference_tokens = SAME_ADVANTAGE_VALID_TOKENS[0]
+    for index, valid_tokens in zip(SAME_ADVANTAGE_INDICES, SAME_ADVANTAGE_VALID_TOKENS, strict=True):
+        expected = gradients[reference_index] * valid_tokens / reference_tokens
+        assert abs(gradients[index] - expected) < 1e-12, f"{context} index={index}"
+
+    # Responses differing only in valid token count must not tie: a per-sample
+    # mean would make all four gradients equal.
+    assert len({round(gradients[index], 12) for index in SAME_ADVANTAGE_INDICES}) == len(SAME_ADVANTAGE_INDICES)
+
+
+@pytest.mark.parametrize(("dp_size", "cp_size"), TOPOLOGIES)
+def test_dr_grpo_reduction_is_topology_and_micro_batch_invariant(dp_size: int, cp_size: int) -> None:
+    world_size = dp_size * cp_size
+    mp.spawn(_topology_worker, args=(dp_size, cp_size, _free_port()), nprocs=world_size, join=True)
