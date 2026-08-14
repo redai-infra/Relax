@@ -1099,6 +1099,9 @@ def policy_loss_function(
         log_probs_and_entropy=log_probs_and_entropy,
     )
     if eopd_fkl_loss is not None:
+        if getattr(args, "opd_teacher_advantage", False):
+            num_samples = len(batch["loss_masks"])
+            eopd_fkl_loss = eopd_fkl_loss * num_samples
         loss = loss + eopd_fkl_loss
 
     if log_probs.numel() == 0:

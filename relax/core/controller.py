@@ -43,6 +43,7 @@ from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
+    is_managed_opd_teacher_colocate,
     maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
@@ -518,6 +519,9 @@ class Controller:
                 continue
             num_serves, num_gpus = self.config.resource.get(role)
             assert num_serves == 1, f"Currently only support num_serves=1 for {role}, but received {num_serves=}"
+            if str(role) == "actor" and is_managed_opd_teacher_colocate(self.config):
+                _, rollout_gpus = self.config.resource.get("rollout", (1, num_gpus))
+                num_gpus = rollout_gpus
             self._health_manager.mark_healthy(role)
             logger.info(f"Service {role} start creating.")
 

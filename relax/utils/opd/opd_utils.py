@@ -143,6 +143,8 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
     overrides["model_path"] = args.teacher_hf_checkpoint
     overrides.setdefault("load_format", "auto")
     overrides.setdefault("enable_memory_saver", colocate_sync)
+    if colocate_sync:
+        overrides.setdefault("enable_weights_cpu_backup", True)
     return overrides
 
 
@@ -706,6 +708,35 @@ def add_opd_arguments(parser: Any) -> Any:
         default=0,
         help="Top-K for EOPD forward KL. 0 (default) uses --opd-log-prob-top-k.",
     )
+    parser.add_argument(
+        "--opd-teacher-advantage",
+        action="store_true",
+        default=False,
+        help=(
+            "Paper-mode EOPD: use teacher_advantage = (teacher_lp - old_student_lp).detach() "
+            "directly as the PPO advantage, replacing GRPO advantages entirely. "
+            "Set --opd-kl-coef=0 --opd-loss-coef=0 when using this mode."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-advantage-additive",
+        action="store_true",
+        default=False,
+        help=(
+            "When used with --opd-teacher-advantage, ADD teacher advantage to GRPO "
+            "advantages instead of replacing them. Requires NOT using --opd-only-reward."
+        ),
+    )
+    parser.add_argument(
+        "--opd-eos-replace",
+        action="store_true",
+        default=False,
+        help=(
+            "Replace <|endoftext|> (151643) with <|im_end|> (151645) in response "
+            "tokens before teacher prefill. Needed for Qwen3 cross-architecture "
+            "distillation where student uses endoftext but teacher expects im_end."
+        ),
+    )
     return parser
 
 
@@ -744,16 +775,24 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
 
     opd_kl_coef = float(getattr(args, "opd_kl_coef", 0.0) or 0.0)
     opd_loss_coef = float(getattr(args, "opd_loss_coef", 0.0) or 0.0)
+    teacher_advantage = getattr(args, "opd_teacher_advantage", False)
 
-    is_adv_mode = opd_kl_coef != 0.0 and opd_loss_coef == 0.0
-    is_loss_mode = opd_kl_coef == 0.0 and opd_loss_coef != 0.0
-    if not is_adv_mode and not is_loss_mode:
-        raise ValueError(
-            "Exactly one of --opd-kl-coef / --opd-loss-coef must be non-zero. "
-            f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}. "
-            "Use --opd-kl-coef=X --opd-loss-coef=0.0 for advantage mode, or "
-            "--opd-kl-coef=0.0 --opd-loss-coef=X for loss mode."
-        )
+    if teacher_advantage:
+        if opd_kl_coef != 0.0 or opd_loss_coef != 0.0:
+            raise ValueError(
+                "--opd-teacher-advantage replaces GRPO advantages with teacher_advantage. "
+                "Set --opd-kl-coef=0.0 --opd-loss-coef=0.0 when using this mode."
+            )
+    else:
+        is_adv_mode = opd_kl_coef != 0.0 and opd_loss_coef == 0.0
+        is_loss_mode = opd_kl_coef == 0.0 and opd_loss_coef != 0.0
+        if not is_adv_mode and not is_loss_mode:
+            raise ValueError(
+                "Exactly one of --opd-kl-coef / --opd-loss-coef must be non-zero. "
+                f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}. "
+                "Use --opd-kl-coef=X --opd-loss-coef=0.0 for advantage mode, or "
+                "--opd-kl-coef=0.0 --opd-loss-coef=X for loss mode."
+            )
 
     if getattr(args, "opd_teacher_prompt_key", None) is not None:
         if args.opd_type != "sglang":
@@ -860,8 +899,6 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
     if getattr(args, "use_eopd", False):
         if args.opd_type not in ("megatron", "sglang"):
             raise ValueError("--use-eopd requires --opd-type=megatron or --opd-type=sglang.")
-        if opd_loss_coef == 0.0:
-            raise ValueError("--use-eopd requires --opd-loss-coef > 0 (loss mode).")
         eopd_top_k = int(getattr(args, "eopd_fkl_top_k", 0) or 0)
         base_top_k = int(getattr(args, "opd_log_prob_top_k", 0) or 0)
         if eopd_top_k <= 0 and base_top_k <= 0:
@@ -1328,11 +1365,40 @@ def _opd_compute_per_token_signal(
     ).to(dtype=student_lp_1d.dtype)
 
 
+def _apply_teacher_advantage(
+    rollout_data: RolloutBatch,
+    advantages: list[torch.Tensor],
+    additive: bool = False,
+) -> None:
+    """Replace or add teacher_advantage = (teacher_lp - old_student_lp).detach() to PPO advantages."""
+    teacher_log_probs = rollout_data.get("teacher_log_probs")
+    student_log_probs = rollout_data.get("rollout_log_probs")
+    if teacher_log_probs is None or student_log_probs is None:
+        return
+    for i, adv in enumerate(advantages):
+        t_lp = teacher_log_probs[i].to(device=adv.device)
+        s_lp = student_log_probs[i].to(device=adv.device)
+        if t_lp.numel() == 0 or s_lp.numel() == 0:
+            continue
+        teacher_adv = (t_lp - s_lp).detach()
+        if additive:
+            advantages[i] = adv + teacher_adv
+        else:
+            advantages[i] = teacher_adv
+
+
 def apply_opd_to_advantages(
     args: Namespace,
     rollout_data: RolloutBatch,
     advantages: list[torch.Tensor],
 ) -> None:
+    teacher_advantage_mode = getattr(args, "opd_teacher_advantage", False)
+
+    if teacher_advantage_mode:
+        additive = getattr(args, "opd_teacher_advantage_additive", False)
+        _apply_teacher_advantage(rollout_data, advantages, additive=additive)
+        return
+
     if args.opd_kl_coef == 0.0:
         return
 
@@ -1346,10 +1412,17 @@ def apply_opd_to_advantages(
     if is_topk:
         student_topk_lp_list = rollout_data.get("opd_topk_student_log_probs")
         teacher_topk_lp_list = rollout_data.get("opd_topk_teacher_log_probs")
-        if student_topk_lp_list is None or teacher_topk_lp_list is None:
-            return
+        has_student = student_topk_lp_list is not None and any(
+            isinstance(v, torch.Tensor) and v.numel() > 0 for v in student_topk_lp_list
+        )
+        has_teacher = teacher_topk_lp_list is not None and any(
+            isinstance(v, torch.Tensor) and v.numel() > 0 for v in teacher_topk_lp_list
+        )
+        if not has_student or not has_teacher:
+            is_topk = False
+
+    if is_topk:
         device = advantages[0].device if advantages else torch.device("cpu")
-        # union ：per-row valid length  → bool mask [R, max_K']
         k_lengths_list = rollout_data.get("opd_topk_ksz") if token_selection == "union" else None
 
         for i, adv in enumerate(advantages):
@@ -1395,16 +1468,23 @@ def apply_opd_to_advantages(
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
+    per_token_clip = getattr(args, "opd_per_token_clip", None)
     for i, adv in enumerate(advantages):
+        s_lp = student_log_probs[i]
+        t_lp = teacher_log_probs[i]
+        if s_lp.numel() == 0 or t_lp.numel() == 0:
+            continue
         kl_term = _opd_compute_per_token_signal(
-            student_lp_1d=student_log_probs[i],
-            teacher_lp_1d=teacher_log_probs[i],
-            token_selection=token_selection,
+            student_lp_1d=s_lp,
+            teacher_lp_1d=t_lp,
+            token_selection="student_sampled",
             kl_type=kl_type,
             jsd_alpha=jsd_alpha,
             norm_mode=norm_mode,
             log_prob_min_clamp=log_prob_min_clamp,
         )
+        if per_token_clip is not None:
+            kl_term = torch.clamp(kl_term, max=float(per_token_clip))
         advantages[i] = adv - args.opd_kl_coef * kl_term.detach()
 
 
@@ -1569,6 +1649,7 @@ def compute_eopd_fkl_loss(
         teacher_ent_chunks.append(t_ent)
 
     eopd_fkl_per_token = torch.cat(fkl_chunks, dim=0).to(dtype=student_topk_lp_list[0].dtype)
+
     eopd_fkl_loss = reduce_opd_loss(batch, eopd_fkl_per_token)
 
     reported: dict[str, torch.Tensor] = {}
@@ -1576,8 +1657,8 @@ def compute_eopd_fkl_loss(
         all_ent_mask = torch.cat(entropy_mask_chunks, dim=0)
         all_teacher_ent = torch.cat(teacher_ent_chunks, dim=0)
         reported["eopd_fkl_loss"] = eopd_fkl_loss.clone().detach()
-        reported["eopd_high_entropy_frac"] = all_ent_mask.mean().clone().detach()
-        reported["eopd_teacher_entropy_mean"] = all_teacher_ent.mean().clone().detach()
+        reported["eopd_high_entropy_frac"] = reduce_opd_loss(batch, all_ent_mask).clone().detach()
+        reported["eopd_teacher_entropy_mean"] = reduce_opd_loss(batch, all_teacher_ent).clone().detach()
 
     return fkl_coef * eopd_fkl_loss, reported
 

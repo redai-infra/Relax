@@ -121,14 +121,18 @@ class OpdManager:
         fields: list[str] = []
         if self.topk_worker is not None:
             fields.extend(self.topk_worker.topk_transfer_fields(eopd=eopd))
+            if self.topk_worker.is_advantage or getattr(self.args, "opd_teacher_advantage", False):
+                fields.append(opd_main_worker.SampledTokenWorker.TRANSFER_TEACHER_LOG_PROBS)
         if self.sampled_worker is not None:
             fields.extend(self.sampled_worker.sampled_transfer_fields(eopd=eopd))
         return fields
 
     def produce_opd_transfer_data(self, samples: list[Sample], train_data: dict) -> None:
         if self.topk_worker is not None:
+            schema_fields = set(self.topk_worker.topk_transfer_fields(eopd=getattr(self.args, "use_eopd", False)))
             for field_name in opd_main_worker.TopkWorker.TRANSFER_FIELDS:
-                if not any(getattr(s, field_name, None) is not None for s in samples):
+                has_any = any(getattr(s, field_name, None) is not None for s in samples)
+                if not has_any and field_name not in schema_fields:
                     continue
                 flat: list = []
                 for s in samples:
@@ -142,6 +146,10 @@ class OpdManager:
             if self.topk_worker.spec.name == "union" and any(getattr(s, kl_field, None) is not None for s in samples):
                 train_data[kl_field] = [
                     getattr(s, kl_field).tolist() if getattr(s, kl_field, None) is not None else [] for s in samples
+                ]
+            if self.topk_worker.is_advantage or getattr(self.args, "opd_teacher_advantage", False):
+                train_data[opd_main_worker.SampledTokenWorker.TRANSFER_TEACHER_LOG_PROBS] = [
+                    s.teacher_log_probs if s.teacher_log_probs is not None else [] for s in samples
                 ]
         elif self.sampled_worker is not None:
             train_data[opd_main_worker.SampledTokenWorker.TRANSFER_TEACHER_LOG_PROBS] = [
@@ -199,6 +207,8 @@ class OpdManager:
         self,
         samples: Sample | Sequence[Sample],
         encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+        *,
+        include_student: bool = True,
     ) -> None:
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
@@ -209,11 +219,61 @@ class OpdManager:
             fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
             self._raise_if_all_failed(sample_list, fetch_results)
 
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
+            if include_student and self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
                 await asyncio.gather(
                     *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
                 )
 
+        self._assemble_transfer(sample_list)
+
+    async def _resolve_direct_engine_urls(self) -> list[str]:
+        """Query the SGLang router for direct worker URLs to bypass the router
+        for heavy token_ids_logprob requests (which block the engine event loop
+        and cause the router's health-check circuit breaker to trip)."""
+        router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
+        try:
+            import sglang_router
+            from packaging.version import parse
+
+            if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"{router_base}/list_workers", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        data = await r.json()
+                        return data.get("urls", [])
+            else:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"{router_base}/workers", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        data = await r.json()
+                        return [w["url"] for w in data.get("workers", [])]
+        except Exception as e:
+            logger.warning("Failed to resolve direct engine URLs from router: %s", e)
+            return []
+
+    async def prefill_student(
+        self,
+        samples: Sample | Sequence[Sample],
+        encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+        max_concurrent: int = 4,
+    ) -> None:
+        """Run student-at-teacher prefill only.  Call after all rollout generation
+        is complete to avoid sending token_ids_logprob requests to the student
+        engine while it is still decoding rollout responses."""
+        if self.topk_worker is None or not self.topk_worker.spec.student_at_teacher:
+            return
+        sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
+        sem = asyncio.Semaphore(max_concurrent)
+
+        direct_urls = await self._resolve_direct_engine_urls()
+        student_url_override = f"{direct_urls[0]}/generate" if direct_urls else None
+        if student_url_override:
+            logger.info("[OPD] Bypassing router for student prefill: %s", student_url_override)
+
+        async def _limited(s: Sample, session: aiohttp.ClientSession) -> None:
+            async with sem:
+                await self._student_prefill(s, session, encode_multimodal_inputs, student_url_override)
+
+        async with _create_teacher_client_session(self.args) as session:
+            await asyncio.gather(*[_limited(s, session) for s in sample_list])
         self._assemble_transfer(sample_list)
 
     async def _post_logprob(
@@ -258,6 +318,15 @@ class OpdManager:
             image_data = None
             teacher_input_ids = sample.rollout_tokens or sample.tokens
             prompt_length = len(sample.tokens) - response_length
+
+        if getattr(self.args, "opd_eos_replace", False):
+            _ENDOFTEXT, _IM_END = 151643, 151645
+            teacher_input_ids = list(teacher_input_ids)
+            for j in range(prompt_length, len(teacher_input_ids)):
+                if teacher_input_ids[j] == _ENDOFTEXT:
+                    teacher_input_ids[j] = _IM_END
+                    break
+
         logprob_start_len = max(prompt_length - 1, 0)
 
         mm_fields = {"image_data": image_data} if image_data is not None else None
@@ -273,7 +342,8 @@ class OpdManager:
             payload = opd_main_worker.build_prefill_payload_base(teacher_input_ids, logprob_start_len)
             if mm_fields:
                 payload.update(mm_fields)
-
+        if getattr(self.args, "use_eopd", False):
+            payload["sampling_params"]["max_new_tokens"] = 1
         teacher_url = _pick_teacher_url(self.args, sample)
         resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
         if resp_obj is None:
@@ -296,7 +366,12 @@ class OpdManager:
             )
             return False
 
-        if self.sampled_worker is not None:
+        needs_teacher_lp = (
+            self.sampled_worker is not None
+            or (self.topk_worker is not None and self.topk_worker.is_advantage)
+            or getattr(self.args, "opd_teacher_advantage", False)
+        )
+        if needs_teacher_lp:
             sample.teacher_log_probs = [float(v) for v in token_logprobs[1 : 1 + response_length]]
 
         if self.topk_worker is not None:
@@ -311,13 +386,34 @@ class OpdManager:
 
         if getattr(self.args, "use_eopd", False):
             entropy = resp_obj.entropy_1d()
-            if entropy is not None and len(entropy) >= response_length:
+            if entropy is not None and len(entropy) >= response_length + 1:
                 sample.teacher_entropy = [float(v) for v in entropy[1 : 1 + response_length]]
+            elif entropy is not None and len(entropy) == response_length:
+                sample.teacher_entropy = [float(v) for v in entropy]
+            else:
+                top_k = int(getattr(self.args, "opd_log_prob_top_k", 0) or 0)
+                vocab_size = int(getattr(self.args, "opd_teacher_vocab_size", 151936) or 151936)
+                entropy_topk = resp_obj.entropy_from_topk(top_k, vocab_size, response_length)
+                if entropy_topk is not None and len(entropy_topk) == response_length:
+                    sample.teacher_entropy = [float(v) for v in entropy_topk]
+                else:
+                    logger.warning(
+                        "EOPD entropy missing for sample_index=%s (got %s elements, need %d). "
+                        "Falling back to zeros (EOPD gate disabled for this sample).",
+                        getattr(sample, "index", None),
+                        len(entropy) if entropy is not None else "None",
+                        response_length,
+                    )
+                    sample.teacher_entropy = [0.0] * response_length
 
         return True
 
     async def _student_prefill(
-        self, sample: Sample, session: aiohttp.ClientSession, encode_mm_fn: EncodeMultimodalInputs | None
+        self,
+        sample: Sample,
+        session: aiohttp.ClientSession,
+        encode_mm_fn: EncodeMultimodalInputs | None,
+        url_override: str | None = None,
     ) -> None:
 
         from relax.utils.opd.opd_utils import build_student_preexpanded_image_data
@@ -346,7 +442,7 @@ class OpdManager:
             mm_fields=mm_fields,
         )
 
-        student_url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
+        student_url = url_override or f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
         resp_obj = await self._post_logprob(session, student_url, payload, sample, "student-at-teacher-topk")
         if resp_obj is None:
             return

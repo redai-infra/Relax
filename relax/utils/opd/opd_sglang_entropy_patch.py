@@ -3,31 +3,11 @@
 """Monkey-patch for SGLang LogitsProcessor: compute per-token entropy during
 teacher prefill and return it via ``customized_info`` → ``meta_info``.
 
-Why
----
-EOPD (Entropy-aware On-Policy Distillation) gates its forward-KL loss on
-per-token teacher entropy.  The SGLang HTTP prefill endpoint returns top-K
-log-probs but **not** entropy.  This patch adds entropy computation inside
-the SGLang server process, piggybacking on the full-vocab log-softmax that
-is already computed for ``input_token_logprobs``.
-
-How
----
-Two methods on ``LogitsProcessor`` are wrapped:
-
-1. ``process_input_logprobs`` — after the original runs, computes
-   ``H = -sum(p * log_p, dim=-1)`` from ``input_logits`` and caches the
-   per-request b64-encoded float32 arrays on ``self``.
-
-2. ``forward`` — injects the cached arrays into
-   ``LogitsProcessorOutput.customized_info["relax_input_entropy_b64"]``,
-   which SGLang's scheduler propagates to ``meta_info`` in the HTTP JSON
-   response.
-
-Usage
------
-Applied by ``_launch_server_with_patches()`` in ``sglang_engine.py`` when
-``RELAX_OPD_ENTROPY_PATCH=1``.  Idempotent: applying twice is a no-op.
+Strategy (v7): Patch ``_get_logits`` to compute entropy from the *actual*
+model logits immediately after the TP all-gather.  Only inject entropy into
+``customized_info`` during EXTEND mode with logprob return (i.e. when
+``extend_logprob_pruned_lens_cpu`` is a list).  Skip decode-mode and
+non-logprob extend calls entirely to avoid broken ``customized_info`` routing.
 """
 
 from __future__ import annotations
@@ -42,21 +22,17 @@ import torch.nn.functional as F
 
 logger = logging.getLogger("opd_sglang_entropy_patch")
 
-_PATCH_FLAG = "_relax_entropy_patched"
+_PATCH_FLAG = "_relax_entropy_patched_v7"
 
 
-def _compute_entropy(logits: torch.Tensor) -> torch.Tensor:
-    """Compute per-token entropy from raw logits.
-
-    Args:
-        logits: ``[N, vocab_size]`` raw (pre-softmax) logits.
-
-    Returns:
-        ``[N]`` entropy in nats.
-    """
+def _compute_entropy(logits: torch.Tensor, chunk_size: int = 256) -> torch.Tensor:
     with torch.no_grad():
-        log_p = F.log_softmax(logits.float(), dim=-1)
-        return -(log_p.exp() * log_p).sum(dim=-1)
+        parts = []
+        for i in range(0, logits.shape[0], chunk_size):
+            chunk = logits[i : i + chunk_size].float()
+            log_p = F.log_softmax(chunk, dim=-1)
+            parts.append(-(log_p.exp() * log_p).sum(dim=-1))
+        return torch.cat(parts) if len(parts) > 1 else parts[0]
 
 
 def _entropy_to_b64(entropy: torch.Tensor) -> str:
@@ -64,58 +40,88 @@ def _entropy_to_b64(entropy: torch.Tensor) -> str:
 
 
 def apply_patch() -> bool:
-    """Patch ``LogitsProcessor`` to compute and propagate input-token entropy.
-
-    Returns True if applied, False if already patched.
-    """
     from sglang.srt.layers.logits_processor import LogitsProcessor
 
     if getattr(LogitsProcessor, _PATCH_FLAG, False):
         return False
 
-    _orig_process = LogitsProcessor.process_input_logprobs
+    _orig_get_logits = LogitsProcessor._get_logits
     _orig_forward = LogitsProcessor.forward
 
-    def _patched_process(self, input_logits, logits_metadata):
-        result = _orig_process(self, input_logits, logits_metadata)
+    def _patched_get_logits(self, hidden_states, lm_head, logits_metadata, *args, **kwargs):
+        logits = _orig_get_logits(self, hidden_states, lm_head, logits_metadata, *args, **kwargs)
+
+        if getattr(self, "_relax_collecting_entropy", False):
+            if torch.cuda.is_current_stream_capturing():
+                return logits
+            try:
+                ent = _compute_entropy(logits)
+                if not hasattr(self, "_relax_entropy_parts"):
+                    self._relax_entropy_parts = []
+                self._relax_entropy_parts.append(ent.cpu())
+            except Exception:
+                logger.warning("entropy computation in _get_logits failed", exc_info=True)
+
+        return logits
+
+    def _patched_forward(self, input_ids, hidden_states, lm_head, logits_metadata, *args, **kwargs):
+        self._relax_collecting_entropy = True
+        self._relax_entropy_parts = []
+
+        output = _orig_forward(self, input_ids, hidden_states, lm_head, logits_metadata, *args, **kwargs)
+
+        self._relax_collecting_entropy = False
 
         try:
-            entropy = _compute_entropy(input_logits)
+            if not self._relax_entropy_parts:
+                return output
 
-            pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu
-            if pruned_lens:
-                per_request = torch.split(entropy, list(pruned_lens))
+            all_entropy = (
+                torch.cat(self._relax_entropy_parts)
+                if len(self._relax_entropy_parts) > 1
+                else self._relax_entropy_parts[0]
+            )
+
+            from sglang.srt.layers.logits_processor import LogitsMetadata
+            from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+            if isinstance(logits_metadata, ForwardBatch):
+                lm = LogitsMetadata.from_forward_batch(logits_metadata)
             else:
-                per_request = [entropy]
+                lm = logits_metadata
 
-            self._relax_entropy_b64 = [_entropy_to_b64(e) for e in per_request]
-        except Exception:
-            logger.debug("entropy computation failed", exc_info=True)
-            self._relax_entropy_b64 = None
+            pruned_lens = getattr(lm, "extend_logprob_pruned_lens_cpu", None)
 
-        return result
+            if not isinstance(pruned_lens, list) or not pruned_lens:
+                self._relax_entropy_parts = []
+                return output
 
-    def _patched_forward(self, *args, **kwargs):
-        self._relax_entropy_b64 = None
-        output = _orig_forward(self, *args, **kwargs)
+            total_input = sum(pruned_lens)
+            if total_input > all_entropy.shape[0]:
+                self._relax_entropy_parts = []
+                return output
 
-        if self._relax_entropy_b64 is not None:
+            input_entropy = all_entropy[-total_input:]
+            per_request = torch.split(input_entropy, list(pruned_lens))
+            b64_list = [_entropy_to_b64(e) for e in per_request]
+
             if output.customized_info is None:
                 output.customized_info = {}
-            output.customized_info["relax_input_entropy_b64"] = self._relax_entropy_b64
-            self._relax_entropy_b64 = None
+            output.customized_info["relax_input_entropy_b64"] = b64_list
+        except Exception:
+            logger.warning("entropy injection in forward failed", exc_info=True)
 
+        self._relax_entropy_parts = []
         return output
 
-    LogitsProcessor.process_input_logprobs = _patched_process
+    LogitsProcessor._get_logits = _patched_get_logits
     LogitsProcessor.forward = _patched_forward
     setattr(LogitsProcessor, _PATCH_FLAG, True)
-    logger.info("[entropy-patch] applied to LogitsProcessor")
+    logger.info("EOPD entropy patch applied to LogitsProcessor._get_logits + .forward")
     return True
 
 
 def apply_opd_entropy_patch() -> None:
-    """Apply the entropy patch in the current (server) process."""
     try:
         apply_patch()
     except Exception as e:
