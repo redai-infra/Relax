@@ -178,6 +178,39 @@ def test_route_is_rebuilt_for_new_packed_boundaries():
             assert torch.equal(got_rows, want_rows)
 
 
+def test_route_is_rebuilt_when_cu_seqlens_is_mutated_in_place():
+    """Identity alone would miss a caller refilling a preallocated boundary
+    buffer.
+
+    Megatron already has that pattern elsewhere (persistent ``_cu_seqlens_buffer``
+    written with ``buf[0] = 0``), so the cache also fingerprints autograd's version
+    counter, which every in-place write bumps.
+    """
+    cu = _cu([3, 1], unit=8)
+    psp = _packed_seq_params(cu)
+    first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+
+    # Same tensor object, refilled with different boundaries.
+    cu.copy_(_cu([2, 2], unit=8))
+    rebuilt = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+    assert rebuilt is not first, "an in-place refill must invalidate the cached route"
+
+    want = cpl.build_thd_cp_partition_route(cu, 4, 1, "zigzag", "contiguous")
+    assert rebuilt.input_split_sizes == want.input_split_sizes
+    assert rebuilt.output_split_sizes == want.output_split_sizes
+
+
+def test_route_is_rebuilt_when_a_view_of_cu_seqlens_is_mutated():
+    """Views share the version counter with their base, so writes through one
+    count."""
+    cu = _cu([3, 1], unit=8)
+    psp = _packed_seq_params(cu)
+    first = cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous")
+
+    cu[1:] = _cu([2, 2], unit=8)[1:]
+    assert cpl.get_thd_cp_partition_route(psp, cu, 4, 1, "zigzag", "contiguous") is not first
+
+
 def test_route_is_rebuilt_when_the_dynamic_cp_geometry_changes():
     """Dynamic CP varies cp_size/cp_rank across micro-batches on one module."""
     cu = _cu([3, 1], unit=8)

@@ -526,10 +526,10 @@ index c297a23..587e1de 100644
 +    return None
 diff --git a/megatron/core/context_parallel_layout.py b/megatron/core/context_parallel_layout.py
 new file mode 100644
-index 0000000..718b2fc
+index 0000000..c287ffb
 --- /dev/null
 +++ b/megatron/core/context_parallel_layout.py
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,699 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 +
 +"""Context parallel tensor layout helpers."""
@@ -651,6 +651,7 @@ index 0000000..718b2fc
 +    input_split_sizes: List[int]
 +    output_split_sizes: List[int]
 +    cu_seqlens: torch.Tensor
++    cu_seqlens_version: int
 +    cp_size: int
 +    cp_rank: int
 +    source_layout: str
@@ -887,6 +888,7 @@ index 0000000..718b2fc
 +            input_split_sizes=input_split_sizes,
 +            output_split_sizes=output_split_sizes,
 +            cu_seqlens=cu_seqlens,
++            cu_seqlens_version=cu_seqlens._version,
 +            cp_size=cp_size,
 +            cp_rank=cp_rank,
 +            source_layout=source_layout,
@@ -905,14 +907,20 @@ index 0000000..718b2fc
 +) -> bool:
 +    """A cached route is only valid for the exact packed boundaries it was built from.
 +
-+    ``cu_seqlens`` is compared by object identity, not by value: a value comparison is
-+    itself a device-host synchronisation, which is precisely what the route exists to
-+    avoid. Identity is also the stronger check -- the same tensor object is the same
-+    buffer, whereas equal values could still come from a different microbatch.
++    ``cu_seqlens`` is matched on object identity *plus* autograd's version counter,
++    never on value: a value comparison would itself be a device-host synchronisation,
++    which is precisely what the route exists to avoid. Identity alone would not survive
++    a caller that refills a preallocated boundary buffer in place -- a pattern that
++    already exists elsewhere in Megatron -- so the version counter, which every in-place
++    op bumps (views share the counter with their base) and which costs a plain Python
++    attribute read, closes that hole. The one case neither check sees is a write that
++    bypasses the dispatcher entirely, e.g. through ``data_ptr()``.
 +    """
 +    if route is None:
 +        return False
 +    if route.cu_seqlens is not cu_seqlens:
++        return False
++    if route.cu_seqlens_version != cu_seqlens._version:
 +        return False
 +    if route.cp_size != cp_size or route.cp_rank != cp_rank:
 +        return False
@@ -1822,7 +1830,7 @@ index 465e83f..232caef 100644
          tensor_recv_prev = None
          tensor_recv_next = None
 diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
-index 8df4df1..66c4d1e 100644
+index 8df4df1..e41d55f 100644
 --- a/megatron/core/ssm/gated_delta_net.py
 +++ b/megatron/core/ssm/gated_delta_net.py
 @@ -14,12 +14,17 @@ import torch.nn as nn
@@ -2285,7 +2293,7 @@ index 8df4df1..66c4d1e 100644
          query, key = torch.split(query_key, [split_size, split_size], dim=2)
  
          # Expand query and key if needed (grouped query attention)
-@@ -567,7 +752,58 @@ class GatedDeltaNet(MegatronModule):
+@@ -567,7 +752,67 @@ class GatedDeltaNet(MegatronModule):
          beta = beta.sigmoid()
          return g, beta
  
@@ -2298,6 +2306,13 @@ index 8df4df1..66c4d1e 100644
 +        GPU -- only need to run for the first layer that asks. The result is cached on
 +        the ``PackedSeqParams`` instance and reused while it still describes the very
 +        same boundary tensors, mirroring how the CP layout routes are cached.
++
++        A cached result is reused only when all four source tensors are still the same
++        objects *and* none of them has been written in place. Identity alone would not
++        notice a caller refilling a preallocated boundary buffer, so autograd's version
++        counter -- which every in-place op bumps, and which costs a plain Python
++        attribute read -- is checked as well. Comparing values instead would reintroduce
++        the device-host sync this cache exists to remove.
 +        """
 +        sources = (
 +            packed_seq_params.cu_seqlens_q_padded,
@@ -2305,14 +2320,14 @@ index 8df4df1..66c4d1e 100644
 +            packed_seq_params.cu_seqlens_kv_padded,
 +            packed_seq_params.cu_seqlens_kv,
 +        )
++        versions = tuple(None if t is None else t._version for t in sources)
 +        cached = getattr(packed_seq_params, "_gdn_resolved_cu_seqlens", None)
 +        if cached is not None:
-+            cached_key, cached_value = cached
++            cached_meta, cached_sources, cached_versions, cached_value = cached
 +            if (
-+                cached_key[0] == seq_len_global
-+                and cached_key[1] == cp_size
-+                and len(cached_key[2]) == len(sources)
-+                and all(a is b for a, b in zip(cached_key[2], sources))
++                cached_meta == (seq_len_global, cp_size)
++                and all(a is b for a, b in zip(cached_sources, sources))
++                and cached_versions == versions
 +            ):
 +                return cached_value
 +
@@ -2334,7 +2349,9 @@ index 8df4df1..66c4d1e 100644
 +
 +        resolved = (cu_seqlens_q, cu_seqlens_kv)
 +        packed_seq_params._gdn_resolved_cu_seqlens = (
-+            (seq_len_global, cp_size, sources),
++            (seq_len_global, cp_size),
++            sources,
++            versions,
 +            resolved,
 +        )
 +        return resolved
@@ -2345,7 +2362,7 @@ index 8df4df1..66c4d1e 100644
          """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
          if cu_seqlens_padded is not None:
              cu_seqlens = cu_seqlens_padded
-@@ -582,6 +818,13 @@ class GatedDeltaNet(MegatronModule):
+@@ -582,6 +827,13 @@ class GatedDeltaNet(MegatronModule):
                  f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
              )
  
@@ -2359,7 +2376,7 @@ index 8df4df1..66c4d1e 100644
          return cu_seqlens
  
      def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
-@@ -780,8 +1023,10 @@ def get_parameter_local_cp(
+@@ -780,8 +1032,10 @@ def get_parameter_local_cp(
          torch.Tensor: The local parameter for the current context parallel rank.
      """
  
@@ -2372,7 +2389,7 @@ index 8df4df1..66c4d1e 100644
  
      # No need to split if CP size is 1.
      if cp_size == 1:
-@@ -800,7 +1045,7 @@ def get_parameter_local_cp(
+@@ -800,7 +1054,7 @@ def get_parameter_local_cp(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
@@ -2381,7 +2398,7 @@ index 8df4df1..66c4d1e 100644
      return param
  
  
-@@ -945,6 +1190,7 @@ def torch_chunk_gated_delta_rule(
+@@ -945,6 +1199,7 @@ def torch_chunk_gated_delta_rule(
      output_final_state=False,
      use_qk_l2norm_in_kernel=False,
      cu_seqlens=None,
@@ -2389,7 +2406,7 @@ index 8df4df1..66c4d1e 100644
  ):
      # pylint: disable=line-too-long
      '''
-@@ -957,6 +1203,9 @@ def torch_chunk_gated_delta_rule(
+@@ -957,6 +1212,9 @@ def torch_chunk_gated_delta_rule(
      assert (
          cu_seqlens is None
      ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
