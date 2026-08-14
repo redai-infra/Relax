@@ -34,6 +34,7 @@ from relax.utils.tq_config import (
     build_mooncake_config,
     build_simple_storage_config,
     estimate_payload_bytes,
+    resolve_mooncake_master_address,
     validate_mooncake_runtime_contract,
     validate_segment_capacity,
 )
@@ -248,9 +249,16 @@ class TestProbeNode:
         def fake_isdir(path):
             return "infiniband" in path
 
+        def fake_listdir(path):
+            if path.endswith("/ports"):
+                return ["1"]
+            if path.endswith("/gids"):
+                return ["3"]
+            return ["rdma0"]
+
         with (
             mock.patch("os.path.isdir", side_effect=fake_isdir),
-            mock.patch("os.listdir", return_value=["rdma0"]),
+            mock.patch("os.listdir", side_effect=fake_listdir),
             mock.patch("builtins.open", mock.mock_open(read_data="4: ACTIVE")),
             mock.patch("relax.utils.rdma_probe._check_mooncake_import") as mi,
             mock.patch("relax.utils.rdma_probe._check_health_check") as hc,
@@ -261,6 +269,78 @@ class TestProbeNode:
             result = probe_node("")
         assert result.effective_protocol == "rdma"
         assert result.ok
+        assert result.effective_device == "rdma0"
+
+    @staticmethod
+    def _multi_hca_open(active_device: str):
+        """Path-aware ``open`` mock: only ``active_device`` has an ACTIVE port
+        and a non-zero GID at index 3."""
+
+        def fake_open(path, *args, **kwargs):
+            path = str(path)
+            if path.endswith("/state"):
+                state = "4: ACTIVE" if f"/{active_device}/" in path else "1: DOWN"
+                return mock.mock_open(read_data=state)(path)
+            if path.endswith("/gids/3"):
+                return mock.mock_open(read_data="0000:0000:0000:0000:0000:ffff:0a00:0001")(path)
+            if "/gids/" in path:
+                return mock.mock_open(read_data="0000:0000:0000:0000:0000:0000:0000:0000")(path)
+            raise FileNotFoundError(path)
+
+        return fake_open
+
+    def test_multi_hca_skips_down_first_device(self):
+        """A down lexicographically-first HCA must not degrade the node when a
+        later device has an ACTIVE port and a usable GID (review: probe every
+        usable HCA before degrading RDMA)."""
+
+        def fake_isdir(path):
+            return "infiniband" in path
+
+        def fake_listdir(path):
+            if path.endswith("/ports"):
+                return ["1"]
+            if path.endswith("/gids"):
+                return ["0", "3"]
+            return ["mlx5_0", "mlx5_1"]
+
+        with (
+            mock.patch("os.path.isdir", side_effect=fake_isdir),
+            mock.patch("os.listdir", side_effect=fake_listdir),
+            mock.patch("builtins.open", side_effect=self._multi_hca_open("mlx5_1")),
+            mock.patch("relax.utils.rdma_probe._check_mooncake_import") as mi,
+            mock.patch("relax.utils.rdma_probe.resource.getrlimit", return_value=(-1, -1)),
+        ):
+            mi.return_value = CheckResult("mooncake_import", True, "ok")
+            result = probe_node("")
+        assert result.effective_protocol == "rdma"
+        assert result.effective_device == "mlx5_1"
+
+    def test_multi_hca_all_down_degrades_to_tcp(self):
+        """When no HCA has an ACTIVE port, the node degrades to
+        Mooncake/TCP."""
+
+        def fake_isdir(path):
+            return "infiniband" in path
+
+        def fake_listdir(path):
+            if path.endswith("/ports"):
+                return ["1"]
+            if path.endswith("/gids"):
+                return ["3"]
+            return ["mlx5_0", "mlx5_1"]
+
+        with (
+            mock.patch("os.path.isdir", side_effect=fake_isdir),
+            mock.patch("os.listdir", side_effect=fake_listdir),
+            mock.patch("builtins.open", side_effect=self._multi_hca_open("none")),
+            mock.patch("relax.utils.rdma_probe._check_mooncake_import") as mi,
+            mock.patch("relax.utils.rdma_probe.resource.getrlimit", return_value=(-1, -1)),
+        ):
+            mi.return_value = CheckResult("mooncake_import", True, "ok")
+            result = probe_node("")
+        assert result.effective_protocol == "tcp"
+        assert "HCA port not ACTIVE" in result.errors
 
     def test_unreachable_external_master_disables_mooncake(self, monkeypatch):
         monkeypatch.setattr(rdma_probe, "_check_mooncake_import", lambda: CheckResult("mooncake_import", True))
@@ -394,7 +474,7 @@ class TestTqConfigBuilder:
         """``tq.init`` reads ``backend.storage_backend``; omitting it silently
         keeps SimpleStorage."""
         eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="rdma0", gdr=False, fallback_reason="")
-        assert build_mooncake_config(eff)["storage_backend"] == "MooncakeStore"
+        assert build_mooncake_config(eff, master_address="master.example:50051")["storage_backend"] == "MooncakeStore"
         assert (
             build_simple_storage_config(total_storage_size=1, num_data_storage_units=1)["storage_backend"]
             == "SimpleStorage"
@@ -402,7 +482,7 @@ class TestTqConfigBuilder:
 
     def test_mooncake_config_has_hard_pin_true(self):
         eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="rdma0", gdr=False, fallback_reason="")
-        cfg = build_mooncake_config(eff)
+        cfg = build_mooncake_config(eff, master_address="master.example:50051")
         mc = cfg["MooncakeStore"]
         assert mc["protocol"] == "rdma"
         assert mc["device_name"] == "rdma0"
@@ -412,8 +492,22 @@ class TestTqConfigBuilder:
 
     def test_mooncake_config_gdr_propagated(self):
         eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=True, fallback_reason="")
-        cfg = build_mooncake_config(eff)
+        cfg = build_mooncake_config(eff, master_address="master.example:50051")
         assert cfg["MooncakeStore"]["use_gdr"] is True
+
+    def test_master_address_is_required(self, monkeypatch):
+        # A loopback default would point every node at itself in multi-node
+        # runs; missing deployment configuration must be rejected instead.
+        monkeypatch.delenv("MC_MASTER_ADDRESS", raising=False)
+        with pytest.raises(RuntimeError, match="MC_MASTER_ADDRESS"):
+            resolve_mooncake_master_address()
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="tcp", device="", gdr=False, fallback_reason="")
+        with pytest.raises(RuntimeError, match="MC_MASTER_ADDRESS"):
+            build_mooncake_config(eff)
+
+    def test_master_address_from_env(self, monkeypatch):
+        monkeypatch.setenv("MC_MASTER_ADDRESS", "master.example:50051")
+        assert resolve_mooncake_master_address() == "master.example:50051"
 
     @pytest.mark.skipif(
         not _REAL_TQ_STORAGE,
@@ -433,14 +527,20 @@ class TestTqConfigBuilder:
         validate_mooncake_runtime_contract()
         assert os.environ["MC_STORE_MEMCPY"] == "0"
 
-    @pytest.mark.skipif(
-        not _REAL_TQ_STORAGE,
-        reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
-    )
-    def test_contract_respects_explicit_memcpy_override(self, monkeypatch):
+    def test_contract_rejects_explicit_memcpy_enable(self, monkeypatch):
+        # mooncake 0.3.10's memcpy path is confirmed to corrupt data, so the
+        # guard fails closed instead of honouring an operator override.  The
+        # rejection happens before any transfer_queue import, so this test
+        # runs on CPU CI too.
         monkeypatch.setenv("MC_STORE_MEMCPY", "1")
-        validate_mooncake_runtime_contract()
-        assert os.environ["MC_STORE_MEMCPY"] == "1"
+        with pytest.raises(RuntimeError, match="MC_STORE_MEMCPY"):
+            validate_mooncake_runtime_contract()
+
+    def test_contract_accepts_explicit_memcpy_disable(self, monkeypatch):
+        monkeypatch.setenv("MC_STORE_MEMCPY", "0")
+        if _REAL_TQ_STORAGE:
+            validate_mooncake_runtime_contract()
+            assert os.environ["MC_STORE_MEMCPY"] == "0"
 
     def test_segment_capacity_text_only_passes(self):
         args = _make_args(multimodal_keys=None)

@@ -37,8 +37,21 @@ _DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"  # config.yaml:42-43
 
 
 def resolve_mooncake_master_address() -> str:
-    """Return the externally managed Mooncake master endpoint."""
-    return os.environ.get("MC_MASTER_ADDRESS", "localhost:50051")
+    """Return the externally managed Mooncake master endpoint.
+
+    ``MC_MASTER_ADDRESS`` is required.  A loopback default would make every
+    node of a multi-node job treat its own localhost as the master, so the
+    reachability probe would degrade ``auto`` runs and abort ``off``/
+    ``required`` runs even when a shared master is healthy elsewhere.
+    """
+    address = os.environ.get("MC_MASTER_ADDRESS", "").strip()
+    if not address:
+        raise RuntimeError(
+            "MooncakeStore requires MC_MASTER_ADDRESS=<host:port> of the externally "
+            "managed mooncake master on every node; Relax never assumes a loopback "
+            "endpoint."
+        )
+    return address
 
 
 def validate_mooncake_runtime_contract() -> None:
@@ -97,9 +110,9 @@ def build_mooncake_config(
     effective
         The job-level :class:`EffectiveConfig` after probing.
     master_address
-        External master server address.  If ``None``, read from the
-        ``MC_MASTER_ADDRESS`` env var; if still unset, fall back to localhost
-        (single-node dev only — production must set the env var).
+        External master server address.  If ``None``, read from the required
+        ``MC_MASTER_ADDRESS`` env var (see
+        :func:`resolve_mooncake_master_address`).
     global_segment_size
         Override the per-client segment size (default 4 GiB).  Benchmarks may
         pass a larger value (e.g. 8 GiB) to avoid staging-buffer pressure.

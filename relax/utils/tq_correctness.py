@@ -8,8 +8,8 @@ without raising, and treats a missing/negative production-status ACK as a
 successful notification.  Those behaviours can turn an explicit storage or
 controller failure into silent data loss.  The pinned mooncake 0.3.10
 additionally corrupts TCP-protocol transfers through its auto-enabled memcpy
-fast path, so that path is disabled here by default (see
-:func:`_enforce_safe_memcpy_default`).
+fast path, so that path is force-disabled here and an explicit enable is
+rejected (see :func:`_enforce_safe_memcpy`).
 
 Keep the compatibility guards here, close to Relax's integration boundary,
 until the equivalent checks are available in the pinned TransferQueue
@@ -162,8 +162,8 @@ def _install_notification_guards(manager_cls: type) -> None:
     setattr(manager_cls, _PATCH_MARKER, True)
 
 
-def _enforce_safe_memcpy_default() -> None:
-    """Disable mooncake's memcpy fast path unless the operator overrides it.
+def _enforce_safe_memcpy() -> None:
+    """Force-disable mooncake's memcpy fast path; reject attempts to enable it.
 
     mooncake 0.3.10 auto-enables ``MC_STORE_MEMCPY`` in TCP-only environments
     (``transfer_task.cpp`` "auto-detected: TCP-only environment, memcpy
@@ -172,16 +172,24 @@ def _enforce_safe_memcpy_default() -> None:
     from a 64 KiB-aligned offset onward while every batch code reported success
     (two-node forensic probes, 2026-08; 12/12 sessions clean with
     ``MC_STORE_MEMCPY=0`` vs ~50% corrupt without).  The same code path
-    SIGSEGVs on single-node loopback.  RDMA-capable sessions auto-disable
-    memcpy anyway, so this default is a no-op there; ``setdefault`` keeps an
-    explicit operator override (e.g. ``MC_STORE_MEMCPY=1``) possible.
+    SIGSEGVs on single-node loopback.  Because the corruption is confirmed on
+    the pinned mooncake build, this guard fails closed: an explicit
+    ``MC_STORE_MEMCPY=1`` is rejected at startup instead of honoured.  Re-gate
+    on the mooncake version once the pin moves to a release with the fix.
     """
-    os.environ.setdefault("MC_STORE_MEMCPY", "0")
+    override = os.environ.get("MC_STORE_MEMCPY", "").strip()
+    if override not in ("", "0"):
+        raise RuntimeError(
+            f"MC_STORE_MEMCPY={override!r} is rejected: the pinned mooncake 0.3.10 "
+            "memcpy fast path silently truncates TCP transfers and can SIGSEGV. "
+            "Unset MC_STORE_MEMCPY; Relax forces it to 0 on this version."
+        )
+    os.environ["MC_STORE_MEMCPY"] = "0"
 
 
 def ensure_mooncake_correctness_guards() -> None:
     """Install and validate all guards required for safe Mooncake operation."""
-    _enforce_safe_memcpy_default()
+    _enforce_safe_memcpy()
     try:
         from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
         from transfer_queue.storage.managers.base import StorageManager

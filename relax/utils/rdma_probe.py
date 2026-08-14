@@ -130,45 +130,103 @@ def _check_rdma_devices() -> CheckResult:
     return CheckResult("rdma_devices", True, ",".join(devs))
 
 
-def _check_port_active(device: str = "", port: int = 1) -> CheckResult:
-    if device:
-        state_path = f"/sys/class/infiniband/{device}/ports/{port}/state"
-        try:
-            with open(state_path) as f:
-                state = f.read().strip()
-            ok = "ACTIVE" in state
-            return CheckResult(f"port_active:{device}/{port}", ok, state)
-        except FileNotFoundError:
-            return CheckResult(f"port_active:{device}/{port}", False, "state file missing")
-        except OSError as e:
-            return CheckResult(f"port_active:{device}/{port}", False, str(e))
-    # No device specified: check the first available one.
-    base = "/sys/class/infiniband"
-    if not os.path.isdir(base):
-        return CheckResult("port_active", False, "no infiniband dir")
-    for dev in sorted(os.listdir(base)):
-        return _check_port_active(dev, port)
-    return CheckResult("port_active", False, "no devices")
+def _check_port_active(device: str, port: int = 1) -> CheckResult:
+    state_path = f"/sys/class/infiniband/{device}/ports/{port}/state"
+    try:
+        with open(state_path) as f:
+            state = f.read().strip()
+        ok = "ACTIVE" in state
+        return CheckResult(f"port_active:{device}/{port}", ok, state)
+    except FileNotFoundError:
+        return CheckResult(f"port_active:{device}/{port}", False, "state file missing")
+    except OSError as e:
+        return CheckResult(f"port_active:{device}/{port}", False, str(e))
 
 
-def _check_gid_available(device: str = "", gid_index: int = 3) -> CheckResult:
-    if device:
-        gid_path = f"/sys/class/infiniband/{device}/ports/1/gids/{gid_index}"
-        try:
-            with open(gid_path) as f:
-                raw = f.read().strip()
-            ok = raw.replace(":", "") != "0" * 32 and bool(raw)
-            return CheckResult(f"gid:{device}/{gid_index}", ok, raw[:24] + "..." if len(raw) > 24 else raw)
-        except FileNotFoundError:
-            return CheckResult(f"gid:{device}/{gid_index}", False, "gid file missing")
-        except OSError as e:
-            return CheckResult(f"gid:{device}/{gid_index}", False, str(e))
+def _check_gid_available(device: str, gid_index: int = 3, port: int = 1) -> CheckResult:
+    gid_path = f"/sys/class/infiniband/{device}/ports/{port}/gids/{gid_index}"
+    try:
+        with open(gid_path) as f:
+            raw = f.read().strip()
+        ok = raw.replace(":", "") != "0" * 32 and bool(raw)
+        return CheckResult(f"gid:{device}/{gid_index}", ok, raw[:24] + "..." if len(raw) > 24 else raw)
+    except FileNotFoundError:
+        return CheckResult(f"gid:{device}/{gid_index}", False, "gid file missing")
+    except OSError as e:
+        return CheckResult(f"gid:{device}/{gid_index}", False, str(e))
+
+
+def _list_numeric_entries(path: str) -> list[int]:
+    """Sorted numeric directory entries (port numbers / GID indices)."""
+    try:
+        return sorted(int(name) for name in os.listdir(path) if name.isdigit())
+    except OSError:
+        return []
+
+
+def _find_usable_gid(device: str, port: int) -> CheckResult:
+    """Return the first usable (non-zero) GID on ``device``/``port``.
+
+    Index 3 (conventionally the RoCE v2 / IPv4-mapped entry) is preferred to
+    preserve the previous behaviour, then every other advertised index is
+    scanned so a host that populates a different index is not misreported as
+    GID-less.
+    """
+    indices = _list_numeric_entries(f"/sys/class/infiniband/{device}/ports/{port}/gids")
+    if not indices:
+        return CheckResult(f"gid:{device}", False, f"no GID entries on port {port}")
+    ordered = ([3] if 3 in indices else []) + [i for i in indices if i != 3]
+    for gid_index in ordered:
+        check = _check_gid_available(device, gid_index, port=port)
+        if check.ok:
+            return check
+    return CheckResult(f"gid:{device}", False, f"no non-zero GID on port {port}")
+
+
+def _select_usable_rdma_device(device: str = "") -> tuple[str, list[CheckResult]]:
+    """Pick one HCA whose ACTIVE port and usable GID both pass together.
+
+    Scans every device under ``/sys/class/infiniband`` (or only ``device``
+    when explicitly requested), every port of each device, and the GID table
+    of the first ACTIVE port — instead of assuming the lexicographically
+    first device with port 1 / GID index 3.  A single down HCA on a
+    multi-HCA host therefore no longer degrades the whole node.
+
+    Returns ``(selected_device, checks)``.  ``selected_device`` is ``""``
+    when no device qualifies; ``checks`` then summarises one failure per
+    inspected device for the probe report.
+    """
     base = "/sys/class/infiniband"
     if not os.path.isdir(base):
-        return CheckResult(f"gid:{gid_index}", False, "no infiniband dir")
-    for dev in sorted(os.listdir(base)):
-        return _check_gid_available(dev, gid_index)
-    return CheckResult(f"gid:{gid_index}", False, "no devices")
+        return "", [CheckResult("port_active", False, "no infiniband dir")]
+    candidates = [device] if device else sorted(os.listdir(base))
+    if not candidates:
+        return "", [CheckResult("port_active", False, "no devices")]
+
+    failures: list[str] = []
+    for dev in candidates:
+        ports = _list_numeric_entries(f"{base}/{dev}/ports")
+        if not ports:
+            failures.append(f"{dev}: no ports")
+            continue
+        port_check: CheckResult | None = None
+        active_port: int | None = None
+        for port in ports:
+            check = _check_port_active(dev, port)
+            if check.ok:
+                port_check, active_port = check, port
+                break
+        if port_check is None or active_port is None:
+            failures.append(f"{dev}: no ACTIVE port")
+            continue
+        gid_check = _find_usable_gid(dev, active_port)
+        if not gid_check.ok:
+            failures.append(f"{dev}/port{active_port}: {gid_check.detail}")
+            continue
+        return dev, [port_check, gid_check]
+
+    detail = "; ".join(failures)
+    return "", [CheckResult("port_active", False, detail), CheckResult("gid", False, detail)]
 
 
 def _check_memlock() -> CheckResult:
@@ -248,7 +306,8 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
     Parameters
     ----------
     device
-        Explicit RDMA device name; empty = auto-detect first available.
+        Explicit RDMA device name; empty = scan every HCA and select one
+        whose ACTIVE port and usable GID both pass.
     probe_rdma
         When ``False``, validate only Mooncake importability and master
         reachability, then select TCP. Used by ``--tq-rdma-mode=off`` so an
@@ -271,9 +330,10 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
         checks.append(_check_master_reachable(master_address))
 
     # Device-dependent checks are irrelevant when RDMA is explicitly off.
+    selected_device = ""
     if probe_rdma:
-        checks.append(_check_port_active(device))
-        checks.append(_check_gid_available(device))
+        selected_device, device_checks = _select_usable_rdma_device(device)
+        checks.extend(device_checks)
 
     # Determine effective protocol via graded degradation.
     mooncake_ok = any(c.name == "mooncake_import" and c.ok for c in checks)
@@ -295,11 +355,8 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
         effective_protocol = "tcp"
     elif rdma_dev_ok and port_ok and gid_ok and memlock_ok:
         effective_protocol = "rdma"
-        if not effective_device:
-            # Pick first available device for the summary.
-            base = "/sys/class/infiniband"
-            if os.path.isdir(base):
-                effective_device = sorted(os.listdir(base))[0]
+        # Report the jointly validated device (ACTIVE port + usable GID).
+        effective_device = selected_device or effective_device
     else:
         # mooncake usable but RDMA incomplete -> degrade to TCP (still MooncakeStore).
         effective_protocol = "tcp"
