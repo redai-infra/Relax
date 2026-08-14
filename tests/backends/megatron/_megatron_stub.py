@@ -32,6 +32,28 @@ from unittest.mock import MagicMock
 #: submodule below these is synthesized on demand, so the P3O import chain does
 #: not have to be enumerated here.
 STUBBED_ROOTS = ("megatron",)
+_MISSING = object()
+
+
+@contextmanager
+def temporarily_stub_module(name: str, module: ModuleType) -> Iterator[None]:
+    """Expose one import stub without resetting unrelated import-cache entries.
+
+    ``unittest.mock.patch.dict(sys.modules, ...)`` restores the complete module
+    cache when its context exits. Imports performed inside that context can
+    include native Torch or Ray modules, so clearing them makes a later import
+    reinitialize process-global extension state. Preserve and restore only the
+    requested entry instead.
+    """
+    previous_module = sys.modules.get(name, _MISSING)
+    sys.modules[name] = module
+    try:
+        yield
+    finally:
+        if previous_module is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous_module
 
 
 class _MagicModule(ModuleType):

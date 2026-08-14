@@ -9,12 +9,11 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
+from tests.backends.megatron._megatron_stub import stubbed_megatron_modules, temporarily_stub_module
 
 
 MODEL_PATH = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "model.py"
@@ -23,13 +22,35 @@ stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
 stream_dataloader.StreamingTQIterator = object
 
 with (
-    patch.dict(sys.modules, {"relax.utils.data.stream_dataloader": stream_dataloader}),
+    temporarily_stub_module("relax.utils.data.stream_dataloader", stream_dataloader),
     stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
 ):
     from relax.backends.megatron import model as model_module
 
 
 _preserved_dynamic_cp_group = model_module._preserved_dynamic_cp_group
+
+
+def test_p3o_module_stub_preserves_unrelated_import_cache(monkeypatch):
+    stub_name = "tests.backends.megatron._p3o_stream_dataloader_stub"
+    unrelated_name = "tests.backends.megatron._p3o_import_cache_probe"
+    stub_module = ModuleType(stub_name)
+    unrelated_module = ModuleType(unrelated_name)
+    monkeypatch.delitem(sys.modules, stub_name, raising=False)
+    monkeypatch.delitem(sys.modules, unrelated_name, raising=False)
+
+    with temporarily_stub_module(stub_name, stub_module):
+        sys.modules[unrelated_name] = unrelated_module
+
+    assert stub_name not in sys.modules
+    assert sys.modules[unrelated_name] is unrelated_module
+
+    previous_module = ModuleType(stub_name)
+    monkeypatch.setitem(sys.modules, stub_name, previous_module)
+    with temporarily_stub_module(stub_name, stub_module):
+        assert sys.modules[stub_name] is stub_module
+
+    assert sys.modules[stub_name] is previous_module
 
 
 def test_p3o_model_step_restores_dynamic_cp_group_after_error():

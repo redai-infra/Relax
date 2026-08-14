@@ -7,9 +7,7 @@ from __future__ import annotations
 import math
 import os
 import socket
-import sys
 from types import ModuleType
-from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -21,14 +19,14 @@ from relax.utils.training.p3o_utils import (
     compute_p3o_token_terms,
     finalize_p3o_step_context,
 )
-from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
+from tests.backends.megatron._megatron_stub import stubbed_megatron_modules, temporarily_stub_module
 
 
 stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
 stream_dataloader.StreamingTQIterator = object
 
 with (
-    patch.dict(sys.modules, {"relax.utils.data.stream_dataloader": stream_dataloader}),
+    temporarily_stub_module("relax.utils.data.stream_dataloader", stream_dataloader),
     stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
 ):
     from relax.backends.megatron import loss as loss_module
