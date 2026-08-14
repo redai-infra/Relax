@@ -47,7 +47,8 @@ def _make_args(**overrides):
 
 
 def test_eopd_smoke_forward_and_backward(opd_utils):
-    """Full chain: compute_eopd_fkl_loss → reduce_opd_loss → backward → non-zero grads."""
+    """Full chain: compute_eopd_fkl_loss → reduce_opd_loss → backward → non-
+    zero grads."""
     K = 32
     seq_len = 10
 
@@ -84,7 +85,8 @@ def test_eopd_smoke_forward_and_backward(opd_utils):
 
 
 def test_eopd_smoke_zero_loss_below_threshold(opd_utils):
-    """All entropy below threshold → loss is zero, but function still returns a valid tensor."""
+    """All entropy below threshold → loss is zero, but function still returns a
+    valid tensor."""
     K = 32
     seq_len = 5
 

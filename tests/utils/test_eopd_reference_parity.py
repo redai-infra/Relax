@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Element-wise parity tests: Relax EOPD vs reference forward-KL formulas from the paper."""
+"""Element-wise parity tests: Relax EOPD vs reference forward-KL formulas from
+the paper."""
 
 import importlib
 import sys
@@ -56,7 +57,8 @@ def _reference_reduce(values: torch.Tensor, loss_mask: torch.Tensor) -> torch.Te
 
 
 class TestForwardKLParity:
-    """Verify compute_opd_kl_topk(forward_kl, trunc) matches reference per-token forward KL."""
+    """Verify compute_opd_kl_topk(forward_kl, trunc) matches reference per-
+    token forward KL."""
 
     def test_basic_parity(self, opd_utils):
         torch.manual_seed(42)
@@ -161,7 +163,8 @@ class TestReductionParity:
 
 
 class TestEndToEndParity:
-    """Full EOPD chain: FKL + entropy gate + reduction matches hand-computed reference."""
+    """Full EOPD chain: FKL + entropy gate + reduction matches hand-computed
+    reference."""
 
     def test_full_chain(self, opd_utils):
         torch.manual_seed(123)

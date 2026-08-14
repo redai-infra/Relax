@@ -3,11 +3,11 @@
 """Monkey-patch for SGLang LogitsProcessor: compute per-token entropy during
 teacher prefill and return it via ``customized_info`` → ``meta_info``.
 
-Strategy (v7): Patch ``_get_logits`` to compute entropy from the *actual*
-model logits immediately after the TP all-gather.  Only inject entropy into
+Strategy (v7): Patch ``_get_logits`` to compute entropy from the *actual* model
+logits immediately after the TP all-gather.  Only inject entropy into
 ``customized_info`` during EXTEND mode with logprob return (i.e. when
-``extend_logprob_pruned_lens_cpu`` is a list).  Skip decode-mode and
-non-logprob extend calls entirely to avoid broken ``customized_info`` routing.
+``extend_logprob_pruned_lens_cpu`` is a list).  Skip decode-mode and non-
+logprob extend calls entirely to avoid broken ``customized_info`` routing.
 """
 
 from __future__ import annotations

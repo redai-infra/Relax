@@ -52,7 +52,8 @@ def test_teacher_advantage_replace(opd_utils_module):
 
 
 def test_teacher_advantage_additive(opd_utils_module):
-    """additive=True adds teacher advantage to original instead of replacing."""
+    """additive=True adds teacher advantage to original instead of
+    replacing."""
     opd_utils, torch = opd_utils_module
 
     teacher_lp = [torch.tensor([-1.0, -2.0])]

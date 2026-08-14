@@ -35,7 +35,8 @@ def test_entropy_b64_roundtrip():
 
 
 def test_logprob_response_entropy_1d_from_b64():
-    """LogprobResponse.entropy_1d() correctly parses meta_info with b64 entropy."""
+    """LogprobResponse.entropy_1d() correctly parses meta_info with b64
+    entropy."""
     from relax.utils.opd.opd_main_worker import LogprobResponse
 
     values = np.array([0.1, 0.5, 1.0, 2.0], dtype=np.float32)
@@ -49,7 +50,8 @@ def test_logprob_response_entropy_1d_from_b64():
 
 
 def test_logprob_response_entropy_1d_bare_string():
-    """LogprobResponse.entropy_1d() handles bare b64 string (not wrapped in list)."""
+    """LogprobResponse.entropy_1d() handles bare b64 string (not wrapped in
+    list)."""
     from relax.utils.opd.opd_main_worker import LogprobResponse
 
     values = np.array([0.3, 0.7], dtype=np.float32)

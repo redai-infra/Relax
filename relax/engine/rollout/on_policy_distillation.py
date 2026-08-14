@@ -255,9 +255,12 @@ class OpdManager:
         encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
         max_concurrent: int = 4,
     ) -> None:
-        """Run student-at-teacher prefill only.  Call after all rollout generation
-        is complete to avoid sending token_ids_logprob requests to the student
-        engine while it is still decoding rollout responses."""
+        """Run student-at-teacher prefill only.
+
+        Call after all rollout generation is complete to avoid sending
+        token_ids_logprob requests to the student engine while it is still
+        decoding rollout responses.
+        """
         if self.topk_worker is None or not self.topk_worker.spec.student_at_teacher:
             return
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
