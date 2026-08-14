@@ -4,24 +4,25 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
-from relax.utils.replay.report import FieldDivergence
+from relax.utils.replay.report import FieldDivergence, StageResult, StageStatus
 from relax.utils.replay.schema import Manifest, StageId
 
 
 def tolerance_for(
     manifest: Manifest, stage: StageId, *, default_atol: float = 1e-6, default_rtol: float = 1e-5
 ) -> tuple[float, float]:
-    """Return ``(atol, rtol)`` for ``stage`` from the manifest, with
-    defaults."""
+    """Return (atol, rtol) for stage from the manifest, with defaults."""
     entry = manifest.comparison_policy.tolerances.get(stage.value, {})
     return entry.get("atol", default_atol), entry.get("rtol", default_rtol)
 
 
 def compare_scalar(expected: float, actual: float, *, atol: float, rtol: float) -> bool:
-    """True when ``actual`` matches ``expected`` within tolerance."""
-    return bool(torch.isclose(torch.tensor(actual), torch.tensor(expected), atol=atol, rtol=rtol))
+    """True when |actual - expected| <= atol + rtol * |expected|."""
+    return abs(actual - expected) <= atol + rtol * abs(expected)
 
 
 def scalar_error(expected: float, actual: float) -> float:
@@ -40,9 +41,9 @@ def compare_tensors(
 ) -> tuple[list[FieldDivergence], float, int, int]:
     """Elementwise-compare two 1-D tensors and localize divergences.
 
-    Returns ``(divergences, max_abs_error, mismatch_count, non_finite_count)``.
-    Flat token index is mapped back to ``(sample_id, token_offset)`` when
-    ``sample_ids``/``response_lengths`` are provided.
+    Returns (divergences, max_abs_error, mismatch_count, non_finite_count).
+    Flat token index is mapped back to (sample_id, token_offset) when
+    sample_ids/response_lengths are provided.
     """
     expected = expected.float().reshape(-1)
     actual = actual.float().reshape(-1)
@@ -70,6 +71,117 @@ def compare_tensors(
             )
         )
     return divergences, max_abs_error, len(mismatched), non_finite
+
+
+def report_scalar_list(
+    result: StageResult,
+    *,
+    expected: list[Any] | None,
+    actual: list[float],
+    sample_ids: list[str],
+    field: str,
+    atol: float,
+    rtol: float,
+    missing: str,
+    mismatch: str,
+) -> StageResult:
+    """Compare per-sample scalars.
+
+    Missing expected values stay PASS.
+    """
+    if expected is None:
+        result.message = missing
+        return result
+    for index, (exp, act) in enumerate(zip(expected, actual, strict=False)):
+        if not compare_scalar(float(exp), float(act), atol=atol, rtol=rtol):
+            result.status = StageStatus.FAIL
+            result.divergences.append(
+                FieldDivergence(
+                    field=field,
+                    sample_id=sample_ids[index],
+                    expected=float(exp),
+                    actual=float(act),
+                    abs_error=scalar_error(float(exp), float(act)),
+                )
+            )
+    if result.status == StageStatus.FAIL:
+        result.message = mismatch.format(n=len(result.divergences))
+    return result
+
+
+def report_scalar_fields(
+    result: StageResult,
+    *,
+    expected: dict[str, Any] | None,
+    actual: dict[str, float],
+    atol: float,
+    rtol: float,
+    missing: str,
+    mismatch: str,
+) -> StageResult:
+    """Compare a map of named scalars.
+
+    Missing expected keys are skipped.
+    """
+    if expected is None:
+        result.message = missing
+        return result
+    for field, actual_value in actual.items():
+        expected_value = expected.get(field)
+        if expected_value is None:
+            continue
+        if not compare_scalar(float(expected_value), float(actual_value), atol=atol, rtol=rtol):
+            result.status = StageStatus.FAIL
+            result.divergences.append(
+                FieldDivergence(
+                    field=field,
+                    expected=float(expected_value),
+                    actual=float(actual_value),
+                    abs_error=scalar_error(float(expected_value), float(actual_value)),
+                )
+            )
+    if result.status == StageStatus.FAIL:
+        result.message = mismatch.format(fields=[item.field for item in result.divergences])
+    return result
+
+
+def report_tensor(
+    result: StageResult,
+    *,
+    expected: torch.Tensor | None,
+    actual: torch.Tensor,
+    field: str,
+    atol: float,
+    rtol: float,
+    sample_ids: list[str],
+    response_lengths: list[int],
+    missing: str,
+    mismatch: str,
+) -> StageResult:
+    """Compare a flat per-token tensor.
+
+    Missing expected payload stays PASS.
+    """
+    if expected is None:
+        result.message = missing
+        return result
+    divergences, max_err, mismatches, non_finite = compare_tensors(
+        expected,
+        actual,
+        field=field,
+        atol=atol,
+        rtol=rtol,
+        sample_ids=sample_ids,
+        response_lengths=response_lengths,
+    )
+    result.divergences = divergences
+    result.max_abs_error = max_err
+    result.mismatch_count = mismatches
+    result.non_finite_count = non_finite
+    if mismatches or non_finite:
+        result.status = StageStatus.FAIL
+        result.message = mismatch.format(n=mismatches)
+    return result
 
 
 def _locate(

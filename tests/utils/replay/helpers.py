@@ -3,11 +3,11 @@
 """Test helpers that build small, hand-checkable GRPO replay bundles.
 
 The fixture is deliberately tiny and deterministic: 4 samples in 2 semantic
-groups of 2 (``n_samples_per_prompt=2``), each with 2 response tokens. Expected
-outputs are computed from *pristine* inputs with reference implementations that
-are independent of the adapters under test; a ``corrupt=...`` option then
-tampers only the *inputs* written to the bundle, so replay must detect the
-divergence against the pristine expected outputs.
+groups of 2 (n_samples_per_prompt=2), each with 2 response tokens. Expected
+outputs are computed from pristine inputs with reference implementations that
+are independent of the adapters under test; a corrupt=... option then tampers
+only the inputs written to the bundle, so replay must detect the divergence
+against the pristine expected outputs.
 """
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ def build_grpo_bundle(
     ref_log_probs: torch.Tensor | None = None,
     loss_masks: list[list[int]] | None = None,
 ) -> tuple[Path, BundleIndex, dict[str, Any]]:
-    """Build a GRPO CP=1 bundle and return ``(path, index, expected)``."""
+    """Build a GRPO CP=1 bundle and return (path, index, expected)."""
     raw_rewards = list(raw_rewards) if raw_rewards is not None else list(RAW_REWARDS)
     loss_masks = [list(mask) for mask in (loss_masks or LOSS_MASKS)]
 
@@ -256,12 +256,11 @@ def build_grpo_bundle(
 
 
 def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) -> CaptureRecord:
-    """Build a pristine GRPO CP=1 ``CaptureRecord`` (same reference data as
-    ``build_grpo_bundle``).
+    """Build a pristine GRPO CP=1 CaptureRecord (same reference data as
+    build_grpo_bundle).
 
     This is the production-capture equivalent of the PR A fixture: a record the
-    ``CaptureManager``/``build_bundle_from_record`` turns into a replayable
-    bundle.
+    CaptureManager/build_bundle_from_record turns into a replayable bundle.
     """
     config = RecomputeConfig(
         advantage_estimator="grpo",
@@ -325,10 +324,10 @@ def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) ->
 
 
 def make_rollout_capture_record(bundle_id: str = "b-rollout-capture") -> CaptureRecord:
-    """Build a pristine rollout-level (reward → advantage) ``CaptureRecord``.
+    """Build a pristine rollout-level (reward → advantage) CaptureRecord.
 
-    Mirrors the production ``capture_hooks.capture_rollout_advantage`` payload:
-    an identity anchored by ``rollout_id``, raw per-sample metadata as deferred
+    Mirrors the production capture_hooks.capture_rollout_advantage payload: an
+    identity anchored by rollout_id, raw per-sample metadata as deferred
     tensors, and only the reward/advantage stages declared (no loss stage).
     """
     config = RecomputeConfig(

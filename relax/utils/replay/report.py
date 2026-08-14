@@ -2,11 +2,10 @@
 
 """Divergence report model.
 
-A replay reports the *first* stage at which recomputed outputs diverge from
+A replay reports the first stage at which recomputed outputs diverge from
 captured expected outputs, plus the field, sample and token offset where
-possible. Stages that were skipped (``recorded-only`` / ``inspect-only`` /
-``unsupported``) are never counted as passing or failing — they are reported as
-``not_verified``.
+possible. Skipped stages (recorded-only / inspect-only / unsupported) never
+count as pass or fail.
 """
 
 from __future__ import annotations

@@ -5,8 +5,8 @@
 The writer is crash-safe: payloads and metadata land in a sibling temp
 directory, then the directory is atomically renamed into place only after the
 completion sentinel is written. The reader refuses to open a bundle that is
-missing ``COMPLETE``, a payload, a rank shard, or whose checksums do not match
-the manifest — and it loads tensors with ``weights_only=True`` only.
+missing COMPLETE, a payload, a rank shard, or whose checksums do not match the
+manifest — and it loads tensors with weights_only=True only.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from typing import Any
 
 import torch
 
-from relax.utils.logging_utils import get_logger
 from relax.utils.replay.schema import (
     BundleIndex,
     Manifest,
@@ -31,8 +30,6 @@ from relax.utils.replay.schema import (
     manifest_to_dict,
 )
 
-
-logger = get_logger(__name__)
 
 _COMPLETE = "COMPLETE"
 _PAYLOAD_DIR = "payloads"
@@ -74,6 +71,14 @@ class LoadedBundle:
     expected: dict[str, Any]
     tensors: dict[str, torch.Tensor]
 
+    @property
+    def sample_ids(self) -> list[str]:
+        return [record.sample_id for record in self.index.samples]
+
+    @property
+    def response_lengths(self) -> list[int]:
+        return [record.response_length for record in self.index.samples]
+
 
 class BundleWriter:
     """Writes a single-rank (or coordinator) replay bundle atomically."""
@@ -99,7 +104,7 @@ class BundleWriter:
         return self._tmp_path / _PAYLOAD_DIR
 
     def write_payload(self, name: str, tensor: torch.Tensor) -> None:
-        """Store one detached CPU tensor payload under ``name``."""
+        """Store one detached CPU tensor payload under name."""
         tensor = tensor.detach().cpu().contiguous()
         path = self._payload_dir() / f"{name}.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,11 +145,11 @@ def write_rank_shard(
     actor_step_id: tuple[int, int],
     payloads: dict[str, torch.Tensor],
 ) -> None:
-    """Write one rank's payload shard and ``COMPLETE.<rank>`` into an existing
+    """Write one rank's payload shard and COMPLETE.<rank> into an existing
     bundle dir.
 
-    Used by multi-rank producers; the coordinator calls :func:`finalize_bundle`
-    once every rank has flushed.
+    Used by multi-rank producers; the coordinator calls finalize_bundle once
+    every rank has flushed.
     """
     bundle_dir = Path(path)
     payload_dir = bundle_dir / _PAYLOAD_DIR
@@ -188,8 +193,8 @@ class BundleReader:
     def load(self, *, allow_partial_read: bool = False) -> LoadedBundle:
         """Load manifest, index, expected outputs and tensor payloads.
 
-        ``allow_partial_read`` is for inspection of incomplete bundles; replay
-        and validate always require a complete bundle.
+        allow_partial_read is for inspection of incomplete bundles; replay and
+        validate always require a complete bundle.
         """
         if not self._path.is_dir():
             raise IncompleteBundleError(f"bundle directory not found: {self._path}")

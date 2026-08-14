@@ -2,18 +2,18 @@
 
 """Command-line entry point for offline trajectory replay.
 
-Usage::
+Usage:
 
     python -m relax.tools.trajectory_replay inspect  <bundle>
     python -m relax.tools.trajectory_replay validate <bundle>
     python -m relax.tools.trajectory_replay replay   <bundle> [--stage all]
         [--sample s-0 --group g-1 --batch mb-0007 --step 120:0]
 
-``inspect`` works on incomplete bundles (no ``COMPLETE`` required); ``validate``
-and ``replay`` require a complete, checksum-validated bundle. ``replay``
+inspect works on incomplete bundles (no COMPLETE required); validate
+and replay require a complete, checksum-validated bundle. replay
 supports selecting a single sample / group / micro-batch (each expands to its
 semantic-group closure); cohort-level stages (loss) are skipped for a partial
-selection. ``--step`` asserts the bundle's actor-step coordinate.
+selection. --step asserts the bundle's actor-step coordinate.
 """
 
 from __future__ import annotations

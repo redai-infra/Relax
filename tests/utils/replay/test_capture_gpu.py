@@ -2,13 +2,13 @@
 
 """GPU smoke test for production capture (PR B).
 
-Runs the real hook path — ``capture_hooks.capture_policy_loss`` with CUDA
-tensors through the async ``CaptureManager`` — and verifies the produced bundle
+Runs the real hook path — capture_hooks.capture_policy_loss with CUDA
+tensors through the async CaptureManager — and verifies the produced bundle
 replays cleanly on CPU. Skipped on CPU-only hosts.
 
-This is a *semi-integration* smoke: it exercises the actual hook functions and
-the deferred GPU→CPU copy on the writer thread, but not ``build_identity``
-(which needs a Megatron ``mpu`` world). Full DP/TP parity is validated by a
+This is a semi-integration smoke: it exercises the actual hook functions and
+the deferred GPU→CPU copy on the writer thread, but not build_identity
+(which needs a Megatron mpu world). Full DP/TP parity is validated by a
 real training run on the target cluster.
 """
 

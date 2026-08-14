@@ -2,9 +2,9 @@
 
 """Bundle validation.
 
-``validate`` checks a bundle's format, integrity, safety and dependency closure
-*without* executing any numerical replay. It is the gate that runs before every
-``replay`` so a stage can never start on an incomplete or tampered bundle.
+validate checks a bundle's format, integrity, safety and dependency closure
+without executing any numerical replay. It is the gate that runs before every
+replay so a stage can never start on an incomplete or tampered bundle.
 """
 
 from __future__ import annotations
@@ -15,13 +15,9 @@ from pathlib import Path
 
 import torch
 
-from relax.utils.logging_utils import get_logger
 from relax.utils.replay.bundle import BundleReader, LoadedBundle
-from relax.utils.replay.identity import ClosureError, expand_selection, validate_identity
+from relax.utils.replay.identity import ClosureError, expand_selection, sample_integrity_problems, validate_identity
 from relax.utils.replay.schema import INDEX_KEYS, MANIFEST_KEYS, StageCapability
-
-
-logger = get_logger(__name__)
 
 
 @dataclass
@@ -98,13 +94,8 @@ def _validate_sample_records(bundle: LoadedBundle, result: ValidationResult) -> 
         if record.sample_id in seen:
             result.add_error(f"duplicate sample_id {record.sample_id!r}")
         seen.add(record.sample_id)
-        if record.response_length < 0 or record.total_length < record.response_length:
-            result.add_error(f"sample {record.sample_id!r} has invalid lengths")
-        if len(record.loss_mask) != record.response_length:
-            result.add_error(
-                f"sample {record.sample_id!r} loss_mask length {len(record.loss_mask)} != response_length "
-                f"{record.response_length}"
-            )
+        for _field, message in sample_integrity_problems(record):
+            result.add_error(message)
 
 
 def _validate_capabilities(bundle: LoadedBundle, result: ValidationResult) -> None:

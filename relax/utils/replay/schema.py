@@ -3,8 +3,8 @@
 """Replay bundle contract.
 
 The on-disk schema for an offline trajectory replay bundle. This module owns
-*data description* only — no production math, no tensors, no I/O beyond
-``dict`` round-trips. The bundle is a directory laid out as::
+data description only — no production math, no tensors, no I/O beyond
+dict round-trips. The bundle is a directory laid out as:
 
     <bundle>/
     ├── manifest.json    # versions, producer, stage contracts, payload specs
@@ -13,7 +13,7 @@ The on-disk schema for an offline trajectory replay bundle. This module owns
     ├── payloads/        # tensor payloads (inputs and expected tensors)
     └── COMPLETE         # completion sentinel (or COMPLETE.<rank> per rank)
 
-Only JSON-compatible metadata and ``weights_only=True`` tensor payloads are
+Only JSON-compatible metadata and weights_only=True tensor payloads are
 accepted, so a bundle can be exchanged without executing arbitrary Python.
 """
 
@@ -25,7 +25,7 @@ from typing import Any
 
 
 # Bundle format version. A reader refuses to open a bundle whose major version
-# differs. ``format_major`` is derived, never stored.
+# differs. format_major is derived, never stored.
 FORMAT_VERSION = "1.0.0"
 FORMAT_MAJOR = FORMAT_VERSION.split(".", maxsplit=1)[0]
 
@@ -76,12 +76,12 @@ STAGE_ORDER: tuple[StageId, ...] = (
 class ActorStepId:
     """Training-step coordinate (Task 34 identity anchor).
 
-    This is the ``(rollout_id, step_id)`` coordinate of one
-    ``train_one_step`` call — the stable identity within a run. The derived
-    ``accumulated_step_id`` scalar is intentionally *not* the identity: under
-    dynamic batching and streaming schedules ``num_steps_per_rollout`` can vary
-    per rollout, so ``rollout_id * num_steps_per_rollout + step_id`` is not a
-    monotonic global counter (see ``relax/backends/megatron/model.py``).
+    This is the (rollout_id, step_id) coordinate of one
+    train_one_step call — the stable identity within a run. The derived
+    accumulated_step_id scalar is intentionally not the identity: under
+    dynamic batching and streaming schedules num_steps_per_rollout can vary
+    per rollout, so rollout_id * num_steps_per_rollout + step_id is not a
+    monotonic global counter (see relax/backends/megatron/model.py).
     """
 
     rollout_id: int
@@ -100,8 +100,8 @@ class WeightLineage:
 class Identity:
     """Logical identity + physical provenance of a captured cohort.
 
-    Anchored by exactly one of ``actor_step_id`` (per-step, loss) or
-    ``rollout_id`` (per-rollout, reward/advantage).
+    Anchored by exactly one of actor_step_id (per-step, loss) or rollout_id
+    (per-rollout, reward/advantage).
     """
 
     actor_step_id: ActorStepId | None = None
@@ -112,15 +112,16 @@ class Identity:
     semantic_group_ids: list[str] = field(default_factory=list)
     normalization_cohort_ids: list[str] = field(default_factory=list)
     weight_lineage: WeightLineage = field(default_factory=WeightLineage)
+    # Parallel world sizes {dp, tp, pp, cp}, not the capturing process rank.
     rank: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
 class SampleRecord:
-    """Replay-relevant, JSON-safe slice of one :class:`Sample`.
+    """Replay-relevant, JSON-safe slice of one Sample.
 
     Text (prompt/response/label) is never stored raw; the caller substitutes a
-    redaction digest. Per-token tensors live in ``payloads/``, not here.
+    redaction digest. Per-token tensors live in payloads/, not here.
     """
 
     sample_id: str
@@ -157,7 +158,7 @@ class StageContract:
     stage: StageId
     version: str
     capability: StageCapability
-    # ``reuse`` — adapter calls the same production kernel; ``reimplemented``
+    # reuse — adapter calls the same production kernel; reimplemented
     # — adapter restates production math and must carry its own parity evidence.
     implementation: str = "reuse"
     inputs: list[str] = field(default_factory=list)

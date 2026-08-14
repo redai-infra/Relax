@@ -2,14 +2,14 @@
 
 """Microbenchmark for the trajectory-replay capture hook overhead.
 
-Measures the per-call cost of ``capture_hooks.capture_policy_loss`` in the three
+Measures the per-call cost of capture_hooks.capture_policy_loss in the three
 modes that matter for the hot-path budget:
 
-- **disabled**: capture never enabled (default) — must be ~0.
-- **unselected**: capture enabled but the step is not selected.
-- **selected**: capture enabled and the step is captured.
+- disabled: capture never enabled (default) — must be ~0.
+- unselected: capture enabled but the step is not selected.
+- selected: capture enabled and the step is captured.
 
-This isolates the *hook* overhead only. The full step-latency budget (§7.3:
+This isolates the hook overhead only. The full step-latency budget (spec 7.3:
 disabled <0.5%, selected-step <3%) must be measured on a real training run,
 because this microbenchmark does not include forward/backward.
 
@@ -24,8 +24,12 @@ import time
 
 import torch
 
+from relax.utils.logging_utils import get_logger
 from relax.utils.replay import capture_hooks
 from relax.utils.replay.capture import CaptureConfig, disable, enable
+
+
+logger = get_logger(__name__)
 
 
 def _synthetic_loss_args(device: torch.device) -> dict:
@@ -63,7 +67,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device} iters={args.iters}")
+    logger.info("device=%s iters=%s", device, args.iters)
 
     disable()
     disabled_ns = _time_hook(args.iters, device) * 1e9
@@ -79,10 +83,10 @@ def main() -> None:
     capture_module.end_step()
     disable()
 
-    print(f"disabled   : {disabled_ns:8.1f} ns/call")
-    print(f"unselected : {unselected_ns:8.1f} ns/call")
-    print(f"selected   : {selected_ns:8.1f} ns/call")
-    print("(full step-latency budget must be measured on a real training run, see spec §7.3)")
+    logger.info("disabled   : %8.1f ns/call", disabled_ns)
+    logger.info("unselected : %8.1f ns/call", unselected_ns)
+    logger.info("selected   : %8.1f ns/call", selected_ns)
+    logger.info("full step-latency budget must be measured on a real training run")
 
 
 def _identity():

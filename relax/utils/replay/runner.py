@@ -3,10 +3,9 @@
 """Offline replay runner.
 
 Executes the pipeline stages in DAG order. Only stages that (a) resolve to
-``recompute`` under the frozen V1 matrix for the bundle's topology and (b) are
-declared ``recompute`` in the manifest are executed; everything else is
-reported as ``skipped`` and never counted toward the first-divergent-stage
-determination.
+recompute under the frozen V1 matrix for the bundle's topology and (b) are
+declared recompute in the manifest are executed; everything else is reported as
+skipped and never counted toward the first-divergent-stage determination.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from relax.utils.replay.stages import capability_for, get_adapter
 
 logger = get_logger(__name__)
 
-# Stages whose output is a reduction over the *entire* cohort. They cannot be
+# Stages whose output is a reduction over the entire cohort. They cannot be
 # faithfully recomputed for a partial selection (single sample/group/batch), so
 # a partial replay reports them as skipped rather than comparing a subset scalar
 # against a full-cohort expected value.
@@ -86,7 +85,7 @@ def replay(
     group_ids: list[str] | None = None,
     batch_ids: list[str] | None = None,
 ) -> ReplayReport:
-    """Load a bundle from ``path`` and replay it (optionally a selection)."""
+    """Load a bundle from path and replay it (optionally a selection)."""
     bundle = BundleReader(path).load()
 
     has_selection = any((sample_ids, group_ids, batch_ids))

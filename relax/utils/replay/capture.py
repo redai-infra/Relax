@@ -1,29 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Production capture (PR B, data plane).
+"""Production capture: post-forward tensors → replay bundle.
 
-This module owns the capture half of the trajectory replay system: turning a
-handful of post-forward tensors, identity and stage outputs from one training
-step into a replay bundle that :mod:`relax.utils.replay.runner` can replay.
-
-It contains no production math and touches no hot path itself. Training enables
-it via :func:`maybe_enable_from_env` (``RELAX_REPLAY_CAPTURE``). The hot-path
-hooks live in :mod:`relax.utils.replay.capture_hooks` and are called from:
-
-- rollout-level reward / advantage: ``MegatronTrainRayActor.train_actor``;
-- policy loss terms: ``relax.backends.megatron.loss.policy_loss_function``;
-- actor-step identity: the ``train_one_step`` loop in
-  ``relax.backends.megatron.model``.
-
-The hot-path contract is strict:
-
-- ``CaptureManager.submit`` only *detaches* tensors and enqueues them; it never
-  calls ``.cpu()`` / ``.item()`` / ``.tolist()`` and never touches ``torch.distributed``.
-- The GPU→CPU copy and serialization happen on a dedicated writer thread.
-- The queue is bounded: when full, a step is dropped and a diagnostic is logged
-  (never back-pressure into training).
-- The writer thread isolates all bundle-build failures so a crash there cannot
-  propagate into the training loop.
+Enabled via maybe_enable_from_env. Hooks live in capture_hooks.
+CaptureManager.submit only detaches tensors; GPU→CPU copy and serialization run
+on a bounded writer thread that never back-pressures training.
 """
 
 from __future__ import annotations
@@ -65,24 +46,22 @@ class CaptureConfig:
 
     enabled: bool = False
     output_dir: str | Path = ""
-    bundle_id_prefix: str = "replay"
     queue_capacity: int = 16
     # Actor steps (rollout_id, step_id) to capture; None captures every step.
     selected_steps: set[tuple[int, int]] | None = None
     # Rollouts to capture at rollout level (reward/advantage); None captures every rollout.
     selected_rollouts: set[int] | None = None
     redaction: dict[str, str] = field(default_factory=dict)
-    commit: str = ""
 
 
 @dataclass
 class CaptureRecord:
     """Everything one capture cohort needs to be replayed.
 
-    A record is anchored by exactly one of ``actor_step_id`` (per-step, loss)
-    or ``rollout_id`` (per-rollout, reward/advantage). ``tensors`` holds the
-    post-forward tensor payloads (inputs and expected outputs); ``expected``
-    holds the JSON-serializable expected outputs.
+    A record is anchored by exactly one of actor_step_id (per-step, loss) or
+    rollout_id (per-rollout, reward/advantage). tensors holds the post-forward
+    tensor payloads (inputs and expected outputs); expected holds the JSON-
+    serializable expected outputs.
     """
 
     identity: Identity
@@ -100,9 +79,9 @@ class CaptureRecord:
     # only) sets this explicitly so the manifest does not promise stages whose
     # payloads are absent.
     stages: set[StageId] | None = None
-    # Raw per-sample metadata used to build ``SampleRecord`` on the writer
+    # Raw per-sample metadata used to build SampleRecord on the writer
     # thread. The mask/reward/group tensors stay detached through the hot path;
-    # their GPU→CPU conversion happens only in ``build_bundle_from_record``.
+    # their GPU→CPU conversion happens only in build_bundle_from_record.
     response_lengths: list[int] | None = None
     total_lengths: list[int] | None = None
     loss_masks_tensor: torch.Tensor | None = None
@@ -120,16 +99,39 @@ class CaptureRecord:
         return "<unset>"
 
 
+def _detach_value(value: Any) -> Any:
+    """Detach tensors in a nested dict/list; leave other values unchanged."""
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_value(item) for item in value]
+    return value
+
+
+def _detach_record(record: CaptureRecord) -> CaptureRecord:
+    """Snapshot record with tensors detached (no GPU→CPU sync)."""
+    return replace(
+        record,
+        tensors={name: tensor.detach() for name, tensor in record.tensors.items()},
+        expected=_detach_value(record.expected),
+        loss_masks_tensor=_detach_value(record.loss_masks_tensor),
+        group_indices_tensor=_detach_value(record.group_indices_tensor),
+        raw_rewards_tensor=_detach_value(record.raw_rewards_tensor),
+        rewards_tensor=_detach_value(record.rewards_tensor),
+    )
+
+
 def build_manifest_for_record(record: CaptureRecord) -> Manifest:
     """Derive the manifest from the frozen V1 capability matrix.
 
-    Each stage in ``STAGE_ORDER`` is declared with the capability the matrix
-    grants for the bundle's topology (``record.config.advantage_estimator`` and
-    ``record.identity.rank["cp"]``). Stages outside the matrix are
-    ``unsupported`` and will be skipped — never silently recomputed. When
-    ``record.stages`` is set, only those stages are declared (the rest get no
-    contract and are skipped), so a partial capture never promises absent
-    payloads.
+    Each stage in STAGE_ORDER is declared with the capability the matrix grants
+    for the bundle's topology (record.config.advantage_estimator and
+    record.identity.rank["cp"]). Stages outside the matrix are unsupported and
+    will be skipped — never silently recomputed. When record.stages is set,
+    only those stages are declared (the rest get no contract and are skipped),
+    so a partial capture never promises absent payloads.
     """
     context_parallel = record.identity.rank.get("cp", 1)
     declared = record.stages if record.stages is not None else set(STAGE_ORDER)
@@ -160,11 +162,11 @@ def build_manifest_for_record(record: CaptureRecord) -> Manifest:
 
 
 def _normalize_expected(expected: dict[str, Any]) -> dict[str, Any]:
-    """Convert detached scalar tensors in ``expected`` to plain floats.
+    """Convert detached scalar tensors in expected to plain floats.
 
-    Runs on the writer thread so the GPU→CPU sync (``.item()``) never happens
-    in the training hot path. Handles nested dicts/lists (e.g. ``loss.policy``
-    metric maps).
+    Runs on the writer thread so the GPU→CPU sync (.item()) never happens in
+    the training hot path. Handles nested dicts/lists (e.g. loss.policy metric
+    maps).
     """
 
     def _convert(value: Any) -> Any:
@@ -180,13 +182,13 @@ def _normalize_expected(expected: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
-    """Build the ``SampleRecord`` list from raw per-sample metadata.
+    """Build the SampleRecord list from raw per-sample metadata.
 
-    Runs on the writer thread; the flat ``loss_masks_tensor`` is split back per
-    sample using ``response_lengths``, and the optional group/reward tensors
-    are converted here so their GPU→CPU sync never happens in the hot path.
-    When the group/reward tensors are absent (loss-only capture) placeholders
-    are used.
+    Runs on the writer thread; the flat loss_masks_tensor is split back per
+    sample using response_lengths, and the optional group/reward tensors are
+    converted here so their GPU→CPU sync never happens in the hot path. When
+    the group/reward tensors are absent (loss-only capture) placeholders are
+    used.
     """
     if record.response_lengths is None or record.total_lengths is None or record.loss_masks_tensor is None:
         raise ValueError("capture record has no samples and incomplete raw sample metadata")
@@ -233,7 +235,7 @@ def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
 
 
 def _micro_batch_id_for(record: CaptureRecord) -> str | None:
-    """Stable micro-batch id for a per-step capture (``mb-<step_id>``).
+    """Stable micro-batch id for a per-step capture (mb-<step_id>).
 
     Rollout-level records have no actor step, so batch selection stays fail-
     closed.
@@ -244,7 +246,7 @@ def _micro_batch_id_for(record: CaptureRecord) -> str | None:
 
 
 def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> Path:
-    """Serialize one :class:`CaptureRecord` into a replay bundle.
+    """Serialize one CaptureRecord into a replay bundle.
 
     Pure and synchronous; used directly by tests and by the async writer
     thread.
@@ -285,8 +287,8 @@ class CaptureManager:
     """Bounded, asynchronous capture sink.
 
     Owns the writer thread and the bounded queue. Disabled by default: when
-    ``config.enabled`` is False, :meth:`submit` is a no-op that never inspects
-    tensors, so the disabled path is a single branch.
+    config.enabled is False, submit is a no-op that never inspects tensors, so
+    the disabled path is a single branch.
     """
 
     def __init__(self, config: CaptureConfig) -> None:
@@ -334,41 +336,17 @@ class CaptureManager:
         return False
 
     def submit(self, record: CaptureRecord) -> bool:
-        """Enqueue a detached snapshot of ``record``; returns True if queued.
+        """Enqueue a detached snapshot of record; returns True if queued.
 
-        Only ``detach()`` happens on the caller thread (no GPU→CPU sync, no
+        Only detach() happens on the caller thread (no GPU→CPU sync, no
         collective). On queue overflow the record is dropped and False
         returned.
         """
         if not self.enabled or not self._record_selected(record):
             return False
 
-        snapshot = CaptureRecord(
-            identity=record.identity,
-            samples=record.samples,
-            config=record.config,
-            tensors={name: tensor.detach() for name, tensor in record.tensors.items()},
-            expected={
-                key: value.detach() if isinstance(value, torch.Tensor) else value
-                for key, value in record.expected.items()
-            },
-            bundle_id=record.bundle_id,
-            actor_step_id=record.actor_step_id,
-            rollout_id=record.rollout_id,
-            producer=record.producer,
-            redaction=record.redaction,
-            stages=record.stages,
-            response_lengths=record.response_lengths,
-            total_lengths=record.total_lengths,
-            loss_masks_tensor=record.loss_masks_tensor.detach() if record.loss_masks_tensor is not None else None,
-            group_indices_tensor=record.group_indices_tensor.detach()
-            if record.group_indices_tensor is not None
-            else None,
-            raw_rewards_tensor=record.raw_rewards_tensor.detach() if record.raw_rewards_tensor is not None else None,
-            rewards_tensor=record.rewards_tensor.detach() if record.rewards_tensor is not None else None,
-        )
         try:
-            self._queue.put_nowait(snapshot)
+            self._queue.put_nowait(_detach_record(record))
             return True
         except queue.Full:
             self._dropped_count += 1
@@ -394,10 +372,9 @@ class CaptureManager:
             finally:
                 self._queue.task_done()
 
-    def flush(self, wait: bool = False) -> None:
-        """Wait for all currently queued records to be written, if
-        requested."""
-        if self._queue is not None and wait:
+    def flush(self) -> None:
+        """Block until queued records have been written."""
+        if self._queue is not None:
             self._queue.join()
 
     def close(self, timeout: float | None = 10.0) -> None:
@@ -422,17 +399,17 @@ class CaptureManager:
 # Process-global capture state (the thin, hot-path-safe hook surface).
 #
 # Training files call the tiny functions below; everything heavier lives on the
-# ``CaptureManager`` / writer thread. ``active()`` is a single global read and
-# ``current_step()`` a single global read — no GPU→CPU sync, no collective.
+# CaptureManager / writer thread. active() is a single global read and
+# current_step() a single global read — no GPU→CPU sync, no collective.
 # ---------------------------------------------------------------------------
 
 _active: CaptureManager | None = None
-_current_step: StepCapture | None = None
+_current_step: CaptureRecord | None = None
 _atexit_registered: bool = False
 
 
 def _parse_selected_steps(raw: str | None) -> set[tuple[int, int]] | None:
-    """Parse ``RELAX_REPLAY_CAPTURE_STEPS`` (``ROLLOUT_ID:STEP_ID,...``)."""
+    """Parse RELAX_REPLAY_CAPTURE_STEPS (ROLLOUT_ID:STEP_ID,...)."""
     if raw is None or not raw.strip():
         return None
     steps: set[tuple[int, int]] = set()
@@ -451,7 +428,7 @@ def _parse_selected_steps(raw: str | None) -> set[tuple[int, int]] | None:
 
 
 def _parse_selected_rollouts(raw: str | None) -> set[int] | None:
-    """Parse ``RELAX_REPLAY_CAPTURE_ROLLOUTS`` (``ID,ID,...``)."""
+    """Parse RELAX_REPLAY_CAPTURE_ROLLOUTS (ID,ID,...)."""
     if raw is None or not raw.strip():
         return None
     rollouts: set[int] = set()
@@ -467,11 +444,11 @@ def _parse_selected_rollouts(raw: str | None) -> set[int] | None:
 
 
 def config_from_env() -> CaptureConfig | None:
-    """Build a :class:`CaptureConfig` from ``RELAX_REPLAY_CAPTURE*`` env vars.
+    """Build a CaptureConfig from RELAX_REPLAY_CAPTURE* env vars.
 
-    Returns ``None`` when capture is unset/false, so the caller can no-op.
-    ``RELAX_REPLAY_CAPTURE=1`` without ``RELAX_REPLAY_CAPTURE_DIR`` logs a
-    warning and also returns ``None`` — never write to an implicit path.
+    Returns None when capture is unset/false, so the caller can no-op.
+    RELAX_REPLAY_CAPTURE=1 without RELAX_REPLAY_CAPTURE_DIR logs a warning and
+    also returns None — never write to an implicit path.
     """
     if not Envs.RELAX_REPLAY_CAPTURE:
         return None
@@ -490,8 +467,8 @@ def config_from_env() -> CaptureConfig | None:
 def maybe_enable_from_env(*, rank: int | None = None) -> CaptureManager | None:
     """Enable capture from env vars. No-op when capture is not requested.
 
-    ``rank`` scopes the output directory to ``<dir>/rank-<rank>`` so concurrent
-    DP/TP writers do not clobber each other on a shared filesystem.
+    rank scopes the output directory to <dir>/rank-<rank> so concurrent DP/TP
+    writers do not clobber each other on a shared filesystem.
     """
     config = config_from_env()
     if config is None:
@@ -507,7 +484,7 @@ def enable(config: CaptureConfig) -> CaptureManager:
 
     Replaces any previously active manager (flushing it first). This is the
     Python-API injection point: the training actor calls it from
-    :func:`maybe_enable_from_env` — no argument-parsing changes required.
+    maybe_enable_from_env — no argument-parsing changes required.
     """
     global _active, _atexit_registered
     if _active is not None:
@@ -528,67 +505,35 @@ def disable() -> None:
 
 
 def active() -> CaptureManager | None:
-    """Return the active manager, or ``None`` when capture is disabled."""
+    """Return the active manager, or None when capture is disabled."""
     return _active
 
 
-class StepCapture:
-    """Accumulates the data captured for one cohort across hooks.
-
-    Anchored by ``actor_step_id`` (per-step, loss) or ``rollout_id`` (per-
-    rollout, reward/advantage). The training-side hooks write tensors /
-    expected outputs into this object; ``end_step`` / ``end_rollout`` turn it
-    into a :class:`CaptureRecord` and hand it to the manager. All tensor
-    detaching happens in ``CaptureManager.submit``, so the hooks themselves
-    only hold live references.
-    """
-
-    def __init__(
-        self,
-        identity: Identity,
-        config: RecomputeConfig,
-        bundle_id: str,
-        *,
-        actor_step_id: tuple[int, int] | None = None,
-        rollout_id: int | None = None,
-        producer: ProducerInfo | None = None,
-    ) -> None:
-        self.actor_step_id = actor_step_id
-        self.rollout_id = rollout_id
-        self.identity = identity
-        self.config = config
-        self.bundle_id = bundle_id
-        self.producer = producer if producer is not None else ProducerInfo()
-        self.samples: list[SampleRecord] = []
-        self.tensors: dict[str, torch.Tensor] = {}
-        self.expected: dict[str, Any] = {}
-        self.stages: set[StageId] | None = None
-        self.response_lengths: list[int] | None = None
-        self.total_lengths: list[int] | None = None
-        self.loss_masks_tensor: torch.Tensor | None = None
-        self.group_indices_tensor: torch.Tensor | None = None
-        self.raw_rewards_tensor: torch.Tensor | None = None
-        self.rewards_tensor: torch.Tensor | None = None
-
-    def to_record(self) -> CaptureRecord:
-        return CaptureRecord(
-            identity=self.identity,
-            samples=self.samples,
-            config=self.config,
-            tensors=self.tensors,
-            expected=self.expected,
-            bundle_id=self.bundle_id,
-            actor_step_id=self.actor_step_id,
-            rollout_id=self.rollout_id,
-            producer=self.producer,
-            stages=self.stages,
-            response_lengths=self.response_lengths,
-            total_lengths=self.total_lengths,
-            loss_masks_tensor=self.loss_masks_tensor,
-            group_indices_tensor=self.group_indices_tensor,
-            raw_rewards_tensor=self.raw_rewards_tensor,
-            rewards_tensor=self.rewards_tensor,
-        )
+def _open_cohort(
+    *,
+    selected: bool,
+    identity: Identity,
+    config: RecomputeConfig,
+    bundle_id: str,
+    actor_step_id: tuple[int, int] | None = None,
+    rollout_id: int | None = None,
+    producer: ProducerInfo | None = None,
+) -> None:
+    global _current_step
+    if not selected:
+        _current_step = None
+        return
+    _current_step = CaptureRecord(
+        identity=identity,
+        samples=[],
+        config=config,
+        tensors={},
+        expected={},
+        bundle_id=bundle_id,
+        actor_step_id=actor_step_id,
+        rollout_id=rollout_id,
+        producer=producer if producer is not None else ProducerInfo(),
+    )
 
 
 def begin_step(
@@ -600,11 +545,14 @@ def begin_step(
     producer: ProducerInfo | None = None,
 ) -> None:
     """Open a per-step capture accumulator (no-op when disabled/unselected)."""
-    global _current_step
-    if _active is None or not _active.is_selected(actor_step_id):
-        _current_step = None
-        return
-    _current_step = StepCapture(identity, config, bundle_id, actor_step_id=actor_step_id, producer=producer)
+    _open_cohort(
+        selected=_active is not None and _active.is_selected(actor_step_id),
+        identity=identity,
+        config=config,
+        bundle_id=bundle_id,
+        actor_step_id=actor_step_id,
+        producer=producer,
+    )
 
 
 def begin_rollout(
@@ -617,19 +565,18 @@ def begin_rollout(
 ) -> None:
     """Open a per-rollout capture accumulator (no-op when
     disabled/unselected)."""
-    global _current_step
-    if _active is None or not _active.is_rollout_selected(rollout_id):
-        _current_step = None
-        return
-    _current_step = StepCapture(identity, config, bundle_id, rollout_id=rollout_id, producer=producer)
+    _open_cohort(
+        selected=_active is not None and _active.is_rollout_selected(rollout_id),
+        identity=identity,
+        config=config,
+        bundle_id=bundle_id,
+        rollout_id=rollout_id,
+        producer=producer,
+    )
 
 
 def should_capture(actor_step_id: tuple[int, int]) -> bool:
-    """Cheap disabled/unselected guard (two global reads, no allocation).
-
-    Callers use this *before* building an :class:`Identity` /
-    :class:`RecomputeConfig` so the disabled hot path does no work at all.
-    """
+    """Cheap disabled/unselected guard (two global reads, no allocation)."""
     return _active is not None and _active.is_selected(actor_step_id)
 
 
@@ -638,28 +585,20 @@ def should_capture_rollout(rollout_id: int) -> bool:
     return _active is not None and _active.is_rollout_selected(rollout_id)
 
 
-def current_step() -> StepCapture | None:
-    """Return the current cohort's accumulator, or ``None`` when disabled."""
+def current_step() -> CaptureRecord | None:
+    """Return the current cohort's accumulator, or None when disabled."""
     return _current_step
 
 
 def end_step() -> None:
-    """Finalize the current step's accumulator and submit it to the manager.
-
-    Accumulators that never received a payload (non-last PP ranks, unselected
-    hooks) are dropped instead of writing an incomplete bundle.
-    """
+    """Submit the current accumulator, or drop it if no hook filled stages."""
     global _current_step
     step = _current_step
     _current_step = None
-    if step is None or _active is None:
+    if step is None or _active is None or not step.stages:
         return
-    if not step.stages:
-        return
-    _active.submit(step.to_record())
+    _active.submit(step)
 
 
 def end_rollout() -> None:
-    """Finalize the current rollout's accumulator and submit it to the
-    manager."""
     end_step()

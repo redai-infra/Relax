@@ -3,8 +3,8 @@
 """Selection replay tests: single sample / group / micro-batch and closure.
 
 A partial selection expands to its semantic-group closure and replays the per-
-sample/per-token stages; cohort-level stages (``loss.policy``) are skipped
-rather than comparing a subset scalar against a full-cohort expected value.
+sample/per-token stages; cohort-level stages (loss.policy) are skipped rather
+than comparing a subset scalar against a full-cohort expected value.
 """
 
 from __future__ import annotations

@@ -2,27 +2,35 @@
 
 """Identity model and dependency closure.
 
-Replay identity is two-layered: *logical* identity (sample, semantic group,
-normalization cohort, actor step) and *physical provenance* (rollout partition,
-consumer batch, micro-batch, rank shard, weight lineage). The dependency
-closure in this module expands a selection to every record it must include
-before a stage may run — and refuses to guess when a mapping is missing,
-mirroring the PR #65 lesson that a physical batch is not a semantic group.
+Expands a sample/group/batch selection to its semantic-group closure and
+refuses to guess when membership is missing (PR #65: physical batch ≠ group).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from relax.utils.logging_utils import get_logger
 from relax.utils.replay.schema import BundleIndex, SampleRecord
-
-
-logger = get_logger(__name__)
 
 
 class ClosureError(ValueError):
     """Raised when a selection cannot be expanded to a complete cohort."""
+
+
+def sample_integrity_problems(record: SampleRecord) -> list[tuple[str, str]]:
+    """Return (field, message) pairs for a malformed sample record."""
+    problems: list[tuple[str, str]] = []
+    if record.response_length < 0 or record.total_length < record.response_length:
+        problems.append(("length", f"sample {record.sample_id!r} has invalid lengths"))
+    if len(record.loss_mask) != record.response_length:
+        problems.append(
+            (
+                "loss_mask_length",
+                f"sample {record.sample_id!r} loss_mask length {len(record.loss_mask)} != "
+                f"response_length {record.response_length}",
+            )
+        )
+    return problems
 
 
 @dataclass
@@ -42,7 +50,7 @@ def _sample_to_group(record: SampleRecord) -> str:
 
 
 def group_members(index: BundleIndex, group_id: str) -> list[SampleRecord]:
-    """Return every sample record belonging to semantic group ``group_id``."""
+    """Return every sample record belonging to semantic group group_id."""
     members = [record for record in index.samples if _sample_to_group(record) == group_id]
     if not members:
         raise ClosureError(f"semantic group {group_id!r} has no members in bundle {index.bundle_id!r}")
@@ -50,10 +58,10 @@ def group_members(index: BundleIndex, group_id: str) -> list[SampleRecord]:
 
 
 def batch_members(index: BundleIndex, batch_id: str) -> list[SampleRecord]:
-    """Return every sample record belonging to micro-batch ``batch_id``.
+    """Return every sample record belonging to micro-batch batch_id.
 
     Fails closed when no sample records the batch (including the case where the
-    producer never recorded ``micro_batch_id``), so a selection never silently
+    producer never recorded micro_batch_id), so a selection never silently
     degrades into a physical-size guess.
     """
     members = [record for record in index.samples if record.micro_batch_id == batch_id]
@@ -75,7 +83,7 @@ def expand_selection(
     """Expand a selection into the full semantic-group dependency closure.
 
     Selecting any sample pulls in its entire semantic group, because reward and
-    advantage normalization are group-level. ``batch_ids`` select by physical
+    advantage normalization are group-level. batch_ids select by physical
     micro-batch membership, then pull each member's group the same way. Missing
     membership is a hard error, never an inference from physical batch size.
     """
@@ -118,9 +126,9 @@ def expand_selection(
 def validate_identity(index: BundleIndex) -> None:
     """Verify the index identity has exactly one valid cohort anchor.
 
-    The anchor is either an ``actor_step_id`` ``(rollout_id, step_id)`` tuple
-    (per-step) or a ``rollout_id`` (per-rollout). A scalar
-    ``accumulated_step_id`` is never a valid anchor (see :class:`ActorStepId`).
+    The anchor is either an actor_step_id (rollout_id, step_id) tuple (per-
+    step) or a rollout_id (per-rollout). A scalar accumulated_step_id is never
+    a valid anchor (see ActorStepId).
     """
     identity = index.identity
     if (identity.actor_step_id is None) == (identity.rollout_id is None):

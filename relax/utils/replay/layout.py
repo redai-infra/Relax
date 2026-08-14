@@ -1,20 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Distributed layout primitives for replay (PR C, pure CPU).
+"""Distributed layout primitives for replay.
 
-This module owns the *layout metadata* half of distributed replay: resolving a
-``(dp, tp, pp, cp)`` topology, computing token shard offsets, ordering shards
-deterministically, validating that a DP-normalized stage has a complete rank
-set, and reconstructing a canonical logical tensor from rank-local shards (or
-rejecting the capability explicitly).
-
-It is pure: no Ray, no Megatron, no ``torch.distributed``. Reconstruction is a
-sequence of local concats driven entirely by the recorded offsets.
-
-Layout metadata is meant to be persisted alongside the bundle; the JSON
-round-trips here are the on-disk form. The full reduction denominator is *not*
-modeled here — that lives with the loss stage, which records numerator and
-denominator explicitly (see the implementation spec §5.8.3).
+Pure CPU: topology, shard offsets, DP completeness, and canonical-tensor
+reconstruction (or explicit rejection). No Ray/Megatron/torch.distributed. CP>1
+stays unsupported in the frozen V1 matrix until parity evidence exists.
 """
 
 from __future__ import annotations
@@ -59,10 +49,10 @@ class RankTopology:
 class ShardSpec:
     """One rank-local shard of a logical tensor.
 
-    ``offsets`` are the *global* start coordinates of the shard (``None`` means
-    "not recorded", which reconstruction rejects). ``unpadded_length`` is the
-    number of real elements along the split dimension; the shard's ``shape``
-    may be larger when capture padded it.
+    offsets are the global start coordinates of the shard (None means "not
+    recorded", which reconstruction rejects). unpadded_length is the number of
+    real elements along the split dimension; the shard's shape may be larger
+    when capture padded it.
     """
 
     rank: int
@@ -130,12 +120,11 @@ def compute_offsets(
     ranks: Sequence[int] | None = None,
     pad_to: int | None = None,
 ) -> TensorLayout:
-    """Build a :class:`TensorLayout` from per-shard unpadded lengths.
+    """Build a TensorLayout from per-shard unpadded lengths.
 
-    Shards are placed contiguously along ``split_dim``; every other dimension
-    is assumed full. When ``pad_to`` is set, each shard's split dimension is
-    padded up to a multiple of ``pad_to`` (the padding is recorded via
-    ``unpadded_length``).
+    Shards are placed contiguously along split_dim; every other dimension is
+    assumed full. When pad_to is set, each shard's split dimension is padded up
+    to a multiple of pad_to (the padding is recorded via unpadded_length).
     """
     dims = tuple(int(v) for v in dims)
     ranks = shard_order(ranks) if ranks is not None else list(range(len(lengths)))
@@ -160,7 +149,7 @@ def compute_offsets(
             unpadded_length=length,
         )
         # Offsets are canonical (unpadded) logical coordinates; padding is a
-        # storage detail carried by ``shape`` vs ``unpadded_length``.
+        # storage detail carried by shape vs unpadded_length.
         offset += length
     return TensorLayout(name=name, dims=dims, split_dim=split_dim, shards=shards)
 
@@ -247,13 +236,12 @@ def reconstruct_shards(layout: TensorLayout, shards: Mapping[int, torch.Tensor])
 
 
 def cp_capability(stage: StageId, cp: int, *, reconstructable: bool) -> StageCapability:
-    """Resolve the replay capability of ``stage`` for a context-parallel
-    topology.
+    """Resolve the replay capability of stage for a context-parallel topology.
 
-    ``CP=1`` is unsharded. ``CP>1`` requires reconstructable shard offsets; the
-    frozen V1 capability matrix does not yet endorse a ``recompute`` verdict
-    for ``CP>1``, so this returns ``unsupported`` even when the layout *is*
-    reconstructable — the mechanism exists, but the evidence does not.
+    CP=1 is unsharded. CP>1 requires reconstructable shard offsets; the frozen
+    V1 capability matrix does not yet endorse a recompute verdict for CP>1, so
+    this returns unsupported even when the layout is reconstructable — the
+    mechanism exists, but the evidence does not.
     """
     if cp == 1:
         return StageCapability.RECOMPUTE if reconstructable else StageCapability.UNSUPPORTED

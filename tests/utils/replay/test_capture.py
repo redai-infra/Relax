@@ -2,8 +2,8 @@
 
 """Tests for the PR B production-capture data plane.
 
-These exercise ``CaptureRecord`` / ``build_bundle_from_record`` (the pure
-capture→bundle bridge) and ``CaptureManager`` (the async, bounded, failure-
+These exercise CaptureRecord / build_bundle_from_record (the pure
+capture→bundle bridge) and CaptureManager (the async, bounded, failure-
 isolated sink) entirely on CPU — the round-trip parity test proves the captured
 bundle is replayable by the PR A runner.
 """
@@ -92,7 +92,7 @@ def test_capture_manager_disabled_noop(tmp_path):
 def test_capture_manager_enabled_writes_bundle(tmp_path):
     manager = CaptureManager(CaptureConfig(enabled=True, output_dir=str(tmp_path)))
     assert manager.submit(make_capture_record("b-async")) is True
-    manager.flush(wait=True)
+    manager.flush()
     manager.close()
     assert (tmp_path / "b-async" / "COMPLETE").exists()
     assert replay(tmp_path / "b-async").passed
@@ -130,7 +130,7 @@ def test_capture_failure_isolation(tmp_path, monkeypatch):
     manager = CaptureManager(CaptureConfig(enabled=True, output_dir=str(tmp_path)))
 
     assert manager.submit(make_capture_record("b-fail")) is True  # never raises
-    manager.flush(wait=True)
+    manager.flush()
     assert manager.error_count == 1
     manager.close()
 
@@ -143,7 +143,7 @@ def test_capture_selected_steps(tmp_path):
     other.actor_step_id = (121, 0)
     assert manager.submit(other) is False
 
-    manager.flush(wait=True)
+    manager.flush()
     manager.close()
     assert (tmp_path / "b-selected" / "COMPLETE").exists()
     assert not (tmp_path / "b-skipped").exists()
@@ -313,7 +313,7 @@ def test_capture_selected_rollouts(tmp_path):
     other.rollout_id = 121
     assert manager.submit(other) is False
 
-    manager.flush(wait=True)
+    manager.flush()
     manager.close()
     assert (tmp_path / "b-rselected" / "COMPLETE").exists()
     assert not (tmp_path / "b-rskipped").exists()

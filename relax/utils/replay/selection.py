@@ -2,12 +2,12 @@
 
 """Bundle subsetting for replay selection.
 
-``select_bundle`` materializes a replayable subset of a loaded bundle: it
-expands the selection to a complete semantic-group closure, filters the sample
-records, slices the flat per-token tensor payloads, and filters per-sample
-expected lists — so the per-sample/per-token adapters run unchanged on the
-subset. Cohort-level stages (``loss.policy``) are *not* subset-replayable and
-are handled by the runner (see :mod:`relax.utils.replay.runner`).
+select_bundle materializes a replayable subset of a loaded bundle: it expands
+the selection to a complete semantic-group closure, filters the sample records,
+slices the flat per-token tensor payloads, and filters per-sample expected
+lists — so the per-sample/per-token adapters run unchanged on the subset.
+Cohort-level stages (loss.policy) are not subset-replayable and are handled by
+the runner (see relax.utils.replay.runner).
 """
 
 from __future__ import annotations
