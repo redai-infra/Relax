@@ -162,9 +162,15 @@ def _whiten_by_segment(values, mini_batch_sizes, process_group):
 
     * Segment ``k`` holds training batch ``k`` on every rank. ``actor.py``
       fetches batches in ``batch_index`` order and appends the counts in that
-      same order, so the orders agree; nothing in this function would notice if
-      they stopped agreeing, and the failure would be silent -- statistics
-      mixed across two training batches, no error.
+      same order, and the fetch is *addressed* rather than popped:
+      ``_get_data_from_transfer_queue`` passes ``batch_index`` to the
+      TransferQueue sampler, which keys its replay cache on
+      ``(partition_id, task_name, dp_rank, batch_index)``. Two ranks asking for
+      the same ``batch_index`` therefore receive their own shards of the *same
+      logical mini-batch* -- that addressing is the guarantee, not the fact
+      that both loops happen to count upwards. Nothing in this function would
+      notice if it stopped holding, and the failure would be silent --
+      statistics mixed across two training batches, no error.
     * A segment's sample count may differ between ranks (a data-parallel split
       balances tokens, not samples) and that is fine, because the statistic is
       reduced across the group. What is not fine is two ranks disagreeing about
