@@ -32,7 +32,8 @@ driver 在**第一次 `tq.init` 之前**完成探测并生成 job 级唯一的 e
 1. 校验参数组合（例如 `simple` + `rdma-mode` 会被拒绝）
 2. `probe_cluster_nodes()` 通过 Ray 把探测任务绑定到每个**存活且有 GPU** 的节点，并额外探测 driver（driver 也会创建 Mooncake owner client）；各节点读取本机 `/sys`、mooncake 状态，并在 2 秒上限内检查外部 master 的 TCP 可达性；超时或崩溃的节点转为退化结果，不静默丢弃
 3. `reduce_results()` 做 AND 归约：整个作业只能跑在最低共同能力上
-4. `required` 模式下若发生任何回退，直接抛异常并打印每个节点的探测明细
+4. Mooncake 生效前，driver 在**每个存活节点**（不限 GPU，因为 Serve replica 与 0-CPU actor 没有 placement 绑定）用真实配置各跑一次**有界 attach 握手**并立即 detach；`auto` 下任一节点失败则统一关闭 Mooncake 状态、全作业收敛到 SimpleStorage，`off`/`required` 下启动失败并列出失败节点
+5. `required` 模式下若发生任何回退，直接抛异常并打印每个节点的探测明细
 
 降级阶梯：
 
@@ -70,7 +71,7 @@ Mooncake → SimpleStorage（任一节点 mooncake/master 不可用、运行时�
 setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_master.log 2>&1 < /dev/null &
 ```
 
-然后给作业设置 `MC_MASTER_ADDRESS=<master-host>:50051`。未设置时内部默认 `localhost:50051`，仅适用于单节点开发。
+然后给**每个节点**的作业环境设置 `MC_MASTER_ADDRESS=<master-host>:50051`。该变量是必填项：未设置时启动直接失败，Relax 不会假定 loopback 端点（多节点作业里每个节点都把自己的 localhost 当 master 会导致误降级或误中止）。
 
 启动前置条件：部署侧必须先启动 master，所有 GPU 节点和 driver 都能解析并连接 `MC_MASTER_ADDRESS`，防火墙允许 master RPC 端口；作业镜像中的 TQ 必须包含本文“正确性依赖”所列修复。Relax 不负责拉起、重启或终止 master。
 
@@ -80,6 +81,8 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 |---|---|---|
 | **master 在探测时不可达** | `auto` 统一降级到 SimpleStorage；`required` 启动失败并列出失败节点 | 先确认 master、DNS/路由和 `MC_MASTER_ADDRESS` |
 | **master 探测通过、但 `tq.init` 时失败/超时** | 第一次初始化在独立 owner actor 中执行，driver 最多等待 60 秒。失败后回收该 actor 及其拥有的半初始化 controller；`auto` 只重试一次 SimpleStorage，`required` 清理后抛出原始错误 | 查看 `mooncake_init_failed:*`、master 日志和 owner 清理日志 |
+| **attach 握手在某节点失败/超时** | driver 汇总各节点结果：`auto` 关闭 Mooncake 状态并统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`off`/`required` 启动失败并列出节点 | 检查失败节点到 master 的连通性与 RDMA 状态 |
+| **worker attach 卡住**（controller 半初始化 / mooncake setup 挂起） | 每个 worker 的 attach 有统一 deadline（默认 60 s，`RELAX_TQ_ATTACH_TIMEOUT_SECONDS` 可调）：先有界等待 controller 提供配置，再在 watchdog 线程里跑 `tq.init`；超时该 worker 立刻失败而不是无限挂起 | 看 `TqAttachTimeout` 报错中的阶段描述 |
 | **正常退出**（作业结束或全局重启） | 只有 owner actor 调用全局 `tq.close()`，随后显式 `storage_client.close()` 卸载 segment；附加 worker 只关闭本地 client，不能删除全局数据或 controller。master 本身不动 | 无需操作 |
 | **异常退出**（worker 被 kill / OOM / 节点掉线） | Python 层不执行，segment 仍在 master 注册。master 要等 `client_ttl`（默认 30 s）才判定客户端过期，期间新作业的 put 会打到死端点并报 `Failed to open segment ... Connection refused` | 等 30 s 后重启，或部署侧调小 `-client_ttl` |
 
@@ -97,7 +100,7 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 
 ## 容量不足与正确性依赖
 
-Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经生产但尚未消费的数据。启动前还会按 rollout batch、采样数、staleness 和多模态 payload 的固定启发式估算检查 4 GiB client segment；`auto` 预检不足时回退 SimpleStorage，`required` 直接失败。该估算只是早期保护，不能替代运行时错误处理，因为真实图片 patch 数会变化。
+Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经生产但尚未消费的数据。启动前按 **token 预算推导最坏情况 payload** 检查 client segment（默认 4 GiB）：文本按 `seq_length × 32 B`，多模态样本另加 `seq_length × 784 像素/token × 12 B`（ViT patch 14、merge 2、float32 RGB，例如 8k 序列约 77 MiB/样本），再乘 rollout batch、采样数与 `staleness+1`；`auto` 预检不足时回退 SimpleStorage，`required`/`off` 直接失败。segment 大小可用 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 调整，容量校验与客户端配置读取同一个值。该上界是保守推导，不能替代运行时错误处理。
 
 运行时依赖固定到 TransferQueue commit `58054a33834aadbcf76aacd6b1e32e25c030f2c9`，并在 Mooncake 启动前检查以下能力：
 
@@ -107,7 +110,7 @@ Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经�
 
 因此，上游曾出现的“返回码未检查导致静默丢数据”不是已知限制，而是 Mooncake 启用的硬门槛：`auto` 在契约不满足时禁用 Mooncake 并回退，`required` 拒绝启动。Docker 镜像固定上述修复 commit，运行时检查用于防止环境被旧包覆盖。
 
-正确性守卫同时默认设置 `MC_STORE_MEMCPY=0`：mooncake 0.3.10 在 TCP-only 环境会自动启用 memcpy 快拷贝路径，该路径存在静默截断缺陷（现象与处置见排障表）；RDMA 会话本就自动禁用 memcpy，不受影响。运维确认环境安全后可在启动前显式导出 `MC_STORE_MEMCPY=1` 覆盖。
+正确性守卫强制 `MC_STORE_MEMCPY=0` 且 **fail-closed**：mooncake 0.3.10 在 TCP-only 环境会自动启用 memcpy 快拷贝路径，该路径存在已确认的静默截断缺陷（现象与处置见排障表）；RDMA 会话本就自动禁用 memcpy，不受影响。由于缺陷在当前 pin 上已实证，显式导出 `MC_STORE_MEMCPY=1` 会在启动时被直接拒绝，待 pin 升级到修复版本后再按版本重新放开。另外，针对 pin 版本剩余缺口的运行时补丁（逐次重试返回码校验、严格 production-status ACK）已拆分到独立的版本门控分支 `feat/tq-mooncake-loss-guards`（`relax/utils/tq_mooncake_patches.py`），本 PR 只保留只读的能力校验。
 
 真机容量故障注入会故意创建 64 MiB segment 并写入 96 MiB，仅允许在独立、可丢弃的 master 上运行：
 
@@ -179,7 +182,7 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 | `setup failed with error code: -1` | master 不可达 | 检查 master 进程与 `MC_MASTER_ADDRESS` |
 | `Failed to open segment ... Connection refused` | 上一轮客户端异常退出，死 segment 仍在 master 注册 | 等 `client_ttl`（30 s）过期后重试 |
 | `batch_get_into failed ... error codes [-800, ...]` | 会话内切换协议（0.3.10 上更敏感），或对端不可达 | 每个协议单独进程跑；确认对端存活 |
-| Mooncake/TCP 档 get 数据尾部全零，但批量返回码全部成功（逐字节校验 FAIL） | mooncake 0.3.10 memcpy 快拷贝路径缺陷：TCP-only 环境被自动启用后，跨节点 get 会静默截断（坏行自 64 KiB 对齐偏移起全零） | 正确性守卫已默认 `MC_STORE_MEMCPY=0`（见“容量不足与正确性依赖”）；若被显式设为 `1`，改回 `0` |
+| Mooncake/TCP 档 get 数据尾部全零，但批量返回码全部成功（逐字节校验 FAIL） | mooncake 0.3.10 memcpy 快拷贝路径缺陷：TCP-only 环境被自动启用后，跨节点 get 会静默截断（坏行自 64 KiB 对齐偏移起全零） | 正确性守卫已强制 `MC_STORE_MEMCPY=0`（见“容量不足与正确性依赖”）；显式设 `1` 会被启动拒绝，unset 即可 |
 | Mooncake/TCP 档在单机回环下原生 SIGSEGV | 与上一行同源（memcpy 路径），回环下表现为崩溃而非静默截断 | 同上 |
 | 长时间反复起停会话后 `batch_upsert_from ... error codes [-800, ...]`，重试耗尽（响亮失败，非静默） | master 长期吸收异常退出的客户端后状态劣化，metrics 仍报 serving | 重启 mooncake master；长跑验收前先起新 master |
 | 多网卡机器跨节点建连失败 | 自动选卡选到了不通的网卡 | 显式 `--tq-rdma-device`；必要时用 `MC_TCP_BIND_ADDRESS` 指定 TCP 侧绑定地址 |
