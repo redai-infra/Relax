@@ -88,6 +88,11 @@ class CaptureRecord:
     group_indices_tensor: torch.Tensor | None = None
     raw_rewards_tensor: torch.Tensor | None = None
     rewards_tensor: torch.Tensor | None = None
+    # Per-sample DataIterator micro-batch ids (mb-0000, ...). Parallel to
+    # response_lengths. captured_micro_batch_ids is the first-writer-wins set
+    # used to ignore activation-checkpoint recomputes of the same micro-batch.
+    sample_micro_batch_ids: list[str] | None = None
+    captured_micro_batch_ids: set[str] = field(default_factory=set)
 
     @property
     def anchor(self) -> str:
@@ -120,6 +125,10 @@ def _detach_record(record: CaptureRecord) -> CaptureRecord:
         group_indices_tensor=_detach_value(record.group_indices_tensor),
         raw_rewards_tensor=_detach_value(record.raw_rewards_tensor),
         rewards_tensor=_detach_value(record.rewards_tensor),
+        sample_micro_batch_ids=(
+            list(record.sample_micro_batch_ids) if record.sample_micro_batch_ids is not None else None
+        ),
+        captured_micro_batch_ids=set(record.captured_micro_batch_ids),
     )
 
 
@@ -216,8 +225,6 @@ def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
         if record.rewards_tensor is not None
         else raw_rewards
     )
-    micro_batch_id = _micro_batch_id_for(record)
-
     return [
         SampleRecord(
             sample_id=f"s-{index}",
@@ -228,21 +235,48 @@ def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
             raw_reward=raw_rewards[index],
             reward=rewards[index],
             label_hash="",
-            micro_batch_id=micro_batch_id,
+            micro_batch_id=_sample_micro_batch_id(record, index),
         )
         for index in range(count)
     ]
 
 
-def _micro_batch_id_for(record: CaptureRecord) -> str | None:
-    """Stable micro-batch id for a per-step capture (mb-<step_id>).
+def format_micro_batch_id(index: int) -> str:
+    """Stable DataIterator micro-batch id (mb-0000, mb-0001, ...)."""
+    return f"mb-{index:04d}"
 
-    Rollout-level records have no actor step, so batch selection stays fail-
-    closed.
+
+def _sample_micro_batch_id(record: CaptureRecord, index: int) -> str | None:
+    """Per-sample micro-batch id, or a single-mb fallback for loss-only
+    records."""
+    if record.sample_micro_batch_ids is not None and index < len(record.sample_micro_batch_ids):
+        return record.sample_micro_batch_ids[index]
+    return _micro_batch_id_for(record)
+
+
+def _micro_batch_id_for(record: CaptureRecord) -> str | None:
+    """Fallback id when the hook did not stamp per-sample membership.
+
+    Step-level records default to mb-0000 (a single captured micro-batch).
+    Rollout-level records leave it unset so --batch stays fail-closed.
     """
     if record.actor_step_id is None:
         return None
-    return f"mb-{record.actor_step_id[1]:04d}"
+    if record.captured_micro_batch_ids:
+        return sorted(record.captured_micro_batch_ids)[0]
+    return format_micro_batch_id(0)
+
+
+def _identity_micro_batch_ids(record: CaptureRecord, samples: list[SampleRecord]) -> list[str]:
+    """Unique micro-batch ids in first-seen order, matching SampleRecord."""
+    seen: list[str] = []
+    for sample in samples:
+        if sample.micro_batch_id and sample.micro_batch_id not in seen:
+            seen.append(sample.micro_batch_id)
+    if seen:
+        return seen
+    fallback = _micro_batch_id_for(record)
+    return [fallback] if fallback is not None else []
 
 
 def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> Path:
@@ -257,11 +291,11 @@ def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> P
     manifest = build_manifest_for_record(record)
     samples = record.samples if record.samples else _build_samples_from_raw(record)
     identity = record.identity
-    micro_batch_id = _micro_batch_id_for(record)
-    # When samples are reconstructed from raw step metadata, stamp a matching
+    micro_batch_ids = _identity_micro_batch_ids(record, samples)
+    # When samples are reconstructed from raw step metadata, stamp matching
     # identity.micro_batch_ids so --batch selection agrees with SampleRecord.
-    if not record.samples and micro_batch_id is not None:
-        identity = replace(identity, micro_batch_ids=[micro_batch_id])
+    if not record.samples and micro_batch_ids:
+        identity = replace(identity, micro_batch_ids=micro_batch_ids)
     index = BundleIndex(bundle_id=record.bundle_id, identity=identity, samples=samples, config=record.config)
 
     expected = _normalize_expected(record.expected)

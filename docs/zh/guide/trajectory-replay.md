@@ -90,7 +90,7 @@ python -m relax.tools.trajectory_replay replay <bundle> \
 
 `replay` 的分歧报告给出：首个分歧 stage、sample、field、token offset、expected/actual 值与最大绝对误差。被跳过（`recorded-only` / `inspect-only` / `unsupported`）的 stage 不计入分歧判定。
 
-**选择粒度**：`--sample`/`--group`/`--batch` 任选其一或多个。选择任何 sample 或 micro-batch 都会**展开到其完整 semantic-group closure**（因为 reward/advantage 归一化是 group 级），缺失 membership 时拒绝执行。部分选择下，per-sample/per-token 阶段（sample → advantage.estimate）正常重算，而 **cohort 级阶段（`loss.policy`）会跳过**——子集 scalar 无法与全 cohort 的期望值相比。`--step ROLLOUT_ID:STEP_ID` 校验 bundle 的 actor-step 坐标，不匹配则报错退出。step 级生产 bundle 会把 `micro_batch_id` 记为 `mb-<step_id>`，因此 `--batch mb-0000` 可以选中该 step 的样本。
+**选择粒度**：`--sample`/`--group`/`--batch` 任选其一或多个。选择任何 sample 或 micro-batch 都会**展开到其完整 semantic-group closure**（因为 reward/advantage 归一化是 group 级），缺失 membership 时拒绝执行。部分选择下，per-sample/per-token 阶段（sample → advantage.estimate）正常重算，而 **cohort 级阶段（`loss.policy`）会跳过**——子集 scalar 无法与全 cohort 的期望值相比。`--step ROLLOUT_ID:STEP_ID` 在单个 bundle 上校验身份：step 级包匹配 `(rollout_id, step_id)`，rollout 级包匹配 `rollout_id`；若路径是抓包目录（含多个 bundle 或 `rank-*` 子目录），则选出匹配的那一份（优先 step 级）。`--batch` 按 DataIterator 的 micro-batch 序号选择（`mb-0000`、`mb-0001`、…），不是 actor `step_id`。
 
 示例（PR #65 历史故障）：
 
@@ -169,4 +169,4 @@ writer.finalize(ranks=[0])
 - 生产捕获拆成两类 bundle：rollout 级（reward/advantage，身份 `rollout_id`，在 `train_actor` 打点）与 step 级（loss，身份 `(rollout_id, step_id)`，在 `train_one_step` 打点）；两者尚未在同一 bundle 中打通「首个分歧阶段」的跨 bundle 传播。通过 `RELAX_REPLAY_CAPTURE=1` 与 `RELAX_REPLAY_CAPTURE_DIR` 打开。
 - 远端 RM/GenRM 结果按 `recorded-only` 处理，不在离线侧重算。
 
-相关设计与实现细节见 [RFC](../../draft/contributor-task-34-async-aware-trajectory-replay-rfc.zh.md) 与实现规格草案。
+相关设计讨论见 [Task 34 RFC #171](https://github.com/redai-infra/Relax/issues/171)。

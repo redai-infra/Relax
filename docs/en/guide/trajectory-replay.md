@@ -90,7 +90,7 @@ python -m relax.tools.trajectory_replay replay <bundle> \
 
 The `replay` report gives the first divergent stage, sample, field, token offset, expected/actual values and max absolute error. Skipped stages (`recorded-only` / `inspect-only` / `unsupported`) never count toward the first-divergence determination.
 
-**Selection granularity**: `--sample` / `--group` / `--batch` may be combined. Selecting any sample or micro-batch expands to its full semantic-group closure (reward/advantage normalization is group-level) and fails closed on missing membership. Under a partial selection, per-sample/per-token stages (sample → advantage.estimate) recompute normally while the cohort-level `loss.policy` stage is skipped — a subset scalar cannot be compared to a full-cohort expected value. `--step ROLLOUT_ID:STEP_ID` asserts the bundle's actor-step coordinate and errors on mismatch. Step-level production bundles record `micro_batch_id` as `mb-<step_id>`, so `--batch mb-0000` selects that step's samples.
+**Selection granularity**: `--sample` / `--group` / `--batch` may be combined. Selecting any sample or micro-batch expands to its full semantic-group closure (reward/advantage normalization is group-level) and fails closed on missing membership. Under a partial selection, per-sample/per-token stages (sample → advantage.estimate) recompute normally while the cohort-level `loss.policy` stage is skipped — a subset scalar cannot be compared to a full-cohort expected value. `--step ROLLOUT_ID:STEP_ID` asserts identity on a single bundle (step bundles match `(rollout_id, step_id)`; rollout bundles match `rollout_id`); if the path is a capture directory (several bundles or `rank-*` children) it picks the matching one, preferring the step-level bundle. `--batch` selects by DataIterator micro-batch index (`mb-0000`, `mb-0001`, …), not by actor `step_id`.
 
 Example (the PR #65 bug):
 
@@ -169,4 +169,4 @@ writer.finalize(ranks=[0])
 - Production capture is split into two bundle types: rollout-level (reward/advantage, identity `rollout_id`, instrumented in `train_actor`) and step-level (loss, identity `(rollout_id, step_id)`, instrumented in `train_one_step`); cross-bundle propagation of the "first divergent stage" is not yet unified. Enable with `RELAX_REPLAY_CAPTURE=1` and `RELAX_REPLAY_CAPTURE_DIR`.
 - Remote RM/GenRM results are treated as `recorded-only` and are not recomputed offline.
 
-See the RFC and the implementation spec for full design and implementation details.
+See [Task 34 RFC #171](https://github.com/redai-infra/Relax/issues/171) for the design discussion.

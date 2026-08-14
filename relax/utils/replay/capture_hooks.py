@@ -157,22 +157,49 @@ def capture_policy_loss(
     response_lengths: list[int],
     total_lengths: list[int],
     reported_loss: dict[str, torch.Tensor],
+    micro_batch_index: int | None = None,
 ) -> None:
-    """Record loss.policy from policy_loss_function (detach only)."""
+    """Record loss.policy from policy_loss_function (detach only).
+
+    Each DataIterator micro-batch is appended. A repeated micro_batch_index
+    (activation-checkpoint recompute) is ignored so the first writer wins.
+    """
     step = capture.current_step()
     if step is None:
         return
 
+    mb_id = capture.format_micro_batch_id(0 if micro_batch_index is None else int(micro_batch_index))
+    if mb_id in step.captured_micro_batch_ids:
+        return
+    step.captured_micro_batch_ids.add(mb_id)
+
     step.stages = {StageId.LOSS_POLICY}
-    step.tensors["old_log_probs"] = old_log_probs.detach()
-    step.tensors["log_probs"] = log_probs.detach()
-    step.tensors["entropy"] = entropy.detach()
-    step.tensors["advantages"] = advantages.detach()
-    step.response_lengths = [int(length) for length in response_lengths]
-    step.total_lengths = [int(length) for length in total_lengths]
-    step.loss_masks_tensor = torch.cat([mask.detach().reshape(-1) for mask in loss_masks]) if loss_masks else None
+    _append_flat(step, "old_log_probs", old_log_probs)
+    _append_flat(step, "log_probs", log_probs)
+    _append_flat(step, "entropy", entropy)
+    _append_flat(step, "advantages", advantages)
+
+    lengths = [int(length) for length in response_lengths]
+    step.response_lengths = (step.response_lengths or []) + lengths
+    step.total_lengths = (step.total_lengths or []) + [int(length) for length in total_lengths]
+    step.sample_micro_batch_ids = (step.sample_micro_batch_ids or []) + [mb_id] * len(lengths)
+
+    if loss_masks:
+        masks = torch.cat([mask.detach().reshape(-1) for mask in loss_masks])
+        step.loss_masks_tensor = (
+            masks if step.loss_masks_tensor is None else torch.cat([step.loss_masks_tensor, masks])
+        )
 
     policy_fields = ("loss", "pg_loss", "entropy_loss", "pg_clipfrac", "ppo_kl")
-    step.expected[StageId.LOSS_POLICY.value] = {
-        field: value.detach() for field, value in reported_loss.items() if field in policy_fields
-    }
+    expected = step.expected.setdefault(StageId.LOSS_POLICY.value, {})
+    for field, value in reported_loss.items():
+        if field not in policy_fields:
+            continue
+        detached = value.detach()
+        expected[field] = detached if field not in expected else expected[field] + detached
+
+
+def _append_flat(step: capture.CaptureRecord, name: str, tensor: torch.Tensor) -> None:
+    detached = tensor.detach().reshape(-1)
+    existing = step.tensors.get(name)
+    step.tensors[name] = detached if existing is None else torch.cat([existing, detached])

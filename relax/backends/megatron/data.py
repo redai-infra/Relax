@@ -666,7 +666,7 @@ class DataIterator:
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
 
-    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
+    def get_next(self, keys: Sequence[str]) -> dict[str, Any]:
         """Return the next micro-batch for the requested keys.
 
         - If `micro_batch_indices` is provided, selects rows according to the current
@@ -676,6 +676,11 @@ class DataIterator:
 
         Returns a dict mapping each key to a list subset (or None if absent).
         """
+        if self.micro_batch_indices is not None:
+            micro_batch_index = self.offset
+        else:
+            micro_batch_index = self.offset // self.micro_batch_size
+
         batch = {}
         for key in keys:
             vals = self.rollout_data.get(key, None)
@@ -695,6 +700,9 @@ class DataIterator:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
+        # DataIterator micro-batch ordinal (0-based). Trajectory replay stamps
+        # this onto each sample so --batch selects a real training micro-batch.
+        batch["replay_micro_batch_index"] = micro_batch_index
         return batch
 
     def reset(self) -> "DataIterator":

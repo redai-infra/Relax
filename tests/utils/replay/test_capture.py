@@ -15,7 +15,7 @@ import threading
 import pytest
 import torch
 
-from relax.utils.replay import capture
+from relax.utils.replay import capture, capture_hooks
 from relax.utils.replay.bundle import BundleReader
 from relax.utils.replay.capture import (
     CaptureConfig,
@@ -135,18 +135,31 @@ def test_capture_failure_isolation(tmp_path, monkeypatch):
     manager.close()
 
 
-def test_capture_selected_steps(tmp_path):
-    manager = CaptureManager(CaptureConfig(enabled=True, output_dir=str(tmp_path), selected_steps={(120, 0)}))
+def test_capture_selected_steps_and_rollouts(tmp_path):
+    manager = CaptureManager(
+        CaptureConfig(
+            enabled=True,
+            output_dir=str(tmp_path),
+            selected_steps={(120, 0)},
+            selected_rollouts={120},
+        )
+    )
     assert manager.submit(make_capture_record("b-selected")) is True
+    skipped_step = make_capture_record("b-skipped-step")
+    skipped_step.actor_step_id = (121, 0)
+    assert manager.submit(skipped_step) is False
 
-    other = make_capture_record("b-skipped")
-    other.actor_step_id = (121, 0)
-    assert manager.submit(other) is False
+    assert manager.submit(make_rollout_capture_record("b-rselected")) is True
+    skipped_rollout = make_rollout_capture_record("b-rskipped")
+    skipped_rollout.rollout_id = 121
+    assert manager.submit(skipped_rollout) is False
 
     manager.flush()
     manager.close()
     assert (tmp_path / "b-selected" / "COMPLETE").exists()
-    assert not (tmp_path / "b-skipped").exists()
+    assert (tmp_path / "b-rselected" / "COMPLETE").exists()
+    assert not (tmp_path / "b-skipped-step").exists()
+    assert not (tmp_path / "b-rskipped").exists()
 
 
 def _step_identity() -> Identity:
@@ -193,38 +206,31 @@ def test_capture_step_lifecycle(tmp_path):
     assert replay(tmp_path / "b-step").passed
 
 
-def test_capture_begin_step_disabled_noop():
+def test_capture_hooks_noop_when_disabled():
     disable()
+    assert should_capture((0, 0)) is False
+    assert should_capture_rollout(120) is False
     begin_step((120, 0), identity=_step_identity(), config=_step_config(), bundle_id="b-x")
+    assert current_step() is None
+    begin_rollout(120, identity=Identity(rollout_id=120, rank={"cp": 1}), config=_step_config(), bundle_id="b-x")
     assert current_step() is None
 
 
-def test_capture_begin_step_unselected_noop(tmp_path):
-    enable(CaptureConfig(enabled=True, output_dir=str(tmp_path), selected_steps={(0, 0)}))
+def test_capture_unselected_or_empty_does_not_write(tmp_path):
+    enable(CaptureConfig(enabled=True, output_dir=str(tmp_path), selected_steps={(0, 0)}, selected_rollouts={0}))
     begin_step((120, 0), identity=_step_identity(), config=_step_config(), bundle_id="b-x")
     assert current_step() is None
+    begin_rollout(120, identity=Identity(rollout_id=120, rank={"cp": 1}), config=_step_config(), bundle_id="b-x")
+    assert current_step() is None
 
-
-def test_end_step_without_payload_does_not_write(tmp_path):
-    # Non-last PP ranks open an accumulator then end it with no stages filled.
     enable(CaptureConfig(enabled=True, output_dir=str(tmp_path)))
     begin_step((120, 0), identity=_step_identity(), config=_step_config(), bundle_id="b-empty")
     end_step()
-    disable()
-    assert not (tmp_path / "b-empty").exists()
-
-
-def test_end_rollout_without_payload_does_not_write(tmp_path):
-    enable(CaptureConfig(enabled=True, output_dir=str(tmp_path)))
     begin_rollout(120, identity=Identity(rollout_id=120, rank={"cp": 1}), config=_step_config(), bundle_id="b-empty-r")
     end_rollout()
     disable()
+    assert not (tmp_path / "b-empty").exists()
     assert not (tmp_path / "b-empty-r").exists()
-
-
-def test_capture_should_capture_guard():
-    # Disabled -> False (the hot-path short-circuit contract).
-    assert should_capture((0, 0)) is False
 
 
 def test_capture_loss_only_roundtrip(tmp_path):
@@ -305,39 +311,12 @@ def test_capture_rollout_lifecycle(tmp_path):
     assert replay(tmp_path / "b-rollout-step").passed
 
 
-def test_capture_selected_rollouts(tmp_path):
-    manager = CaptureManager(CaptureConfig(enabled=True, output_dir=str(tmp_path), selected_rollouts={120}))
-    assert manager.submit(make_rollout_capture_record("b-rselected")) is True
-
-    other = make_rollout_capture_record("b-rskipped")
-    other.rollout_id = 121
-    assert manager.submit(other) is False
-
-    manager.flush()
-    manager.close()
-    assert (tmp_path / "b-rselected" / "COMPLETE").exists()
-    assert not (tmp_path / "b-rskipped").exists()
-
-
-def test_capture_should_capture_rollout_guard():
-    # Disabled -> False (the rollout hot-path short-circuit contract).
-    assert should_capture_rollout(120) is False
-
-
-def test_capture_begin_rollout_unselected_noop(tmp_path):
-    enable(CaptureConfig(enabled=True, output_dir=str(tmp_path), selected_rollouts={0}))
-    begin_rollout(120, identity=Identity(rollout_id=120, rank={"cp": 1}), config=_step_config(), bundle_id="b-x")
-    assert current_step() is None
-
-
-def test_config_from_env_disabled(monkeypatch):
-    monkeypatch.delenv("RELAX_REPLAY_CAPTURE", raising=False)
-    monkeypatch.delenv("RELAX_REPLAY_CAPTURE_DIR", raising=False)
-    assert config_from_env() is None
-
-
-def test_config_from_env_missing_dir_stays_disabled(monkeypatch):
-    monkeypatch.setenv("RELAX_REPLAY_CAPTURE", "1")
+@pytest.mark.parametrize("set_capture", [False, True])
+def test_config_from_env_stays_disabled_without_dir(monkeypatch, set_capture):
+    if set_capture:
+        monkeypatch.setenv("RELAX_REPLAY_CAPTURE", "1")
+    else:
+        monkeypatch.delenv("RELAX_REPLAY_CAPTURE", raising=False)
     monkeypatch.delenv("RELAX_REPLAY_CAPTURE_DIR", raising=False)
     assert config_from_env() is None
 
@@ -371,3 +350,74 @@ def test_maybe_enable_from_env_scopes_rank_dir(monkeypatch, tmp_path):
     assert manager.enabled
     assert active() is manager
     assert str(tmp_path / "rank-3") == manager.output_dir
+
+
+def _policy_reported_loss(old, logp, entropy, advantages, samples, config):
+    from relax.utils.training.ppo_utils import compute_policy_loss
+
+    lengths = [sample.response_length for sample in samples]
+    masks = [sample.loss_mask for sample in samples]
+    ppo_kl = old - logp
+    pg_loss, clipfrac = compute_policy_loss(ppo_kl, advantages, config.eps_clip, config.eps_clip_high)
+
+    def reduce(values: torch.Tensor) -> torch.Tensor:
+        total = values.new_zeros(())
+        for chunk, mask in zip(torch.split(values, lengths), masks, strict=False):
+            mask_t = torch.tensor(mask, dtype=values.dtype)
+            total = total + (chunk * mask_t).sum() / torch.clamp_min(mask_t.sum(), 1)
+        return total
+
+    pg = reduce(pg_loss)
+    entropy_loss = reduce(entropy)
+    return {
+        "loss": pg - config.entropy_coef * entropy_loss,
+        "pg_loss": pg,
+        "entropy_loss": entropy_loss,
+        "pg_clipfrac": reduce(clipfrac),
+        "ppo_kl": reduce(ppo_kl),
+    }
+
+
+def _capture_loss_slice(record, start: int, end: int, micro_batch_index: int) -> None:
+    samples = record.samples[start:end]
+    token_start = sum(sample.response_length for sample in record.samples[:start])
+    token_end = token_start + sum(sample.response_length for sample in samples)
+    sl = slice(token_start, token_end)
+    capture_hooks.capture_policy_loss(
+        old_log_probs=record.tensors["old_log_probs"][sl],
+        log_probs=record.tensors["log_probs"][sl],
+        entropy=record.tensors["entropy"][sl],
+        advantages=record.tensors["advantages"][sl],
+        loss_masks=[torch.tensor(sample.loss_mask) for sample in samples],
+        response_lengths=[sample.response_length for sample in samples],
+        total_lengths=[sample.total_length for sample in samples],
+        reported_loss=_policy_reported_loss(
+            record.tensors["old_log_probs"][sl],
+            record.tensors["log_probs"][sl],
+            record.tensors["entropy"][sl],
+            record.tensors["advantages"][sl],
+            samples,
+            record.config,
+        ),
+        micro_batch_index=micro_batch_index,
+    )
+
+
+def test_capture_policy_loss_records_data_iterator_micro_batches(tmp_path):
+    record = make_capture_record("b-mb")
+    enable(CaptureConfig(enabled=True, output_dir=str(tmp_path)))
+    begin_step((120, 0), identity=record.identity, config=record.config, bundle_id="b-mb")
+
+    _capture_loss_slice(record, 0, 2, micro_batch_index=7)
+    _capture_loss_slice(record, 2, 4, micro_batch_index=8)
+    # Activation-checkpoint recompute of mb 7 must not double-count.
+    _capture_loss_slice(record, 0, 2, micro_batch_index=7)
+    end_step()
+    disable()
+
+    loaded = BundleReader(tmp_path / "b-mb").load()
+    assert loaded.index.identity.micro_batch_ids == ["mb-0007", "mb-0008"]
+    assert [sample.micro_batch_id for sample in loaded.index.samples] == ["mb-0007", "mb-0007", "mb-0008", "mb-0008"]
+    assert loaded.tensors["old_log_probs"].numel() == 8
+    assert replay(tmp_path / "b-mb").passed
+    assert replay(tmp_path / "b-mb", batch_ids=["mb-0008"]).passed

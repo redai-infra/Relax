@@ -71,6 +71,13 @@ def test_select_missing_batch_fails_closed(tmp_path):
         expand_selection(index, batch_ids=["mb-9999"])
 
 
+def test_select_missing_group_fails_closed(tmp_path):
+    bundle, index, _ = build_grpo_bundle(tmp_path / "b")
+    index.samples[0].group_index = None
+    with pytest.raises(ClosureError):
+        expand_selection(index, sample_ids=["s-0"])
+
+
 def test_select_bundle_slices_tensors_and_expected(tmp_path):
     bundle, _, _ = build_grpo_bundle(tmp_path / "b")
     loaded = BundleReader(bundle).load()
