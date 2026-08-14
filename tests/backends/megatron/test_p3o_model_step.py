@@ -13,7 +13,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from tests.backends.megatron._megatron_stub import stubbed_megatron_modules, temporarily_stub_module
+from tests.backends.megatron._megatron_stub import (
+    isolated_module_cache,
+    stubbed_megatron_modules,
+    temporarily_stub_module,
+)
 
 
 MODEL_PATH = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "model.py"
@@ -22,6 +26,7 @@ stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
 stream_dataloader.StreamingTQIterator = object
 
 with (
+    isolated_module_cache("relax.backends.megatron"),
     temporarily_stub_module("relax.utils.data.stream_dataloader", stream_dataloader),
     stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
 ):
@@ -51,6 +56,31 @@ def test_p3o_module_stub_preserves_unrelated_import_cache(monkeypatch):
         assert sys.modules[stub_name] is stub_module
 
     assert sys.modules[stub_name] is previous_module
+
+
+def test_p3o_module_cache_scope_removes_only_test_imports(monkeypatch):
+    prefix = "tests.backends.megatron._p3o_module_cache"
+    child_name = f"{prefix}.child"
+    unrelated_name = "tests.backends.megatron._p3o_unrelated_import"
+    cache_module = ModuleType(prefix)
+    child_module = ModuleType(child_name)
+    unrelated_module = ModuleType(unrelated_name)
+    parent_module = sys.modules["tests.backends.megatron"]
+    monkeypatch.delitem(sys.modules, prefix, raising=False)
+    monkeypatch.delitem(sys.modules, child_name, raising=False)
+    monkeypatch.delattr(parent_module, "_p3o_module_cache", raising=False)
+
+    with isolated_module_cache(prefix):
+        sys.modules[prefix] = cache_module
+        setattr(parent_module, "_p3o_module_cache", cache_module)
+        sys.modules[child_name] = child_module
+        setattr(cache_module, "child", child_module)
+        monkeypatch.setitem(sys.modules, unrelated_name, unrelated_module)
+
+    assert prefix not in sys.modules
+    assert child_name not in sys.modules
+    assert not hasattr(parent_module, "_p3o_module_cache")
+    assert sys.modules[unrelated_name] is unrelated_module
 
 
 def test_p3o_model_step_restores_dynamic_cp_group_after_error():

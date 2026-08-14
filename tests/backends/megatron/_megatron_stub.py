@@ -56,6 +56,35 @@ def temporarily_stub_module(name: str, module: ModuleType) -> Iterator[None]:
             sys.modules[name] = previous_module
 
 
+@contextmanager
+def isolated_module_cache(prefix: str) -> Iterator[None]:
+    """Discard test-only imports below ``prefix`` without flushing all
+    modules."""
+    prefix_with_dot = f"{prefix}."
+    modules_before = {
+        name: module for name, module in sys.modules.items() if name == prefix or name.startswith(prefix_with_dot)
+    }
+    try:
+        yield
+    finally:
+        new_module_names = sorted(
+            (
+                name
+                for name in sys.modules
+                if name not in modules_before and (name == prefix or name.startswith(prefix_with_dot))
+            ),
+            key=lambda module_name: module_name.count("."),
+            reverse=True,
+        )
+        for name in new_module_names:
+            module = sys.modules.pop(name)
+            parent_name, _, attribute_name = name.rpartition(".")
+            parent_module = sys.modules.get(parent_name)
+            if parent_module is not None and getattr(parent_module, attribute_name, _MISSING) is module:
+                delattr(parent_module, attribute_name)
+        sys.modules.update(modules_before)
+
+
 class _MagicModule(ModuleType):
     """Module whose unknown attributes resolve to ``MagicMock``.
 

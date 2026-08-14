@@ -19,13 +19,18 @@ from relax.utils.training.p3o_utils import (
     compute_p3o_token_terms,
     finalize_p3o_step_context,
 )
-from tests.backends.megatron._megatron_stub import stubbed_megatron_modules, temporarily_stub_module
+from tests.backends.megatron._megatron_stub import (
+    isolated_module_cache,
+    stubbed_megatron_modules,
+    temporarily_stub_module,
+)
 
 
 stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
 stream_dataloader.StreamingTQIterator = object
 
 with (
+    isolated_module_cache("relax.backends.megatron"),
     temporarily_stub_module("relax.utils.data.stream_dataloader", stream_dataloader),
     stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
 ):
