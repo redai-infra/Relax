@@ -22,7 +22,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.algorithms import get_algorithm
-from relax.algorithms.rewards import metrics_group_verdict
+from relax.algorithms.rewards import metrics_group_verdict, zero_std_group_label
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
@@ -4068,7 +4068,15 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
 
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
+    # `zero_std_group_label` rather than `g[0]`: the label has to come off a
+    # *scored* sample. `g[0]` need not be one -- neither for a group where
+    # nothing was scored, which `_is_zero_std` counts above, nor for a flat
+    # group whose first sample is the unscored one -- and reading it off an
+    # unscored sample raises `TypeError` out of `round(None, 1)`, which is the
+    # crash `metrics_group_verdict` removed one line further up.
+    interesting_rewards = [
+        label for g in interesting_sample_groups if (label := zero_std_group_label(args, g)) is not None
+    ]
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 

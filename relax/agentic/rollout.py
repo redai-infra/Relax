@@ -20,7 +20,7 @@ from relax.agentic.pipeline.runtime import (
 )
 from relax.agentic.profile import TRACE_KEY
 from relax.algorithms import get_algorithm
-from relax.algorithms.rewards import metrics_group_verdict
+from relax.algorithms.rewards import metrics_group_verdict, zero_std_group_label
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -1311,8 +1311,14 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, floa
         # The distributed copy counts them instead; see `metrics_group_verdict`.
         if metrics_group_verdict(args, group) is not True:
             continue
-        rewarded = [sample for sample in group if sample.reward is not None]
-        interesting_rewards.append(str(round(rewarded[0].get_reward_value(args), 1)))
+        # A `True` verdict already implies a scored sample, so the label is
+        # never None here. It goes through the shared helper anyway: this line
+        # and its opposite number in the distributed copy are the half of this
+        # metric `metrics_group_verdict` did not cover, and they had already
+        # drifted -- that copy read the label off `group[0]`, scored or not.
+        label = zero_std_group_label(args, group)
+        if label is not None:
+            interesting_rewards.append(label)
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 
 

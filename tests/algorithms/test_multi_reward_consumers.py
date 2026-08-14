@@ -31,6 +31,7 @@ from relax.algorithms.rewards import (  # noqa: E402
     group_carries_reward_signal,
     metrics_group_verdict,
     normalize_gdpo_decoupled,
+    zero_std_group_label,
 )
 
 
@@ -279,13 +280,45 @@ def test_metrics_verdict_is_unknown_when_the_reward_schema_does_not_fit():
         group_carries_reward_signal(args, group)
 
 
+def test_the_label_comes_off_a_scored_sample_not_the_first_one():
+    """The counted group's label must not be read off `group[0]`.
+
+    A flat group can begin with an unscored sample: under --group-rm the whole
+    group is scored in one shot that an abort skips, and the verdict above
+    deliberately tolerates that rather than taking the rollout down. The label
+    then has to skip it too -- `get_reward_value` is None there and
+    `round(None, 1)` raises the same TypeError the verdict removed, one line
+    further down.
+    """
+    group = [_S(0, None), _S(0, 0.5), _S(0, 0.5)]
+
+    assert metrics_group_verdict(_scalar_args(), group) is True  # counted...
+    assert zero_std_group_label(_scalar_args(), group) == "0.5"  # ...and filed under a real reward
+
+
+def test_a_group_with_nothing_scored_has_no_label():
+    """`None`, so the caller drops it rather than inventing a reward for it.
+
+    The distributed copy counts unanswerable groups (`is not False`), so it
+    reaches the label for a group where every reward is None. There is no
+    number to report for one, and asking for it anyway is what crashed.
+    """
+    assert zero_std_group_label(_scalar_args(), [_S(0, None), _S(0, None)]) is None
+
+
 def test_the_two_metrics_copies_both_delegate_the_decision():
-    """Neither copy may re-derive "is this group flat" for itself.
+    """Neither copy may re-derive "is this group flat", nor its label, for
+    itself.
 
     A source check because `relax/distributed/ray/rollout.py` imports `sglang`
-    and cannot be loaded here. It is weak -- it cannot tell whether the verdict
-    is *used* correctly -- so it is paired with the behavioural tests above
-    rather than standing in for them.
+    and cannot be loaded here. It is weak -- it cannot tell whether either is
+    *used* correctly -- so it is paired with the behavioural tests above rather
+    than standing in for them.
+
+    The label is checked because splitting the verdict out and leaving the
+    label behind is exactly how these copies drifted the second time: both
+    delegated the verdict while one read the label off `group[0]` and the other
+    off the first scored sample.
     """
     import pathlib
 
@@ -295,4 +328,5 @@ def test_the_two_metrics_copies_both_delegate_the_decision():
     for path in ("agentic/rollout.py", "distributed/ray/rollout.py"):
         src = (root / path).read_text()
         assert "metrics_group_verdict" in src, path
+        assert "zero_std_group_label" in src, f"{path} must not build the count label itself"
         assert "group_carries_reward_signal" not in src, f"{path} must not ask the strict question"

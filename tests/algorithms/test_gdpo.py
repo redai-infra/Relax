@@ -855,3 +855,77 @@ def test_the_filter_agrees_with_the_normalizer_on_a_cancelling_group():
 
     assert group_carries_reward_signal(args, samples) is False
     assert REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3) == [0.0, 0.0, 0.0]
+
+
+# ---------------- when the floor stops being a floor (_MAX_COMPONENT_NOISE) ----
+
+
+def _offset_group(base, delta):
+    """A component varying by `delta` around `base`, plus a well-conditioned
+    one.
+
+    The second column keeps the group from being rejected for some other
+    reason, so what the assertions see is the first column's conditioning
+    alone.
+    """
+    return torch.tensor([[base + i * delta, float(i)] for i in range(3)], dtype=torch.float64)
+
+
+def test_a_reward_with_no_significant_digits_raises_instead_of_being_floored():
+    """The floor rounds a residue to zero; it must not round a signal to zero.
+
+    Its bound grows with |reward| / spread, so a reward carrying a large
+    constant offset reaches a floor of order 1 -- large enough to zero a group
+    whose combined advantage is order 1 too. That is a broken reward scale, and
+    zeroing it silently is what `extract_reward_components` refuses to do one
+    stage earlier for the same reason.
+    """
+    group = _offset_group(1e15, 1.0)
+    weights = torch.tensor([0.5, 0.5])
+
+    with pytest.raises(ValueError, match="floating-point rounding rather than reward"):
+        combine_group(group, weights, ["correctness", "format"])
+
+
+def test_the_raise_names_the_component_that_cannot_be_read():
+    """Two components, one broken: the message has to say which."""
+    group = torch.tensor([[0.0, 1e15], [1.0, 1e15 + 1.0], [2.0, 1e15 + 2.0]], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="'format'"):
+        combine_group(group, torch.tensor([0.5, 0.5]), ["correctness", "format"])
+
+
+def test_a_large_but_readable_reward_is_left_alone():
+    """The check must not fire on a reward that is merely large.
+
+    1e9 with a spread of 0.1 still carries eight significant digits where it
+    varies; only the ratio matters, not the magnitude.
+    """
+    combined = combine_group(_offset_group(1e9, 0.1), torch.tensor([0.5, 0.5]), ["a", "b"])
+    assert float(combined.abs().amax()) > 0.1
+
+
+def test_the_cancelling_group_still_reaches_the_floor():
+    """The pathological group this floor exists for must stay below the check.
+
+    If the raise fired here it would replace the behaviour it was added to
+    protect: this group is *supposed* to come out as exactly zero.
+    """
+    assert combine_group(_constant_sum_group(), torch.tensor([0.5, 0.5])).tolist() == [0.0, 0.0, 0.0]
+
+
+def test_the_metrics_report_the_unreadable_group_rather_than_dying_on_it():
+    """The observer must not become the enforcer -- eval has no such contract.
+
+    Same split the file already makes for a missing --gdpo-reward-keys: the
+    filter, which decides whether a group trains, raises; the zero-std metrics
+    turn it into "cannot tell" and log it.
+    """
+    from relax.algorithms.rewards import metrics_group_verdict
+
+    args = _args(weights=[0.5, 0.5], n=3)
+    samples = [_S(0, {"correctness": 1e15 + i, "format": float(i)}) for i in range(3)]
+
+    with pytest.raises(ValueError, match="floating-point rounding rather than reward"):
+        group_carries_reward_signal(args, samples)
+    assert metrics_group_verdict(args, samples) is None
