@@ -3042,14 +3042,17 @@ def validate_algorithm_args(args) -> None:
         )
     if spec.forbids_normalize_advantages and args.normalize_advantages:
         raise ValueError(
-            f"The {spec.name!r} advantage estimator already whitens advantages per sequence; "
-            "`--normalize-advantages` would apply a second, token-level whitening on top. "
-            "Please remove it."
+            f"The {spec.name!r} advantage estimator is incompatible with --normalize-advantages: it "
+            "has already settled the scale of its advantages, and the token-level pass would apply a "
+            "second normalization on top -- whitening twice for gdpo, and for rloo re-introducing the "
+            "standard-deviation division the leave-one-out baseline deliberately omits (which also "
+            "makes the result depend on the DP partition). Please remove --normalize-advantages."
         )
     if spec.requires_rewards_normalization and not args.rewards_normalization:
         raise ValueError(
-            f"The {spec.name!r} advantage estimator needs reward normalization. "
-            "Please remove `--disable-rewards-normalization`."
+            f"The {spec.name!r} advantage estimator requires rewards normalization to be enabled: its "
+            "group-reward normalization stage is exactly what --disable-rewards-normalization skips. "
+            "Please remove --disable-rewards-normalization."
         )
     if not spec.allows_reward_post_process_hooks:
         # Both hooks return from post_process_rewards before the registry's
@@ -3067,8 +3070,9 @@ def validate_algorithm_args(args) -> None:
                 )
     if args.n_samples_per_prompt < spec.min_group_size:
         raise ValueError(
-            f"The {spec.name!r} advantage estimator needs `--n-samples-per-prompt` >= "
-            f"{spec.min_group_size}, got {args.n_samples_per_prompt}."
+            f"The {spec.name!r} advantage estimator requires --n-samples-per-prompt >= "
+            f"{spec.min_group_size} (got {args.n_samples_per_prompt}); its reward stage is undefined "
+            "for a smaller group."
         )
     # `--hybrid` also ends up with fully_async set, but only later in validation and
     # only as an implementation detail: it uses the colocate role set, so advantages
@@ -3082,6 +3086,35 @@ def validate_algorithm_args(args) -> None:
             "slice at a time — with a slice of one sample the advantages come out all zero and the "
             "run trains on no signal without failing. Use --colocate or --hybrid."
         )
+
+    if spec.requires_global_token_loss and not args.calculate_per_token_loss:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator requires --calculate-per-token-loss so policy loss "
+            "is normalized by the global number of valid response tokens. The per-sample token-mean "
+            "reducer would reweight unequal-length responses by 1 / response_length."
+        )
+
+    if spec.requires_on_policy_updates:
+        # `supports_fully_async` above is about *where* advantages get computed;
+        # this is about the objective having no ratio correction at all, which
+        # rules out `--hybrid` as well even though hybrid keeps the colocate
+        # role set. Two fields, two reasons -- see AlgorithmSpec.
+        if args.fully_async or getattr(args, "hybrid", False):
+            raise ValueError(
+                f"The {spec.name!r} advantage estimator only supports synchronous (colocate) training. "
+                "Please remove --fully-async / --hybrid."
+            )
+        if args.max_staleness != 0:
+            raise ValueError(
+                f"The {spec.name!r} advantage estimator requires --max-staleness 0: its unclipped "
+                "objective has no importance-ratio correction for stale rollout data."
+            )
+        if args.partial_rollout or args.use_dynamic_global_batch_size:
+            raise ValueError(
+                f"The {spec.name!r} advantage estimator is incompatible with --partial-rollout / "
+                "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
+                "at runtime, breaking the one-update-per-rollout guarantee."
+            )
 
     if spec.uses_reward_components:
         _validate_multi_reward_args(args, spec)
@@ -3150,54 +3183,6 @@ def _validate_multi_reward_args(args, spec) -> None:
             filter_path,
             args.reward_key,
         )
-
-    if args.n_samples_per_prompt < spec.min_group_size:
-        raise ValueError(
-            f"--advantage-estimator {spec.name} requires --n-samples-per-prompt >= {spec.min_group_size} "
-            f"(got {args.n_samples_per_prompt}); its reward stage is undefined for a smaller group."
-        )
-
-    if spec.requires_rewards_normalization and not args.rewards_normalization:
-        raise ValueError(
-            f"--advantage-estimator {spec.name} requires rewards normalization to be enabled "
-            "(its group-reward stage is what --disable-rewards-normalization skips). "
-            "Please remove --disable-rewards-normalization."
-        )
-
-    if spec.forbids_normalize_advantages and args.normalize_advantages:
-        raise ValueError(
-            f"--advantage-estimator {spec.name} is incompatible with --normalize-advantages: "
-            "the latter re-whitens advantages after DP sharding "
-            "(distributed_masked_whiten in loss.py), which re-introduces the std "
-            f"normalization {spec.name} removes and makes the result depend on the DP partition. "
-            "Please remove --normalize-advantages."
-        )
-
-    if spec.requires_global_token_loss and not args.calculate_per_token_loss:
-        raise ValueError(
-            f"--advantage-estimator {spec.name} requires --calculate-per-token-loss so policy loss is "
-            "normalized by the global number of valid response tokens. The per-sample token-mean "
-            "reducer would reweight unequal-length responses by 1 / response_length."
-        )
-
-    if spec.requires_on_policy_updates:
-        if args.fully_async or getattr(args, "hybrid", False):
-            raise ValueError(
-                f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
-                "Please remove --fully-async / --hybrid."
-            )
-        if args.max_staleness != 0:
-            raise ValueError(
-                f"--advantage-estimator {spec.name} requires --max-staleness 0: the unclipped objective "
-                "has no importance-ratio correction for stale rollout data."
-            )
-        if args.partial_rollout or args.use_dynamic_global_batch_size:
-            raise ValueError(
-                f"--advantage-estimator {spec.name} is incompatible with --partial-rollout / "
-                "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
-                "at runtime, breaking the one-update-per-rollout guarantee."
-            )
-
 
 def validate_reward_side_kl(args, is_sft: bool) -> None:
     """Reject ``--kl-coef`` for estimators that have nowhere to put it.

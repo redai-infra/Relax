@@ -857,75 +857,102 @@ def test_the_filter_agrees_with_the_normalizer_on_a_cancelling_group():
     assert REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3) == [0.0, 0.0, 0.0]
 
 
-# ---------------- when the floor stops being a floor (_MAX_COMPONENT_NOISE) ----
+# ---------------- where the floor still swallows signal (a known limit) ----
+#
+# A guard that raised above a fixed per-column noise level used to live in
+# `combine_group`. It was removed because it could not be made to hold, and
+# these tests pin the measurements that showed why: each one is a group the
+# guard would have let through while the floor zeroes a real signal. They are
+# characterisation tests -- they assert the limitation, so that anyone who
+# fixes it sees them fail rather than discovering the behaviour from a run.
 
 
 def _offset_group(base, delta):
     """A component varying by `delta` around `base`, plus a well-conditioned
-    one.
-
-    The second column keeps the group from being rejected for some other
-    reason, so what the assertions see is the first column's conditioning
-    alone.
-    """
+    one."""
     return torch.tensor([[base + i * delta, float(i)] for i in range(3)], dtype=torch.float64)
 
 
-def test_a_reward_with_no_significant_digits_raises_instead_of_being_floored():
-    """The floor rounds a residue to zero; it must not round a signal to zero.
+def test_the_floor_zeroes_a_real_signal_two_columns_are_enough():
+    """`noise` under 1% per column, and the floor still takes the group.
 
-    Its bound grows with |reward| / spread, so a reward carrying a large
-    constant offset reaches a floor of order 1 -- large enough to zero a group
-    whose combined advantage is order 1 too. That is a broken reward scale, and
-    zeroing it silently is what `extract_reward_components` refuses to do one
-    stage earlier for the same reason.
+    This is the measurement that retired the per-column guard: any threshold
+    high enough to leave the cancelling group alone sits above this one.
     """
-    group = _offset_group(1e15, 1.0)
-    weights = torch.tensor([0.5, 0.5])
+    base = 4.05e13
+    # float64 throughout: `extract_reward_components` builds float64 precisely
+    # so this offset survives, and in float32 `base + 1.0` would not move at all.
+    group = torch.tensor([[base, base + 2.0], [base + 1.0, base + 1.0], [base + 2.0, base + 0.1]], dtype=torch.float64)
+    weights = torch.tensor([1.0, 1.0])
 
-    with pytest.raises(ValueError, match="floating-point rounding rather than reward"):
-        combine_group(group, weights, ["correctness", "format"])
+    noise = component_noise_scale(group)
+    unfloored = (standardize_group_components(group).double() * weights.double()).sum(dim=1)
+
+    assert float(noise.amax()) < 0.01  # every column reads as clean...
+    assert float(unfloored.abs().amax()) > 0.03  # ...and the signal is real...
+    assert combine_group(group, weights).tolist() == [0.0, 0.0, 0.0]  # ...and lost anyway
 
 
-def test_the_raise_names_the_component_that_cannot_be_read():
-    """Two components, one broken: the message has to say which."""
-    group = torch.tensor([[0.0, 1e15], [1.0, 1e15 + 1.0], [2.0, 1e15 + 2.0]], dtype=torch.float64)
+def test_the_floor_grows_with_the_component_count():
+    """The floor is a weighted *sum*, so more components raise it.
 
-    with pytest.raises(ValueError, match="'format'"):
-        combine_group(group, torch.tensor([0.5, 0.5]), ["correctness", "format"])
-
-
-def test_a_large_but_readable_reward_is_left_alone():
-    """The check must not fire on a reward that is merely large.
-
-    1e9 with a spread of 0.1 still carries eight significant digits where it
-    varies; only the ratio matters, not the magnitude.
+    No per-column bound can see this: the columns stay equally clean as the
+    floor climbs past the signal.
     """
-    combined = combine_group(_offset_group(1e9, 0.1), torch.tensor([0.5, 0.5]), ["a", "b"])
-    assert float(combined.abs().amax()) > 0.1
+    base = 2.9e13
+    rows = []
+    for i in range(3):
+        up = [base + float(i)] * 8
+        down = [base + float(2 - i)] * 8
+        rows.append(up + down)
+    group = torch.tensor(rows, dtype=torch.float64)
+    group[2, 0] += 0.1  # a real difference, 12% of that column's spread
+    weights = torch.ones(16)
+
+    noise = component_noise_scale(group)
+    floor = 8.0 * float((weights.double().abs() * noise).sum())
+
+    assert float(noise.amax()) < 0.01  # per column: clean
+    assert floor > 0.5  # summed over 16 columns: not
+    assert combine_group(group, weights).tolist() == [0.0, 0.0, 0.0]
+
+
+def test_the_noise_estimate_assumes_float64_provenance():
+    """A reward computed in float32 carries ~5e8x more error than this bound.
+
+    The estimate uses float64's eps, so a column whose variation is entirely
+    float32 rounding measures as clean and standardises to full scale.
+    """
+    base = 1e9
+    ulp32 = float(torch.tensor(base, dtype=torch.float32).item() * 2**-23)
+    group = torch.tensor([[base + i * ulp32, float(i)] for i in range(3)], dtype=torch.float64)
+
+    assert float(component_noise_scale(group).amax()) < 1e-8  # reads as pristine
+    assert float(combine_group(group, torch.tensor([1.0, 1.0])).abs().amax()) > 1.0  # full-scale garbage
+
+
+def test_the_noise_estimate_is_a_fraction_only_above_gdpo_eps():
+    """Below GDPO_EPS the denominator is clamped, so `noise` understates.
+
+    Reading `component_noise_scale` as "what fraction of the standardised value
+    is rounding" is only valid while std dominates GDPO_EPS.
+    """
+    group = torch.tensor([[1e9 + i * 1e-6, float(i)] for i in range(3)], dtype=torch.float64)
+
+    noise = float(component_noise_scale(group).amax())
+    standardized = standardize_group_components(group)
+    actual = noise / float(standardized[:, 0].abs().amax())
+
+    assert noise < 0.01  # the estimate says "clean"
+    assert actual > 0.15  # the real contamination is over 15%
 
 
 def test_the_cancelling_group_still_reaches_the_floor():
-    """The pathological group this floor exists for must stay below the check.
-
-    If the raise fired here it would replace the behaviour it was added to
-    protect: this group is *supposed* to come out as exactly zero.
-    """
+    """The group the floor exists for still comes out as exactly zero."""
     assert combine_group(_constant_sum_group(), torch.tensor([0.5, 0.5])).tolist() == [0.0, 0.0, 0.0]
 
 
-def test_the_metrics_report_the_unreadable_group_rather_than_dying_on_it():
-    """The observer must not become the enforcer -- eval has no such contract.
-
-    Same split the file already makes for a missing --gdpo-reward-keys: the
-    filter, which decides whether a group trains, raises; the zero-std metrics
-    turn it into "cannot tell" and log it.
-    """
-    from relax.algorithms.rewards import metrics_group_verdict
-
-    args = _args(weights=[0.5, 0.5], n=3)
-    samples = [_S(0, {"correctness": 1e15 + i, "format": float(i)}) for i in range(3)]
-
-    with pytest.raises(ValueError, match="floating-point rounding rather than reward"):
-        group_carries_reward_signal(args, samples)
-    assert metrics_group_verdict(args, samples) is None
+def test_a_large_but_readable_reward_keeps_its_signal():
+    """1e9 with a spread of 0.1 still carries eight significant digits."""
+    combined = combine_group(_offset_group(1e9, 0.1), torch.tensor([0.5, 0.5]))
+    assert float(combined.abs().amax()) > 0.1

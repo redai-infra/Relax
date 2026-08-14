@@ -38,21 +38,6 @@ afford to: on well-conditioned rewards the bound sits fifteen orders of
 magnitude below the signal, so any value in this neighbourhood suppresses
 exactly the same things."""
 
-_MAX_COMPONENT_NOISE = 0.01
-"""When :func:`component_noise_scale` stops being negligible and starts being
-the answer.
-
-The standardised values it bounds have unit variance, so this reads directly as
-a fraction: at 0.01 a hundredth of what the component contributes to the
-combined advantage is rounding rather than reward. That is a broken reward
-scale, not a small inaccuracy -- the direction of the gradient is partly noise
-whether or not the noise floor happens to zero the group.
-
-The fifteen orders of margin on well-conditioned rewards mean this is nowhere
-near anything real: it needs |reward| to exceed the group's own spread by about
-1e14 before it trips, which is a reward carrying no significant digits where it
-varies."""
-
 
 def group_positions(samples: list[Any], expected_size: int) -> dict[int, list[int]]:
     """Map ``Sample.group_index`` to the positions it occupies in ``samples``.
@@ -316,7 +301,7 @@ def component_noise_scale(group: torch.Tensor) -> torch.Tensor:
     return torch.where(collapsed_columns(group, dim=0), torch.zeros_like(noise), noise)
 
 
-def combine_group(group: torch.Tensor, weights: torch.Tensor, keys: list[str] | None = None) -> torch.Tensor:
+def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """GDPO steps 1 and 2 for one ``[G, K]`` prompt group, with a noise floor.
 
     Two components summing to a constant should standardise to exact opposites
@@ -344,38 +329,39 @@ def combine_group(group: torch.Tensor, weights: torch.Tensor, keys: list[str] | 
     column is already handled. ``_NOISE_FLOOR_SAFETY`` is the one judgement
     call; given the fifteen orders of margin on well-conditioned input, its
     exact value changes nothing that is not already noise.
+
+    **Where the floor still swallows signal, measured rather than assumed.**
+    A guard that raised above a fixed per-column noise level used to live here.
+    It was removed because it could not be made to hold: the floor is
+    ``8 * sum(|w_k| * noise_k)`` while any per-column test is a max, so the two
+    do not even scale together. Three measurements, all reproducible on CPU:
+
+    * **The floor outgrows any per-column bound.** With 16 components at
+      ``noise_k = 0.0064`` each -- every column individually cleaner than 1% --
+      the floor reaches 0.82 and zeroes a real combined signal of 0.03..0.07.
+      More components means a higher floor at unchanged per-column noise.
+    * **Two components are enough.** At ``base = 4.05e13`` the columns measure
+      ``noise = [0.0090, 0.0095]`` and the floor, 0.148, zeroes a combined
+      signal of 0.033.
+    * **The estimate assumes float64 provenance.** ``eps`` here is float64's.
+      A reward computed in float32 (a ``torch.float32`` tensor's ``.item()``,
+      an ``np.float32``) carries ~5e8 times more error than this bound admits:
+      a column varying by exactly one float32 ulp at 1e9 measures
+      ``noise = 1.9e-9`` and standardises to a full-scale ±2, which no bound
+      derived from float64 ``eps`` can see.
+
+    A fourth, for anyone reading ``component_noise_scale`` as a fraction: it is
+    one only while ``std >> GDPO_EPS``. At ``std << GDPO_EPS`` the denominator
+    is clamped and the standardised column no longer has unit variance --
+    ``base=1e9`` with a spread of 1e-6 measures ``noise = 0.0022`` while the
+    true relative contamination is 20.7%.
+
+    So a group can be a hundredth of a percent from "clean" per column and
+    still lose its gradient here, silently. That is a real limitation of this
+    design, not a tuning problem; fixing it needs the floor and the diagnostic
+    to be the same quantity, which is a larger change than this function.
     """
     noise = component_noise_scale(group)
-
-    # Raise rather than floor when the estimate stops being negligible. The
-    # floor's contract is "round a residue to the zero it mathematically is",
-    # and that holds only while the residue *is* residue. Past
-    # `_MAX_COMPONENT_NOISE` the column has no significant digits left where it
-    # varies, and zeroing it would do precisely what
-    # `extract_reward_components` refuses to do one stage earlier: make a
-    # component that could not be read indistinguishable from one that
-    # genuinely collapsed, and hide a broken reward scale behind training that
-    # looks plausible. The failure this catches is silent in both directions --
-    # groups below the floor are dropped with no log at all, and a batch where
-    # every group is dropped reports "rewards do not vary", which is not what
-    # happened.
-    #
-    # Here rather than in the callers because there are two of them -- the
-    # normaliser and the filter -- and a check in one of them is a check the
-    # other disagrees with.
-    if float(noise.amax()) > _MAX_COMPONENT_NOISE:
-        column = int(noise.argmax())
-        name = f"{keys[column]!r}" if keys else f"at index {column}"
-        magnitude = float(group[:, column].abs().amax())
-        spread = float(group[:, column].std())
-        raise ValueError(
-            f"Reward component {name} varies by {spread:.6g} around values as large as "
-            f"{magnitude:.6g}, so {float(noise[column]):.2%} of its standardised value is "
-            f"floating-point rounding rather than reward. Rescale it (subtract the offset, or "
-            f"report the difference directly): standardising it divides the spread by itself, "
-            f"which amplifies that rounding into the advantage."
-        )
-
     standardized = standardize_group_components(group)
     combined = (standardized.double() * weights.double()).sum(dim=1)
 
@@ -444,7 +430,7 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     combined = torch.zeros(len(samples), dtype=torch.float64)
     silent_groups = 0
     for positions in positions_by_group.values():
-        combined[positions] = combine_group(components[positions], weight_tensor, keys)
+        combined[positions] = combine_group(components[positions], weight_tensor)
         if not bool(combined[positions].any()):
             silent_groups += 1
 
@@ -535,7 +521,7 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
     # `combine_group`, not steps 1 and 2 open-coded: this has to answer the
     # same question `normalize_gdpo_decoupled` will, including the noise floor.
     # Open-coding it is how the two came apart before.
-    return bool(combine_group(components, weights, keys).any())
+    return bool(combine_group(components, weights).any())
 
 
 def observed_reward_signal(args: Any, samples: list[Any]) -> bool | None:
@@ -626,15 +612,39 @@ def zero_std_group_label(args: Any, samples: list[Any]) -> str | None:
     happens to be the unscored one.
 
     ``None`` means the group cannot be filed under any reward, not that it
-    carries signal. Only a group with nothing scored at all returns it, and
-    such a group is dropped from the counts by both callers -- a group that was
-    never scored has no reward to report, so counting it would need a label
-    that does not exist rather than one this function declined to compute.
+    carries signal. Both callers drop such a group -- a group with no readable
+    reward has none to report, so counting it would need a label that does not
+    exist rather than one this function declined to compute.
+
+    "Readable" is checked, not assumed, because ``reward is not None`` does not
+    imply the *value* is. Two ways it does not, both reachable:
+
+    * ``reward`` is a dict and ``args.reward_key`` selects a ``None`` out of it
+      -- a partially failed reward function. The dict is not ``None``, so a
+      test on ``sample.reward`` alone passes it through to ``round(None, 1)``:
+      the same ``TypeError``, one predicate later.
+    * ``reward`` is a dict without ``args.reward_key`` at all, which raises
+      ``KeyError`` -- and ``KeyError`` is outside the ``(TypeError,
+      ValueError)`` that :func:`observed_reward_signal` catches, so it is not
+      covered by the "metrics observe, they do not enforce" split. Eval may run
+      a different reward model entirely (``EvalConfig.rm_type``), which is
+      exactly where a reward without the training ``--reward-key`` shows up.
+
+    Both are treated as "this sample carries no label", not as an error to
+    raise: this is a logging helper, and the stage that consumes the reward
+    still refuses the same input.
     """
-    scored = next((sample for sample in samples if sample.reward is not None), None)
-    if scored is None:
-        return None
-    return str(round(scored.get_reward_value(args), 1))
+    for sample in samples:
+        if sample.reward is None:
+            continue
+        try:
+            value = sample.get_reward_value(args)
+        except (KeyError, IndexError, TypeError):
+            continue
+        if value is None:
+            continue
+        return str(round(value, 1))
+    return None
 
 
 REWARD_NORMALIZERS: dict[str, Callable[[Any, list[Any], list[float]], list[float]]] = {

@@ -306,6 +306,34 @@ def test_a_group_with_nothing_scored_has_no_label():
     assert zero_std_group_label(_scalar_args(), [_S(0, None), _S(0, None)]) is None
 
 
+def test_a_reward_dict_holding_a_none_is_not_a_scored_sample():
+    """`reward is not None` does not mean the *value* is not None.
+
+    A partially failed reward function returns the dict with a None inside it.
+    The dict passes a test on `sample.reward`, and the None then reaches
+    `round(None, 1)` -- the same TypeError, one predicate later.
+    """
+    args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
+
+    assert zero_std_group_label(args, [_S(0, {"score": None}), _S(0, {"score": None})]) is None
+    # ...and a readable sample later in the group is still found
+    assert zero_std_group_label(args, [_S(0, {"score": None}), _S(0, {"score": 0.5})]) == "0.5"
+
+
+def test_a_reward_missing_the_key_entirely_has_no_label_either():
+    """KeyError is outside what `observed_reward_signal` catches.
+
+    So it is not covered by the "metrics observe, they do not enforce" split
+    that protects the verdict: an eval reward model with a different schema
+    (EvalConfig.rm_type) would take the metrics down here, past the point that
+    guards them.
+    """
+    args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
+    group = [_S(0, {"other": 1.0}), _S(0, {"other": 2.0})]
+
+    assert zero_std_group_label(args, group) is None
+
+
 def test_the_two_metrics_copies_both_delegate_the_decision():
     """Neither copy may re-derive "is this group flat", nor its label, for
     itself.
