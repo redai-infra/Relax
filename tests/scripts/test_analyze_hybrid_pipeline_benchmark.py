@@ -445,6 +445,12 @@ def test_schedule_matched_baseline_fetches_all_chunks_before_forward(tmp_path):
     assert analysis.summary["hybrid_pipeline_overlap"] is False
 
 
+def test_measurement_scope_distinguishes_first_step_from_steady_state():
+    assert analyzer._measurement_scope(((0, 0),)) == "fresh_process_first_step"
+    assert analyzer._measurement_scope(((4, 8), (9, 13))) == "steady_state"
+    assert analyzer._measurement_scope(((0, 2),)) == "selected_steps"
+
+
 @pytest.mark.parametrize(
     ("kwargs", "error"),
     [

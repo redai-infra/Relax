@@ -379,6 +379,25 @@ producer rollout ID 减去当前 actor rollout ID；若 producer 的 trace 写�
 已完成的 actor fetch 本身可证明当前 rollout 已 ready。该值不得超过 manifest
 记录的 `max_staleness`（参考配方为 `2`），paired 稳态均值最多增加 `0.25`。
 
+Task 21 中置信度更高的机制应按 PR #201 已验收的方法做独立累计消融，不要把
+ProcessorPool、true-on-policy train-forward log-prob 复用与 chunk overlap 捆成
+一个 experiment。以下标签有意不沿用 PR #201 的 `A1/A2/A3`：本分支没有捆绑
+其 owner/ref group payload dedup，因为该机制在 #201 的配对均值中使 samples/s
+回退：
+
+```text
+B   : MM_PROCESSOR_POOL_SIZE=0 HYBRID_REUSE_TRAIN_LOGPROBS=0 HYBRID_PIPELINE_FORWARD=0
+P   : MM_PROCESSOR_POOL_SIZE=8 HYBRID_REUSE_TRAIN_LOGPROBS=0 HYBRID_PIPELINE_FORWARD=0
+P+R : MM_PROCESSOR_POOL_SIZE=8 HYBRID_REUSE_TRAIN_LOGPROBS=1 HYBRID_PIPELINE_FORWARD=0
+P+S : MM_PROCESSOR_POOL_SIZE=8 HYBRID_REUSE_TRAIN_LOGPROBS=0 HYBRID_PIPELINE_FORWARD=1
+```
+
+每个 fresh process 至少运行 40 个 optimizer step，排除 warmup；每个条件至少
+两次独立运行，同时报告均值和范围。`HYBRID_REUSE_TRAIN_LOGPROBS=1` 要求前向
+确定性、每个 rollout partition 恰好一个 optimizer mini，且 `max_staleness > 0`
+时必须启用 TIS。参考 launcher 有意禁止它与 `HYBRID_PIPELINE_FORWARD=1` 同时
+启用，以保持两项收益可归因。
+
 回滚时去掉 `--hybrid-pipeline-forward`，或设置
 `HYBRID_PIPELINE_FORWARD=0`；无需转换 checkpoint 或数据集。若要扩展
 DP/PP/VPP 或 role graph，必须先新增 collective-order 与 restore-count 测试，
@@ -387,7 +406,9 @@ DP/PP/VPP 或 role graph，必须先新增 collective-order 与 restore-count �
 `--steady-windows 0-0` 明确统计“每次启动新进程后的第一个 optimizer step”。
 它适用于固定资源窗口只能容纳单步训练的场景，但不能表述为稳态吞吐。报告中
 应称为配对 first-step benchmark，至少使用两个 seed 并平衡启动顺序；资源允许
-时仍应补充后续多 step 的稳态窗口。
+时仍应补充后续多 step 的稳态窗口。分析器会将前者记录为
+`measurement_scope=fresh_process_first_step`；至少包含三个后续 step 的窗口记录为
+`measurement_scope=steady_state`。
 
 ______________________________________________________________________
 

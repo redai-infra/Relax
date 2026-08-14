@@ -826,6 +826,15 @@ def _stable_steps(windows: Sequence[tuple[int, int]]) -> set[int]:
     return {step for start, end in windows for step in range(start, end + 1)}
 
 
+def _measurement_scope(windows: Sequence[tuple[int, int]]) -> str:
+    steps = sorted(_stable_steps(windows))
+    if steps == [0]:
+        return "fresh_process_first_step"
+    if len(steps) >= 3 and steps[0] > 0:
+        return "steady_state"
+    return "selected_steps"
+
+
 def _scalar_map(rows: Sequence[dict[str, Any]], tag: str) -> dict[int, float]:
     return {int(row["step"]): float(row["value"]) for row in rows if row["tag"] == tag}
 
@@ -1047,6 +1056,8 @@ def analyze_run(
         "run_dir": str(run_dir),
         "condition": manifest["condition"],
         "seed": manifest["seed"],
+        "measurement_scope": _measurement_scope(windows),
+        "measurement_windows": [list(window) for window in windows],
         "hybrid_pipeline_forward": pipeline_enabled,
         "hybrid_pipeline_overlap": pipeline_overlap_enabled,
         "steady_windows": [list(window) for window in windows],
@@ -1359,6 +1370,12 @@ def _build_comparison(
             sum(bool(row["first_forward_before_last_put_start"]) for row in rows) / len(rows) if rows else None
         )
     comparison = {
+        "measurement_scope": _measurement_scope(windows),
+        "claim_limit": (
+            "Fresh-process first optimizer step only; do not report as steady-state training throughput."
+            if _measurement_scope(windows) == "fresh_process_first_step"
+            else None
+        ),
         "paired_runs": paired,
         "window_speedups": window_speedups,
         "paired_seed_count": len(paired),
@@ -1637,7 +1654,8 @@ def _plot_comparison(
     axes[0, 1].bar([position - 0.2 for position in positions], utilization, width=0.4, label="mean util")
     axes[0, 1].bar([position + 0.2 for position in positions], idle_ratio, width=0.4, label="idle <10%")
     axes[0, 1].set_xticks(positions, labels)
-    axes[0, 1].set_ylabel("steady-window percent")
+    scope_label = "first-step" if _measurement_scope(windows) == "fresh_process_first_step" else "selected-window"
+    axes[0, 1].set_ylabel(f"{scope_label} percent")
     axes[0, 1].legend()
     axes[1, 1].bar(labels, vram)
     axes[1, 1].set_ylabel("full-run sampled peak VRAM (GiB)")
@@ -1722,7 +1740,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--steady-windows",
         default="4-8,9-13,14-18",
-        help="Inclusive, non-overlapping step windows as START-END comma-separated ranges.",
+        help=(
+            "Inclusive, non-overlapping measurement windows as START-END comma-separated ranges. "
+            "Using 0-0 is classified as a fresh-process first-step benchmark, not steady state."
+        ),
     )
     parser.add_argument("--expected-samples", type=int, default=256)
     parser.add_argument(
@@ -1777,6 +1798,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             for run_dir in args.run_dir
         ]
         result: dict[str, Any] = {
+            "measurement_scope": _measurement_scope(windows),
+            "claim_limit": (
+                "Fresh-process first optimizer step only; do not report as steady-state training throughput."
+                if _measurement_scope(windows) == "fresh_process_first_step"
+                else None
+            ),
             "runs": [analysis.summary for analysis in analyses],
             "validation": "passed",
         }

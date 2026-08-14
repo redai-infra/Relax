@@ -1,4 +1,4 @@
-# Task 21: Hybrid-async multimodal pipeline — formal GPU results
+# Task 21: Hybrid-async multimodal pipeline - fresh-process first-step GPU results
 
 ## Protocol
 
@@ -7,7 +7,12 @@
 - Hardware: physical RTX A6000 GPUs `1,2,3,4,6`; four actor GPUs (`TP=2`, `CP=2`) plus one rollout GPU.
 - Workload: Qwen3-VL-8B-Instruct, OpenR1-Multimodal, 256 generated samples per run, response cap 1024, one real optimizer step.
 - Design: paired seeds `20260811`–`20260814`, ABBAABBA order; baseline and experiment differ only in `--hybrid-pipeline-overlap`.
-- Statistics: four fresh-process paired runs. The formal analyzer validated every run and all preregistered targets.
+- Statistics: four fresh-process paired runs, each containing one optimizer step. The analyzer validated every run and all preregistered first-step targets.
+
+These results measure first-step latency and throughput under the fixed Qwen3-VL,
+TP2 x CP2 x DP1 profile. They do not establish steady-state training
+throughput. A steady-state claim requires multi-step runs with warmup excluded
+and later measurement windows declared before analysis.
 
 ## Result summary
 
@@ -17,7 +22,7 @@
 | hybrid phase-1 time, arithmetic mean | 165.38 s | 130.38 s | paired geometric-mean reduction **21.21%** |
 | end-to-end step time, arithmetic mean | 342.24 s | 305.61 s | **10.70% lower** |
 | producer/actor overlap | 0/4 runs | 4/4 runs | **100%** experiment overlap |
-| steady GPU utilization, arithmetic mean | 40.01% | 44.37% | +4.36 percentage points |
+| first-step-window GPU utilization, arithmetic mean | 40.01% | 44.37% | +4.36 percentage points |
 | sampled peak VRAM, maximum | 47,380 MiB | 47,140 MiB | no regression |
 
 Every paired run exceeded the preregistered 5% throughput target: `10.22%`, `12.21%`, `12.80%`, and `12.82%`. Every pair also reduced phase-1 time by `19.11%`–`23.53%`.
@@ -30,7 +35,7 @@ The phase-1 plot shows the producer/actor overlap interval, phase-1 latency, and
 
 ![Phase-1 overlap](task21_phase1_overlap.png)
 
-The GPU plot combines the 500 ms NVML time series with steady-window utilization, idle ratio, and sampled peak VRAM. Utilization improves without a peak-memory regression.
+The GPU plot combines the 500 ms NVML time series with first-step-window utilization, idle ratio, and sampled peak VRAM. It describes these fresh-process runs only.
 
 ![GPU utilization and VRAM](task21_gpu_util_vram.png)
 

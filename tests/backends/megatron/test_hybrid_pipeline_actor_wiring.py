@@ -60,6 +60,56 @@ def test_hybrid_pipeline_runtime_rechecks_supported_parallel_topology(monkeypatc
         actor._validate_hybrid_pipeline_runtime(rollout_plan, dp_size=1)
 
 
+def test_hybrid_true_on_policy_reuse_requires_deterministic_single_mini():
+    assert actor_module is not None
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(
+        true_on_policy_mode=True,
+        keep_old_actor=False,
+        use_rollout_logprobs=False,
+        max_staleness=2,
+        use_tis=True,
+        custom_megatron_before_log_prob_hook_path=None,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        lora_dropout=0.0,
+        kl_coef=0.0,
+        use_kl_loss=False,
+        use_opd=False,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+    )
+
+    assert actor._should_reuse_hybrid_train_forward_log_probs(SimpleNamespace(num_rollout_minis=1)) is True
+
+    actor.args.use_tis = False
+    with pytest.raises(ValueError, match="requires --use-tis"):
+        actor._should_reuse_hybrid_train_forward_log_probs(SimpleNamespace(num_rollout_minis=1))
+
+
+def test_hybrid_true_on_policy_skips_dedicated_actor_forward(monkeypatch):
+    assert actor_module is not None
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = SimpleNamespace(
+        compute_advantages_and_returns=True,
+        use_rollout_logprobs=False,
+        get_mismatch_metrics=False,
+    )
+    actor.weights_backuper = SimpleNamespace(backup_tags={"actor"})
+    monkeypatch.setattr(
+        actor_module,
+        "get_data_iterator",
+        lambda *_args, **_kwargs: pytest.fail("no forward iterator should be built"),
+    )
+
+    actor._hybrid_forward_subbatch(
+        {"total_lengths": [1]},
+        rollout_id=0,
+        chunk_index=0,
+        reuse_train_forward_log_probs=True,
+    )
+
+
 def _rollout_batch(start: int, count: int) -> dict:
     values = list(range(start, start + count))
     return {

@@ -407,6 +407,27 @@ lead must remain at most the manifest's configured `max_staleness` value
 (`2` in the reference recipe), and its paired steady mean may increase by at
 most `0.25`.
 
+The higher-confidence Task 21 mechanisms should be benchmarked as separate
+cumulative ablations, following the accepted PR #201 protocol. In particular,
+compare ProcessorPool and true-on-policy train-forward log-prob reuse separately
+from chunk overlap. The labels below intentionally do not reuse PR #201's
+`A1/A2/A3` names because this branch does not bundle its owner/ref group payload
+dedup, whose paired mean regressed samples/s in that PR:
+
+```text
+B   : MM_PROCESSOR_POOL_SIZE=0 HYBRID_REUSE_TRAIN_LOGPROBS=0 HYBRID_PIPELINE_FORWARD=0
+P   : MM_PROCESSOR_POOL_SIZE=8 HYBRID_REUSE_TRAIN_LOGPROBS=0 HYBRID_PIPELINE_FORWARD=0
+P+R : MM_PROCESSOR_POOL_SIZE=8 HYBRID_REUSE_TRAIN_LOGPROBS=1 HYBRID_PIPELINE_FORWARD=0
+P+S : MM_PROCESSOR_POOL_SIZE=8 HYBRID_REUSE_TRAIN_LOGPROBS=0 HYBRID_PIPELINE_FORWARD=1
+```
+
+Run at least 40 optimizer steps per fresh process, exclude warmup, use at least
+two independent runs per condition, and report the range as well as the mean.
+`HYBRID_REUSE_TRAIN_LOGPROBS=1` requires deterministic forwards, one optimizer
+mini per rollout partition, and TIS when `max_staleness > 0`. It intentionally
+cannot be combined with `HYBRID_PIPELINE_FORWARD=1` in the reference launcher,
+so the two effects remain attributable.
+
 To roll back, omit `--hybrid-pipeline-forward` (or set
 `HYBRID_PIPELINE_FORWARD=0`). No checkpoint or dataset conversion is needed.
 Before widening the support matrix, add collective-order and restore-count
@@ -417,7 +438,9 @@ multimodal smoke, and paired performance measurements.
 step. It is useful when only one training step fits the fixed resource window,
 but it is not a steady-state throughput claim. Label it as a paired first-step
 benchmark, balance launch order across at least two seeds, and use later
-multi-step windows whenever resources permit.
+multi-step windows whenever resources permit. The analyzer records this as
+`measurement_scope=fresh_process_first_step`; later windows with at least three
+selected steps are recorded as `measurement_scope=steady_state`.
 
 ______________________________________________________________________
 

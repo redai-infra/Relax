@@ -25,6 +25,7 @@ def _run_launcher(
     tmp_path: Path,
     *,
     overrides: dict[str, str] | None = None,
+    mode: str = "hybrid-async",
 ) -> tuple[subprocess.CompletedProcess[str], list[str], Path, Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -66,7 +67,7 @@ printf '%s' "${TENSORBOARD_DIR:-}" > "${RAY_TENSORBOARD_CAPTURE}"
         env.update(overrides)
 
     result = subprocess.run(
-        ["bash", str(LAUNCHER), "hybrid-async"],
+        ["bash", str(LAUNCHER), mode],
         cwd=REPO_ROOT,
         env=env,
         check=False,
@@ -89,6 +90,8 @@ def test_launcher_preserves_default_qwen35_recipe(tmp_path):
     assert _argument_value(arguments, "--max-tokens-per-gpu") == "12288"
     assert _argument_value(arguments, "--rollout-num-gpus-per-engine") == "2"
     assert _argument_value(arguments, "--num-iters-per-train-update") == "2"
+    assert _argument_value(arguments, "--mm-processor-pool-size") == "0"
+    assert "--true-on-policy-mode" not in arguments
     assert _argument_value(arguments, "--save") == f"{tmp_path / 'exp' / 'Qwen3.5-9B_mcore_8xgpu'}/"
     assert _argument_value(arguments, "--save-interval") == "100"
     assert "--rollout-result-dir" not in arguments
@@ -174,6 +177,49 @@ def test_launcher_exposes_schedule_matched_no_overlap_control(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "--hybrid-pipeline-forward" in arguments
     assert "--no-hybrid-pipeline-overlap" in arguments
+
+
+def test_launcher_exposes_processor_pool_and_train_logprob_reuse(tmp_path):
+    result, arguments, _, _ = _run_launcher(
+        tmp_path,
+        overrides={
+            "MM_PROCESSOR_POOL_SIZE": "8",
+            "HYBRID_REUSE_TRAIN_LOGPROBS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _argument_value(arguments, "--mm-processor-pool-size") == "8"
+    assert "--true-on-policy-mode" in arguments
+    assert "--hybrid-pipeline-forward" not in arguments
+
+
+def test_launcher_keeps_pipeline_and_train_logprob_reuse_as_separate_ablations(tmp_path):
+    result, arguments, capture_path, _ = _run_launcher(
+        tmp_path,
+        overrides={
+            "HYBRID_PIPELINE_FORWARD": "1",
+            "HYBRID_REUSE_TRAIN_LOGPROBS": "1",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "are separate ablations" in result.stderr
+    assert arguments == []
+    assert not capture_path.exists()
+
+
+def test_launcher_rejects_train_logprob_reuse_in_sync_mode(tmp_path):
+    result, arguments, capture_path, _ = _run_launcher(
+        tmp_path,
+        overrides={"HYBRID_REUSE_TRAIN_LOGPROBS": "1"},
+        mode="sync",
+    )
+
+    assert result.returncode == 2
+    assert "require MODE=hybrid-async" in result.stderr
+    assert arguments == []
+    assert not capture_path.exists()
 
 
 def test_launcher_rejects_overlap_control_without_pipeline_forward(tmp_path):

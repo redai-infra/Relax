@@ -33,6 +33,8 @@ EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
+MM_PROCESSOR_POOL_SIZE="${MM_PROCESSOR_POOL_SIZE:-0}"
+HYBRID_REUSE_TRAIN_LOGPROBS="${HYBRID_REUSE_TRAIN_LOGPROBS:-0}"
 MODEL_NAME="${MODEL_NAME:-Qwen3.5-9B}"
 MODEL_RUN_NAME="${MODEL_RUN_NAME:-qwen35-9b}"
 MODEL_CHECKPOINT_DIR="${MODEL_CHECKPOINT_DIR:-${MODEL_DIR}/${MODEL_NAME}}"
@@ -73,6 +75,15 @@ require_positive_integer() {
     fi
 }
 
+require_nonnegative_integer() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+        echo "${name} must be a non-negative integer, got ${value}" >&2
+        exit 2
+    fi
+}
+
 require_fraction() {
     local name="$1"
     local value="$2"
@@ -103,6 +114,13 @@ case "${HYBRID_PIPELINE_OVERLAP}" in
     exit 2
     ;;
 esac
+case "${HYBRID_REUSE_TRAIN_LOGPROBS}" in
+  0|1) ;;
+  *)
+    echo "HYBRID_REUSE_TRAIN_LOGPROBS must be 0 or 1, got ${HYBRID_REUSE_TRAIN_LOGPROBS}" >&2
+    exit 2
+    ;;
+esac
 case "${SGLANG_DETERMINISTIC_INFERENCE}" in
   0|1) ;;
   *)
@@ -118,9 +136,10 @@ case "${CHECKPOINT_SAVE}" in
     ;;
 esac
 if [ "${MODE}" != "hybrid-async" ] && {
-    [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] || [ -n "${HYBRID_PIPELINE_TRACE_DIR}" ];
+    [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] || [ -n "${HYBRID_PIPELINE_TRACE_DIR}" ] ||
+        [ "${HYBRID_REUSE_TRAIN_LOGPROBS}" = "1" ];
 }; then
-    echo "Hybrid pipeline forward/trace options require MODE=hybrid-async" >&2
+    echo "Hybrid pipeline forward/trace and train-logprob reuse options require MODE=hybrid-async" >&2
     exit 2
 fi
 
@@ -138,12 +157,17 @@ for item in \
     "ROLLOUT_NUM_GPUS_PER_ENGINE:${ROLLOUT_NUM_GPUS_PER_ENGINE}"; do
     require_positive_integer "${item%%:*}" "${item#*:}"
 done
+require_nonnegative_integer "MM_PROCESSOR_POOL_SIZE" "${MM_PROCESSOR_POOL_SIZE}"
 if [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] && (( NUM_ITERS_PER_TRAIN_UPDATE < 2 )); then
     echo "HYBRID_PIPELINE_FORWARD requires NUM_ITERS_PER_TRAIN_UPDATE >= 2" >&2
     exit 2
 fi
 if [ "${HYBRID_PIPELINE_FORWARD}" = "0" ] && [ "${HYBRID_PIPELINE_OVERLAP}" = "0" ]; then
     echo "HYBRID_PIPELINE_OVERLAP=0 requires HYBRID_PIPELINE_FORWARD=1" >&2
+    exit 2
+fi
+if [ "${HYBRID_PIPELINE_FORWARD}" = "1" ] && [ "${HYBRID_REUSE_TRAIN_LOGPROBS}" = "1" ]; then
+    echo "HYBRID_PIPELINE_FORWARD and HYBRID_REUSE_TRAIN_LOGPROBS are separate ablations and cannot be enabled together" >&2
     exit 2
 fi
 if [ "${CHECKPOINT_SAVE}" = "1" ]; then
@@ -217,6 +241,11 @@ if [ "${HYBRID_PIPELINE_FORWARD}" = "1" ]; then
         HYBRID_PIPELINE_ARGS+=(--no-hybrid-pipeline-overlap)
     fi
 fi
+
+TASK21_OPT_ARGS=(--mm-processor-pool-size "${MM_PROCESSOR_POOL_SIZE}")
+if [ "${HYBRID_REUSE_TRAIN_LOGPROBS}" = "1" ]; then
+    TASK21_OPT_ARGS+=(--true-on-policy-mode)
+fi
 if [ -n "${HYBRID_PIPELINE_TRACE_DIR}" ]; then
     HYBRID_PIPELINE_ARGS+=(
         --hybrid-pipeline-trace-dir "${HYBRID_PIPELINE_TRACE_DIR}"
@@ -248,6 +277,8 @@ fi
 printf '%s\n' \
     "MODE=${MODE}" \
     "NUM_ROLLOUT=${NUM_ROLLOUT}" \
+    "MM_PROCESSOR_POOL_SIZE=${MM_PROCESSOR_POOL_SIZE}" \
+    "HYBRID_REUSE_TRAIN_LOGPROBS=${HYBRID_REUSE_TRAIN_LOGPROBS}" \
     "HYBRID_PIPELINE_FORWARD=${HYBRID_PIPELINE_FORWARD}" \
     "HYBRID_PIPELINE_OVERLAP=${HYBRID_PIPELINE_OVERLAP}" \
     "HYBRID_PIPELINE_TRACE_DIR=${HYBRID_PIPELINE_TRACE_DIR}" \
@@ -399,6 +430,7 @@ if [ "${MODE}" = "hybrid-async" ]; then
          --balance-data \
         --hybrid \
         "${HYBRID_PIPELINE_ARGS[@]}" \
+        "${TASK21_OPT_ARGS[@]}" \
         "${REPRO_ARGS[@]}" \
         "${DEBUG_ARGS[@]}" \
         "${MODEL_ARGS[@]}" \
@@ -421,6 +453,7 @@ else
          --colocate \
          --use-health-check \
          --balance-data \
+         "${TASK21_OPT_ARGS[@]}" \
          "${REPRO_ARGS[@]}" \
          "${DEBUG_ARGS[@]}" \
          "${MODEL_ARGS[@]}" \
