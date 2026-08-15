@@ -339,6 +339,7 @@ def wait_actor_gone(name: str = "TransferQueueController", timeout: float = 30.0
         except ValueError:
             return
         time.sleep(0.4)
+    raise TimeoutError(f"Ray actor {name!r} is still registered after {timeout:.1f}s")
 
 
 def close_tq_unmount_and_wait() -> None:

@@ -471,6 +471,46 @@ class TestInitializeTqWithFallback:
         assert result.owns_controller is False
         assert calls["attempts"] == []
 
+    def test_attach_rejects_different_polling_mode(self, monkeypatch):
+        requested = self._conf("SimpleStorage")
+        requested["controller"]["polling_mode"] = True
+        stored = self._conf("SimpleStorage")
+        stored["controller"]["polling_mode"] = False
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="controller sampling contract"):
+            tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
+        assert calls["attempts"] == []
+
+    def test_attach_rejects_different_sampler_type(self, monkeypatch):
+        requested = self._conf("SimpleStorage")
+        requested["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2)
+        stored = self._conf("SimpleStorage")
+        stored["controller"]["sampler"] = _SamplerB(n_samples_per_prompt=2)
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="controller sampling contract"):
+            tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
+        assert calls["attempts"] == []
+
+    def test_attach_rejects_different_sampler_public_config(self, monkeypatch):
+        requested = self._conf("SimpleStorage")
+        requested["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2)
+        stored = self._conf("SimpleStorage")
+        stored["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=4)
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="controller sampling contract"):
+            tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
+        assert calls["attempts"] == []
+
+    def test_attach_ignores_sampler_private_runtime_state(self, monkeypatch):
+        requested = self._conf("SimpleStorage")
+        requested["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2, state={"request": 1})
+        stored = self._conf("SimpleStorage")
+        stored["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2, state={"stored": 3})
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
+        assert result.config is stored
+        assert calls["attempts"] == []
+
     def test_auto_cleans_failed_mooncake_then_retries_simple_once(self, monkeypatch):
         primary = self._conf("MooncakeStore")
         fallback = self._conf("SimpleStorage")
@@ -508,6 +548,16 @@ class TestInitializeTqWithFallback:
         result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
         assert result.config["backend"]["storage_backend"] == "SimpleStorage"
         assert len(calls["attempts"]) == 2
+
+
+class _SamplerA:
+    def __init__(self, n_samples_per_prompt: int, state: dict | None = None):
+        self.n_samples_per_prompt = n_samples_per_prompt
+        self._states = state or {}
+
+
+class _SamplerB(_SamplerA):
+    pass
 
 
 class _RemoteMethod:

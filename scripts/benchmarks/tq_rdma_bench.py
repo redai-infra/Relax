@@ -124,9 +124,22 @@ def build_tq_config(config_name: str, args: argparse.Namespace, num_storage_unit
     )
 
 
+def wait_actor_gone(name: str = "TransferQueueController", timeout: float = 20.0) -> None:
+    """Wait for a named TQ actor to leave GCS, failing closed on timeout."""
+    import ray
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ray.get_actor(name, namespace="transfer_queue")
+        except ValueError:
+            return
+        time.sleep(0.4)
+    raise TimeoutError(f"Ray actor {name!r} is still registered after {timeout:.1f}s")
+
+
 def close_tq_and_wait(timeout: float = 20.0) -> None:
-    """Close TQ, unmount the Mooncake segment, and wait for the controller to
-    leave the GCS.
+    """Close TQ, unmount the Mooncake segment, and confirm controller exit.
 
     Required between configs: ``tq.init`` attaches to an existing controller
     and ignores the new conf (interface.py:152), so without close+wait every
@@ -138,9 +151,6 @@ def close_tq_and_wait(timeout: float = 20.0) -> None:
     dead endpoint ("Failed to open segment ... Connection refused") until the
     master's ``client_ttl`` (30 s) expires.  Unmount explicitly instead.
     """
-    import time
-
-    import ray
     import transfer_queue as tq
 
     store_client = None
@@ -154,13 +164,7 @@ def close_tq_and_wait(timeout: float = 20.0) -> None:
     if store_client is not None and hasattr(store_client, "close"):
         store_client.close()  # unmounts the segment and deregisters from the master
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            ray.get_actor("TransferQueueController", namespace="transfer_queue")
-        except ValueError:
-            return
-        time.sleep(0.4)
+    wait_actor_gone(timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #

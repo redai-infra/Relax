@@ -69,7 +69,7 @@ class TqCleanupTimeout(TimeoutError):
 
 
 class TqConfigurationMismatch(RuntimeError):
-    """Raised when an existing controller uses a different backend config."""
+    """Raised when an existing controller uses an incompatible job config."""
 
 
 def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -102,6 +102,41 @@ def _backend_signature(conf: Any) -> tuple[Any, ...]:
         "SimpleStorage",
         _get_config_value(simple, "total_storage_size"),
         _get_config_value(simple, "num_data_storage_units"),
+    )
+
+
+def _sampler_signature(sampler: Any) -> tuple[Any, ...]:
+    """Return sampler identity and immutable construction-time parameters.
+
+    TransferQueue samplers keep mutable scheduling state in underscore-prefixed
+    attributes.  Those caches legitimately differ between processes and must
+    not prevent an attach; public attributes describe the sampling contract
+    that workers and the existing controller must agree on.
+    """
+    if sampler is None:
+        return (None, ())
+    if isinstance(sampler, str):
+        return ("string", sampler)
+    if isinstance(sampler, type):
+        return ("class", f"{sampler.__module__}.{sampler.__qualname__}")
+
+    sampler_type = f"{type(sampler).__module__}.{type(sampler).__qualname__}"
+    try:
+        public_config = tuple(
+            sorted((name, value) for name, value in vars(sampler).items() if not name.startswith("_"))
+        )
+    except TypeError:
+        public_config = ()
+    return (sampler_type, public_config)
+
+
+def _configuration_signature(conf: Any) -> tuple[Any, ...]:
+    """Return fields that must agree for workers to share a controller."""
+    controller = _get_config_value(conf, "controller", {})
+    return (
+        _backend_signature(conf),
+        bool(_get_config_value(controller, "polling_mode", False)),
+        _sampler_signature(_get_config_value(controller, "sampler")),
     )
 
 
@@ -565,14 +600,15 @@ def _start_owner(conf: Any, *, timeout: float) -> TqInitResult:
 
     # A concurrent initializer won the named-actor race. This process is only
     # attached and must never retain an actor capable of global tq.close().
-    config_mismatch = _backend_signature(stored_conf) != _backend_signature(conf)
+    config_mismatch = _configuration_signature(stored_conf) != _configuration_signature(conf)
     try:
         ray.get(owner.detach.remote(), timeout=10.0)
     finally:
         _stop_owner_actor(owner)
     if config_mismatch:
         raise TqConfigurationMismatch(
-            "A concurrent TransferQueue initializer won with a different backend config "
+            "A concurrent TransferQueue initializer won with a different backend config or controller sampling "
+            "contract "
             f"(requested={_backend_description(conf)}, stored={_backend_description(stored_conf)}). "
             "Detached without modifying the winning controller."
         )
@@ -619,9 +655,10 @@ def initialize_tq_with_fallback(
             # Attach semantics: use the controller's actual config. Upstream
             # tq.init(conf) returns the caller-provided config even when ignored.
             stored_conf = _get_stored_config()
-            if _backend_signature(stored_conf) != _backend_signature(attempt_conf):
+            if _configuration_signature(stored_conf) != _configuration_signature(attempt_conf):
                 raise TqConfigurationMismatch(
                     "Refusing to attach to an existing TransferQueueController with a different backend config "
+                    "or controller sampling contract "
                     f"(requested={_backend_description(attempt_conf)}, stored={_backend_description(stored_conf)}). "
                     "Only the owner may close the existing controller."
                 )

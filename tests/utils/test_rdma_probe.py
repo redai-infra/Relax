@@ -35,6 +35,7 @@ from relax.utils.tq_config import (
     build_simple_storage_config,
     estimate_payload_bytes,
     resolve_mooncake_master_address,
+    resolve_tq_capacity_batch_size,
     validate_mooncake_runtime_contract,
     validate_segment_capacity,
 )
@@ -570,6 +571,38 @@ class TestTqConfigBuilder:
         per_sample = estimate_payload_bytes(args)
         assert per_sample == 8192 * (32 + 784 * 12)
         assert 70 * 1024**2 < per_sample < 80 * 1024**2
+
+    def test_capacity_batch_uses_dynamic_partial_rollout_oversampling(self):
+        args = _make_args(
+            rollout_batch_size=16,
+            partial_rollout=True,
+            use_dynamic_global_batch_size=True,
+            over_sampling_batch_size=64,
+        )
+        assert resolve_tq_capacity_batch_size(args) == 64
+        assert estimate_payload_bytes(args) == 64 * 8192 * 32
+
+    def test_capacity_batch_uses_nominal_rollout_without_dynamic_partial_rollout(self):
+        args = _make_args(
+            rollout_batch_size=16,
+            partial_rollout=False,
+            use_dynamic_global_batch_size=True,
+            over_sampling_batch_size=64,
+        )
+        assert resolve_tq_capacity_batch_size(args) == 16
+
+    def test_dynamic_partial_rollout_capacity_rejects_oversampling_peak(self):
+        args = _make_args(
+            multimodal_keys=["pixel_values"],
+            rollout_batch_size=16,
+            partial_rollout=True,
+            use_dynamic_global_batch_size=True,
+            over_sampling_batch_size=64,
+        )
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        err = validate_segment_capacity(args, eff)
+        assert err is not None
+        assert "effective_batch=64" in err
 
     def test_estimate_payload_requires_seq_length(self):
         args = _make_args(seq_length=None)

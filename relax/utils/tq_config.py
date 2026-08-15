@@ -186,6 +186,23 @@ _BYTES_PER_PIXEL_VALUE = 3 * 4
 _TEXT_BYTES_PER_TOKEN = 32
 
 
+def resolve_tq_capacity_batch_size(args: Any) -> int:
+    """Return the largest batch that one TQ step may need to hold.
+
+    Dynamic partial rollout schedules from the over-sampling pool, so its
+    capacity contract is ``over_sampling_batch_size`` rather than the smaller
+    nominal ``rollout_batch_size``.  Keep this resolution shared with the
+    Controller's SimpleStorage sizing so both backends reserve for the same
+    number of samples.
+    """
+    rollout_batch = getattr(args, "rollout_batch_size")
+    if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
+        over_sampling_batch = getattr(args, "over_sampling_batch_size", None)
+        if over_sampling_batch is not None:
+            return int(over_sampling_batch)
+    return int(rollout_batch)
+
+
 def estimate_payload_bytes(args: Any) -> int:
     """Worst-case per-step payload upper bound in bytes.
 
@@ -197,7 +214,7 @@ def estimate_payload_bytes(args: Any) -> int:
     passed configurations which later failed puts mid-training.
     """
     n_samples = args.n_samples_per_prompt
-    rollout_batch = args.rollout_batch_size
+    capacity_batch = resolve_tq_capacity_batch_size(args)
     seq_length = int(getattr(args, "seq_length", 0) or 0)
     if seq_length <= 0:
         raise RuntimeError(
@@ -207,7 +224,7 @@ def estimate_payload_bytes(args: Any) -> int:
     per_sample = seq_length * _TEXT_BYTES_PER_TOKEN
     if getattr(args, "multimodal_keys", None) is not None:
         per_sample += seq_length * _PIXELS_PER_VISION_TOKEN * _BYTES_PER_PIXEL_VALUE
-    return rollout_batch * n_samples * per_sample
+    return capacity_batch * n_samples * per_sample
 
 
 def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | None:
@@ -222,6 +239,7 @@ def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | No
         return None
 
     max_staleness = getattr(args, "max_staleness", 0)
+    capacity_batch = resolve_tq_capacity_batch_size(args)
     payload = estimate_payload_bytes(args)
     needed = payload * (max_staleness + 1)
     available = resolve_global_segment_size()
@@ -229,7 +247,7 @@ def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | No
     if needed > available:
         return (
             f"MooncakeStore segment capacity insufficient: worst-case in-flight payload "
-            f"{needed / 1024**3:.1f} GiB (rollout_batch={args.rollout_batch_size} × "
+            f"{needed / 1024**3:.1f} GiB (effective_batch={capacity_batch} × "
             f"n_samples={args.n_samples_per_prompt} × staleness+1={max_staleness + 1}) "
             f"exceeds global_segment_size {available / 1024**3:.1f} GiB. "
             f"Reduce batch size / max_staleness, or raise RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB."

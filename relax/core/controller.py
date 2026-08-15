@@ -51,6 +51,7 @@ from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
 from relax.utils.tq_config import (
     build_backend_config,
+    resolve_tq_capacity_batch_size,
     resolve_mooncake_master_address,
     validate_mooncake_runtime_contract,
 )
@@ -271,11 +272,7 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        batch_size_for_capacity = (
-            self.config.over_sampling_batch_size
-            if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
-            else self.config.rollout_batch_size
-        )
+        batch_size_for_capacity = resolve_tq_capacity_batch_size(self.config)
         total_storage_size = (
             batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
