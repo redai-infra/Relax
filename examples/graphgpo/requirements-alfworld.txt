@@ -1,0 +1,4 @@
+alfworld==0.4.2
+httpx==0.28.1
+openai==2.46.0
+PyYAML==6.0.3

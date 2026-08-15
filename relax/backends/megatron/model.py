@@ -45,12 +45,14 @@ from relax.utils.training.ppo_utils import (
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import DataIterator, get_batch
+from .data import ROLLOUT_VALID_ROW_FLAGS_KEY, DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 
 logger = get_logger(__name__)
+
+AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV = "RELAX_AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE"
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -221,6 +223,42 @@ def _main_loss_has_tokens(batch: dict) -> bool:
     return bool(num_tokens.item() > 0)
 
 
+def _optimizer_scheduler_training_plan(args: Namespace) -> tuple[int, int]:
+    """Return ``(train_iters, default_horizon_rows)`` for the scheduler.
+
+    Fixed-row training preserves the legacy trajectory-count formula.  The opt-
+    in synchronous variable-row path advances its scheduler by real turn rows,
+    so its default LR/WD horizon uses the configured maximum exported rows per
+    trajectory.  This is a deterministic upper bound; early terminal
+    trajectories simply consume fewer scheduler rows.
+    """
+
+    global_batch_size = int(args.global_batch_size)
+    num_rollout = int(args.num_rollout)
+    trajectories_per_rollout = int(args.rollout_batch_size) * int(args.n_samples_per_prompt)
+    legacy_train_iters = num_rollout * trajectories_per_rollout // global_batch_size
+
+    variable_row_enabled = bool(
+        getattr(args, "group_rm", False)
+        and getattr(args, "agentic_custom_advantage_path", None)
+        and getattr(args, "use_dynamic_batch_size", False)
+    )
+    raw_max_rows = os.environ.get(AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV)
+    if not variable_row_enabled or raw_max_rows is None or not raw_max_rows.strip():
+        return legacy_train_iters, legacy_train_iters * global_batch_size
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        raise ValueError("Agentic variable-row scheduler supports synchronous training only.")
+
+    normalized_max_rows = raw_max_rows.strip()
+    if not normalized_max_rows.isascii() or not normalized_max_rows.isdigit() or int(normalized_max_rows) <= 0:
+        raise ValueError(
+            f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_max_rows!r}."
+        )
+    max_rows_per_rollout = trajectories_per_rollout * int(normalized_max_rows)
+    max_windows_per_rollout = (max_rows_per_rollout + global_batch_size - 1) // global_batch_size
+    return num_rollout * max_windows_per_rollout, num_rollout * max_rows_per_rollout
+
+
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
@@ -234,12 +272,15 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     Returns:
         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.
     """
-    # Iteration-based training.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # Iteration-based training. Variable-row mode uses real turn rows as the
+    # scheduler unit; fixed-row mode remains byte-for-byte equivalent.
+    args.train_iters, default_horizon_steps = _optimizer_scheduler_training_plan(args)
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
-    lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-    wd_incr_steps = args.train_iters * args.global_batch_size
+        lr_decay_steps = default_horizon_steps
+    else:
+        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
+    wd_incr_steps = default_horizon_steps
     wsd_decay_steps = None
     if args.lr_wsd_decay_iters is not None:
         wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
@@ -952,6 +993,7 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
+    scheduler_increment: int | None = None,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -967,12 +1009,21 @@ def train_one_step(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
+        scheduler_increment (int | None): Real global rows in this variable-row
+            window. ``None`` keeps the fixed-row global-batch increment.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
         and gradient norm for logging.
     """
     args = get_args()
+    resolved_scheduler_increment = args.global_batch_size if scheduler_increment is None else scheduler_increment
+    if (
+        isinstance(resolved_scheduler_increment, bool)
+        or not isinstance(resolved_scheduler_increment, int)
+        or resolved_scheduler_increment <= 0
+    ):
+        raise ValueError(f"scheduler increment must be a positive integer, got {resolved_scheduler_increment!r}")
 
     # Set grad to zero.
     for model_chunk in model:
@@ -1029,6 +1080,7 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "max_seq_lens",
+                    ROLLOUT_VALID_ROW_FLAGS_KEY,
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1214,7 +1266,7 @@ def train_one_step(
     if valid_step:
         # Update learning rate.
         assert update_successful
-        opt_param_scheduler.step(increment=args.global_batch_size)
+        opt_param_scheduler.step(increment=resolved_scheduler_increment)
     else:
         grad_norm = float("nan")
 
@@ -1265,6 +1317,95 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+def _normalize_scheduler_increments(
+    scheduler_increments: Sequence[int] | None,
+    num_steps_per_rollout: int,
+) -> tuple[int, ...] | None:
+    """Validate optional per-window real-row scheduler increments."""
+
+    if scheduler_increments is None:
+        return None
+    if len(scheduler_increments) != num_steps_per_rollout:
+        raise ValueError(
+            "scheduler_increments length must match the rollout training windows, "
+            f"got increments={len(scheduler_increments)}, windows={num_steps_per_rollout}."
+        )
+    normalized = tuple(scheduler_increments)
+    if any(
+        isinstance(increment, bool) or not isinstance(increment, int) or increment <= 0 for increment in normalized
+    ):
+        raise ValueError(f"scheduler_increments must contain positive integers, got {scheduler_increments!r}")
+    return normalized
+
+
+def _initial_variable_row_tracking_step(args: Namespace, opt_param_scheduler) -> int:
+    """Resume the monotonic row-based tracking cursor from actor or scheduler
+    state."""
+
+    tracking_step = getattr(args, "_agentic_variable_row_tracking_samples", None)
+    if tracking_step is None:
+        tracking_step = int(getattr(opt_param_scheduler, "num_steps", 0))
+    if tracking_step < 0:
+        raise ValueError(f"_agentic_variable_row_tracking_samples must be non-negative, got {tracking_step}.")
+    return tracking_step
+
+
+def _advance_variable_row_tracking_step(args: Namespace, tracking_step: int, increment: int) -> int:
+    """Consume one real-row window and persist the next collision-free
+    cursor."""
+
+    next_tracking_step = tracking_step + increment
+    setattr(args, "_agentic_variable_row_tracking_samples", next_tracking_step)
+    return next_tracking_step
+
+
+def _restore_agentic_variable_row_resume_cursor(
+    args: Namespace,
+    opt_param_scheduler: OptimizerParamScheduler | None,
+    iteration: int,
+) -> bool:
+    """Restore the real-row cursor from a loaded native scheduler checkpoint.
+
+    Megatron persists ``OptimizerParamScheduler.num_steps`` in the native
+    checkpoint and restores it in ``load_state_dict``. That counter is the
+    exact real-row cursor used by agentic variable-row training. A resumed
+    variable-row run must reuse it and must not apply the legacy
+    ``iteration * global_batch_size`` catch-up step afterwards.
+
+    Returns ``True`` only when a non-zero variable-row checkpoint was restored.
+    Missing, invalid, or conflicting state fails closed.
+    """
+
+    raw_max_rows = os.environ.get(AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV)
+    variable_row_enabled = bool(
+        getattr(args, "group_rm", False)
+        and getattr(args, "agentic_custom_advantage_path", None)
+        and getattr(args, "use_dynamic_batch_size", False)
+        and raw_max_rows is not None
+        and raw_max_rows.strip()
+    )
+    if not variable_row_enabled or iteration <= 0:
+        return False
+
+    if opt_param_scheduler is None:
+        raise RuntimeError("Agentic variable-row resume requires a restored optimizer scheduler.")
+    restored_step = getattr(opt_param_scheduler, "num_steps", None)
+    if isinstance(restored_step, bool) or not isinstance(restored_step, int) or restored_step <= 0:
+        raise RuntimeError(
+            "Agentic variable-row resume requires a positive checkpoint scheduler "
+            f"num_steps value, got {restored_step!r} at iteration {iteration}."
+        )
+
+    existing_step = getattr(args, "_agentic_variable_row_tracking_samples", None)
+    if existing_step is not None and existing_step != restored_step:
+        raise RuntimeError(
+            "Agentic variable-row resume cursor conflicts with the loaded scheduler: "
+            f"tracking={existing_step}, scheduler={restored_step}."
+        )
+    setattr(args, "_agentic_variable_row_tracking_samples", restored_step)
+    return True
+
+
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -1272,6 +1413,7 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    scheduler_increments: Sequence[int] | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -1285,6 +1427,8 @@ def train(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
+        scheduler_increments (Sequence[int] | None): Per-window real global row
+            counts for variable-row training. ``None`` preserves legacy behavior.
     """
     args = get_args()
     is_data_iterator = isinstance(data_iterator[0], DataIterator)
@@ -1371,6 +1515,9 @@ def train(
             )
 
     num_steps_per_rollout = len(num_microbatches)
+    scheduler_increments = _normalize_scheduler_increments(scheduler_increments, num_steps_per_rollout)
+    if scheduler_increments is not None:
+        variable_row_tracking_step = _initial_variable_row_tracking_step(args, opt_param_scheduler)
     use_step_iterators = (
         not is_data_iterator and len(data_iterator) > 1 and isinstance(data_iterator[0], StreamingTQIterator)
     )
@@ -1385,6 +1532,7 @@ def train(
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         # Run training step.
         with timer(f"train_micro_batch_{step_id}", keep=False):
+            scheduler_increment = None if scheduler_increments is None else scheduler_increments[step_id]
             loss_dict, grad_norm = train_one_step(
                 args,
                 rollout_id,
@@ -1394,6 +1542,14 @@ def train(
                 optimizer,
                 opt_param_scheduler,
                 num_microbatches[step_id],
+                scheduler_increment=scheduler_increment,
+            )
+        if scheduler_increments is None:
+            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+        else:
+            accumulated_step_id = variable_row_tracking_step
+            variable_row_tracking_step = _advance_variable_row_tracking_step(
+                args, variable_row_tracking_step, scheduler_increment
             )
         if keep_forward_pre_hook_disabled:
             force_param_sync(model)
@@ -1434,7 +1590,6 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {
@@ -1454,9 +1609,14 @@ def train(
             log_dict["train/step"] = accumulated_step_id
             num_per_epoch = getattr(args, "num_rollout_per_epoch", None)
             if num_per_epoch:
-                log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
-                    num_per_epoch * num_steps_per_rollout
-                )
+                if scheduler_increments is None:
+                    log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
+                        num_per_epoch * num_steps_per_rollout
+                    )
+                else:
+                    log_dict[f"train/{role_tag}cur_epoch"] = (
+                        rollout_id + (step_id + 1) / num_steps_per_rollout
+                    ) / num_per_epoch
             tracking_utils.log(args, log_dict, step_key="train/step")
             tracking_utils.flush_metrics(args, accumulated_step_id)
 
@@ -1765,6 +1925,13 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    restored_variable_row_cursor = _restore_agentic_variable_row_resume_cursor(args, opt_param_scheduler, iteration)
+    if restored_variable_row_cursor:
+        logger.info(
+            "Restored agentic variable-row cursor %d from checkpoint iteration %d",
+            args._agentic_variable_row_tracking_samples,
+            iteration,
+        )
     if role == "critic":
         release_critic_lm_heads(model)
         loaded_value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
@@ -1773,5 +1940,7 @@ def initialize_model_and_optimizer(
         )
         install_critic_value_head_runtime_check(model)
     clear_memory()
+    if opt_param_scheduler is not None and not restored_variable_row_cursor:
+        opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
     return model, optimizer, opt_param_scheduler, iteration

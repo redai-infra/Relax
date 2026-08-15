@@ -63,13 +63,73 @@ class RewardWaitingGroup:
     def materialized_group(self) -> list[Any]:
         return [unit.sample for unit in self.materialized_units()]
 
-    def metadata_by_slot(self) -> list[dict[Any, dict[str, Any]]]:
+    @staticmethod
+    def _resolved_policy_version(sample: Any) -> str:
+        metadata = sample.metadata
+        if not isinstance(metadata, dict):
+            raise RuntimeError("Agentic row metadata must be a dict before custom advantage evaluation.")
+
+        weight_versions = getattr(sample, "weight_versions", None)
+        if weight_versions is None:
+            weight_versions = []
+        if not isinstance(weight_versions, (list, tuple)):
+            raise RuntimeError("Sample.weight_versions must be a list or tuple.")
+        normalized_versions: list[str] = []
+        for value in weight_versions:
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value):
+                raise RuntimeError(f"Sample.weight_versions contains an invalid policy version: {value!r}.")
+            normalized_versions.append(str(value))
+        unique_versions = set(normalized_versions)
+        if len(unique_versions) > 1:
+            raise RuntimeError(
+                f"One agentic row spans multiple policy versions: weight_versions={sorted(unique_versions)!r}."
+            )
+        if unique_versions:
+            resolved = next(iter(unique_versions))
+        else:
+            start_rollout_id = metadata.get("start_rollout_id")
+            if (
+                isinstance(start_rollout_id, bool)
+                or not isinstance(start_rollout_id, (str, int))
+                or not str(start_rollout_id)
+            ):
+                raise RuntimeError(
+                    "Agentic row policy_version is unavailable: Sample.weight_versions is empty "
+                    "and metadata.start_rollout_id is missing or invalid."
+                )
+            resolved = str(start_rollout_id)
+
+        declared = metadata.get("policy_version")
+        if declared is not None:
+            if isinstance(declared, bool) or not isinstance(declared, (str, int)) or not str(declared):
+                raise RuntimeError(f"metadata.policy_version is invalid: {declared!r}.")
+            if str(declared) != resolved:
+                raise RuntimeError(
+                    "metadata.policy_version conflicts with the policy version captured by Relax: "
+                    f"declared={declared!r}, captured={resolved!r}."
+                )
+        return resolved
+
+    def metadata_by_slot(
+        self,
+        *,
+        require_policy_version: bool = False,
+    ) -> list[dict[Any, dict[str, Any]]]:
         payload: list[dict[Any, dict[str, Any]]] = []
+        missing_policy_versions: list[tuple[Any, str]] = []
         for idx in range(self.expected_count):
             slot_payload: dict[Any, dict[str, Any]] = {}
             for unit in self.units_by_slot.get(idx, []):
-                slot_payload[unit.name] = copy.deepcopy(unit.sample.metadata)
+                metadata = copy.deepcopy(unit.sample.metadata)
+                if require_policy_version:
+                    resolved = self._resolved_policy_version(unit.sample)
+                    metadata["policy_version"] = resolved
+                    if "policy_version" not in unit.sample.metadata:
+                        missing_policy_versions.append((unit.sample, resolved))
+                slot_payload[unit.name] = metadata
             payload.append(slot_payload)
+        for sample, resolved in missing_policy_versions:
+            sample.metadata["policy_version"] = resolved
         return payload
 
     def materialized_slot_count(self) -> int:
@@ -93,6 +153,12 @@ class RewardDomain:
         self.custom_advantage_func = (
             load_function(custom_advantage_path) if custom_advantage_path is not None else None
         )
+        if self.custom_advantage_func is None:
+            self._require_agentic_policy_version = False
+        else:
+            from relax.agentic.pipeline.transfer import use_agentic_variable_row_mode
+
+            self._require_agentic_policy_version = use_agentic_variable_row_mode(args)
         self._waiting_groups: dict[GroupKey, RewardWaitingGroup] = {}
         self._inflight_sample_tasks: dict[SampleKey, asyncio.Task] = {}
         self._inflight_group_tasks: dict[GroupKey, asyncio.Task] = {}
@@ -341,7 +407,11 @@ class RewardDomain:
         raise TypeError("custom advantage output must be a number in this version.")
 
     async def _run_custom_advantage(self, waiting_group: RewardWaitingGroup) -> list[Any] | None:
-        result = self.custom_advantage_func(waiting_group.metadata_by_slot())
+        result = self.custom_advantage_func(
+            waiting_group.metadata_by_slot(
+                require_policy_version=self._require_agentic_policy_version,
+            )
+        )
         if asyncio.iscoroutine(result):
             result = await result
         if result is None:

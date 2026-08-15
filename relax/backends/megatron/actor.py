@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import hashlib
 import logging
 import os
 import random
 import socket
 import time
 from argparse import Namespace
+from collections.abc import Mapping
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, List
 
@@ -81,11 +84,14 @@ from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
+    ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
+    ROLLOUT_VALID_ROW_FLAGS_KEY,
     DataIterator,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     get_data_iterator,
+    get_rollout_valid_row_flags,
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
@@ -105,6 +111,465 @@ logger = logging.getLogger(__name__)
 
 
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
+AGENTIC_VARIABLE_ROW_PADDING_KEY = "agentic_variable_row_padding"
+AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV = "RELAX_AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE"
+AGENTIC_ROW_IDENTITY_KEY = "agentic_row_identity"
+AGENTIC_ROW_IDENTITY_TAG_KEY = "agentic_row_identity_tag"
+AGENTIC_ROW_IDENTITY_TAGS_FIELD = "agentic_row_identity_tags"
+AGENTIC_ROW_IDENTITY_SCHEMA_VERSION = 1
+
+
+def _use_agentic_variable_row_mode(args: Namespace) -> bool:
+    """Whether this actor must consume explicit agentic turn rows.
+
+    Keep this predicate aligned with the producer-side gate without importing
+    the agentic pipeline into the Megatron backend.  The feature is
+    deliberately default-off and async/hybrid modes use different streaming
+    contracts.
+    """
+
+    base_enabled = bool(
+        getattr(args, "group_rm", False)
+        and getattr(args, "agentic_custom_advantage_path", None)
+        and getattr(args, "use_dynamic_batch_size", False)
+    )
+    if not base_enabled:
+        return False
+
+    raw_max_rows = os.environ.get(AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV)
+    if raw_max_rows is None or not raw_max_rows.strip():
+        return False
+    normalized_max_rows = raw_max_rows.strip()
+    if not normalized_max_rows.isascii() or not normalized_max_rows.isdigit() or int(normalized_max_rows) <= 0:
+        raise ValueError(
+            f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_max_rows!r}."
+        )
+
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        raise ValueError("Agentic variable-row training supports synchronous mode only.")
+    return True
+
+
+def _agentic_variable_row_max_padded_rows(args: Namespace) -> int:
+    """Return the maximum physical rows allowed in one padded partition."""
+
+    raw_value = os.environ.get(AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV)
+    if raw_value is None or not raw_value.strip():
+        raise ValueError(
+            f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be set to a positive integer "
+            "for agentic variable-row training."
+        )
+    try:
+        max_rows_per_sample = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_value!r}."
+        ) from exc
+    if max_rows_per_sample <= 0:
+        raise ValueError(f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_value!r}.")
+
+    global_batch_size = int(args.global_batch_size)
+    max_actual_rows = int(args.rollout_batch_size) * int(args.n_samples_per_prompt) * max_rows_per_sample
+    if global_batch_size <= 0 or max_actual_rows <= 0:
+        raise ValueError(
+            "Agentic variable-row limits require positive global_batch_size, rollout_batch_size, "
+            f"and n_samples_per_prompt, got global_batch_size={global_batch_size}, "
+            f"rollout_batch_size={args.rollout_batch_size}, n_samples_per_prompt={args.n_samples_per_prompt}."
+        )
+    return ((max_actual_rows + global_batch_size - 1) // global_batch_size) * global_batch_size
+
+
+def _extract_agentic_variable_row_padding_flags(batch_meta: Any, expected_samples: int) -> list[bool]:
+    """Strictly decode the producer's per-row padding marker."""
+
+    if isinstance(expected_samples, bool) or not isinstance(expected_samples, int) or expected_samples <= 0:
+        raise ValueError(f"expected_samples must be a positive integer, got {expected_samples!r}")
+    get_all_custom_meta = getattr(batch_meta, "get_all_custom_meta", None)
+    if not callable(get_all_custom_meta):
+        raise RuntimeError("Agentic variable-row BatchMeta must provide get_all_custom_meta().")
+    all_custom_meta = get_all_custom_meta()
+    if not isinstance(all_custom_meta, list):
+        raise RuntimeError("Agentic variable-row BatchMeta.get_all_custom_meta() must return a list.")
+    if len(all_custom_meta) != expected_samples:
+        raise RuntimeError(
+            f"Agentic variable-row metadata size mismatch: expected {expected_samples}, got {len(all_custom_meta)}."
+        )
+
+    flags: list[bool] = []
+    for sample_idx, custom_meta in enumerate(all_custom_meta):
+        if not isinstance(custom_meta, Mapping):
+            raise RuntimeError(
+                "Agentic variable-row custom metadata must be a mapping: "
+                f"sample_idx={sample_idx}, got {type(custom_meta).__name__}."
+            )
+        if AGENTIC_VARIABLE_ROW_PADDING_KEY not in custom_meta:
+            raise RuntimeError(
+                f"Agentic variable-row sample metadata is missing {AGENTIC_VARIABLE_ROW_PADDING_KEY!r}: "
+                f"sample_idx={sample_idx}."
+            )
+        flag = custom_meta[AGENTIC_VARIABLE_ROW_PADDING_KEY]
+        if type(flag) is not bool:
+            raise RuntimeError(
+                f"Agentic variable-row padding marker must be bool: sample_idx={sample_idx}, got {flag!r}."
+            )
+        flags.append(flag)
+    return flags
+
+
+def _agentic_row_identity_tag(row_id: str) -> int:
+    digest = hashlib.sha256(row_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") & ((1 << 63) - 1)
+
+
+def _agentic_identity_tag_value(value: Any, *, context: str) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{context} must be an int64 scalar, got {value!r}.")
+    item = getattr(value, "item", None)
+    if callable(item):
+        device = getattr(value, "device", None)
+        if device is not None and getattr(device, "type", "cpu") != "cpu":
+            raise RuntimeError(f"{context} must remain CPU-resident during identity validation.")
+        value = item()
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(f"{context} must be an int64 scalar, got {value!r}.")
+    return value
+
+
+def _extract_agentic_variable_row_identities(
+    batch_meta: Any,
+    rollout_data: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Decode and bind queue custom metadata to the fetched tensor rows."""
+
+    total_lengths = rollout_data.get("total_lengths")
+    response_lengths = rollout_data.get("response_lengths")
+    row_tags = rollout_data.get(AGENTIC_ROW_IDENTITY_TAGS_FIELD)
+    if not isinstance(total_lengths, list) or not isinstance(response_lengths, list):
+        raise RuntimeError("Agentic identity validation requires list total_lengths and response_lengths.")
+    expected_samples = len(total_lengths)
+    if expected_samples <= 0 or len(response_lengths) != expected_samples:
+        raise RuntimeError(
+            "Agentic identity data field size mismatch: "
+            f"total_lengths={expected_samples}, response_lengths={len(response_lengths)}."
+        )
+    if not isinstance(row_tags, (list, tuple)) or len(row_tags) != expected_samples:
+        raise RuntimeError(
+            f"{AGENTIC_ROW_IDENTITY_TAGS_FIELD} must contain one CPU tag per fetched row: "
+            f"expected={expected_samples}, got={len(row_tags) if isinstance(row_tags, (list, tuple)) else None}."
+        )
+
+    get_all_custom_meta = getattr(batch_meta, "get_all_custom_meta", None)
+    if not callable(get_all_custom_meta):
+        raise RuntimeError("Agentic variable-row BatchMeta must provide get_all_custom_meta().")
+    all_custom_meta = get_all_custom_meta()
+    if not isinstance(all_custom_meta, list) or len(all_custom_meta) != expected_samples:
+        raise RuntimeError(
+            "Agentic identity custom metadata size mismatch: "
+            f"expected={expected_samples}, got={len(all_custom_meta) if isinstance(all_custom_meta, list) else None}."
+        )
+
+    identities: list[dict[str, Any]] = []
+    for sample_idx, (custom_meta, data_tag) in enumerate(zip(all_custom_meta, row_tags, strict=True)):
+        if not isinstance(custom_meta, Mapping):
+            raise RuntimeError(f"Agentic identity custom metadata row {sample_idx} must be a mapping.")
+        identity = custom_meta.get(AGENTIC_ROW_IDENTITY_KEY)
+        if not isinstance(identity, Mapping):
+            raise RuntimeError(f"Agentic identity row {sample_idx} is missing {AGENTIC_ROW_IDENTITY_KEY!r}.")
+        identity = dict(identity)
+        if identity.get("schema_version") != AGENTIC_ROW_IDENTITY_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Agentic identity row {sample_idx} has unsupported schema_version {identity.get('schema_version')!r}."
+            )
+        row_id = identity.get("row_id")
+        if not isinstance(row_id, str) or not row_id:
+            raise RuntimeError(f"Agentic identity row {sample_idx} has an invalid row_id {row_id!r}.")
+        padding = identity.get("padding")
+        if type(padding) is not bool or custom_meta.get(AGENTIC_VARIABLE_ROW_PADDING_KEY) is not padding:
+            raise RuntimeError(f"Agentic identity row {sample_idx} has inconsistent padding markers.")
+        expected_tag = _agentic_row_identity_tag(row_id)
+        meta_tag = _agentic_identity_tag_value(
+            custom_meta.get(AGENTIC_ROW_IDENTITY_TAG_KEY),
+            context=f"custom metadata row {sample_idx} identity tag",
+        )
+        fetched_tag = _agentic_identity_tag_value(
+            data_tag,
+            context=f"fetched row {sample_idx} identity tag",
+        )
+        if meta_tag != expected_tag or fetched_tag != expected_tag:
+            raise RuntimeError(
+                f"TransferQueue row/custom-metadata identity mismatch: sample_idx={sample_idx}, row_id={row_id!r}."
+            )
+        total_length = int(total_lengths[sample_idx])
+        response_length = int(response_lengths[sample_idx])
+        if custom_meta.get("total_lengths") != total_length or identity.get("total_length") != total_length:
+            raise RuntimeError(f"Agentic identity row {sample_idx} has inconsistent total_length.")
+        if identity.get("response_length") != response_length:
+            raise RuntimeError(f"Agentic identity row {sample_idx} has inconsistent response_length.")
+        action_token_count = identity.get("action_token_count")
+        if isinstance(action_token_count, bool) or not isinstance(action_token_count, int) or action_token_count < 0:
+            raise RuntimeError(f"Agentic identity row {sample_idx} has invalid action_token_count.")
+        if padding:
+            if action_token_count != 0 or any(
+                identity.get(key) is not None
+                for key in ("rollout_group_id", "task_id", "trajectory_id", "turn_id", "turn_index")
+            ):
+                raise RuntimeError(f"Agentic padding row {sample_idx} leaks a real row identity.")
+        else:
+            required_keys = (
+                "rollout_group_id",
+                "policy_version",
+                "task_id",
+                "trajectory_id",
+                "turn_id",
+                "turn_index",
+                "sample_index",
+                "terminal",
+                "truncated",
+                "group_row_count",
+                "group_trajectory_count",
+                "group_row_ids_sha256",
+                "partition_expected_group_count",
+            )
+            missing = [key for key in required_keys if identity.get(key) is None]
+            if missing:
+                raise RuntimeError(f"Agentic identity row {sample_idx} is missing fields {missing!r}.")
+            if action_token_count <= 0:
+                raise RuntimeError(f"Agentic real row {sample_idx} contains no trainable action tokens.")
+        identities.append(identity)
+    return identities
+
+
+def _validate_agentic_variable_row_partition_identities(
+    identities: list[Mapping[str, Any]],
+    *,
+    expected_group_count: int,
+    expected_trajectories_per_group: int,
+) -> dict[str, Any]:
+    """Validate a globally gathered partition manifest independent of row
+    order."""
+
+    if not identities:
+        raise RuntimeError("Agentic identity partition is empty.")
+    row_ids = [identity.get("row_id") for identity in identities]
+    if any(not isinstance(row_id, str) or not row_id for row_id in row_ids):
+        raise RuntimeError("Agentic identity partition contains an invalid row_id.")
+    if len(set(row_ids)) != len(row_ids):
+        raise RuntimeError("Agentic identity partition contains duplicate row_id values.")
+    real_rows = [dict(identity) for identity in identities if identity.get("padding") is False]
+    padding_rows = [dict(identity) for identity in identities if identity.get("padding") is True]
+    if len(real_rows) + len(padding_rows) != len(identities) or not real_rows:
+        raise RuntimeError("Agentic identity partition contains invalid padding markers or no real rows.")
+    policy_versions = {identity.get("policy_version") for identity in identities}
+    if None in policy_versions or len(policy_versions) != 1:
+        raise RuntimeError(f"Agentic identity partition mixes policy versions: {policy_versions!r}.")
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for identity in real_rows:
+        group_id = identity.get("rollout_group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise RuntimeError(f"Agentic real row has invalid rollout_group_id {group_id!r}.")
+        groups.setdefault(group_id, []).append(identity)
+    if len(groups) != expected_group_count:
+        raise RuntimeError(
+            "Agentic identity partition has a residual or missing rollout group: "
+            f"expected={expected_group_count}, got={len(groups)}."
+        )
+
+    trajectory_to_group: dict[str, str] = {}
+    for group_id, rows in groups.items():
+        tasks = {identity.get("task_id") for identity in rows}
+        policies = {identity.get("policy_version") for identity in rows}
+        expected_group_counts = {identity.get("partition_expected_group_count") for identity in rows}
+        row_counts = {identity.get("group_row_count") for identity in rows}
+        trajectory_counts = {identity.get("group_trajectory_count") for identity in rows}
+        digests = {identity.get("group_row_ids_sha256") for identity in rows}
+        if len(tasks) != 1 or len(policies) != 1:
+            raise RuntimeError(f"Agentic rollout group {group_id!r} mixes task or policy identity.")
+        if expected_group_counts != {expected_group_count}:
+            raise RuntimeError(f"Agentic rollout group {group_id!r} has a conflicting partition group count.")
+        if row_counts != {len(rows)}:
+            raise RuntimeError(f"Agentic rollout group {group_id!r} is missing or has duplicate physical rows.")
+        if trajectory_counts != {expected_trajectories_per_group}:
+            raise RuntimeError(f"Agentic rollout group {group_id!r} has a conflicting trajectory count.")
+        if digests != {
+            hashlib.sha256("\n".join(sorted(identity["row_id"] for identity in rows)).encode()).hexdigest()
+        }:
+            raise RuntimeError(f"Agentic rollout group {group_id!r} row manifest digest does not match.")
+
+        by_trajectory: dict[str, list[dict[str, Any]]] = {}
+        sample_index_to_trajectory: dict[int, str] = {}
+        for identity in rows:
+            trajectory_id = identity.get("trajectory_id")
+            sample_index = identity.get("sample_index")
+            if not isinstance(trajectory_id, str) or not trajectory_id:
+                raise RuntimeError(f"Agentic rollout group {group_id!r} has an invalid trajectory_id.")
+            if isinstance(sample_index, bool) or not isinstance(sample_index, int) or sample_index < 0:
+                raise RuntimeError(f"Agentic rollout group {group_id!r} has an invalid sample_index.")
+            previous_group = trajectory_to_group.setdefault(trajectory_id, group_id)
+            if previous_group != group_id:
+                raise RuntimeError(f"trajectory_id {trajectory_id!r} appears in multiple rollout groups.")
+            previous_trajectory = sample_index_to_trajectory.setdefault(sample_index, trajectory_id)
+            if previous_trajectory != trajectory_id:
+                raise RuntimeError(f"Sample.index {sample_index} maps to multiple trajectories.")
+            by_trajectory.setdefault(trajectory_id, []).append(identity)
+        if len(by_trajectory) != expected_trajectories_per_group:
+            raise RuntimeError(
+                f"Agentic rollout group {group_id!r} expected {expected_trajectories_per_group} trajectories, "
+                f"got {len(by_trajectory)}."
+            )
+        for trajectory_id, rows_for_trajectory in by_trajectory.items():
+            ordered = sorted(rows_for_trajectory, key=lambda identity: identity.get("turn_index", -1))
+            turns = [identity.get("turn_index") for identity in ordered]
+            if turns != list(range(len(ordered))):
+                raise RuntimeError(f"Agentic trajectory {trajectory_id!r} has a missing or duplicate turn row.")
+            if any(identity.get("turn_id") != f"turn_{identity['turn_index']:03d}" for identity in ordered):
+                raise RuntimeError(f"Agentic trajectory {trajectory_id!r} has a non-canonical turn_id.")
+            if any(identity.get("terminal") or identity.get("truncated") for identity in ordered[:-1]):
+                raise RuntimeError(f"Agentic trajectory {trajectory_id!r} terminates before its final row.")
+            final = ordered[-1]
+            if type(final.get("terminal")) is not bool or type(final.get("truncated")) is not bool:
+                raise RuntimeError(f"Agentic trajectory {trajectory_id!r} has invalid final status markers.")
+            if final["terminal"] == final["truncated"]:
+                raise RuntimeError(
+                    f"Agentic trajectory {trajectory_id!r} final row must be exactly terminal or truncated."
+                )
+    return {
+        "policy_version": next(iter(policy_versions)),
+        "group_count": len(groups),
+        "real_row_count": len(real_rows),
+        "padding_row_count": len(padding_rows),
+    }
+
+
+def _validate_agentic_variable_row_window(
+    *,
+    actual_global_rows: int,
+    global_batch_size: int,
+    total_padded_rows_before: int,
+    max_padded_rows: int,
+) -> int:
+    """Validate one consumed full window and return cumulative physical
+    rows."""
+
+    for name, value in (
+        ("actual_global_rows", actual_global_rows),
+        ("global_batch_size", global_batch_size),
+        ("total_padded_rows_before", total_padded_rows_before),
+        ("max_padded_rows", max_padded_rows),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if global_batch_size <= 0:
+        raise ValueError(f"global_batch_size must be positive, got {global_batch_size}")
+    if actual_global_rows <= 0 or actual_global_rows > global_batch_size:
+        raise RuntimeError(
+            "Agentic variable-row window must contain between 1 and global_batch_size real rows, "
+            f"got actual_global_rows={actual_global_rows}, global_batch_size={global_batch_size}."
+        )
+    if total_padded_rows_before < 0:
+        raise ValueError(f"total_padded_rows_before must be non-negative, got {total_padded_rows_before}")
+    if max_padded_rows <= 0 or max_padded_rows % global_batch_size != 0:
+        raise ValueError(
+            "max_padded_rows must be a positive multiple of global_batch_size, "
+            f"got max_padded_rows={max_padded_rows}, global_batch_size={global_batch_size}."
+        )
+
+    total_padded_rows = total_padded_rows_before + global_batch_size
+    if total_padded_rows > max_padded_rows:
+        raise RuntimeError(
+            "Agentic variable-row consumer exceeded the configured partition bound: "
+            f"consumed_padded_rows={total_padded_rows}, max_padded_rows={max_padded_rows}."
+        )
+    return total_padded_rows
+
+
+def _validate_agentic_variable_row_partition(
+    *,
+    total_physical_rows: int,
+    total_actual_rows: int,
+    global_batch_size: int,
+) -> int:
+    """Validate the producer's partition-level modulo-padding contract."""
+
+    for name, value in (
+        ("total_physical_rows", total_physical_rows),
+        ("total_actual_rows", total_actual_rows),
+        ("global_batch_size", global_batch_size),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if global_batch_size <= 0:
+        raise ValueError(f"global_batch_size must be positive, got {global_batch_size}")
+    if total_physical_rows <= 0 or total_physical_rows % global_batch_size != 0:
+        raise RuntimeError(
+            "Agentic variable-row partition must contain a positive multiple of global_batch_size "
+            f"physical rows, got total_physical_rows={total_physical_rows}, "
+            f"global_batch_size={global_batch_size}."
+        )
+    if total_actual_rows <= 0 or total_actual_rows > total_physical_rows:
+        raise RuntimeError(
+            "Agentic variable-row partition has an invalid real-row total: "
+            f"total_actual_rows={total_actual_rows}, total_physical_rows={total_physical_rows}."
+        )
+    total_padding_rows = total_physical_rows - total_actual_rows
+    if total_padding_rows >= global_batch_size:
+        raise RuntimeError(
+            "Agentic variable-row partition contains at least one global batch of padding: "
+            f"total_padding_rows={total_padding_rows}, global_batch_size={global_batch_size}."
+        )
+    return total_padding_rows
+
+
+def _agentic_variable_row_drain_action(
+    *,
+    ready_min: int,
+    ready_max: int,
+    stream_drained: bool,
+    accepted_windows: int,
+) -> str:
+    """Pure state transition for the DP-aligned variable-row drain loop."""
+
+    if ready_min not in (0, 1) or ready_max not in (0, 1) or ready_min > ready_max:
+        raise ValueError(f"Invalid DP readiness range: min={ready_min}, max={ready_max}.")
+    if isinstance(stream_drained, bool) is False:
+        raise TypeError(f"stream_drained must be bool, got {type(stream_drained).__name__}")
+    if isinstance(accepted_windows, bool) or not isinstance(accepted_windows, int) or accepted_windows < 0:
+        raise ValueError(f"accepted_windows must be a non-negative integer, got {accepted_windows!r}.")
+    if ready_min == 1:
+        if stream_drained:
+            raise RuntimeError("A variable-row batch is pending after the partition reported drained.")
+        return "accept"
+    if ready_max == 1:
+        return "wait"
+    if stream_drained:
+        if accepted_windows == 0:
+            raise RuntimeError("Variable-row partition drained before yielding any training window.")
+        return "done"
+    return "retry"
+
+
+def _agentic_variable_row_stream_drained_consensus(
+    *,
+    stream_drained: bool,
+    device: Any,
+    dp_group: Any,
+) -> bool:
+    """Return true only after every data-parallel rank observes a drained
+    stream."""
+
+    if type(stream_drained) is not bool:
+        raise TypeError(f"stream_drained must be bool, got {type(stream_drained).__name__}")
+    drained_consensus = torch.tensor(
+        [int(stream_drained)],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(
+        drained_consensus,
+        op=dist.ReduceOp.MIN,
+        group=dp_group,
+    )
+    return bool(drained_consensus.item())
 
 
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
@@ -609,7 +1074,217 @@ class MegatronTrainRayActor(TrainRayActor):
         """Backward-compatible name kept for existing internal call sites."""
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
+    def _collect_agentic_variable_row_batches(
+        self,
+        *,
+        rollout_id: int,
+        task_name: str,
+        data_fields: list[str],
+        process_batch=None,
+    ) -> tuple[list[RolloutBatch], list, list[int], list[int], list[bool]]:
+        """Drain a padded variable-row partition into full local GBS
+        windows."""
+
+        if self.role != "actor":
+            raise NotImplementedError("Agentic variable-row training currently supports the GRPO actor only.")
+        if getattr(self.args, "debug_train_only", False):
+            raise NotImplementedError("debug_train_only does not support agentic variable-row training.")
+        if getattr(self.args, "advantage_estimator", None) != "grpo":
+            raise NotImplementedError(
+                "Agentic variable-row training currently supports advantage_estimator=grpo only."
+            )
+        if getattr(self.args, "use_critic", False) or getattr(self.args, "use_opd", False):
+            raise NotImplementedError("Agentic variable-row training does not yet support critic or OPD paths.")
+        if getattr(self.args, "multimodal_keys", None) is not None:
+            raise NotImplementedError("Agentic variable-row training currently supports text-only samples.")
+        if mpu.get_context_parallel_world_size() != 1:
+            raise NotImplementedError("Agentic variable-row loss scaling currently requires context_parallel_size=1.")
+
+        dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+        global_batch_size = int(self.args.global_batch_size)
+        if global_batch_size <= 0 or global_batch_size % dp_size != 0:
+            raise ValueError(
+                "Agentic variable-row training requires global_batch_size divisible by data-parallel size, "
+                f"got global_batch_size={global_batch_size}, dp_size={dp_size}."
+            )
+        local_batch_size = global_batch_size // dp_size
+        max_padded_rows = _agentic_variable_row_max_padded_rows(self.args)
+        partition_id = f"train_{rollout_id}"
+
+        batches: list[RolloutBatch] = []
+        batch_metas: list = []
+        local_sample_counts: list[int] = []
+        global_sample_counts: list[int] = []
+        local_valid_row_flags: list[bool] = []
+        local_partition_identities: list[dict[str, Any]] = []
+        identity_data_fields = list(data_fields)
+        if AGENTIC_ROW_IDENTITY_TAGS_FIELD not in identity_data_fields:
+            identity_data_fields.append(AGENTIC_ROW_IDENTITY_TAGS_FIELD)
+        batch_index = 0
+        total_padded_rows = 0
+        empty_poll_sleep_s = float(os.environ.get("RELAX_EMPTY_POLL_SLEEP_MS", "50")) / 1000.0
+        fetch_iter = 0
+        timeout_s = max(float(getattr(self.args, "distributed_timeout_minutes", 30)) * 60.0, 1.0)
+        last_progress_at = time.monotonic()
+        pending_data = None
+        pending_meta = None
+
+        while True:
+            if time.monotonic() - last_progress_at > timeout_s:
+                raise TimeoutError(
+                    "Timed out draining agentic variable-row partition: "
+                    f"partition_id={partition_id}, task_name={task_name}, batch_index={batch_index}."
+                )
+
+            if pending_data is None:
+                with timer("train_get_data"):
+                    pending_data, pending_meta = self._get_data_from_transfer_queue(
+                        task_name,
+                        rollout_id,
+                        identity_data_fields,
+                        local_batch_size,
+                        batch_index,
+                        partition_id=partition_id,
+                    )
+
+            has_pending = 1 if pending_data is not None else 0
+            ready_min = torch.tensor(
+                [has_pending],
+                dtype=torch.int64,
+                device=device_utils.make_current_torch_device(),
+            )
+            ready_max = ready_min.clone()
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+            dist.all_reduce(ready_min, op=dist.ReduceOp.MIN, group=dp_group)
+            dist.all_reduce(ready_max, op=dist.ReduceOp.MAX, group=dp_group)
+
+            ready_min_value = int(ready_min.item())
+            ready_max_value = int(ready_max.item())
+            stream_drained = False
+            if ready_max_value == 0:
+                stream_drained = bool(
+                    self.all_consumed(
+                        task_name,
+                        rollout_id,
+                        partition_id=partition_id,
+                        streaming=True,
+                    )
+                )
+                stream_drained = _agentic_variable_row_stream_drained_consensus(
+                    stream_drained=stream_drained,
+                    device=device_utils.make_current_torch_device(),
+                    dp_group=dp_group,
+                )
+            drain_action = _agentic_variable_row_drain_action(
+                ready_min=ready_min_value,
+                ready_max=ready_max_value,
+                stream_drained=stream_drained,
+                accepted_windows=len(batches),
+            )
+            if drain_action == "done":
+                break
+            if drain_action != "accept":
+                if fetch_iter % 100 == 0:
+                    logger.info(
+                        "[agentic variable rows] rollout_id=%s batch_index=%s task=%s: "
+                        "waiting until every DP rank has one full local batch.",
+                        rollout_id,
+                        batch_index,
+                        task_name,
+                    )
+                fetch_iter += 1
+                if empty_poll_sleep_s > 0:
+                    time.sleep(empty_poll_sleep_s)
+                continue
+
+            rollout_data, batch_meta = pending_data, pending_meta
+            pending_data = None
+            pending_meta = None
+            num_local_rows = len(rollout_data.get("total_lengths", []))
+            if num_local_rows != local_batch_size:
+                raise RuntimeError(
+                    "Agentic variable-row sampler returned a non-full local batch: "
+                    f"rollout_id={rollout_id}, batch_index={batch_index}, "
+                    f"expected={local_batch_size}, got={num_local_rows}."
+                )
+            padding_flags = _extract_agentic_variable_row_padding_flags(batch_meta, num_local_rows)
+            row_identities = _extract_agentic_variable_row_identities(batch_meta, rollout_data)
+            rollout_data.pop(AGENTIC_ROW_IDENTITY_TAGS_FIELD, None)
+            if [identity["padding"] for identity in row_identities] != padding_flags:
+                raise RuntimeError("Agentic identity and padding metadata disagree after TransferQueue reorder.")
+            local_partition_identities.extend(row_identities)
+            local_actual_rows = num_local_rows - sum(padding_flags)
+            actual_rows_tensor = torch.tensor(
+                [local_actual_rows],
+                dtype=torch.int64,
+                device=device_utils.make_current_torch_device(),
+            )
+            dist.all_reduce(
+                actual_rows_tensor,
+                op=dist.ReduceOp.SUM,
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            actual_global_rows = int(actual_rows_tensor.item())
+            total_padded_rows = _validate_agentic_variable_row_window(
+                actual_global_rows=actual_global_rows,
+                global_batch_size=global_batch_size,
+                total_padded_rows_before=total_padded_rows,
+                max_padded_rows=max_padded_rows,
+            )
+
+            if process_batch is not None:
+                process_batch(rollout_data)
+            batches.append(rollout_data)
+            batch_metas.append(batch_meta)
+            local_sample_counts.append(num_local_rows)
+            global_sample_counts.append(actual_global_rows)
+            local_valid_row_flags.extend(not is_padding for is_padding in padding_flags)
+            # SeqlenBalancedSampler may reorder the producer's final padding rows
+            # across physical windows.  Padding therefore does not identify a
+            # terminal window; the partition drain signal is the sole end marker.
+            batch_index += 1
+            fetch_iter = 0
+            last_progress_at = time.monotonic()
+
+        if not batches:
+            raise RuntimeError(
+                "Agentic variable-row partition drained without yielding a training window: "
+                f"partition_id={partition_id}, task_name={task_name}."
+            )
+        _validate_agentic_variable_row_partition(
+            total_physical_rows=total_padded_rows,
+            total_actual_rows=sum(global_sample_counts),
+            global_batch_size=global_batch_size,
+        )
+        if dp_size == 1:
+            global_partition_identities = local_partition_identities
+        else:
+            gathered_identities: list[Any] = [None] * dp_size
+            dist.all_gather_object(
+                gathered_identities,
+                local_partition_identities,
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            global_partition_identities = []
+            for dp_rank, rank_identities in enumerate(gathered_identities):
+                if not isinstance(rank_identities, list):
+                    raise RuntimeError(
+                        "Agentic identity all-gather returned a non-list payload: "
+                        f"dp_rank={dp_rank}, type={type(rank_identities).__name__}."
+                    )
+                global_partition_identities.extend(rank_identities)
+        _validate_agentic_variable_row_partition_identities(
+            global_partition_identities,
+            expected_group_count=int(self.args.rollout_batch_size),
+            expected_trajectories_per_group=int(self.args.n_samples_per_prompt),
+        )
+        return batches, batch_metas, local_sample_counts, global_sample_counts, local_valid_row_flags
+
     def train(self, rollout_id: int) -> None:
+        variable_row_mode = _use_agentic_variable_row_mode(self.args)
+        if variable_row_mode and self.args.debug_train_only:
+            raise NotImplementedError("debug_train_only does not support agentic variable-row training.")
+
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
@@ -657,6 +1332,27 @@ class MegatronTrainRayActor(TrainRayActor):
                 return self.train_actor(rollout_id, rollout_data)
         else:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train with mcore.")
+            if variable_row_mode:
+                task_name = sft_task_name(self.args, component="backend")
+                data_fields = build_data_fields(self.args, consumer="actor")
+                (
+                    rollout_mini_batches,
+                    rollout_mini_batch_metas,
+                    rollout_mini_local_sample_counts,
+                    rollout_mini_global_sample_counts,
+                    rollout_valid_row_flags,
+                ) = self._collect_agentic_variable_row_batches(
+                    rollout_id=rollout_id,
+                    task_name=task_name,
+                    data_fields=data_fields,
+                )
+                rollout_data = concat_rollout_batches(rollout_mini_batches)
+                rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+                rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = rollout_mini_global_sample_counts
+                rollout_data[ROLLOUT_MINI_BATCH_METAS_KEY] = rollout_mini_batch_metas
+                rollout_data[ROLLOUT_VALID_ROW_FLAGS_KEY] = rollout_valid_row_flags
+                return self.train_actor(rollout_id, rollout_data)
+
             if is_sft_mode(self.args):
                 batch_size = self.args.global_batch_size // mpu.get_data_parallel_world_size(
                     with_context_parallel=False
@@ -895,6 +1591,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     data_iterator,
                     num_microbatches,
+                    scheduler_increments=rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY),
                 )
 
             self.prof.step(rollout_id=rollout_id)
@@ -920,7 +1617,20 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        total_lengths = rollout_data["total_lengths"]
+        valid_row_flags = get_rollout_valid_row_flags(rollout_data)
+        if valid_row_flags is None:
+            metric_total_lengths = rollout_data["total_lengths"]
+            metric_loss_masks = rollout_data["loss_masks"]
+        else:
+            metric_total_lengths = [
+                length
+                for length, is_valid in zip(rollout_data["total_lengths"], valid_row_flags, strict=True)
+                if is_valid
+            ]
+            metric_loss_masks = [
+                mask for mask, is_valid in zip(rollout_data["loss_masks"], valid_row_flags, strict=True) if is_valid
+            ]
+        total_lengths = metric_total_lengths
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
             all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
@@ -931,7 +1641,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # assistant-only tokens; for RL it's the response-only mask sum. Avoids
         # the SFT `response_length == total_length` convention (see data.py:296).
         response_token_counts = [
-            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in rollout_data["loss_masks"]
+            int(m.sum().item()) if isinstance(m, torch.Tensor) else int(sum(m)) for m in metric_loss_masks
         ]
         all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
         dist.all_gather_object(
@@ -1239,13 +1949,27 @@ class MegatronTrainRayActor(TrainRayActor):
         global normalization across the full batch and DP group.
         """
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
+        variable_row_mode = _use_agentic_variable_row_mode(self.args)
+        if variable_row_mode and self.args.debug_train_only:
+            raise NotImplementedError("debug_train_only does not support agentic variable-row training.")
+
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-        plan = build_rollout_minibatch_plan(self.args, dp_size)
-        batch_size = plan.mini_local_sample_request
+        if variable_row_mode:
+            if self.args.global_batch_size % dp_size != 0:
+                raise ValueError(
+                    "Agentic variable-row training requires global_batch_size divisible by data-parallel size, "
+                    f"got global_batch_size={self.args.global_batch_size}, dp_size={dp_size}."
+                )
+            plan = None
+            batch_size = self.args.global_batch_size // dp_size
+        else:
+            plan = build_rollout_minibatch_plan(self.args, dp_size)
+            batch_size = plan.mini_local_sample_request
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
         rollout_mini_local_sample_counts: list[int] = []
+        rollout_mini_global_sample_counts: list[int] = []
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1266,7 +1990,34 @@ class MegatronTrainRayActor(TrainRayActor):
                 collected_batches.append(sub_batch)
                 rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
         else:
-            batch_index = 0
+            if variable_row_mode:
+                variable_data_fields = [
+                    "tokens",
+                    "total_lengths",
+                    "response_lengths",
+                    "loss_masks",
+                    "rollout_log_probs",
+                    "rewards",
+                    "raw_reward",
+                ]
+                variable_data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
+                if self.args.multimodal_keys is not None:
+                    variable_data_fields.append("multimodal_train_inputs")
+                if self.args.use_opd and self.args.opd_type == "sglang":
+                    variable_data_fields.append("teacher_log_probs")
+                (
+                    collected_batches,
+                    _batch_metas,
+                    rollout_mini_local_sample_counts,
+                    rollout_mini_global_sample_counts,
+                ) = self._collect_agentic_variable_row_batches(
+                    rollout_id=rollout_id,
+                    task_name="train",
+                    data_fields=variable_data_fields,
+                    process_batch=self._hybrid_forward_subbatch,
+                )
+                plan = Namespace(num_rollout_minis=len(collected_batches))
+            batch_index = plan.num_rollout_minis if variable_row_mode else 0
             # Surface stuck-loop conditions: when the partition can never reach the
             # requested batch_size (e.g. rollout dropped samples without refilling),
             # `get_meta` keeps returning size=0 while `all_consumed` stays False,
@@ -1344,6 +2095,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 else:
                     rollout_data[key].append(value)
         rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+        if variable_row_mode:
+            rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = rollout_mini_global_sample_counts
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:

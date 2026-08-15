@@ -26,6 +26,7 @@ except ImportError as e:
     ) from e
 
 from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
+from relax.agentic.pipeline.transfer import use_agentic_variable_row_mode
 from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
     shutdown_agentic_chat_api_services,
@@ -95,6 +96,39 @@ def _can_cleanup_s3_model_weights(config: Namespace, serve_dict: dict) -> bool:
     if getattr(config, "sglang_config", None) is not None:
         return False
     return getattr(config, "sglang_load_format", "auto") in _S3_MODEL_CLEANUP_SAFE_LOAD_FORMATS
+
+
+AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV = "RELAX_AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE"
+
+
+def _agentic_max_exported_rows_per_sample() -> int:
+    raw_value = os.environ.get(AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV)
+    if raw_value is None or not raw_value.strip():
+        raise ValueError(
+            f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be set to a positive integer "
+            "when agentic variable-row transfer is enabled."
+        )
+    normalized_value = raw_value.strip()
+    if not normalized_value.isascii() or not normalized_value.isdigit():
+        raise ValueError(f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_value!r}.")
+    try:
+        value = int(normalized_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_value!r}."
+        ) from exc
+    if value <= 0:
+        raise ValueError(f"{AGENTIC_MAX_EXPORTED_ROWS_PER_SAMPLE_ENV} must be a positive integer, got {raw_value!r}.")
+    return value
+
+
+def _agentic_variable_row_storage_size(config: Namespace) -> int:
+    max_exported_rows = _agentic_max_exported_rows_per_sample()
+    max_actual_rows = config.rollout_batch_size * config.n_samples_per_prompt * max_exported_rows
+    padded_rows_per_partition = (
+        (max_actual_rows + config.global_batch_size - 1) // config.global_batch_size
+    ) * config.global_batch_size
+    return padded_rows_per_partition * (config.max_staleness + 1)
 
 
 def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
@@ -242,15 +276,31 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        batch_size_for_capacity = (
-            self.config.over_sampling_batch_size
-            if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
-            else self.config.rollout_batch_size
-        )
-        total_storage_size = (
-            batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
-        )
-        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+        variable_row_mode = use_agentic_variable_row_mode(self.config)
+        if variable_row_mode:
+            total_storage_size = _agentic_variable_row_storage_size(self.config)
+        else:
+            batch_size_for_capacity = (
+                self.config.over_sampling_batch_size
+                if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
+                else self.config.rollout_batch_size
+            )
+            total_storage_size = (
+                batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
+            )
+        if variable_row_mode:
+            dp_size = compute_dp_size(self.config)
+            sampler = SeqlenBalancedSampler(
+                n_samples_per_prompt=1,
+                dp_size=dp_size,
+            )
+            logger.info(
+                "Using SeqlenBalancedSampler for agentic variable-row transfer with "
+                "n_samples_per_prompt=1, dp_size=%s, total_storage_size=%s",
+                dp_size,
+                total_storage_size,
+            )
+        elif getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
             # Fully-async + dynamic-batch path streams data per DP via token
             # budget; the controller-side sampler maintains per-DP buckets and
             # balances tokens at small-unit granularity.  See

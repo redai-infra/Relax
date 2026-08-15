@@ -41,6 +41,53 @@ logger = get_logger(__name__)
 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY = "rollout_mini_local_sample_counts"
 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY = "rollout_mini_global_sample_counts"
 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY = "rollout_mini_prompt_group_counts"
+ROLLOUT_VALID_ROW_FLAGS_KEY = "agentic_variable_row_valid_rows"
+
+
+def get_rollout_valid_row_flags(rollout_data: RolloutBatch) -> list[bool] | None:
+    """Return strict per-row validity flags for variable-row batches.
+
+    Ordinary fixed-row batches do not carry the field and retain their legacy
+    accounting.  Variable-row batches persist it after TransferQueue metadata
+    has been decoded so synthetic tail padding can never become a metric row.
+    """
+
+    flags = rollout_data.get(ROLLOUT_VALID_ROW_FLAGS_KEY)
+    if flags is None:
+        return None
+    if not isinstance(flags, list):
+        raise RuntimeError(f"{ROLLOUT_VALID_ROW_FLAGS_KEY} must be a list, got {type(flags).__name__}.")
+    expected_rows = len(rollout_data.get("total_lengths", []))
+    if len(flags) != expected_rows:
+        raise RuntimeError(
+            f"{ROLLOUT_VALID_ROW_FLAGS_KEY} must contain one flag per row: expected={expected_rows}, got={len(flags)}."
+        )
+    if any(type(flag) is not bool for flag in flags):
+        raise RuntimeError(f"{ROLLOUT_VALID_ROW_FLAGS_KEY} must contain only bool values.")
+    return flags
+
+
+def _rollout_metrics_view(rollout_data: RolloutBatch) -> tuple[RolloutBatch, int | None]:
+    """Build a shallow metrics-only view without synthetic variable-row
+    pads."""
+
+    flags = get_rollout_valid_row_flags(rollout_data)
+    if flags is None:
+        return rollout_data, None
+    valid_indices = [idx for idx, is_valid in enumerate(flags) if is_valid]
+    row_count = len(flags)
+    metrics_view = {}
+    for key, value in rollout_data.items():
+        if key == ROLLOUT_VALID_ROW_FLAGS_KEY:
+            continue
+        if isinstance(value, (list, tuple)) and len(value) == row_count:
+            metrics_view[key] = [value[idx] for idx in valid_indices]
+        elif isinstance(value, torch.Tensor) and value.ndim > 0 and value.size(0) == row_count:
+            index = torch.tensor(valid_indices, dtype=torch.long, device=value.device)
+            metrics_view[key] = value.index_select(0, index)
+        else:
+            metrics_view[key] = value
+    return metrics_view, len(valid_indices)
 
 
 @dataclass(frozen=True)
@@ -50,6 +97,150 @@ class RolloutMiniBatchPlan:
     fixed_n_samples_per_prompt: int | None
     mini_global_samples: int | None
     mini_local_sample_request: int | None
+
+
+@dataclass(frozen=True)
+class VariableRowMiniBatchWindow:
+    """One fixed-global-batch training window over variable rollout rows.
+
+    ``actual_rows_per_dp`` describes the real rows assigned to each data
+    parallel rank. Callers must append ``padding_rows_per_dp`` rows whose loss
+    masks are all zero before training the window.
+    """
+
+    start_row: int
+    stop_row: int
+    actual_global_rows: int
+    padded_global_rows: int
+    actual_rows_per_dp: tuple[int, ...]
+    padded_rows_per_dp: tuple[int, ...]
+    padding_rows_per_dp: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class VariableRowMiniBatchPlan:
+    """Fixed-global-batch windows that consume every variable rollout row."""
+
+    actual_global_rows: int
+    global_batch_size: int
+    windows: tuple[VariableRowMiniBatchWindow, ...]
+    total_padded_global_rows: int
+    total_padding_rows: int
+
+
+def _require_positive_int(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+
+
+def build_variable_row_minibatch_plan(
+    actual_global_rows: int,
+    global_batch_size: int,
+    dp_size: int,
+    micro_batch_size: int,
+) -> VariableRowMiniBatchPlan:
+    """Partition variable rollout rows into fixed-global-batch windows.
+
+    The existing fixed-n rollout plan is intentionally not involved. Every
+    window keeps Megatron's configured global batch size; only the final window
+    may contain padding. Real rows are assigned to DP ranks as evenly as
+    possible, and the remaining per-rank rows must be materialized with a zero-
+    valued loss mask by the caller.
+    """
+
+    for name, value in (
+        ("actual_global_rows", actual_global_rows),
+        ("global_batch_size", global_batch_size),
+        ("dp_size", dp_size),
+        ("micro_batch_size", micro_batch_size),
+    ):
+        _require_positive_int(name, value)
+
+    padded_window_multiple = dp_size * micro_batch_size
+    if global_batch_size % padded_window_multiple != 0:
+        raise ValueError(
+            "global_batch_size must be divisible by dp_size * micro_batch_size, "
+            f"got global_batch_size={global_batch_size}, dp_size={dp_size}, "
+            f"micro_batch_size={micro_batch_size}"
+        )
+
+    padded_rows_per_rank = global_batch_size // dp_size
+    windows: list[VariableRowMiniBatchWindow] = []
+    start_row = 0
+    while start_row < actual_global_rows:
+        stop_row = min(start_row + global_batch_size, actual_global_rows)
+        actual_window_rows = stop_row - start_row
+        actual_rows_base, ranks_with_extra_row = divmod(actual_window_rows, dp_size)
+        actual_rows_per_dp = tuple(actual_rows_base + (rank < ranks_with_extra_row) for rank in range(dp_size))
+        padded_rows_per_dp = (padded_rows_per_rank,) * dp_size
+        padding_rows_per_dp = tuple(padded_rows_per_rank - actual_rows for actual_rows in actual_rows_per_dp)
+
+        windows.append(
+            VariableRowMiniBatchWindow(
+                start_row=start_row,
+                stop_row=stop_row,
+                actual_global_rows=actual_window_rows,
+                padded_global_rows=global_batch_size,
+                actual_rows_per_dp=actual_rows_per_dp,
+                padded_rows_per_dp=padded_rows_per_dp,
+                padding_rows_per_dp=padding_rows_per_dp,
+            )
+        )
+        start_row = stop_row
+
+    total_padded_global_rows = len(windows) * global_batch_size
+    return VariableRowMiniBatchPlan(
+        actual_global_rows=actual_global_rows,
+        global_batch_size=global_batch_size,
+        windows=tuple(windows),
+        total_padded_global_rows=total_padded_global_rows,
+        total_padding_rows=total_padded_global_rows - actual_global_rows,
+    )
+
+
+def _build_rollout_mini_loss_scales(
+    *,
+    num_microbatches: Sequence[int],
+    actual_global_sample_counts: Sequence[int] | None,
+    global_batch_size: int,
+    dp_size: int,
+) -> list[float] | None:
+    """Build one explicit loss scale per micro-batch for variable-row
+    windows."""
+
+    if actual_global_sample_counts is None:
+        return None
+    if len(actual_global_sample_counts) != len(num_microbatches):
+        raise ValueError(
+            f"{ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY} length must match num_microbatches windows, "
+            f"got counts={len(actual_global_sample_counts)}, windows={len(num_microbatches)}."
+        )
+    if isinstance(global_batch_size, bool) or not isinstance(global_batch_size, int) or global_batch_size <= 0:
+        raise ValueError(f"global_batch_size must be a positive integer, got {global_batch_size!r}")
+    if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size <= 0:
+        raise ValueError(f"dp_size must be a positive integer, got {dp_size!r}")
+
+    scales: list[float] = []
+    for window_idx, (num_mbs, actual_rows) in enumerate(
+        zip(num_microbatches, actual_global_sample_counts, strict=True)
+    ):
+        if isinstance(num_mbs, bool) or not isinstance(num_mbs, int) or num_mbs <= 0:
+            raise ValueError(f"num_microbatches[{window_idx}] must be a positive integer, got {num_mbs!r}")
+        if (
+            isinstance(actual_rows, bool)
+            or not isinstance(actual_rows, int)
+            or actual_rows <= 0
+            or actual_rows > global_batch_size
+        ):
+            raise ValueError(
+                f"{ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY}[{window_idx}] must be in "
+                f"[1, {global_batch_size}], got {actual_rows!r}."
+            )
+        scale = num_mbs * dp_size / actual_rows
+        scales.extend([scale] * num_mbs)
+    return scales
 
 
 def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBatchPlan:
@@ -591,6 +782,7 @@ def gather_log_data(
     args: Namespace,
     rollout_id: int,
     log_dict: dict[str, float],
+    metric_row_count: int | None = None,
 ) -> dict[str, float] | None:
     """Gather per-rank metrics, reduce by mean on the DP source rank, and log.
 
@@ -606,15 +798,27 @@ def gather_log_data(
         gathered_log_dict = [None] * dp_size
         # Not sure if this will be a performance bottleneck.
         dist.gather_object(
-            log_dict,
+            (log_dict, metric_row_count) if metric_row_count is not None else log_dict,
             gathered_log_dict,
             dst=mpu.get_data_parallel_src_rank(with_context_parallel=True),
             group=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
         )
 
-        reduced_log_dict = {
-            f"{metric_name}/{key}": sum([d[key] for d in gathered_log_dict]) / dp_size for key in log_dict
-        }
+        if metric_row_count is None:
+            reduced_log_dict = {
+                f"{metric_name}/{key}": sum([d[key] for d in gathered_log_dict]) / dp_size for key in log_dict
+            }
+        else:
+            if isinstance(metric_row_count, bool) or not isinstance(metric_row_count, int) or metric_row_count < 0:
+                raise ValueError(f"metric_row_count must be a non-negative integer, got {metric_row_count!r}")
+            total_rows = sum(row_count for _, row_count in gathered_log_dict)
+            if total_rows <= 0:
+                raise RuntimeError("Variable-row metrics contain no real rows across the data-parallel group.")
+            reduced_log_dict = {
+                f"{metric_name}/{key}": sum(metrics[key] * row_count for metrics, row_count in gathered_log_dict)
+                / total_rows
+                for key in log_dict
+            }
         logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
 
         # Calculate step once to avoid duplication
@@ -625,7 +829,7 @@ def gather_log_data(
         return reduced_log_dict
     else:
         dist.gather_object(
-            log_dict,
+            (log_dict, metric_row_count) if metric_row_count is not None else log_dict,
             None,
             dst=mpu.get_data_parallel_src_rank(with_context_parallel=True),
             group=mpu.get_data_parallel_group_gloo(with_context_parallel=True),
@@ -646,6 +850,7 @@ class DataIterator:
         micro_batch_size: int | None = None,
         micro_batch_indices: list[list[int]] | None = None,
         max_tokens_per_gpu: int | None = None,
+        micro_batch_loss_scales: list[float] | None = None,
     ) -> None:
         """Initialize an iterator over `rollout_data`.
 
@@ -658,15 +863,38 @@ class DataIterator:
                 reads it in get_batch to pick each mb's CP size consistently with how the
                 micro-batches were packed (forward-only uses log_probs_max_tokens_per_gpu,
                 training uses max_tokens_per_gpu). None falls back to args.max_tokens_per_gpu.
+            micro_batch_loss_scales: Optional explicit scale for every micro-batch.
+                Used only by agentic variable-row windows; ordinary paths leave it unset.
         """
         self.rollout_data = rollout_data
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
         self.max_tokens_per_gpu = max_tokens_per_gpu
+        self.micro_batch_loss_scales = micro_batch_loss_scales
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
+        self.micro_batch_offset = 0
 
-    def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
+        if micro_batch_loss_scales is not None:
+            if micro_batch_indices is not None:
+                expected_microbatches = len(micro_batch_indices)
+            else:
+                if micro_batch_size is None or micro_batch_size <= 0:
+                    raise ValueError("micro_batch_size must be positive when explicit loss scales are provided")
+                num_local_samples = len(rollout_data.get("total_lengths", []))
+                if num_local_samples % micro_batch_size != 0:
+                    raise ValueError(
+                        "Local sample count must be divisible by micro_batch_size when explicit loss scales "
+                        f"are provided, got samples={num_local_samples}, micro_batch_size={micro_batch_size}."
+                    )
+                expected_microbatches = num_local_samples // micro_batch_size
+            if len(micro_batch_loss_scales) != expected_microbatches:
+                raise ValueError(
+                    "micro_batch_loss_scales length must equal the iterator micro-batch count, "
+                    f"got scales={len(micro_batch_loss_scales)}, expected={expected_microbatches}."
+                )
+
+    def get_next(self, keys: Sequence[str]) -> dict[str, object]:
         """Return the next micro-batch for the requested keys.
 
         - If `micro_batch_indices` is provided, selects rows according to the current
@@ -691,15 +919,25 @@ class DataIterator:
                     )
                     batch[key] = vals[self.offset : self.offset + self.micro_batch_size]
 
+        if self.micro_batch_loss_scales is not None:
+            if self.micro_batch_offset >= len(self.micro_batch_loss_scales):
+                raise RuntimeError(
+                    "DataIterator consumed more micro-batches than its explicit loss-scale schedule: "
+                    f"offset={self.micro_batch_offset}, scales={len(self.micro_batch_loss_scales)}."
+                )
+            batch["__loss_scale__"] = self.micro_batch_loss_scales[self.micro_batch_offset]
+
         if self.micro_batch_indices is not None:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
+        self.micro_batch_offset += 1
         return batch
 
     def reset(self) -> "DataIterator":
         """Reset internal offset to the start and return self."""
         self.offset = 0
+        self.micro_batch_offset = 0
         return self
 
 
@@ -741,6 +979,7 @@ def get_data_iterator(
         global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
     num_local_gbs = global_batch_size // dp_size
     step_local_sample_counts = rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
+    step_global_sample_counts = rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY)
 
     if step_local_sample_counts is not None:
         if not isinstance(step_local_sample_counts, list) or not step_local_sample_counts:
@@ -767,6 +1006,30 @@ def get_data_iterator(
             )
         num_steps_per_rollout = num_local_samples // num_local_gbs
 
+    if step_global_sample_counts is not None:
+        if step_local_sample_counts is None:
+            raise ValueError(
+                f"{ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY} requires "
+                f"{ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY} to preserve rollout-window boundaries."
+            )
+        if not isinstance(step_global_sample_counts, list) or not step_global_sample_counts:
+            raise ValueError(f"{ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY} must be a non-empty list")
+        if len(step_global_sample_counts) != num_steps_per_rollout:
+            raise ValueError(
+                f"{ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY} length must equal rollout windows, "
+                f"got counts={len(step_global_sample_counts)}, windows={num_steps_per_rollout}."
+            )
+        invalid_global_counts = [
+            count
+            for count in step_global_sample_counts
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0 or count > args.global_batch_size
+        ]
+        if invalid_global_counts:
+            raise ValueError(
+                f"{ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY} must contain integers in "
+                f"[1, {args.global_batch_size}], got {step_global_sample_counts}."
+            )
+
     # With balance_data, synchronise num_steps_per_rollout across DP ranks so
     # collectives stay aligned. Explicit rollout-mini boundaries or divisible
     # fixed-size local steps must already produce the same count on every rank;
@@ -790,10 +1053,24 @@ def get_data_iterator(
             f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
         )
 
-    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None, max_tokens_per_gpu=None):
+    def _generate_data_iterator(
+        rollout_data,
+        micro_batch_size,
+        micro_batch_indices=None,
+        max_tokens_per_gpu=None,
+        micro_batch_loss_scales=None,
+    ):
         data_iterator = []
         for _ in range(vpp_size):
-            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices, max_tokens_per_gpu))
+            data_iterator.append(
+                DataIterator(
+                    rollout_data,
+                    micro_batch_size,
+                    micro_batch_indices,
+                    max_tokens_per_gpu,
+                    micro_batch_loss_scales,
+                )
+            )
         return data_iterator
 
     if step_local_sample_counts is None:
@@ -807,7 +1084,17 @@ def get_data_iterator(
                 f"got invalid_counts={invalid_counts}, micro_batch_size={args.micro_batch_size}"
             )
         num_microbatches = [count // args.micro_batch_size for count in step_local_sample_counts]
-        data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+        micro_batch_loss_scales = _build_rollout_mini_loss_scales(
+            num_microbatches=num_microbatches,
+            actual_global_sample_counts=step_global_sample_counts,
+            global_batch_size=int(args.global_batch_size),
+            dp_size=dp_size,
+        )
+        data_iterator = _generate_data_iterator(
+            rollout_data,
+            args.micro_batch_size,
+            micro_batch_loss_scales=micro_batch_loss_scales,
+        )
     else:
         _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
         assert _max_tokens is not None
@@ -862,7 +1149,19 @@ def get_data_iterator(
         logger.info(
             f"After dynamic batching, num_microbatches: {num_microbatches}, micro_batch_indices: {micro_batch_indices}"
         )
-        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices, _max_tokens)
+        micro_batch_loss_scales = _build_rollout_mini_loss_scales(
+            num_microbatches=num_microbatches,
+            actual_global_sample_counts=step_global_sample_counts,
+            global_batch_size=int(args.global_batch_size),
+            dp_size=dp_size,
+        )
+        data_iterator = _generate_data_iterator(
+            rollout_data,
+            None,
+            micro_batch_indices,
+            _max_tokens,
+            micro_batch_loss_scales,
+        )
 
     return (
         data_iterator,
@@ -884,6 +1183,8 @@ def log_rollout_data(
     - Non-tensor lists are averaged elementwise.
     - Scalars are converted to Python numbers.
     """
+    source_rollout_data = rollout_data
+    rollout_data, metric_row_count = _rollout_metrics_view(source_rollout_data)
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         # Under dynamic CP, rollout_data was merged back to full-length responses
         # (dynamic_cp_merge_output), so metrics here run on full data — use cp=1 (no
@@ -894,12 +1195,16 @@ def log_rollout_data(
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
         max_seq_lens = rollout_data.get("max_seq_lens", None)
-        padded_total_lengths = maybe_padded_total_lengths(
-            total_lengths,
-            args.qkv_format,
-            getattr(args, "is_vl_model", False)
-            or rollout_data.get("multimodal_train_inputs") is not None
-            or getattr(args, "uses_unsplit_forward", False),
+        padded_total_lengths = (
+            maybe_padded_total_lengths(
+                total_lengths,
+                args.qkv_format,
+                getattr(args, "is_vl_model", False)
+                or rollout_data.get("multimodal_train_inputs") is not None
+                or getattr(args, "uses_unsplit_forward", False),
+            )
+            if total_lengths
+            else None
         )
 
         for key, val in rollout_data.items():
@@ -925,6 +1230,15 @@ def log_rollout_data(
             # There are the following assumptions:
             # - Each dp rank has the same number of samples
             if isinstance(val, (list, tuple)):
+                source_val = source_rollout_data.get(key)
+                if not val:
+                    if (
+                        isinstance(source_val, (list, tuple))
+                        and source_val
+                        and isinstance(source_val[0], (torch.Tensor, int, float))
+                    ):
+                        log_dict[key] = 0.0
+                    continue
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
@@ -964,23 +1278,25 @@ def log_rollout_data(
                         continue
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
-                val = val.float().mean()
+                val = 0.0 if metric_row_count == 0 and val.numel() == 0 else val.float().mean()
             else:
                 continue
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
-        if total_lengths:
+        if total_lengths or metric_row_count is not None:
             dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            local_max = max(total_lengths) if total_lengths else -1
+            local_neg_min = -min(total_lengths) if total_lengths else -(1 << 62)
             stats = torch.tensor(
-                [max(total_lengths), -min(total_lengths)],
+                [local_max, local_neg_min],
                 dtype=torch.int64,
-                device=loss_masks[0].device,
+                device=(loss_masks[0] if loss_masks else source_rollout_data["loss_masks"][0]).device,
             )
             dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=dp_group)
             log_dict["total_lengths/max"] = int(stats[0].item())
             log_dict["total_lengths/min"] = -int(stats[1].item())
 
-        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
+        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, metric_row_count=metric_row_count)
         if args.ci_test and reduced_log_dict is not None:
             if (
                 rollout_id == 0
@@ -996,7 +1312,7 @@ def log_rollout_data(
                 assert 0 < reduced_log_dict["rollout/entropy"] < 0.5
 
     if args.log_multi_turn:
-        log_multi_turn_data(rollout_id, args, rollout_data)
+        log_multi_turn_data(rollout_id, args, source_rollout_data)
 
     if args.log_correct_samples:
         if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
@@ -1087,6 +1403,8 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
     Operates only on PP last stage and TP rank 0. Uses GPU tensors when
     available to compute statistics without host transfers.
     """
+    source_rollout_data = rollout_data
+    rollout_data, metric_row_count = _rollout_metrics_view(source_rollout_data)
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         log_dict = {}
         for key, val in rollout_data.items():
@@ -1110,13 +1428,26 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
                     log_dict["wo_obs_response_length/response_length_mean"] = wo_obs_response_lengths.mean().item()
                     log_dict["wo_obs_response_length/response_length_max"] = wo_obs_response_lengths.max().item()
                     log_dict["wo_obs_response_length/response_length_min"] = wo_obs_response_lengths.min().item()
+                elif source_rollout_data.get("loss_masks"):
+                    log_dict["raw_response_length/response_length_mean"] = 0.0
+                    log_dict["raw_response_length/response_length_max"] = 0.0
+                    log_dict["raw_response_length/response_length_min"] = 0.0
+                    log_dict["raw_response_length/response_length_clip_ratio"] = 0.0
+                    log_dict["wo_obs_response_length/response_length_mean"] = 0.0
+                    log_dict["wo_obs_response_length/response_length_max"] = 0.0
+                    log_dict["wo_obs_response_length/response_length_min"] = 0.0
             if key == "round_number":
                 # Use numpy for vectorized round number statistics
-                round_number_array = np.array(val)
-                log_dict["multi_turn_metric/round_number_mean"] = np.mean(round_number_array)
-                log_dict["multi_turn_metric/round_number_max"] = np.max(round_number_array)
-                log_dict["multi_turn_metric/round_number_min"] = np.min(round_number_array)
-        gather_log_data("multi_turn", args, rollout_id, log_dict)
+                if val:
+                    round_number_array = np.array(val)
+                    log_dict["multi_turn_metric/round_number_mean"] = np.mean(round_number_array)
+                    log_dict["multi_turn_metric/round_number_max"] = np.max(round_number_array)
+                    log_dict["multi_turn_metric/round_number_min"] = np.min(round_number_array)
+                elif source_rollout_data.get("round_number"):
+                    log_dict["multi_turn_metric/round_number_mean"] = 0.0
+                    log_dict["multi_turn_metric/round_number_max"] = 0.0
+                    log_dict["multi_turn_metric/round_number_min"] = 0.0
+        gather_log_data("multi_turn", args, rollout_id, log_dict, metric_row_count=metric_row_count)
 
 
 def log_perf_data_fwd(args, rollout_id):
