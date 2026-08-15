@@ -4,12 +4,11 @@
 
 Relax refuses to run MooncakeStore unless the installed TransferQueue and
 mooncake expose the primitives that make silent data loss detectable.  This
-module validates capabilities and environment only; it never modifies
-TransferQueue at runtime.  The temporary runtime patches that harden the
-remaining gaps of the pinned revision (per-retry result validation, raising
-removal failures, and a strict production-status ACK) are maintained in a
-separate version-gated PR so their exact applicability and removal condition
-stay reviewable on their own.
+module validates capabilities and environment, then installs temporary,
+version-gated runtime patches for the remaining gaps of the pinned revision
+(per-retry result validation, raising non-idempotent removal failures, and a
+strict production-status ACK).  The exact applicability and removal condition
+remain isolated in :mod:`relax.utils.tq_mooncake_patches`.
 
 The pinned mooncake 0.3.10 additionally corrupts TCP-protocol transfers
 through its auto-enabled memcpy fast path, so that path is force-disabled
@@ -47,10 +46,10 @@ def _enforce_safe_memcpy() -> None:
 
 
 def ensure_mooncake_correctness_guards() -> None:
-    """Validate that the installed stack can run MooncakeStore safely.
+    """Validate the installed stack and install pinned Mooncake runtime guards.
 
-    Read-only: checks the memcpy environment contract and that the pinned
-    TransferQueue ships the Mooncake retry APIs Relax's data plane relies on.
+    Checks the memcpy environment contract and required retry APIs before
+    installing the exact-version patches for remaining upstream gaps.
     """
     _enforce_safe_memcpy()
     try:

@@ -15,6 +15,8 @@ from types import SimpleNamespace
 import pytest
 
 from relax.utils.tq_mooncake_patches import (
+    _install_notification_guards,
+    _install_store_guards,
     _require_pinned_transfer_queue,
     _strict_notify_and_wait,
     _StrictMooncakeStoreProxy,
@@ -57,14 +59,16 @@ class _SequenceStore:
 
 
 class _FakeNotifySocket:
-    def __init__(self) -> None:
+    def __init__(self, connect_error: Exception | None = None) -> None:
         self.closed = False
+        self.connect_error = connect_error
 
     def setsockopt(self, *args, **kwargs) -> None:
         pass
 
     def connect(self, *args, **kwargs) -> None:
-        pass
+        if self.connect_error is not None:
+            raise self.connect_error
 
     async def send_multipart(self, request) -> None:
         pass
@@ -115,10 +119,55 @@ class TestMooncakeCorrectnessGuardPrimitives:
         with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
             store.batch_upsert_from(["k0", "k1"], [1, 2], [8, 8])
 
-    def test_remove_failure_is_raised(self):
+    def test_remove_object_not_found_is_allowed(self):
         store = _StrictMooncakeStoreProxy(_SequenceStore([[0, -704]]))
+        assert store.batch_remove(["k0", "k1"], force=True) == [0, -704]
+
+    def test_remove_non_idempotent_failure_is_raised(self):
+        store = _StrictMooncakeStoreProxy(_SequenceStore([[0, -1]]))
         with pytest.raises(RuntimeError, match="batch_remove failed"):
             store.batch_remove(["k0", "k1"], force=True)
+
+    def test_missing_wrapped_store_raises_attribute_error(self):
+        store = object.__new__(_StrictMooncakeStoreProxy)
+        with pytest.raises(AttributeError):
+            store.close
+
+    def test_store_guard_installation_is_idempotent(self):
+        raw_store = _SequenceStore([[0]])
+
+        class Client:
+            def __init__(self):
+                self._store = raw_store
+
+        _install_store_guards(Client)
+        guarded_init = Client.__init__
+        _install_store_guards(Client)
+
+        client = Client()
+        assert Client.__init__ is guarded_init
+        assert isinstance(client._store, _StrictMooncakeStoreProxy)
+        assert client._store._store is raw_store
+
+
+class TestNotificationGuardPrimitives:
+    @pytest.mark.asyncio
+    async def test_guarded_notify_rejects_missing_controller(self):
+        class Manager:
+            controller_info = None
+
+            async def notify_data_update(self):
+                raise AssertionError("original notify must not run without a controller")
+
+            async def _notify_and_wait(self, request_msg):
+                pass
+
+        _install_notification_guards(Manager)
+        guarded_notify = Manager.notify_data_update
+        _install_notification_guards(Manager)
+        assert Manager.notify_data_update is guarded_notify
+        with pytest.raises(RuntimeError, match="has no controller"):
+            await Manager().notify_data_update()
 
 
 @pytest.mark.skipif(
@@ -157,6 +206,45 @@ class TestMooncakeCorrectnessGuards:
             controller_info=SimpleNamespace(ip="redacted", to_addr=lambda name: "inproc://controller"),
         )
         with pytest.raises(RuntimeError, match="rejected the production-status update"):
+            await _strict_notify_and_wait(manager, [b"request"])
+        assert socket.closed is True
+
+    @pytest.mark.asyncio
+    async def test_positive_production_status_ack_returns(self, monkeypatch):
+        from transfer_queue.utils import zmq_utils
+
+        socket = _FakeNotifySocket()
+        monkeypatch.setattr(zmq_utils, "create_zmq_socket", lambda **kwargs: socket)
+        monkeypatch.setattr(
+            zmq_utils.ZMQMessage,
+            "deserialize",
+            staticmethod(
+                lambda messages: SimpleNamespace(
+                    request_type=zmq_utils.ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+                    body={"success": True, "partition_id": "p0"},
+                )
+            ),
+        )
+        manager = SimpleNamespace(
+            storage_manager_id="guard-test",
+            zmq_context=object(),
+            controller_info=SimpleNamespace(ip="redacted", to_addr=lambda name: "inproc://controller"),
+        )
+        await _strict_notify_and_wait(manager, [b"request"])
+        assert socket.closed is True
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_closes_notification_socket(self, monkeypatch):
+        from transfer_queue.utils import zmq_utils
+
+        socket = _FakeNotifySocket(connect_error=ConnectionError("controller unavailable"))
+        monkeypatch.setattr(zmq_utils, "create_zmq_socket", lambda **kwargs: socket)
+        manager = SimpleNamespace(
+            storage_manager_id="guard-test",
+            zmq_context=object(),
+            controller_info=SimpleNamespace(ip="redacted", to_addr=lambda name: "inproc://controller"),
+        )
+        with pytest.raises(ConnectionError, match="controller unavailable"):
             await _strict_notify_and_wait(manager, [b"request"])
         assert socket.closed is True
 

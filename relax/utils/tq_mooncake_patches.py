@@ -19,7 +19,7 @@ to start rather than running unvalidated patches
 Removal condition: delete this module and its single call site in
 :func:`relax.utils.tq_correctness.ensure_mooncake_correctness_guards` once the
 pinned TransferQueue itself validates every batch/retry result, raises on
-removal failure, and requires a positive production-status ACK.
+non-idempotent removal failure, and requires a positive production-status ACK.
 """
 
 from __future__ import annotations
@@ -35,6 +35,8 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _PATCH_MARKER = "_relax_mooncake_correctness_guards_v1"
+# Mooncake's idempotent-delete result; the pinned upstream clear path accepts it.
+_MOONCAKE_OBJECT_NOT_FOUND = -704
 
 # Exact pins these patches were written and forensically validated against.
 _PATCHED_TQ_VERSIONS = ("0.1.10.dev0",)
@@ -74,6 +76,8 @@ class _StrictMooncakeStoreProxy:
         self._store = store
 
     def __getattr__(self, name: str) -> Any:
+        if name == "_store":
+            raise AttributeError(name)
         return getattr(self._store, name)
 
     def batch_upsert_from(self, keys: list[str], *args: Any, **kwargs: Any) -> Any:
@@ -89,7 +93,9 @@ class _StrictMooncakeStoreProxy:
     def batch_remove(self, keys: list[str], *args: Any, **kwargs: Any) -> Any:
         results = self._store.batch_remove(keys, *args, **kwargs)
         _validate_result_count("batch_remove", keys, results)
-        failures = [(key, code) for key, code in zip(keys, results, strict=True) if code != 0]
+        failures = [
+            (key, code) for key, code in zip(keys, results, strict=True) if code not in (0, _MOONCAKE_OBJECT_NOT_FOUND)
+        ]
         if failures:
             detail = ", ".join(f"{key}={code}" for key, code in failures)
             raise RuntimeError(f"batch_remove failed: {detail}")
@@ -103,16 +109,17 @@ async def _strict_notify_and_wait(self: Any, request_msg: list) -> None:
     from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
     identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
-    sock = create_zmq_socket(
-        ctx=self.zmq_context,
-        socket_type=zmq.DEALER,
-        ip=self.controller_info.ip,
-        identity=identity,
-    )
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.connect(self.controller_info.to_addr("request_handle_socket"))
-
+    sock = None
     try:
+        sock = create_zmq_socket(
+            ctx=self.zmq_context,
+            socket_type=zmq.DEALER,
+            ip=self.controller_info.ip,
+            identity=identity,
+        )
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(self.controller_info.to_addr("request_handle_socket"))
+
         await sock.send_multipart(request_msg)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + tq_base.TQ_DATA_UPDATE_RESPONSE_TIMEOUT
@@ -146,7 +153,7 @@ async def _strict_notify_and_wait(self: Any, request_msg: list) -> None:
             return
     finally:
         try:
-            if not sock.closed:
+            if sock is not None and not sock.closed:
                 sock.close(linger=0)
         except Exception as error:  # pragma: no cover - best-effort socket cleanup
             logger.debug(f"Failed to close TransferQueue notification socket: {error}")
