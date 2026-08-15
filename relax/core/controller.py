@@ -51,8 +51,8 @@ from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
 from relax.utils.tq_config import (
     build_backend_config,
-    resolve_tq_capacity_batch_size,
     resolve_mooncake_master_address,
+    resolve_tq_capacity_batch_size,
     validate_mooncake_runtime_contract,
 )
 from relax.utils.tq_lifecycle import (
