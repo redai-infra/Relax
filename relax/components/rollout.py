@@ -334,7 +334,10 @@ class Rollout(Base):
         self.healthy = healthy
 
         self.data_system_client = attach_tq_client(
-            self.config.tq_config, requested_gdr=getattr(self.config, "tq_use_gdr", False), role="rollout"
+            self.config.tq_config,
+            requested_gdr=getattr(self.config, "tq_use_gdr", False),
+            role="rollout",
+            lease_owner=self,
         )
         self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
             config, pg, data_source=data_source, runtime_env=runtime_env

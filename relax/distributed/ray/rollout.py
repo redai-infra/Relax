@@ -817,6 +817,7 @@ class RolloutManager(ReloadableMixin):
             self.args.tq_config,
             requested_gdr=getattr(self.args, "tq_use_gdr", False),
             role="rollout_worker",
+            lease_owner=self,
         )
 
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
@@ -922,7 +923,11 @@ class RolloutManager(ReloadableMixin):
         self._shutdown_all_engines()
         # Deregister this worker's Mooncake segment before the actor dies so a
         # fast restart does not hit stale endpoints until client_ttl expires.
-        detach_tq_client()
+        generation = getattr(self, "_tq_client_generation", None)
+        if generation is not None:
+            detach_tq_client(generation)
+        self._tq_client_generation = None
+        self.data_system_client = None
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.

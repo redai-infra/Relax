@@ -42,6 +42,13 @@ OWNER_TOKEN_FIELD = "relax_owner_token"
 DEFAULT_TQ_INIT_TIMEOUT_SECONDS = 60.0
 DEFAULT_TQ_ATTACH_TIMEOUT_SECONDS = 60.0
 
+# TransferQueue stores its client in process-global module state.  A generation
+# identifies the most recent component that claimed that client so a delayed
+# destructor from an in-place reload cannot close its successor's connection.
+_TQ_CLIENT_LEASE_LOCK = threading.RLock()
+_TQ_CLIENT_GENERATION = 0
+_CURRENT_TQ_CLIENT_GENERATION: int | None = None
+
 
 @dataclass(frozen=True)
 class TqInitResult:
@@ -401,7 +408,14 @@ def _bounded_tq_init(conf: Any, deadline: float, *, role: str) -> None:
         raise error[0]
 
 
-def attach_tq_client(conf: Any, *, requested_gdr: bool, role: str, timeout: float | None = None) -> Any:
+def attach_tq_client(
+    conf: Any,
+    *,
+    requested_gdr: bool,
+    role: str,
+    timeout: float | None = None,
+    lease_owner: Any | None = None,
+) -> Any:
     """Attach a component process within a bounded deadline and report its
     local experimental GDR state.
 
@@ -409,19 +423,32 @@ def attach_tq_client(conf: Any, *, requested_gdr: bool, role: str, timeout: floa
     ``tq.init`` itself, because either phase can hang unboundedly (get_config
     polling and mooncake endpoint setup respectively).  ``None`` resolves the
     deadline from ``RELAX_TQ_ATTACH_TIMEOUT_SECONDS`` (default 60 s).
+
+    When ``lease_owner`` is provided, its private generation token is updated
+    after a successful attach.  Teardown must pass that token to
+    :func:`detach_tq_client`; stale owners then leave a newer process-global
+    client untouched.
     """
-    if timeout is None:
-        timeout = _resolve_attach_timeout()
-    deadline = time.monotonic() + timeout
-    _prepare_mooncake_runtime(conf)
-    _await_controller_config(deadline)
-    _bounded_tq_init(conf, deadline, role=role)
-    client = tq.get_client()
-    log_tq_gdr_runtime_status(requested=requested_gdr, role=role)
+    global _CURRENT_TQ_CLIENT_GENERATION, _TQ_CLIENT_GENERATION
+
+    with _TQ_CLIENT_LEASE_LOCK:
+        if timeout is None:
+            timeout = _resolve_attach_timeout()
+        deadline = time.monotonic() + timeout
+        _prepare_mooncake_runtime(conf)
+        _await_controller_config(deadline)
+        _bounded_tq_init(conf, deadline, role=role)
+        client = tq.get_client()
+        log_tq_gdr_runtime_status(requested=requested_gdr, role=role)
+
+        _TQ_CLIENT_GENERATION += 1
+        _CURRENT_TQ_CLIENT_GENERATION = _TQ_CLIENT_GENERATION
+        if lease_owner is not None:
+            lease_owner._tq_client_generation = _CURRENT_TQ_CLIENT_GENERATION
     return client
 
 
-def detach_tq_client() -> None:
+def detach_tq_client(generation: int | None = None) -> None:
     """Detach this worker's TQ client (attach-only inverse of
     :func:`attach_tq_client`).
 
@@ -429,11 +456,26 @@ def detach_tq_client() -> None:
     from the master immediately instead of lingering until ``client_ttl``
     expires — a stale endpoint breaks fast restarts with "Failed to open
     segment".  Only process-local handles are touched (never the named
-    controller or globally stored data), so every worker teardown hook may
-    call this unconditionally; force-killed workers still fall back to the
-    master-side TTL.
+    controller or globally stored data).  A component teardown passes the
+    generation recorded by :func:`attach_tq_client`; a stale generation means
+    another component has since claimed the process-global client and is left
+    untouched.  ``None`` remains an unconditional detach for short-lived
+    attach handshakes and owner cleanup.  Force-killed workers still fall back
+    to the master-side TTL.
     """
-    _close_local_tq_client()
+    global _CURRENT_TQ_CLIENT_GENERATION
+
+    with _TQ_CLIENT_LEASE_LOCK:
+        if generation is not None and generation != _CURRENT_TQ_CLIENT_GENERATION:
+            logger.debug(
+                "[dataplane] Skipping stale TQ detach: "
+                f"owner_generation={generation} current_generation={_CURRENT_TQ_CLIENT_GENERATION}"
+            )
+            return
+        try:
+            _close_local_tq_client()
+        finally:
+            _CURRENT_TQ_CLIENT_GENERATION = None
 
 
 def _alive_node_ids() -> list[str]:
@@ -501,7 +543,7 @@ def close_tq_and_unmount(*, is_owner: bool) -> None:
     """
     if not is_owner:
         logger.info("[dataplane] Detaching local TQ client; global controller is owned by another process.")
-        _close_local_tq_client()
+        detach_tq_client()
         return
 
     store_client = None
@@ -539,7 +581,7 @@ class _TransferQueueOwner:
         close_tq_and_unmount(is_owner=self._owns_controller)
 
     def detach(self) -> None:
-        _close_local_tq_client()
+        detach_tq_client()
 
 
 def _stop_owner_actor(owner: Any) -> None:

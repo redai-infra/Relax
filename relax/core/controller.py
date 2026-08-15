@@ -311,12 +311,12 @@ class Controller:
         )
 
         if getattr(self.config, "tq_storage_backend", "simple") == "simple":
-            # Zero-behavior-change default path (review PR#256): identical to
-            # upstream, the first tq.init runs inside the Controller process
-            # and no _TransferQueueOwner actor is created.  The only addition
-            # is the F10 reaper, which acts solely on a provably
-            # half-initialised leftover controller that would otherwise make
-            # this tq.init poll get_config forever.
+            # Preserve the upstream SimpleStorage ownership model: the first
+            # tq.init runs inside Controller and no _TransferQueueOwner actor
+            # is created.  Lifecycle hardening still applies: the F10 reaper
+            # removes a provably half-initialised controller, worker attaches
+            # use a 60-second default deadline, and constructor failure closes
+            # any legacy tq.init completed by this process.
             reap_unusable_tq_controller()
             self._tq_owner = None
             self._tq_legacy_init = True
@@ -396,10 +396,11 @@ class Controller:
     def _resolve_tq_backend(self, total_storage_size: int) -> dict:
         """Resolve the TransferQueue ``backend`` config dict.
 
-        Default behavior (``--tq-storage-backend=simple``) is identical to the
-        previous hardcoded SimpleStorage path.  When MooncakeStore is
-        requested, runs the RDMA capability probe *before* ``tq.init``, applies
-        graded degradation, and emits the startup log line.
+        ``--tq-storage-backend=simple`` retains the previous storage and
+        ownership semantics while sharing the bounded worker-attach and
+        failure-cleanup hardening.  When MooncakeStore is requested, this runs
+        the RDMA capability probe *before* ``tq.init``, applies graded
+        degradation, and emits the startup log line.
         """
         # 1. Validate flag combinations (structural, before any probe).
         #    getattr defaults keep old checkpoints / non-argparse configs safe.
@@ -445,8 +446,6 @@ class Controller:
             )
         master_address = resolve_mooncake_master_address()
         probe_results = probe_cluster_nodes(device, master_address, probe_rdma=mode != "off")
-        for r in probe_results:
-            logger.debug(r.summary())
 
         effective = reduce_results(
             probe_results,

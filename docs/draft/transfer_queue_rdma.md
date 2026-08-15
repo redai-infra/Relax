@@ -4,7 +4,7 @@
 
 Relax 的数据面（rollout ↔ train 之间的样本传输）默认走 TransferQueue 的 SimpleStorage/ZMQ。本特性把 TransferQueue 已有的 MooncakeStore 后端接出来，使数据面可以走 RDMA，并在能力不足时安全回退。
 
-首期只做配置接入、能力探测与一致回退，**不改变 payload 形状与数据分发语义**。默认参数下行为与接入前完全一致。
+首期只做配置接入、能力探测与一致回退，**不改变 payload 形状与数据分发语义**。默认参数仍使用 SimpleStorage 及原有 controller 所有权模型；同时所有 worker attach（包括 SimpleStorage）新增默认 60 秒 deadline，半初始化 controller 会被回收，Controller 构造失败时会关闭本进程已经完成的 legacy `tq.init`。
 
 ## 配置入口
 
@@ -12,7 +12,7 @@ Relax 的数据面（rollout ↔ train 之间的样本传输）默认走 Transfe
 
 | 参数 | 取值 | 说明 |
 |---|---|---|
-| `--tq-storage-backend` | `simple`（默认）/ `mooncake` | `simple` 等价于接入前行为 |
+| `--tq-storage-backend` | `simple`（默认）/ `mooncake` | `simple` 保留接入前的存储与 controller 所有权语义，并共享新增的有界 attach/失败清理 |
 | `--tq-rdma-mode` | `off`（默认）/ `auto` / `required` | `off` 即使有硬件也不用 RDMA；`auto` 探测失败自动降级；`required` 探测失败直接报错退出 |
 | `--tq-rdma-device` | 设备名，如 `mlx5_bond_0`；空为自动 | 多网卡机器上自动选择可能选错，跨节点时建议显式指定 |
 | `--tq-use-gdr` | 默认关 | **实验性**，见下文 |
@@ -34,6 +34,8 @@ driver 在**第一次 `tq.init` 之前**完成探测并生成 job 级唯一的 e
 3. `reduce_results()` 做 AND 归约：整个作业只能跑在最低共同能力上
 4. Mooncake 生效前，driver 在**每个存活节点**（不限 GPU，因为 Serve replica 与 0-CPU actor 没有 placement 绑定）用真实配置各跑一次**有界 attach 握手**并立即 detach；`auto` 下任一节点失败则统一关闭 Mooncake 状态、全作业收敛到 SimpleStorage，`off`/`required` 下启动失败并列出失败节点
 5. `required` 模式下若发生任何回退，直接抛异常并打印每个节点的探测明细
+
+第 4 步不是轻量探针：每个节点都会创建真实 Mooncake client，并按配置请求挂载/注册完整 client segment（默认 `global_segment_size=4 GiB`，另有默认 1 GiB local buffer），完成后立即释放。具体物理 RSS、锁页与注册方式取决于 Mooncake 实现，但启动阶段会出现节点级瞬时内存/注册资源尖峰；CPU-only head 也在覆盖范围内。节点内存或 `memlock` 不足会表现为 attach 握手失败：`auto` 下整个作业统一回退 SimpleStorage，`off`/`required` 下启动失败。调大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 时必须把这份每节点启动资源足迹一并纳入容量规划。
 
 降级阶梯：
 
@@ -81,7 +83,7 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 |---|---|---|
 | **master 在探测时不可达** | `auto` 统一降级到 SimpleStorage；`required` 启动失败并列出失败节点 | 先确认 master、DNS/路由和 `MC_MASTER_ADDRESS` |
 | **master 探测通过、但 `tq.init` 时失败/超时** | 第一次初始化在独立 owner actor 中执行，driver 最多等待 60 秒。失败后回收该 actor 及其拥有的半初始化 controller；`auto` 只重试一次 SimpleStorage，`required` 清理后抛出原始错误 | 查看 `mooncake_init_failed:*`、master 日志和 owner 清理日志 |
-| **attach 握手在某节点失败/超时** | driver 汇总各节点结果：`auto` 关闭 Mooncake 状态并统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`off`/`required` 启动失败并列出节点 | 检查失败节点到 master 的连通性与 RDMA 状态 |
+| **attach 握手在某节点失败/超时** | driver 汇总各节点结果：`auto` 关闭 Mooncake 状态并统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`off`/`required` 启动失败并列出节点 | 检查失败节点到 master 的连通性、RDMA 状态、可用内存与 `memlock`；握手会瞬时创建完整 client segment，CPU-only head 也会执行 |
 | **worker attach 卡住**（controller 半初始化 / mooncake setup 挂起） | 每个 worker 的 attach 有统一 deadline（默认 60 s，`RELAX_TQ_ATTACH_TIMEOUT_SECONDS` 可调）：先有界等待 controller 提供配置，再在 watchdog 线程里跑 `tq.init`；超时该 worker 立刻失败而不是无限挂起 | 看 `TqAttachTimeout` 报错中的阶段描述 |
 | **正常退出**（作业结束或全局重启） | 只有 owner actor 调用全局 `tq.close()`，随后显式 `storage_client.close()` 卸载 segment；附加 worker 只关闭本地 client，不能删除全局数据或 controller。master 本身不动 | 无需操作 |
 | **异常退出**（worker 被 kill / OOM / 节点掉线） | Python 层不执行，segment 仍在 master 注册。master 要等 `client_ttl`（默认 30 s）才判定客户端过期，期间新作业的 put 会打到死端点并报 `Failed to open segment ... Connection refused` | 等 30 s 后重启，或部署侧调小 `-client_ttl` |
@@ -178,6 +180,7 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
 | 启动日志 `backend=SimpleStorage fallback=mooncake_unavailable:<node>` | 该节点上 `import mooncake` 失败 | 检查该节点的 `mooncake-transfer-engine` 安装；镜像是否一致 |
+| 启动日志 `MooncakeStore capacity fallback to SimpleStorage` | 保守的最坏情况容量上界超过 client segment；多模态按“每个 token 都可能是 vision token”估算，8k 序列约 77 MiB/样本，再乘 batch、采样数与 `staleness+1`，很容易超过默认 4 GiB | 按容量日志核对参数；减少 batch / `n_samples_per_prompt` / `max_staleness`，或调大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 并同步规划每节点 attach 的瞬时资源足迹 |
 | `protocol=tcp fallback=...`，但机器有 RDMA 卡 | 端口非 ACTIVE、GID 取不到、`memlock` 过低，或指定的 `--tq-rdma-device` 在部分节点不存在 | 看 `probe result` 里哪一项 FAIL；`memlock` 需要 unlimited |
 | `setup failed with error code: -1` | master 不可达 | 检查 master 进程与 `MC_MASTER_ADDRESS` |
 | `Failed to open segment ... Connection refused` | 上一轮客户端异常退出，死 segment 仍在 master 注册 | 等 `client_ttl`（30 s）过期后重试 |

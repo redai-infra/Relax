@@ -325,22 +325,47 @@ class TestWorkerDetach:
         tq_lifecycle.detach_tq_client()
         assert calls == [True]
 
+    def test_stale_generation_does_not_close_successor(self, monkeypatch):
+        client = object()
+        monkeypatch.setattr(tq_lifecycle, "_TQ_CLIENT_GENERATION", 0)
+        monkeypatch.setattr(tq_lifecycle, "_CURRENT_TQ_CLIENT_GENERATION", None)
+        monkeypatch.setattr(tq_lifecycle, "_prepare_mooncake_runtime", lambda conf: None)
+        monkeypatch.setattr(tq_lifecycle, "_await_controller_config", lambda deadline: None)
+        monkeypatch.setattr(tq_lifecycle, "_bounded_tq_init", lambda conf, deadline, role: None)
+        monkeypatch.setattr(tq_lifecycle.tq, "get_client", lambda: client)
+        monkeypatch.setattr(tq_lifecycle, "log_tq_gdr_runtime_status", lambda **kwargs: "not_requested")
+
+        old_owner = SimpleNamespace()
+        new_owner = SimpleNamespace()
+        assert tq_lifecycle.attach_tq_client({}, requested_gdr=False, role="old", lease_owner=old_owner) is client
+        assert tq_lifecycle.attach_tq_client({}, requested_gdr=False, role="new", lease_owner=new_owner) is client
+        assert new_owner._tq_client_generation > old_owner._tq_client_generation
+
+        calls = []
+        monkeypatch.setattr(tq_lifecycle, "_close_local_tq_client", lambda: calls.append(True))
+        tq_lifecycle.detach_tq_client(old_owner._tq_client_generation)
+        assert calls == []
+        tq_lifecycle.detach_tq_client(new_owner._tq_client_generation)
+        assert calls == [True]
+
     def test_component_del_detaches_attached_client(self, monkeypatch):
         from relax.components.base import Base
 
         calls = []
-        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda generation: calls.append(generation))
         component = Base()
         component.data_system_client = object()
+        component._tq_client_generation = 7
         component.__del__()
-        assert calls == [True]
-        component.data_system_client = None  # keep GC-time __del__ a no-op
+        assert calls == [7]
+        assert component.data_system_client is None
+        assert component._tq_client_generation is None
 
     def test_component_del_without_client_is_noop(self, monkeypatch):
         from relax.components.base import Base
 
         calls = []
-        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda generation: calls.append(generation))
         component = Base()
         component.__del__()
         assert calls == []

@@ -59,7 +59,6 @@ _REAL_TQ_STORAGE = _has_real_tq_storage()
 def _make_probe(
     protocol: str | None = "rdma",
     device: str = "rdma0",
-    gdr: bool = False,
     node: str = "node-A",
 ) -> ProbeResult:
     return ProbeResult(
@@ -67,7 +66,7 @@ def _make_probe(
         checks=(CheckResult("mooncake_import", True),),
         effective_protocol=protocol,
         effective_device=device,
-        gdr_eligible=gdr,
+        gdr_eligible=protocol == "rdma",
     )
 
 
@@ -176,24 +175,25 @@ class TestReduceResults:
         assert eff.protocol == "tcp"
         assert "node-B" in eff.fallback_reason
 
-    def test_gdr_eligible_only_when_all_nodes(self):
+    def test_gdr_request_is_forwarded_for_rdma(self):
         eff = reduce_results(
-            [_make_probe(gdr=True), _make_probe(gdr=False, node="node-B")],
-            requested_backend="mooncake",
-            requested_device="",
-            use_gdr=True,
-        )
-        assert eff.gdr is False
-        assert "gdr_cuda_not_initialized" in eff.fallback_reason
-
-    def test_gdr_eligible_all_nodes(self):
-        eff = reduce_results(
-            [_make_probe(gdr=True), _make_probe(gdr=True, node="node-B")],
+            [_make_probe(), _make_probe(node="node-B")],
             requested_backend="mooncake",
             requested_device="",
             use_gdr=True,
         )
         assert eff.gdr is True
+        assert eff.fallback_reason == ""
+
+    def test_requested_device_must_match_every_rdma_node(self):
+        eff = reduce_results(
+            [_make_probe(device="rdma0"), _make_probe(device="rdma1", node="node-B")],
+            requested_backend="mooncake",
+            requested_device="rdma0",
+            use_gdr=False,
+        )
+        assert eff.protocol == "tcp"
+        assert eff.fallback_reason == "device_mismatch:rdma0"
 
     def test_empty_results_falls_back(self):
         eff = reduce_results(
@@ -244,6 +244,7 @@ class TestProbeNode:
                 result = probe_node("")
         # mooncake importable but no RDMA device → tcp
         assert result.effective_protocol == "tcp"
+        assert result.gdr_eligible is False
 
     def test_active_rdma_device_gives_rdma(self):
         """When all checks pass, protocol should be rdma."""
@@ -272,6 +273,7 @@ class TestProbeNode:
         assert result.effective_protocol == "rdma"
         assert result.ok
         assert result.effective_device == "rdma0"
+        assert result.gdr_eligible is True
 
     @staticmethod
     def _multi_hca_open(active_device: str):

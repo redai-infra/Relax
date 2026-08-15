@@ -82,7 +82,10 @@ class SFT(Base):
         self.step = getattr(config, "start_rollout_id", 0)
 
         self.data_system_client = attach_tq_client(
-            self.config.tq_config, requested_gdr=getattr(self.config, "tq_use_gdr", False), role=self.role
+            self.config.tq_config,
+            requested_gdr=getattr(self.config, "tq_use_gdr", False),
+            role=self.role,
+            lease_owner=self,
         )
 
         self._dataset: Any | None = None

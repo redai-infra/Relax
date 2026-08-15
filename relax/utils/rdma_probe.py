@@ -561,7 +561,6 @@ def reduce_results(
     # AND reduction: the job can only run at the lowest common capability.
     any_no_mooncake = any(r.effective_protocol is None for r in results)
     all_rdma = all(r.effective_protocol == "rdma" for r in results)
-    all_gdr = all(r.gdr_eligible for r in results)
 
     if any_no_mooncake:
         failed_nodes = [r.node for r in results if r.effective_protocol is None]
@@ -591,7 +590,7 @@ def reduce_results(
     if all_rdma:
         # Device: if any node lacks the requested device, fall back to tcp.
         if requested_device:
-            device_ok = all(r.effective_device == requested_device or not r.effective_device for r in results)
+            device_ok = all(r.effective_device == requested_device for r in results)
             if not device_ok:
                 return EffectiveConfig(
                     backend="MooncakeStore",
@@ -604,8 +603,10 @@ def reduce_results(
             backend="MooncakeStore",
             protocol="rdma",
             device=requested_device,
-            gdr=use_gdr and all_gdr,
-            fallback_reason="" if (not use_gdr or all_gdr) else "gdr_cuda_not_initialized",
+            # probe_node defines GDR eligibility as RDMA transport readiness;
+            # CUDA staging is deliberately decided and logged by each worker.
+            gdr=use_gdr,
+            fallback_reason="",
         )
 
     # Some nodes can't do RDMA → degrade to TCP (still MooncakeStore).

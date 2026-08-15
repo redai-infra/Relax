@@ -40,7 +40,10 @@ class Advantages(Base):
         self.healthy = healthy
 
         self.data_system_client = attach_tq_client(
-            self.config.tq_config, requested_gdr=getattr(self.config, "tq_use_gdr", False), role="advantages"
+            self.config.tq_config,
+            requested_gdr=getattr(self.config, "tq_use_gdr", False),
+            role="advantages",
+            lease_owner=self,
         )
         self.step = 0
 

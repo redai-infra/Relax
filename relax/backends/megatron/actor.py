@@ -155,10 +155,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # Best-effort detach on graceful teardown; ray.kill / fate-sharing
         # kills skip destructors, in which case the Mooncake master TTL
         # reclaims the segment.
-        if getattr(self, "data_system_client", None) is None:
+        generation = getattr(self, "_tq_client_generation", None)
+        if getattr(self, "data_system_client", None) is None or generation is None:
             return
         try:
-            detach_tq_client()
+            detach_tq_client(generation)
+            self._tq_client_generation = None
+            self.data_system_client = None
         except Exception:  # destructor must never raise (interpreter shutdown)
             return
 
@@ -199,7 +202,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if repatch is not None:
             repatch(args)
         self.data_system_client = attach_tq_client(
-            args.tq_config, requested_gdr=getattr(args, "tq_use_gdr", False), role=role
+            args.tq_config,
+            requested_gdr=getattr(args, "tq_use_gdr", False),
+            role=role,
+            lease_owner=self,
         )
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
