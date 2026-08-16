@@ -165,7 +165,9 @@ export MODEL_CONFIG_DIR="${DIR}/../models"
 
 # ── NVLink detection ────────────────────────────────────────────────────────
 if nvidia-smi 2>&1 > /dev/null; then
-    NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+    # `grep` returns 1 when the topology has no NVLink entries.  Keep that
+    # valid no-NVLink case compatible with the script's `pipefail` setting.
+    NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | { grep -o 'NV[0-9][0-9]*' || true; } | wc -l)
 else
     NVLINK_COUNT=0
 fi
