@@ -29,6 +29,8 @@ def test_parser_help_renders_percent_targets(capsys):
     assert exc_info.value.code == 0
     output = capsys.readouterr().out
     assert "--enforce-targets" in output
+    assert "--enforce-steady-targets" in output
+    assert "--steady-campaign" in output
     assert "5% throughput, 15% phase-1, and 80% overlap" in " ".join(output.split())
 
 
@@ -125,6 +127,7 @@ def _write_run(
     nonfinite=False,
     producer_put_count=2,
     producer_last_start_ns=700,
+    reuse_train_forward_log_probs=False,
 ):
     if pipeline_overlap is None:
         pipeline_overlap = pipeline_enabled
@@ -147,6 +150,7 @@ def _write_run(
                 "num_iters_per_train_update": 2,
                 "hybrid_pipeline_forward": int(pipeline_enabled),
                 "hybrid_pipeline_overlap": int(pipeline_overlap),
+                "hybrid_reuse_train_logprobs": int(reuse_train_forward_log_probs),
                 "hybrid_pipeline_trace_dir": str(timeline),
                 "hybrid_pipeline_fetch_timeout_s": 600,
                 "git_commit": "a" * 40,
@@ -346,6 +350,18 @@ def _write_run(
                 fingerprint=FULL_FINGERPRINT,
             ),
         ]
+    if reuse_train_forward_log_probs:
+        actor = [
+            row
+            for row in actor
+            if row["event"]
+            not in {
+                "actor_restore_start",
+                "actor_restore_end",
+                "actor_forward_start",
+                "actor_forward_end",
+            }
+        ]
     actor += [
         _event("advantages_start", 1010, role="actor", sample_count=4),
         _event("advantages_end", 1020, role="actor", sample_count=4),
@@ -380,6 +396,26 @@ def test_complete_pipeline_trace_is_validated_and_summarized(tmp_path):
     assert analysis.trace_rows[0]["actor_forward_samples"] == 4
     assert (run_dir / "analysis" / "summary.json").is_file()
     assert (run_dir / "analysis" / "trace_events.csv").is_file()
+
+
+def test_train_forward_reuse_trace_skips_dedicated_actor_forward(tmp_path):
+    run_dir = _write_run(
+        tmp_path,
+        pipeline_enabled=False,
+        reuse_train_forward_log_probs=True,
+    )
+
+    analysis = analyzer.analyze_run(
+        run_dir,
+        windows=((4, 4),),
+        expected_samples=4,
+        expected_actor_chunks=2,
+    )
+
+    assert analysis.summary["trace"]["reuse_train_forward_log_probs"] is True
+    assert analysis.trace_rows[0]["actor_forward_count"] == 0
+    assert analysis.trace_rows[0]["actor_forward_samples"] == 4
+    assert analysis.trace_rows[0]["actor_restore_count"] == 0
 
 
 @pytest.mark.parametrize("producer_put_count", [1, 2, 3])
@@ -726,6 +762,173 @@ def _comparison_analysis(
             },
         },
     )
+
+
+def _steady_campaign_analysis(label, seed, throughput):
+    condition = "experiment" if label == "P+S" else "baseline"
+    analysis = _comparison_analysis(
+        condition,
+        seed,
+        throughput,
+        phase1=8.0 if label == "P+S" else 10.0,
+        overlap=label == "P+S",
+    )
+    pool_size, reuse, pipeline = analyzer.STEADY_CAMPAIGN_CONDITIONS[label]
+    analysis.manifest.update(
+        {
+            "order": f"{label}-{seed}",
+            "num_rollout": 40,
+            "num_iters_per_train_update": 4,
+            "hybrid_pipeline_forward": pipeline,
+            "hybrid_pipeline_overlap": pipeline,
+            "mm_processor_pool_size": pool_size,
+            "hybrid_reuse_train_logprobs": reuse,
+            "physical_gpu_indices": [0, 1, 2, 3, 4],
+        }
+    )
+    trace_template = analysis.trace_rows[0]
+    analysis.trace_rows[:] = [
+        {
+            **trace_template,
+            "rollout_id": step,
+            "first_forward_before_last_put_start": label == "P+S",
+            "first_forward_before_last_put_done": label == "P+S",
+        }
+        for step in range(40)
+    ]
+    scalar_values = {
+        "perf/step_token_per_s": throughput,
+        "perf/step_resp_token_per_s": throughput / 2,
+        "perf/step_time": 20.0 * 100.0 / throughput,
+        "perf/hybrid_phase1_time": 8.0 if label == "P+S" else 10.0,
+        "rollout/raw_reward": 0.5,
+        "rollout/truncated_ratio": 0.0,
+        "rollout/image_count/mean": 1.0,
+        "train/loss": 1.0,
+        "train/grad_norm": 0.5,
+        "train/ppo_kl": 0.0,
+        "train/pg_clipfrac": 0.0,
+    }
+    analysis.scalar_rows[:] = [
+        {"tag": tag, "step": step, "value": value} for step in range(40) for tag, value in scalar_values.items()
+    ]
+    analysis.summary["trace"] = {"rollout_count": 40}
+    analysis.summary["metrics"]["perf/step_time"] = {
+        "count": 30,
+        "mean": scalar_values["perf/step_time"],
+        "min": scalar_values["perf/step_time"],
+        "max": scalar_values["perf/step_time"],
+        "p50": scalar_values["perf/step_time"],
+        "p95": scalar_values["perf/step_time"],
+    }
+    analysis.summary["metrics"]["rollout/image_count/mean"] = {
+        "count": 30,
+        "mean": 1.0,
+        "min": 1.0,
+        "max": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+    }
+    analysis.summary["metrics"]["perf/wall_clock_samples_per_s"] = {"aggregate": 12.8 * throughput / 100.0}
+    analysis.summary["nvml"] = {
+        "gpu_count": 5,
+        "per_gpu": {
+            str(gpu_index): {
+                "steady_sample_count": 30,
+                "steady_mean_gpu_util_percent": 80.0,
+                "steady_idle_ratio_below_10_percent": 0.05,
+                "peak_memory_used_mib": 10_000,
+            }
+            for gpu_index in range(5)
+        },
+        "steady_mean_gpu_util_percent": 80.0,
+        "steady_idle_ratio_below_10_percent": 0.05,
+        "peak_memory_used_mib": 10_000,
+    }
+    return analysis
+
+
+def _steady_campaign_analyses():
+    throughputs = {
+        "B": (100.0, 102.0),
+        "P": (104.0, 106.08),
+        "P+R": (110.0, 112.2),
+        "P+S": (112.0, 114.24),
+    }
+    return [
+        _steady_campaign_analysis(label, seed, throughput)
+        for label, values in throughputs.items()
+        for seed, throughput in zip((1, 2), values, strict=True)
+    ]
+
+
+def test_four_condition_steady_campaign_reports_attributable_throughput():
+    campaign = analyzer._build_steady_campaign(
+        _steady_campaign_analyses(),
+        windows=((10, 19), (20, 29), (30, 39)),
+        expected_gpu_count=5,
+        enforce_targets=True,
+    )
+
+    assert campaign["measurement_scope"] == "steady_state"
+    assert campaign["independent_seed_count"] == 2
+    assert campaign["measured_optimizer_step_count"] == 30
+    assert set(campaign["conditions"]) == {"B", "P", "P+R", "P+S"}
+    assert campaign["comparisons"]["P_vs_B"]["perf/step_token_per_s:geomean_improvement"] == pytest.approx(0.04)
+    assert campaign["comparisons"]["P+R_vs_P"]["paired_seed_count"] == 2
+    assert campaign["comparisons"]["P+S_vs_B"]["paired_runs"][0]["rollout/image_count/mean:delta"] == 0
+    assert campaign["conditions"]["B"]["runs"][0]["optimizer_update_count"] == 40
+    assert campaign["conditions"]["B"]["runs"][0]["steady_actor_fetch_samples"] == 30 * 256
+
+
+def test_four_condition_steady_campaign_fails_closed_on_protocol_gaps():
+    analyses = _steady_campaign_analyses()
+    analyses.pop()
+    with pytest.raises(analyzer.BenchmarkValidationError, match="unpaired condition seeds"):
+        analyzer._build_steady_campaign(
+            analyses,
+            windows=((10, 19), (20, 29), (30, 39)),
+            expected_gpu_count=5,
+            enforce_targets=True,
+        )
+
+    analyses = _steady_campaign_analyses()
+    analyses[0].manifest["num_rollout"] = 39
+    with pytest.raises(analyzer.BenchmarkValidationError, match="identical manifest field 'num_rollout'"):
+        analyzer._build_steady_campaign(
+            analyses,
+            windows=((10, 19), (20, 29), (30, 39)),
+            expected_gpu_count=5,
+            enforce_targets=True,
+        )
+
+    with pytest.raises(analyzer.BenchmarkValidationError, match="warmup-excluded"):
+        analyzer._build_steady_campaign(
+            _steady_campaign_analyses(),
+            windows=((0, 0),),
+            expected_gpu_count=5,
+            enforce_targets=True,
+        )
+
+
+def test_steady_campaign_descriptor_loads_completed_run_list(tmp_path):
+    completed = tmp_path / "completed-runs.txt"
+    completed.write_text("run-a\nrun-b\n", encoding="utf-8")
+    descriptor = tmp_path / "campaign.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "completed_runs_file": "completed-runs.txt",
+                "steady_windows": "10-19,20-29,30-39",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = analyzer._load_steady_campaign_descriptor(descriptor)
+
+    assert loaded["run_dirs"] == [(tmp_path / "run-a").resolve(), (tmp_path / "run-b").resolve()]
 
 
 def test_preregistered_targets_pass_and_fail_deterministically():

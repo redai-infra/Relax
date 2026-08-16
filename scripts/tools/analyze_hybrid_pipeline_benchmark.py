@@ -65,6 +65,22 @@ CORRECTNESS_GUARDRAIL_TAGS = (
     "train/ppo_kl",
     "train/pg_clipfrac",
 )
+STEADY_CAMPAIGN_CONDITIONS = {
+    "B": (0, 0, 0),
+    "P": (8, 0, 0),
+    "P+R": (8, 1, 0),
+    "P+S": (8, 0, 1),
+}
+STEADY_CAMPAIGN_REQUIRED_TAGS = (
+    "perf/step_token_per_s",
+    "perf/step_resp_token_per_s",
+    "perf/step_time",
+    "rollout/raw_reward",
+    "rollout/image_count/mean",
+    "train/loss",
+    "train/grad_norm",
+    "train/ppo_kl",
+)
 RUN_MANIFEST_REQUIRED_FIELDS = {
     "hostname",
     "condition",
@@ -451,6 +467,7 @@ def _analyze_trace(
     *,
     pipeline_enabled: bool,
     pipeline_overlap_enabled: bool,
+    reuse_train_forward_log_probs: bool,
     expected_samples: int,
     expected_actor_chunks: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -532,13 +549,15 @@ def _analyze_trace(
                 key="chunk_index",
                 context=context,
             )
-            if len(fetch_pairs) != expected_stream_chunks or len(forward_pairs) != expected_stream_chunks:
+            expected_forward_chunks = 0 if reuse_train_forward_log_probs else expected_stream_chunks
+            if len(fetch_pairs) != expected_stream_chunks or len(forward_pairs) != expected_forward_chunks:
                 _fail(
-                    f"{context} expected {expected_stream_chunks} fetch/forward chunks, "
+                    f"{context} expected fetch={expected_stream_chunks}, forward={expected_forward_chunks} chunks, "
                     f"got fetch={len(fetch_pairs)}, forward={len(forward_pairs)}"
                 )
-            if len(restore_pairs) != 1:
-                _fail(f"{context} expected exactly one actor restore, got {len(restore_pairs)}")
+            expected_restore_count = 0 if reuse_train_forward_log_probs else 1
+            if len(restore_pairs) != expected_restore_count:
+                _fail(f"{context} expected {expected_restore_count} actor restores, got {len(restore_pairs)}")
             _pair_events(
                 stream_rows,
                 "advantages_start",
@@ -559,7 +578,10 @@ def _analyze_trace(
             fetch_end = [end for _, end in fetch_pairs]
             forward_start = [start for start, _ in forward_pairs]
             forward_end = [end for _, end in forward_pairs]
-            for event_rows, event_name in ((fetch_end, "fetch"), (forward_start, "forward")):
+            sample_event_groups = [(fetch_end, "fetch")]
+            if not reuse_train_forward_log_probs:
+                sample_event_groups.append((forward_start, "forward"))
+            for event_rows, event_name in sample_event_groups:
                 if any(row["sample_count"] is None for row in event_rows):
                     _fail(f"{context} {event_name} event is missing sample_count")
                 actual_samples = sum(int(row["sample_count"]) for row in event_rows)
@@ -574,9 +596,13 @@ def _analyze_trace(
                 fetch_end,
                 context=f"{context} fetch",
             )
-            forward_fingerprint = _combine_global_index_fingerprints(
-                forward_start,
-                context=f"{context} forward",
+            forward_fingerprint = (
+                fetch_fingerprint
+                if reuse_train_forward_log_probs
+                else _combine_global_index_fingerprints(
+                    forward_start,
+                    context=f"{context} forward",
+                )
             )
             if fetch_fingerprint != producer_fingerprint:
                 _fail(
@@ -589,27 +615,34 @@ def _analyze_trace(
                     f"fetch={fetch_fingerprint}, forward={forward_fingerprint}"
                 )
 
-            fetch_by_chunk = {end["chunk_index"]: (start, end) for start, end in fetch_pairs}
-            for forward_start_row, forward_end_row in forward_pairs:
-                chunk_index = forward_start_row["chunk_index"]
-                if chunk_index not in fetch_by_chunk:
-                    _fail(f"{context} forward chunk {chunk_index!r} has no matching fetch")
-                _, fetch_end_row = fetch_by_chunk[chunk_index]
-                if fetch_end_row["monotonic_ns"] > forward_start_row["monotonic_ns"]:
-                    _fail(f"{context} forward chunk {chunk_index!r} starts before fetch completes")
-                if forward_start_row["monotonic_ns"] > forward_end_row["monotonic_ns"]:
-                    _fail(f"{context} forward chunk {chunk_index!r} ends before it starts")
+            if not reuse_train_forward_log_probs:
+                fetch_by_chunk = {end["chunk_index"]: (start, end) for start, end in fetch_pairs}
+                for forward_start_row, forward_end_row in forward_pairs:
+                    chunk_index = forward_start_row["chunk_index"]
+                    if chunk_index not in fetch_by_chunk:
+                        _fail(f"{context} forward chunk {chunk_index!r} has no matching fetch")
+                    _, fetch_end_row = fetch_by_chunk[chunk_index]
+                    if fetch_end_row["monotonic_ns"] > forward_start_row["monotonic_ns"]:
+                        _fail(f"{context} forward chunk {chunk_index!r} starts before fetch completes")
+                    if forward_start_row["monotonic_ns"] > forward_end_row["monotonic_ns"]:
+                        _fail(f"{context} forward chunk {chunk_index!r} ends before it starts")
 
-            first_phase_ns = min(
-                min(start["monotonic_ns"] for start, _ in fetch_pairs),
-                restore_pairs[0][0]["monotonic_ns"],
+            first_fetch_ns = min(start["monotonic_ns"] for start, _ in fetch_pairs)
+            first_phase_ns = (
+                first_fetch_ns
+                if reuse_train_forward_log_probs
+                else min(first_fetch_ns, restore_pairs[0][0]["monotonic_ns"])
             )
-            last_forward_ns = max(row["monotonic_ns"] for row in forward_end)
-            first_forward_ns = min(row["monotonic_ns"] for row in forward_start)
+            last_forward_ns = max(
+                row["monotonic_ns"] for row in (fetch_end if reuse_train_forward_log_probs else forward_end)
+            )
+            first_forward_ns = min(
+                row["monotonic_ns"] for row in (fetch_end if reuse_train_forward_log_probs else forward_start)
+            )
             last_fetch_end_ns = max(row["monotonic_ns"] for row in fetch_end)
             last_put_start_ns = max(row["monotonic_ns"] for row in put_start)
             last_put_done_ns = max(row["monotonic_ns"] for row in put_done)
-            chunk_schedule_overlapped = first_forward_ns < last_fetch_end_ns
+            chunk_schedule_overlapped = not reuse_train_forward_log_probs and first_forward_ns < last_fetch_end_ns
             if pipeline_enabled and chunk_schedule_overlapped != pipeline_overlap_enabled:
                 expected_order = (
                     "the first forward before the final fetch completed"
@@ -637,9 +670,14 @@ def _analyze_trace(
                     "global_rank": stream[2],
                     "pipeline_enabled": pipeline_enabled,
                     "pipeline_overlap_enabled": pipeline_overlap_enabled,
+                    "reuse_train_forward_log_probs": reuse_train_forward_log_probs,
                     "producer_samples": producer_samples,
                     "actor_fetch_samples": sum(int(row["sample_count"]) for row in fetch_end),
-                    "actor_forward_samples": sum(int(row["sample_count"]) for row in forward_start),
+                    "actor_forward_samples": (
+                        sum(int(row["sample_count"]) for row in fetch_end)
+                        if reuse_train_forward_log_probs
+                        else sum(int(row["sample_count"]) for row in forward_start)
+                    ),
                     "producer_put_count": len(put_pairs),
                     "actor_fetch_count": len(fetch_pairs),
                     "actor_forward_count": len(forward_pairs),
@@ -707,6 +745,7 @@ def _analyze_trace(
         "hostname": next(iter({row["hostname"] for row in rows})),
         "pipeline_enabled": pipeline_enabled,
         "pipeline_overlap_enabled": pipeline_overlap_enabled,
+        "reuse_train_forward_log_probs": reuse_train_forward_log_probs,
         "rollout_count": len(rollout_rows),
         "actor_stream_count": len({_stream_key(row) for row in rows if row["role"] == "actor"}),
         "producer_overlap_rollout_count": producer_overlap_count,
@@ -1021,6 +1060,12 @@ def analyze_run(
     if type(overlap_flag) is not int or overlap_flag not in (0, 1):
         _fail(f"{run_dir} hybrid_pipeline_overlap must be integer 0 or 1, got {overlap_flag!r}")
     pipeline_overlap_enabled = bool(overlap_flag)
+    reuse_flag = manifest.get("hybrid_reuse_train_logprobs", 0)
+    if type(reuse_flag) is not int or reuse_flag not in (0, 1):
+        _fail(f"{run_dir} hybrid_reuse_train_logprobs must be integer 0 or 1, got {reuse_flag!r}")
+    reuse_train_forward_log_probs = bool(reuse_flag)
+    if reuse_train_forward_log_probs and pipeline_enabled:
+        _fail(f"{run_dir} cannot combine train-forward log-prob reuse with pipeline forwarding")
     if manifest["global_batch_size"] != expected_samples:
         _fail(
             f"{run_dir} expected_samples={expected_samples} disagrees with "
@@ -1042,6 +1087,7 @@ def analyze_run(
         trace_rows,
         pipeline_enabled=pipeline_enabled,
         pipeline_overlap_enabled=pipeline_overlap_enabled,
+        reuse_train_forward_log_probs=reuse_train_forward_log_probs,
         expected_samples=expected_samples,
         expected_actor_chunks=expected_actor_chunks,
     )
@@ -1060,6 +1106,7 @@ def analyze_run(
         "measurement_windows": [list(window) for window in windows],
         "hybrid_pipeline_forward": pipeline_enabled,
         "hybrid_pipeline_overlap": pipeline_overlap_enabled,
+        "hybrid_reuse_train_logprobs": reuse_train_forward_log_probs,
         "steady_windows": [list(window) for window in windows],
         "trace": trace_summary,
         "metrics": metrics,
@@ -1110,6 +1157,295 @@ def _distribution_summary(values: Iterable[float]) -> dict[str, float | int]:
         "max": max(samples),
         "population_stddev": stddev,
         "coefficient_of_variation": stddev / abs(mean) if mean else 0.0,
+    }
+
+
+def _steady_condition(analysis: RunAnalysis) -> str:
+    manifest = analysis.manifest
+    missing = sorted(
+        {"mm_processor_pool_size", "hybrid_reuse_train_logprobs", "hybrid_pipeline_forward"} - set(manifest)
+    )
+    if missing:
+        _fail(f"{analysis.run_dir} is missing steady attribution controls {missing}")
+    controls = tuple(
+        manifest[key] for key in ("mm_processor_pool_size", "hybrid_reuse_train_logprobs", "hybrid_pipeline_forward")
+    )
+    if any(type(value) is not int for value in controls):
+        _fail(f"{analysis.run_dir} steady attribution controls must be integers, got {controls}")
+    matches = [label for label, expected in STEADY_CAMPAIGN_CONDITIONS.items() if controls == expected]
+    if not matches:
+        _fail(f"{analysis.run_dir} has unsupported steady attribution controls {controls}")
+    label = matches[0]
+    expected_overlap = int(label == "P+S")
+    overlap = manifest.get("hybrid_pipeline_overlap")
+    if type(overlap) is not int or overlap != expected_overlap:
+        _fail(
+            f"{analysis.run_dir} condition {label} requires "
+            f"hybrid_pipeline_overlap={expected_overlap}, got {overlap!r}"
+        )
+    expected_manifest_condition = "experiment" if label == "P+S" else "baseline"
+    if manifest["condition"] != expected_manifest_condition:
+        _fail(
+            f"{analysis.run_dir} controls identify {label}, but manifest condition is "
+            f"{manifest['condition']!r}; expected {expected_manifest_condition!r}"
+        )
+    return label
+
+
+def _steady_metric_value(analysis: RunAnalysis, tag: str) -> float:
+    metric = analysis.summary["metrics"].get(tag)
+    if not metric:
+        _fail(f"{analysis.run_dir} is missing steady metric {tag}")
+    key = (
+        "aggregate"
+        if tag in {"perf/step_token_per_s", "perf/step_resp_token_per_s", "perf/wall_clock_samples_per_s"}
+        else "mean"
+    )
+    value = metric.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        _fail(f"{analysis.run_dir} has invalid steady metric {tag}.{key}={value!r}")
+    return float(value)
+
+
+def _steady_workload_by_step(
+    analysis: RunAnalysis,
+    steady_steps: set[int],
+) -> dict[int, tuple[Any, ...]]:
+    return {
+        int(row["rollout_id"]): (
+            row["producer_global_indexes_fingerprint"],
+            int(row["actor_fetch_samples"]),
+            int(row["actor_total_tokens"]),
+            int(row["actor_response_tokens"]),
+            int(row["actor_multimodal_tensor_bytes"]),
+        )
+        for row in analysis.trace_rows
+        if int(row["rollout_id"]) in steady_steps
+    }
+
+
+def _steady_pair_summary(
+    by_seed: dict[Any, dict[str, RunAnalysis]],
+    *,
+    candidate: str,
+    reference: str,
+    steady_steps: set[int],
+) -> dict[str, Any]:
+    paired_runs = []
+    ratio_tags = (
+        "perf/step_token_per_s",
+        "perf/step_resp_token_per_s",
+        "perf/wall_clock_samples_per_s",
+    )
+    delta_tags = (
+        "rollout/raw_reward",
+        "rollout/image_count/mean",
+        "train/loss",
+        "train/grad_norm",
+        "train/ppo_kl",
+    )
+    for seed, conditions in sorted(by_seed.items(), key=lambda item: str(item[0])):
+        reference_run = conditions[reference]
+        candidate_run = conditions[candidate]
+        reference_workload = _steady_workload_by_step(reference_run, steady_steps)
+        candidate_workload = _steady_workload_by_step(candidate_run, steady_steps)
+        if reference_workload != candidate_workload:
+            _fail(
+                f"seed {seed} steady workload differs for {candidate} versus {reference}: "
+                f"{candidate_workload=} {reference_workload=}"
+            )
+        row: dict[str, Any] = {
+            "seed": seed,
+            "reference": reference,
+            "candidate": candidate,
+        }
+        for tag in ratio_tags:
+            reference_value = _steady_metric_value(reference_run, tag)
+            candidate_value = _steady_metric_value(candidate_run, tag)
+            if reference_value <= 0 or candidate_value <= 0:
+                _fail(f"{tag} must be positive for seed {seed}, got {reference_value}, {candidate_value}")
+            row[f"{tag}:reference"] = reference_value
+            row[f"{tag}:candidate"] = candidate_value
+            row[f"{tag}:improvement"] = candidate_value / reference_value - 1
+        reference_step_time = _steady_metric_value(reference_run, "perf/step_time")
+        candidate_step_time = _steady_metric_value(candidate_run, "perf/step_time")
+        if reference_step_time <= 0 or candidate_step_time <= 0:
+            _fail(f"perf/step_time must be positive for seed {seed}")
+        row["perf/step_time:reference"] = reference_step_time
+        row["perf/step_time:candidate"] = candidate_step_time
+        row["perf/step_time:reduction"] = 1 - candidate_step_time / reference_step_time
+        for tag in delta_tags:
+            reference_value = _steady_metric_value(reference_run, tag)
+            candidate_value = _steady_metric_value(candidate_run, tag)
+            row[f"{tag}:reference"] = reference_value
+            row[f"{tag}:candidate"] = candidate_value
+            row[f"{tag}:delta"] = candidate_value - reference_value
+        row["nvml/steady_mean_gpu_util_percent:reference"] = reference_run.summary["nvml"].get(
+            "steady_mean_gpu_util_percent"
+        )
+        row["nvml/steady_mean_gpu_util_percent:candidate"] = candidate_run.summary["nvml"].get(
+            "steady_mean_gpu_util_percent"
+        )
+        row["nvml/peak_memory_used_mib:reference"] = reference_run.summary["nvml"].get("peak_memory_used_mib")
+        row["nvml/peak_memory_used_mib:candidate"] = candidate_run.summary["nvml"].get("peak_memory_used_mib")
+        paired_runs.append(row)
+
+    result: dict[str, Any] = {"paired_runs": paired_runs, "paired_seed_count": len(paired_runs)}
+    for tag in ratio_tags:
+        ratios = [1 + row[f"{tag}:improvement"] for row in paired_runs]
+        result[f"{tag}:geomean_improvement"] = _geometric_mean(ratios) - 1
+    step_time_ratios = [1 - row["perf/step_time:reduction"] for row in paired_runs]
+    result["perf/step_time:geomean_reduction"] = 1 - _geometric_mean(step_time_ratios)
+    return result
+
+
+def _build_steady_campaign(
+    analyses: Sequence[RunAnalysis],
+    *,
+    windows: Sequence[tuple[int, int]],
+    expected_gpu_count: int,
+    enforce_targets: bool,
+) -> dict[str, Any]:
+    if _measurement_scope(windows) != "steady_state":
+        _fail("steady campaign requires warmup-excluded steady-state measurement windows")
+    steady_steps = _stable_steps(windows)
+    if len(steady_steps) < 30:
+        _fail(f"steady campaign requires at least 30 measured optimizer steps, got {len(steady_steps)}")
+    if expected_gpu_count <= 0:
+        _fail(f"expected_gpu_count must be positive, got {expected_gpu_count}")
+
+    by_condition: dict[str, list[RunAnalysis]] = defaultdict(list)
+    for analysis in analyses:
+        by_condition[_steady_condition(analysis)].append(analysis)
+    if set(by_condition) != set(STEADY_CAMPAIGN_CONDITIONS):
+        _fail(f"steady campaign requires B/P/P+R/P+S, got {sorted(by_condition)}")
+
+    comparison_fields = COMPARISON_FIXED_MANIFEST_FIELDS + COMPARISON_WORKLOAD_MANIFEST_FIELDS
+    missing_fields = {
+        str(analysis.run_dir): sorted(set(comparison_fields) - set(analysis.manifest))
+        for analysis in analyses
+        if set(comparison_fields) - set(analysis.manifest)
+    }
+    if missing_fields:
+        _fail(f"steady campaign manifests are missing fixed fields: {missing_fields}")
+    for field in comparison_fields:
+        values = {json.dumps(analysis.manifest[field], sort_keys=True) for analysis in analyses}
+        if len(values) != 1:
+            _fail(f"steady campaign requires identical manifest field {field!r}, got {sorted(values)}")
+
+    by_seed: dict[Any, dict[str, RunAnalysis]] = defaultdict(dict)
+    for condition, condition_runs in by_condition.items():
+        for analysis in condition_runs:
+            seed = analysis.manifest["seed"]
+            if condition in by_seed[seed]:
+                _fail(f"duplicate steady condition {condition} for seed {seed}")
+            by_seed[seed][condition] = analysis
+    incomplete = {
+        seed: sorted(conditions)
+        for seed, conditions in by_seed.items()
+        if set(conditions) != set(STEADY_CAMPAIGN_CONDITIONS)
+    }
+    if incomplete:
+        _fail(f"steady campaign has unpaired condition seeds: {incomplete}")
+    if enforce_targets and len(by_seed) < 2:
+        _fail(f"steady campaign requires at least two independent seeds, got {len(by_seed)}")
+
+    condition_summaries: dict[str, Any] = {}
+    for condition, condition_runs in sorted(by_condition.items()):
+        run_summaries = []
+        for analysis in sorted(condition_runs, key=lambda item: str(item.manifest["seed"])):
+            context = f"{condition} seed={analysis.manifest['seed']}"
+            if int(analysis.manifest["num_rollout"]) < 40:
+                _fail(f"{context} requires at least 40 optimizer steps")
+            rollout_count = int(analysis.summary["trace"]["rollout_count"])
+            if rollout_count != int(analysis.manifest["num_rollout"]):
+                _fail(
+                    f"{context} optimizer update conservation failed: "
+                    f"trace={rollout_count}, manifest={analysis.manifest['num_rollout']}"
+                )
+            trace_steps = {int(row["rollout_id"]) for row in analysis.trace_rows}
+            missing_trace_steps = sorted(steady_steps - trace_steps)
+            if missing_trace_steps:
+                _fail(f"{context} is missing steady trace steps {missing_trace_steps}")
+            for tag in STEADY_CAMPAIGN_REQUIRED_TAGS:
+                metric_steps = {
+                    int(row["step"])
+                    for row in analysis.scalar_rows
+                    if row["tag"] == tag and int(row["step"]) in steady_steps
+                }
+                missing_metric_steps = sorted(steady_steps - metric_steps)
+                if missing_metric_steps:
+                    _fail(f"{context} {tag} is missing steady steps {missing_metric_steps}")
+            gpu_count = analysis.summary["nvml"].get("gpu_count")
+            if gpu_count != expected_gpu_count:
+                _fail(f"{context} expected NVML data for {expected_gpu_count} GPUs, got {gpu_count!r}")
+            per_gpu = analysis.summary["nvml"].get("per_gpu", {})
+            missing_nvml = sorted(
+                gpu for gpu, summary in per_gpu.items() if int(summary.get("steady_sample_count", 0)) <= 0
+            )
+            if len(per_gpu) != expected_gpu_count or missing_nvml:
+                _fail(f"{context} has incomplete steady per-GPU NVML data: {missing_nvml}")
+
+            steady_rows = [row for row in analysis.trace_rows if int(row["rollout_id"]) in steady_steps]
+            expected_samples = int(analysis.manifest["global_batch_size"])
+            if any(int(row["actor_fetch_samples"]) != expected_samples for row in steady_rows):
+                _fail(f"{context} failed steady sample conservation")
+            run_summaries.append(
+                {
+                    "run_dir": str(analysis.run_dir),
+                    "seed": analysis.manifest["seed"],
+                    "optimizer_update_count": rollout_count,
+                    "measured_optimizer_step_count": len(steady_steps),
+                    "perf/step_token_per_s": _steady_metric_value(analysis, "perf/step_token_per_s"),
+                    "perf/wall_clock_samples_per_s": _steady_metric_value(analysis, "perf/wall_clock_samples_per_s"),
+                    "perf/step_time": analysis.summary["metrics"]["perf/step_time"],
+                    "rollout/raw_reward": analysis.summary["metrics"]["rollout/raw_reward"],
+                    "rollout/image_count/mean": analysis.summary["metrics"]["rollout/image_count/mean"],
+                    "train/loss": analysis.summary["metrics"]["train/loss"],
+                    "train/grad_norm": analysis.summary["metrics"]["train/grad_norm"],
+                    "train/ppo_kl": analysis.summary["metrics"]["train/ppo_kl"],
+                    "steady_actor_fetch_samples": sum(int(row["actor_fetch_samples"]) for row in steady_rows),
+                    "steady_actor_total_tokens": sum(int(row["actor_total_tokens"]) for row in steady_rows),
+                    "steady_actor_response_tokens": sum(int(row["actor_response_tokens"]) for row in steady_rows),
+                    "steady_actor_multimodal_tensor_bytes": sum(
+                        int(row["actor_multimodal_tensor_bytes"]) for row in steady_rows
+                    ),
+                    "nvml": analysis.summary["nvml"],
+                }
+            )
+        condition_summaries[condition] = {
+            "runs": run_summaries,
+            "perf/step_token_per_s": _distribution_summary(row["perf/step_token_per_s"] for row in run_summaries),
+            "perf/wall_clock_samples_per_s": _distribution_summary(
+                row["perf/wall_clock_samples_per_s"] for row in run_summaries
+            ),
+        }
+
+    comparisons = {}
+    for candidate, reference in (
+        ("P", "B"),
+        ("P+R", "B"),
+        ("P+S", "B"),
+        ("P+R", "P"),
+        ("P+S", "P"),
+    ):
+        comparisons[f"{candidate}_vs_{reference}"] = _steady_pair_summary(
+            by_seed,
+            candidate=candidate,
+            reference=reference,
+            steady_steps=steady_steps,
+        )
+    return {
+        "measurement_scope": "steady_state",
+        "claim_limit": None,
+        "steady_windows": [list(window) for window in windows],
+        "warmup_excluded_step_count": min(steady_steps),
+        "measured_optimizer_step_count": len(steady_steps),
+        "independent_seed_count": len(by_seed),
+        "seeds": sorted(by_seed, key=str),
+        "conditions": condition_summaries,
+        "comparisons": comparisons,
+        "validation": "passed",
     }
 
 
@@ -1722,14 +2058,61 @@ def _plot_comparison(
     return generated
 
 
+def _load_steady_campaign_descriptor(path: Path) -> dict[str, Any]:
+    path = path.resolve()
+    try:
+        descriptor = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _fail(f"cannot parse steady campaign descriptor {path}: {exc}")
+    if not isinstance(descriptor, dict):
+        _fail(f"steady campaign descriptor {path} must contain a JSON object")
+    if descriptor.get("schema_version") != 1:
+        _fail(f"steady campaign descriptor {path} requires schema_version=1")
+
+    run_dirs = descriptor.get("run_dirs")
+    completed_runs_file = descriptor.get("completed_runs_file")
+    if (run_dirs is None) == (completed_runs_file is None):
+        _fail(f"{path} must define exactly one of run_dirs or completed_runs_file")
+    if completed_runs_file is not None:
+        completed_path = Path(str(completed_runs_file))
+        if not completed_path.is_absolute():
+            completed_path = path.parent / completed_path
+        try:
+            run_dirs = [
+                line.strip() for line in completed_path.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+        except OSError as exc:
+            _fail(f"cannot read completed steady runs {completed_path}: {exc}")
+    if not isinstance(run_dirs, list) or not run_dirs or any(not isinstance(item, str) for item in run_dirs):
+        _fail(f"{path} run_dirs must be a non-empty string list")
+
+    resolved_run_dirs = []
+    for item in run_dirs:
+        run_dir = Path(item)
+        if not run_dir.is_absolute():
+            run_dir = path.parent / run_dir
+        resolved_run_dirs.append(run_dir.resolve())
+    descriptor["run_dirs"] = resolved_run_dirs
+    return descriptor
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--run-dir",
         action="append",
         type=Path,
-        required=True,
+        default=[],
         help="Benchmark run directory. Repeat for paired baseline/experiment comparison.",
+    )
+    parser.add_argument(
+        "--steady-campaign",
+        type=Path,
+        default=None,
+        help=(
+            "JSON descriptor for a B/P/P+R/P+S steady-state campaign. The descriptor supplies "
+            "run_dirs (or completed_runs_file), steady_windows, and expected topology values."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -1769,6 +2152,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require the preregistered 5%% throughput, 15%% phase-1, and 80%% overlap targets.",
     )
     parser.add_argument(
+        "--enforce-steady-targets",
+        action="store_true",
+        help=(
+            "Require the four-condition steady protocol: at least 40 optimizer steps, 30 "
+            "warmup-excluded measured steps, two paired seeds, fixed workload/hardware, complete "
+            "correctness metrics, and steady NVML coverage."
+        ),
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Do not generate comparison PNG files.",
@@ -1779,23 +2171,47 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        windows = _parse_windows(args.steady_windows)
-        if args.expected_samples <= 0 or args.expected_actor_chunks <= 0 or args.expected_gpu_count <= 0:
+        descriptor = None
+        run_dirs = list(args.run_dir)
+        steady_windows = args.steady_windows
+        expected_samples = args.expected_samples
+        expected_actor_chunks = args.expected_actor_chunks
+        expected_gpu_count = args.expected_gpu_count
+        output_dir = args.output_dir
+        if args.steady_campaign is not None:
+            if run_dirs:
+                _fail("--steady-campaign cannot be combined with --run-dir")
+            descriptor = _load_steady_campaign_descriptor(args.steady_campaign)
+            run_dirs = descriptor["run_dirs"]
+            steady_windows = descriptor.get("steady_windows", steady_windows)
+            expected_samples = descriptor.get("expected_samples", expected_samples)
+            expected_actor_chunks = descriptor.get("expected_actor_chunks", expected_actor_chunks)
+            expected_gpu_count = descriptor.get("expected_gpu_count", expected_gpu_count)
+            if output_dir is None and descriptor.get("output_dir") is not None:
+                output_dir = Path(str(descriptor["output_dir"]))
+        if not run_dirs:
+            _fail("at least one --run-dir or --steady-campaign is required")
+        windows = _parse_windows(str(steady_windows))
+        if expected_samples <= 0 or expected_actor_chunks <= 0 or expected_gpu_count <= 0:
             _fail("expected sample, actor chunk, and GPU counts must be positive")
-        if len(args.run_dir) > 1 and args.output_dir is None:
+        if len(run_dirs) > 1 and output_dir is None and not args.validate_only:
             _fail("--output-dir is required when comparing multiple runs")
         if args.validate_only and args.enforce_targets:
             _fail("--validate-only and --enforce-targets are mutually exclusive")
+        if args.enforce_targets and args.enforce_steady_targets:
+            _fail("--enforce-targets and --enforce-steady-targets are mutually exclusive")
+        if args.enforce_steady_targets and args.steady_campaign is None:
+            _fail("--enforce-steady-targets requires --steady-campaign")
 
         analyses = [
             analyze_run(
                 run_dir,
                 windows=windows,
-                expected_samples=args.expected_samples,
-                expected_actor_chunks=args.expected_actor_chunks,
-                require_reproducibility_artifacts=args.enforce_targets,
+                expected_samples=expected_samples,
+                expected_actor_chunks=expected_actor_chunks,
+                require_reproducibility_artifacts=(args.enforce_targets or args.enforce_steady_targets),
             )
-            for run_dir in args.run_dir
+            for run_dir in run_dirs
         ]
         result: dict[str, Any] = {
             "measurement_scope": _measurement_scope(windows),
@@ -1807,7 +2223,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             "runs": [analysis.summary for analysis in analyses],
             "validation": "passed",
         }
-        if len(analyses) > 1:
+        if descriptor is not None:
+            campaign = _build_steady_campaign(
+                analyses,
+                windows=windows,
+                enforce_targets=args.enforce_steady_targets,
+                expected_gpu_count=expected_gpu_count,
+            )
+            result["steady_campaign"] = campaign
+            if output_dir is not None:
+                resolved_output_dir = output_dir.resolve()
+                resolved_output_dir.mkdir(parents=True, exist_ok=True)
+                (resolved_output_dir / "steady_campaign_summary.json").write_text(
+                    json.dumps(result, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                for name, comparison in campaign["comparisons"].items():
+                    _write_csv(
+                        resolved_output_dir / f"{name.replace('+', '_plus_')}_paired_runs.csv",
+                        comparison["paired_runs"],
+                    )
+        elif len(analyses) > 1:
             comparison = _build_comparison(
                 analyses,
                 windows=windows,
@@ -1815,16 +2251,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_gpu_count=args.expected_gpu_count,
             )
             result["comparison"] = comparison
-            output_dir = args.output_dir.resolve()
-            output_dir.mkdir(parents=True, exist_ok=True)
+            resolved_output_dir = output_dir.resolve()
+            resolved_output_dir.mkdir(parents=True, exist_ok=True)
             if not args.no_plots:
-                result["plots"] = _plot_comparison(analyses, comparison, output_dir, windows)
-            (output_dir / "comparison_summary.json").write_text(
+                result["plots"] = _plot_comparison(analyses, comparison, resolved_output_dir, windows)
+            (resolved_output_dir / "comparison_summary.json").write_text(
                 json.dumps(result, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            _write_csv(output_dir / "paired_run_summary.csv", comparison["paired_runs"])
-            _write_csv(output_dir / "window_speedup_summary.csv", comparison["window_speedups"])
+            _write_csv(resolved_output_dir / "paired_run_summary.csv", comparison["paired_runs"])
+            _write_csv(resolved_output_dir / "window_speedup_summary.csv", comparison["window_speedups"])
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except BenchmarkValidationError as exc:
