@@ -843,7 +843,8 @@ async def generate_and_rm_group(
     # data_source), encode once and attach the result to every sample so that
     # generate() picks up the pre-encoded data instead of re-encoding per sample.
     first_mm = getattr(group[0], "multimodal_inputs", None)
-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+    has_media = first_mm is not None and any(first_mm.get(key) for key in ("images", "videos", "audio"))
+    if has_media and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
         encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
         for sample in group:
             sample._pre_encoded_mm = encoded_mm

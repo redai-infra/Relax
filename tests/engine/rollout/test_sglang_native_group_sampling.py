@@ -497,6 +497,31 @@ async def test_generate_and_rm_group_strips_pre_encoded_media_when_fallback_fail
         assert not hasattr(sample, "_pre_encoded_mm_elapsed")
 
 
+async def test_generate_and_rm_group_skips_pre_encoding_for_empty_media(monkeypatch) -> None:
+    state = _NativeState()
+    args = _native_args(sglang_native_group_sampling=False)
+    group = [Sample(prompt="same", multimodal_inputs={})]
+
+    async def unexpected_encode(multimodal_inputs):
+        raise AssertionError("empty multimodal inputs must not be encoded")
+
+    async def fake_generate_and_rm(args_arg, sample, sampling_params, evaluation=False):
+        return sample
+
+    async def fake_rm(args_arg, group_arg):
+        return [0.0] * len(group_arg)
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda _args: state)
+    monkeypatch.setattr(sglang_rollout, "_encode_multimodal_inputs", unexpected_encode)
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+    monkeypatch.setattr(sglang_rollout, "batched_async_rm", fake_rm)
+
+    result = await sglang_rollout.generate_and_rm_group(args, group, {"max_new_tokens": 32})
+
+    assert result[0] is group[0]
+    assert result[0].reward == 0.0
+
+
 async def test_generate_and_rm_group_warns_once_for_ineligible_groups(monkeypatch) -> None:
     state = _NativeState()
     args = _native_args(partial_rollout=True)
