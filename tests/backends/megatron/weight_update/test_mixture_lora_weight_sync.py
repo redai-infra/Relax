@@ -547,6 +547,7 @@ def test_update_lifecycle_keeps_call_order_and_skips_base_after_first_sync():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.all_reduce"),
         patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
+        patch("relax.backends.megatron.weight_update.synchronized_send.get_gloo_group", return_value=None),
         patch("ray.get", side_effect=lambda refs: refs),
     ):
         updater._update_weights_mixture_lora()
@@ -606,6 +607,7 @@ def test_update_failure_keeps_generation_paused_and_preserves_version():
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.all_reduce"),
         patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
+        patch("relax.backends.megatron.weight_update.synchronized_send.get_gloo_group", return_value=None),
         patch("ray.get", side_effect=lambda refs: refs),
         pytest.raises(RuntimeError, match="engine rejected routed weights"),
     ):
@@ -627,12 +629,13 @@ def test_stream_failure_does_not_publish_the_final_versioned_chunk():
     with (
         patch("ray.get", side_effect=RuntimeError("engine update failed")),
         patch(
-            "relax.backends.megatron.weight_update.update_weight_from_tensor."
+            "relax.backends.megatron.weight_update.synchronized_send."
             "device_utils.maybe_backend_barrier_on_weight_chunk"
         ) as chunk_barrier,
         patch("torch.distributed.get_rank", return_value=0),
         patch("torch.distributed.all_reduce"),
         patch("relax.backends.megatron.weight_update.update_weight_from_tensor.get_gloo_group", return_value=None),
+        patch("relax.backends.megatron.weight_update.synchronized_send.get_gloo_group", return_value=None),
         pytest.raises(RuntimeError, match="engine update failed"),
     ):
         updater._send_weight_update_stream([([("first", torch.ones(1))], None), ([("second", torch.ones(1))], 5)])

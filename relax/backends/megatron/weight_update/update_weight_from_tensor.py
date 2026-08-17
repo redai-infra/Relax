@@ -14,7 +14,6 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
-from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
@@ -32,6 +31,7 @@ from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .lora_adapter_sync import LoraAdapterSync
 from .mixture_lora_sync import MixtureLoraSync
+from .synchronized_send import run_synchronized_phase, send_chunks_pipelined
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -263,27 +263,14 @@ class UpdateWeightFromTensor:
 
         # Pipeline: when chunk N's IPC refs are in-flight on the engine,
         # chunk N+1's HF conversion + serialize + gather can proceed in
-        # parallel.  We defer ``ray.get`` to the *next* iteration so the
-        # two stages overlap.
-        prev_refs: list[ObjectRef] = []
-        prev_long_lived_tensors = None
+        # parallel.  The shared primitive defers each ``ray.get`` to the
+        # *next* iteration and synchronizes its failures across ranks.
         with export_ctx:
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-                # Wait for the *previous* chunk's IPC to finish before
-                # releasing its GPU tensors.
-                if prev_refs:
-                    ray.get(prev_refs)
-                del prev_long_lived_tensors
-                prev_refs = refs
-                prev_long_lived_tensors = long_lived_tensors
-                # Backend-specific per-chunk synchronization is handled in device
-                # utils so this path stays hardware-agnostic.
-                device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-            # Drain the last chunk.
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
+            send_chunks_pipelined(
+                self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights),
+                self._send_hf_params,
+                description="base weight chunk transfer",
+            )
 
         # All ranks must finish sending before rank 0 triggers Marlin repack,
         # otherwise engines in slower gather groups may still be processing
@@ -358,7 +345,9 @@ class UpdateWeightFromTensor:
             ray.get([engine.continue_generation.remote() for engine in all_engines])
 
         for phase_name, operation in (("pause and flush", pause_and_flush), ("send weights", send_weights)):
-            local_error, phase_failed = self._run_synchronized_weight_update_phase(operation)
+            local_error, phase_failed = run_synchronized_phase(
+                operation, description=f"Mixture-of-LoRA weight update phase {phase_name!r}"
+            )
             if not phase_failed:
                 continue
 
@@ -371,8 +360,9 @@ class UpdateWeightFromTensor:
                 raise local_error
             raise RuntimeError(f"Mixture-of-LoRA weight update phase {phase_name!r} failed on another rank")
 
-        local_error, phase_failed = self._run_synchronized_weight_update_phase(
-            lambda: resume_generation(finish_quantization=True)
+        local_error, phase_failed = run_synchronized_phase(
+            lambda: resume_generation(finish_quantization=True),
+            description="Mixture-of-LoRA weight update phase 'resume generation'",
         )
         if phase_failed:
             if local_error is not None:
@@ -382,62 +372,20 @@ class UpdateWeightFromTensor:
         self.weight_version = next_weight_version
         self._mixture_lora_sync.base_sync_done = True
 
-    @staticmethod
-    def _run_synchronized_weight_update_phase(operation):
-        """Run one update phase and share its failure state across ranks."""
-
-        local_error = None
-        try:
-            operation()
-        except Exception as error:
-            local_error = error
-            logger.error(
-                "Weight update phase failed on rank %d before failure synchronization",
-                dist.get_rank(),
-                exc_info=(type(error), error, error.__traceback__),
-            )
-        failed = torch.tensor([local_error is not None], dtype=torch.int32)
-        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=get_gloo_group())
-        return local_error, bool(failed.item())
-
     def _send_weight_update_stream(self, updates) -> None:
-        """Pipeline conversion collectives with the preceding IPC request."""
+        """Pipeline conversion collectives with the preceding IPC request.
 
-        previous_refs: list[ObjectRef] = []
-        previous_tensors = None
-        has_previous_chunk = False
-        for named_tensors, weight_version in updates:
-            # The versioned final chunk makes the whole update visible. Confirm
-            # the preceding chunk on every rank before publishing that version.
-            if weight_version is not None and has_previous_chunk:
-                previous_error, previous_failed = self._run_synchronized_weight_update_phase(
-                    lambda: ray.get(previous_refs) if previous_refs else None
-                )
-                del previous_tensors
-                previous_refs = []
-                previous_tensors = None
-                if previous_failed:
-                    if previous_error is not None:
-                        raise previous_error
-                    raise RuntimeError("A preceding Mixture-of-LoRA weight chunk failed on another rank")
+        ``updates`` yields ``(named_tensors, weight_version)``; the versioned
+        final chunk makes the whole update visible, so every preceding chunk is
+        confirmed on every rank before it is sent.
+        """
 
-            refs, long_lived_tensors = self._send_hf_params(named_tensors, weight_version=weight_version)
-            previous_error = None
-            if previous_refs:
-                try:
-                    ray.get(previous_refs)
-                except Exception as error:
-                    previous_error = error
-            del previous_tensors
-            previous_refs = refs
-            previous_tensors = long_lived_tensors
-            has_previous_chunk = True
-            device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-            if previous_error is not None:
-                raise previous_error
-        if previous_refs:
-            ray.get(previous_refs)
-        del previous_tensors
+        send_chunks_pipelined(
+            updates,
+            lambda update: self._send_hf_params(update[0], weight_version=update[1]),
+            description="Mixture-of-LoRA weight chunk transfer",
+            confirm_before=lambda update: update[1] is not None,
+        )
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -505,18 +453,11 @@ class UpdateWeightFromTensor:
         # 1) Send BASE weights only. In adapter mode the HF iterator pulls adapter params OUT of
         #    the conversion buckets (collect_adapters=True) without merging, so only base weights
         #    flow through SGLang's base-model load_weights (which has no notion of lora_A/lora_B).
-        prev_refs: list[ObjectRef] = []
-        prev_long_lived_tensors = None
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
-            prev_refs = refs
-            prev_long_lived_tensors = long_lived_tensors
-        if prev_refs:
-            ray.get(prev_refs)
-        del prev_long_lived_tensors
+        send_chunks_pipelined(
+            self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights),
+            self._send_hf_params,
+            description="adapter-mode base weight chunk transfer",
+        )
 
         dist.barrier(group=get_gloo_group())
 
