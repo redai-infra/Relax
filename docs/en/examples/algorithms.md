@@ -4,6 +4,9 @@ Relax supports multiple policy gradient algorithms, all selected via the `--adva
 
 GRPO, CISPO, GSPO, and SAPO share the same service topology, so their argument blocks can be swapped in existing scripts. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
+Dr.GRPO combines centered group advantages with a fixed-scale token-sum policy
+loss. Both changes can be enabled explicitly in a GRPO training recipe.
+
 REINFORCE++ and REINFORCE++-baseline also reuse the GRPO service topology, but
 their return, global normalization and KL contracts are algorithm-specific.
 See [REINFORCE++ Training](../guide/reinforce-plus-plus.md) before enabling
@@ -44,6 +47,78 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## Dr.GRPO
+
+Dr.GRPO applies two modifications to the standard GRPO objective: it removes
+group standard-deviation normalization from the advantage, and normalizes the
+policy-gradient token loss by one fixed response-length scale. This reduces
+the dependence of the objective on the sampled response lengths while keeping
+the existing GRPO policy objective.
+
+Reference: [Dr.GRPO](https://arxiv.org/abs/2503.20783).
+
+### How It Works
+
+For a prompt group with rewards $R_1, \ldots, R_G$, Dr.GRPO uses the centered
+advantage
+
+$$A_i = R_i - \frac{1}{G}\sum_{j=1}^{G}R_j$$
+
+instead of dividing the centered reward by the group standard deviation. With
+response-token mask $m_{i,t}$, token-level policy loss $\ell_{i,t}$, global
+response batch size $B$, and fixed scale $S$, the fixed-scale aggregation is
+
+$$
+\mathcal{L}_{\mathrm{Dr.GRPO}} =
+\frac{1}{B}\sum_{i=1}^{B}
+\frac{\sum_t m_{i,t}\ell_{i,t}}{S},
+\qquad
+S = \texttt{--pg-loss-scale-factor}.
+$$
+
+The default `seq-mean-token-mean` aggregation gives each response an equal
+token-mean contribution. `seq-mean-token-sum-norm` instead sums the valid
+token losses for each response and divides by the same $S$, so the relative
+contribution of a response follows its number of valid response tokens.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--advantage-estimator grpo` | `grpo` | Select the GRPO advantage computation used by Dr.GRPO |
+| `--disable-grpo-std-normalization` | not set | Use centered group rewards without group standard-deviation normalization |
+| `--pg-loss-aggregation` | `seq-mean-token-mean` | Set to `seq-mean-token-sum-norm` for fixed-scale token-sum aggregation |
+| `--pg-loss-scale-factor` | `None` | Fixed token-sum scale; when omitted, it is resolved from `--rollout-max-response-len` |
+| `--calculate-per-token-loss` | — | Enable the per-token loss path used by the Dr.GRPO recipe |
+
+### Quick Start
+
+The explicit Dr.GRPO argument block is:
+
+```bash
+DR_GRPO_ARGS=(
+   --advantage-estimator grpo
+   --disable-grpo-std-normalization
+   --pg-loss-aggregation seq-mean-token-sum-norm
+   --calculate-per-token-loss
+)
+```
+
+The paired Qwen3.5-4B recipe uses the same script for Dr.GRPO and standard
+GRPO. Set `USE_DRGRPO=1` to run the Dr.GRPO configuration:
+
+```bash
+MODEL_DIR=/path/to/model/root \
+DATA_DIR=/path/to/data/root \
+USE_DRGRPO=1 \
+bash examples/algorithms/dr_grpo/run-qwen35-4B-dr-grpo-2xgpu.sh
+```
+
+Set `USE_DRGRPO=0` with the same command to run the standard GRPO arm of the
+paired recipe.
 
 ---
 
@@ -213,6 +288,7 @@ SAPO_ARGS=(
 |-----------|----------------------|-------------|---------------|
 | **PPO** | Critic values + GAE | PPO-Clip (hard clip) | Disabled in the current synchronous topology |
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
+| **Dr.GRPO** | Centered group reward without std normalization | Fixed-scale token-sum aggregation | Optional KL loss |
 | **REINFORCE++** | Token KL-to-go return + global token normalization | PPO-Clip (hard clip) | k1 KL in shaped reward |
 | **REINFORCE++-baseline** | Inclusive group mean + global token normalization | PPO-Clip (hard clip) | Separate k2 KL loss |
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |

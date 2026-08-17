@@ -136,6 +136,7 @@ def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkey
 
     args = Namespace(
         balance_data=True,
+        calculate_per_token_loss=False,
         global_batch_size=32,
         micro_batch_size=4,
         use_dynamic_batch_size=False,
@@ -173,6 +174,7 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
 
     args = Namespace(
         balance_data=True,
+        calculate_per_token_loss=False,
         global_batch_size=16,
         micro_batch_size=4,
         use_dynamic_batch_size=False,

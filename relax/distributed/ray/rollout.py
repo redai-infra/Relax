@@ -41,6 +41,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import (
     compute_pass_rate,
+    compute_response_length_metrics,
     compute_rollout_explicit_reward_metrics,
     compute_rollout_step,
     compute_statistics,
@@ -3981,6 +3982,7 @@ def compute_metrics_from_samples(args, samples):
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    log_dict |= compute_response_length_metrics(args, samples)
     log_dict |= _compute_min_mean_max_stats([s["image_count"] for s in multimodal_stats], "image_count/")
     log_dict |= _compute_min_mean_max_stats(
         [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"

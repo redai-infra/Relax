@@ -646,6 +646,7 @@ class DataIterator:
         micro_batch_size: int | None = None,
         micro_batch_indices: list[list[int]] | None = None,
         max_tokens_per_gpu: int | None = None,
+        per_microbatch_loss_normalizers: list[torch.Tensor | None] | None = None,
     ) -> None:
         """Initialize an iterator over `rollout_data`.
 
@@ -663,8 +664,10 @@ class DataIterator:
         self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
         self.max_tokens_per_gpu = max_tokens_per_gpu
+        self.per_microbatch_loss_normalizers = per_microbatch_loss_normalizers
         assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
+        self.microbatch_offset = 0
 
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch for the requested keys.
@@ -676,6 +679,7 @@ class DataIterator:
 
         Returns a dict mapping each key to a list subset (or None if absent).
         """
+        microbatch_index = self.microbatch_offset
         batch = {}
         for key in keys:
             vals = self.rollout_data.get(key, None)
@@ -695,11 +699,15 @@ class DataIterator:
             self.offset += 1
         else:
             self.offset += self.micro_batch_size
+        self.microbatch_offset += 1
+        if self.per_microbatch_loss_normalizers is not None:
+            batch["__per_token_loss_normalizer__"] = self.per_microbatch_loss_normalizers[microbatch_index]
         return batch
 
     def reset(self) -> "DataIterator":
         """Reset internal offset to the start and return self."""
         self.offset = 0
+        self.microbatch_offset = 0
         return self
 
 
@@ -790,15 +798,53 @@ def get_data_iterator(
             f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
         )
 
-    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None, max_tokens_per_gpu=None):
+    def _generate_data_iterator(
+        rollout_data,
+        micro_batch_size,
+        micro_batch_indices=None,
+        max_tokens_per_gpu=None,
+        per_microbatch_loss_normalizers=None,
+    ):
         data_iterator = []
         for _ in range(vpp_size):
-            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices, max_tokens_per_gpu))
+            data_iterator.append(
+                DataIterator(
+                    rollout_data,
+                    micro_batch_size,
+                    micro_batch_indices,
+                    max_tokens_per_gpu,
+                    per_microbatch_loss_normalizers,
+                )
+            )
         return data_iterator
 
     if step_local_sample_counts is None:
         step_local_sample_counts = [num_local_gbs for _ in range(num_steps_per_rollout)]
 
+    # Compute one step-global masked response-token count before building microbatches.
+    use_fixed_sum_normalizer = (
+        args.calculate_per_token_loss
+        and getattr(args, "pg_loss_aggregation", "seq-mean-token-mean") == "seq-mean-token-sum-norm"
+    )
+    step_loss_normalizers: tuple[torch.Tensor, ...] | None = None
+    if use_fixed_sum_normalizer:
+        step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
+        masks = rollout_data["loss_masks"]
+        normalizer_device = masks[0].device if masks else device_utils.make_current_torch_device()
+        zero = torch.zeros((), dtype=torch.float, device=normalizer_device)
+        step_token_counts = [
+            sum((mask.sum() for mask in masks[step_offsets[i] : step_offsets[i + 1]]), zero)
+            for i in range(num_steps_per_rollout)
+        ]
+        local_normalizers = torch.stack(step_token_counts).to(
+            device=device_utils.make_current_torch_device(), dtype=torch.float
+        )
+        dist.all_reduce(local_normalizers, op=dist.ReduceOp.SUM, group=dp_group)
+        step_loss_normalizers = local_normalizers.unbind()
+
+    micro_batch_size = None
+    micro_batch_indices = None
+    iterator_max_tokens_per_gpu = None
     if not args.use_dynamic_batch_size:
         invalid_counts = [count for count in step_local_sample_counts if count % args.micro_batch_size != 0]
         if invalid_counts:
@@ -807,10 +853,11 @@ def get_data_iterator(
                 f"got invalid_counts={invalid_counts}, micro_batch_size={args.micro_batch_size}"
             )
         num_microbatches = [count // args.micro_batch_size for count in step_local_sample_counts]
-        data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+        micro_batch_size = args.micro_batch_size
     else:
         _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
         assert _max_tokens is not None
+        iterator_max_tokens_per_gpu = _max_tokens
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
@@ -862,7 +909,25 @@ def get_data_iterator(
         logger.info(
             f"After dynamic batching, num_microbatches: {num_microbatches}, micro_batch_indices: {micro_batch_indices}"
         )
-        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices, _max_tokens)
+
+    per_microbatch_loss_normalizers = None
+    if step_loss_normalizers is not None:
+        if len(step_loss_normalizers) != len(num_microbatches):
+            raise ValueError("step_loss_normalizers and num_microbatches must have the same length.")
+        # Keep one step-global denominator for all of that step's micro-batches.
+        per_microbatch_loss_normalizers = [
+            step_loss_normalizers[step_index]
+            for step_index, microbatch_count in enumerate(num_microbatches)
+            for _ in range(microbatch_count)
+        ]
+
+    data_iterator = _generate_data_iterator(
+        rollout_data,
+        micro_batch_size,
+        micro_batch_indices,
+        iterator_max_tokens_per_gpu,
+        per_microbatch_loss_normalizers,
+    )
 
     return (
         data_iterator,

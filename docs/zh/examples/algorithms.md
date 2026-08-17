@@ -4,6 +4,8 @@ Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数�
 
 GRPO、CISPO、GSPO 与 SAPO 使用相同的服务拓扑，可以直接在现有脚本中替换算法参数块。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
+Dr.GRPO 将组内中心化 advantage 与固定尺度 token-sum policy loss 组合起来。两个修改都可以在 GRPO 训练 recipe 中显式启用。
+
 REINFORCE++ 与 REINFORCE++-baseline 同样复用 GRPO 服务拓扑，但 return、全局归一化和 KL 契约由算法单独定义。启用任一 estimator 前，请先阅读 [REINFORCE++ 训练文档](../guide/reinforce-plus-plus.md)。
 
 ---
@@ -41,6 +43,66 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## Dr.GRPO
+
+Dr.GRPO 对标准 GRPO 目标做两个修改：移除 advantage 的组内标准差归一化，并使用一个固定的回复长度尺度归一化 policy-gradient token loss。在保留现有 GRPO 策略目标的同时，降低目标函数对采样回复长度的依赖。
+
+参考论文：[Dr.GRPO](https://arxiv.org/abs/2503.20783)。
+
+### 算法原理
+
+对于一个奖励为 $R_1, \ldots, R_G$ 的 prompt group，Dr.GRPO 使用中心化 advantage：
+
+$$A_i = R_i - \frac{1}{G}\sum_{j=1}^{G}R_j$$
+
+不再将中心化后的 reward 除以组内标准差。设回复 token mask 为 $m_{i,t}$，token 级 policy loss 为 $\ell_{i,t}$，全局 response batch size 为 $B$，固定尺度为 $S$，则固定尺度 aggregation 为：
+
+$$
+\mathcal{L}_{\mathrm{Dr.GRPO}} =
+\frac{1}{B}\sum_{i=1}^{B}
+\frac{\sum_t m_{i,t}\ell_{i,t}}{S},
+\qquad
+S = \texttt{--pg-loss-scale-factor}
+$$
+
+默认的 `seq-mean-token-mean` aggregation 会让每个 response 都贡献一个等权的 token 均值。`seq-mean-token-sum-norm` 则对每个 response 求有效 token loss 之和，再除以同一个 $S$，因此 response 的相对贡献与其有效回复 token 数成比例。
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--advantage-estimator grpo` | `grpo` | 选择 Dr.GRPO 使用的 GRPO advantage 计算方式 |
+| `--disable-grpo-std-normalization` | 未设置 | 使用不进行组内标准差归一化的中心化 group reward |
+| `--pg-loss-aggregation` | `seq-mean-token-mean` | 设置为 `seq-mean-token-sum-norm` 以启用固定尺度 token-sum aggregation |
+| `--pg-loss-scale-factor` | `None` | 固定 token-sum 尺度；未设置时根据 `--rollout-max-response-len` 推导 |
+| `--calculate-per-token-loss` | — | 启用 Dr.GRPO recipe 使用的 per-token loss 路径 |
+
+### 快速开始
+
+显式的 Dr.GRPO 参数块如下：
+
+```bash
+DR_GRPO_ARGS=(
+   --advantage-estimator grpo
+   --disable-grpo-std-normalization
+   --pg-loss-aggregation seq-mean-token-sum-norm
+   --calculate-per-token-loss
+)
+```
+
+配对的 Qwen3.5-4B recipe 使用同一个脚本运行 Dr.GRPO 和标准 GRPO。设置 `USE_DRGRPO=1` 运行 Dr.GRPO 配置：
+
+```bash
+MODEL_DIR=/path/to/model/root \
+DATA_DIR=/path/to/data/root \
+USE_DRGRPO=1 \
+bash examples/algorithms/dr_grpo/run-qwen35-4B-dr-grpo-2xgpu.sh
+```
+
+使用相同命令将 `USE_DRGRPO=0`，即可运行配对 recipe 中的标准 GRPO 配置。
 
 ---
 
@@ -210,6 +272,7 @@ SAPO_ARGS=(
 |------|---------------|---------|-----------|
 | **PPO** | Critic value + GAE | PPO-Clip（硬裁剪） | 当前同步拓扑中禁用 |
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
+| **Dr.GRPO** | 不进行标准差归一化的中心化组奖励 | 固定尺度 token-sum aggregation | 可选 KL loss |
 | **REINFORCE++** | Token KL-to-go return + 全局 token 归一化 | PPO-Clip（硬裁剪） | shaped reward 中的 k1 KL |
 | **REINFORCE++-baseline** | Inclusive group mean + 全局 token 归一化 | PPO-Clip（硬裁剪） | 独立 k2 KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |

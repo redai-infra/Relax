@@ -1,5 +1,6 @@
 import logging
 import math
+from numbers import Real
 from typing import Any, Literal
 
 import numpy as np
@@ -85,6 +86,28 @@ def compute_statistics(values: list[float]) -> dict[str, float]:
         "max": np.max(values).item(),
         "min": np.min(values).item(),
     }
+
+
+def _is_correct_reward(reward: Any) -> bool:
+    if not isinstance(reward, Real):
+        raise TypeError(
+            "Correct/Incorrect response-length metrics require a numeric reward, "
+            f"got {type(reward).__name__}. Set --reward-key when the reward is a dict."
+        )
+    return reward > 0
+
+
+def compute_response_length_metrics(args, samples: list[Sample]) -> dict[str, float]:
+    response_lengths_by_category = {"Correct": [], "Incorrect": []}
+    for sample in samples:
+        category = "Correct" if _is_correct_reward(sample.get_reward_value(args)) else "Incorrect"
+        response_lengths_by_category[category].append(sample.effective_response_length)
+
+    log_dict = {}
+    for category, response_lengths in response_lengths_by_category.items():
+        if response_lengths:
+            log_dict[f"response_len/{category}/mean"] = sum(response_lengths) / len(response_lengths)
+    return log_dict
 
 
 def is_rollout_numeric_metric_value(value) -> bool:

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable
 
 import torch
@@ -163,6 +165,64 @@ def get_sum_of_sample_mean(
             )
 
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
+
+
+def get_sequence_loss_aggregator(
+    mode: str,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    scale_factor: float | None = None,
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build a response-level loss aggregator with CP-aware mask slicing."""
+    if mode == "seq-mean-token-mean":
+        return get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            loss_masks,
+            qkv_format=qkv_format,
+            max_seq_lens=max_seq_lens,
+            padded_total_lengths=padded_total_lengths,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
+        )
+    if mode != "seq-mean-token-sum-norm":
+        raise ValueError(f"Unsupported sequence loss aggregation mode: {mode}.")
+    if scale_factor is None or scale_factor <= 0:
+        raise ValueError(f"scale_factor must be positive, got {scale_factor}.")
+
+    sum_of_token = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        calculate_per_token_loss=True,
+        qkv_format=qkv_format,
+        max_seq_lens=max_seq_lens,
+        padded_total_lengths=padded_total_lengths,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
+    )
+
+    def sum_of_token_normalized(x: torch.Tensor) -> torch.Tensor:
+        return sum_of_token(x) / scale_factor
+
+    return sum_of_token_normalized
+
+
+def get_per_token_loss_scale(
+    num_microbatches: int,
+    global_batch_size: int,
+    data_parallel_world_size: int,
+    step_token_normalizer: float | torch.Tensor,
+) -> float | torch.Tensor:
+    """Scale a fixed-normalized loss before Megatron's per-token finalizer."""
+    base_scale = num_microbatches / global_batch_size * data_parallel_world_size
+    return base_scale * step_token_normalizer
 
 
 def get_cp_local_num_tokens(

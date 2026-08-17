@@ -1796,6 +1796,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="from Dr.GRPO https://arxiv.org/pdf/2503.20783",
             )
             parser.add_argument(
+                "--pg-loss-aggregation",
+                type=str,
+                choices=["seq-mean-token-mean", "seq-mean-token-sum-norm"],
+                default="seq-mean-token-mean",
+                help="Policy-gradient loss aggregation mode.",
+            )
+            parser.add_argument(
+                "--pg-loss-scale-factor",
+                type=float,
+                default=None,
+                help=(
+                    "Fixed token-sum normalizer for --pg-loss-aggregation seq-mean-token-sum-norm. "
+                    "Defaults to --rollout-max-response-len."
+                ),
+            )
+            parser.add_argument(
                 "--disable-rewards-normalization",
                 action="store_false",
                 dest="rewards_normalization",
@@ -2872,6 +2888,32 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _validate_pg_loss_aggregation(args: Any) -> None:
+    pg_loss_aggregation = getattr(args, "pg_loss_aggregation", "seq-mean-token-mean")
+    if pg_loss_aggregation != "seq-mean-token-sum-norm":
+        return
+    if args.advantage_estimator != "grpo":
+        raise ValueError("--pg-loss-aggregation seq-mean-token-sum-norm requires --advantage-estimator grpo.")
+    if args.pg_loss_scale_factor is None:
+        args.pg_loss_scale_factor = getattr(args, "rollout_max_response_len", None)
+    if args.pg_loss_scale_factor is None or args.pg_loss_scale_factor <= 0:
+        raise ValueError(
+            "--pg-loss-aggregation seq-mean-token-sum-norm requires a positive --pg-loss-scale-factor "
+            "or --rollout-max-response-len."
+        )
+    if args.calculate_per_token_loss and getattr(args, "fully_async", False):
+        raise ValueError(
+            "--pg-loss-aggregation seq-mean-token-sum-norm with --calculate-per-token-loss does not support "
+            "--fully-async because its streaming iterator has no step-global token normalizer."
+        )
+    if getattr(args, "grpo_std_normalization", True):
+        logger.warning(
+            "--pg-loss-aggregation seq-mean-token-sum-norm changes only the length normalization; "
+            "without --disable-grpo-std-normalization the group-mean advantage is still std-normalized. "
+            "This is not the Dr.GRPO objective from https://arxiv.org/pdf/2503.20783."
+        )
+
+
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
     """Validate the frozen Task 29 REINFORCE++ algorithm contracts."""
     if is_sft:
@@ -2998,6 +3040,8 @@ def slime_validate_args(args):
 
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
+
+    _validate_pg_loss_aggregation(args)
 
     if getattr(args, "lora_rank", 0) > 0:
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):

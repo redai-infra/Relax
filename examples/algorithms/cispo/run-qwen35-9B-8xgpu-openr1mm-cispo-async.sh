@@ -9,7 +9,7 @@
 # run-qwen35-9B-8xgpu-openr1mm-async.sh. Only the advantage estimator differs.
 #
 # Usage:
-#   bash examples/algorithms/run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh [async|sync]
+#   bash examples/algorithms/cispo/run-qwen35-9B-8xgpu-openr1mm-cispo-async.sh [async|sync]
 
 set -ex
 set -o pipefail
@@ -22,13 +22,13 @@ echo "当前时间: $now"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
+    source "${SCRIPT_DIR}/../../../scripts/entrypoint/local.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen35-9B.sh"
 # source "${MODEL_CONFIG_DIR}/qwen3-vl-4B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:=Relax/dev/fully_async_openr1mm}"
-EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=200}"

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -38,6 +40,8 @@ from .cp_utils import (
     all_gather_with_cp,
     get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
+    get_per_token_loss_scale,
+    get_sequence_loss_aggregator,
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
@@ -1039,8 +1043,15 @@ def policy_loss_function(
                 sum_of_sample_mean, modified_response_masks
             )
 
+    pg_loss_aggregation = getattr(args, "pg_loss_aggregation", "seq-mean-token-mean")
+
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        if pg_loss_aggregation != "seq-mean-token-mean":
+            raise ValueError(
+                "--pg-loss-aggregation seq-mean-token-sum-norm cannot be combined with "
+                "--custom-pg-loss-reducer-function-path."
+            )
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
         pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
@@ -1050,7 +1061,24 @@ def policy_loss_function(
         if is_reinforce_plus_plus:
             pg_loss_reducer = _get_reinforce_plus_plus_mask_safe_reducer(pg_loss_reducer, pg_loss_masks)
     else:
-        pg_loss_reducer = sum_of_sample_mean
+        if pg_loss_aggregation == "seq-mean-token-sum-norm":
+            pg_loss_masks = (
+                modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+            )
+            pg_loss_reducer = get_sequence_loss_aggregator(
+                pg_loss_aggregation,
+                total_lengths,
+                response_lengths,
+                pg_loss_masks,
+                args.pg_loss_scale_factor,
+                args.qkv_format,
+                max_seq_lens,
+                padded_total_lengths,
+                dynamic_cp_size=batch.get("dynamic_cp_size", None),
+                dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+            )
+        else:
+            pg_loss_reducer = sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -1414,6 +1442,8 @@ def loss_function(
     # mbs must contribute zero gradient AND zero metric values.
     is_dummy = batch.get("__is_dummy__", False)
     explicit_loss_scale = batch.get("__loss_scale__", None)
+    per_token_loss_normalizer = batch.get("__per_token_loss_normalizer__", None)
+    pg_loss_aggregation = getattr(args, "pg_loss_aggregation", "seq-mean-token-mean")
 
     # Rescale the loss for Megatron's gradient accumulation. The non-per-token
     # branch folds in the DP(+CP) world size (cancelled by DDP's 1/dp_cp grad
@@ -1437,6 +1467,18 @@ def loss_function(
     else:
         if is_dummy:
             loss = 0.0 * loss
+        elif pg_loss_aggregation == "seq-mean-token-sum-norm":
+            if per_token_loss_normalizer is None:
+                raise RuntimeError(
+                    "Missing step-global token normalizer for --pg-loss-aggregation seq-mean-token-sum-norm "
+                    "with --calculate-per-token-loss."
+                )
+            loss = loss * get_per_token_loss_scale(
+                num_microbatches,
+                global_batch_size,
+                mpu.get_data_parallel_world_size(with_context_parallel=True),
+                per_token_loss_normalizer,
+            )
         # Non-dummy per-token path: do NOT scale by cp_size. `loss` is the
         # CP-local token-sum; finalize_model_grads normalizes the summed gradient
         # by the all-reduced CP-local `num_tokens`. A `* cp_size` here would weight
