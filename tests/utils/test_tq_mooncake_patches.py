@@ -119,6 +119,11 @@ class TestMooncakeCorrectnessGuardPrimitives:
         with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
             store.batch_upsert_from(["k0", "k1"], [1, 2], [8, 8])
 
+    def test_get_short_result_is_raised(self):
+        store = _StrictMooncakeStoreProxy(_SequenceStore([[0]]))
+        with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
+            store.batch_get_into(["k0", "k1"], [1, 2], [8, 8])
+
     def test_remove_object_not_found_is_allowed(self):
         store = _StrictMooncakeStoreProxy(_SequenceStore([[0, -704]]))
         assert store.batch_remove(["k0", "k1"], force=True) == [0, -704]
@@ -183,6 +188,13 @@ class TestMooncakeCorrectnessGuards:
         client = _client_with_store(store)
         with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
             client._batch_upsert_with_retry(["k0", "k1"], [1, 2], [8, 8])
+
+    def test_get_retry_short_result_is_never_treated_as_success(self, monkeypatch):
+        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
+        store = _StrictMooncakeStoreProxy(_SequenceStore([[-1, -1], [0]]))
+        client = _client_with_store(store)
+        with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
+            client._batch_get_into_with_retry(["k0", "k1"], [1, 2], [8, 8])
 
     @pytest.mark.asyncio
     async def test_negative_production_status_ack_is_raised(self, monkeypatch):
