@@ -87,16 +87,23 @@ reward would define an unvalidated hybrid objective. The reward/verifier name
 valid for compatible datasets.
 
 With `--context-parallel-size > 1`, P3O automatically runs every THD
-self-attention layer on the reconstructed full sequence before slicing the
-result back to each CP rank. This strict path applies to both `micro-batch` and
-`step` ESS scopes and makes the QKV projection and attention kernel see the
-same token order and shape as CP1. It duplicates full-sequence QKV, attention,
-and projection compute and activations on every CP rank, so peak memory and
-compute are higher than native context parallelism; whole-layer activation
-recomputation is recommended for long contexts. The validated contract is
-currently standard zig-zag THD with tensor parallel size 1. If the full-sequence path runs out
-of memory, P3O aborts and refuses CP>1 instead of silently falling back to the
-non-equivalent native CP kernel order.
+TransformerLayer on the reconstructed full sequence before slicing the result
+back to each CP rank. This strict path applies to both `micro-batch` and `step`
+ESS scopes and makes QKV, attention, residual, and MLP kernels see the same
+token order and shape as CP1. It duplicates full-layer compute and activations
+on every CP rank, so peak memory and compute are higher than native context
+parallelism; whole-layer activation recomputation is recommended for long
+contexts. The supported contract is currently standard zig-zag THD with tensor
+parallel size 1. If the full-sequence path runs out of memory, P3O aborts and
+refuses CP>1 instead of silently falling back to the non-equivalent native CP
+kernel order.
+
+Strict partition invariance also requires Megatron `--deterministic-mode` and
+`--batch-invariant-mode`. The recipes enable both for matched P3O/GRPO runs and
+set `NCCL_ALGO=Ring`, `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` in the Ray runtime before model construction.
+Batch-invariant kernels cover the final normalization and LM head outside the
+wrapped TransformerLayers; P3O fails closed if either mode is absent.
 
 Formal defaults are G=16, global batch 64, micro-batch 1, rollout batch 4,
 response length 4096, and 30 optimizer steps (`--num-rollout 30`). The planned

@@ -212,6 +212,8 @@ def get_model_provider_func(
         # Override provider attributes with matching args values
         bridge_keys = [
             "attention_backend",
+            "deterministic_mode",
+            "batch_invariant_mode",
             "tensor_model_parallel_size",
             "sequence_parallel",
             "pipeline_model_parallel_size",

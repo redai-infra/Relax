@@ -21,10 +21,10 @@ from relax.backends.megatron.model import (
 )
 
 
-class _AttentionRoot(torch.nn.Module):
-    def __init__(self, attention: torch.nn.Module):
+class _LayerRoot(torch.nn.Module):
+    def __init__(self, layer: torch.nn.Module):
         super().__init__()
-        self.attention = attention
+        self.layer = layer
 
 
 class SelfAttention(torch.nn.Module):
@@ -77,6 +77,58 @@ class SelfAttention(torch.nn.Module):
         return output, torch.zeros(projected.shape[-1], dtype=projected.dtype)
 
 
+class TransformerLayer(torch.nn.Module):
+    """Megatron-shaped layer with a token-shape-sensitive post-attention
+    MLP."""
+
+    def __init__(self, cp_group: object, attention_weight: torch.Tensor, mlp_weight: torch.Tensor):
+        super().__init__()
+        self.self_attention = SelfAttention(cp_group, attention_weight)
+        self.mlp_weight = torch.nn.Parameter(mlp_weight.clone())
+        self.seen_token_counts: list[int] = []
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        inference_context: object | None = None,
+        packed_seq_params: object | None = None,
+        sequence_len_offset: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        *,
+        inference_params: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        del context_mask, padding_mask
+        attention_output, _ = self.self_attention(
+            hidden_states,
+            attention_mask,
+            None,
+            inference_context,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            rotary_pos_cos_sin,
+            attention_bias,
+            packed_seq_params,
+            sequence_len_offset,
+            inference_params=inference_params,
+        )
+        token_count = attention_output.shape[0]
+        self.seen_token_counts.append(token_count)
+        # Real fused MLP/residual kernels are numerically shape-sensitive. Make
+        # that boundary explicit so an attention-only adapter cannot satisfy
+        # this whole-layer partition-invariance test accidentally.
+        output = (attention_output @ self.mlp_weight) * (1.0 + token_count / 100.0)
+        return output, context
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -111,24 +163,31 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
         ]
         full_hidden = torch.cat(cp_padded_samples)
         canonical_hidden = torch.cat([*real_samples, torch.zeros(6, 1, hidden_size, dtype=torch.float64)])
-        weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
+        attention_weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
+        mlp_weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
 
         reference_hidden = canonical_hidden.clone().requires_grad_(True)
-        reference_weight = weight.clone().requires_grad_(True)
-        reference_projected = reference_hidden @ reference_weight
-        reference_output = torch.cat(
-            [
-                torch.cumsum(reference_projected[start:end], dim=0)
-                for start, end in zip(canonical_cu_seqlens[:-1], canonical_cu_seqlens[1:], strict=True)
-            ]
+        reference_layer = TransformerLayer(
+            SimpleNamespace(size=lambda: 1, rank=lambda: 0), attention_weight, mlp_weight
+        )
+        reference_packed_seq_params = SimpleNamespace(
+            qkv_format="thd",
+            cu_seqlens_q=torch.tensor(canonical_cu_seqlens, dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor(canonical_cu_seqlens, dtype=torch.int32),
+            local_cp_size=1,
+            cp_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        )
+        reference_output, _ = reference_layer(
+            reference_hidden,
+            packed_seq_params=reference_packed_seq_params,
         )
         reference_mask = torch.zeros(len(reference_output), 1, 1, dtype=torch.float64)
         reference_mask[: sum(total_lengths)] = 1.0
         (reference_output * reference_mask).square().sum().backward()
 
         local_hidden = gdn_cp_slice(full_hidden, cu_seqlens, world_size, rank).clone().requires_grad_(True)
-        attention = SelfAttention(dist.group.WORLD, weight)
-        root = _AttentionRoot(attention)
+        layer = TransformerLayer(dist.group.WORLD, attention_weight, mlp_weight)
+        root = _LayerRoot(layer)
         assert _install_p3o_full_sequence_attention(_p3o_args(scope), root) == 1
 
         packed_seq_params = SimpleNamespace(
@@ -141,7 +200,7 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
             _relax_attention_pad_multiple=8,
             _relax_cu_seqlens_cpu=cu_seqlens,
         )
-        output, bias = attention(local_hidden, None, packed_seq_params=packed_seq_params)
+        output, context = layer(local_hidden, packed_seq_params=packed_seq_params)
         expected_full_output = torch.zeros_like(full_hidden)
         source_offset = 0
         canonical_offset = 0
@@ -153,8 +212,9 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
             canonical_offset += total_length
         expected_output = gdn_cp_slice(expected_full_output, cu_seqlens, world_size, rank)
         assert torch.equal(output.detach(), expected_output)
-        assert torch.equal(bias, torch.zeros(hidden_size, dtype=torch.float64))
-        assert attention.seen_local_cp_sizes == [1]
+        assert context is None
+        assert layer.self_attention.seen_local_cp_sizes == [1]
+        assert layer.seen_token_counts == [len(canonical_hidden)]
 
         full_loss_mask = torch.zeros(len(full_hidden), 1, 1, dtype=torch.float64)
         source_offset = 0
@@ -174,8 +234,9 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
             canonical_offset += total_length
         expected_input_grad = gdn_cp_slice(expected_full_input_grad, cu_seqlens, world_size, rank)
         torch.testing.assert_close(local_hidden.grad, expected_input_grad, atol=1e-10, rtol=1e-10)
-        dist.all_reduce(attention.weight.grad, op=dist.ReduceOp.SUM)
-        torch.testing.assert_close(attention.weight.grad, reference_weight.grad, atol=1e-10, rtol=1e-10)
+        for parameter, reference_parameter in zip(layer.parameters(), reference_layer.parameters(), strict=True):
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            torch.testing.assert_close(parameter.grad, reference_parameter.grad, atol=1e-10, rtol=1e-10)
     finally:
         dist.destroy_process_group()
 
@@ -186,46 +247,56 @@ def test_p3o_full_sequence_attention_cpu_cp2_matches_cp1(scope: str) -> None:
 
 
 def test_p3o_full_sequence_attention_gate_is_p3o_cp_only() -> None:
-    attention = SelfAttention(SimpleNamespace(size=lambda: 1, rank=lambda: 0), torch.eye(2))
-    root = _AttentionRoot(attention)
-    original_forward = attention.forward
+    layer = TransformerLayer(
+        SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        torch.eye(2),
+        torch.eye(2),
+    )
+    root = _LayerRoot(layer)
+    original_forward = layer.forward
 
     assert _install_p3o_full_sequence_attention(_p3o_args("micro-batch", context_parallel_size=1), root) == 0
-    assert attention.forward == original_forward
+    assert layer.forward == original_forward
     assert (
         _install_p3o_full_sequence_attention(
             _p3o_args("micro-batch", advantage_estimator="grpo", context_parallel_size=2), root
         )
         == 0
     )
-    assert attention.forward == original_forward
+    assert layer.forward == original_forward
     assert _install_p3o_full_sequence_attention(_p3o_args("micro-batch"), root) == 1
-    installed_forward = attention.forward
+    installed_forward = layer.forward
     assert _install_p3o_full_sequence_attention(_p3o_args("micro-batch"), root) == 0
-    assert attention.forward == installed_forward
+    assert layer.forward == installed_forward
 
 
 def test_p3o_full_sequence_attention_oom_refuses_native_cp_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     from relax.backends.megatron import model as model_module
 
     cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
-    attention = SelfAttention(cp_group, torch.eye(2))
-    root = _AttentionRoot(attention)
-    assert _install_p3o_full_sequence_attention(_p3o_args("micro-batch"), root) == 1
+    layer = TransformerLayer(cp_group, torch.eye(2), torch.eye(2))
+    leaked_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
 
-    def raise_oom(*args: object, **kwargs: object) -> torch.Tensor:
+    def raise_oom_after_group_switch(*args: object, **kwargs: object) -> tuple[torch.Tensor, None]:
         del args, kwargs
+        layer.self_attention.pg_collection.cp = leaked_group
         raise torch.cuda.OutOfMemoryError("synthetic OOM")
 
-    monkeypatch.setattr(model_module, "_p3o_cp_gather_full", raise_oom)
+    layer.forward = raise_oom_after_group_switch
+    root = _LayerRoot(layer)
+    assert _install_p3o_full_sequence_attention(_p3o_args("micro-batch"), root) == 1
+
+    monkeypatch.setattr(model_module, "_p3o_cp_gather_full", lambda hidden, *args: torch.cat([hidden, hidden]))
     packed_seq_params = SimpleNamespace(
         qkv_format="thd",
         cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32),
         cu_seqlens_kv=torch.tensor([0, 8], dtype=torch.int32),
         local_cp_size=None,
         cp_group=None,
+        _relax_total_lengths=[5],
+        _relax_attention_pad_multiple=8,
+        _relax_cu_seqlens_cpu=[0, 8],
     )
     with pytest.raises(RuntimeError, match=P3O_CP_ATTENTION_OOM_ERROR):
-        attention(torch.randn(4, 1, 2), None, packed_seq_params=packed_seq_params)
-    assert attention.seen_local_cp_sizes == []
-    assert attention.pg_collection.cp is cp_group
+        layer(torch.randn(4, 1, 2), packed_seq_params=packed_seq_params)
+    assert layer.self_attention.pg_collection.cp is cp_group

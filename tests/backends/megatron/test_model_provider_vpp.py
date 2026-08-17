@@ -29,6 +29,8 @@ class _FakeProvider:
         self.bf16 = False
         self.params_dtype = None
         self.vision_dp_when_cp = False
+        self.deterministic_mode = False
+        self.batch_invariant_mode = False
 
     def finalize(self):
         self.finalized = True
@@ -133,6 +135,8 @@ def _bridge_args(**overrides):
         "sequence_parallel": True,
         "pipeline_model_parallel_size": 4,
         "virtual_pipeline_model_parallel_size": 2,
+        "deterministic_mode": True,
+        "batch_invariant_mode": True,
         "context_parallel_size": 1,
         "expert_model_parallel_size": 1,
         "expert_tensor_parallel_size": 1,
@@ -181,6 +185,16 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.virtual_pipeline_model_parallel_size == 2
     assert provider.finalized
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+def test_bridge_provider_receives_partition_invariance_modes(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    module.get_model_provider_func(_bridge_args(), role="actor")
+
+    assert provider.deterministic_mode is True
+    assert provider.batch_invariant_mode is True
+    assert provider.finalized
 
 
 def test_bridge_provider_uses_fp32_when_precision_flags_are_disabled(monkeypatch):

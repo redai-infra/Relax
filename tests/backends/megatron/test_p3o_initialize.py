@@ -1,0 +1,97 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+from argparse import Namespace
+
+import pytest
+import torch
+
+from relax.backends.megatron import initialize
+
+
+def _args(**overrides: object) -> Namespace:
+    values = {
+        "advantage_estimator": "p3o",
+        "batch_invariant_mode": True,
+        "deterministic_mode": True,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"deterministic_mode": False}, "deterministic-mode"),
+        ({"batch_invariant_mode": False}, "batch-invariant-mode"),
+    ],
+)
+def test_p3o_partition_modes_fail_closed(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        initialize._configure_p3o_partition_invariance(_args(**overrides))
+
+
+def test_p3o_partition_modes_enable_batch_invariant_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: calls.append("enabled"))
+
+    initialize._configure_p3o_partition_invariance(_args())
+
+    assert calls == ["enabled"]
+
+
+def test_non_p3o_does_not_change_partition_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: calls.append("enabled"))
+
+    initialize._configure_p3o_partition_invariance(
+        _args(advantage_estimator="grpo", batch_invariant_mode=False, deterministic_mode=False)
+    )
+
+    assert calls == []
+
+
+def test_non_p3o_honors_explicit_batch_invariant_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: calls.append("enabled"))
+
+    initialize._configure_p3o_partition_invariance(
+        _args(advantage_estimator="grpo", batch_invariant_mode=True, deterministic_mode=True)
+    )
+
+    assert calls == ["enabled"]
+
+
+def _logical_dp_gradient(data_parallel_size: int) -> torch.Tensor:
+    torch.manual_seed(11)
+    weight = torch.randn(7, 5, dtype=torch.bfloat16)
+    inputs = [torch.randn(length, 5, dtype=torch.bfloat16) for length in (3, 5, 4, 6, 2, 7, 4, 5)]
+    targets = [torch.randn(value.shape[0], 7, dtype=torch.bfloat16) for value in inputs]
+    rank_gradients = []
+    for indices in torch.tensor_split(torch.arange(len(inputs)), data_parallel_size):
+        main_grad = torch.zeros_like(weight, dtype=torch.float32)
+        for index in indices.tolist():
+            parameter = weight.clone().requires_grad_(True)
+            output = torch.nn.functional.linear(inputs[index], parameter)
+            ((output - targets[index]) ** 2).sum().backward()
+            main_grad += parameter.grad.float()
+        rank_gradients.append(main_grad)
+    return sum(rank_gradients)
+
+
+def test_p3o_bf16_mbs1_parameter_gradient_matches_across_dp_partitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: None)
+    initialize._configure_p3o_partition_invariance(_args())
+
+    reference = _logical_dp_gradient(1)
+    for data_parallel_size in (2, 4):
+        candidate = _logical_dp_gradient(data_parallel_size)
+        reference64 = reference.double().flatten()
+        candidate64 = candidate.double().flatten()
+        relative_l2 = torch.linalg.vector_norm(candidate64 - reference64) / torch.linalg.vector_norm(reference64)
+        cosine = torch.dot(reference64, candidate64) / (
+            torch.linalg.vector_norm(reference64) * torch.linalg.vector_norm(candidate64)
+        )
+        assert relative_l2 <= 1e-6
+        assert cosine >= 1 - 1e-9

@@ -482,9 +482,9 @@ def get_batch(
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group
         if getattr(get_args(), "advantage_estimator", None) == "p3o":
-            # P3O's strict CP attention reconstructs the CP1 QKV shape without
-            # changing this existing token layout. Keep the host boundaries from
-            # construction so every layer avoids a device-to-host synchronization.
+            # P3O's strict CP path reconstructs the CP1 TransformerLayer shape
+            # without changing this existing token layout. Keep the host
+            # boundaries so every layer avoids a device-to-host synchronization.
             packed_seq_params._relax_total_lengths = list(batch["total_lengths"])
             packed_seq_params._relax_attention_pad_multiple = pad_size
             packed_seq_params._relax_cu_seqlens_cpu = cu_seqlens_cpu

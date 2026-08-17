@@ -294,6 +294,8 @@ P3O_build_args() {
         --rollout-seed "${P3O_SEED}"
         --attention-dropout 0.0
         --hidden-dropout 0.0
+        --deterministic-mode
+        --batch-invariant-mode
         --accumulate-allreduce-grads-in-fp32
         --attention-softmax-in-fp32
         --attention-backend flash
@@ -393,6 +395,11 @@ P3O_run() {
         echo "pipeline_model_parallel_size=${P3O_PIPELINE_MODEL_PARALLEL_SIZE}"
         echo "nccl_debug=${P3O_NCCL_DEBUG}"
         echo "torch_distributed_debug=${P3O_TORCH_DISTRIBUTED_DEBUG}"
+        echo "deterministic_mode=1"
+        echo "batch_invariant_mode=1"
+        echo "nccl_algo=Ring"
+        echo "nvte_allow_nondeterministic_algo=0"
+        echo "cublas_workspace_config=:4096:8"
         echo "behavior_temperature=${P3O_BEHAVIOR_TEMPERATURE}"
         echo "ray_job_id=${P3O_JOB_ID}"
         echo "repo=${P3O_REPO_ROOT}"
@@ -446,6 +453,9 @@ env_vars = {
     "OPENBLAS_NUM_THREADS": os.environ["P3O_RUNTIME_OPENBLAS_NUM_THREADS"],
     "NCCL_NVLS_ENABLE": os.environ["P3O_RUNTIME_NCCL_NVLS_ENABLE"],
     "NVSHMEM_DISABLE_NCCL": os.environ["P3O_RUNTIME_NVSHMEM_DISABLE_NCCL"],
+    "NCCL_ALGO": "Ring",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
 }
 
 if os.environ["P3O_RUNTIME_CLEAR_PROXIES"] == "1":

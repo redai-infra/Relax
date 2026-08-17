@@ -1,5 +1,6 @@
 import random
 import socket
+from argparse import Namespace
 
 import numpy as np
 import torch
@@ -7,12 +8,31 @@ import torch.distributed as dist
 from megatron.core import mpu, tensor_parallel
 from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 from megatron.training.global_vars import _build_tokenizer, set_args
 
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def _configure_p3o_partition_invariance(args: Namespace) -> None:
+    """Enable batch-invariant kernels and fail closed for incomplete P3O
+    mode."""
+    batch_invariant_mode = getattr(args, "batch_invariant_mode", False)
+    if getattr(args, "advantage_estimator", None) == "p3o":
+        missing: list[str] = []
+        if not getattr(args, "deterministic_mode", False):
+            missing.append("--deterministic-mode")
+        if not batch_invariant_mode:
+            missing.append("--batch-invariant-mode")
+        if missing:
+            raise RuntimeError(
+                "P3O strict partition invariance requires " + " and ".join(missing) + "; refusing a non-equivalent run"
+            )
+    if batch_invariant_mode:
+        enable_batch_invariant_mode()
 
 
 def _set_random_seed(
@@ -76,6 +96,7 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 def init(args):
     set_args(args)
+    _configure_p3o_partition_invariance(args)
 
     if getattr(args, "disable_jit_fuser", False):
         from megatron.core.jit import disable_jit_fuser

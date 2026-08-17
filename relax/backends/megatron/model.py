@@ -57,7 +57,7 @@ logger = get_logger(__name__)
 
 
 P3O_CP_ATTENTION_OOM_ERROR = (
-    "P3O strict mode refuses context-parallel size greater than one after full-sequence attention OOM"
+    "P3O strict mode refuses context-parallel size greater than one after full-sequence TransformerLayer OOM"
 )
 
 
@@ -191,45 +191,56 @@ def _restore_p3o_attention_output_layout(
     return output
 
 
-def _build_p3o_full_sequence_attention_forward(attention: torch.nn.Module) -> Callable:
-    """Wrap one SelfAttention instance with P3O's strict CP-equivalent path."""
-    original_forward = attention.forward
+def _build_p3o_full_sequence_layer_forward(layer: torch.nn.Module) -> Callable:
+    """Wrap one TransformerLayer with P3O's strict CP-equivalent path."""
+    original_forward = layer.forward
 
     @wraps(original_forward)
     def full_sequence_forward(
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        key_value_states: torch.Tensor | None = None,
-        inference_context: object | None = None,
+        attention_mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
         rotary_pos_emb: object | None = None,
         rotary_pos_cos: torch.Tensor | None = None,
         rotary_pos_sin: torch.Tensor | None = None,
         rotary_pos_cos_sin: torch.Tensor | None = None,
         attention_bias: torch.Tensor | None = None,
+        inference_context: object | None = None,
         packed_seq_params: object | None = None,
-        sequence_len_offset: int | None = None,
+        sequence_len_offset: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         *,
         inference_params: object | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, object | None]:
         if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
-            raise RuntimeError("P3O full-sequence attention requires THD packed_seq_params when CP>1")
+            raise RuntimeError("P3O full-sequence layers require THD packed_seq_params when CP>1")
 
+        attention = getattr(layer, "self_attention", None)
+        if attention is None:
+            raise RuntimeError("P3O full-sequence layer requires a self_attention module")
         cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
         if cp_size == 1:
             return original_forward(
                 hidden_states,
                 attention_mask,
-                key_value_states,
-                inference_context,
+                context,
+                context_mask,
                 rotary_pos_emb,
                 rotary_pos_cos,
                 rotary_pos_sin,
                 rotary_pos_cos_sin,
                 attention_bias,
+                inference_context,
                 packed_seq_params,
                 sequence_len_offset,
+                padding_mask,
                 inference_params=inference_params,
+                **kwargs,
             )
+        if padding_mask is not None:
+            raise RuntimeError("P3O strict full-sequence layers do not support a CP-local padding_mask")
 
         cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu", None)
         if cu_seqlens_cpu is None:
@@ -262,26 +273,29 @@ def _build_p3o_full_sequence_attention_forward(attention: torch.nn.Module) -> Ca
             if hasattr(full_packed_seq_params, "cu_seqlens_q_padded"):
                 full_packed_seq_params.cu_seqlens_q_padded = None
                 full_packed_seq_params.cu_seqlens_kv_padded = None
-            full_output, bias = original_forward(
+            full_output, full_context = original_forward(
                 canonical_hidden_states,
                 attention_mask,
-                key_value_states,
-                inference_context,
+                context,
+                context_mask,
                 rotary_pos_emb,
                 rotary_pos_cos,
                 rotary_pos_sin,
                 rotary_pos_cos_sin,
                 attention_bias,
+                inference_context,
                 full_packed_seq_params,
                 sequence_len_offset,
+                padding_mask,
                 inference_params=inference_params,
+                **kwargs,
             )
             source_layout_output = _restore_p3o_attention_output_layout(
                 full_output,
                 cu_seqlens_cpu,
                 total_lengths,
             )
-            return _p3o_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank), bias
+            return _p3o_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank), full_context
         except torch.cuda.OutOfMemoryError as exc:
             raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
         finally:
@@ -298,14 +312,15 @@ def _install_p3o_full_sequence_attention(args: Namespace, model: torch.nn.Module
 
     installed = 0
     for module in model.modules():
-        if type(module).__name__ != "SelfAttention" or getattr(
-            module, "_relax_p3o_full_sequence_attention_installed", False
+        if type(module).__name__ != "TransformerLayer" or getattr(
+            module, "_relax_p3o_full_sequence_layer_installed", False
         ):
             continue
-        if not hasattr(module, "pg_collection") or not hasattr(module.pg_collection, "cp"):
-            raise RuntimeError("P3O full-sequence attention requires SelfAttention.pg_collection.cp")
-        module.forward = _build_p3o_full_sequence_attention_forward(module)
-        module._relax_p3o_full_sequence_attention_installed = True
+        attention = getattr(module, "self_attention", None)
+        if attention is None or not hasattr(attention, "pg_collection") or not hasattr(attention.pg_collection, "cp"):
+            raise RuntimeError("P3O full-sequence layer requires SelfAttention.pg_collection.cp")
+        module.forward = _build_p3o_full_sequence_layer_forward(module)
+        module._relax_p3o_full_sequence_layer_installed = True
         installed += 1
     return installed
 
@@ -681,11 +696,11 @@ def setup_model_and_optimizer(
     )
 
     if getattr(args, "advantage_estimator", None) == "p3o" and getattr(args, "context_parallel_size", 1) > 1:
-        installed_attention_modules = sum(
+        installed_full_sequence_layers = sum(
             _install_p3o_full_sequence_attention(args, model_chunk) for model_chunk in model
         )
-        if installed_attention_modules == 0:
-            raise RuntimeError("P3O context parallelism requires at least one supported SelfAttention module")
+        if installed_full_sequence_layers == 0:
+            raise RuntimeError("P3O context parallelism requires at least one supported TransformerLayer")
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from

@@ -273,6 +273,8 @@ def test_p3o_configs_freeze_required_formal_values():
         assert _option_value(args, "--weight-decay") == "0.01"
         assert "--calculate-per-token-loss" in args
         assert "--use-rollout-logprobs" in args
+        assert "--deterministic-mode" in args
+        assert "--batch-invariant-mode" in args
         assert "--rollout-shuffle" in args
         assert "--colocate" in args
         assert "--fully-async" not in args
@@ -505,6 +507,9 @@ def test_p3o_runner_executes_all_scenarios_with_fake_ray(
     assert runtime_env["NCCL_DEBUG"] == "WARN"
     assert runtime_env["TORCH_DISTRIBUTED_DEBUG"] == "OFF"
     assert runtime_env["RAY_OVERRIDE_JOB_RUNTIME_ENV"] == "1"
+    assert runtime_env["NCCL_ALGO"] == "Ring"
+    assert runtime_env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] == "0"
+    assert runtime_env["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
     for proxy_name in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
