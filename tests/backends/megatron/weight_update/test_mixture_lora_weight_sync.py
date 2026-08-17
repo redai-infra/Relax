@@ -312,6 +312,21 @@ def test_direct_hf_iterator_excludes_mixture_parameters():
     assert [info.name for info in infos] == ["module.module.decoder.layers.0.self_attention.linear_qkv.weight"]
 
 
+def _patch_bridge_mpu(**parallel_state):
+    """Patch the ``mpu`` handle the bridge bound at import time.
+
+    ``hf_weight_iterator_bridge`` does ``from megatron.core import mpu``, and
+    sibling suites import it while a stub ``megatron.core`` sits in
+    ``sys.modules``, so patching ``megatron.core.mpu`` can leave the object the
+    bridge actually calls untouched.
+    """
+
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge
+
+    stub = SimpleNamespace(**{name: (lambda value=value: value) for name, value in parallel_state.items()})
+    return patch.object(hf_weight_iterator_bridge, "mpu", stub)
+
+
 def test_bridge_hf_iterator_excludes_mixture_parameters():
     from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _build_param_info_buckets
 
@@ -323,9 +338,11 @@ def test_bridge_hf_iterator_excludes_mixture_parameters():
             side_effect=[iter(vanilla), iter(_named_parameters())],
         ),
         patch("torch.distributed.get_rank", return_value=0),
-        patch("megatron.core.mpu.get_pipeline_model_parallel_world_size", return_value=1),
-        patch("megatron.core.mpu.get_expert_model_parallel_world_size", return_value=1),
-        patch("megatron.core.mpu.get_tensor_model_parallel_world_size", return_value=1),
+        _patch_bridge_mpu(
+            get_pipeline_model_parallel_world_size=1,
+            get_expert_model_parallel_world_size=1,
+            get_tensor_model_parallel_world_size=1,
+        ),
     ):
         expert_buckets, base_buckets, _, _ = _build_param_info_buckets(args, model=[])
 
@@ -364,11 +381,13 @@ def test_bridge_ep_metadata_selects_one_owner_for_replicated_non_expert_params()
         ),
         patch("torch.distributed.get_rank", return_value=3),
         patch("torch.distributed.all_gather_object", side_effect=gather_ep),
-        patch("megatron.core.mpu.get_pipeline_model_parallel_world_size", return_value=1),
-        patch("megatron.core.mpu.get_expert_model_parallel_world_size", return_value=2),
-        patch("megatron.core.mpu.get_expert_model_parallel_group", return_value="ep-group"),
-        patch("megatron.core.mpu.get_tensor_model_parallel_world_size", return_value=1),
-        patch("megatron.core.mpu.get_expert_tensor_parallel_world_size", return_value=1),
+        _patch_bridge_mpu(
+            get_pipeline_model_parallel_world_size=1,
+            get_expert_model_parallel_world_size=2,
+            get_expert_model_parallel_group="ep-group",
+            get_tensor_model_parallel_world_size=1,
+            get_expert_tensor_parallel_world_size=1,
+        ),
     ):
         expert_buckets, non_expert_buckets, _, _ = _build_param_info_buckets(args, model=[])
 
