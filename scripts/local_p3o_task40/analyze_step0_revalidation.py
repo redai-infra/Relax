@@ -21,7 +21,7 @@ NEAR_ZERO_ABS_TOL = 1e-9
 LOGPROB_ABS_TOL = 1e-6
 GRAD_REL_L2_TOL = 1e-6
 GRAD_COSINE_MIN = 1.0 - 1e-9
-COMMIT_UNDER_TEST = "ef854a3cfb3eb692e083d14e12fbd96a8b1c7af5"
+COMMIT_UNDER_TEST = "347b9ef69b54b761247069f4e486b097c7ea93a1"
 TOPOLOGIES = ("dp1", "dp4cp1", "dp2cp1", "dp2cp2")
 METRIC_KEYS = {
     "normalized_ess": "train/p3o/normalized_ess",
