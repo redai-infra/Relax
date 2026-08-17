@@ -24,6 +24,7 @@ from relax.utils.mixture_lora_common import (
     RoutingDecision,
     RoutingStatistics,
     compute_routing_statistics,
+    mixture_lora_tp_partition_dims,
     route_topk,
 )
 
@@ -562,6 +563,29 @@ class MegatronDenseRoutedLoRAExecutor(nn.Module):
         return (delta * scale).reshape(*input_shape, expert_outputs.shape[-1])
 
 
+def mark_routed_tensor_parallel_shard(parameter: nn.Parameter, *, partition_dim: int | None) -> None:
+    """Publish Megatron's tensor-parallel metadata on a routed parameter.
+
+    Grad-norm clipping and sharded checkpointing read ``tensor_model_parallel``
+    off the Parameter itself. Initializing through per-expert slice views
+    leaves the Parameter unmarked, so Megatron falls back to its
+    ``tensor_model_parallel=False`` default, treats every sharded adapter
+    tensor as a tensor-parallel duplicate, and clips against a partial global
+    norm.
+    """
+
+    from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+
+    if hasattr(parameter, "tensor_model_parallel"):
+        return
+    set_tensor_model_parallel_attributes(
+        parameter,
+        partition_dim is not None,
+        -1 if partition_dim is None else partition_dim,
+        1,
+    )
+
+
 class MixtureLoRAExperts(nn.Module):
     """LoRA expert parameters stored in one stable logical layout."""
 
@@ -602,6 +626,7 @@ class MixtureLoRAExperts(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        partition_dims = mixture_lora_tp_partition_dims(self._input_is_parallel)
         if self._tp_world_size == 1:
             for expert_weight in self.lora_A:
                 nn.init.xavier_uniform_(expert_weight)
@@ -611,7 +636,11 @@ class MixtureLoRAExperts(nn.Module):
                 _initialize_affine_weight_gpu,
             )
 
-            partition_dim = 1 if self._input_is_parallel else 0
+            # The loop below initializes per-expert slice views: they share
+            # storage with lora_A so the values land in the Parameter, but any
+            # attribute Megatron sets on a view dies with it. lora_A and lora_B
+            # are therefore marked explicitly once the values are in place.
+            partition_dim = partition_dims["experts.lora_A"] - 1
             per_partition_size = self.lora_A.shape[partition_dim + 1]
             for expert_weight in self.lora_A:
                 if self._use_cpu_initialization:
@@ -634,6 +663,9 @@ class MixtureLoRAExperts(nn.Module):
                         partition_dim=partition_dim,
                     )
         nn.init.zeros_(self.lora_B)
+        if self._tp_world_size > 1:
+            mark_routed_tensor_parallel_shard(self.lora_A, partition_dim=partition_dims["experts.lora_A"])
+            mark_routed_tensor_parallel_shard(self.lora_B, partition_dim=partition_dims["experts.lora_B"])
 
 
 class MixtureLoRARouter(nn.Module):
@@ -646,10 +678,20 @@ class MixtureLoRARouter(nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        input_is_parallel: bool = False,
+        tp_world_size: int = 1,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(num_experts, input_size, device=device, dtype=dtype))
         nn.init.normal_(self.weight, mean=0.0, std=0.02)
+        if tp_world_size > 1:
+            # Column-parallel sites keep a replicated router (marked as a
+            # tensor-parallel duplicate); row-parallel sites shard it along the
+            # input axis and must contribute every shard to the global norm.
+            mark_routed_tensor_parallel_shard(
+                self.weight,
+                partition_dim=mixture_lora_tp_partition_dims(input_is_parallel)["router.weight"],
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x.float(), self.weight.float())
@@ -717,7 +759,14 @@ class MixtureLoRAAdapter(nn.Module):
             tp_world_size=tp_world_size,
             use_cpu_initialization=use_cpu_initialization,
         )
-        self.router = MixtureLoRARouter(config.num_experts, local_input_size, device=device, dtype=dtype)
+        self.router = MixtureLoRARouter(
+            config.num_experts,
+            local_input_size,
+            device=device,
+            dtype=dtype,
+            input_is_parallel=input_is_parallel,
+            tp_world_size=tp_world_size,
+        )
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.executor = MegatronDenseRoutedLoRAExecutor(
             input_is_parallel=input_is_parallel,
@@ -938,11 +987,12 @@ class MixtureParallelLinearAdapter(nn.Module):
         sharded_state = self.to_wrap.sharded_state_dict(prefix, sharded_offsets, metadata)
         adapter_state = self.mixture_lora.state_dict(prefix="", keep_vars=True)
         axis_map = {
-            "experts.lora_A": 2 if self.mixture_lora.input_is_parallel else 1,
-            "experts.lora_B": 1,
+            parameter_kind: partition_dim
+            for parameter_kind, partition_dim in mixture_lora_tp_partition_dims(
+                self.mixture_lora.input_is_parallel
+            ).items()
+            if partition_dim is not None
         }
-        if self.mixture_lora.input_is_parallel:
-            axis_map["router.weight"] = 1
         dp_cp_group = (
             metadata["dp_cp_group"]
             if metadata is not None and metadata.get("dp_cp_group") is not None
@@ -1042,6 +1092,7 @@ __all__ = [
     "get_microbatch_objective_scale",
     "get_mixture_lora_routing_context",
     "install_mixture_lora_checkpoint_context",
+    "mark_routed_tensor_parallel_shard",
     "mixture_lora_metrics_from_packed_records",
     "pack_mixture_lora_routing_records",
 ]

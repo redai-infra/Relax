@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 from relax.backends.megatron.mixture_lora_modules import (
     MixtureLoRAAdapter,
+    MixtureLoRAExperts,
+    MixtureLoRARouter,
     MixtureLoRARoutingContext,
     MixtureParallelLinearAdapter,
     activate_mixture_lora_routing_context,
@@ -161,6 +163,64 @@ def test_mixture_lora_parameter_layout_and_initialization():
     assert torch.count_nonzero(adapter.experts.lora_B) == 0
     assert list(adapter.executor.parameters()) == []
     assert adapter.executor.state_dict() == {}
+
+
+@pytest.mark.parametrize(
+    ("input_is_parallel", "lora_a_partition_dim", "router_is_parallel"),
+    [(False, 1, False), (True, 2, True)],
+)
+def test_mixture_lora_parameters_publish_tensor_parallel_metadata(
+    input_is_parallel, lora_a_partition_dim, router_is_parallel
+):
+    pytest.importorskip("megatron.core.tensor_parallel.layers")
+    config = _config(num_experts=4, rank=4)
+    experts = MixtureLoRAExperts(
+        config,
+        8,
+        6,
+        local_rank=config.rank if input_is_parallel else config.rank // 2,
+        local_input_size=4 if input_is_parallel else 8,
+        local_output_size=6 if input_is_parallel else 3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        input_is_parallel=input_is_parallel,
+        tp_rank=1,
+        tp_world_size=2,
+        use_cpu_initialization=True,
+    )
+    router = MixtureLoRARouter(
+        config.num_experts,
+        4 if input_is_parallel else 8,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        input_is_parallel=input_is_parallel,
+        tp_world_size=2,
+    )
+
+    # Grad-norm clipping reads these off the Parameter, not off the per-expert
+    # slice views the initializers run on.
+    assert experts.lora_A.tensor_model_parallel is True
+    assert experts.lora_A.partition_dim == lora_a_partition_dim
+    assert experts.lora_B.tensor_model_parallel is True
+    assert experts.lora_B.partition_dim == 1
+    assert router.weight.tensor_model_parallel is router_is_parallel
+    assert torch.count_nonzero(experts.lora_A) > 0
+
+
+def test_mixture_lora_parameters_stay_unmarked_without_tensor_parallelism():
+    adapter = MixtureLoRAAdapter(
+        _config(),
+        "linear_proj",
+        6,
+        7,
+        dropout=0.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert not hasattr(adapter.experts.lora_A, "tensor_model_parallel")
+    assert not hasattr(adapter.experts.lora_B, "tensor_model_parallel")
+    assert not hasattr(adapter.router.weight, "tensor_model_parallel")
 
 
 def test_mixture_lora_wrapper_freezes_base_and_routes_gradients():

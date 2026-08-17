@@ -825,6 +825,15 @@ def _tensor_parallel_initialization_worker(rank: int, world_size: int, init_meth
         full_a = torch.cat(shards, dim=1)
         assert full_a.shape == (config.num_experts, config.rank, 8)
         assert not torch.equal(shards[0], shards[1])
+
+        # Every shard of a sharded adapter parameter has to reach the global
+        # grad-norm reduction; only the replicated router is a duplicate that
+        # rank 0 alone contributes.
+        from megatron.core.tensor_parallel.layers import param_is_not_tensor_parallel_duplicate
+
+        assert param_is_not_tensor_parallel_duplicate(adapter.experts.lora_A, tp_group=dist.group.WORLD)
+        assert param_is_not_tensor_parallel_duplicate(adapter.experts.lora_B, tp_group=dist.group.WORLD)
+        assert param_is_not_tensor_parallel_duplicate(adapter.router.weight, tp_group=dist.group.WORLD) == (rank == 0)
     finally:
         dist.destroy_process_group()
 

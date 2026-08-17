@@ -355,6 +355,27 @@ def build_mixture_lora_state_specs(
     )
 
 
+def mixture_lora_tp_partition_dims(input_is_parallel: bool) -> dict[MixtureLoraParameterKind, int | None]:
+    """Map each routed parameter to its tensor-parallel shard axis.
+
+    The axes refer to the stable stored layout described by
+    ``build_mixture_lora_state_specs``; ``None`` marks a replicated parameter.
+    Row-parallel sites (``input_is_parallel``) shard ``lora_A`` and the router
+    on their input axis, column-parallel sites shard ``lora_A`` on its rank
+    axis and replicate the router. ``lora_B`` is always output-sharded.
+
+    Every consumer that has to reason about sharding — parameter marking,
+    sharded checkpoints, and rollout weight sync — reads its axes from here so
+    the three cannot drift apart.
+    """
+
+    return {
+        "experts.lora_A": 2 if input_is_parallel else 1,
+        "experts.lora_B": 1,
+        "router.weight": 1 if input_is_parallel else None,
+    }
+
+
 @dataclass(frozen=True)
 class RoutingDecision:
     """Token-level Top-K routing results.

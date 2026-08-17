@@ -16,6 +16,7 @@ from relax.utils.megatron_peft_utils import build_mixture_lora_config, is_mixtur
 from relax.utils.mixture_lora_common import (
     MixtureLoraStateSpec,
     build_mixture_lora_state_specs,
+    mixture_lora_tp_partition_dims,
 )
 
 from .common import named_params_and_buffers
@@ -84,19 +85,12 @@ def _parameter_kind(parameter_name: str) -> str:
 
 def _tp_shard_dim(site_id: str, parameter_kind: str) -> int | None:
     target = site_id.rsplit(".", maxsplit=1)[-1]
-    if target == "linear_qkv":
-        return {
-            "experts.lora_A": 1,
-            "experts.lora_B": 1,
-            "router.weight": None,
-        }[parameter_kind]
-    if target == "linear_proj":
-        return {
-            "experts.lora_A": 2,
-            "experts.lora_B": 1,
-            "router.weight": 1,
-        }[parameter_kind]
-    raise ValueError(f"Unsupported Mixture-of-LoRA site: {site_id!r}")
+    if target not in ("linear_qkv", "linear_proj"):
+        raise ValueError(f"Unsupported Mixture-of-LoRA site: {site_id!r}")
+    # linear_proj consumes a tensor-parallel-sharded input; linear_qkv produces
+    # a sharded output. The shard axes themselves come from the shared table so
+    # training, checkpointing and rollout sync cannot drift apart.
+    return mixture_lora_tp_partition_dims(input_is_parallel=target == "linear_proj")[parameter_kind]
 
 
 def _qkv_lora_b_to_sglang(
