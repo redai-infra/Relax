@@ -764,6 +764,59 @@ def gdn_cp_slice(
     return torch.cat(pieces, dim=0)
 
 
+class _P3OReplicatedFullSequenceSlice(torch.autograd.Function):
+    """Slice replicated full-sequence output with a CP-invariant backward.
+
+    Every strict P3O CP rank runs the same full TransformerLayer, but owns a
+    different downstream loss shard. Reassemble those local output gradients
+    before the layer backward so every replica performs the same weight-grad
+    GEMM. Dividing by CP here is cancelled by the later CP parameter-gradient
+    SUM and by the full-input gather's reduce-scatter SUM.
+    """
+
+    @staticmethod
+    def forward(ctx, full, cu_seqlens, cp_size, cp_rank, cp_group):
+        ctx.cu_seqlens = list(cu_seqlens)
+        ctx.cp_size = int(cp_size)
+        ctx.cp_rank = int(cp_rank)
+        ctx.cp_group = cp_group
+        ctx.full_shape = tuple(full.shape)
+        return gdn_cp_slice(full, ctx.cu_seqlens, ctx.cp_size, ctx.cp_rank)
+
+    @staticmethod
+    def backward(ctx, grad_local):
+        full_grad = grad_local.new_zeros(ctx.full_shape)
+        local_offset = 0
+        for full_start, full_end in zip(ctx.cu_seqlens[:-1], ctx.cu_seqlens[1:], strict=True):
+            chunk_size = (full_end - full_start) // (2 * ctx.cp_size)
+            first_start = full_start + ctx.cp_rank * chunk_size
+            second_start = full_start + (2 * ctx.cp_size - ctx.cp_rank - 1) * chunk_size
+            full_grad[first_start : first_start + chunk_size] = grad_local[local_offset : local_offset + chunk_size]
+            local_offset += chunk_size
+            full_grad[second_start : second_start + chunk_size] = grad_local[local_offset : local_offset + chunk_size]
+            local_offset += chunk_size
+        if local_offset != grad_local.shape[0]:
+            raise RuntimeError(
+                "P3O replicated CP output gradient does not match packed layout: "
+                f"consumed={local_offset}, local_tokens={grad_local.shape[0]}"
+            )
+        dist.all_reduce(full_grad, op=dist.ReduceOp.SUM, group=ctx.cp_group)
+        full_grad.mul_(1.0 / ctx.cp_size)
+        return full_grad, None, None, None, None
+
+
+def p3o_cp_replicated_slice(
+    full: torch.Tensor,
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+    cp_rank: int,
+    cp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Slice a strict replicated P3O layer and canonicalize its backward."""
+    cu = cu_seqlens if isinstance(cu_seqlens, list) else cu_seqlens.tolist()
+    return _P3OReplicatedFullSequenceSlice.apply(full, cu, cp_size, cp_rank, cp_group)
+
+
 class _AllGatherFullSequence(torch.autograd.Function):
     """All-gather each CP rank's shard into the full sequence; backward reduce-
     scatters (sums) the gradient.

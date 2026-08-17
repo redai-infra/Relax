@@ -108,12 +108,13 @@ def _p3o_cp_slice(
     cu_seqlens: list[int],
     cp_size: int,
     cp_rank: int,
+    cp_group: object,
 ) -> torch.Tensor:
     """Return the current rank's THD zig-zag shard from full attention
     output."""
-    from .cp_utils import gdn_cp_slice
+    from .cp_utils import p3o_cp_replicated_slice
 
-    return gdn_cp_slice(full_output, cu_seqlens, cp_size, cp_rank)
+    return p3o_cp_replicated_slice(full_output, cu_seqlens, cp_size, cp_rank, cp_group)
 
 
 def _canonicalize_p3o_attention_input(
@@ -295,7 +296,13 @@ def _build_p3o_full_sequence_layer_forward(layer: torch.nn.Module) -> Callable:
                 cu_seqlens_cpu,
                 total_lengths,
             )
-            return _p3o_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank), full_context
+            return _p3o_cp_slice(
+                source_layout_output,
+                cu_seqlens_cpu,
+                cp_size,
+                cp_rank,
+                cp_group,
+            ), full_context
         except torch.cuda.OutOfMemoryError as exc:
             raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
         finally:
@@ -353,6 +360,125 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         if module is None:
             return None
     return None
+
+
+def _find_p3o_post_process_modules(
+    model: torch.nn.Module,
+) -> tuple[torch.nn.Module, torch.nn.Module] | None:
+    """Find the final normalization and LM head on the last pipeline stage."""
+    module = unwrap_model(model)
+    for _ in range(4):
+        output_layer = getattr(module, "output_layer", None)
+        decoder = getattr(module, "decoder", None)
+        final_layernorm = getattr(decoder, "final_layernorm", None)
+        if output_layer is not None and not isinstance(output_layer, torch.nn.Identity):
+            if final_layernorm is None:
+                raise RuntimeError("P3O strict CP post-processing requires decoder.final_layernorm")
+            return final_layernorm, output_layer
+        module = getattr(module, "module", None) or getattr(module, "language_model", None)
+        if module is None:
+            return None
+    return None
+
+
+def _build_p3o_full_sequence_post_process_forward(
+    module: torch.nn.Module,
+    packed_seq_params: object,
+    cp_size: int,
+    cp_group: object,
+    cp_rank: int,
+) -> Callable:
+    """Make one token-wise post-process module use the canonical CP1 shape."""
+    original_forward = module.forward
+    cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu")
+    total_lengths = getattr(packed_seq_params, "_relax_total_lengths")
+    pad_multiple = getattr(packed_seq_params, "_relax_attention_pad_multiple")
+
+    @wraps(original_forward)
+    def full_sequence_forward(hidden_states: torch.Tensor, *args: object, **kwargs: object):
+        try:
+            full_hidden_states = _p3o_cp_gather_full(hidden_states, cu_seqlens_cpu, cp_size, cp_group)
+            canonical_hidden_states, _ = _canonicalize_p3o_attention_input(
+                full_hidden_states,
+                cu_seqlens_cpu,
+                total_lengths,
+                pad_multiple,
+            )
+            sequence_parallel = getattr(module, "sequence_parallel", None)
+            if sequence_parallel is not None:
+                module.sequence_parallel = False
+            try:
+                result = original_forward(canonical_hidden_states, *args, **kwargs)
+            finally:
+                if sequence_parallel is not None:
+                    module.sequence_parallel = sequence_parallel
+
+            output = result[0] if isinstance(result, tuple) else result
+            source_layout_output = _restore_p3o_attention_output_layout(
+                output,
+                cu_seqlens_cpu,
+                total_lengths,
+            )
+            local_output = _p3o_cp_slice(
+                source_layout_output,
+                cu_seqlens_cpu,
+                cp_size,
+                cp_rank,
+                cp_group,
+            )
+            if isinstance(result, tuple):
+                return (local_output, *result[1:])
+            return local_output
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
+
+    return full_sequence_forward
+
+
+@contextmanager
+def _p3o_full_sequence_post_process(
+    args: Namespace,
+    model: torch.nn.Module,
+    packed_seq_params: object | None,
+) -> Iterator[None]:
+    """Canonicalize final RMSNorm and LM-head forward/backward under strict
+    CP."""
+    if getattr(args, "advantage_estimator", None) != "p3o" or getattr(args, "context_parallel_size", 1) <= 1:
+        yield
+        return
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        raise RuntimeError("P3O strict CP post-processing requires THD packed_seq_params")
+    modules = _find_p3o_post_process_modules(model)
+    if modules is None:
+        yield
+        return
+    attention = next((module for module in model.modules() if type(module).__name__ == "SelfAttention"), None)
+    if attention is None:
+        raise RuntimeError("P3O strict CP post-processing requires a SelfAttention module")
+    cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
+    if cp_size == 1:
+        yield
+        return
+
+    originals: list[tuple[torch.nn.Module, Callable]] = []
+    try:
+        for module in modules:
+            original_forward = module.forward
+            module.forward = _build_p3o_full_sequence_post_process_forward(
+                module,
+                packed_seq_params,
+                cp_size,
+                cp_group,
+                cp_rank,
+            )
+            originals.append((module, original_forward))
+        yield
+    finally:
+        for module, original_forward in originals:
+            try:
+                del module.forward
+            except AttributeError:
+                module.forward = original_forward
 
 
 @contextmanager
@@ -1469,7 +1595,8 @@ def train_one_step(
                 ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
-                output_tensor = model(**forward_kwargs)
+                with _p3o_full_sequence_post_process(args, model, batch.get("packed_seq_params")):
+                    output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage

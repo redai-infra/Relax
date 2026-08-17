@@ -18,6 +18,7 @@ from relax.backends.megatron.cp_utils import gdn_cp_slice
 from relax.backends.megatron.model import (
     P3O_CP_ATTENTION_OOM_ERROR,
     _install_p3o_full_sequence_attention,
+    _p3o_full_sequence_post_process,
 )
 
 
@@ -129,6 +130,34 @@ class TransformerLayer(torch.nn.Module):
         return output, context
 
 
+class _TokenShapePostProcess(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor, *, returns_tuple: bool = False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight.clone())
+        self.returns_tuple = returns_tuple
+        self.seen_token_counts: list[int] = []
+
+    def forward(self, hidden_states: torch.Tensor, *args: object, **kwargs: object):
+        del args, kwargs
+        self.seen_token_counts.append(hidden_states.shape[0])
+        output = (hidden_states @ self.weight) * (1.0 + hidden_states.shape[0] / 100.0)
+        return (output, None) if self.returns_tuple else output
+
+
+class _PostProcessRoot(torch.nn.Module):
+    def __init__(
+        self,
+        layer: TransformerLayer,
+        final_layernorm: torch.nn.Module,
+        output_layer: torch.nn.Module,
+    ) -> None:
+        super().__init__()
+        self.layer = layer
+        self.decoder = torch.nn.Module()
+        self.decoder.final_layernorm = final_layernorm
+        self.output_layer = output_layer
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -235,6 +264,50 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
         expected_input_grad = gdn_cp_slice(expected_full_input_grad, cu_seqlens, world_size, rank)
         torch.testing.assert_close(local_hidden.grad, expected_input_grad, atol=1e-10, rtol=1e-10)
         for parameter, reference_parameter in zip(layer.parameters(), reference_layer.parameters(), strict=True):
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            torch.testing.assert_close(parameter.grad, reference_parameter.grad, atol=1e-10, rtol=1e-10)
+
+        norm_weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
+        head_weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
+        reference_norm = _TokenShapePostProcess(norm_weight)
+        reference_head = _TokenShapePostProcess(head_weight, returns_tuple=True)
+        reference_post_input = reference_output.detach().clone().requires_grad_(True)
+        reference_post_output, _ = reference_head(reference_norm(reference_post_input))
+        (reference_post_output * reference_mask).square().sum().backward()
+
+        norm = _TokenShapePostProcess(norm_weight)
+        head = _TokenShapePostProcess(head_weight, returns_tuple=True)
+        post_root = _PostProcessRoot(layer, norm, head)
+        local_post_input = output.detach().clone().requires_grad_(True)
+        original_norm_forward = norm.forward
+        original_head_forward = head.forward
+        with _p3o_full_sequence_post_process(_p3o_args(scope), post_root, packed_seq_params):
+            local_post_output, _ = head(norm(local_post_input))
+        assert norm.forward == original_norm_forward
+        assert head.forward == original_head_forward
+        assert norm.seen_token_counts == [len(canonical_hidden)]
+        assert head.seen_token_counts == [len(canonical_hidden)]
+        (local_post_output * local_loss_mask).square().sum().backward()
+
+        expected_full_post_input_grad = torch.zeros_like(full_hidden)
+        source_offset = 0
+        canonical_offset = 0
+        for total_length, padded_length in zip(total_lengths, cp_padded_lengths, strict=True):
+            expected_full_post_input_grad[source_offset : source_offset + total_length] = reference_post_input.grad[
+                canonical_offset : canonical_offset + total_length
+            ]
+            source_offset += padded_length
+            canonical_offset += total_length
+        torch.testing.assert_close(
+            local_post_input.grad,
+            gdn_cp_slice(expected_full_post_input_grad, cu_seqlens, world_size, rank),
+            atol=1e-10,
+            rtol=1e-10,
+        )
+        for parameter, reference_parameter in (
+            (norm.weight, reference_norm.weight),
+            (head.weight, reference_head.weight),
+        ):
             dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
             torch.testing.assert_close(parameter.grad, reference_parameter.grad, atol=1e-10, rtol=1e-10)
     finally:

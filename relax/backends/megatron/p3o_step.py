@@ -201,7 +201,10 @@ def compute_p3o_step_context(
             inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
 
         try:
-            output_tensor = model_chunk(**forward_kwargs)
+            from .model import _p3o_full_sequence_post_process
+
+            with _p3o_full_sequence_post_process(args, model_chunk, batch.get("packed_seq_params")):
+                output_tensor = model_chunk(**forward_kwargs)
         finally:
             if orig_cp_group is not None:
                 inner.pg_collection.cp = orig_cp_group

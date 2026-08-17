@@ -135,6 +135,10 @@ def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
     loss, metrics = loss_module.p3o_loss_function(args, batch, torch.zeros(1), torch.sum)
 
     assert REQUIRED_P3O_METRICS <= metrics.keys()
+    assert loss.dtype is torch.float64
+    assert metrics["p3o/score_loss"].dtype is torch.float64
+    assert metrics["p3o/total_loss"].dtype is torch.float64
+    assert metrics["p3o/normalized_ess"].dtype is torch.float64
     assert not any(metric.startswith("opd/") for metric in metrics)
     assert torch.equal(metrics["p3o/reference_kl"], torch.zeros(()))
     assert not metrics["p3o/reference_kl"].requires_grad

@@ -31,6 +31,12 @@ def _configure_p3o_partition_invariance(args: Namespace) -> None:
             raise RuntimeError(
                 "P3O strict partition invariance requires " + " and ".join(missing) + "; refusing a non-equivalent run"
             )
+        # MCore's batch-invariant TE GEMM wrapper does not honor the
+        # ``accumulate=True`` contract when fused wgrad writes directly to
+        # ``main_grad``: every micro-batch copies over the previous one. Keep
+        # the batch-invariant kernels, but use TE/DDP's stable unfused gradient
+        # accumulation path for the complete optimizer step.
+        args.gradient_accumulation_fusion = False
     if batch_invariant_mode:
         enable_batch_invariant_mode()
 

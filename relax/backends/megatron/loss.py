@@ -968,18 +968,24 @@ def p3o_loss_function(
         clip_high=getattr(args, "clip_high", 0.2),
     )
 
-    score_loss = sum_of_sample_mean(terms.score_loss)
-    adaptive_kl_loss = sum_of_sample_mean(terms.adaptive_kl_loss)
+    # Keep cancellation-sensitive optimizer-step scalars in FP64. The cast is
+    # differentiable, so token gradients still flow back in their model dtype;
+    # only the reduction order is protected from DP/CP partition rounding.
+    def stable_token_sum(values: torch.Tensor) -> torch.Tensor:
+        return sum_of_sample_mean(values.to(torch.float64))
+
+    score_loss = stable_token_sum(terms.score_loss)
+    adaptive_kl_loss = stable_token_sum(terms.adaptive_kl_loss)
     # behavior_kl_proxy: sampled-token k3 proxy (1-ESS), not full-vocabulary KL.
     # Measures concentration of importance ratios via ESS, not distributional shift.
-    behavior_kl_proxy = sum_of_sample_mean(terms.behavior_kl_proxy)
+    behavior_kl_proxy = stable_token_sum(terms.behavior_kl_proxy)
     # cap_fraction: fraction of tokens where adaptive cap binds (ratio > ESS).
     # Different from PPO's clip_fraction which measures fixed-interval clipping.
-    cap_fraction = sum_of_sample_mean(terms.cap_hits)
-    clip_fraction = sum_of_sample_mean(terms.clip_hits)
+    cap_fraction = stable_token_sum(terms.cap_hits)
+    clip_fraction = stable_token_sum(terms.clip_hits)
 
     entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    entropy_loss = stable_token_sum(entropy)
 
     loss = score_loss + adaptive_kl_loss - args.entropy_coef * entropy_loss
 
@@ -990,7 +996,7 @@ def p3o_loss_function(
         # behavior KL above and reported under its own key.
         ref_log_probs = torch.cat(batch["ref_log_probs"], dim=0)
         reference_kl = compute_approx_kl(log_probs, ref_log_probs, kl_loss_type=args.kl_loss_type)
-        reference_kl_loss = sum_of_sample_mean(reference_kl)
+        reference_kl_loss = stable_token_sum(reference_kl)
         reference_kl_metric = reference_kl_loss.clone().detach()
         loss = loss + args.kl_loss_coef * reference_kl_loss
 
@@ -999,10 +1005,10 @@ def p3o_loss_function(
 
     # Global step scalars are reported as scalar * local_valid_tokens so that the
     # caller's divide-by-global-token-count recovers the scalar itself.
-    local_valid_tokens = valid_mask.sum().to(torch.float32)
+    local_valid_tokens = valid_mask.sum().to(torch.float64)
 
     def scaled(value: torch.Tensor) -> torch.Tensor:
-        return (value.to(torch.float32) * local_valid_tokens).clone().detach()
+        return (value.to(torch.float64) * local_valid_tokens).clone().detach()
 
     reported_loss = {
         "loss": loss.clone().detach(),

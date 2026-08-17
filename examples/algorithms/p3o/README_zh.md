@@ -70,11 +70,11 @@ OPD advantage replacement 或 OPD-only reward 都会形成未经验证的混合�
 reward/verifier 名称 `P3O_RM_TYPE=mopd` 与 `--use-opd` 训练功能无关，兼容数据集
 仍可使用。
 
-当 `--context-parallel-size > 1` 时，P3O 会自动在每个 THD TransformerLayer 之前
-重建全序列，完成整层计算后再把输出切回各 CP rank。该严格路径对 `micro-batch` 和
-`step` 两种 ESS scope 都生效，使 QKV、attention、残差和 MLP kernel 看到与 CP1
-相同的 token 顺序和形状。它会在每个 CP rank 上重复完整层的计算和 activation，
-因此峰值显存和计算量都高于原生 CP；长上下文建议开启整层 activation
+当 `--context-parallel-size > 1` 时，P3O 会自动为每个 THD TransformerLayer、最终
+normalization 和 LM head 重建全序列，完成计算后再把输出切回各 CP rank。该严格路径对
+`micro-batch` 和 `step` 两种 ESS scope 都生效，使 forward/backward kernel 看到与 CP1
+相同的 token 顺序和形状。它会在每个 CP rank 上重复全序列计算和 activation，因此
+峰值显存和计算量都高于原生 CP；长上下文建议开启整层 activation
 recomputation。当前支持的合同是标准 zig-zag THD 且 tensor parallel size 为 1。
 如果全序列路径发生 OOM，P3O 会终止并拒绝 CP>1，不会静默回退到数值不等价的
 原生 CP kernel order。
@@ -83,9 +83,10 @@ recomputation。当前支持的合同是标准 zig-zag THD 且 tensor parallel s
 `--batch-invariant-mode`。示例脚本会为配对的 P3O/GRPO run 同时启用两者，并在模型
 构建前向 Ray runtime 注入 `NCCL_ALGO=Ring`、
 `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` 和
-`CUBLAS_WORKSPACE_CONFIG=:4096:8`。batch-invariant kernel 覆盖 wrapped
-TransformerLayer 之外的最终 normalization 与 LM head；缺少任一模式时 P3O 会
-fail closed。
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`。缺少任一模式时 P3O 会 fail closed。P3O 在该模式下
+还会关闭 fused weight-gradient accumulation，因为
+当前随附的 batch-invariant TE GEMM 无法遵守跨多个 micro-batch 的 `main_grad`
+累积合同。该绕行使用稳定的 TE/DDP 累积路径，可能降低吞吐或增加瞬时梯度显存。
 
 正式默认值为 G=16、global batch 64、micro-batch 1、rollout batch 4、response
 length 4096 和 30 个 optimizer step（`--num-rollout 30`）。计划配对 seed 为 42、

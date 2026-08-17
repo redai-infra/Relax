@@ -39,6 +39,17 @@ def test_p3o_partition_modes_enable_batch_invariant_kernels(monkeypatch: pytest.
     assert calls == ["enabled"]
 
 
+def test_p3o_partition_modes_disable_fused_wgrad_accumulation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BIK's TE wrapper must not overwrite ``main_grad`` between micro-
+    batches."""
+    monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: None)
+    args = _args(gradient_accumulation_fusion=True)
+
+    initialize._configure_p3o_partition_invariance(args)
+
+    assert args.gradient_accumulation_fusion is False
+
+
 def test_non_p3o_does_not_change_partition_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: calls.append("enabled"))

@@ -31,6 +31,7 @@ class _FakeProvider:
         self.vision_dp_when_cp = False
         self.deterministic_mode = False
         self.batch_invariant_mode = False
+        self.gradient_accumulation_fusion = True
 
     def finalize(self):
         self.finalized = True
@@ -137,6 +138,7 @@ def _bridge_args(**overrides):
         "virtual_pipeline_model_parallel_size": 2,
         "deterministic_mode": True,
         "batch_invariant_mode": True,
+        "gradient_accumulation_fusion": False,
         "context_parallel_size": 1,
         "expert_model_parallel_size": 1,
         "expert_tensor_parallel_size": 1,
@@ -194,6 +196,7 @@ def test_bridge_provider_receives_partition_invariance_modes(monkeypatch):
 
     assert provider.deterministic_mode is True
     assert provider.batch_invariant_mode is True
+    assert provider.gradient_accumulation_fusion is False
     assert provider.finalized
 
 
