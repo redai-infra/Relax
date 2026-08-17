@@ -310,6 +310,21 @@ class TestBoundedAttach:
         with pytest.raises(tq_lifecycle.TqAttachTimeout, match="attach timed out"):
             tq_lifecycle._await_controller_config(time.monotonic() + 0.3)
 
+    def test_cluster_attach_handshake_worker_is_one_shot(self, monkeypatch):
+        remote_options = {}
+
+        def record_remote_options(**options):
+            remote_options.update(options)
+            return lambda function: function
+
+        monkeypatch.setattr(tq_lifecycle.ray, "remote", record_remote_options)
+        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: [])
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda *args, **kwargs: ([], []))
+
+        assert tq_lifecycle.verify_cluster_attach({}, timeout=0.1) == []
+        assert remote_options["max_calls"] == 1
+        assert remote_options["max_retries"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Worker detach (attach-only inverse used by every worker teardown hook)

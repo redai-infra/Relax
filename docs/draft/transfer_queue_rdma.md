@@ -75,6 +75,8 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 
 然后给**每个节点**的作业环境设置 `MC_MASTER_ADDRESS=<master-host>:50051`。该变量是必填项：未设置时启动直接失败，Relax 不会假定 loopback 端点（多节点作业里每个节点都把自己的 localhost 当 master 会导致误降级或误中止）。
 
+Mooncake/TCP 长会话还应在 driver 与所有 Ray worker 中统一设置 `MC_TCP_ENABLE_CONNECTION_POOL=1`。未启用连接池时，大批量反复传输可能耗尽临时 TCP 端口并报 `Cannot assign requested address`；该变量必须通过作业运行时环境传播到所有节点，不能只在提交命令所在的 shell 中设置。RDMA transport 不依赖此选项。
+
 启动前置条件：部署侧必须先启动 master，所有 GPU 节点和 driver 都能解析并连接 `MC_MASTER_ADDRESS`，防火墙允许 master RPC 端口；作业镜像中的 TQ 必须包含本文“正确性依赖”所列修复。Relax 不负责拉起、重启或终止 master。
 
 三种情形下的行为：
@@ -83,7 +85,7 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 |---|---|---|
 | **master 在探测时不可达** | `auto` 统一降级到 SimpleStorage；`required` 启动失败并列出失败节点 | 先确认 master、DNS/路由和 `MC_MASTER_ADDRESS` |
 | **master 探测通过、但 `tq.init` 时失败/超时** | 第一次初始化在独立 owner actor 中执行，driver 最多等待 60 秒。失败后回收该 actor 及其拥有的半初始化 controller；`auto` 只重试一次 SimpleStorage，`required` 清理后抛出原始错误 | 查看 `mooncake_init_failed:*`、master 日志和 owner 清理日志 |
-| **attach 握手在某节点失败/超时** | driver 汇总各节点结果：`auto` 关闭 Mooncake 状态并统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`off`/`required` 启动失败并列出节点 | 检查失败节点到 master 的连通性、RDMA 状态、可用内存与 `memlock`；握手会瞬时创建完整 client segment，CPU-only head 也会执行 |
+| **attach 握手在某节点失败/超时** | driver 汇总各节点结果：`auto` 关闭 Mooncake 状态并统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`off`/`required` 启动失败并列出节点。握手使用一次性 Ray worker，超时的 `tq.init` watchdog thread 不会污染后续任务 | 检查失败节点到 master 的连通性、RDMA 状态、可用内存与 `memlock`；握手会瞬时创建完整 client segment，CPU-only head 也会执行 |
 | **worker attach 卡住**（controller 半初始化 / mooncake setup 挂起） | 每个 worker 的 attach 有统一 deadline（默认 60 s，`RELAX_TQ_ATTACH_TIMEOUT_SECONDS` 可调）：先有界等待 controller 提供配置，再在 watchdog 线程里跑 `tq.init`；超时该 worker 立刻失败而不是无限挂起 | 看 `TqAttachTimeout` 报错中的阶段描述 |
 | **正常退出**（作业结束或全局重启） | 只有 owner actor 调用全局 `tq.close()`，随后显式 `storage_client.close()` 卸载 segment；附加 worker 只关闭本地 client，不能删除全局数据或 controller。master 本身不动 | 无需操作 |
 | **异常退出**（worker 被 kill / OOM / 节点掉线） | Python 层不执行，segment 仍在 master 注册。master 要等 `client_ttl`（默认 30 s）才判定客户端过期，期间新作业的 put 会打到死端点并报 `Failed to open segment ... Connection refused` | 等 30 s 后重启，或部署侧调小 `-client_ttl` |

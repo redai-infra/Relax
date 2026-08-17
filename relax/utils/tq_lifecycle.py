@@ -488,18 +488,20 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
     """Bounded attach handshake from every alive node; returns failure
     summaries.
 
-    Each task performs the same bounded :func:`attach_tq_client` a worker would
-    perform (real stored config, real storage client) and detaches immediately,
-    so it validates the *actual endpoints* instead of a ``/sys`` capability
-    heuristic on a node the scheduler may never use.  An empty return means
-    every alive node attached within the deadline; the driver aggregates
-    failures and decides one job-level outcome.
+    Each one-shot task performs the same bounded :func:`attach_tq_client` a
+    worker would perform (real stored config, real storage client) and detaches
+    immediately, so it validates the *actual endpoints* instead of a ``/sys``
+    capability heuristic on a node the scheduler may never use.  The worker is
+    not reused because a timed-out ``tq.init`` daemon thread cannot be stopped
+    safely in-process.  An empty return means every alive node attached within
+    the deadline; the driver aggregates failures and decides one job-level
+    outcome.
     """
     if timeout is None:
         timeout = _resolve_attach_timeout()
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    @ray.remote(num_cpus=0, max_retries=0)
+    @ray.remote(num_cpus=0, max_retries=0, max_calls=1)
     def _handshake(handshake_conf: Any) -> None:
         from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
 
