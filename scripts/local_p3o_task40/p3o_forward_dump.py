@@ -131,6 +131,7 @@ class DumpState:
     original_get_batch: Callable[..., Any] | None = None
     original_cp_probe: Callable[..., Any] | None = None
     required_stages: set[str] = field(default_factory=set)
+    capture_target_count: int = 0
 
 
 _STATE = DumpState()
@@ -233,6 +234,15 @@ def _observed_get_batch(*args: Any, **kwargs: Any) -> Any:
     if _STATE.phase == CAPTURE_PHASE and not batch.get("__is_dummy__", False):
         _STATE.pending.append(_record_batch(batch))
     return batch
+
+
+def _install_get_batch_observers(model_backend: Any, p3o_step_backend: Any) -> None:
+    original = model_backend.get_batch
+    if original is not p3o_step_backend.get_batch:
+        raise RuntimeError("model.py and p3o_step.py do not share the expected original get_batch callable")
+    _STATE.original_get_batch = original
+    model_backend.get_batch = _observed_get_batch
+    p3o_step_backend.get_batch = _observed_get_batch
 
 
 def _sanitize_stage(stage: str) -> str:
@@ -357,6 +367,8 @@ def _root_post_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any], 
     _STATE.capture_directories.append(relative)
     _STATE.active = None
     _write_rank_manifest()
+    if len(_STATE.capture_directories) >= _STATE.capture_target_count:
+        _STATE.phase = "train_after_capture"
 
 
 def _register_pre_post(module: Any, stage_prefix: str, preferred_axis: int | None = 0) -> None:
@@ -488,7 +500,7 @@ def configure(args: Any) -> None:
     from megatron.core import mpu
 
     from relax.backends.megatron import model as model_backend
-    from relax.backends.megatron import model_provider
+    from relax.backends.megatron import model_provider, p3o_step
 
     if _STATE.args is not None:
         raise RuntimeError("Task40 forward dump configure() was called more than once in one process")
@@ -518,13 +530,20 @@ def configure(args: Any) -> None:
     _STATE.tp_world_size = mpu.get_tensor_model_parallel_world_size()
     _STATE.pp_rank = mpu.get_pipeline_model_parallel_rank()
     _STATE.pp_world_size = mpu.get_pipeline_model_parallel_world_size()
+    denominator = _STATE.dp_world_size * int(args.micro_batch_size)
+    if denominator <= 0 or int(args.global_batch_size) % denominator != 0:
+        raise ValueError(
+            "Task40 forward dump cannot derive the per-rank capture count from "
+            f"global_batch_size={args.global_batch_size}, dp_world_size={_STATE.dp_world_size}, "
+            f"micro_batch_size={args.micro_batch_size}"
+        )
+    _STATE.capture_target_count = int(args.global_batch_size) // denominator
     _STATE.dump_dir = Path(args.dump_details).parent / "dump"
     _STATE.dump_dir.mkdir(parents=True, exist_ok=True)
     (_STATE.dump_dir / f"rank{_STATE.rank:05d}").mkdir(exist_ok=True)
     _json_write(_STATE.dump_dir / f"runtime_rank{_STATE.rank}.json", _runtime_metadata(args))
 
-    _STATE.original_get_batch = model_backend.get_batch
-    model_backend.get_batch = _observed_get_batch
+    _install_get_batch_observers(model_backend, p3o_step)
 
     _STATE.original_cp_probe = model_provider._install_cp_probe
 
@@ -551,9 +570,13 @@ def before_train_step(
     optimizer: Any,
     opt_param_scheduler: Any,
 ) -> None:
-    """Stop capture before the replayed P3O stats/train forwards."""
-    del args, rollout_id, step_id, model, optimizer, opt_param_scheduler
-    _STATE.phase = "train"
+    """Capture the first P3O forward when rollout log-probs skip actor
+    forward."""
+    del rollout_id, step_id, model, optimizer, opt_param_scheduler
+    if not _STATE.capture_directories and bool(getattr(args, "use_rollout_logprobs", False)):
+        _STATE.phase = CAPTURE_PHASE
+    else:
+        _STATE.phase = "train"
 
 
 def finalize_manifest(run_dir: Path) -> dict[str, Any]:

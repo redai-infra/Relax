@@ -54,11 +54,20 @@ There is intentionally no precision argument or FP32 branch in the launcher.
 
 ## Capture scope
 
-The hooks capture the forward used to calculate current policy log-probability,
-selected by `before_log_prob`. The later P3O stats replay and gradient forward
-consume the same Step-0 inputs and are deliberately not duplicated on disk.
-Activation recomputation is disabled in every template. A run therefore has
-exactly one dump for each non-dummy rank-local log-prob micro-batch.
+The frozen commands pass `--use-rollout-logprobs`, so the actor intentionally
+skips a separate current-policy log-prob forward. The hooks therefore select
+the first production P3O stats forward through `before_train_step`; for a
+configuration that does execute actor log-prob forward, `before_log_prob`
+selects that earlier equivalent path. Capture stops after exactly
+`global_batch_size / (DP * MBS)` completed rank-local micro-batches, before the
+gradient forward can be duplicated on disk. Activation recomputation is
+disabled in every template. A run therefore has exactly one dump for each
+non-dummy rank-local micro-batch.
+
+The hook observes both module-local aliases of `get_batch`: the ordinary
+forward path in `model.py` and the P3O sufficient-statistics path in
+`p3o_step.py`. This is required because each module imports the callable by
+value; replacing only one alias does not observe the other path.
 
 For each decoder layer `NNN`, the required stage set is:
 
