@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import contextlib
+import copy
 import dataclasses
 import gc
 import math
@@ -10,7 +11,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 
 import torch
@@ -53,6 +54,260 @@ from .rollout_policy_lag import build_rollout_policy_age_metrics
 
 
 logger = get_logger(__name__)
+
+
+P3O_CP_ATTENTION_OOM_ERROR = (
+    "P3O strict mode refuses context-parallel size greater than one after full-sequence attention OOM"
+)
+
+
+class _P3OSingletonCPGroup:
+    """Non-collective CP=1 view used by Megatron's THD RoPE path."""
+
+    @staticmethod
+    def size() -> int:
+        return 1
+
+    @staticmethod
+    def rank() -> int:
+        return 0
+
+
+_P3O_SINGLETON_CP_GROUP = _P3OSingletonCPGroup()
+
+
+def _resolve_p3o_attention_cp(attention: torch.nn.Module, packed_seq_params: object) -> tuple[int, object, int]:
+    """Resolve the effective CP group for one packed attention forward."""
+    local_cp_size = getattr(packed_seq_params, "local_cp_size", None)
+    if local_cp_size is not None:
+        cp_group = getattr(packed_seq_params, "cp_group", None)
+        if cp_group is None:
+            raise RuntimeError("P3O full-sequence attention requires packed_seq_params.cp_group for dynamic CP")
+        cp_size = int(local_cp_size)
+    else:
+        cp_group = attention.pg_collection.cp
+        cp_size = int(cp_group.size())
+    cp_rank = int(cp_group.rank()) if cp_size > 1 else 0
+    return cp_size, cp_group, cp_rank
+
+
+def _p3o_cp_gather_full(
+    hidden_states: torch.Tensor,
+    cu_seqlens: list[int],
+    cp_size: int,
+    cp_group: object,
+) -> torch.Tensor:
+    """Gather THD hidden-state shards before the shape-sensitive QKV GEMM."""
+    from .cp_utils import gdn_cp_gather_full
+
+    return gdn_cp_gather_full(hidden_states, cu_seqlens, cp_size, cp_group)
+
+
+def _p3o_cp_slice(
+    full_output: torch.Tensor,
+    cu_seqlens: list[int],
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Return the current rank's THD zig-zag shard from full attention
+    output."""
+    from .cp_utils import gdn_cp_slice
+
+    return gdn_cp_slice(full_output, cu_seqlens, cp_size, cp_rank)
+
+
+def _canonicalize_p3o_attention_input(
+    full_hidden_states: torch.Tensor,
+    source_cu_seqlens: list[int],
+    total_lengths: list[int],
+    pad_multiple: int,
+) -> tuple[torch.Tensor, list[int]]:
+    """Remove CP-only padding and reproduce the CP1 packed sequence shape."""
+    if pad_multiple <= 0:
+        raise ValueError(f"P3O attention pad multiple must be positive, got {pad_multiple}")
+    if not total_lengths:
+        raise ValueError("P3O full-sequence attention requires at least one packed sequence")
+    if len(source_cu_seqlens) not in {len(total_lengths) + 1, len(total_lengths) + 2}:
+        raise ValueError(
+            f"P3O attention metadata mismatch: cu_seqlens={len(source_cu_seqlens)}, total_lengths={len(total_lengths)}"
+        )
+    if (
+        source_cu_seqlens[0] != 0
+        or any(end < start for start, end in zip(source_cu_seqlens[:-1], source_cu_seqlens[1:], strict=True))
+        or source_cu_seqlens[-1] != full_hidden_states.shape[0]
+    ):
+        raise ValueError(
+            "P3O attention cu_seqlens must be monotonic and span the reconstructed tensor: "
+            f"cu_seqlens={source_cu_seqlens}, tokens={full_hidden_states.shape[0]}"
+        )
+
+    pieces: list[torch.Tensor] = []
+    canonical_cu_seqlens = [0]
+    for index, total_length in enumerate(total_lengths):
+        source_start = source_cu_seqlens[index]
+        source_end = source_cu_seqlens[index + 1]
+        if total_length < 0 or source_end - source_start < total_length:
+            raise ValueError(
+                "P3O attention source segment is shorter than its real sequence: "
+                f"index={index}, source_length={source_end - source_start}, total_length={total_length}"
+            )
+        pieces.append(full_hidden_states[source_start : source_start + total_length])
+        canonical_cu_seqlens.append(canonical_cu_seqlens[-1] + total_length)
+
+    canonical_padding = (-canonical_cu_seqlens[-1]) % pad_multiple
+    if canonical_padding:
+        trailing_start = source_cu_seqlens[len(total_lengths)]
+        trailing_end = source_cu_seqlens[-1]
+        available_padding = min(trailing_end - trailing_start, canonical_padding)
+        if available_padding:
+            pieces.append(full_hidden_states[trailing_start : trailing_start + available_padding])
+        missing_padding = canonical_padding - available_padding
+        if missing_padding:
+            pieces.append(full_hidden_states.new_zeros((missing_padding, *full_hidden_states.shape[1:])))
+        canonical_cu_seqlens.append(canonical_cu_seqlens[-1] + canonical_padding)
+
+    return torch.cat(pieces, dim=0), canonical_cu_seqlens
+
+
+def _restore_p3o_attention_output_layout(
+    canonical_output: torch.Tensor,
+    source_cu_seqlens: list[int],
+    total_lengths: list[int],
+) -> torch.Tensor:
+    """Map real-token outputs back into the original CP-padded THD layout."""
+    if canonical_output.shape[0] < sum(total_lengths):
+        raise ValueError(
+            "P3O canonical attention output is shorter than the real-token total: "
+            f"output={canonical_output.shape[0]}, total={sum(total_lengths)}"
+        )
+    output = canonical_output.new_zeros((source_cu_seqlens[-1], *canonical_output.shape[1:]))
+    canonical_start = 0
+    for index, total_length in enumerate(total_lengths):
+        source_start = source_cu_seqlens[index]
+        output[source_start : source_start + total_length] = canonical_output[
+            canonical_start : canonical_start + total_length
+        ]
+        canonical_start += total_length
+    return output
+
+
+def _build_p3o_full_sequence_attention_forward(attention: torch.nn.Module) -> Callable:
+    """Wrap one SelfAttention instance with P3O's strict CP-equivalent path."""
+    original_forward = attention.forward
+
+    @wraps(original_forward)
+    def full_sequence_forward(
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        key_value_states: torch.Tensor | None = None,
+        inference_context: object | None = None,
+        rotary_pos_emb: object | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: object | None = None,
+        sequence_len_offset: int | None = None,
+        *,
+        inference_params: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+            raise RuntimeError("P3O full-sequence attention requires THD packed_seq_params when CP>1")
+
+        cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
+        if cp_size == 1:
+            return original_forward(
+                hidden_states,
+                attention_mask,
+                key_value_states,
+                inference_context,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                rotary_pos_cos_sin,
+                attention_bias,
+                packed_seq_params,
+                sequence_len_offset,
+                inference_params=inference_params,
+            )
+
+        cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu", None)
+        if cu_seqlens_cpu is None:
+            cu_seqlens_cpu = packed_seq_params.cu_seqlens_q.tolist()
+            packed_seq_params._relax_cu_seqlens_cpu = cu_seqlens_cpu
+
+        original_cp_group = attention.pg_collection.cp
+        try:
+            full_hidden_states = _p3o_cp_gather_full(hidden_states, cu_seqlens_cpu, cp_size, cp_group)
+            total_lengths = getattr(packed_seq_params, "_relax_total_lengths", None)
+            pad_multiple = getattr(packed_seq_params, "_relax_attention_pad_multiple", None)
+            if total_lengths is None or pad_multiple is None:
+                raise RuntimeError("P3O full-sequence attention requires Relax packed-length metadata")
+            canonical_hidden_states, canonical_cu_seqlens = _canonicalize_p3o_attention_input(
+                full_hidden_states,
+                cu_seqlens_cpu,
+                total_lengths,
+                pad_multiple,
+            )
+            full_packed_seq_params = copy.copy(packed_seq_params)
+            full_packed_seq_params.local_cp_size = 1
+            full_packed_seq_params.cp_group = _P3O_SINGLETON_CP_GROUP
+            canonical_cu_seqlens_tensor = packed_seq_params.cu_seqlens_q.new_tensor(canonical_cu_seqlens)
+            full_packed_seq_params.cu_seqlens_q = canonical_cu_seqlens_tensor
+            full_packed_seq_params.cu_seqlens_kv = canonical_cu_seqlens_tensor
+            full_packed_seq_params.max_seqlen_q = max(
+                end - start for start, end in zip(canonical_cu_seqlens[:-1], canonical_cu_seqlens[1:], strict=True)
+            )
+            full_packed_seq_params.max_seqlen_kv = full_packed_seq_params.max_seqlen_q
+            if hasattr(full_packed_seq_params, "cu_seqlens_q_padded"):
+                full_packed_seq_params.cu_seqlens_q_padded = None
+                full_packed_seq_params.cu_seqlens_kv_padded = None
+            full_output, bias = original_forward(
+                canonical_hidden_states,
+                attention_mask,
+                key_value_states,
+                inference_context,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                rotary_pos_cos_sin,
+                attention_bias,
+                full_packed_seq_params,
+                sequence_len_offset,
+                inference_params=inference_params,
+            )
+            source_layout_output = _restore_p3o_attention_output_layout(
+                full_output,
+                cu_seqlens_cpu,
+                total_lengths,
+            )
+            return _p3o_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank), bias
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
+        finally:
+            attention.pg_collection.cp = original_cp_group
+
+    return full_sequence_forward
+
+
+def _install_p3o_full_sequence_attention(args: Namespace, model: torch.nn.Module) -> int:
+    """Install strict full-sequence attention for P3O whenever configured CP is
+    greater than one."""
+    if getattr(args, "advantage_estimator", None) != "p3o" or getattr(args, "context_parallel_size", 1) <= 1:
+        return 0
+
+    installed = 0
+    for module in model.modules():
+        if type(module).__name__ != "SelfAttention" or getattr(
+            module, "_relax_p3o_full_sequence_attention_installed", False
+        ):
+            continue
+        if not hasattr(module, "pg_collection") or not hasattr(module.pg_collection, "cp"):
+            raise RuntimeError("P3O full-sequence attention requires SelfAttention.pg_collection.cp")
+        module.forward = _build_p3o_full_sequence_attention_forward(module)
+        module._relax_p3o_full_sequence_attention_installed = True
+        installed += 1
+    return installed
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -424,6 +679,13 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+
+    if getattr(args, "advantage_estimator", None) == "p3o" and getattr(args, "context_parallel_size", 1) > 1:
+        installed_attention_modules = sum(
+            _install_p3o_full_sequence_attention(args, model_chunk) for model_chunk in model
+        )
+        if installed_attention_modules == 0:
+            raise RuntimeError("P3O context parallelism requires at least one supported SelfAttention module")
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from

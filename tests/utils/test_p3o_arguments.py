@@ -106,6 +106,11 @@ def _p3o_args(**overrides) -> Namespace:
         use_routing_replay=False,
         use_rollout_routing_replay=False,
         overlap_moe_expert_parallel_comm=False,
+        context_parallel_size=1,
+        tensor_model_parallel_size=1,
+        qkv_format="thd",
+        is_vl_model=False,
+        allgather_cp=False,
     )
     config.update(overrides)
     return Namespace(**config)
@@ -180,6 +185,25 @@ def test_p3o_arguments_rejects_micro_batch_ess_with_recomputed_loss():
 
 def test_p3o_arguments_step_scope_allows_recomputed_loss():
     validate_p3o_args(_p3o_args(p3o_ess_scope="step", recompute_loss_function=True))
+
+
+@pytest.mark.parametrize("scope", ["micro-batch", "step"])
+def test_p3o_arguments_accepts_strict_full_sequence_cp(scope):
+    validate_p3o_args(_p3o_args(p3o_ess_scope=scope, context_parallel_size=2))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"qkv_format": "bshd"}, "THD"),
+        ({"tensor_model_parallel_size": 2}, "tensor-model-parallel-size 1"),
+        ({"is_vl_model": True}, "text-only THD"),
+        ({"allgather_cp": True}, "standard zig-zag THD"),
+    ],
+)
+def test_p3o_arguments_rejects_unsupported_strict_cp_attention(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        validate_p3o_args(_p3o_args(context_parallel_size=2, **overrides))
 
 
 def test_megatron_checkpoint_source_recognizes_root_and_direct_iteration_paths(tmp_path):

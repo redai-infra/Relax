@@ -2969,6 +2969,17 @@ def _validate_p3o_args(args: argparse.Namespace) -> None:
     if clip_low < 0.0 or clip_high < 0.0:
         raise ValueError(f"--clip-low/--clip-high must be non-negative, got {clip_low}, {clip_high}.")
 
+    context_parallel_size = getattr(args, "context_parallel_size", 1)
+    if context_parallel_size > 1:
+        if getattr(args, "qkv_format", "thd") != "thd":
+            raise ValueError("P3O context parallelism requires THD full-sequence attention.")
+        if getattr(args, "tensor_model_parallel_size", 1) != 1:
+            raise ValueError("P3O strict full-sequence attention currently requires --tensor-model-parallel-size 1.")
+        if getattr(args, "is_vl_model", False):
+            raise ValueError("P3O strict full-sequence context parallelism currently supports text-only THD models.")
+        if getattr(args, "allgather_cp", False):
+            raise ValueError("P3O strict full-sequence attention requires standard zig-zag THD context parallelism.")
+
     if not args.use_rollout_logprobs:
         raise ValueError(
             "P3O requires the rollout sampling distribution as its behavior policy. "

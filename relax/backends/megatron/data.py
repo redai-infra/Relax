@@ -441,6 +441,7 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
+            cu_seqlens_cpu = cu_seqlens_list
             cu_seqlens = torch.tensor(
                 cu_seqlens_list, dtype=torch.int, device=device_utils.make_current_torch_device()
             )
@@ -464,6 +465,7 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
+            cu_seqlens_cpu = [value * cp_size for value in cu_seqlens]
             cu_seqlens = (
                 torch.tensor(cu_seqlens, dtype=torch.int).to(device_utils.make_current_torch_device()) * cp_size
             )
@@ -479,6 +481,13 @@ def get_batch(
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group
+        if getattr(get_args(), "advantage_estimator", None) == "p3o":
+            # P3O's strict CP attention reconstructs the CP1 QKV shape without
+            # changing this existing token layout. Keep the host boundaries from
+            # construction so every layer avoids a device-to-host synchronization.
+            packed_seq_params._relax_total_lengths = list(batch["total_lengths"])
+            packed_seq_params._relax_attention_pad_multiple = pad_size
+            packed_seq_params._relax_cu_seqlens_cpu = cu_seqlens_cpu
 
         tokens = tokens.unsqueeze(0)
     else:
