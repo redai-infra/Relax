@@ -38,7 +38,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_mixture_lora_enabled,
 )
-from relax.utils.mixture_lora import configure_mixture_lora_external_model
+from relax.utils.mixture_lora_common import configure_mixture_lora_external_model
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
 from relax.utils.s3_model_loader import (
     get_s3_model_cached_path,

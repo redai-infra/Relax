@@ -11,14 +11,14 @@ from torch import nn
 pytest.importorskip("megatron.bridge")
 pytest.importorskip("sglang.srt.models.qwen3")
 
-from relax.backends.megatron.mixture_lora import MixtureLoRAAdapter  # noqa: E402
+from relax.backends.megatron.mixture_lora_modules import MixtureLoRAAdapter  # noqa: E402
 from relax.models.qwen3_mixture_lora.sglang.model import (  # noqa: E402
     EntryClass,
     SGLangMixtureLoRA,
     attach_sglang_mixture_lora,
     load_sglang_mixture_lora_weights,
 )
-from relax.utils.mixture_lora import MixtureLoraConfig  # noqa: E402
+from relax.utils.mixture_lora_common import MixtureLoraConfig  # noqa: E402
 
 
 def _config():

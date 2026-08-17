@@ -42,7 +42,7 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
-from .mixture_lora import get_microbatch_objective_scale
+from .mixture_lora_modules import get_microbatch_objective_scale
 
 
 def get_responses(

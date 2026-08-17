@@ -10,14 +10,14 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
-from relax.backends.megatron.mixture_lora import (
+from relax.backends.megatron.mixture_lora_modules import (
     MixtureLoRAAdapter,
     MixtureLoRARoutingContext,
     activate_mixture_lora_routing_context,
     mixture_lora_metrics_from_packed_records,
     pack_mixture_lora_routing_records,
 )
-from relax.utils.mixture_lora import (
+from relax.utils.mixture_lora_common import (
     DenseRoutedLoRAExecutor,
     MixtureLoraConfig,
     compute_routing_statistics,

@@ -1,6 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Megatron model modules and Bridge injection for Mixture-of-LoRA."""
+"""Megatron-side Mixture-of-LoRA modules, routing context, and Bridge
+injection.
+
+Everything here depends on Megatron parallel state; the backend-independent
+configuration and routing math lives in ``relax.utils.mixture_lora_common``.
+"""
 
 import math
 import re
@@ -14,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from relax.utils.mixture_lora import (
+from relax.utils.mixture_lora_common import (
     MixtureLoraConfig,
     RoutingDecision,
     RoutingStatistics,

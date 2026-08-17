@@ -7,7 +7,7 @@ from typing import Tuple
 
 import torch
 
-from relax.utils.mixture_lora import MixtureLoraConfig
+from relax.utils.mixture_lora_common import MixtureLoraConfig
 
 
 # Fixed name under which the trained policy LoRA adapter is registered on the rollout

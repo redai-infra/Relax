@@ -67,9 +67,9 @@ def sglang_engine_module(monkeypatch):
     megatron_peft_utils.is_mixture_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
-    mixture_lora = ModuleType("relax.utils.mixture_lora")
+    mixture_lora = ModuleType("relax.utils.mixture_lora_common")
     mixture_lora.configure_mixture_lora_external_model = lambda *_args, **_kwargs: None
-    monkeypatch.setitem(sys.modules, "relax.utils.mixture_lora", mixture_lora)
+    monkeypatch.setitem(sys.modules, "relax.utils.mixture_lora_common", mixture_lora)
 
     sys.modules.pop("relax.backends.sglang.sglang_engine", None)
     module = importlib.import_module("relax.backends.sglang.sglang_engine")

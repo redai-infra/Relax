@@ -480,7 +480,7 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             if is_mixture_lora_enabled(args):
-                from relax.backends.megatron.mixture_lora import (
+                from relax.backends.megatron.mixture_lora_modules import (
                     build_mixture_lora_peft,
                     ensure_mixture_lora_recompute_inputs_grad,
                     install_mixture_lora_checkpoint_context,

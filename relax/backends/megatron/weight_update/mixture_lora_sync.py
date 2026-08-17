@@ -13,7 +13,7 @@ from megatron.core import mpu
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.utils import device as device_utils
 from relax.utils.megatron_peft_utils import build_mixture_lora_config, is_mixture_lora_param
-from relax.utils.mixture_lora import (
+from relax.utils.mixture_lora_common import (
     MixtureLoraStateSpec,
     build_mixture_lora_state_specs,
 )

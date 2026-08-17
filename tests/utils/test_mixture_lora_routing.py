@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from relax.utils.mixture_lora import (
+from relax.utils.mixture_lora_common import (
     MIXTURE_LORA_SCHEMA_VERSION,
     DenseRoutedLoRAExecutor,
     MixtureLoraConfig,

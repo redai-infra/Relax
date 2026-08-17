@@ -47,7 +47,7 @@ from relax.utils.training.ppo_utils import (
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
-from .mixture_lora import (
+from .mixture_lora_modules import (
     MixtureLoRARoutingContext,
     MixtureParallelLinearAdapter,
     activate_mixture_lora_routing_context,

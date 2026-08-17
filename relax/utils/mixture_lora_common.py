@@ -1,6 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Backend-independent routing primitives for Mixture-of-LoRA."""
+"""Backend-independent Mixture-of-LoRA contracts.
+
+Configuration, routing math, parameter naming, and transport specs shared by
+the Megatron training modules (``mixture_lora_modules``) and the SGLang rollout
+modules (``relax.models.mixture_lora_sglang``). Nothing here may import a
+training or inference backend.
+"""
 
 import json
 import math

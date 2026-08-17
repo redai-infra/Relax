@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from relax.utils.env import Envs
-from relax.utils.mixture_lora import (
+from relax.utils.mixture_lora_common import (
     DenseRoutedLoRAExecutor,
     MixtureLoraConfig,
     deserialize_mixture_lora_config,

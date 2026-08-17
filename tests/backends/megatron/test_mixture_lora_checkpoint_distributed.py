@@ -9,8 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from relax.backends.megatron.mixture_lora import MixtureParallelLinearAdapter
-from relax.utils.mixture_lora import MixtureLoraConfig
+from relax.backends.megatron.mixture_lora_modules import MixtureParallelLinearAdapter
+from relax.utils.mixture_lora_common import MixtureLoraConfig
 
 
 def _config() -> MixtureLoraConfig:

@@ -26,7 +26,7 @@ from relax.backends.megatron.weight_update.update_weight_from_tensor import (  #
     _send_to_colocated_engine,
     iter_mixture_weight_updates,
 )
-from relax.utils.mixture_lora import MixtureLoraStateSpec  # noqa: E402
+from relax.utils.mixture_lora_common import MixtureLoraStateSpec  # noqa: E402
 from relax.utils.types import ParamInfo  # noqa: E402
 
 

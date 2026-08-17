@@ -16,7 +16,7 @@ from relax.backends.sglang.sglang_engine import (  # noqa: E402
     _compute_server_args,
     _configure_external_model_environment,
 )
-from relax.utils.mixture_lora import (  # noqa: E402
+from relax.utils.mixture_lora_common import (  # noqa: E402
     MixtureLoraConfig,
     configure_mixture_lora_external_model,
     deserialize_mixture_lora_config,

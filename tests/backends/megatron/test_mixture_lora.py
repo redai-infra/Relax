@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from relax.backends.megatron.mixture_lora import (
+from relax.backends.megatron.mixture_lora_modules import (
     MixtureLoRAAdapter,
     MixtureLoRARoutingContext,
     MixtureParallelLinearAdapter,
@@ -24,7 +24,7 @@ from relax.backends.megatron.mixture_lora import (
     pack_mixture_lora_routing_records,
 )
 from relax.utils import megatron_bridge_utils
-from relax.utils.mixture_lora import MixtureLoraConfig, compute_routing_statistics
+from relax.utils.mixture_lora_common import MixtureLoraConfig, compute_routing_statistics
 
 
 def _config(*, num_experts=3, top_k=2, rank=2, alpha=4.0):
