@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
@@ -185,6 +186,64 @@ def test_pipeline_metadata_gather_uses_output_list_first_and_merges_stages():
         stage_0.state.parameter_name: stage_0,
         stage_1.state.parameter_name: stage_1,
     }
+
+
+@contextmanager
+def _single_rank_routed_sync(*, peer_failed: bool = False):
+    """Run routed-weight validation on a one-rank stand-in for the world."""
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        if peer_failed:
+            tensor.fill_(1)
+
+    with (
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.all_reduce", side_effect=fake_all_reduce),
+        patch("relax.backends.megatron.weight_update.synchronized_send.get_gloo_group", return_value=None),
+        patch(
+            "relax.backends.megatron.weight_update.mixture_lora_sync.device_utils.make_current_torch_device",
+            return_value=torch.device("cpu"),
+        ),
+        patch("torch.distributed.broadcast") as broadcast,
+        patch("torch.distributed.all_gather") as all_gather,
+    ):
+        yield broadcast, all_gather
+
+
+def test_routed_weight_validation_rejects_bad_tensors_before_any_collective():
+    from relax.backends.megatron.weight_update.mixture_lora_sync import MixtureLoraSync
+
+    sync = MixtureLoraSync.__new__(MixtureLoraSync)
+    sync.param_infos = (_info("linear_qkv", "router.weight", (2, 6), (2, 6), None),)
+
+    with _single_rank_routed_sync() as (broadcast, all_gather):
+        with pytest.raises(KeyError, match="Missing Mixture-of-LoRA weight"):
+            sync.get_weight_chunks({})
+        with pytest.raises(ValueError, match="has shape"):
+            sync.get_weight_chunks({"weight": torch.zeros(2, 5)})
+
+    broadcast.assert_not_called()
+    all_gather.assert_not_called()
+
+
+def test_routed_weight_validation_aborts_every_rank_when_one_rank_fails():
+    """A rank-local raise before the PP/TP collectives strands its peers.
+
+    The validation result is therefore shared before the first collective, so a
+    rank whose own shards are fine still aborts instead of blocking.
+    """
+
+    from relax.backends.megatron.weight_update.mixture_lora_sync import MixtureLoraSync
+
+    sync = MixtureLoraSync.__new__(MixtureLoraSync)
+    sync.param_infos = (_info("linear_qkv", "router.weight", (2, 6), (2, 6), None),)
+
+    with _single_rank_routed_sync(peer_failed=True) as (broadcast, all_gather):
+        with pytest.raises(RuntimeError, match="failed on another rank"):
+            sync.get_weight_chunks({"weight": torch.zeros(2, 6)})
+
+    broadcast.assert_not_called()
+    all_gather.assert_not_called()
 
 
 def test_qkv_lora_b_tp_shards_are_converted_from_group_layout_to_qkv_blocks():

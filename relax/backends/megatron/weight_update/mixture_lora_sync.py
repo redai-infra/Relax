@@ -20,6 +20,7 @@ from relax.utils.mixture_lora_common import (
 )
 
 from .common import named_params_and_buffers
+from .synchronized_send import raise_on_any_rank_failure
 
 
 @dataclass(frozen=True)
@@ -249,10 +250,59 @@ class MixtureLoraSync:
         self,
         local_weights: Mapping[str, torch.Tensor],
     ) -> Iterator[list[tuple[str, torch.Tensor]]]:
-        """Yield full routed tensors in deterministic, size-bounded chunks."""
+        """Yield full routed tensors in deterministic, size-bounded chunks.
+
+        Each rank checks the shards it owns *before* the first collective and
+        shares the outcome with every other rank: the PP broadcast and the TP
+        all-gather below are collective, so a rank-local raise in between would
+        leave the peers of the failing rank blocked until the distributed
+        timeout instead of reporting the bad tensor.
+        """
+
+        device = device_utils.make_current_torch_device()
+        local_tensors: dict[str, torch.Tensor] = {}
+        raise_on_any_rank_failure(
+            lambda: local_tensors.update(self._collect_local_tensors(local_weights, device=device)),
+            description="Mixture-of-LoRA routed weight validation",
+        )
+        return self._iter_weight_chunks(local_tensors, device=device)
+
+    def _collect_local_tensors(
+        self,
+        local_weights: Mapping[str, torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Validate and stage every routed tensor this rank owns."""
 
         rank = dist.get_rank()
-        device = device_utils.make_current_torch_device()
+        staged: dict[str, torch.Tensor] = {}
+        for info in self.param_infos:
+            if rank != info.src_rank:
+                continue
+            if info.weight_key not in local_weights:
+                raise KeyError(f"Missing Mixture-of-LoRA weight {info.weight_key!r}")
+            source_tensor = local_weights[info.weight_key]
+            if tuple(source_tensor.shape) != info.local_shape:
+                raise ValueError(
+                    f"Mixture-of-LoRA weight {info.weight_key!r} has shape {tuple(source_tensor.shape)}, "
+                    f"expected {info.local_shape}"
+                )
+            if source_tensor.dtype != info.state.dtype:
+                raise TypeError(
+                    f"Mixture-of-LoRA weight {info.weight_key!r} has dtype {source_tensor.dtype}, "
+                    f"expected {info.state.dtype}"
+                )
+            staged[info.state.parameter_name] = source_tensor.to(device=device)
+        return staged
+
+    def _iter_weight_chunks(
+        self,
+        local_tensors: Mapping[str, torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        rank = dist.get_rank()
         tp_world_size = mpu.get_tensor_model_parallel_world_size()
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_world_size = mpu.get_pipeline_model_parallel_world_size()
@@ -264,20 +314,7 @@ class MixtureLoraSync:
 
         for info in self.param_infos:
             if rank == info.src_rank:
-                if info.weight_key not in local_weights:
-                    raise KeyError(f"Missing Mixture-of-LoRA weight {info.weight_key!r}")
-                source_tensor = local_weights[info.weight_key]
-                if tuple(source_tensor.shape) != info.local_shape:
-                    raise ValueError(
-                        f"Mixture-of-LoRA weight {info.weight_key!r} has shape {tuple(source_tensor.shape)}, "
-                        f"expected {info.local_shape}"
-                    )
-                if source_tensor.dtype != info.state.dtype:
-                    raise TypeError(
-                        f"Mixture-of-LoRA weight {info.weight_key!r} has dtype {source_tensor.dtype}, "
-                        f"expected {info.state.dtype}"
-                    )
-                local_tensor = source_tensor.to(device=device)
+                local_tensor = local_tensors[info.state.parameter_name]
             else:
                 local_tensor = torch.empty(info.local_shape, dtype=info.state.dtype, device=device)
             if pp_group is not None and info.src_rank in pp_ranks:
