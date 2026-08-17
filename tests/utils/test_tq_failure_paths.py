@@ -26,8 +26,14 @@ import asyncio
 import importlib.util
 import multiprocessing
 import os
+import queue
 import socket
+import subprocess
+import sys
+import tempfile
+import uuid
 from types import SimpleNamespace
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -128,6 +134,11 @@ def _mm_slow_path_worker(result_queue, protocol: str) -> None:
     ("ok", ...), ("mismatch", ...) for data corruption, or ("error", ...) for
     engine failures — the parent treats anything but "ok" as a hard failure.
     """
+    client = None
+    keys: list[str] = []
+    put_meta: list[dict | None] | None = None
+    status = "error"
+    detail = "roundtrip did not run"
     try:
         from relax.utils.payload_digest import diff_digests, leaf_digests
         from tests.utils.mm_payload_fixtures import mm_train_data
@@ -135,35 +146,118 @@ def _mm_slow_path_worker(result_queue, protocol: str) -> None:
         train_data, source = mm_train_data(4)
         samples = train_data["multimodal_train_inputs"]
         client = TestMooncakeByteExact._client(protocol)
-        try:
-            keys = [f"mmslow_{protocol}_{index}@multimodal_train_inputs" for index in range(len(samples))]
-            put_meta = client.put(keys, samples)
-            if not all(isinstance(meta, dict) and meta.get("packed_size") for meta in put_meta):
-                result_queue.put(
-                    ("error", f"[{source}] dict payloads did not take the non-tensor path, put meta: {put_meta}")
-                )
-                return
-            got = client.get(
-                keys,
-                shapes=[[] for _ in keys],
-                dtypes=[None] * len(keys),
-                custom_backend_meta=put_meta,
+        run_token = uuid.uuid4().hex
+        keys = [f"mmslow_{run_token}_{protocol}_{index}@multimodal_train_inputs" for index in range(len(samples))]
+        put_meta = client.put(keys, samples)
+        if not all(isinstance(meta, dict) and meta.get("packed_size") for meta in put_meta):
+            raise RuntimeError(f"[{source}] dict payloads did not take the non-tensor path, put meta: {put_meta}")
+        got = client.get(
+            keys,
+            shapes=[[] for _ in keys],
+            dtypes=[None] * len(keys),
+            custom_backend_meta=put_meta,
+        )
+        problems: list[str] = []
+        for index, (want, have) in enumerate(zip(samples, got, strict=True)):
+            problems += [f"sample {index}: {line}" for line in diff_digests(leaf_digests(want), leaf_digests(have))]
+        if problems:
+            status, detail = "mismatch", f"[{source}] {problems[:6]}"
+        else:
+            leaves = sum(len(leaf_digests(sample)) for sample in samples)
+            packed = sum(meta["packed_size"] for meta in put_meta)
+            status, detail = (
+                "ok",
+                f"[{source}] {len(samples)} samples, {leaves} leaves, {packed} packed bytes",
             )
-            problems: list[str] = []
-            for index, (want, have) in enumerate(zip(samples, got, strict=True)):
-                problems += [
-                    f"sample {index}: {line}" for line in diff_digests(leaf_digests(want), leaf_digests(have))
-                ]
-            if problems:
-                result_queue.put(("mismatch", f"[{source}] {problems[:6]}"))
-            else:
-                leaves = sum(len(leaf_digests(sample)) for sample in samples)
-                packed = sum(meta["packed_size"] for meta in put_meta)
-                result_queue.put(("ok", f"[{source}] {len(samples)} samples, {leaves} leaves, {packed} packed bytes"))
-        finally:
-            client.close()
     except BaseException as error:  # pragma: no cover - transport/env failures
-        result_queue.put(("error", f"{type(error).__name__}: {error}"))
+        status, detail = "error", f"{type(error).__name__}: {error}"
+    finally:
+        if client is not None:
+            try:
+                if keys:
+                    client.clear(keys, put_meta)
+                client.close()
+            except BaseException as error:  # pragma: no cover - native cleanup failures
+                status, detail = "error", f"cleanup {type(error).__name__}: {error}"
+    result_queue.put((status, detail))
+
+
+def _dense_roundtrip_worker(result_queue, protocol: str) -> None:
+    """Child-process target: dense tensor roundtrip on one pristine session."""
+    client = None
+    keys: list[str] = []
+    status = "error"
+    detail = "roundtrip did not run"
+    try:
+        tensors = {
+            # Production multimodal field names, dimensions, and mixed dtypes.
+            "pixel_values": torch.randn(64, 1176, dtype=torch.float32).to(torch.bfloat16),
+            "image_grid_thw": torch.tensor([[1, 8, 8]], dtype=torch.int64),
+            "input_ids": torch.arange(4096, dtype=torch.int64),
+            "attention_mask": torch.ones(4096, dtype=torch.int64),
+            "rewards": torch.linspace(-1, 1, 64, dtype=torch.float32),
+            "noncontig": torch.randn(128, 256).t(),  # transposed == non-contiguous
+        }
+        client = TestMooncakeByteExact._client(protocol)
+        run_token = uuid.uuid4().hex
+        keys = [f"bx_{run_token}_{protocol}_{name}" for name in tensors]
+        values = list(tensors.values())
+        client.put(keys, values)
+        got = client.get(
+            keys,
+            shapes=[tuple(value.shape) for value in values],
+            dtypes=[value.dtype for value in values],
+        )
+        problems = [
+            name
+            for name, want, have in zip(tensors, values, got, strict=True)
+            if have is None or not torch.equal(have, want.contiguous())
+        ]
+        if problems:
+            status, detail = "mismatch", f"non-byte-exact fields: {problems}"
+        else:
+            status, detail = "ok", f"{len(tensors)} dense tensors"
+    except BaseException as error:  # pragma: no cover - transport/env failures
+        status, detail = "error", f"{type(error).__name__}: {error}"
+    finally:
+        if client is not None:
+            try:
+                if keys:
+                    client.clear(keys)
+                client.close()
+            except BaseException as error:  # pragma: no cover - native cleanup failures
+                status, detail = "error", f"cleanup {type(error).__name__}: {error}"
+    result_queue.put((status, detail))
+
+
+def _run_isolated_roundtrip(target: Callable[[Any, str], None], protocol: str, *, timeout: float) -> tuple[str, str]:
+    """Run one native Mooncake session with a hard process boundary."""
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(target=target, args=(result_queue, protocol))
+    try:
+        process.start()
+        process.join(timeout=timeout)
+        timed_out = process.is_alive()
+        if timed_out:
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        if process.is_alive():
+            pytest.fail(f"{protocol} roundtrip process survived SIGKILL")
+        if timed_out:
+            pytest.fail(f"{protocol} roundtrip did not finish within {timeout:.0f} seconds")
+        if process.exitcode != 0:
+            pytest.fail(f"{protocol} roundtrip process exited with code {process.exitcode}")
+        try:
+            return result_queue.get(timeout=2)
+        except queue.Empty:
+            pytest.fail(f"{protocol} roundtrip process returned no result")
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +418,27 @@ class TestBoundedAttach:
         assert tq_lifecycle.verify_cluster_attach({}, timeout=0.1) == []
         assert remote_options["max_calls"] == 1
         assert remote_options["max_retries"] == 0
+
+    def test_cluster_attach_timeout_does_not_leave_process_global_state(self):
+        """The one-shot worker dies before its abandoned tq.init can mutate
+        state."""
+        env = os.environ.copy()
+        env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+        env.pop("RAY_ADDRESS", None)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        # Ray places Unix-domain sockets below its temp directory.  A pytest
+        # tmp_path can exceed Linux's 107-byte AF_UNIX path limit.
+        with tempfile.TemporaryDirectory(prefix="tq-ray-") as probe_dir:
+            result = subprocess.run(
+                [sys.executable, "-m", "tests.utils._tq_handshake_timeout_probe", probe_dir],
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+        assert result.returncode == 0, f"probe stdout:\n{result.stdout}\nprobe stderr:\n{result.stderr}"
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +1068,9 @@ class TestMooncakeByteExact:
     def _client(protocol: str):
         from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
 
+        from relax.utils.tq_correctness import ensure_mooncake_correctness_guards
+
+        ensure_mooncake_correctness_guards()
         return MooncakeStoreClient(
             {
                 "protocol": protocol,
@@ -969,30 +1087,14 @@ class TestMooncakeByteExact:
 
     @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
     def test_multi_dtype_shape_roundtrip_is_byte_exact(self, protocol):
-        tensors = {
-            # Production multimodal field names, dimensions, and mixed dtypes.
-            "pixel_values": torch.randn(64, 1176, dtype=torch.float32).to(torch.bfloat16),
-            "image_grid_thw": torch.tensor([[1, 8, 8]], dtype=torch.int64),
-            "input_ids": torch.arange(4096, dtype=torch.int64),
-            "attention_mask": torch.ones(4096, dtype=torch.int64),
-            "rewards": torch.linspace(-1, 1, 64, dtype=torch.float32),
-            "noncontig": torch.randn(128, 256).t(),  # transposed == non-contiguous
-        }
-        client = self._client(protocol)
-        try:
-            keys = [f"bx_{protocol}_{name}" for name in tensors]
-            values = list(tensors.values())
-            client.put(keys, values)
-            got = client.get(
-                keys,
-                shapes=[tuple(v.shape) for v in values],
-                dtypes=[v.dtype for v in values],
-            )
-            for name, want, have in zip(tensors, values, got, strict=True):
-                assert have is not None, f"{name} came back empty"
-                assert torch.equal(have, want.contiguous()), f"{name} is not byte-exact"
-        finally:
-            client.close()
+        """Run each protocol in a pristine, externally bounded session.
+
+        Mooncake 0.3.10 can wedge in ``setup()`` when one process closes a TCP
+        client and then creates an RDMA client.  Process isolation also keeps a
+        native engine hang from blocking the pytest worker indefinitely.
+        """
+        status, detail = _run_isolated_roundtrip(_dense_roundtrip_worker, protocol, timeout=120)
+        assert status == "ok", f"{status}: {detail}"
 
     @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
     def test_multimodal_list_dict_slow_path_roundtrip_is_byte_exact(self, protocol):
@@ -1010,14 +1112,5 @@ class TestMooncakeByteExact:
         session (mooncake 0.3.10 misbehaves when one process cycles clients
         across protocols) and a wedged engine cannot hang the suite.
         """
-        context = multiprocessing.get_context("spawn")
-        result_queue = context.Queue()
-        process = context.Process(target=_mm_slow_path_worker, args=(result_queue, protocol))
-        process.start()
-        process.join(timeout=240)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            pytest.fail(f"multimodal slow-path roundtrip ({protocol}) did not finish within 240 seconds")
-        status, detail = result_queue.get(timeout=2)
+        status, detail = _run_isolated_roundtrip(_mm_slow_path_worker, protocol, timeout=240)
         assert status == "ok", f"{status}: {detail}"
