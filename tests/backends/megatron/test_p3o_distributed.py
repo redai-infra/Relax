@@ -92,6 +92,34 @@ def _extreme_ratio_worker(rank: int, world_size: int, port: int, log_ratio: floa
         dist.destroy_process_group()
 
 
+def _reduced_s2_overflow_worker(rank: int, world_size: int, port: int) -> None:
+    _init_gloo(rank, world_size, port)
+    try:
+        local_stats = P3OSufficientStats.from_vector(
+            torch.tensor([1.0, torch.finfo(torch.float64).max * 0.75, 1.0], dtype=torch.float64)
+        )
+        assert torch.isfinite(local_stats.as_vector()).all()
+
+        try:
+            synchronize_p3o_stats(
+                local_stats,
+                torch.zeros((), dtype=torch.float64),
+                dp_cp_group=dist.group.WORLD,
+                pp_group=None,
+                is_pipeline_last_stage=True,
+            )
+        except ValueError as error:
+            assert "unrepresentable squared ratio" in str(error)
+        else:
+            raise AssertionError("every rank must fail before the ESS=1 fallback")
+
+        healthy = torch.ones((), dtype=torch.float64)
+        dist.all_reduce(healthy)
+        assert healthy.item() == world_size
+    finally:
+        dist.destroy_process_group()
+
+
 def _pipeline_worker(rank: int, world_size: int, port: int) -> None:
     _init_gloo(rank, world_size, port)
     try:
@@ -333,6 +361,11 @@ def test_p3o_distributed_positive_extreme_ratio_fails_synchronously_with_dummy_r
 def test_p3o_distributed_negative_extreme_ratio_fails_synchronously_with_dummy_rank():
     world_size = 2
     mp.spawn(_extreme_ratio_worker, args=(world_size, _free_port(), -500.0), nprocs=world_size, join=True)
+
+
+def test_p3o_distributed_collective_s2_overflow_fails_synchronously():
+    world_size = 2
+    mp.spawn(_reduced_s2_overflow_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
 def test_p3o_distributed_pipeline_broadcasts_last_stage_stats():

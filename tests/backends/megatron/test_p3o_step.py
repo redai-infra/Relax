@@ -104,20 +104,22 @@ def test_p3o_step_raises_only_after_global_invalid_flag_is_visible(monkeypatch):
         )
 
 
-def test_p3o_step_raises_when_collective_overflows_finite_local_stats(monkeypatch):
+@pytest.mark.parametrize("moment_index", range(3), ids=("s1", "s2", "n"))
+@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")], ids=("inf", "nan"))
+def test_p3o_step_raises_when_collective_produces_nonfinite_moment(monkeypatch, moment_index, nonfinite):
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     dp_cp_group = object()
 
     def all_reduce(vector, *, op, group):
         assert group is dp_cp_group
-        vector[1] = float("inf")
+        vector[moment_index] = nonfinite
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
     with pytest.raises(ValueError, match="unrepresentable squared ratio"):
         synchronize_p3o_stats(
-            _stats((1.0, torch.finfo(torch.float64).max * 0.75, 1.0)),
+            _stats((1.0, 1.0, 1.0)),
             torch.zeros((), dtype=torch.float64),
             dp_cp_group=dp_cp_group,
             pp_group=None,
