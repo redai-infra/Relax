@@ -21,6 +21,7 @@ NEAR_ZERO_ABS_TOL = 1e-9
 LOGPROB_ABS_TOL = 1e-6
 GRAD_REL_L2_TOL = 1e-6
 GRAD_COSINE_MIN = 1.0 - 1e-9
+COMMIT_UNDER_TEST = "ef854a3cfb3eb692e083d14e12fbd96a8b1c7af5"
 TOPOLOGIES = ("dp1", "dp4cp1", "dp2cp1", "dp2cp2")
 METRIC_KEYS = {
     "normalized_ess": "train/p3o/normalized_ess",
@@ -518,7 +519,7 @@ def main() -> None:
     route = "Batch 5" if input_identity_failed else ("Batch 6" if failed_stages else None)
     result = {
         "batch": 7,
-        "commit": "e16d325996644f6b205d5b50a189d7e3b35d23da",
+        "commit": COMMIT_UNDER_TEST,
         "status": "COMPLETE" if overall_pass else "FAIL_ROUTING",
         "allow_batch8": overall_pass,
         "thresholds": {
