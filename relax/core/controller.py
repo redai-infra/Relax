@@ -11,6 +11,7 @@ import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
 
 
@@ -37,6 +38,7 @@ from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrie
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
+from relax.utils.env import Envs
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -45,6 +47,7 @@ from relax.utils.opd.opd_utils import (
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
+from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
@@ -62,6 +65,36 @@ def _is_colocate(config: Namespace) -> bool:
 logger = get_logger(__name__)
 
 ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", "genrm"]
+# ``auto`` may resolve to a node-local full checkpoint on a single-node engine,
+# while ``runai_streamer`` keeps the model source on raw S3.  Be conservative:
+# cleanup is enabled only when the configured plan cannot retain SHM weights.
+_S3_MODEL_CLEANUP_SAFE_LOAD_FORMATS = {"dummy", "runai_streamer"}
+
+
+def _require_positive_timeout(value: float, env_name: str) -> float:
+    if value <= 0:
+        raise ValueError(f"{env_name} must be greater than 0, got {value}")
+    return value
+
+
+def _cleanup_s3_model_weights_on_node(config: Namespace) -> tuple[int, int]:
+    return cleanup_s3_model_weights_from_shm(config)
+
+
+def _can_cleanup_s3_model_weights(config: Namespace, serve_dict: dict) -> bool:
+    model_source = getattr(config, "model_source", None)
+    if model_source is None:
+        return False
+    if getattr(config, "debug_rollout_only", False):
+        return False
+    has_rollout = any(str(role) == "rollout" for role in serve_dict)
+    if not has_rollout:
+        return True
+    if getattr(config, "rollout_external", False):
+        return False
+    if getattr(config, "sglang_config", None) is not None:
+        return False
+    return getattr(config, "sglang_load_format", "auto") in _S3_MODEL_CLEANUP_SAFE_LOAD_FORMATS
 
 
 def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
@@ -141,6 +174,71 @@ class Controller:
             logger.info("Global health check system enabled")
         else:
             logger.info("Global health check system disabled (use --use-health-check to enable)")
+
+    def _cleanup_s3_model_weights_after_init(self) -> None:
+        """Remove policy weight shards after every startup consumer is
+        ready."""
+        if getattr(self.config, "disable_s3_model_cleanup", False):
+            logger.info("S3 model SHM cleanup is disabled")
+            return
+        if getattr(self.config, "model_source", None) is None:
+            return
+        if not _can_cleanup_s3_model_weights(self.config, self.serve_dict):
+            logger.info("Keeping S3 model weights in SHM because the rollout load plan may retain SHM-backed weights")
+            return
+
+        cleanup_task = ray.remote(num_cpus=0, max_retries=0)(_cleanup_s3_model_weights_on_node)
+        refs = []
+        for node in ray.nodes():
+            if not node.get("Alive", False):
+                continue
+            node_id = node.get("NodeID")
+            if not node_id:
+                continue
+            refs.append(
+                cleanup_task.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+                ).remote(self.config)
+            )
+        if not refs:
+            return
+
+        task_timeout = _require_positive_timeout(
+            Envs.RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S,
+            "RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S",
+        )
+        terminal_refs, pending_refs = ray.wait(
+            refs,
+            num_returns=len(refs),
+            timeout=task_timeout,
+        )
+        if pending_refs:
+            for ref in pending_refs:
+                ray.cancel(ref, force=True)
+            cancel_timeout = _require_positive_timeout(
+                Envs.RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S,
+                "RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S",
+            )
+            _, uncancelled_refs = ray.wait(
+                pending_refs,
+                num_returns=len(pending_refs),
+                timeout=cancel_timeout,
+            )
+            if uncancelled_refs:
+                raise TimeoutError(
+                    "S3 model SHM cleanup timed out and cancellation did not reach "
+                    f"{len(uncancelled_refs)} of {len(pending_refs)} pending node tasks"
+                )
+            raise TimeoutError(
+                f"S3 model SHM cleanup timed out with {len(pending_refs)} of {len(refs)} node tasks pending"
+            )
+        results = ray.get(terminal_refs)
+        removed_files = sum(result[0] for result in results)
+        removed_bytes = sum(result[1] for result in results)
+        logger.info(
+            f"S3 model SHM cleanup completed on {len(results)} nodes: "
+            f"removed_files={removed_files}, removed_bytes={removed_bytes}"
+        )
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
@@ -620,6 +718,11 @@ class Controller:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
                         await service.set_step(step)
+
+            # All startup consumers have now initialized and the first policy
+            # weights have been synchronized. Remove source weight shards
+            # before any service starts its training/rollout loop.
+            self._cleanup_s3_model_weights_after_init()
 
             task_refs = []
             service_names = []

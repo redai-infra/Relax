@@ -11,6 +11,8 @@ RELAX_INTEGRATION_ROOT="${RELAX_INTEGRATION_ROOT:-$(cd "${EXAMPLE_DIR}/../.." &&
 RAY_CLI="${RAY_CLI:-ray}"
 R2E_DATA_DIR=""
 R2E_GYM_MODE=""
+R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-}"
+R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"
 R2E_GYM_MAX_CONCURRENCY="${R2E_GYM_MAX_CONCURRENCY:-1}"
 NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE:-0}"
 NEMO_GYM_HTTP_PROXY="${NEMO_GYM_HTTP_PROXY:-${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}}"
@@ -18,7 +20,7 @@ NEMO_GYM_CALLBACK_PROXY="${NEMO_GYM_CALLBACK_PROXY:-}"
 NEMO_GYM_CALLBACK_TIMEOUT_S="${NEMO_GYM_CALLBACK_TIMEOUT_S:-600}"
 R2E_GYM_AGENT_TIMEOUT="${R2E_GYM_AGENT_TIMEOUT:-3600}"
 R2E_GYM_TEST_TIMEOUT="${R2E_GYM_TEST_TIMEOUT:-1800}"
-R2E_GYM_MAX_TURNS="${R2E_GYM_MAX_TURNS:-100}"
+R2E_GYM_MAX_TURNS="${R2E_GYM_MAX_TURNS:-30}"
 R2E_GYM_MEMORY_MB="${R2E_GYM_MEMORY_MB:-32768}"
 R2E_GYM_MAX_DEADLINE_S="${R2E_GYM_MAX_DEADLINE_S:-7200}"
 GYM_DRY_RUN="${GYM_DRY_RUN:-false}"
@@ -34,6 +36,8 @@ Usage:
   start_r2e_gym_local.sh \
     --data-dir <prepared-r2e-directory> \
     --mode <golden|train> \
+    [--sif-dir <shared-sif-directory>] \
+    [--sif-prefix <filename-prefix>] \
     [--max-concurrency <positive-integer>] \
     [--proxy <http-proxy-url>] \
     [--callback-proxy <http-proxy-url>] \
@@ -54,6 +58,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --mode)
             R2E_GYM_MODE="${2:-}"
+            shift 2
+            ;;
+        --sif-dir)
+            R2E_GYM_SIF_DIR="${2:-}"
+            shift 2
+            ;;
+        --sif-prefix)
+            R2E_GYM_SIF_PREFIX="${2:-}"
             shift 2
             ;;
         --max-concurrency)
@@ -99,6 +111,18 @@ case "${R2E_DATA_DIR}" in
         exit 2
         ;;
 esac
+R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-${R2E_DATA_DIR}/sif}"
+case "${R2E_GYM_SIF_DIR}" in
+    /*) ;;
+    *)
+        echo "--sif-dir must be an absolute path" >&2
+        exit 2
+        ;;
+esac
+if [[ "${R2E_GYM_SIF_PREFIX}" == */* ]]; then
+    echo "--sif-prefix must be a filename prefix without '/'" >&2
+    exit 2
+fi
 case "${R2E_GYM_MODE}" in
     golden)
         R2E_GYM_VERIFY_GOLDEN_PATCH=1
@@ -189,6 +213,7 @@ fi
 GYM_BIND_HOST="${GYM_BIND_HOST:-0.0.0.0}"
 
 callback_hosts="${NEMO_GYM_CALLBACK_ALLOWED_HOSTS:-${GYM_HOST}}"
+callback_networks="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-}"
 if [ -n "${MASTER_ADDR:-}" ] && [[ "${MASTER_ADDR}" != *"://"* ]] && [[ "${MASTER_ADDR}" != *":"* ]]; then
     case ",${callback_hosts}," in
         *",${MASTER_ADDR},"*) ;;
@@ -203,6 +228,7 @@ for callback_host in "${callback_host_list[@]}"; do
     fi
 done
 NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${callback_hosts}"
+NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${callback_networks}"
 
 existing_no_proxy="${no_proxy:-${NO_PROXY:-}}"
 NO_PROXY="127.0.0.1,localhost,${GYM_HOST},${callback_hosts}"
@@ -220,7 +246,6 @@ if [ -n "${NEMO_GYM_HTTP_PROXY}" ]; then
 fi
 
 R2E_GYM_DATA="${R2E_DATA_DIR}/r2e_gym_train.jsonl"
-R2E_GYM_SIF_DIR="${R2E_DATA_DIR}/sif"
 NEMO_GYM_ARTIFACT_ROOT="${NEMO_GYM_ARTIFACT_ROOT:-${R2E_DATA_DIR}/artifacts}"
 mkdir -p "${NEMO_GYM_ARTIFACT_ROOT}"
 chmod 700 "${NEMO_GYM_ARTIFACT_ROOT}"
@@ -231,8 +256,10 @@ echo "  gym_host=${GYM_HOST}"
 echo "  bind_host=${GYM_BIND_HOST}"
 echo "  ray_address=${GYM_RAY_ADDRESS}"
 echo "  callback_hosts=${NEMO_GYM_CALLBACK_ALLOWED_HOSTS}"
+echo "  callback_networks=${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-<none>}"
 echo "  data=${R2E_GYM_DATA}"
 echo "  sif_dir=${R2E_GYM_SIF_DIR}"
+echo "  sif_prefix=${R2E_GYM_SIF_PREFIX:-<none>}"
 echo "  artifact_root=${NEMO_GYM_ARTIFACT_ROOT}"
 echo "  golden=${R2E_GYM_VERIFY_GOLDEN_PATCH}"
 echo "  max_concurrency=${R2E_GYM_MAX_CONCURRENCY}"
@@ -256,10 +283,37 @@ if [ ! -d "${R2E_GYM_SIF_DIR}" ]; then
     echo "ERROR: R2E-Gym SIF directory is missing on this Ray worker: ${R2E_GYM_SIF_DIR}" >&2
     exit 2
 fi
-first_sif="$(find "${R2E_GYM_SIF_DIR}" -maxdepth 1 -type f -name "*.sif" -size +0c -print -quit)"
+first_sif="$(find -L "${R2E_GYM_SIF_DIR}" -maxdepth 1 -type f -name "${R2E_GYM_SIF_PREFIX}*.sif" -size +0c -print -quit)"
 if [ -z "${first_sif}" ]; then
-    echo "ERROR: no non-empty .sif file found in ${R2E_GYM_SIF_DIR}" >&2
+    echo "ERROR: no non-empty ${R2E_GYM_SIF_PREFIX}*.sif file found in ${R2E_GYM_SIF_DIR}" >&2
     exit 2
+fi
+sif_manifest="${R2E_DATA_DIR}/r2e_gym_train_sifs.jsonl"
+if [ -s "${sif_manifest}" ]; then
+    manifest_entry_count=0
+    missing_sif_count=0
+    while IFS= read -r sif_name; do
+        if [ -z "${sif_name}" ]; then
+            continue
+        fi
+        manifest_entry_count=$((manifest_entry_count + 1))
+        expected_sif="${R2E_GYM_SIF_DIR}/${R2E_GYM_SIF_PREFIX}${sif_name}"
+        if [ ! -s "${expected_sif}" ]; then
+            missing_sif_count=$((missing_sif_count + 1))
+            if [ "${missing_sif_count}" -le 10 ]; then
+                echo "ERROR: manifest SIF is missing or empty: ${expected_sif}" >&2
+            fi
+        fi
+    done < <(jq -r '.sif_name // empty' "${sif_manifest}")
+    if [ "${manifest_entry_count}" -eq 0 ]; then
+        echo "ERROR: no sif_name entries found in ${sif_manifest}" >&2
+        exit 2
+    fi
+    if [ "${missing_sif_count}" -gt 0 ]; then
+        echo "ERROR: ${missing_sif_count}/${manifest_entry_count} manifest SIFs are unavailable." >&2
+        exit 2
+    fi
+    echo "Manifest SIF coverage: ${manifest_entry_count}/${manifest_entry_count}"
 fi
 if [ "${GYM_DRY_RUN}" != "false" ] && [ "${GYM_DRY_RUN}" != "true" ]; then
     echo "GYM_DRY_RUN must be false or true" >&2
@@ -368,14 +422,24 @@ for port in 28100 28101 28103; do
         "${cluster_python}" - "${port}" <<'PY'
 import socket
 import sys
+import time
 
 port = int(sys.argv[1])
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+last_error = None
+for _ in range(20):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("0.0.0.0", port))
+        sock.close()
+        break
     except OSError as exc:
-        print(exc)
-        raise SystemExit(1) from exc
+        last_error = exc
+        sock.close()
+        time.sleep(0.5)
+else:
+    print(last_error)
+    raise SystemExit(1) from last_error
 PY
     )"; then
         echo "ERROR: local R2E-Gym port ${port} is already in use:" >&2
@@ -386,7 +450,11 @@ done
 
 echo "R2E-Gym preflight passed:"
 wc -l "${R2E_GYM_DATA}"
-find "${R2E_GYM_SIF_DIR}" -maxdepth 1 -type f -name "*.sif" -size +0c -printf "  sif=%p size=%s bytes\n"
+printf "  sif_count=%s\n" "$(
+    find -L "${R2E_GYM_SIF_DIR}" -maxdepth 1 -type f -name "${R2E_GYM_SIF_PREFIX}*.sif" -size +0c |
+        wc -l
+)"
+printf "  first_sif=%s\n" "${first_sif}"
 apptainer version
 apptainer exec "${first_sif}" true
 
@@ -431,9 +499,10 @@ export NEMO_GYM_SANITIZE_PLATFORM_RELEASE=1
 export NEMO_GYM_PYTHON_STARTUP_DIR="${PYTHON_STARTUP_DIR}"
 export PYTHONPATH="${PYTHON_STARTUP_DIR}:${RELAX_INTEGRATION_ROOT}:${GYM_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-export GYM_HOST GYM_RAY_ADDRESS NEMO_GYM_CALLBACK_ALLOWED_HOSTS NEMO_GYM_CALLBACK_PROXY
+export GYM_HOST GYM_RAY_ADDRESS NEMO_GYM_CALLBACK_ALLOWED_HOSTS NEMO_GYM_CALLBACK_ALLOWED_NETWORKS
+export NEMO_GYM_CALLBACK_PROXY
 export NEMO_GYM_ARTIFACT_ROOT NEMO_GYM_CALLBACK_TIMEOUT_S NEMO_GYM_VERBOSE
-export R2E_GYM_DATA R2E_GYM_SIF_DIR R2E_GYM_MAX_CONCURRENCY R2E_GYM_MAX_DEADLINE_S
+export R2E_GYM_DATA R2E_GYM_SIF_DIR R2E_GYM_SIF_PREFIX R2E_GYM_MAX_CONCURRENCY R2E_GYM_MAX_DEADLINE_S
 export NEMO_GYM_GATEWAY_ENVIRONMENTS_JSON
 NEMO_GYM_GATEWAY_ENVIRONMENTS_JSON="$(
     "${GYM_ROOT}/.venv/bin/python" - <<'PY'
@@ -478,7 +547,7 @@ exec "${GYM_ROOT}/.venv/bin/gym" env start \
     ++swe_agents.responses_api_agents.swe_agents.host="${GYM_BIND_HOST}" \
     ++swe_agents.responses_api_agents.swe_agents.port=28101 \
     ++swe_agents.responses_api_agents.swe_agents.dataset_harness=r2e_gym \
-    "++swe_agents.responses_api_agents.swe_agents.container_formatter='${R2E_GYM_SIF_DIR}/{instance_id}.sif'" \
+    "++swe_agents.responses_api_agents.swe_agents.container_formatter='${R2E_GYM_SIF_DIR}/${R2E_GYM_SIF_PREFIX}{instance_id}.sif'" \
     ++swe_agents.responses_api_agents.swe_agents.dataset_path="${R2E_GYM_DATA}" \
     ++swe_agents.responses_api_agents.swe_agents.concurrency="${R2E_GYM_MAX_CONCURRENCY}" \
     ++swe_agents.responses_api_agents.swe_agents.agent_max_turns="${R2E_GYM_MAX_TURNS}" \

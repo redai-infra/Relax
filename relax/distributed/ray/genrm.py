@@ -9,6 +9,7 @@ RolloutManager but focused on reward evaluation only.
 import logging
 
 import ray
+import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.backends.sglang.sglang_engine import GenRMEngine
@@ -21,6 +22,37 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
+
+# A GenRM engine process can die on its own (SGLang's scheduler watchdog
+# SIGQUITs the server after a CUDA-level hang). The next call into it then
+# raises one of these. Everything else is a real bug and must propagate.
+#   - ConnectionError / TimeoutError: raised by GenRMEngine.release_memory_occupation
+#     when the drain loop hits its dead-server fast-fail or its deadline.
+#   - requests.exceptions.{ConnectionError,Timeout}: raised by _make_request, i.e.
+#     the resume_memory_occupation path. These are OSError subclasses but NOT
+#     builtin ConnectionError/TimeoutError, so they must be listed explicitly --
+#     otherwise an engine that died during the offloaded window (only observable
+#     at onload) escalates to the global restart this whole mechanism avoids.
+#   - RayActorError: the Ray actor itself is gone.
+# ray.get re-raises as a class inheriting from BOTH RayTaskError and the
+# original cause (ray/exceptions.py::as_instanceof_cause), so isinstance works.
+_ENGINE_DEAD_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    ray.exceptions.RayActorError,
+)
+
+# Rebuilding one engine is ~1.5 min (weight load + cuda graph capture). Bound it
+# so a dead *node* -- whose placement-group bundle can never be filled -- degrades
+# to "run with N-1 engines" instead of hanging the training step forever.
+_ENGINE_REBUILD_TIMEOUT_S = 900.0
+_ENGINE_SHUTDOWN_TIMEOUT_S = 60.0
+
+
+def _is_engine_dead(exc: BaseException) -> bool:
+    return isinstance(exc, _ENGINE_DEAD_EXCEPTIONS)
 
 
 @ray.remote
@@ -80,36 +112,129 @@ class GenRMManager:
     def onload(self, tags: list[str] | None = None):
         """Load genRM model weights to GPU.
 
+        Also the recovery point for engines that died since the last step: a
+        freshly built engine comes up onloaded, which is exactly the state this
+        phase wants, and unlike offload() this call is not followed by a gloo
+        barrier across the actor ranks (megatron/actor.py:1696 vs :619).
+
         Args:
             tags: Optional list of tags to specify which resources to load.
                   Available tags: GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE,
                                  GPU_MEMORY_TYPE_CUDA_GRAPH
         """
+        rebuilt = self.recover()
         if self._onloaded and tags is None:
             logger.info("GenRM engines already onloaded; skipping")
             return
         logger.info(f"GenRM engines onload started with tags={tags}")
-        onload_handles = [
-            engine.resume_memory_occupation.remote(tags=tags) for engine in self.genrm_engines if engine is not None
-        ]
-        if onload_handles:
-            ray.get(onload_handles)
+        # Engines rebuilt just above are already onloaded -- resuming them again
+        # would be a double-resume, so only touch the ones that survived.
+        dead = self._fanout("resume_memory_occupation", skip_ranks=rebuilt, tags=tags)
+        if dead:
+            # An engine that died while we were offloaded is only discovered
+            # here (offload() short-circuits when already offloaded), so it
+            # missed the recover() above. Rebuild now rather than leaving the
+            # judge a man down for the whole next rollout phase.
+            self._retire_engines(dead)
+            self.recover()
         self._onloaded = True
         logger.info("GenRM engines onload completed")
 
     def offload(self):
-        """Offload genRM model weights from GPU to free memory."""
+        """Offload genRM model weights from GPU to free memory.
+
+        Dead engines are retired here but NOT rebuilt: this runs on actor rank
+        0 with the other ranks waiting on a gloo barrier, so we keep it short
+        and leave the ~1.5 min rebuild to the next onload().
+        """
         if not self._onloaded:
             logger.info("GenRM engines already offloaded; skipping")
             return
         logger.info("GenRM engines offload started")
-        offload_handles = [
-            engine.release_memory_occupation.remote() for engine in self.genrm_engines if engine is not None
-        ]
-        if offload_handles:
-            ray.get(offload_handles)
+        dead = self._fanout("release_memory_occupation")
+        self._retire_engines(dead)
+        # Unconditional: the surviving engines did release, so the manager must
+        # not claim to still be onloaded just because one engine died.
         self._onloaded = False
-        logger.info("GenRM engines offload completed")
+        logger.info(f"GenRM engines offload completed (retired {len(dead)} dead)")
+
+    def _fanout(self, method: str, *, skip_ranks: set[int] | None = None, **kwargs) -> list[int]:
+        """Call ``method`` on every live engine; return the ranks that are
+        dead.
+
+        Per-handle ray.get rather than one ray.get over the list: the batched
+        form aborts on the first failure and loses which engine raised.
+        """
+        skip = skip_ranks or set()
+        handles = {}
+        for rank in range(0, len(self.all_genrm_engines), self.nodes_per_engine):
+            engine = self.all_genrm_engines[rank]
+            if engine is None or rank in skip:
+                continue
+            handles[rank] = getattr(engine, method).remote(**kwargs)
+
+        dead = []
+        for rank, handle in handles.items():
+            try:
+                ray.get(handle)
+            except Exception as exc:
+                if not _is_engine_dead(exc):
+                    raise
+                logger.warning(f"GenRM engine rank={rank} died during {method}: {exc}")
+                dead.append(rank)
+        return dead
+
+    def _retire_engines(self, ranks: list[int]) -> None:
+        """Tear down dead engines and null their slots so recover() rebuilds
+        them."""
+        for rank in ranks:
+            for i in range(rank, rank + self.nodes_per_engine):
+                engine = self.all_genrm_engines[i]
+                if engine is None:
+                    continue
+                try:
+                    # shutdown() kill_process_tree's the SGLang server. Must run
+                    # before ray.kill or the scheduler subprocesses are orphaned
+                    # and keep holding GPU memory, so the rebuild can't fit.
+                    ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
+                except Exception as exc:
+                    logger.warning(f"GenRM engine rank={i} shutdown failed (killing anyway): {exc}")
+                try:
+                    ray.kill(engine)
+                except Exception as exc:
+                    logger.warning(f"GenRM engine rank={i} ray.kill failed: {exc}")
+                self.all_genrm_engines[i] = None
+                logger.info(f"GenRM engine rank={i} retired")
+
+    def recover(self) -> set[int]:
+        """Rebuild engines whose slot is None. Returns the ranks rebuilt.
+
+        Mirrors RolloutServer.recover. ``init_genrm_engines`` already skips
+        non-None slots, so it rebuilds exactly the holes, reusing the same
+        placement-group bundles and probing fresh ports (surviving engines'
+        ports are bound, so they're skipped).
+        """
+        dead = [i for i, engine in enumerate(self.all_genrm_engines) if engine is None]
+        if not dead:
+            return set()
+
+        logger.info(f"GenRM recovering {len(dead)} engine(s): ranks={dead}")
+        try:
+            init_genrm_engines(self.args, self.pg, self.all_genrm_engines, self._engine_addr_and_ports)
+        except Exception as exc:
+            logger.exception(f"GenRM engine rebuild failed for ranks={dead}: {exc}")
+
+        rebuilt = {i for i in dead if self.all_genrm_engines[i] is not None}
+        still_dead = [i for i in dead if i not in rebuilt]
+        if still_dead:
+            # Degrade rather than escalate: judging on N-1 engines beats a
+            # global restart. Only a total wipeout is unrecoverable here.
+            if all(engine is None for engine in self.all_genrm_engines):
+                raise RuntimeError(f"All GenRM engines are dead and could not be rebuilt (ranks={still_dead})")
+            logger.error(f"GenRM engines still dead after recovery, continuing degraded: ranks={still_dead}")
+        if rebuilt:
+            logger.info(f"GenRM recovered engine ranks={sorted(rebuilt)}")
+        return rebuilt
 
     def is_onloaded(self):
         return self._onloaded
@@ -122,9 +247,19 @@ class GenRMManager:
 
         The host/port information is captured during engine initialization
         from the addr_and_ports dict passed to ``init_genrm_engines``.
+
+        ``all_genrm_engines`` holds one entry per *node*, so a multi-node engine
+        (genrm_num_gpus_per_engine > num_gpus_per_node) occupies
+        ``nodes_per_engine`` consecutive ranks. Only node_rank 0 of each group
+        runs the SGLang HTTP server -- the followers are compute-only workers
+        and answer /generate with 404 -- so stride the same way the
+        ``genrm_engines`` property does and return head nodes only.
+
+        The list is also compacted over dead engines, so callers must swap it
+        and any derived round-robin state together.
         """
         results = []
-        for rank in range(len(self.all_genrm_engines)):
+        for rank in range(0, len(self.all_genrm_engines), self.nodes_per_engine):
             engine = self.all_genrm_engines[rank]
             if engine is not None and rank in self._engine_addr_and_ports:
                 info = self._engine_addr_and_ports[rank]
@@ -226,7 +361,21 @@ def init_genrm_engines(args, pg, all_genrm_engines, engine_addr_and_ports=None):
 
     # Initialize engines
     init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in genrm_engines]
-    ray.get(init_handles)
+    try:
+        # Bounded: a bundle on a dead node never schedules, and an unbounded
+        # ray.get would block the training step forever.
+        ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
+    except Exception:
+        # The slots were filled with actor handles before init ran, so on any
+        # failure they hold engines whose SGLang server never came up. Null them
+        # so the caller sees them as still-dead instead of silently healthy.
+        for rank, engine in genrm_engines:
+            try:
+                ray.kill(engine)
+            except Exception:
+                pass
+            all_genrm_engines[rank] = None
+        raise
 
     return num_new_engines
 

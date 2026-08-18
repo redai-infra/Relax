@@ -7,6 +7,7 @@ This module provides a Ray Serve deployment for Generative Reward Model
 """
 
 import asyncio
+import time
 from argparse import Namespace
 from itertools import cycle
 from typing import Any, List, Optional, Union
@@ -108,6 +109,7 @@ class GenRM(Base):
         # Store engine addresses for HTTP-based generation
         self._engine_hosts_ports = None
         self._engine_index = 0
+        self._engine_cache_refreshed_at = 0.0
         self._logger.info("GenRM service initialized successfully")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
@@ -156,6 +158,65 @@ class GenRM(Base):
             self._logger.error(f"GenRM generation failed: {e}")
             raise
 
+    def _invalidate_engine_cache(self) -> None:
+        """Force the next _pick_engine to re-read the live engine list.
+
+        GenRMManager rebuilds a dead engine on a *fresh port*, so a cache held
+        from before the rebuild points at nothing.
+
+        Throttled: a dead engine fails many in-flight requests at once, and the
+        refresh is a blocking ray.get on this replica's event loop. Without the
+        cooldown a burst of N failures costs N serialized round-trips.
+        """
+        now = time.monotonic()
+        if now - self._engine_cache_refreshed_at < Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S:
+            return
+        self._engine_hosts_ports = None
+
+    def _needs_engine_refresh(self) -> bool:
+        """Whether _pick_engine must re-read the engine list before serving.
+
+        An empty list is never a valid cache. The manager reports ``[]`` for the
+        whole window between offload() retiring every dead engine and the next
+        onload() rebuilding them, so caching it would strand this replica on
+        "No genRM engines available" forever — long after recovery finished,
+        because nothing would ever re-read the list. The retry loop in
+        _call_engine cannot rescue it either: _pick_engine raises before any
+        HTTP request is made, so _invalidate_engine_cache is never reached.
+
+        Re-reading is throttled by the same cooldown as an invalidation: while
+        the list is empty *every* in-flight request lands here, and the read is
+        a blocking ray.get on this replica's event loop.
+        """
+        if self._engine_hosts_ports is None:
+            return True
+        if self._engine_hosts_ports:
+            return False
+        return time.monotonic() - self._engine_cache_refreshed_at >= Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S
+
+    def _pick_engine(self) -> tuple[int, str, int]:
+        """Round-robin one live engine, refreshing the list if it was
+        dropped."""
+        if self._needs_engine_refresh():
+            hosts_ports = ray.get(self.genrm_manager.get_engine_hosts_ports.remote())
+            self._engine_cache_refreshed_at = time.monotonic()
+            # Swap the list and its cycle together: the manager compacts the
+            # list over dead engines, so a cycle built for the old length would
+            # hand back an out-of-range index.
+            self._engine_cycle = cycle(range(len(hosts_ports)))
+            self._engine_hosts_ports = hosts_ports
+
+        hosts_ports = self._engine_hosts_ports
+        if not hosts_ports:
+            raise RuntimeError("No genRM engines available")
+
+        # Thread-safe round-robin via itertools.cycle (next() is atomic in CPython).
+        # Re-read the local alias, not self._*, so a concurrent invalidation
+        # can't make the index and the list disagree.
+        idx = next(self._engine_cycle) % len(hosts_ports)
+        host, port = hosts_ports[idx]
+        return idx, host, port
+
     async def _call_engine(self, messages: list, sampling_params: Optional[dict] = None) -> dict:
         """Call an SGLang engine for text generation.
 
@@ -169,19 +230,7 @@ class GenRM(Base):
         Returns:
             Dict containing at least {"text": str} from the SGLang server.
         """
-        # Lazily fetch engine host/port information and build cycle iterator
-        if self._engine_hosts_ports is None:
-            self._engine_hosts_ports = ray.get(self.genrm_manager.get_engine_hosts_ports.remote())
-            self._engine_cycle = cycle(range(len(self._engine_hosts_ports)))
-
-        if not self._engine_hosts_ports:
-            raise RuntimeError("No genRM engines available")
-
-        # Thread-safe round-robin via itertools.cycle (next() is atomic in CPython)
-        idx = next(self._engine_cycle)
-        host, port = self._engine_hosts_ports[idx]
-
-        url = f"http://{host}:{port}/generate"
+        idx, host, port = self._pick_engine()
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
         # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
@@ -232,7 +281,7 @@ class GenRM(Base):
         retry_attempts = Envs.GENRM_ENGINE_RETRY_ATTEMPTS
         for _attempt in range(1, retry_attempts + 1):
             try:
-                resp = await self._http_client.post(url, json=payload)
+                resp = await self._http_client.post(f"http://{host}:{port}/generate", json=payload)
                 resp.raise_for_status()
                 break
             except asyncio.CancelledError:
@@ -240,6 +289,12 @@ class GenRM(Base):
             except Exception as e:
                 status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
                 if (status == 0 or status >= 500) and _attempt < retry_attempts:
+                    # A transport error means this engine may be gone and its
+                    # replacement will come back on a different port, so drop the
+                    # cache and re-pick — retrying the same dead host is useless.
+                    if status == 0:
+                        self._invalidate_engine_cache()
+                    idx, host, port = self._pick_engine()
                     await asyncio.sleep(0.3 * _attempt)
                     continue
                 raise

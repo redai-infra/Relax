@@ -2,7 +2,9 @@
 
 """Unit tests for multimodal preprocessing wrapper."""
 
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,6 +19,18 @@ from relax.engine.sft.dataset.sample import (
     CanonicalMessage,
     CanonicalSample,
 )
+
+
+@pytest.fixture(autouse=True)
+def stub_processor_pool_module(monkeypatch):
+    processor_pool = ModuleType("relax.utils.data.processor_pool")
+    processor_pool.prepare_mm_inputs_for_ipc = MagicMock(side_effect=lambda mm_inputs: mm_inputs)
+    processor_pool.process_sample_in_worker = MagicMock()
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", processor_pool)
+
+    import relax.utils.data as data_package
+
+    monkeypatch.setattr(data_package, "processor_pool", processor_pool, raising=False)
 
 
 def _text_sample():

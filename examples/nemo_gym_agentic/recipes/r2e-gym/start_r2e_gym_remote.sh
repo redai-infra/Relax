@@ -14,25 +14,32 @@ Usage:
     --gym-host <routable-local-ip> \
     --data-dir <prepared-r2e-directory> \
     --mode <golden|train> \
+    [--sif-dir <docker-host-shared-sif-directory>] \
+    [--sif-prefix <filename-prefix>] \
     [--callback-host <relax-callback-host>] \
+    [--callback-network <relax-callback-cidr>] \
     [--image <nemo-gym-image>] \
     [--repo-dir <docker-host-relax-checkout>] \
     [--proxy <http-proxy-url>] \
     [--callback-proxy <http-proxy-url>] \
     [--callback-timeout-s <positive-integer>] \
     [--max-concurrency <positive-integer>] \
+    [--gym-cpus <positive-integer>] \
     [--verbose] \
     [--container-name <name>]
 
 golden mode uses the Gym host as its non-contacted callback allowlist entry.
-train mode requires --callback-host to exactly match the host in Relax's callback URL.
+train mode requires an exact --callback-host or a --callback-network containing Relax's callback IP.
 EOF
 }
 
 GYM_HOST=""
 R2E_DATA_DIR=""
 R2E_GYM_MODE=""
+R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-}"
+R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"
 RELAX_CALLBACK_HOST=""
+RELAX_CALLBACK_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-}"
 NEMO_GYM_IMAGE="${NEMO_GYM_IMAGE:-relax-nemo-gym:r2e-dev}"
 NEMO_GYM_CONTAINER="${NEMO_GYM_CONTAINER:-nemo-gym-r2e-local}"
 NEMO_GYM_HTTP_PROXY="${NEMO_GYM_HTTP_PROXY:-${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}}"
@@ -42,6 +49,7 @@ NEMO_GYM_CALLBACK_TIMEOUT_S="${NEMO_GYM_CALLBACK_TIMEOUT_S:-600}"
 NEMO_GYM_START_TIMEOUT_S="${NEMO_GYM_START_TIMEOUT_S:-1800}"
 GYM_RAY_NUM_CPUS="${GYM_RAY_NUM_CPUS:-8}"
 R2E_GYM_MAX_CONCURRENCY="${R2E_GYM_MAX_CONCURRENCY:-16}"
+R2E_GYM_MAX_TURNS="${R2E_GYM_MAX_TURNS:-50}"
 NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE:-0}"
 RELAX_REPO_ROOT="${RELAX_REPO_ROOT:-$(cd -- "${EXAMPLE_DIR}/../.." &>/dev/null && pwd)}"
 
@@ -59,8 +67,24 @@ while [ "$#" -gt 0 ]; do
             R2E_GYM_MODE="${2:-}"
             shift 2
             ;;
+        --sif-dir)
+            R2E_GYM_SIF_DIR="${2:-}"
+            shift 2
+            ;;
+        --sif-prefix)
+            R2E_GYM_SIF_PREFIX="${2:-}"
+            shift 2
+            ;;
         --callback-host)
             RELAX_CALLBACK_HOST="${2:-}"
+            shift 2
+            ;;
+        --callback-network)
+            if [ -n "${RELAX_CALLBACK_NETWORKS}" ]; then
+                RELAX_CALLBACK_NETWORKS="${RELAX_CALLBACK_NETWORKS},${2:-}"
+            else
+                RELAX_CALLBACK_NETWORKS="${2:-}"
+            fi
             shift 2
             ;;
         --image)
@@ -85,6 +109,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --max-concurrency)
             R2E_GYM_MAX_CONCURRENCY="${2:-}"
+            shift 2
+            ;;
+        --gym-cpus)
+            GYM_RAY_NUM_CPUS="${2:-}"
             shift 2
             ;;
         --verbose)
@@ -122,6 +150,18 @@ case "${R2E_DATA_DIR}" in
         exit 2
         ;;
 esac
+R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-${R2E_DATA_DIR}/sif}"
+case "${R2E_GYM_SIF_DIR}" in
+    /*) ;;
+    *)
+        echo "--sif-dir must be an absolute Docker-host path" >&2
+        exit 2
+        ;;
+esac
+if [[ "${R2E_GYM_SIF_PREFIX}" == */* ]]; then
+    echo "--sif-prefix must be a filename prefix without '/'" >&2
+    exit 2
+fi
 case "${RELAX_REPO_ROOT}" in
     /*) ;;
     *)
@@ -136,8 +176,8 @@ case "${R2E_GYM_MODE}" in
         ;;
     train)
         R2E_GYM_VERIFY_GOLDEN_PATCH=0
-        if [ -z "${RELAX_CALLBACK_HOST}" ]; then
-            echo "train mode requires --callback-host" >&2
+        if [ -z "${RELAX_CALLBACK_HOST}" ] && [ -z "${RELAX_CALLBACK_NETWORKS}" ]; then
+            echo "train mode requires --callback-host or --callback-network" >&2
             exit 2
         fi
         ;;
@@ -146,9 +186,27 @@ case "${R2E_GYM_MODE}" in
         exit 2
         ;;
 esac
-if [[ "${RELAX_CALLBACK_HOST}" == *"://"* ]] || [[ "${RELAX_CALLBACK_HOST}" == *":"* ]]; then
+if [ -n "${RELAX_CALLBACK_HOST}" ] &&
+    { [[ "${RELAX_CALLBACK_HOST}" == *"://"* ]] || [[ "${RELAX_CALLBACK_HOST}" == *":"* ]] ||
+        [[ "${RELAX_CALLBACK_HOST}" == */* ]]; }; then
     echo "--callback-host must be the exact bare host from the Relax callback URL" >&2
     exit 2
+fi
+if [ -n "${RELAX_CALLBACK_NETWORKS}" ]; then
+    command -v python3 >/dev/null 2>&1 || {
+        echo "python3 is required to validate --callback-network" >&2
+        exit 2
+    }
+    python3 - "${RELAX_CALLBACK_NETWORKS}" <<'PY'
+import ipaddress
+import sys
+
+for value in sys.argv[1].split(","):
+    try:
+        ipaddress.ip_network(value, strict=True)
+    except ValueError as exc:
+        raise SystemExit(f"--callback-network must contain valid CIDR networks: {value!r}: {exc}") from None
+PY
 fi
 if ! [[ "${NEMO_GYM_START_TIMEOUT_S}" =~ ^[1-9][0-9]*$ ]]; then
     echo "NEMO_GYM_START_TIMEOUT_S must be a positive integer" >&2
@@ -179,23 +237,64 @@ command -v curl >/dev/null 2>&1 || {
     echo "curl is required" >&2
     exit 2
 }
-if docker container inspect "${NEMO_GYM_CONTAINER}" >/dev/null 2>&1; then
-    echo "Removing existing container ${NEMO_GYM_CONTAINER}..."
-    docker rm -f "${NEMO_GYM_CONTAINER}" >/dev/null
-fi
 
 docker image inspect "${NEMO_GYM_IMAGE}" >/dev/null
 test -s "${R2E_DATA_DIR}/r2e_gym_train.jsonl" || {
     echo "Missing prepared dataset: ${R2E_DATA_DIR}/r2e_gym_train.jsonl" >&2
     exit 2
 }
-find "${R2E_DATA_DIR}/sif" -maxdepth 1 -type f -name "*.sif" -size +0c -print -quit | grep -q . || {
-    echo "No prepared SIF found under ${R2E_DATA_DIR}/sif" >&2
+first_sif="$(find -L "${R2E_GYM_SIF_DIR}" -maxdepth 1 -type f \
+    -name "${R2E_GYM_SIF_PREFIX}*.sif" -size +0c -print -quit)"
+if [ -z "${first_sif}" ]; then
+    echo "No prepared ${R2E_GYM_SIF_PREFIX}*.sif found under ${R2E_GYM_SIF_DIR}" >&2
     exit 2
-}
+fi
 
-callback_allowlist="${RELAX_CALLBACK_HOST},${GYM_HOST},127.0.0.1"
-container_no_proxy="127.0.0.1,localhost,${GYM_HOST},${RELAX_CALLBACK_HOST}"
+sif_mount_args=()
+docker_preflight_mount_args=(
+    --mount "type=bind,source=${RELAX_REPO_ROOT},target=/opt/relax-integration,readonly"
+    --mount "type=bind,source=${R2E_DATA_DIR},target=${R2E_DATA_DIR},readonly"
+)
+if [ "${R2E_GYM_SIF_DIR}" != "${R2E_DATA_DIR}/sif" ]; then
+    sif_mount_args+=(--volume "${R2E_GYM_SIF_DIR}:${R2E_GYM_SIF_DIR}:ro")
+    docker_preflight_mount_args+=(
+        --mount "type=bind,source=${R2E_GYM_SIF_DIR},target=${R2E_GYM_SIF_DIR},readonly"
+    )
+fi
+
+if ! docker run --rm \
+    --network none \
+    "${docker_preflight_mount_args[@]}" \
+    --entrypoint /bin/bash \
+    "${NEMO_GYM_IMAGE}" \
+    -ceu '
+        data_dir="$1"
+        sif_dir="$2"
+        sif_prefix="$3"
+        test -s "${data_dir}/r2e_gym_train.jsonl"
+        test -s /opt/relax-integration/examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh
+        first_sif="$(find -L "${sif_dir}" -maxdepth 1 -type f \
+            -name "${sif_prefix}*.sif" -size +0c -print -quit)"
+        test -n "${first_sif}"
+    ' -- "${R2E_DATA_DIR}" "${R2E_GYM_SIF_DIR}" "${R2E_GYM_SIF_PREFIX}"; then
+    echo "ERROR: Docker daemon cannot read the configured Relax checkout, dataset, or SIF directory." >&2
+    echo "In Docker-in-Docker, a FUSE mount created only inside the client container is not visible to the" >&2
+    echo "outer Docker daemon. Mount --repo-dir, --data-dir, and --sif-dir on the Docker host first." >&2
+    echo "The existing ${NEMO_GYM_CONTAINER} container was not changed." >&2
+    exit 2
+fi
+
+if docker container inspect "${NEMO_GYM_CONTAINER}" >/dev/null 2>&1; then
+    echo "Removing existing container ${NEMO_GYM_CONTAINER}..."
+    docker rm -f "${NEMO_GYM_CONTAINER}" >/dev/null
+fi
+
+callback_allowlist="${GYM_HOST},127.0.0.1"
+container_no_proxy="127.0.0.1,localhost,${GYM_HOST}"
+if [ -n "${RELAX_CALLBACK_HOST}" ]; then
+    callback_allowlist="${RELAX_CALLBACK_HOST},${callback_allowlist}"
+    container_no_proxy="${container_no_proxy},${RELAX_CALLBACK_HOST}"
+fi
 if [ -n "${NEMO_GYM_NO_PROXY}" ]; then
     container_no_proxy="${container_no_proxy},${NEMO_GYM_NO_PROXY}"
 fi
@@ -211,8 +310,11 @@ echo "  container=${NEMO_GYM_CONTAINER}"
 echo "  image=${NEMO_GYM_IMAGE}"
 echo "  mode=${R2E_GYM_MODE}"
 echo "  gym_url=http://${GYM_HOST}:28100"
-echo "  callback_host=${RELAX_CALLBACK_HOST}"
+echo "  callback_host=${RELAX_CALLBACK_HOST:-<none>}"
+echo "  callback_networks=${RELAX_CALLBACK_NETWORKS:-<none>}"
 echo "  data_dir=${R2E_DATA_DIR}"
+echo "  sif_dir=${R2E_GYM_SIF_DIR}"
+echo "  sif_prefix=${R2E_GYM_SIF_PREFIX:-<none>}"
 echo "  repo_dir=${RELAX_REPO_ROOT}"
 echo "  max_concurrency=${R2E_GYM_MAX_CONCURRENCY}"
 echo "  callback_timeout_s=${NEMO_GYM_CALLBACK_TIMEOUT_S}"
@@ -230,6 +332,7 @@ docker create \
     --shm-size 16g \
     --mount "type=bind,source=${RELAX_REPO_ROOT},target=/opt/relax-integration,readonly" \
     --volume "${R2E_DATA_DIR}:${R2E_DATA_DIR}" \
+    "${sif_mount_args[@]}" \
     --volume "${r2e_setup_volume}:/opt/nemo-gym/responses_api_agents/swe_agents/swe_r2e_gym_setup" \
     --volume "${openhands_setup_volume}:/opt/nemo-gym/responses_api_agents/swe_agents/swe_openhands_setup" \
     --env GYM_HOST="${GYM_HOST}" \
@@ -239,12 +342,15 @@ docker create \
     --env R2E_GYM_CLUSTER_PYTHON="/opt/nemo-gym/.venv/bin/python" \
     --env R2E_GYM_MODE="${R2E_GYM_MODE}" \
     --env R2E_GYM_MAX_CONCURRENCY="${R2E_GYM_MAX_CONCURRENCY}" \
+    --env R2E_GYM_MAX_TURNS="${R2E_GYM_MAX_TURNS}" \
     --env NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE}" \
     --env NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${callback_allowlist}" \
+    --env NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${RELAX_CALLBACK_NETWORKS}" \
     --env NEMO_GYM_CALLBACK_PROXY="${NEMO_GYM_CALLBACK_PROXY}" \
     --env NEMO_GYM_CALLBACK_TIMEOUT_S="${NEMO_GYM_CALLBACK_TIMEOUT_S}" \
     --env R2E_GYM_DATA="${R2E_DATA_DIR}/r2e_gym_train.jsonl" \
-    --env R2E_GYM_SIF_DIR="${R2E_DATA_DIR}/sif" \
+    --env R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR}" \
+    --env R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX}" \
     --env R2E_GYM_VERIFY_GOLDEN_PATCH="${R2E_GYM_VERIFY_GOLDEN_PATCH}" \
     --env HTTP_PROXY="${NEMO_GYM_HTTP_PROXY}" \
     --env HTTPS_PROXY="${NEMO_GYM_HTTP_PROXY}" \
@@ -268,6 +374,8 @@ docker create \
         local_args=(
             --data-dir "$(dirname "${R2E_GYM_DATA}")"
             --mode "${R2E_GYM_MODE}"
+            --sif-dir "${R2E_GYM_SIF_DIR}"
+            --sif-prefix "${R2E_GYM_SIF_PREFIX}"
             --max-concurrency "${R2E_GYM_MAX_CONCURRENCY}"
         )
         if [ "${NEMO_GYM_VERBOSE}" = "1" ]; then
