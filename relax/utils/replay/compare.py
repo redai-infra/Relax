@@ -87,8 +87,8 @@ def report_scalar_list(
 ) -> StageResult:
     """Compare per-sample scalars.
 
-    Missing expected values fail: a recompute stage without recorded outputs
-    is an incomplete bundle, not a silent pass.
+    Missing expected values fail: a recompute stage without recorded outputs is
+    an incomplete bundle, not a silent pass.
     """
     if expected is None:
         result.status = StageStatus.FAIL

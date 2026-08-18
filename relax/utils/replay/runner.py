@@ -4,8 +4,8 @@
 
 Executes the pipeline stages in DAG order. Only stages that (a) resolve to
 recompute under the frozen V1 matrix for the bundle's topology and (b) are
-declared recompute in the manifest are executed. An unsupported topology
-(non-GRPO or CP!=1) raises ValueError. Per-stage unsupported / recorded-only /
+declared recompute in the manifest are executed. An unsupported topology (non-
+GRPO or CP!=1) raises ValueError. Per-stage unsupported / recorded-only /
 inspect-only results are skipped unless the caller explicitly requested that
 stage, in which case unsupported fails. Skipped stages never count toward the
 first-divergent-stage determination.

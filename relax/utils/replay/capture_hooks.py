@@ -51,9 +51,11 @@ def build_identity(rollout_id: int, step_id: int | None = None) -> Identity:
 
 
 def capture_producer_ranks() -> list[int]:
-    """Global ranks on the last pipeline stage (they own post-forward payloads).
+    """Global ranks on the last pipeline stage (they own post-forward
+    payloads).
 
-    Init-time all-gather; not on the training hot path. Independent of rank order.
+    Init-time all-gather; not on the training hot path. Independent of rank
+    order.
     """
     import torch.distributed as dist
     from megatron.core import mpu
@@ -74,8 +76,8 @@ def capture_producer_ranks() -> list[int]:
 def maybe_enable_for_actor() -> capture.CaptureManager | None:
     """Enable capture on last-PP producer ranks only.
 
-    Every actor rank must call this when capture env vars are set (all-gather is
-    collective). Non-producers return without starting a writer thread.
+    Every actor rank must call this when capture env vars are set (all-gather
+    is collective). Non-producers return without starting a writer thread.
     """
     if capture.config_from_env() is None:
         return None

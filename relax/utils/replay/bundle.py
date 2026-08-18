@@ -73,7 +73,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def metadata_checksums(directory: str | Path) -> dict[str, str]:
-    """SHA-256 of manifest.json, index.json and expected.json under directory."""
+    """SHA-256 of manifest.json, index.json and expected.json under
+    directory."""
     directory = Path(directory)
     checksums: dict[str, str] = {}
     for name in _METADATA_FILES:
@@ -229,7 +230,8 @@ def write_cohort_shard(
 
 
 def try_finalize_cohort(path: str | Path, ranks: list[int]) -> bool:
-    """If every expected COMPLETE.<rank> is present and consistent, write COMPLETE.
+    """If every expected COMPLETE.<rank> is present and consistent, write
+    COMPLETE.
 
     Returns True when the cohort is finalized (including already-complete).
     Missing ranks return False without waiting. Safe to call from each rank's

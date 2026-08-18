@@ -4,8 +4,8 @@
 
 Enabled via maybe_enable_from_env. Hooks live in capture_hooks.
 CaptureManager.submit detaches and clones tensors (GPU→GPU copy, no CPU sync);
-GPU→CPU copy and serialization run on a bounded writer thread that never
-back-pressures training.
+GPU→CPU copy and serialization run on a bounded writer thread that never back-
+pressures training.
 """
 
 from __future__ import annotations
@@ -580,7 +580,8 @@ def maybe_enable_from_env(
 
     rank is this process. expected_ranks is the last-PP producer set that must
     publish COMPLETE.<rank>; None means this rank only. Output stays under
-    RELAX_REPLAY_CAPTURE_DIR; multi-rank writers coordinate via try_finalize_cohort.
+    RELAX_REPLAY_CAPTURE_DIR; multi-rank writers coordinate via
+    try_finalize_cohort.
     """
     config = config_from_env()
     if config is None:

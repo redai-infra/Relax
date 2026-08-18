@@ -257,7 +257,8 @@ def build_grpo_bundle(
 
 
 def resign_metadata_checksums(bundle: Path) -> None:
-    """Recompute COMPLETE / COMPLETE.<rank> metadata hashes after a test mutates files."""
+    """Recompute COMPLETE / COMPLETE.<rank> metadata hashes after a test
+    mutates files."""
     checksums = metadata_checksums(bundle)
     complete_path = bundle / "COMPLETE"
     complete = json.loads(complete_path.read_text(encoding="utf-8"))
