@@ -35,12 +35,19 @@ def test_dr_grpo_is_registered():
     assert ALGOS["dr_grpo"] == ALGOS["grpo"]
 
 
-def test_dr_grpo_reward_centering_is_mandatory_and_does_not_divide_by_group_std():
+def test_dr_grpo_centers_rewards_without_dividing_by_group_std():
+    """Dr.GRPO keeps the group mean subtraction but drops the std division.
+
+    ``--disable-rewards-normalization`` is rejected for Dr.GRPO in
+    ``_validate_dr_grpo_args``, so centering is guaranteed before this function
+    runs; see ``test_dr_grpo_rejects_incompatible_semantics``. What is specific
+    to Dr.GRPO here is that ``grpo_std_normalization`` no longer applies.
+    """
     args = SimpleNamespace(
         advantage_estimator="dr_grpo",
         custom_reward_post_process_path=None,
         agentic_custom_advantage_path=None,
-        rewards_normalization=False,
+        rewards_normalization=True,
         grpo_std_normalization=True,
         n_samples_per_prompt=2,
         reward_key=None,

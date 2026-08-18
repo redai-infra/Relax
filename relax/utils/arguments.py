@@ -2951,8 +2951,6 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
 
 def _validate_dr_grpo_args(args) -> None:
     """Validate Dr.GRPO's fixed-budget optimization contract."""
-    if getattr(args, "advantage_estimator", None) != "dr_grpo":
-        return
 
     if type(args.rollout_max_response_len) is not int or args.rollout_max_response_len <= 0:
         raise ValueError("--rollout-max-response-len must be a positive integer for Dr.GRPO.")
@@ -3664,7 +3662,8 @@ def slime_validate_args(args):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
 
-    _validate_dr_grpo_args(args)
+    if getattr(args, "advantage_estimator", None) == "dr_grpo":
+        _validate_dr_grpo_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(

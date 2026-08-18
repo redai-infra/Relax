@@ -746,12 +746,13 @@ def prepare_policy_optimizer_window_metadata(
         start = 0
         for step_local_sample_count in step_local_sample_counts:
             end = start + step_local_sample_count
-            local_response_tokens = torch.stack(
-                [
-                    mask.sum().to(device=stats_device, dtype=torch.float32)
-                    for mask in rollout_data["loss_masks"][start:end]
-                ]
-            ).sum()
+            window_masks = rollout_data["loss_masks"][start:end]
+            if window_masks:
+                local_response_tokens = torch.stack(
+                    [mask.sum().to(device=stats_device, dtype=torch.float32) for mask in window_masks]
+                ).sum()
+            else:
+                local_response_tokens = torch.zeros((), device=stats_device, dtype=torch.float32)
             step_stats.append(
                 torch.stack(
                     [
@@ -764,7 +765,8 @@ def prepare_policy_optimizer_window_metadata(
 
         stats = torch.stack(step_stats)
         dist.all_reduce(stats, group=mpu.get_data_parallel_group(with_context_parallel=False))
-        step_loss_scales = stats[:, 1] / (stats[:, 0] * args.rollout_max_response_len)
+        step_denominators = (stats[:, 0] * args.rollout_max_response_len).clamp_min(1.0)
+        step_loss_scales = stats[:, 1] / step_denominators
         step_window_empty = stats[:, 1] <= 0
         return [
             {"__dr_grpo_window_scale__": scale, "__optimizer_window_empty__": window_empty}

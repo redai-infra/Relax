@@ -182,15 +182,11 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
-    if args.advantage_estimator in [
-        "grpo",
-        "dr_grpo",
-        "gspo",
-        "sapo",
-        "cispo",
-        "reinforce_plus_plus_baseline",
-        "rloo",
-    ] and (args.rewards_normalization or args.advantage_estimator == "dr_grpo"):
+    if (
+        args.advantage_estimator
+        in ["grpo", "dr_grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
+        and args.rewards_normalization
+    ):
         # group norm
         rewards = torch.tensor(raw_rewards, dtype=torch.float)
         positions_by_group: dict[int, list[int]] = {}
@@ -458,7 +454,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
             args.custom_reward_post_process_path is None
             and args.advantage_estimator
             in ["grpo", "dr_grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
-            and (args.rewards_normalization or args.advantage_estimator == "dr_grpo")
+            and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))
             if None in group_ids:

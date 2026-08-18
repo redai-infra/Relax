@@ -765,8 +765,6 @@ def get_data_iterator(
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
-    if num_local_samples == 0:
-        raise ValueError("rollout data must contain at least one local sample")
     if getattr(args, "partial_rollout", False) and getattr(args, "use_dynamic_global_batch_size", False):
         global_batch_size = num_local_samples * dp_size
     else:
