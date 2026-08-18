@@ -9,6 +9,7 @@ keeping these assertions running in CI instead of silently skipping.
 """
 
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -191,6 +192,74 @@ def test_p3o_loss_function_normalizes_by_true_valid_tokens(monkeypatch):
 
     assert normalizer.item() == 1
     assert logging_dict["values"][0].item() == 1
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_p3o_loss_uses_one_canonical_full_cp_graph(monkeypatch, cp_rank):
+    """Only CP0's full loss survives, while full response masks stay
+    ungathered."""
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: cp_rank)
+
+    full_logits = torch.arange(12.0, requires_grad=True).reshape(1, 2, 6)
+    local_logits = torch.arange(6.0, requires_grad=True).reshape(1, 1, 6)
+    rollout = torch.tensor([-0.2])
+    advantages = torch.tensor([0.5])
+    full_mask = torch.tensor([1.0, 0.0])
+    gathered_inputs = []
+
+    def gather(value, *args, **kwargs):
+        del args, kwargs
+        gathered_inputs.append(value)
+        return torch.cat([value, value])
+
+    reducer_inputs = {}
+
+    def build_reducer(*args, **kwargs):
+        reducer_inputs["args"] = args
+        reducer_inputs["kwargs"] = kwargs
+        return torch.sum
+
+    impl_inputs = {}
+
+    def canonical_impl(args, batch, logits, reducer):
+        del args
+        impl_inputs.update(batch=batch, logits=logits, reducer=reducer)
+        loss = logits.sum()
+        return loss, {"loss": loss.detach()}
+
+    monkeypatch.setattr(loss_module, "all_gather_with_cp", gather)
+    monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", build_reducer)
+    monkeypatch.setattr(loss_module, "_p3o_loss_function_impl", canonical_impl)
+    batch = {
+        "packed_seq_params": SimpleNamespace(_relax_p3o_canonical_full_logits=full_logits),
+        "rollout_log_probs": [rollout],
+        "advantages": [advantages],
+        "loss_masks": [full_mask],
+        "unconcat_tokens": [torch.tensor([1, 2, 3])],
+        "total_lengths": [3],
+        "response_lengths": [2],
+    }
+    args = Namespace(qkv_format="thd", calculate_per_token_loss=True)
+
+    loss, metrics = loss_module.p3o_loss_function(args, batch, local_logits, torch.sum)
+
+    assert gathered_inputs == [rollout, advantages]
+    if cp_rank == 0:
+        assert impl_inputs["batch"]["loss_masks"][0] is full_mask
+    else:
+        assert torch.equal(impl_inputs["batch"]["loss_masks"][0], torch.zeros_like(full_mask))
+    assert impl_inputs["batch"]["dynamic_cp_size"] == 1
+    assert impl_inputs["batch"]["dynamic_cp_rank"] == 0
+    assert impl_inputs["logits"] is full_logits
+    assert reducer_inputs["args"][2][0] is impl_inputs["batch"]["loss_masks"][0]
+    assert reducer_inputs["kwargs"] == {"dynamic_cp_size": 1, "dynamic_cp_rank": 0}
+    if cp_rank == 0:
+        assert torch.equal(loss, full_logits.sum())
+        assert torch.equal(metrics["loss"], full_logits.sum().detach())
+    else:
+        assert torch.equal(loss, torch.zeros(()))
+        assert torch.equal(metrics["loss"], torch.zeros(()))
 
 
 def test_policy_loss_dispatch_selects_dedicated_p3o_path():

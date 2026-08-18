@@ -862,7 +862,7 @@ def get_p3o_context(
     return finalize_p3o_step_context(stats)
 
 
-def p3o_loss_function(
+def _p3o_loss_function_impl(
     args: Namespace,
     batch: RolloutBatch,
     logits: torch.Tensor,
@@ -1033,6 +1033,85 @@ def p3o_loss_function(
         reported_loss["kl_loss"] = reference_kl_loss.clone().detach()
 
     return loss, reported_loss
+
+
+def p3o_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute P3O on one canonical full-response CP loss graph."""
+    packed = batch.get("packed_seq_params")
+    dynamic_cp_size = batch.get("dynamic_cp_size")
+    dynamic_cp_rank = batch.get("dynamic_cp_rank")
+    dynamic_cp_group = getattr(packed, "cp_group", None) if dynamic_cp_size is not None else None
+    cp_size = int(dynamic_cp_size) if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    full_logits = getattr(packed, "_relax_p3o_canonical_full_logits", None)
+    if cp_size <= 1 or full_logits is None:
+        return _p3o_loss_function_impl(args, batch, logits, sum_of_sample_mean)
+
+    total_lengths = [int(value) for value in batch["total_lengths"]]
+    response_lengths = [int(value) for value in batch["response_lengths"]]
+    max_seq_lens = batch.get("max_seq_lens")
+    padded_total_lengths = batch.get("padded_total_lengths")
+    max_values = max_seq_lens if max_seq_lens is not None else [None] * len(total_lengths)
+    padded_values = padded_total_lengths if padded_total_lengths is not None else [None] * len(total_lengths)
+    full_batch = dict(batch)
+    # Response-valued training fields are CP-local after ``get_batch``.  The
+    # per-sample loss masks intentionally remain full-length and are consumed
+    # by the CP-aware reducers, so gathering them a second time would violate
+    # ``all_gather_with_cp``'s local-response input contract.
+    for field in ("rollout_log_probs", "advantages", "ref_log_probs"):
+        values = batch.get(field)
+        if values is None:
+            continue
+        full_batch[field] = [
+            all_gather_with_cp(
+                value,
+                total_length,
+                response_length,
+                padded_total_length=padded_total_length,
+                qkv_format=args.qkv_format,
+                max_seq_len=max_seq_len,
+                dynamic_cp_size=dynamic_cp_size,
+                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_group=dynamic_cp_group,
+            )
+            for value, total_length, response_length, max_seq_len, padded_total_length in zip(
+                values,
+                total_lengths,
+                response_lengths,
+                max_values,
+                padded_values,
+                strict=True,
+            )
+        ]
+    cp_rank = int(dynamic_cp_rank) if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
+    if cp_rank != 0:
+        # Keep micro-batch-scope collectives symmetric without counting the
+        # replicated full response once per CP rank.  CP0 owns the canonical
+        # loss graph; other ranks retain only the zero-gradient local-logit
+        # path returned below.
+        full_batch["loss_masks"] = [torch.zeros_like(mask) for mask in batch["loss_masks"]]
+    full_batch["dynamic_cp_size"] = 1
+    full_batch["dynamic_cp_rank"] = 0
+    full_reducer = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        full_batch["loss_masks"],
+        args.calculate_per_token_loss,
+        args.qkv_format,
+        max_seq_lens,
+        padded_total_lengths,
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    full_loss, full_log = _p3o_loss_function_impl(args, full_batch, full_logits, full_reducer)
+    if cp_rank == 0:
+        return full_loss, full_log
+    zero_loss = 0.0 * logits.sum()
+    return zero_loss, {key: torch.zeros_like(value) for key, value in full_log.items()}
 
 
 def _get_reinforce_plus_plus_mask_safe_reducer(

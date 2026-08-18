@@ -98,6 +98,11 @@ recomputation。当前支持的合同是标准 zig-zag THD 且 tensor parallel s
 canonical micro-batch 时，其 Triton autotune launcher 不可用。
 当前 strict-DP 合同要求每个 optimizer step 只有一个 rollout mini；如果存在多个
 mini 边界会 fail closed，不会静默重排。
+在每个 CP group 内，严格模式会在 embedding、TransformerLayer、final norm、LM head
+和 P3O loss 边界重建 CP1 token 顺序。Forward 值由 CP rank 0 broadcast；backward
+把 token-shard 梯度 reduce 到同一 canonical graph，并把其他 replica graph 的梯度
+置零。这样 dense 参数和 embedding 参数都只按 CP1 顺序累加一次，不再平均不同
+rank-local CUDA 或 sparse-embedding 结果。
 
 正式默认值为 G=16、global batch 64、micro-batch 1、rollout batch 4、response
 length 4096 和 30 个 optimizer step（`--num-rollout 30`）。计划配对 seed 为 42、

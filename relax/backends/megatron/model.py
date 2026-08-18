@@ -381,12 +381,128 @@ def _find_p3o_post_process_modules(
     return None
 
 
+def _find_p3o_embedding(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Find the token embedding on the first pipeline stage."""
+    module = unwrap_model(model)
+    for _ in range(4):
+        embedding = getattr(module, "embedding", None)
+        if embedding is not None and not isinstance(embedding, torch.nn.Identity):
+            return embedding
+        module = getattr(module, "module", None) or getattr(module, "language_model", None)
+        if module is None:
+            return None
+    return None
+
+
+def _build_p3o_full_sequence_embedding_forward(
+    module: torch.nn.Module,
+    packed_seq_params: object,
+    cp_size: int,
+    cp_group: object,
+    cp_rank: int,
+) -> Callable:
+    """Run the embedding weight-gradient accumulation in canonical CP1
+    order."""
+    original_forward = module.forward
+    cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu")
+    total_lengths = getattr(packed_seq_params, "_relax_total_lengths")
+    pad_multiple = getattr(packed_seq_params, "_relax_attention_pad_multiple")
+
+    def canonicalize_batch_first(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if value.ndim < 2 or value.shape[0] != 1:
+            raise RuntimeError(
+                f"P3O strict CP embedding requires batch-first singleton inputs, got shape={tuple(value.shape)}"
+            )
+        full_value = _p3o_cp_gather_full(value.transpose(0, 1).contiguous(), cu_seqlens_cpu, cp_size, cp_group)
+        canonical_value, _ = _canonicalize_p3o_attention_input(
+            full_value,
+            cu_seqlens_cpu,
+            total_lengths,
+            pad_multiple,
+        )
+        return canonical_value.transpose(0, 1).contiguous()
+
+    @wraps(original_forward)
+    def full_sequence_forward(
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        tokentype_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        try:
+            canonical_input_ids = canonicalize_batch_first(input_ids)
+            if canonical_input_ids is None:
+                raise RuntimeError("P3O strict CP embedding requires input_ids")
+            canonical_output = original_forward(
+                canonical_input_ids,
+                canonicalize_batch_first(position_ids),
+                canonicalize_batch_first(tokentype_ids),
+            )
+            from .cp_utils import gdn_cp_slice, p3o_cp_canonical_full
+
+            canonical_output = p3o_cp_canonical_full(canonical_output, cp_group)
+            source_layout_output = _restore_p3o_attention_output_layout(
+                canonical_output,
+                cu_seqlens_cpu,
+                total_lengths,
+            )
+            return gdn_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank)
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
+
+    return full_sequence_forward
+
+
+@contextmanager
+def _p3o_full_sequence_embedding(
+    args: Namespace,
+    model: torch.nn.Module,
+    packed_seq_params: object | None,
+) -> Iterator[None]:
+    """Canonicalize token-embedding forward/backward under strict CP."""
+    if getattr(args, "advantage_estimator", None) != "p3o" or getattr(args, "context_parallel_size", 1) <= 1:
+        yield
+        return
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        raise RuntimeError("P3O strict CP embedding requires THD packed_seq_params")
+    embedding = _find_p3o_embedding(model)
+    if embedding is None:
+        yield
+        return
+    attention = next((candidate for candidate in model.modules() if type(candidate).__name__ == "SelfAttention"), None)
+    if attention is None:
+        raise RuntimeError("P3O strict CP embedding requires a SelfAttention module")
+    cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
+    if cp_size == 1:
+        yield
+        return
+
+    original_forward = embedding.forward
+    try:
+        embedding.forward = _build_p3o_full_sequence_embedding_forward(
+            embedding,
+            packed_seq_params,
+            cp_size,
+            cp_group,
+            cp_rank,
+        )
+        yield
+    finally:
+        try:
+            del embedding.forward
+        except AttributeError:
+            embedding.forward = original_forward
+
+
 def _build_p3o_full_sequence_post_process_forward(
     module: torch.nn.Module,
     packed_seq_params: object,
     cp_size: int,
     cp_group: object,
     cp_rank: int,
+    *,
+    stash_full_logits: bool,
 ) -> Callable:
     """Make one token-wise post-process module use the canonical CP1 shape."""
     original_forward = module.forward
@@ -414,18 +530,23 @@ def _build_p3o_full_sequence_post_process_forward(
                     module.sequence_parallel = sequence_parallel
 
             output = result[0] if isinstance(result, tuple) else result
+            from .cp_utils import gdn_cp_slice, p3o_cp_canonical_full
+
+            canonical_output = p3o_cp_canonical_full(output, cp_group)
+            if stash_full_logits:
+                # GPTModel's public policy-logit contract is FP32.  Stashing
+                # inside the raw LM head happens before that outer contract is
+                # applied, so make the canonical full view match the tensor
+                # consumed by the ordinary CP1 loss path.
+                packed_seq_params._relax_p3o_canonical_full_logits = (
+                    canonical_output.transpose(0, 1).float().contiguous()
+                )
             source_layout_output = _restore_p3o_attention_output_layout(
-                output,
+                canonical_output,
                 cu_seqlens_cpu,
                 total_lengths,
             )
-            local_output = _p3o_cp_slice(
-                source_layout_output,
-                cu_seqlens_cpu,
-                cp_size,
-                cp_rank,
-                cp_group,
-            )
+            local_output = gdn_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank)
             if isinstance(result, tuple):
                 return (local_output, *result[1:])
             return local_output
@@ -462,7 +583,7 @@ def _p3o_full_sequence_post_process(
 
     originals: list[tuple[torch.nn.Module, Callable]] = []
     try:
-        for module in modules:
+        for module_index, module in enumerate(modules):
             original_forward = module.forward
             module.forward = _build_p3o_full_sequence_post_process_forward(
                 module,
@@ -470,6 +591,7 @@ def _p3o_full_sequence_post_process(
                 cp_size,
                 cp_group,
                 cp_rank,
+                stash_full_logits=module_index == 1,
             )
             originals.append((module, original_forward))
         yield
@@ -1595,8 +1717,9 @@ def train_one_step(
                 ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
-                with _p3o_full_sequence_post_process(args, model, batch.get("packed_seq_params")):
-                    output_tensor = model(**forward_kwargs)
+                with _p3o_full_sequence_embedding(args, model, batch.get("packed_seq_params")):
+                    with _p3o_full_sequence_post_process(args, model, batch.get("packed_seq_params")):
+                        output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage

@@ -121,6 +121,12 @@ their Triton autotune launcher is not valid when multiple replicas execute the
 same canonical micro-batch concurrently.
 The current strict-DP contract requires one rollout mini per optimizer step and
 fails closed instead of silently reordering multiple mini boundaries.
+Within each CP group, strict mode reconstructs the CP1 token order at the
+embedding, TransformerLayer, final-norm, LM-head, and P3O-loss boundaries.
+Forward values are broadcast from CP rank zero; backward reduces token-shard
+gradients to that same canonical graph and zeros the other replica graphs.
+This makes dense and embedding parameter accumulation run once in CP1 order
+instead of averaging rank-local CUDA or sparse-embedding results.
 
 Formal defaults are G=16, global batch 64, micro-batch 1, rollout batch 4,
 response length 4096, and 30 optimizer steps (`--num-rollout 30`). The planned

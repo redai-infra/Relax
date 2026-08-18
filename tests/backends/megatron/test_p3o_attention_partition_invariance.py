@@ -18,6 +18,7 @@ from relax.backends.megatron.cp_utils import gdn_cp_slice
 from relax.backends.megatron.model import (
     P3O_CP_ATTENTION_OOM_ERROR,
     _install_p3o_full_sequence_attention,
+    _p3o_full_sequence_embedding,
     _p3o_full_sequence_post_process,
 )
 
@@ -144,15 +145,35 @@ class _TokenShapePostProcess(torch.nn.Module):
         return (output, None) if self.returns_tuple else output
 
 
+class _TokenEmbedding(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.word_embeddings = torch.nn.Embedding.from_pretrained(weight.clone(), freeze=False)
+        self.seen_token_counts: list[int] = []
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        tokentype_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del position_ids
+        assert tokentype_ids is None
+        self.seen_token_counts.append(input_ids.shape[1])
+        return self.word_embeddings(input_ids).transpose(0, 1).contiguous()
+
+
 class _PostProcessRoot(torch.nn.Module):
     def __init__(
         self,
         layer: TransformerLayer,
         final_layernorm: torch.nn.Module,
         output_layer: torch.nn.Module,
+        embedding: torch.nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.layer = layer
+        self.embedding = embedding
         self.decoder = torch.nn.Module()
         self.decoder.final_layernorm = final_layernorm
         self.output_layer = output_layer
@@ -267,6 +288,42 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
             dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
             torch.testing.assert_close(parameter.grad, reference_parameter.grad, atol=1e-10, rtol=1e-10)
 
+        embedding_weight = torch.randn(17, hidden_size, dtype=torch.float64)
+        real_token_ids = [
+            torch.tensor([1, 2, 3, 2, 1], dtype=torch.long),
+            torch.tensor([4, 5, 4, 6, 4], dtype=torch.long),
+        ]
+        source_token_ids = torch.cat(
+            [
+                torch.cat([tokens, torch.zeros(padded - len(tokens), dtype=torch.long)])
+                for tokens, padded in zip(real_token_ids, cp_padded_lengths, strict=True)
+            ]
+        )
+        canonical_token_ids = torch.cat([*real_token_ids, torch.zeros(6, dtype=torch.long)]).unsqueeze(0)
+        reference_embedding = _TokenEmbedding(embedding_weight)
+        reference_embedding_output = reference_embedding(canonical_token_ids, None)
+        (reference_embedding_output * reference_mask).square().sum().backward()
+
+        embedding = _TokenEmbedding(embedding_weight)
+        embedding_root = _PostProcessRoot(
+            layer,
+            torch.nn.Identity(),
+            torch.nn.Identity(),
+            embedding,
+        )
+        local_token_ids = gdn_cp_slice(source_token_ids, cu_seqlens, world_size, rank).unsqueeze(0)
+        with _p3o_full_sequence_embedding(_p3o_args(scope), embedding_root, packed_seq_params):
+            local_embedding_output = embedding(local_token_ids, None)
+        assert embedding.seen_token_counts == [len(canonical_hidden)]
+        (local_embedding_output * local_loss_mask).square().sum().backward()
+        dist.all_reduce(embedding.word_embeddings.weight.grad, op=dist.ReduceOp.SUM)
+        torch.testing.assert_close(
+            embedding.word_embeddings.weight.grad,
+            reference_embedding.word_embeddings.weight.grad,
+            atol=1e-10,
+            rtol=1e-10,
+        )
+
         norm_weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
         head_weight = torch.randn(hidden_size, hidden_size, dtype=torch.float64)
         reference_norm = _TokenShapePostProcess(norm_weight)
@@ -285,6 +342,8 @@ def _cp2_parity_worker(rank: int, world_size: int, port: int, scope: str) -> Non
             local_post_output, _ = head(norm(local_post_input))
         assert norm.forward == original_norm_forward
         assert head.forward == original_head_forward
+        assert packed_seq_params._relax_p3o_canonical_full_logits.dtype == torch.float32
+        assert packed_seq_params._relax_p3o_canonical_full_logits.shape[:2] == (1, len(canonical_hidden))
         assert norm.seen_token_counts == [len(canonical_hidden)]
         assert head.seen_token_counts == [len(canonical_hidden)]
         (local_post_output * local_loss_mask).square().sum().backward()
