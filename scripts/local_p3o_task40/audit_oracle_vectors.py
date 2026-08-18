@@ -61,7 +61,8 @@ def _distribution(values: list[float]) -> dict[str, Any]:
 def _response_indices(
     *, total_length: int, response_length: int, cp_size: int, cp_rank: int, max_seq_len: int
 ) -> list[tuple[int, int]]:
-    """Return ``(response_index, global_chunk_index)`` in local output order."""
+    """Return ``(response_index, global_chunk_index)`` in local output
+    order."""
     if cp_size == 1:
         return [(index, 0) for index in range(response_length)]
 

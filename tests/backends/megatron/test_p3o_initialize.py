@@ -1,11 +1,34 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from collections.abc import Iterator
+from types import ModuleType
 
 import pytest
 import torch
 
-from relax.backends.megatron import initialize
+from tests.backends.megatron._megatron_stub import (
+    isolated_module_cache,
+    stubbed_megatron_modules,
+    temporarily_stub_module,
+)
+
+
+relax_models = ModuleType("relax.models")
+
+with (
+    isolated_module_cache("relax.backends.megatron"),
+    temporarily_stub_module("relax.models", relax_models),
+    stubbed_megatron_modules(),
+):
+    from relax.backends.megatron import initialize
+
+
+@pytest.fixture(autouse=True)
+def _megatron_import_stub() -> Iterator[None]:
+    """Keep Megatron's synthetic modules available for dynamic imports."""
+    with stubbed_megatron_modules():
+        yield
 
 
 def _args(**overrides: object) -> Namespace:

@@ -8,6 +8,7 @@ import os
 import socket
 from argparse import Namespace
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -15,8 +16,26 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from relax.backends.megatron import initialize
-from relax.backends.megatron.cp_utils import p3o_cp_replicated_slice
+from tests.backends.megatron._megatron_stub import (
+    isolated_module_cache,
+    stubbed_megatron_modules,
+    temporarily_stub_module,
+)
+
+
+stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
+stream_dataloader.StreamingTQIterator = object
+relax_models = ModuleType("relax.models")
+
+with (
+    isolated_module_cache("relax.backends.megatron"),
+    temporarily_stub_module("relax.utils.data.stream_dataloader", stream_dataloader),
+    temporarily_stub_module("relax.models", relax_models),
+    stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
+):
+    from relax.backends.megatron import initialize
+    from relax.backends.megatron.cp_utils import p3o_cp_replicated_slice
+    from relax.backends.megatron.data import _merge_p3o_strict_dp_rollout_batches
 
 
 def _free_port() -> int:
@@ -90,6 +109,7 @@ def _worker(
         torch.manual_seed(20260817)
         model = _TinyPolicy()
         initialize.enable_batch_invariant_mode = lambda: None
+        initialize._disable_p3o_compiled_fused_cross_entropy = lambda: None
         args = Namespace(
             advantage_estimator="p3o",
             batch_invariant_mode=True,
@@ -206,8 +226,6 @@ def test_p3o_full_training_backward_matches_dp1_across_dp_and_cp2(tmp_path: Path
 
 
 def test_p3o_strict_dp_rollout_merge_keeps_one_loss_anchor() -> None:
-    from relax.backends.megatron.data import _merge_p3o_strict_dp_rollout_batches
-
     batches = [
         {
             "tokens": [torch.tensor([rank + 1, rank + 2])],
@@ -232,8 +250,6 @@ def test_p3o_strict_dp_rollout_merge_keeps_one_loss_anchor() -> None:
 
 
 def test_p3o_strict_dp_rollout_merge_rejects_multiple_rollout_minis() -> None:
-    from relax.backends.megatron.data import _merge_p3o_strict_dp_rollout_batches
-
     batch = {
         "tokens": [torch.tensor([1]), torch.tensor([2])],
         "total_lengths": [1, 1],

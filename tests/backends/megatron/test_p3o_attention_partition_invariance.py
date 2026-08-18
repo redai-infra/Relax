@@ -7,20 +7,44 @@ from __future__ import annotations
 import os
 import socket
 from argparse import Namespace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from relax.backends.megatron.cp_utils import gdn_cp_slice
-from relax.backends.megatron.model import (
-    P3O_CP_ATTENTION_OOM_ERROR,
-    _install_p3o_full_sequence_attention,
-    _p3o_full_sequence_embedding,
-    _p3o_full_sequence_post_process,
+from tests.backends.megatron._megatron_stub import (
+    isolated_module_cache,
+    stubbed_megatron_modules,
+    temporarily_stub_module,
 )
+
+
+stream_dataloader = ModuleType("relax.utils.data.stream_dataloader")
+stream_dataloader.StreamingTQIterator = object
+relax_models = ModuleType("relax.models")
+
+with (
+    isolated_module_cache("relax.backends.megatron"),
+    temporarily_stub_module("relax.utils.data.stream_dataloader", stream_dataloader),
+    temporarily_stub_module("relax.models", relax_models),
+    stubbed_megatron_modules(("megatron", "ray", "tensordict", "pybase64")),
+):
+    from relax.backends.megatron import model as model_module
+    from relax.backends.megatron.cp_utils import gdn_cp_slice
+
+
+def _unwrap_test_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the synthetic test root without Megatron DDP unwrapping."""
+    return model
+
+
+model_module.unwrap_model = _unwrap_test_model
+P3O_CP_ATTENTION_OOM_ERROR = model_module.P3O_CP_ATTENTION_OOM_ERROR
+_install_p3o_full_sequence_attention = model_module._install_p3o_full_sequence_attention
+_p3o_full_sequence_embedding = model_module._p3o_full_sequence_embedding
+_p3o_full_sequence_post_process = model_module._p3o_full_sequence_post_process
 
 
 class _LayerRoot(torch.nn.Module):
@@ -403,8 +427,6 @@ def test_p3o_full_sequence_attention_gate_is_p3o_cp_only() -> None:
 
 
 def test_p3o_full_sequence_attention_oom_refuses_native_cp_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    from relax.backends.megatron import model as model_module
-
     cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
     layer = TransformerLayer(cp_group, torch.eye(2), torch.eye(2))
     leaked_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
