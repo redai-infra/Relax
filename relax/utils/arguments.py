@@ -2704,6 +2704,16 @@ def _pre_parse_cli_model_source():
     )
 
 
+def _prevalidate_resource_cli() -> None:
+    """Validate resource shape before loading heavyweight backend parsers."""
+    if any(option in sys.argv[1:] for option in ("-h", "--help")):
+        return
+    resource_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    resource_parser.add_argument("--resource", type=json.loads)
+    resource_args, _ = resource_parser.parse_known_args()
+    _validate_resource_config(resource_args)
+
+
 def parse_args(add_custom_arguments=None, *, strict=False):
     """Parse Relax arguments with an optional registered model source.
 
@@ -2741,10 +2751,7 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
-    resource_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    resource_parser.add_argument("--resource", type=json.loads)
-    resource_args, _ = resource_parser.parse_known_args()
-    _validate_resource_config(resource_args)
+    _prevalidate_resource_cli()
     skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
@@ -3075,6 +3082,9 @@ def _validate_resource_config(args) -> None:
 def _validate_dataset_paths(args) -> None:
     from relax.utils.data.data_utils import resolve_path_plan
 
+    if getattr(args, "loss_type", None) == "sft" and getattr(args, "custom_dataset_class_path", None):
+        return
+
     prompt_data = getattr(args, "prompt_data", None)
     path_specs = [prompt_data] if isinstance(prompt_data, str) else list(prompt_data or [])
     eval_prompt_data = list(getattr(args, "eval_prompt_data", None) or [])
@@ -3084,6 +3094,11 @@ def _validate_dataset_paths(args) -> None:
         path_specs.extend(dataset.path for dataset in getattr(args, "eval_datasets", []) or [])
     for spec in path_specs:
         paths, _ = resolve_path_plan(spec)
+        if not paths:
+            raise FileNotFoundError(
+                f"Dataset path {spec!r} resolved to no supported files. "
+                "Fix: add a .jsonl or .parquet file, or correct the dataset path."
+            )
         missing = [path for path in paths if not os.path.exists(path)]
         if missing:
             raise FileNotFoundError(

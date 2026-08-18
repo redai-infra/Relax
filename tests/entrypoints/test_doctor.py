@@ -144,6 +144,35 @@ def test_valid_generalized_dataset_path_returns_success(
     assert report["resources"]["total_gpus"] == 1
 
 
+def test_empty_dataset_directory_returns_nonzero(
+    training_argv, tmp_path, capsys, optional_sglang_backend, megatron_backend
+):
+    empty_directory = tmp_path / "empty-dataset"
+    empty_directory.mkdir()
+    prompt_index = training_argv.index("--prompt-data") + 1
+    training_argv[prompt_index] = str(empty_directory)
+
+    assert doctor.main(["--format", "json", "--", *training_argv]) == 1
+    report = json.loads(capsys.readouterr().err)
+    assert "resolved to no supported files" in report["error"]
+    assert "add a .jsonl or .parquet file" in report["suggestion"]
+
+
+def test_custom_sft_dataset_owns_its_path_semantics(tmp_path):
+    from relax.utils.arguments import _validate_dataset_paths
+
+    custom_data_source = tmp_path / "custom-data-source"
+    custom_data_source.mkdir()
+    args = Namespace(
+        loss_type="sft",
+        custom_dataset_class_path="example.CustomDataset",
+        prompt_data=str(custom_data_source),
+        eval_prompt_data=None,
+    )
+
+    _validate_dataset_paths(args)
+
+
 def test_report_uses_registry_roles_and_colocate_resources(megatron_backend):
     args = Namespace(
         loss_type="rl",
@@ -419,6 +448,19 @@ def test_missing_dependency_has_install_suggestion(monkeypatch, capsys):
     report = json.loads(capsys.readouterr().err)
     assert "example_backend" in report["error"]
     assert "install 'example_backend'" in report["suggestion"]
+
+
+@pytest.mark.parametrize("help_option", ["-h", "--help"])
+def test_training_help_bypasses_resource_prevalidation(monkeypatch, help_option):
+    from relax.utils import arguments
+
+    def forbidden(_args):
+        raise AssertionError("resource validation should not run for help")
+
+    monkeypatch.setattr(arguments, "_validate_resource_config", forbidden)
+    monkeypatch.setattr(arguments.sys, "argv", ["relax.entrypoints.train", help_option])
+
+    arguments._prevalidate_resource_cli()
 
 
 def test_outdated_dependency_preserves_upgrade_command():
