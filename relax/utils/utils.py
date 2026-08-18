@@ -18,6 +18,7 @@ from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import (
     GROUP_REWARD_NORMALIZATION_ESTIMATORS,
     GRPO_STYLE_ADVANTAGE_ESTIMATORS,
+    compute_rloo_leave_one_out_rewards,
 )
 from relax.utils.types import Sample
 
@@ -247,7 +248,19 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
                     f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
                 )
             group_rewards = rewards[positions]
-            if args.advantage_estimator == "p3o":
+            if args.advantage_estimator == "rloo":
+                finite_mask = torch.isfinite(group_rewards)
+                if not finite_mask.all():
+                    invalid_group_positions = (~finite_mask).nonzero(as_tuple=False).flatten().tolist()
+                    invalid_sample_positions = [positions[position] for position in invalid_group_positions]
+                    invalid_values = group_rewards[~finite_mask].tolist()
+                    raise ValueError(
+                        f"RLOO group_index={group_index} contains non-finite reward(s) at "
+                        f"group position(s) {invalid_group_positions}, sample position(s) "
+                        f"{invalid_sample_positions}: {invalid_values}."
+                    )
+                group_rewards = compute_rloo_leave_one_out_rewards(group_rewards)
+            elif args.advantage_estimator == "p3o":
                 if len(positions) > 1:
                     group_rewards = group_rewards - group_rewards.mean()
                     group_rewards = group_rewards / (group_rewards.std(correction=1) + 1e-8)

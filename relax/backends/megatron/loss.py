@@ -37,6 +37,7 @@ from relax.utils.training.ppo_utils import (
     compute_log_probs,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_rloo_loss,
     compute_sapo_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -1299,6 +1300,11 @@ def policy_loss_function(
             advantages=advantages,
             eps_clip=args.eps_clip,
             eps_clip_high=args.eps_clip_high,
+        )
+    elif args.advantage_estimator == "rloo":
+        pg_loss, pg_clipfrac = compute_rloo_loss(
+            log_probs=log_probs,
+            advantages=advantages,
         )
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)

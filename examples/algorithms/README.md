@@ -4,7 +4,7 @@
 
 ## 概述
 
-Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、CISPO、GSPO 与 SAPO 共享同一套服务拓扑，可以通过替换算法参数块（`*_ARGS`）切换；PPO 还需要 Critic 与 Advantages 服务，应使用专用启动脚本。
+Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。GRPO、P3O、RLOO、CISPO、GSPO 与 SAPO 共享 Actor/Rollout 服务拓扑；RLOO 仅支持同步固定批量，PPO 还需要 Critic 与 Advantages 服务，应分别遵守专用配置。
 
 ## 支持的算法
 
@@ -13,6 +13,7 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 | **PPO**                  | `--advantage-estimator ppo`                          | Actor-Critic、token 级 GAE       |
 | **P3O**                  | `--advantage-estimator p3o`                          | 行为策略失配校正、ESS 自适应上限 |
 | **GRPO**                 | `--advantage-estimator grpo`                         | 默认、大多数场景                 |
+| **RLOO**                 | `--advantage-estimator rloo`                         | 无偏基线、非裁剪 REINFORCE       |
 | **REINFORCE++**          | `--advantage-estimator reinforce_plus_plus`          | token KL-to-go 与全局归一化      |
 | **REINFORCE++-baseline** | `--advantage-estimator reinforce_plus_plus_baseline` | group baseline 与独立 k2 KL      |
 | **CISPO**                | `--advantage-estimator cispo`                        | 保留梯度方向、需要更高精度       |
@@ -49,6 +50,13 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 - baseline 变体不把 token KL 放入 advantage，而是使用独立的 k2 KL loss
 - 两个变体当前只支持同步 colocate、CP=1 和 response-mean reduction
 - 完整公式、mask 与边界行为参见[REINFORCE++ 设计文档](../../docs/zh/guide/reinforce-plus-plus.md)
+
+### RLOO（无偏 Leave-One-Out 基线）
+
+- 用同一 prompt 的其他采样奖励构造 leave-one-out baseline，不按组内标准差归一化
+- 使用非裁剪 REINFORCE loss，`train/pg_clipfrac` 始终为 `0`
+- 仅支持同步固定批量，要求 `rollout_batch_size × n_samples_per_prompt = global_batch_size`
+- 推荐从 `run-qwen3-0.6B-1xgpu-rloo.sh` 开始，并通过环境变量按硬件调整批量
 
 ### CISPO（保留梯度信号）
 
@@ -101,6 +109,21 @@ python3 -m relax.entrypoints.train \
     ...
 ```
 
+### 示例：运行 RLOO（文本）
+
+```bash
+export MODEL_DIR=/path/to/models
+export DATA_DIR=/path/to/data
+
+NUM_ROLLOUT=60 \
+ROLLOUT_BATCH_SIZE=4 \
+N_SAMPLES=8 \
+GLOBAL_BATCH_SIZE=32 \
+bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
+```
+
+保持 `ROLLOUT_BATCH_SIZE × N_SAMPLES = GLOBAL_BATCH_SIZE`。设置 `ADVANTAGE_ESTIMATOR=grpo` 可使用相同 recipe 运行对照臂。脚本将清洗数据写入 artifact cache（可用 `RLOO_DATA_CACHE_DIR` 覆盖），并要求模型用 `\boxed{...}` 输出最终答案，以匹配 `math` reward parser。
+
 ### 示例：运行 CISPO（多模态）
 
 ```bash
@@ -141,13 +164,27 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 ### 通用参数
 
-| 参数                    | 默认值               | 说明                                                                                                    |
-| ----------------------- | -------------------- | ------------------------------------------------------------------------------------------------------- |
-| `--advantage-estimator` | `grpo`               | 算法类型：`grpo`, `cispo`, `gspo`, `sapo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
-| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                             |
-| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                        |
-| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                    |
-| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                              |
+| 参数                    | 默认值               | 说明                                                                                                            |
+| ----------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `--advantage-estimator` | `grpo`               | 算法类型：`grpo`, `cispo`, `gspo`, `sapo`, `ppo`, `rloo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` |
+| `--eps-clip`            | `0.2`                | 下方裁剪边距（ratio 下界 = `1 - eps_clip`）                                                                     |
+| `--eps-clip-high`       | 与 `--eps-clip` 相同 | 上方裁剪边距（ratio 上界 = `1 + eps_clip_high`）                                                                |
+| `--clip-grad`           | —                    | 梯度裁剪范数，CISPO 下推荐设为 `1.0`                                                                            |
+| `--kl-coef`             | `0.0`                | KL 惩罚系数；当前同步 PPO 会将非零值重置为 `0.0`，REINFORCE++ 等算法可使用                                      |
+
+### RLOO 专用约束与指标
+
+| 项目                                         | 要求/含义                                             |
+| -------------------------------------------- | ----------------------------------------------------- |
+| `--n-samples-per-prompt`                     | 至少为 `2`                                            |
+| `rollout_batch_size × n_samples_per_prompt`  | 必须等于 `global_batch_size`                          |
+| `--num-steps-per-rollout`                    | 不设置或为 `1`                                        |
+| `--calculate-per-token-loss`                 | 必须开启，按全局有效 response token 数归一化          |
+| `--kl-coef`                                  | 必须为 `0`；配置 `--ref-load` 后使用直接 KL loss 路径 |
+| `--max-staleness`                            | 必须为 `0`                                            |
+| async、partial rollout、dynamic global batch | 不支持                                                |
+| `--normalize-advantages`                     | 不支持                                                |
+| `rollout/rloo/*`                             | 训练侧 baseline、advantage signal、空响应与异常组诊断 |
 
 ### CISPO 专用参数
 
@@ -262,3 +299,5 @@ examples/algorithms/
 - [CISPO - MiniMax-M1](https://arxiv.org/abs/2506.13585)
 - [PPO - Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)
 - [REINFORCE++ - Simple Efficient Alignment](https://arxiv.org/abs/2501.03262)
+- [RLOO - Back to Basics (Ahmadian et al. 2024)](https://arxiv.org/abs/2402.14740)
+- [RLOO - Buy 4 REINFORCE Samples, Get a Baseline for Free (Kool et al. 2019)](https://arxiv.org/abs/1905.12705)

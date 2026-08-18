@@ -126,8 +126,9 @@ class Advantages(Base):
 
         This function extracts rewards, log-probs, values, and masks from
         `rollout_data`, computes KL divergences, then applies the chosen advantage
-        estimator. Supported methods: "grpo", "gspo", "sapo", "ppo",
-        "reinforce_plus_plus", and "reinforce_plus_plus_baseline".
+        estimator. Supported methods: "grpo", "gspo", "sapo", "cispo",
+        "rloo", "ppo", "reinforce_plus_plus", and
+        "reinforce_plus_plus_baseline".
 
         Early returns if both `log_probs` and `values` are None (intermediate
         pipeline stages).
