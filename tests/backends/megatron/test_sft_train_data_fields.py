@@ -48,7 +48,7 @@ def test_rl_data_fields_unchanged():
     args = _mk_actor_args(loss_type="policy_loss")
     fields = build_data_fields(args)
 
-    for required in ("tokens", "loss_masks", "rollout_log_probs", "rewards", "raw_reward"):
+    for required in ("tokens", "loss_masks", "rollout_log_probs", "rewards", "raw_reward", "group_index"):
         assert required in fields
 
 

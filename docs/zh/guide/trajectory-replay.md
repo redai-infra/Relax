@@ -85,12 +85,12 @@ python -m relax.tools.trajectory_replay replay <bundle> [--stage all]
 
 # 选择单条 / 单 group / 单 micro-batch 重放（可重复），或断言 step 坐标
 python -m relax.tools.trajectory_replay replay <bundle> \
-    [--sample s-0] [--group g-1] [--batch mb-0007] [--step 120:0]
+    [--sample s-0] [--group g-1] [--batch mb-0007] [--step 120:0] [--rollout 120]
 ```
 
 `replay` 的分歧报告给出：首个分歧 stage、sample、field、token offset、expected/actual 值与最大绝对误差。被跳过（`recorded-only` / `inspect-only` / `unsupported`）的 stage 不计入分歧判定。
 
-**选择粒度**：`--sample`/`--group`/`--batch` 任选其一或多个。选择任何 sample 或 micro-batch 都会**展开到其完整 semantic-group closure**（因为 reward/advantage 归一化是 group 级），缺失 membership 时拒绝执行。部分选择下，per-sample/per-token 阶段（sample → advantage.estimate）正常重算，而 **cohort 级阶段（`loss.policy`）会跳过**——子集 scalar 无法与全 cohort 的期望值相比。`--step ROLLOUT_ID:STEP_ID` 在单个 bundle 上校验身份：step 级包匹配 `(rollout_id, step_id)`，rollout 级包匹配 `rollout_id`；若路径是抓包目录（含多个 bundle 或 `rank-*` 子目录），则选出匹配的那一份（优先 step 级）。`--batch` 按 DataIterator 的 micro-batch 序号选择（`mb-0000`、`mb-0001`、…），不是 actor `step_id`。
+**选择粒度**：`--sample`/`--group`/`--batch` 任选其一或多个。选择任何 sample 或 micro-batch 都会**展开到其完整 semantic-group closure**（因为 reward/advantage 归一化是 group 级），缺失 membership 时拒绝执行。部分选择下，per-sample/per-token 阶段（sample → advantage.estimate）正常重算，而 **cohort 级阶段（`loss.policy`）会跳过**——子集 scalar 无法与全 cohort 的期望值相比。`--step ROLLOUT_ID:STEP_ID` 只接受精确的 `actor_step_id=(rollout_id, step_id)` 匹配；rollout 级包用 `--rollout ROLLOUT_ID`。两者互斥。若路径是抓包目录（含多个 bundle 或 `rank-*` 子目录），则选出匹配的那一份。`--batch` 按 DataIterator 的 micro-batch 序号选择（`mb-0000`、`mb-0001`、…），不是 actor `step_id`。
 
 示例（PR #65 历史故障）：
 
@@ -105,7 +105,22 @@ bundle b-00001 — first divergent stage: reward.post_process
 
 ## 启用生产捕获
 
-捕获默认关闭，不改变训练数值。通过环境变量打开（不改 CLI 参数解析）；Actor 在 `MegatronTrainRayActor.init` 里调用 `maybe_enable_from_env`，每个 rank 写到 `<DIR>/rank-<rank>/`：
+捕获默认关闭，不改变训练数值。通过环境变量打开（不改 CLI 参数解析）；Actor 在
+`MegatronTrainRayActor.init` 里调用 `maybe_enable_for_actor`，只在 last pipeline
+stage 的 rank 上启用捕获（这些 rank 持有 post-forward payload），其余 rank 保持沉默。
+单 producer 写 `<DIR>/<bundle>/`；多 producer 写 `<DIR>/<bundle>/rank-<rank>/`，各
+producer 的 writer 线程在写完 `COMPLETE.<rank>` 后 **try-finalize**（缺人就返回，
+到齐才写最终 `COMPLETE`），训练线程不等待：
+
+```text
+<DIR>/
+  replay-0-0/
+    COMPLETE.0          # 该 rank 的身份、owned payloads、checksum
+    COMPLETE.1
+    COMPLETE            # 全部预期 rank 到齐后才出现
+    rank-0/             # rank-local 完整 bundle，可单独 replay
+    rank-1/
+```
 
 ```bash
 export RELAX_REPLAY_CAPTURE=1

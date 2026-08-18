@@ -10,9 +10,16 @@ from pathlib import Path
 import pytest
 import torch
 
-from relax.utils.replay.bundle import BundleReader, IncompleteBundleError, sha256_file
+from relax.utils.replay.bundle import (
+    BundleReader,
+    IncompleteBundleError,
+    sha256_file,
+    try_finalize_cohort,
+    write_cohort_shard,
+)
+from relax.utils.replay.schema import ActorStepId, Identity
 from relax.utils.replay.validate import validate_bundle
-from tests.utils.replay.helpers import build_grpo_bundle
+from tests.utils.replay.helpers import build_grpo_bundle, resign_metadata_checksums
 
 
 def _payload_path(bundle: Path, name: str) -> Path:
@@ -24,6 +31,7 @@ def _rewrite_manifest(bundle: Path, mutate) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     mutate(manifest)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resign_metadata_checksums(bundle)
 
 
 def _replace_payload(bundle: Path, name: str, obj) -> None:
@@ -48,6 +56,7 @@ def _replace_payload(bundle: Path, name: str, obj) -> None:
     complete = json.loads(complete_path.read_text(encoding="utf-8"))
     complete["payloads"][name] = new_sha256
     complete_path.write_text(json.dumps(complete), encoding="utf-8")
+    resign_metadata_checksums(bundle)
 
 
 def test_bundle_roundtrip(tmp_path):
@@ -155,6 +164,7 @@ def _rewrite_index(bundle: Path, mutate) -> None:
     index = json.loads(index_path.read_text(encoding="utf-8"))
     mutate(index)
     index_path.write_text(json.dumps(index), encoding="utf-8")
+    resign_metadata_checksums(bundle)
 
 
 def test_bundle_identity_anchor_rejected(tmp_path):
@@ -164,6 +174,7 @@ def test_bundle_identity_anchor_rejected(tmp_path):
         index["identity"]["rollout_id"] = 120
 
     _rewrite_index(bundle, both_anchors)
+    _sync_shard_identity(bundle)
     result = validate_bundle(bundle)
     assert not result.valid
     assert any("exactly one" in error for error in result.errors)
@@ -173,6 +184,50 @@ def test_bundle_identity_anchor_rejected(tmp_path):
         index["identity"]["rollout_id"] = None
 
     _rewrite_index(bundle, neither_anchor)
+    _sync_shard_identity(bundle)
     result = validate_bundle(bundle)
     assert not result.valid
     assert any("exactly one" in error for error in result.errors)
+
+
+def _sync_shard_identity(bundle: Path) -> None:
+    """Copy index.identity onto COMPLETE.0 so reader identity checks pass."""
+    identity = json.loads((bundle / "index.json").read_text(encoding="utf-8"))["identity"]
+    shard_path = bundle / "COMPLETE.0"
+    shard = json.loads(shard_path.read_text(encoding="utf-8"))
+    shard["actor_step_id"] = identity["actor_step_id"]
+    shard["rollout_id"] = identity.get("rollout_id")
+    shard_path.write_text(json.dumps(shard), encoding="utf-8")
+
+
+def test_bundle_metadata_checksum_mismatch(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    expected_path = bundle / "expected.json"
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    expected["loss.policy"]["loss"] = 0.0
+    expected_path.write_text(json.dumps(expected), encoding="utf-8")
+    with pytest.raises(IncompleteBundleError, match="metadata checksum"):
+        BundleReader(bundle).load()
+
+
+def test_bundle_shard_actor_step_mismatch(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    shard_path = bundle / "COMPLETE.0"
+    shard = json.loads(shard_path.read_text(encoding="utf-8"))
+    shard["actor_step_id"] = {"rollout_id": 999, "step_id": 0}
+    shard_path.write_text(json.dumps(shard), encoding="utf-8")
+    with pytest.raises(IncompleteBundleError, match="actor_step_id"):
+        BundleReader(bundle).load()
+
+
+def test_try_finalize_cohort_waits_then_completes(tmp_path):
+    cohort = tmp_path / "cohort"
+    identity = Identity(actor_step_id=ActorStepId(rollout_id=120, step_id=0))
+    write_cohort_shard(cohort, rank=0, identity=identity, expected_ranks=[0, 1], payloads={"x": "abc"})
+    assert try_finalize_cohort(cohort, [0, 1]) is False
+    write_cohort_shard(cohort, rank=1, identity=identity, expected_ranks=[0, 1], payloads={"y": "def"})
+    assert try_finalize_cohort(cohort, [0, 1]) is True
+    complete = json.loads((cohort / "COMPLETE").read_text(encoding="utf-8"))
+    assert complete["ranks"] == [0, 1]
+    assert complete["shards"]["1"]["payloads"] == {"y": "def"}
+    assert try_finalize_cohort(cohort, [0, 1]) is True

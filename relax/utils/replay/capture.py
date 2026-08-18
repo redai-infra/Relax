@@ -3,8 +3,9 @@
 """Production capture: post-forward tensors → replay bundle.
 
 Enabled via maybe_enable_from_env. Hooks live in capture_hooks.
-CaptureManager.submit only detaches tensors; GPU→CPU copy and serialization run
-on a bounded writer thread that never back-pressures training.
+CaptureManager.submit detaches and clones tensors (GPU→GPU copy, no CPU sync);
+GPU→CPU copy and serialization run on a bounded writer thread that never
+back-pressures training.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import torch
 
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.replay.bundle import BundleWriter
+from relax.utils.replay.bundle import BundleWriter, try_finalize_cohort, write_cohort_shard
 from relax.utils.replay.schema import (
     FORMAT_VERSION,
     STAGE_ORDER,
@@ -52,6 +53,11 @@ class CaptureConfig:
     # Rollouts to capture at rollout level (reward/advantage); None captures every rollout.
     selected_rollouts: set[int] | None = None
     redaction: dict[str, str] = field(default_factory=dict)
+    # Capturing process rank and the last-PP ranks that must publish
+    # COMPLETE.<rank> before the shared cohort is finalized. None means this
+    # rank only (single-rank bundle, no cross-rank coordinator).
+    rank: int = 0
+    expected_ranks: list[int] | None = None
 
 
 @dataclass
@@ -93,6 +99,8 @@ class CaptureRecord:
     # used to ignore activation-checkpoint recomputes of the same micro-batch.
     sample_micro_batch_ids: list[str] | None = None
     captured_micro_batch_ids: set[str] = field(default_factory=set)
+    capture_rank: int = 0
+    expected_ranks: list[int] | None = None
 
     @property
     def anchor(self) -> str:
@@ -104,31 +112,41 @@ class CaptureRecord:
         return "<unset>"
 
 
-def _detach_value(value: Any) -> Any:
-    """Detach tensors in a nested dict/list; leave other values unchanged."""
+def _snapshot_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Detach and clone so later in-place writes cannot mutate the snapshot.
+
+    clone() is a device-local copy (GPU→GPU when the tensor is CUDA) and does
+    not synchronize to CPU. GPU→CPU transfer stays on the writer thread.
+    """
+    return tensor.detach().clone()
+
+
+def _snapshot_value(value: Any) -> Any:
+    """Snapshot tensors in a nested dict/list; leave other values unchanged."""
     if isinstance(value, torch.Tensor):
-        return value.detach()
+        return _snapshot_tensor(value)
     if isinstance(value, dict):
-        return {key: _detach_value(item) for key, item in value.items()}
+        return {key: _snapshot_value(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_detach_value(item) for item in value]
+        return [_snapshot_value(item) for item in value]
     return value
 
 
-def _detach_record(record: CaptureRecord) -> CaptureRecord:
-    """Snapshot record with tensors detached (no GPU→CPU sync)."""
+def _snapshot_record(record: CaptureRecord) -> CaptureRecord:
+    """Immutable snapshot of record tensors (no GPU→CPU sync)."""
     return replace(
         record,
-        tensors={name: tensor.detach() for name, tensor in record.tensors.items()},
-        expected=_detach_value(record.expected),
-        loss_masks_tensor=_detach_value(record.loss_masks_tensor),
-        group_indices_tensor=_detach_value(record.group_indices_tensor),
-        raw_rewards_tensor=_detach_value(record.raw_rewards_tensor),
-        rewards_tensor=_detach_value(record.rewards_tensor),
+        tensors={name: _snapshot_tensor(tensor) for name, tensor in record.tensors.items()},
+        expected=_snapshot_value(record.expected),
+        loss_masks_tensor=_snapshot_value(record.loss_masks_tensor),
+        group_indices_tensor=_snapshot_value(record.group_indices_tensor),
+        raw_rewards_tensor=_snapshot_value(record.raw_rewards_tensor),
+        rewards_tensor=_snapshot_value(record.rewards_tensor),
         sample_micro_batch_ids=(
             list(record.sample_micro_batch_ids) if record.sample_micro_batch_ids is not None else None
         ),
         captured_micro_batch_ids=set(record.captured_micro_batch_ids),
+        expected_ranks=list(record.expected_ranks) if record.expected_ranks is not None else None,
     )
 
 
@@ -279,14 +297,46 @@ def _identity_micro_batch_ids(record: CaptureRecord, samples: list[SampleRecord]
     return [fallback] if fallback is not None else []
 
 
+def _resolved_ranks(record: CaptureRecord) -> tuple[int, list[int]]:
+    rank = record.capture_rank
+    expected = list(record.expected_ranks) if record.expected_ranks is not None else [rank]
+    return rank, expected
+
+
+def _publish_cohort_and_finalize(
+    cohort_dir: Path,
+    record: CaptureRecord,
+    *,
+    relpath: str | None,
+    payloads: dict[str, str] | None = None,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    rank, expected = _resolved_ranks(record)
+    write_cohort_shard(
+        cohort_dir,
+        rank=rank,
+        identity=record.identity,
+        expected_ranks=expected,
+        payloads=payloads or {},
+        metadata=metadata,
+        relpath=relpath,
+    )
+    try_finalize_cohort(cohort_dir, expected)
+
+
 def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> Path:
     """Serialize one CaptureRecord into a replay bundle.
 
     Pure and synchronous; used directly by tests and by the async writer
-    thread.
+    thread. A multi-rank capture writes rank-local bundles under
+    <dir>/<bundle_id>/rank-<rank>/ and try-finalizes a shared COMPLETE without
+    waiting for other ranks.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    rank, expected = _resolved_ranks(record)
+    multi = len(expected) > 1
+    cohort_dir = output_dir / record.bundle_id
 
     manifest = build_manifest_for_record(record)
     samples = record.samples if record.samples else _build_samples_from_raw(record)
@@ -298,23 +348,32 @@ def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> P
         identity = replace(identity, micro_batch_ids=micro_batch_ids)
     index = BundleIndex(bundle_id=record.bundle_id, identity=identity, samples=samples, config=record.config)
 
-    expected = _normalize_expected(record.expected)
+    expected_outputs = _normalize_expected(record.expected)
     # Derive per-sample reward expectations from the deferred tensors (writer
     # thread), so the reward adapters have JSON-serializable lists to compare.
     if record.raw_rewards_tensor is not None:
-        expected.setdefault(StageId.REWARD_RAW.value, {})["raw_rewards"] = [
+        expected_outputs.setdefault(StageId.REWARD_RAW.value, {})["raw_rewards"] = [
             float(value) for value in record.raw_rewards_tensor.detach().cpu().tolist()
         ]
     if record.rewards_tensor is not None:
-        expected.setdefault(StageId.REWARD_POST_PROCESS.value, {})["rewards"] = [
+        expected_outputs.setdefault(StageId.REWARD_POST_PROCESS.value, {})["rewards"] = [
             float(value) for value in record.rewards_tensor.detach().cpu().tolist()
         ]
 
-    writer = BundleWriter(output_dir / record.bundle_id, manifest, index, expected)
+    rank_path = (cohort_dir / f"rank-{rank}") if multi else cohort_dir
+    writer = BundleWriter(rank_path, manifest, index, expected_outputs, rank=rank)
     for name, tensor in record.tensors.items():
         writer.write_payload(name, tensor.detach().cpu().contiguous())
-    writer.finalize(ranks=[0])
-    return output_dir / record.bundle_id
+    rank_complete = writer.finalize(ranks=[rank])
+    if multi:
+        _publish_cohort_and_finalize(
+            cohort_dir,
+            record,
+            relpath=f"rank-{rank}",
+            payloads=dict(rank_complete["payloads"]),
+            metadata=dict(rank_complete["metadata"]) if rank_complete.get("metadata") else None,
+        )
+    return rank_path
 
 
 class CaptureManager:
@@ -352,6 +411,14 @@ class CaptureManager:
     def error_count(self) -> int:
         return self._error_count
 
+    @property
+    def rank(self) -> int:
+        return self._config.rank
+
+    @property
+    def expected_ranks(self) -> list[int] | None:
+        return self._config.expected_ranks
+
     def is_selected(self, actor_step_id: tuple[int, int]) -> bool:
         if self._config.selected_steps is None:
             return True
@@ -369,28 +436,36 @@ class CaptureManager:
             return self.is_rollout_selected(record.rollout_id)
         return False
 
-    def submit(self, record: CaptureRecord) -> bool:
-        """Enqueue a detached snapshot of record; returns True if queued.
-
-        Only detach() happens on the caller thread (no GPU→CPU sync, no
-        collective). On queue overflow the record is dropped and False
-        returned.
-        """
-        if not self.enabled or not self._record_selected(record):
-            return False
-
+    def _enqueue(self, record: CaptureRecord, *, drop_label: str) -> bool:
+        assert self._queue is not None
         try:
-            self._queue.put_nowait(_detach_record(record))
+            self._queue.put_nowait(record)
             return True
         except queue.Full:
             self._dropped_count += 1
             logger.warning(
                 "replay capture queue full (capacity=%d); dropping %s (dropped=%d)",
                 self._config.queue_capacity,
-                record.anchor,
+                drop_label,
                 self._dropped_count,
             )
             return False
+
+    def submit(self, record: CaptureRecord) -> bool:
+        """Enqueue a cloned snapshot of record; returns True if queued.
+
+        detach()+clone() happens on the caller thread (no GPU→CPU sync, no
+        collective). On queue overflow the record is dropped and False
+        returned.
+        """
+        if not self.enabled or not self._record_selected(record):
+            return False
+        snapshot = _snapshot_record(record)
+        snapshot.capture_rank = self._config.rank
+        snapshot.expected_ranks = (
+            list(self._config.expected_ranks) if self._config.expected_ranks is not None else None
+        )
+        return self._enqueue(snapshot, drop_label=record.anchor)
 
     def _writer_loop(self) -> None:
         assert self._queue is not None
@@ -498,17 +573,24 @@ def config_from_env() -> CaptureConfig | None:
     )
 
 
-def maybe_enable_from_env(*, rank: int | None = None) -> CaptureManager | None:
+def maybe_enable_from_env(
+    *, rank: int | None = None, expected_ranks: list[int] | None = None
+) -> CaptureManager | None:
     """Enable capture from env vars. No-op when capture is not requested.
 
-    rank scopes the output directory to <dir>/rank-<rank> so concurrent DP/TP
-    writers do not clobber each other on a shared filesystem.
+    rank is this process. expected_ranks is the last-PP producer set that must
+    publish COMPLETE.<rank>; None means this rank only. Output stays under
+    RELAX_REPLAY_CAPTURE_DIR; multi-rank writers coordinate via try_finalize_cohort.
     """
     config = config_from_env()
     if config is None:
         return None
     if rank is not None:
-        config = replace(config, output_dir=str(Path(config.output_dir) / f"rank-{rank}"))
+        config = replace(
+            config,
+            rank=rank,
+            expected_ranks=list(expected_ranks) if expected_ranks is not None else None,
+        )
     logger.info("enabling trajectory-replay capture under %s", config.output_dir)
     return enable(config)
 
@@ -518,7 +600,7 @@ def enable(config: CaptureConfig) -> CaptureManager:
 
     Replaces any previously active manager (flushing it first). This is the
     Python-API injection point: the training actor calls it from
-    maybe_enable_from_env — no argument-parsing changes required.
+    maybe_enable_for_actor — no argument-parsing changes required.
     """
     global _active, _atexit_registered
     if _active is not None:

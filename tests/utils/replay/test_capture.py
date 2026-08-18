@@ -10,6 +10,7 @@ bundle is replayable by the PR A runner.
 
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -51,6 +52,15 @@ from tests.utils.replay.helpers import make_capture_record, make_rollout_capture
 def _reset_capture_global():
     yield
     disable()
+
+
+def test_capture_snapshot_isolates_storage():
+    from relax.utils.replay.capture import _snapshot_record
+
+    record = make_capture_record("b-clone")
+    snapshot = _snapshot_record(record)
+    record.tensors["log_probs"].fill_(99.0)
+    assert torch.equal(snapshot.tensors["log_probs"], torch.zeros_like(record.tensors["log_probs"]))
 
 
 def test_capture_roundtrip_parity(tmp_path):
@@ -206,6 +216,17 @@ def test_capture_step_lifecycle(tmp_path):
     assert replay(tmp_path / "b-step").passed
 
 
+def test_group_indices_from_rollout_uses_tq_or_synthesizes():
+    class _Args:
+        n_samples_per_prompt = 2
+
+    from_tq = capture_hooks._group_indices_from_rollout({"group_index": [3, 3, 9, 9]}, _Args())
+    assert list(from_tq) == [3, 3, 9, 9]
+
+    synthesized = capture_hooks._group_indices_from_rollout({"response_lengths": [1, 1, 1, 1]}, _Args())
+    assert synthesized == [0, 0, 1, 1]
+
+
 def test_capture_hooks_noop_when_disabled():
     disable()
     assert should_capture((0, 0)) is False
@@ -342,14 +363,30 @@ def test_config_from_env_rejects_bad_steps(monkeypatch, tmp_path):
         config_from_env()
 
 
-def test_maybe_enable_from_env_scopes_rank_dir(monkeypatch, tmp_path):
+def test_maybe_enable_from_env_records_rank(monkeypatch, tmp_path):
     monkeypatch.setenv("RELAX_REPLAY_CAPTURE", "1")
     monkeypatch.setenv("RELAX_REPLAY_CAPTURE_DIR", str(tmp_path))
-    manager = maybe_enable_from_env(rank=3)
+    manager = maybe_enable_from_env(rank=3, expected_ranks=[1, 3])
     assert manager is not None
     assert manager.enabled
     assert active() is manager
-    assert str(tmp_path / "rank-3") == manager.output_dir
+    assert manager.output_dir == str(tmp_path)
+    assert manager.rank == 3
+    assert manager.expected_ranks == [1, 3]
+
+
+def test_maybe_enable_for_actor_only_producers(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAX_REPLAY_CAPTURE", "1")
+    monkeypatch.setenv("RELAX_REPLAY_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setattr(capture_hooks, "capture_producer_ranks", lambda: [1, 3])
+    monkeypatch.setattr("torch.distributed.get_rank", lambda: 2)
+    assert capture_hooks.maybe_enable_for_actor() is None
+    disable()
+    monkeypatch.setattr("torch.distributed.get_rank", lambda: 3)
+    manager = capture_hooks.maybe_enable_for_actor()
+    assert manager is not None
+    assert manager.rank == 3
+    assert manager.expected_ranks == [1, 3]
 
 
 def _policy_reported_loss(old, logp, entropy, advantages, samples, config):
@@ -421,3 +458,24 @@ def test_capture_policy_loss_records_data_iterator_micro_batches(tmp_path):
     assert loaded.tensors["old_log_probs"].numel() == 8
     assert replay(tmp_path / "b-mb").passed
     assert replay(tmp_path / "b-mb", batch_ids=["mb-0008"]).passed
+
+
+def test_capture_cohort_try_finalize(tmp_path):
+    record0 = make_capture_record("b-cohort")
+    record0.capture_rank = 0
+    record0.expected_ranks = [0, 1]
+    path0 = build_bundle_from_record(record0, tmp_path)
+    cohort = tmp_path / "b-cohort"
+    assert path0 == cohort / "rank-0"
+    assert (cohort / "COMPLETE.0").is_file()
+    assert not (cohort / "COMPLETE").is_file()
+
+    record1 = make_capture_record("b-cohort")
+    record1.capture_rank = 1
+    record1.expected_ranks = [0, 1]
+    path1 = build_bundle_from_record(record1, tmp_path)
+    assert path1 == cohort / "rank-1"
+    complete = json.loads((cohort / "COMPLETE").read_text(encoding="utf-8"))
+    assert complete["ranks"] == [0, 1]
+    assert replay(path0).passed
+    assert replay(path1).passed

@@ -12,12 +12,13 @@ against the pristine expected outputs.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from relax.utils.replay.bundle import BundleWriter
+from relax.utils.replay.bundle import BundleWriter, metadata_checksums
 from relax.utils.replay.capture import CaptureRecord
 from relax.utils.replay.schema import (
     ActorStepId,
@@ -253,6 +254,19 @@ def build_grpo_bundle(
     writer.finalize(ranks=[0])
 
     return Path(path), index, expected
+
+
+def resign_metadata_checksums(bundle: Path) -> None:
+    """Recompute COMPLETE / COMPLETE.<rank> metadata hashes after a test mutates files."""
+    checksums = metadata_checksums(bundle)
+    complete_path = bundle / "COMPLETE"
+    complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    complete["metadata"] = checksums
+    complete_path.write_text(json.dumps(complete, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    for shard in sorted(bundle.glob("COMPLETE.*")):
+        data = json.loads(shard.read_text(encoding="utf-8"))
+        data["metadata"] = checksums
+        shard.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) -> CaptureRecord:

@@ -85,12 +85,12 @@ python -m relax.tools.trajectory_replay replay <bundle> [--stage all]
 
 # Select a single sample / group / micro-batch (repeatable), or assert the step coordinate.
 python -m relax.tools.trajectory_replay replay <bundle> \
-    [--sample s-0] [--group g-1] [--batch mb-0007] [--step 120:0]
+    [--sample s-0] [--group g-1] [--batch mb-0007] [--step 120:0] [--rollout 120]
 ```
 
 The `replay` report gives the first divergent stage, sample, field, token offset, expected/actual values and max absolute error. Skipped stages (`recorded-only` / `inspect-only` / `unsupported`) never count toward the first-divergence determination.
 
-**Selection granularity**: `--sample` / `--group` / `--batch` may be combined. Selecting any sample or micro-batch expands to its full semantic-group closure (reward/advantage normalization is group-level) and fails closed on missing membership. Under a partial selection, per-sample/per-token stages (sample → advantage.estimate) recompute normally while the cohort-level `loss.policy` stage is skipped — a subset scalar cannot be compared to a full-cohort expected value. `--step ROLLOUT_ID:STEP_ID` asserts identity on a single bundle (step bundles match `(rollout_id, step_id)`; rollout bundles match `rollout_id`); if the path is a capture directory (several bundles or `rank-*` children) it picks the matching one, preferring the step-level bundle. `--batch` selects by DataIterator micro-batch index (`mb-0000`, `mb-0001`, …), not by actor `step_id`.
+**Selection granularity**: `--sample` / `--group` / `--batch` may be combined. Selecting any sample or micro-batch expands to its full semantic-group closure (reward/advantage normalization is group-level) and fails closed on missing membership. Under a partial selection, per-sample/per-token stages (sample → advantage.estimate) recompute normally while the cohort-level `loss.policy` stage is skipped — a subset scalar cannot be compared to a full-cohort expected value. `--step ROLLOUT_ID:STEP_ID` accepts an exact `actor_step_id=(rollout_id, step_id)` match only; use `--rollout ROLLOUT_ID` for a rollout-level bundle. The two flags are mutually exclusive. If the path is a capture directory (several bundles or `rank-*` children) it picks the matching one. `--batch` selects by DataIterator micro-batch index (`mb-0000`, `mb-0001`, …), not by actor `step_id`.
 
 Example (the PR #65 bug):
 
@@ -105,7 +105,25 @@ bundle b-00001 — first divergent stage: reward.post_process
 
 ## Enabling production capture
 
-Capture is off by default and does not change training numerics. Turn it on with environment variables (no CLI argument-parsing change). The actor calls `maybe_enable_from_env` from `MegatronTrainRayActor.init` and writes per rank under `<DIR>/rank-<rank>/`:
+Capture is off by default and does not change training numerics. Turn it on with
+environment variables (no CLI argument-parsing change). The actor calls
+`maybe_enable_for_actor` from `MegatronTrainRayActor.init`, which enables capture
+only on last pipeline-stage ranks (they own the post-forward payloads). Other
+ranks stay silent. A single producer writes `<DIR>/<bundle>/`; multiple producers
+write `<DIR>/<bundle>/rank-<rank>/`. Each producer's writer thread
+**try-finalizes** after publishing `COMPLETE.<rank>` (returns immediately if
+peers are missing; writes the final `COMPLETE` once every producer has landed).
+The training thread never waits:
+
+```text
+<DIR>/
+  replay-0-0/
+    COMPLETE.0          # this rank's identity, owned payloads, checksums
+    COMPLETE.1
+    COMPLETE            # appears only after every expected rank has flushed
+    rank-0/             # rank-local complete bundle; replayable on its own
+    rank-1/
+```
 
 ```bash
 export RELAX_REPLAY_CAPTURE=1

@@ -12,6 +12,7 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "rollout_log_probs",
         "rewards",
         "raw_reward",
+        "group_index",
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")

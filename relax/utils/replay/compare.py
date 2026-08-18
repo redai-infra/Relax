@@ -87,9 +87,11 @@ def report_scalar_list(
 ) -> StageResult:
     """Compare per-sample scalars.
 
-    Missing expected values stay PASS.
+    Missing expected values fail: a recompute stage without recorded outputs
+    is an incomplete bundle, not a silent pass.
     """
     if expected is None:
+        result.status = StageStatus.FAIL
         result.message = missing
         return result
     for index, (exp, act) in enumerate(zip(expected, actual, strict=False)):
@@ -121,14 +123,17 @@ def report_scalar_fields(
 ) -> StageResult:
     """Compare a map of named scalars.
 
-    Missing expected keys are skipped.
+    A missing expected map or key fails the stage.
     """
     if expected is None:
+        result.status = StageStatus.FAIL
         result.message = missing
         return result
     for field, actual_value in actual.items():
         expected_value = expected.get(field)
         if expected_value is None:
+            result.status = StageStatus.FAIL
+            result.divergences.append(FieldDivergence(field=field, actual=float(actual_value)))
             continue
         if not compare_scalar(float(expected_value), float(actual_value), atol=atol, rtol=rtol):
             result.status = StageStatus.FAIL
@@ -160,9 +165,10 @@ def report_tensor(
 ) -> StageResult:
     """Compare a flat per-token tensor.
 
-    Missing expected payload stays PASS.
+    Missing expected payload fails the stage.
     """
     if expected is None:
+        result.status = StageStatus.FAIL
         result.message = missing
         return result
     divergences, max_err, mismatches, non_finite = compare_tensors(

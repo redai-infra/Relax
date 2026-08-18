@@ -59,7 +59,6 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
-from relax.utils.replay.capture import maybe_enable_from_env
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -370,7 +369,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self.data_iterator = None
 
         if role == "actor":
-            maybe_enable_from_env(rank=dist.get_rank())
+            capture_hooks.maybe_enable_for_actor()
 
         if dist.get_rank() == 0:
             logger.info(
@@ -1294,6 +1293,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     "rollout_log_probs",
                     "rewards",
                     "raw_reward",
+                    "group_index",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
@@ -1477,6 +1477,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "rollout_log_probs",
             "rewards",
             "raw_reward",
+            "group_index",
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is
         # recomputed inline from the train forward (see policy_loss_function).

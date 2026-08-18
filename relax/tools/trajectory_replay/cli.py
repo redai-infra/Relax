@@ -7,15 +7,16 @@ Usage:
     python -m relax.tools.trajectory_replay inspect  <bundle>
     python -m relax.tools.trajectory_replay validate <bundle>
     python -m relax.tools.trajectory_replay replay   <bundle> [--stage all]
-        [--sample s-0 --group g-1 --batch mb-0007 --step 120:0]
+        [--sample s-0 --group g-1 --batch mb-0007 --step 120:0 --rollout 120]
 
 inspect works on incomplete bundles (no COMPLETE required); validate
 and replay require a complete, checksum-validated bundle. replay
 supports selecting a single sample / group / micro-batch (each expands to its
 semantic-group closure); cohort-level stages (loss) are skipped for a partial
-selection. --step ROLLOUT_ID:STEP_ID selects that actor step: on a single
-bundle it asserts identity (step bundles match actor_step_id; rollout bundles
-match rollout_id); on a capture directory it picks the matching bundle.
+selection. --step ROLLOUT_ID:STEP_ID selects that actor step by exact
+actor_step_id match. --rollout ROLLOUT_ID selects a rollout-level bundle.
+On a capture directory, the matching bundle is picked; the two flags are
+mutually exclusive.
 """
 
 from __future__ import annotations
@@ -108,8 +109,11 @@ def _is_bundle(path: Path) -> bool:
 
 
 def _iter_bundles(root: Path) -> list[Path]:
-    """Return bundle directories under root (root itself, children, or rank-*
-    children)."""
+    """Return bundle directories under root.
+
+    A capture directory has complete bundles as children, or cohort directories
+    whose rank-* children are complete bundles.
+    """
     if _is_bundle(root):
         return [root]
     if not root.is_dir():
@@ -121,68 +125,110 @@ def _iter_bundles(root: Path) -> list[Path]:
         if _is_bundle(child):
             found.append(child)
             continue
-        if child.name.startswith("rank-"):
-            found.extend(path for path in sorted(child.iterdir()) if path.is_dir() and _is_bundle(path))
+        found.extend(
+            grandchild
+            for grandchild in sorted(child.iterdir())
+            if grandchild.is_dir() and grandchild.name.startswith("rank-") and _is_bundle(grandchild)
+        )
     return found
+
+
+def _cohort_complete(cohort_dir: Path) -> bool:
+    return (cohort_dir / "COMPLETE").is_file()
+
+
+def _cohort_expected_ranks(cohort_dir: Path) -> list[int] | None:
+    for path in sorted(cohort_dir.iterdir()):
+        if not path.name.startswith("COMPLETE.") or not path.is_file():
+            continue
+        shard = json.loads(path.read_text(encoding="utf-8"))
+        recorded = shard.get("expected_ranks")
+        if isinstance(recorded, list) and len(recorded) > 1:
+            return [int(rank) for rank in recorded]
+    return None
+
+
+def _select_matching_bundle(hits: list[Path], selector: str) -> Path:
+    """Pick one hit; multi-rank rank-* siblings require the cohort COMPLETE."""
+    parents = {path.parent for path in hits}
+    rank_local = all(path.name.startswith("rank-") for path in hits)
+    if rank_local and len(parents) == 1:
+        parent = next(iter(parents))
+        needs_complete = len(hits) > 1 or _cohort_expected_ranks(parent) is not None
+        if needs_complete and not _cohort_complete(parent):
+            raise ValueError(f"cohort {parent} is incomplete (missing COMPLETE) for {selector}")
+        return sorted(hits, key=lambda path: path.name)[0]
+    if len(hits) == 1:
+        return hits[0]
+    names = ", ".join(path.name for path in hits)
+    raise ValueError(f"multiple bundles match {selector}: {names}")
 
 
 def _load_index(bundle_path: Path):
     return index_from_dict(json.loads((bundle_path / "index.json").read_text(encoding="utf-8")))
 
 
-def _identity_matches_step(index, rollout_id: int, step_id: int) -> str | None:
-    """Return step, rollout, or None for how index matches the requested actor
-    step."""
+def _identity_matches_step(index, rollout_id: int, step_id: int) -> bool:
+    """True when index is the requested actor step (exact actor_step_id)."""
     actual = index.identity.actor_step_id
-    if actual is not None:
-        return "step" if (actual.rollout_id, actual.step_id) == (rollout_id, step_id) else None
-    if index.identity.rollout_id == rollout_id:
-        return "rollout"
-    return None
+    return actual is not None and (actual.rollout_id, actual.step_id) == (rollout_id, step_id)
 
 
-def _resolve_bundle(bundle_path: Path, step: str | None) -> Path:
+def _identity_matches_rollout(index, rollout_id: int) -> bool:
+    """True when index is a rollout-level bundle for rollout_id."""
+    return index.identity.actor_step_id is None and index.identity.rollout_id == rollout_id
+
+
+def _resolve_bundle(bundle_path: Path, step: str | None, rollout: int | None) -> Path:
     """Resolve a bundle path or a capture directory to one bundle."""
     if _is_bundle(bundle_path):
         return bundle_path
     bundles = _iter_bundles(bundle_path)
     if not bundles:
         raise FileNotFoundError(f"{bundle_path} is not a replay bundle (missing index.json / manifest.json)")
-    if step is None:
+    if step is None and rollout is None:
         if len(bundles) == 1:
             return bundles[0]
         raise ValueError(
-            f"{bundle_path} contains {len(bundles)} bundles; pass a specific bundle or --step ROLLOUT_ID:STEP_ID"
+            f"{bundle_path} contains {len(bundles)} bundles; pass a specific bundle, "
+            "--step ROLLOUT_ID:STEP_ID, or --rollout ROLLOUT_ID"
         )
-    parsed = _parse_step(step)
-    if parsed is None:
-        raise ValueError(f"invalid --step {step!r} (expected ROLLOUT_ID:STEP_ID)")
-    rollout_id, step_id = parsed
-    step_hits: list[Path] = []
-    rollout_hits: list[Path] = []
-    for path in bundles:
-        kind = _identity_matches_step(_load_index(path), rollout_id, step_id)
-        if kind == "step":
-            step_hits.append(path)
-        elif kind == "rollout":
-            rollout_hits.append(path)
-    hits = step_hits or rollout_hits
-    if len(hits) == 1:
-        return hits[0]
-    if len(hits) > 1:
-        names = ", ".join(path.name for path in hits)
-        raise ValueError(f"multiple bundles match actor step {rollout_id}:{step_id}: {names}")
-    raise ValueError(f"no bundle in {bundle_path} matches actor step {rollout_id}:{step_id}")
+    if step is not None and rollout is not None:
+        raise ValueError("--step and --rollout are mutually exclusive")
+    hits: list[Path] = []
+    if step is not None:
+        parsed = _parse_step(step)
+        if parsed is None:
+            raise ValueError(f"invalid --step {step!r} (expected ROLLOUT_ID:STEP_ID)")
+        rollout_id, step_id = parsed
+        hits = [path for path in bundles if _identity_matches_step(_load_index(path), rollout_id, step_id)]
+        selector = f"actor step {rollout_id}:{step_id}"
+    else:
+        assert rollout is not None
+        hits = [path for path in bundles if _identity_matches_rollout(_load_index(path), rollout)]
+        selector = f"rollout {rollout}"
+    if not hits:
+        raise ValueError(f"no bundle in {bundle_path} matches {selector}")
+    return _select_matching_bundle(hits, selector)
 
 
 def _replay(
-    bundle_path: Path, stages: str, sample: list[str], group: list[str], batch: list[str], step: str | None
+    bundle_path: Path,
+    stages: str,
+    sample: list[str],
+    group: list[str],
+    batch: list[str],
+    step: str | None,
+    rollout: int | None,
 ) -> int:
+    if step is not None and rollout is not None:
+        logger.error("--step and --rollout are mutually exclusive")
+        return 1
     if step is not None and _parse_step(step) is None:
         logger.error("invalid --step %r (expected ROLLOUT_ID:STEP_ID)", step)
         return 1
     try:
-        bundle_path = _resolve_bundle(bundle_path, step)
+        bundle_path = _resolve_bundle(bundle_path, step, rollout)
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
         logger.error("%s", exc)
         return 1
@@ -190,19 +236,34 @@ def _replay(
         parsed = _parse_step(step)
         assert parsed is not None
         rollout_id, step_id = parsed
-        if _identity_matches_step(_load_index(bundle_path), rollout_id, step_id) is None:
+        if not _identity_matches_step(_load_index(bundle_path), rollout_id, step_id):
             logger.error("bundle is not the requested actor step %d:%d", rollout_id, step_id)
+            return 1
+    if rollout is not None and not _identity_matches_rollout(_load_index(bundle_path), rollout):
+        logger.error("bundle is not the requested rollout %d", rollout)
+        return 1
+
+    requested_stages: frozenset[str] | None = None
+    if stages != "all":
+        requested_stages = frozenset(part.strip() for part in stages.split(",") if part.strip())
+        if not requested_stages:
+            logger.error("empty --stage filter")
             return 1
 
     try:
-        report = run_replay(bundle_path, sample_ids=sample or None, group_ids=group or None, batch_ids=batch or None)
+        report = run_replay(
+            bundle_path,
+            sample_ids=sample or None,
+            group_ids=group or None,
+            batch_ids=batch or None,
+            requested_stages=requested_stages,
+        )
     except Exception as exc:  # noqa: BLE001 — surface any replay failure to the user
         logger.error("replay failed: %s", exc)
         return 1
 
-    if stages != "all":
-        selected = set(stages.split(","))
-        report.stages = [stage for stage in report.stages if stage.stage in selected]
+    if requested_stages is not None:
+        report.stages = [stage for stage in report.stages if stage.stage in requested_stages]
 
     for line in _format_report(report).splitlines():
         logger.info("%s", line)
@@ -227,7 +288,13 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser.add_argument("--batch", action="append", default=[], help="micro-batch id to replay (repeatable)")
     replay_parser.add_argument(
         "--step",
-        help="select actor step ROLLOUT_ID:STEP_ID (assert on a bundle; pick from a capture directory)",
+        help="select actor step ROLLOUT_ID:STEP_ID by exact actor_step_id",
+    )
+    replay_parser.add_argument(
+        "--rollout",
+        type=int,
+        default=None,
+        help="select a rollout-level bundle by rollout_id",
     )
 
     return parser
@@ -240,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate":
         return _validate(args.bundle)
     if args.command == "replay":
-        return _replay(args.bundle, args.stage, args.sample, args.group, args.batch, args.step)
+        return _replay(args.bundle, args.stage, args.sample, args.group, args.batch, args.step, args.rollout)
     return 1
 
 

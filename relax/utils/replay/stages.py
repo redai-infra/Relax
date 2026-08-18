@@ -66,6 +66,11 @@ def get_adapter(stage: StageId) -> StageAdapter:
         raise ValueError(f"No replay adapter registered for stage {stage.value!r}") from exc
 
 
+def topology_supported(*, advantage_estimator: str, context_parallel: int = 1) -> bool:
+    """True when the frozen V1 matrix can recompute this bundle's topology."""
+    return advantage_estimator == "grpo" and context_parallel == 1
+
+
 def capability_for(stage: StageId, *, advantage_estimator: str, context_parallel: int = 1) -> StageCapability:
     """Resolve the V1 capability for stage under a given topology.
 
@@ -73,6 +78,6 @@ def capability_for(stage: StageId, *, advantage_estimator: str, context_parallel
     SAPO/CISPO and any CP>1 topology — is explicitly unsupported so a caller
     can never silently claim a recompute it has not proven.
     """
-    if advantage_estimator != "grpo" or context_parallel != 1:
+    if not topology_supported(advantage_estimator=advantage_estimator, context_parallel=context_parallel):
         return StageCapability.UNSUPPORTED
     return V1_STAGE_CAPABILITIES.get(stage, StageCapability.UNSUPPORTED)

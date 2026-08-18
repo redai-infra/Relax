@@ -50,6 +50,44 @@ def build_identity(rollout_id: int, step_id: int | None = None) -> Identity:
     return Identity(actor_step_id=ActorStepId(rollout_id=int(rollout_id), step_id=int(step_id)), rank=rank)
 
 
+def capture_producer_ranks() -> list[int]:
+    """Global ranks on the last pipeline stage (they own post-forward payloads).
+
+    Init-time all-gather; not on the training hot path. Independent of rank order.
+    """
+    import torch.distributed as dist
+    from megatron.core import mpu
+
+    from relax.utils.distributed_utils import get_gloo_group
+
+    flag = bool(mpu.is_pipeline_last_stage(ignore_virtual=True))
+    world = dist.get_world_size()
+    # Last-PP flags are CPU metadata. NCCL all_gather_object copies onto CUDA
+    # and fails after offload_train (cudaErrorInvalidValue).
+    if world == 1:
+        return [0] if flag else []
+    gathered: list[object] = [None] * world
+    dist.all_gather_object(gathered, flag, group=get_gloo_group())
+    return [index for index, item in enumerate(gathered) if item]
+
+
+def maybe_enable_for_actor() -> capture.CaptureManager | None:
+    """Enable capture on last-PP producer ranks only.
+
+    Every actor rank must call this when capture env vars are set (all-gather is
+    collective). Non-producers return without starting a writer thread.
+    """
+    if capture.config_from_env() is None:
+        return None
+    import torch.distributed as dist
+
+    expected = capture_producer_ranks()
+    rank = dist.get_rank()
+    if rank not in expected:
+        return None
+    return capture.maybe_enable_from_env(rank=rank, expected_ranks=expected)
+
+
 def begin_step_for(args: Any, rollout_id: int, step_id: int, bundle_id: str | None = None) -> None:
     """Open a per-step accumulator from train_one_step."""
     actor_step_id = (int(rollout_id), int(step_id))
@@ -97,6 +135,15 @@ def _detach_1d(value: Any, dtype: torch.dtype) -> torch.Tensor:
     return torch.tensor(list(value), dtype=dtype)
 
 
+def _group_indices_from_rollout(rollout_data: Any, args: Any) -> Any:
+    """Prefer TransferQueue ``group_index``; else consecutive GRPO groups."""
+    if "group_index" in rollout_data:
+        return rollout_data["group_index"]
+    n_samples = len(rollout_data["response_lengths"])
+    n = int(getattr(args, "n_samples_per_prompt", 1) or 1)
+    return [index // n for index in range(n_samples)]
+
+
 def capture_rollout_advantage(*, rollout_data: Any, args: Any) -> None:
     """Record the reward → advantage chain from train_actor."""
     step = capture.current_step()
@@ -124,7 +171,7 @@ def capture_rollout_advantage(*, rollout_data: Any, args: Any) -> None:
     step.total_lengths = [int(length) for length in rollout_data["total_lengths"]]
     if rollout_data.get("loss_masks"):
         step.loss_masks_tensor = _cat(list(rollout_data["loss_masks"]))
-    step.group_indices_tensor = _detach_1d(rollout_data["group_index"], torch.long)
+    step.group_indices_tensor = _detach_1d(_group_indices_from_rollout(rollout_data, args), torch.long)
     step.raw_rewards_tensor = _detach_1d(rollout_data["raw_reward"], torch.float32)
     step.rewards_tensor = _detach_1d(rollout_data["rewards"], torch.float32)
 

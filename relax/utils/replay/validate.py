@@ -105,6 +105,9 @@ def _validate_capabilities(bundle: LoadedBundle, result: ValidationResult) -> No
             result.add_warning(f"stage {stage.value!r} is unsupported in this bundle")
     if config.advantage_estimator != "grpo":
         result.add_error(f"unsupported advantage_estimator {config.advantage_estimator!r} (V1 supports GRPO only)")
+    context_parallel = bundle.index.identity.rank.get("cp", 1)
+    if context_parallel != 1:
+        result.add_error(f"unsupported context parallel cp={context_parallel} (V1 supports CP=1 only)")
 
 
 def _validate_numerics(bundle: LoadedBundle, result: ValidationResult) -> None:

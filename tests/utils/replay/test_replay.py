@@ -18,6 +18,7 @@ from tests.utils.replay.helpers import (
     DEFAULT_LOSS,
     NORMALIZED_REWARDS,
     build_grpo_bundle,
+    resign_metadata_checksums,
 )
 
 
@@ -88,6 +89,60 @@ def test_corrupt_schema_field_detected(tmp_path):
     index = json.loads(index_path.read_text(encoding="utf-8"))
     del index["samples"][0]["loss_mask"]
     index_path.write_text(json.dumps(index), encoding="utf-8")
+    resign_metadata_checksums(bundle)
 
     result = validate_bundle(bundle)
     assert not result.valid
+
+
+def test_replay_unsupported_estimator_fails(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    index_path = bundle / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["config"]["advantage_estimator"] = "ppo"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    resign_metadata_checksums(bundle)
+
+    with pytest.raises(ValueError, match="unsupported replay topology"):
+        replay(bundle)
+
+
+def test_replay_unsupported_cp_fails(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    index_path = bundle / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["identity"]["rank"]["cp"] = 2
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    resign_metadata_checksums(bundle)
+
+    with pytest.raises(ValueError, match="unsupported replay topology"):
+        replay(bundle)
+
+
+def test_replay_missing_expected_fails(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    expected_path = bundle / "expected.json"
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    del expected["reward.post_process"]
+    expected_path.write_text(json.dumps(expected), encoding="utf-8")
+    resign_metadata_checksums(bundle)
+
+    report = replay(bundle)
+    assert report.passed is False
+    assert report.first_divergent_stage == "reward.post_process"
+
+
+def test_replay_loss_value_skipped_on_grpo(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    report = replay(bundle)
+    loss_value = next(stage for stage in report.stages if stage.stage == "loss.value")
+    assert loss_value.status == StageStatus.SKIPPED
+    assert report.passed is True
+
+
+def test_replay_requested_unsupported_stage_fails(tmp_path):
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
+    report = replay(bundle, requested_stages=frozenset({"loss.value"}))
+    loss_value = next(stage for stage in report.stages if stage.stage == "loss.value")
+    assert loss_value.status == StageStatus.FAIL
+    assert report.passed is False
