@@ -1207,21 +1207,21 @@ def _steady_metric_value(analysis: RunAnalysis, tag: str) -> float:
     return float(value)
 
 
-def _steady_workload_by_step(
+def _steady_input_workload(
     analysis: RunAnalysis,
     steady_steps: set[int],
-) -> dict[int, tuple[Any, ...]]:
-    return {
-        int(row["rollout_id"]): (
+) -> list[tuple[Any, ...]]:
+    # Prompt/image identity is the controlled workload. Generated response
+    # lengths and packed tensor bytes remain observable outputs and are
+    # reported per run, but can vary with sampling and dynamic microbatching.
+    return sorted(
+        (
             row["producer_global_indexes_fingerprint"],
             int(row["actor_fetch_samples"]),
-            int(row["actor_total_tokens"]),
-            int(row["actor_response_tokens"]),
-            int(row["actor_multimodal_tensor_bytes"]),
         )
         for row in analysis.trace_rows
         if int(row["rollout_id"]) in steady_steps
-    }
+    )
 
 
 def _steady_pair_summary(
@@ -1247,8 +1247,8 @@ def _steady_pair_summary(
     for seed, conditions in sorted(by_seed.items(), key=lambda item: str(item[0])):
         reference_run = conditions[reference]
         candidate_run = conditions[candidate]
-        reference_workload = _steady_workload_by_step(reference_run, steady_steps)
-        candidate_workload = _steady_workload_by_step(candidate_run, steady_steps)
+        reference_workload = _steady_input_workload(reference_run, steady_steps)
+        candidate_workload = _steady_input_workload(candidate_run, steady_steps)
         if reference_workload != candidate_workload:
             _fail(
                 f"seed {seed} steady workload differs for {candidate} versus {reference}: "
@@ -1398,6 +1398,23 @@ def _build_steady_campaign(
                     "measured_optimizer_step_count": len(steady_steps),
                     "perf/step_token_per_s": _steady_metric_value(analysis, "perf/step_token_per_s"),
                     "perf/wall_clock_samples_per_s": _steady_metric_value(analysis, "perf/wall_clock_samples_per_s"),
+                    "windows": [
+                        {
+                            "start": start,
+                            "end": end,
+                            "perf/step_token_per_s": _aggregate_throughput(
+                                analysis.scalar_rows,
+                                "perf/step_token_per_s",
+                                ((start, end),),
+                            ),
+                            "perf/wall_clock_samples_per_s": _aggregate_samples_per_second(
+                                analysis.scalar_rows,
+                                ((start, end),),
+                                expected_samples,
+                            ),
+                        }
+                        for start, end in windows
+                    ],
                     "perf/step_time": analysis.summary["metrics"]["perf/step_time"],
                     "rollout/raw_reward": analysis.summary["metrics"]["rollout/raw_reward"],
                     "rollout/image_count/mean": analysis.summary["metrics"]["rollout/image_count/mean"],
@@ -1419,6 +1436,19 @@ def _build_steady_campaign(
             "perf/wall_clock_samples_per_s": _distribution_summary(
                 row["perf/wall_clock_samples_per_s"] for row in run_summaries
             ),
+            "windows": [
+                {
+                    "start": start,
+                    "end": end,
+                    "perf/step_token_per_s": _distribution_summary(
+                        row["windows"][index]["perf/step_token_per_s"] for row in run_summaries
+                    ),
+                    "perf/wall_clock_samples_per_s": _distribution_summary(
+                        row["windows"][index]["perf/wall_clock_samples_per_s"] for row in run_summaries
+                    ),
+                }
+                for index, (start, end) in enumerate(windows)
+            ],
         }
 
     comparisons = {}

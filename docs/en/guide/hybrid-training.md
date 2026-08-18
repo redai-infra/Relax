@@ -394,11 +394,15 @@ settings, physical-to-container GPU mapping, checkpoint mode, and debug
 capture/replay settings. Missing workload fields or any mismatch fail closed.
 The hostname and a SHA-256 fingerprint over GPU UUID, model, PCI address, and
 driver version must also match across the comparison.
-Paired global-index fingerprints must match exactly. When deterministic SGLang
-inference is enabled, total, response, and multimodal-byte workloads must also
-match exactly rather than within a tolerance. The comparison JSON reports the
-mean, median, range, population standard deviation, and coefficient of
-variation across paired repeats.
+Paired global-index fingerprints must match exactly. For the steady-state
+campaign, the ordered schedule may differ under asynchronous chunk forwarding,
+so the analyzer compares the full warmup-excluded input fingerprint/sample
+multiset. Generated response lengths and packed multimodal-byte totals remain
+reported per run and are included in the token-throughput denominator; they are
+outputs of sampling and dynamic microbatching rather than fixed prompt/image
+inputs. The first-step comparison retains its stricter exact token and byte
+workload guard. The comparison JSON reports the mean, median, range, population
+standard deviation, and coefficient of variation across paired repeats.
 The staleness curve is the trace-derived producer lead at the first actor
 forward: the largest completed producer rollout ID minus the actor rollout ID
 at that timestamp. The current rollout is considered ready once its actor fetch

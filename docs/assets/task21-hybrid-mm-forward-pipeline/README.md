@@ -1,4 +1,28 @@
-# Task 21: Hybrid-async multimodal pipeline - fresh-process first-step GPU results
+# Task 21: Hybrid-async multimodal pipeline benchmark results
+
+## Steady-state result
+
+The formal steady-state campaign completed on commit `e2be8cd158609cc2dfae72b7ba92df72cacb3091` using physical GPUs `0,1,2,6,7`: actor TP2 x CP2 x DP1 on four GPUs and one rollout engine on one GPU. Each B/P/P+R/P+S condition used two paired seeds (`20260816`, `20260817`), 40 optimizer updates, 10 warmup updates, and measured windows `10-19`, `20-29`, and `30-39`.
+
+| Condition | Steady token throughput (mean, range) | Samples/s (mean) | Geomean vs reference |
+|---|---:|---:|---:|
+| B | 1,209.50 (1,144.11-1,274.89) token/s | 1.562 | reference |
+| P | 1,197.49 (1,184.17-1,210.81) token/s | 1.516 | -0.85% token/s vs B |
+| P+R | 1,565.68 (1,559.71-1,571.65) token/s | 1.988 | **+29.64% token/s vs B**; +30.75% vs P |
+| P+S | 1,188.79 (1,142.59-1,234.99) token/s | 1.498 | -1.64% token/s vs B |
+
+P+R is positive in both paired seeds (`+36.33%`, `+23.28%` token/s vs B), with a 21.50% geometric-mean step-time reduction. The ProcessorPool-only and chunk-overlap paths do not show a sustained throughput gain in this campaign; their values remain reported as attributable ablations rather than being combined into the P+R claim.
+
+The three warmup-excluded window means (token/s) were:
+
+| Condition | 10-19 | 20-29 | 30-39 |
+|---|---:|---:|---:|
+| B | 1,221.46 | 1,188.81 | 1,219.31 |
+| P | 1,202.85 | 1,204.60 | 1,185.82 |
+| P+R | 1,556.00 | 1,565.52 | 1,575.02 |
+| P+S | 1,198.25 | 1,178.24 | 1,190.35 |
+
+Every formal run conserved 256 actor samples per update and exactly 40 optimizer updates; measured image count was 1 per sample, metrics were finite, and all five selected GPUs have steady NVML samples. The analyzer reports `measurement_scope=steady_state`, `validation=passed`, two independent seeds, and 30 measured optimizer steps per run. The raw campaign artifacts are under `/data01/LWX/relax-task21/campaigns/STEADY40-ALL-IDLE-e2be8cd-20260817-210540-GPU01267/analysis/`.
 
 ## Protocol
 

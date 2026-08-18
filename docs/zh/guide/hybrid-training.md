@@ -370,10 +370,13 @@ context 上限、actor token 预算、actor/rollout 资源拓扑、SGLang 确定
 字段缺失或取值不同都会 fail closed。
 此外还要求 hostname，以及由 GPU UUID、型号、PCI 地址和驱动版本生成的
 SHA-256 硬件指纹完全一致。
-成对 run 的 global-index fingerprint 必须精确一致；启用 SGLang 确定性推理时，
-总 token、response token 与多模态
-tensor 字节数也必须精确一致，不使用容差。comparison JSON 同时报告重复实验
-的均值、中位数、范围、总体标准差和变异系数。
+成对 run 的 global-index fingerprint 必须精确一致。对于稳态 campaign，异步
+chunk forwarding 允许 step 间调度顺序不同，因此 analyzer 比较 warmup 之后完整
+窗口的输入 fingerprint/sample 多重集合。生成的 response 长度和动态
+microbatching 产生的多模态 tensor 字节数仍按 run 报告，并计入 token 吞吐率的
+分子；它们是采样与动态打包的输出，不是固定 prompt/image 输入。first-step
+comparison 仍保留严格的 token 与字节工作量精确匹配护栏。comparison JSON 同时
+报告重复实验的均值、中位数、范围、总体标准差和变异系数。
 staleness 曲线来自 trace：在 actor 首次 forward 时，用已完成 put 的最大
 producer rollout ID 减去当前 actor rollout ID；若 producer 的 trace 写入稍晚，
 已完成的 actor fetch 本身可证明当前 rollout 已 ready。该值不得超过 manifest

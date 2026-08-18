@@ -879,6 +879,37 @@ def test_four_condition_steady_campaign_reports_attributable_throughput():
     assert campaign["comparisons"]["P+S_vs_B"]["paired_runs"][0]["rollout/image_count/mean:delta"] == 0
     assert campaign["conditions"]["B"]["runs"][0]["optimizer_update_count"] == 40
     assert campaign["conditions"]["B"]["runs"][0]["steady_actor_fetch_samples"] == 30 * 256
+    assert campaign["conditions"]["B"]["windows"][0]["perf/step_token_per_s"]["mean"] == pytest.approx(101.0)
+    assert campaign["conditions"]["B"]["runs"][0]["windows"][0] == {
+        "start": 10,
+        "end": 19,
+        "perf/step_token_per_s": pytest.approx(100.0),
+        "perf/wall_clock_samples_per_s": pytest.approx(12.8),
+    }
+
+
+def test_steady_input_workload_ignores_schedule_and_generated_output_variation():
+    reference = _steady_campaign_analysis("B", 1, 100.0)
+    candidate = _steady_campaign_analysis("P+S", 1, 112.0)
+    fingerprints = [f"{index:032x}" for index in range(3)]
+
+    for index, row in enumerate(reference.trace_rows):
+        row["producer_global_indexes_fingerprint"] = fingerprints[index % 3]
+    for index, row in enumerate(candidate.trace_rows):
+        row["producer_global_indexes_fingerprint"] = fingerprints[(-index) % 3]
+        row["actor_total_tokens"] += index
+        row["actor_response_tokens"] += index
+        row["actor_multimodal_tensor_bytes"] += index
+
+    steady_steps = set(range(10, 40))
+    assert analyzer._steady_input_workload(reference, steady_steps) == analyzer._steady_input_workload(
+        candidate, steady_steps
+    )
+
+    candidate.trace_rows[10]["producer_global_indexes_fingerprint"] = "f" * 32
+    assert analyzer._steady_input_workload(reference, steady_steps) != analyzer._steady_input_workload(
+        candidate, steady_steps
+    )
 
 
 def test_four_condition_steady_campaign_fails_closed_on_protocol_gaps():
