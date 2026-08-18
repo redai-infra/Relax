@@ -134,4 +134,4 @@ def test_launcher_is_frozen_to_four_bf16_step_scope_cells() -> None:
 
 
 def test_retry_verdict_is_pinned_to_the_batch6_loop_commit() -> None:
-    assert analysis.COMMIT_UNDER_TEST == "347b9ef69b54b761247069f4e486b097c7ea93a1"
+    assert analysis.COMMIT_UNDER_TEST == "e7f6e4c92f40ed6b6d3a1375f7a868a83c5080fa"
