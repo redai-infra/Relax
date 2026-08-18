@@ -284,6 +284,34 @@ def test_preflight_rejects_zero_gpu_for_an_active_model_role(megatron_backend):
         validate_preflight_args(args)
 
 
+def test_preflight_rejects_zero_gpu_for_managed_teacher(megatron_backend):
+    from relax.utils.arguments import validate_preflight_args
+
+    args = Namespace(
+        loss_type="rl",
+        advantage_estimator="grpo",
+        debug_rollout_only=False,
+        debug_train_only=False,
+        hybrid=False,
+        fully_async=False,
+        true_on_policy_mode=False,
+        genrm_model_path=None,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="/models/teacher",
+        opd_teacher_routes=None,
+        resource={"actor": [1, 1], "rollout": [1, 1], "teacher": [1, 0]},
+        prompt_data=None,
+        eval_prompt_data=None,
+        eval_datasets=[],
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_preflight_args(args)
+    assert "teacher" in str(exc_info.value)
+    assert "num_gpus > 0" in str(exc_info.value)
+
+
 def test_redacts_success_and_error_output():
     argv = [
         "--wandb-key",
