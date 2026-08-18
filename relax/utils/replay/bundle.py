@@ -88,9 +88,7 @@ def _identity_anchor(identity: Identity) -> dict[str, Any]:
     """COMPLETE.<rank> identity fields that must match index.identity."""
     step = identity.actor_step_id
     return {
-        "actor_step_id": (
-            {"rollout_id": step.rollout_id, "step_id": step.step_id} if step is not None else None
-        ),
+        "actor_step_id": ({"rollout_id": step.rollout_id, "step_id": step.step_id} if step is not None else None),
         "rollout_id": identity.rollout_id,
     }
 

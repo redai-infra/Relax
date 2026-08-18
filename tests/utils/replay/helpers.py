@@ -262,7 +262,9 @@ def resign_metadata_checksums(bundle: Path) -> None:
     complete_path = bundle / "COMPLETE"
     complete = json.loads(complete_path.read_text(encoding="utf-8"))
     complete["metadata"] = checksums
-    complete_path.write_text(json.dumps(complete, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    complete_path.write_text(
+        json.dumps(complete, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     for shard in sorted(bundle.glob("COMPLETE.*")):
         data = json.loads(shard.read_text(encoding="utf-8"))
         data["metadata"] = checksums

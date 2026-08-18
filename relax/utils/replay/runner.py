@@ -46,9 +46,7 @@ def _skip_or_fail(
     fail_if_requested: bool,
 ) -> None:
     """Skip a non-recompute stage, or fail when the caller asked for it."""
-    status = (
-        StageStatus.FAIL if fail_if_requested and _requested(stage, requested_stages) else StageStatus.SKIPPED
-    )
+    status = StageStatus.FAIL if fail_if_requested and _requested(stage, requested_stages) else StageStatus.SKIPPED
     report.add(StageResult(stage=stage.value, status=status, message=message))
 
 
