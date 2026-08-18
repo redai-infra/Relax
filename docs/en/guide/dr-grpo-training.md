@@ -30,8 +30,8 @@ where:
 
 This fixed budget prevents short responses from receiving a larger per-token weight only because they contain fewer response tokens.
 
-::: warning Optional advantage normalization
-`--normalize-advantages` is honored when explicitly enabled. It applies an additional masked whitening step after group reward centering and therefore changes the original Dr.GRPO advantage semantics. The option is disabled by default.
+::: warning Advantage normalization is rejected
+`--normalize-advantages` is rejected for Dr.GRPO. Removing the advantage variance normalization is the core of Dr.GRPO, and the flag re-applies a global whitening step that contradicts it. Startup fails with a validation error if the flag is set.
 :::
 
 ## Relax Implementation
@@ -112,7 +112,7 @@ Adjust the GPU counts, model configuration, data paths, and token budget for you
 | `--n-samples-per-prompt` | `1` | Number of responses in each reward-centering group |
 | `--global-batch-size` | `None` | Number of responses in one optimizer step for the usual fixed-size schedule |
 | `--calculate-per-token-loss` | off | Automatically enabled for Dr.GRPO; required by Megatron when CP is enabled |
-| `--normalize-advantages` | off | Optionally apply masked advantage whitening after group centering |
+| `--normalize-advantages` | off | Rejected because Dr.GRPO removes advantage variance normalization by design |
 | `--disable-rewards-normalization` | off | Rejected because group centering is mandatory for Dr.GRPO |
 | `--kl-coef` | `0.0` | Must remain zero; Dr.GRPO does not add reward-side KL |
 | `--use-kl-loss` | off | Add an explicit KL loss term |
@@ -125,7 +125,7 @@ Use `--use-kl-loss` with a positive `--kl-loss-coef` when an explicit KL penalty
 
 1. Set `--rollout-max-response-len` explicitly and keep it equal to the response budget used by Rollout. It is part of the Dr.GRPO objective, not only a memory limit.
 2. Compare reward, evaluation accuracy, and response length when comparing GRPO and Dr.GRPO. Their Actor loss and gradient norm magnitudes use different denominators and are not directly comparable.
-3. Keep `--normalize-advantages` disabled when reproducing the paper's reward semantics. Enable it only as an intentional experiment.
+3. Keep `--normalize-advantages` unset. Dr.GRPO rejects it, so use the standard GRPO estimator if you want whitened advantages.
 4. A custom reward post-processor overrides the default group centering. It must provide the intended Dr.GRPO advantages.
 5. When using `--custom-pg-loss-reducer-function-path`, ensure the custom reducer preserves the token-sum numerator expected by the final fixed-budget scale.
 

@@ -45,6 +45,7 @@ def _args(**overrides) -> SimpleNamespace:
         hybrid=False,
         rewards_normalization=True,
         kl_coef=0.0,
+        normalize_advantages=False,
         calculate_per_token_loss=False,
     )
     defaults.update(overrides)
@@ -74,6 +75,7 @@ def test_dr_grpo_validates_async_execution_mode(arguments_module, hybrid, should
     [
         ({"rewards_normalization": False}, "disable-rewards-normalization"),
         ({"kl_coef": 0.01}, "does not apply reward-side KL"),
+        ({"normalize_advantages": True}, "--normalize-advantages"),
     ],
 )
 def test_dr_grpo_rejects_incompatible_semantics(arguments_module, overrides, error):

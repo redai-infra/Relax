@@ -30,8 +30,8 @@ $$
 
 该固定预算避免仅仅因为 response 较短，就给其中每个 token 更大的权重。
 
-::: warning 可选 advantage normalization
-显式设置 `--normalize-advantages` 时，Dr.GRPO 会照常执行该配置。它会在组内 reward 中心化后额外进行 masked whitening，因此会改变原始 Dr.GRPO 的 advantage 语义。该选项默认关闭。
+::: warning 拒绝 advantage normalization
+Dr.GRPO 会拒绝 `--normalize-advantages`。去掉 advantage 的方差归一化正是 Dr.GRPO 的核心，而该选项会重新叠加一层全局 whitening，与之矛盾。设置该选项会在启动阶段报校验错误。
 :::
 
 ## Relax 实现
@@ -112,7 +112,7 @@ PERF_ARGS=(
 | `--n-samples-per-prompt` | `1` | 每个 reward centering group 中的 response 数 |
 | `--global-batch-size` | `None` | 常规固定 batch schedule 下，每个 optimizer step 的 response 数 |
 | `--calculate-per-token-loss` | 关闭 | Dr.GRPO 会自动启用；Megatron 在 CP 场景下也强制要求 |
-| `--normalize-advantages` | 关闭 | 在组内中心化后可选执行 masked advantage whitening |
+| `--normalize-advantages` | 关闭 | 会被拒绝，因为 Dr.GRPO 在设计上去掉了 advantage 方差归一化 |
 | `--disable-rewards-normalization` | 关闭 | 会被拒绝，因为 Dr.GRPO 必须执行组内中心化 |
 | `--kl-coef` | `0.0` | 必须保持为零；Dr.GRPO 不添加 reward-side KL |
 | `--use-kl-loss` | 关闭 | 添加 explicit KL loss 项 |
@@ -125,7 +125,7 @@ PERF_ARGS=(
 
 1. 显式设置 `--rollout-max-response-len`，并保证它与 Rollout 使用的 response budget 一致。它是 Dr.GRPO objective 的组成部分，不只是显存限制。
 2. 对比 GRPO 与 Dr.GRPO 时，应观察 reward、evaluation accuracy 和 response length。两种算法的 Actor loss 与 gradient norm 使用不同分母，不能直接比较绝对值。
-3. 复现论文 reward 语义时保持关闭 `--normalize-advantages`；仅在有意进行额外实验时启用。
+3. 不要设置 `--normalize-advantages`。Dr.GRPO 会拒绝该选项；如果需要 whitened advantage，请改用标准 GRPO estimator。
 4. 自定义 reward 后处理会覆盖默认的组内中心化逻辑，因此必须自行提供符合预期的 Dr.GRPO advantage。
 5. 使用 `--custom-pg-loss-reducer-function-path` 时，确保自定义 reducer 保留最终 fixed-budget scale 所期望的 token-sum 分子。
 

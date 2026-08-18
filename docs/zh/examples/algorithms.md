@@ -136,7 +136,7 @@ Relax 通过给组合后的 Actor loss 乘以 $T/(N B)$，再复用 Megatron 对
 |---|---|---|
 | `--advantage-estimator dr_grpo` | — | 启用 Dr.GRPO |
 | `--rollout-max-response-len` | `None` | 固定 response budget `B`，必须设置 |
-| `--normalize-advantages` | 关闭 | 可选的额外 masked whitening；会改变论文默认语义 |
+| `--normalize-advantages` | 关闭 | 会被拒绝；它与 Dr.GRPO 去掉 advantage 方差归一化的设计矛盾 |
 | `--calculate-per-token-loss` | 关闭 | Dr.GRPO 会自动启用，CP 场景下也强制要求 |
 
 ### 快速开始

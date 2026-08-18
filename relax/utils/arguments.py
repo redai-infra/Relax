@@ -2968,6 +2968,12 @@ def _validate_dr_grpo_args(args) -> None:
             "Dr.GRPO does not apply reward-side KL; set --kl-coef 0 and use --use-kl-loss with "
             "--kl-loss-coef for an explicit KL penalty."
         )
+    if getattr(args, "normalize_advantages", False):
+        raise ValueError(
+            "Dr.GRPO removes advantage variance normalization by design; --normalize-advantages "
+            "re-applies a global whitening step that contradicts it. Please remove "
+            "--normalize-advantages from your command."
+        )
 
     args.calculate_per_token_loss = True
     logger.info("Dr.GRPO selected Megatron per-token normalization.")

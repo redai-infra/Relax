@@ -139,7 +139,7 @@ Relax implements the fixed denominator by scaling the combined Actor loss with $
 |---|---|---|
 | `--advantage-estimator dr_grpo` | — | Enable Dr.GRPO |
 | `--rollout-max-response-len` | `None` | Fixed response budget `B`; it must be set |
-| `--normalize-advantages` | off | Optional additional masked whitening; changes the paper's default semantics |
+| `--normalize-advantages` | off | Rejected; it contradicts Dr.GRPO's removal of advantage variance normalization |
 | `--calculate-per-token-loss` | off | Automatically enabled by Dr.GRPO and required for CP |
 
 ### Quick Start
