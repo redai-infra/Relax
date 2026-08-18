@@ -1249,3 +1249,232 @@ def _assert_fully_masked_response_keeps_denominators_aligned(dp_size, dp_rank, c
 def test_dr_grpo_reduction_is_topology_and_micro_batch_invariant(dp_size: int, cp_size: int) -> None:
     world_size = dp_size * cp_size
     mp.spawn(_topology_worker, args=(dp_size, cp_size, _free_port()), nprocs=world_size, join=True)
+
+
+def _train_one_step_spy_worker(rank: int, port: int, window_empty: bool, result_path: str) -> None:
+    """Drive the real ``train_one_step`` and record optimizer/scheduler calls.
+
+    The empty-window guard lives in ``train_one_step``, downstream of the
+    metadata that :func:`prepare_policy_optimizer_window_metadata` attaches to
+    each micro-batch. Asserting on the metadata alone cannot show that the
+    optimizer and the LR scheduler are actually left alone, so this worker runs
+    the production function with spies in place of Megatron's optimizer and
+    ``OptimizerParamScheduler``.
+    """
+    import json
+
+    from relax.backends.megatron import model as model_module
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=1)
+    try:
+        calls: dict[str, int] = {"optimizer_step": 0, "scheduler_step": 0, "zero_grad_buffer": 0}
+
+        class _Optimizer:
+            param_groups = [{"lr": 0.0}]
+
+            def zero_grad(self) -> None:
+                pass
+
+            def step(self):
+                calls["optimizer_step"] += 1
+                return True, torch.tensor(1.5), None
+
+        class _Scheduler:
+            def step(self, increment: int) -> None:
+                calls["scheduler_step"] += 1
+
+        class _ModelChunk:
+            def zero_grad_buffer(self) -> None:
+                calls["zero_grad_buffer"] += 1
+
+            def __call__(self, **_kwargs):
+                return torch.zeros(1)
+
+        batch = {
+            "tokens": torch.zeros(1, dtype=torch.long),
+            "packed_seq_params": None,
+            "full_loss_masks": torch.zeros(1),
+            "__optimizer_window_empty__": torch.tensor(window_empty),
+        }
+        # One logging vector shaped like loss_function's: [num_tokens, *metrics].
+        losses_reduced = [{"keys": ["loss"], "values": torch.tensor([4.0, 8.0])}]
+
+        args = Namespace(
+            advantage_estimator="dr_grpo",
+            calculate_per_token_loss=True,
+            check_for_nan_in_loss_and_grad=True,
+            ci_test=False,
+            custom_megatron_before_train_step_hook_path=None,
+            data_pad_size_multiplier=1,
+            decoder_seq_length=None,
+            dynamic_context_parallel=False,
+            enable_mtp_training=False,
+            fully_async=False,
+            global_batch_size=8,
+            is_vl_model=False,
+            loss_type="policy_loss",
+            micro_batch_size=1,
+            qkv_format="thd",
+            allgather_cp=False,
+            seq_length=8,
+            use_dynamic_batch_size=False,
+            use_opd=False,
+            uses_unsplit_forward=False,
+        )
+
+        def _forward_backward_func(*, forward_step_func, data_iterator, model, **_kwargs):
+            # Run the production forward_step so the empty-window flag reaches
+            # train_one_step the same way it does in training.
+            forward_step_func(data_iterator, model[0])
+            return losses_reduced
+
+        model_module.get_args = lambda: args
+        model_module.get_batch = lambda *_args, **_kwargs: batch
+        model_module.get_forward_backward_func = lambda: _forward_backward_func
+        model_module.mpu.is_pipeline_last_stage = lambda *_a, **_k: True
+        model_module.mpu.get_data_parallel_group = lambda **_k: dist.group.WORLD
+        model_module.mpu.get_virtual_pipeline_model_parallel_world_size = lambda: None
+
+        loss_reduced, grad_norm = model_module.train_one_step(
+            args=args,
+            rollout_id=0,
+            step_id=0,
+            data_iterator=[iter([batch])],
+            model=[_ModelChunk()],
+            optimizer=_Optimizer(),
+            opt_param_scheduler=_Scheduler(),
+            num_microbatches=1,
+        )
+
+        with open(result_path, "w") as handle:
+            json.dump({"calls": calls, "grad_norm": float(grad_norm), "loss": loss_reduced}, handle)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("window_empty", [True, False])
+def test_train_one_step_skips_optimizer_and_scheduler_for_empty_window(tmp_path, window_empty: bool) -> None:
+    import json
+
+    result_path = str(tmp_path / "calls.json")
+    mp.spawn(
+        _train_one_step_spy_worker,
+        args=(_free_port(), window_empty, result_path),
+        nprocs=1,
+        join=True,
+    )
+    with open(result_path) as handle:
+        recorded = json.load(handle)
+
+    if window_empty:
+        assert recorded["calls"]["optimizer_step"] == 0
+        assert recorded["calls"]["scheduler_step"] == 0
+        # A skipped window must report a finite zero, not NaN, or downstream
+        # grad-norm health checks would flag the step as diverged.
+        assert recorded["grad_norm"] == 0.0
+    else:
+        assert recorded["calls"]["optimizer_step"] == 1
+        assert recorded["calls"]["scheduler_step"] == 1
+        assert recorded["grad_norm"] == 1.5
+
+
+def _megatron_finalizer_worker(rank: int, port: int, num_tokens: float, result_path: str) -> None:
+    """Scale a Dr.GRPO window's gradient with the real Megatron finalizer.
+
+    ``FROZEN_DR_GRPO_GRADIENT_TOTAL`` is the gradient accumulated *before*
+    Megatron normalizes it, i.e. the token-loss sum already carrying the
+    ``T / (N * B)`` window scale. The fixed-denominator claim only holds if
+    Megatron's own ``finalize_model_grads`` then divides by the all-reduced
+    ``T``, so this worker calls that production function instead of repeating
+    the division in test code.
+    """
+    import json
+
+    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=1)
+    try:
+        config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
+        config.timers = None
+        config.sequence_parallel = False
+        config.moe_router_enable_expert_bias = False
+
+        class _ModelChunk(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float64))
+                self.weight.grad = torch.tensor([float(FROZEN_DR_GRPO_GRADIENT_TOTAL)], dtype=torch.float64)
+                self.config = config
+                self.scalings: list[float] = []
+
+            def finish_grad_sync(self, force_all_reduce: bool = False) -> None:
+                pass
+
+            def scale_gradients(self, scaling: float) -> None:
+                self.scalings.append(float(scaling))
+                self.weight.grad *= scaling
+
+        pg_collection = ProcessGroupCollection()
+        for name in ("tp", "pp", "dp_cp", "dp", "cp", "mp"):
+            setattr(pg_collection, name, dist.group.WORLD)
+        pg_collection.embd = None
+        pg_collection.pos_embd = None
+
+        chunk = _ModelChunk()
+        finalize_model_grads([chunk], num_tokens=torch.tensor(num_tokens), pg_collection=pg_collection)
+
+        with open(result_path, "w") as handle:
+            json.dump({"scalings": chunk.scalings, "gradient": chunk.weight.grad.tolist()}, handle)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_megatron_finalizer_reaches_dr_grpo_fixed_denominator(tmp_path) -> None:
+    import json
+
+    result_path = str(tmp_path / "finalized.json")
+    mp.spawn(
+        _megatron_finalizer_worker,
+        args=(_free_port(), float(FROZEN_RESPONSE_TOKENS), result_path),
+        nprocs=1,
+        join=True,
+    )
+    with open(result_path) as handle:
+        recorded = json.load(handle)
+
+    # Megatron computes 1/T from the fp32 token counter, so compare on the
+    # relative scale that dtype supports rather than bit-for-bit.
+    assert recorded["scalings"] == pytest.approx([1.0 / FROZEN_RESPONSE_TOKENS], rel=1e-6)
+    # Megatron's 1/T lands on the paper's sum(loss) / (N * B).
+    assert recorded["gradient"][0] == pytest.approx(float(FROZEN_DR_GRPO_LOSS), rel=1e-6)
+
+
+def test_megatron_finalizer_leaves_gradients_alone_for_empty_window(tmp_path) -> None:
+    """A fully masked window reaches the finalizer with ``T == 0``.
+
+    Megatron guards the division itself, so the window must come back unscaled
+    rather than raising or producing inf/NaN. ``train_one_step`` then skips the
+    optimizer, see
+    :func:`test_train_one_step_skips_optimizer_and_scheduler_for_empty_window`.
+    """
+    import json
+
+    result_path = str(tmp_path / "finalized_empty.json")
+    mp.spawn(
+        _megatron_finalizer_worker,
+        args=(_free_port(), 0.0, result_path),
+        nprocs=1,
+        join=True,
+    )
+    with open(result_path) as handle:
+        recorded = json.load(handle)
+
+    assert recorded["scalings"] == []
+    assert recorded["gradient"][0] == pytest.approx(float(FROZEN_DR_GRPO_GRADIENT_TOTAL), abs=1e-12)
+    assert math.isfinite(recorded["gradient"][0])
