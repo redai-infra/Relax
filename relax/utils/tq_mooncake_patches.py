@@ -12,9 +12,9 @@ process-local and idempotent.
 
 These are monkey patches over *private* upstream internals
 (``MooncakeStoreClient.__init__``, ``StorageManager._notify_and_wait``), so
-they are gated on the exact pinned version: any other transfer_queue refuses
-to start rather than running unvalidated patches
-(see :func:`_require_pinned_transfer_queue`).
+they are gated on the exact pinned package version and installed VCS revision:
+any other build refuses to start rather than running unvalidated patches (see
+:func:`_require_pinned_transfer_queue`).
 
 Removal condition: delete this module and its single call site in
 :func:`relax.utils.tq_correctness.ensure_mooncake_correctness_guards` once the
@@ -25,7 +25,11 @@ non-idempotent removal failure, and requires a positive production-status ACK.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from functools import wraps
+from importlib import metadata
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -38,24 +42,75 @@ _PATCH_MARKER = "_relax_mooncake_correctness_guards_v1"
 # Mooncake's idempotent-delete result; the pinned upstream clear path accepts it.
 _MOONCAKE_OBJECT_NOT_FOUND = -704
 
-# Exact pins these patches were written and forensically validated against.
-_PATCHED_TQ_VERSIONS = ("0.1.10.dev0",)
+# Exact builds these patches were written and forensically validated against.
+_PATCHED_TQ_BUILDS = {
+    "0.1.10.dev0": frozenset({"58054a33834aadbcf76aacd6b1e32e25c030f2c9"}),
+}
+
+
+def _installed_transfer_queue_revision(transfer_queue_module: Any) -> str | None:
+    """Read the installed VCS revision from standard PEP 610 metadata."""
+    try:
+        distribution = metadata.distribution("transferqueue")
+        if str(distribution.version) != str(getattr(transfer_queue_module, "__version__", "unknown")):
+            return None
+
+        module_file = getattr(transfer_queue_module, "__file__", None)
+        if not module_file:
+            return None
+        module_path = Path(module_file).resolve()
+        package_root = Path(distribution.locate_file("transfer_queue")).resolve()
+        module_path.relative_to(package_root)
+
+        direct_url = distribution.read_text("direct_url.json")
+    except (metadata.PackageNotFoundError, AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        return None
+    if direct_url is None:
+        return None
+
+    try:
+        provenance = json.loads(direct_url)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(provenance, dict):
+        return None
+
+    vcs_info = provenance.get("vcs_info")
+    if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != "git":
+        return None
+    commit_id = vcs_info.get("commit_id")
+    if not isinstance(commit_id, str) or not commit_id.strip():
+        return None
+    revision = commit_id.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        return None
+    return revision
 
 
 def _require_pinned_transfer_queue() -> None:
-    """Refuse to patch any transfer_queue version the guards were not written
-    for."""
+    """Refuse to patch any TransferQueue source revision not validated here."""
     import transfer_queue
 
     version = str(getattr(transfer_queue, "__version__", "unknown"))
-    if version not in _PATCHED_TQ_VERSIONS:
+    expected_revisions = _PATCHED_TQ_BUILDS.get(version)
+    if expected_revisions is None:
         raise RuntimeError(
             f"transfer_queue {version} is not covered by Relax's Mooncake loss guards "
-            f"(validated pins: {', '.join(_PATCHED_TQ_VERSIONS)}).  These guards replace "
+            f"(validated versions: {', '.join(_PATCHED_TQ_BUILDS)}).  These guards replace "
             "private upstream internals (MooncakeStoreClient.__init__, "
             "StorageManager._notify_and_wait); re-validate them against the new pin and "
-            "extend _PATCHED_TQ_VERSIONS, or delete relax/utils/tq_mooncake_patches.py "
+            "extend _PATCHED_TQ_BUILDS, or delete relax/utils/tq_mooncake_patches.py "
             "entirely if the fixes have landed upstream."
+        )
+
+    revision = _installed_transfer_queue_revision(transfer_queue)
+    if revision not in expected_revisions:
+        actual_revision = revision or "unknown"
+        raise RuntimeError(
+            f"transfer_queue {version} revision {actual_revision} is not covered by Relax's Mooncake loss guards "
+            f"(validated revisions: {', '.join(sorted(expected_revisions))}).  The exact source revision is required "
+            "because these guards replace private upstream internals; install the validated pin or re-validate "
+            "the guards before extending _PATCHED_TQ_BUILDS."
         )
 
 

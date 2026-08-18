@@ -17,6 +17,7 @@ import pytest
 from relax.utils.tq_mooncake_patches import (
     _install_notification_guards,
     _install_store_guards,
+    _installed_transfer_queue_revision,
     _require_pinned_transfer_queue,
     _strict_notify_and_wait,
     _StrictMooncakeStoreProxy,
@@ -97,6 +98,8 @@ class TestVersionGate:
     """Patches refuse to install on any transfer_queue they were not written
     for."""
 
+    _PINNED_REVISION = "58054a33834aadbcf76aacd6b1e32e25c030f2c9"
+
     def test_unpinned_version_is_rejected(self, monkeypatch):
         import transfer_queue
 
@@ -104,11 +107,112 @@ class TestVersionGate:
         with pytest.raises(RuntimeError, match="not covered by Relax"):
             _require_pinned_transfer_queue()
 
-    def test_pinned_version_is_accepted(self, monkeypatch):
+    def test_pinned_version_and_revision_are_accepted(self, monkeypatch):
         import transfer_queue
 
         monkeypatch.setattr(transfer_queue, "__version__", "0.1.10.dev0", raising=False)
+        monkeypatch.setattr(
+            "relax.utils.tq_mooncake_patches._installed_transfer_queue_revision",
+            lambda module: self._PINNED_REVISION,
+        )
         _require_pinned_transfer_queue()
+
+    def test_same_version_with_different_revision_is_rejected(self, monkeypatch):
+        import transfer_queue
+
+        monkeypatch.setattr(transfer_queue, "__version__", "0.1.10.dev0", raising=False)
+        monkeypatch.setattr(
+            "relax.utils.tq_mooncake_patches._installed_transfer_queue_revision",
+            lambda module: "0" * 40,
+        )
+        with pytest.raises(RuntimeError, match="revision .* is not covered"):
+            _require_pinned_transfer_queue()
+
+    def test_missing_revision_metadata_is_rejected(self, monkeypatch):
+        import transfer_queue
+
+        monkeypatch.setattr(transfer_queue, "__version__", "0.1.10.dev0", raising=False)
+        monkeypatch.setattr(
+            "relax.utils.tq_mooncake_patches._installed_transfer_queue_revision",
+            lambda module: None,
+        )
+        with pytest.raises(RuntimeError, match="revision unknown is not covered"):
+            _require_pinned_transfer_queue()
+
+    @pytest.mark.parametrize(
+        ("direct_url", "expected"),
+        [
+            (None, None),
+            ("not-json", None),
+            ("{}", None),
+            ('{"vcs_info": {}}', None),
+            ('{"vcs_info": {"vcs": "hg", "commit_id": "58054a33834aadbcf76aacd6b1e32e25c030f2c9"}}', None),
+            ('{"vcs_info": {"vcs": "git", "commit_id": "abc123"}}', None),
+            (
+                '{"vcs_info": {"vcs": "git", "commit_id": " 58054A33834AADBCF76AACD6B1E32E25C030F2C9 "}}',
+                _PINNED_REVISION,
+            ),
+        ],
+    )
+    def test_revision_metadata_is_parsed_fail_closed(self, monkeypatch, tmp_path, direct_url, expected):
+        package_root = tmp_path / "installed" / "transfer_queue"
+
+        class Distribution:
+            version = "0.1.10.dev0"
+
+            def locate_file(self, filename):
+                assert filename == "transfer_queue"
+                return package_root
+
+            def read_text(self, filename):
+                assert filename == "direct_url.json"
+                return direct_url
+
+        monkeypatch.setattr(
+            "relax.utils.tq_mooncake_patches.metadata.distribution",
+            lambda name: Distribution(),
+        )
+        module = SimpleNamespace(
+            __version__="0.1.10.dev0",
+            __file__=package_root / "__init__.py",
+        )
+        assert _installed_transfer_queue_revision(module) == expected
+
+    def test_distribution_version_mismatch_is_unverifiable(self, monkeypatch, tmp_path):
+        class Distribution:
+            version = "0.1.10.dev1"
+
+        monkeypatch.setattr(
+            "relax.utils.tq_mooncake_patches.metadata.distribution",
+            lambda name: Distribution(),
+        )
+        module = SimpleNamespace(
+            __version__="0.1.10.dev0",
+            __file__=tmp_path / "transfer_queue" / "__init__.py",
+        )
+        assert _installed_transfer_queue_revision(module) is None
+
+    def test_shadowed_module_is_unverifiable(self, monkeypatch, tmp_path):
+        package_root = tmp_path / "installed" / "transfer_queue"
+
+        class Distribution:
+            version = "0.1.10.dev0"
+
+            def locate_file(self, filename):
+                return package_root
+
+            def read_text(self, filename):
+                return '{"vcs_info": {"vcs": "git", "commit_id": "58054a33834aadbcf76aacd6b1e32e25c030f2c9"}}'
+
+        monkeypatch.setattr(
+            "relax.utils.tq_mooncake_patches.metadata.distribution",
+            lambda name: Distribution(),
+        )
+        shadowed_module = SimpleNamespace(
+            __version__="0.1.10.dev0",
+            __file__=tmp_path / "shadow" / "transfer_queue.py",
+        )
+        assert _installed_transfer_queue_revision(shadowed_module) is None
 
 
 class TestMooncakeCorrectnessGuardPrimitives:
