@@ -3060,6 +3060,11 @@ def _validate_resource_config(args) -> None:
                 f"Invalid --resource entry for {role!r}: num_gpus must be >= 0, got {num_gpus}. "
                 "Fix: set the second list value to a non-negative integer."
             )
+        if role in {"advantages", "sft"} and num_gpus != 0:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: this CPU-only role requires num_gpus == 0. "
+                "Fix: set the second list value to 0."
+            )
         if role in {"actor", "rollout", "critic", "genrm"} and num_gpus == 0:
             raise ValueError(
                 f"Invalid --resource entry for {role!r}: this model role requires num_gpus > 0. "
@@ -3103,7 +3108,9 @@ def validate_preflight_args(args) -> None:
     """Run read-only checks that are useful before launching runtime
     services."""
     from relax.engine.sft.bootstrap import validate_sft_resource
+    from relax.utils.training.ppo_utils import validate_ppo_config
 
+    validate_ppo_config(args)
     validate_sft_resource(args)
     if getattr(args, "loss_type", None) != "sft":
         if getattr(args, "debug_rollout_only", False):

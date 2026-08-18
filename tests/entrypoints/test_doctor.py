@@ -98,13 +98,21 @@ def optional_sglang_backend(monkeypatch):
     monkeypatch.setattr(arguments, "_validate_sglang_args", lambda _args: None)
 
 
+@pytest.fixture
+def megatron_backend():
+    """Require the real parser instead of replacing its authoritative
+    config."""
+    if importlib.util.find_spec("megatron") is None:
+        pytest.skip("Megatron is not installed in the minimal CI environment")
+
+
 def _error_cases():
     path = Path(__file__).parent / "fixtures" / "doctor_errors.jsonl"
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.mark.parametrize("case", _error_cases(), ids=lambda case: case["name"])
-def test_error_library_uses_real_doctor(training_argv, case, capsys, optional_sglang_backend):
+def test_error_library_uses_real_doctor(training_argv, case, capsys, optional_sglang_backend, megatron_backend):
     argv = list(training_argv)
     if case.get("remove_prompt"):
         index = argv.index("--prompt-data")
@@ -121,7 +129,9 @@ def test_error_library_uses_real_doctor(training_argv, case, capsys, optional_sg
     assert "Traceback" not in captured.err
 
 
-def test_valid_generalized_dataset_path_returns_success(training_argv, tmp_path, capsys, optional_sglang_backend):
+def test_valid_generalized_dataset_path_returns_success(
+    training_argv, tmp_path, capsys, optional_sglang_backend, megatron_backend
+):
     second_prompt = tmp_path / "prompt-2.jsonl"
     second_prompt.write_text('{"prompt": "2+2", "label": "4"}\n', encoding="utf-8")
     prompt_index = training_argv.index("--prompt-data") + 1
@@ -134,7 +144,7 @@ def test_valid_generalized_dataset_path_returns_success(training_argv, tmp_path,
     assert report["resources"]["total_gpus"] == 1
 
 
-def test_report_uses_registry_roles_and_colocate_resources():
+def test_report_uses_registry_roles_and_colocate_resources(megatron_backend):
     args = Namespace(
         loss_type="rl",
         advantage_estimator="grpo",
@@ -154,7 +164,7 @@ def test_report_uses_registry_roles_and_colocate_resources():
     assert report["resources"]["shares_actor_rollout_gpus"] is True
 
 
-def test_hybrid_resources_are_not_colocated():
+def test_hybrid_resources_are_not_colocated(megatron_backend):
     args = Namespace(
         loss_type="rl",
         advantage_estimator="grpo",
@@ -173,7 +183,7 @@ def test_hybrid_resources_are_not_colocated():
     assert report["resources"]["shares_actor_rollout_gpus"] is False
 
 
-def test_sft_report_does_not_claim_actor_rollout_gpu_sharing():
+def test_sft_report_does_not_claim_actor_rollout_gpu_sharing(megatron_backend):
     args = Namespace(
         loss_type="sft",
         advantage_estimator="grpo",
@@ -194,7 +204,7 @@ def test_sft_report_does_not_claim_actor_rollout_gpu_sharing():
     assert report["resources"]["shares_actor_rollout_gpus"] is False
 
 
-def test_preflight_rejects_zero_gpu_for_an_active_model_role():
+def test_preflight_rejects_zero_gpu_for_an_active_model_role(megatron_backend):
     from relax.utils.arguments import validate_preflight_args
 
     args = Namespace(
@@ -254,7 +264,7 @@ def test_normal_token_and_key_configuration_is_not_redacted():
     assert doctor._redact(config) == config
 
 
-def test_main_does_not_start_runtime(monkeypatch, training_argv, capsys, optional_sglang_backend):
+def test_main_does_not_start_runtime(monkeypatch, training_argv, capsys, optional_sglang_backend, megatron_backend):
     from relax.backends.megatron import arguments as megatron_arguments
     from relax.utils import arguments
 
