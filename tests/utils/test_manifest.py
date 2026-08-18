@@ -87,6 +87,20 @@ def test_sanitizer_covers_reviewed_secret_shapes() -> None:
     manifest.verify_no_secrets(sanitized)
 
 
+@pytest.mark.parametrize(
+    "parameter",
+    ["accessToken", "access%5Ftoken", "%61ccess%54oken", "authToken", "clientSecret", "apiKey", "token[]"],
+)
+def test_sanitizer_redacts_normalized_url_query_secret_keys(parameter: str) -> None:
+    secret = "unit-test-secret"
+    value = f"https://example.com/path?{parameter}={secret}&verbose=1"
+
+    sanitized = manifest.sanitize_value(value)
+
+    assert secret not in sanitized
+    assert sanitized == f"https://example.com/path?{parameter}={manifest.REDACTED}&verbose=1"
+
+
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_sanitizer_converts_non_finite_floats_to_standard_json(value: float) -> None:
     sanitized = manifest.sanitize_value({"value": value})

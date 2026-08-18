@@ -20,6 +20,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import unquote
 
 import yaml
 
@@ -101,7 +102,7 @@ def _mask_sensitive_assignment(match: re.Match) -> str:
 
 
 def _mask_sensitive_url_parameter(match: re.Match) -> str:
-    key = re.sub(r"[^A-Za-z0-9]+", "_", match.group(2)).strip("_")
+    key = _normalize_key(unquote(match.group(2)))
     return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}" if _SECRET_KEY.search(key) else match.group(0)
 
 
