@@ -326,7 +326,7 @@ def test_dr_grpo_cp_padding_preserves_token_count_and_reduction() -> None:
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 def test_get_cp_local_num_tokens_counts_fully_masked_response_as_zero(cp_size: int) -> None:
-    """Every CP degree must count real unmasked tokens, with no per-sample clamp.
+    """Every CP degree counts real unmasked tokens, with no per-sample clamp.
 
     A filtered sample stays in the batch with an all-zero loss_mask. Clamping
     its count to 1 at CP=1 made that branch report one more token than CP>1 for
@@ -354,8 +354,8 @@ def test_get_cp_local_num_tokens_counts_fully_masked_response_as_zero(cp_size: i
 def test_get_cp_local_num_tokens_is_zero_when_every_response_is_masked(cp_size: int) -> None:
     """A fully-filtered window yields a zero denominator, not a clamped one.
 
-    Callers must guard their own division; Megatron's ``finalize_model_grads``
-    already skips its ``1 / num_tokens`` scaling when the count is not positive.
+    Callers must guard their own division; ``finalize_model_grads`` already
+    skips its ``1 / num_tokens`` scaling when the count is not positive.
     """
     loss_masks = [torch.zeros(8, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)]
 
@@ -370,7 +370,7 @@ def test_get_cp_local_num_tokens_is_zero_when_every_response_is_masked(cp_size: 
 
 
 def test_dr_grpo_flags_fully_masked_window_and_leaves_others_alone(monkeypatch) -> None:
-    """A window whose every response is filtered must be flagged and zero-scaled.
+    """A fully filtered window must be flagged and zero-scaled.
 
     The gradient is then exactly zero, but stepping is not a no-op: Adam still
     decays its moments and the scheduler still burns a global batch of LR
