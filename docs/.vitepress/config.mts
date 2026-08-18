@@ -288,6 +288,7 @@ export default defineConfig({
               items: [
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
+                { text: 'Config Doctor', link: '/en/guide/config-doctor' },
                 { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' }
               ]
             }
@@ -400,6 +401,7 @@ export default defineConfig({
               items: [
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
                 { text: '调试指南', link: '/zh/guide/debugging' },
+                { text: '配置检查与 Dry-run', link: '/zh/guide/config-doctor' },
                 { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' }
               ]
             }

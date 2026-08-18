@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import warnings
+from contextlib import contextmanager
 from typing import Any
 
 import yaml
@@ -39,6 +40,41 @@ _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-infra/'
     'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
 )
+
+
+@contextmanager
+def _registered_options():
+    """Collect options registered by the real Relax/backend parsers."""
+    registered = set()
+    original = argparse._ActionsContainer.add_argument
+
+    def add_argument(container, *name_or_flags, **kwargs):
+        registered.update(flag for flag in name_or_flags if isinstance(flag, str) and flag.startswith("-"))
+        return original(container, *name_or_flags, **kwargs)
+
+    argparse._ActionsContainer.add_argument = add_argument
+    try:
+        yield registered
+    finally:
+        argparse._ActionsContainer.add_argument = original
+
+
+def _unknown_options(argv: list[str], registered: set[str]) -> list[str]:
+    unknown = []
+    for token in argv:
+        if token == "--" or not token.startswith("-"):
+            continue
+        try:
+            float(token)
+            continue
+        except ValueError:
+            pass
+        option = token.split("=", 1)[0]
+        if option in registered:
+            continue
+        if option not in unknown:
+            unknown.append(option)
+    return unknown
 
 
 def check_transfer_queue_version() -> None:
@@ -2655,8 +2691,12 @@ def _pre_parse_cli_model_source():
     )
 
 
-def parse_args(add_custom_arguments=None):
-    """Parse Relax arguments with an optional registered model source."""
+def parse_args(add_custom_arguments=None, *, strict=False):
+    """Parse Relax arguments with an optional registered model source.
+
+    ``strict`` is used by static preflight callers to reject options that the
+    split Megatron/SGLang parsers would otherwise silently ignore.
+    """
     from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
 
     original_argv = sys.argv
@@ -2664,7 +2704,17 @@ def parse_args(add_custom_arguments=None):
     if provider_source is not None:
         sys.argv = apply_model_source_to_argv(original_argv, provider_source)
     try:
-        return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+        if not strict:
+            return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+        with _registered_options() as registered:
+            args = _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+        unknown = _unknown_options(sys.argv[1:], registered)
+        if unknown:
+            options = ", ".join(unknown)
+            raise ValueError(
+                f"Unknown training option(s): {options}. Fix: correct the spelling or remove unsupported options."
+            )
+        return args
     finally:
         sys.argv = original_argv
 
@@ -2678,6 +2728,10 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
+    resource_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    resource_parser.add_argument("--resource", type=json.loads)
+    resource_args, _ = resource_parser.parse_known_args()
+    _validate_resource_config(resource_args)
     skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
@@ -2961,10 +3015,63 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _validate_resource_config(args) -> None:
+    resource = getattr(args, "resource", None)
+    if not isinstance(resource, dict) or not resource:
+        raise ValueError(
+            "--resource must be a non-empty JSON object. Fix: pass entries such as "
+            '--resource \'{"actor": [1, 8], "rollout": [1, 8]}\'.'
+        )
+    for role, spec in resource.items():
+        if not isinstance(role, str) or not isinstance(spec, (list, tuple)) or len(spec) != 2:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: expected [num_services, num_gpus], got {spec!r}."
+            )
+        num_services, num_gpus = spec
+        if type(num_services) is not int or type(num_gpus) is not int:
+            raise ValueError(f"Invalid --resource entry for {role!r}: both values must be integers, got {spec!r}.")
+        if num_services != 1:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: num_services must currently be 1, got {num_services}."
+            )
+        if num_gpus < 0:
+            raise ValueError(f"Invalid --resource entry for {role!r}: num_gpus must be >= 0, got {num_gpus}.")
+
+
+def _validate_dataset_paths(args) -> None:
+    from relax.utils.data.data_utils import resolve_path_plan
+
+    prompt_data = getattr(args, "prompt_data", None)
+    path_specs = [prompt_data] if isinstance(prompt_data, str) else list(prompt_data or [])
+    eval_prompt_data = list(getattr(args, "eval_prompt_data", None) or [])
+    if getattr(args, "loss_type", None) == "sft":
+        path_specs.extend(eval_prompt_data[1::2])
+    else:
+        path_specs.extend(dataset.path for dataset in getattr(args, "eval_datasets", []) or [])
+    for spec in path_specs:
+        paths, _ = resolve_path_plan(spec)
+        missing = [path for path in paths if not os.path.exists(path)]
+        if missing:
+            raise FileNotFoundError(
+                f"Dataset path(s) do not exist: {missing}. Fix: correct the path or mount/download the dataset first."
+            )
+
+
+def validate_preflight_args(args) -> None:
+    """Run read-only checks that are useful before launching runtime
+    services."""
+    from relax.engine.sft.bootstrap import validate_sft_resource
+
+    validate_sft_resource(args)
+    _validate_dataset_paths(args)
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
+
+    _validate_resource_config(args)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
     if is_sft:
