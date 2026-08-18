@@ -154,7 +154,7 @@ class _HttpRunHandle:
         response.raise_for_status()
         if not isinstance(payload, dict):
             raise RuntimeError("NeMo Gym agent response must be a JSON object")
-        result = _normalize_run_result(payload)
+        result = _normalize_run_result(payload, environment=self.spec.environment)
         if not self.capture_artifacts:
             return result
         if self.artifact_root is None:
@@ -250,7 +250,7 @@ def _build_run_payload(request: TrialRequest, *, rollout_id: str) -> dict[str, A
     return payload
 
 
-def _normalize_run_result(payload: dict[str, Any]) -> AdapterResult:
+def _normalize_run_result(payload: dict[str, Any], environment: str | None = None) -> AdapterResult:
     reward = payload.get("reward")
     status = TrialStatus.TRUNCATED if payload.get("truncated") else TrialStatus.COMPLETED
     metrics = payload.get("metrics", {})
@@ -284,6 +284,19 @@ def _normalize_run_result(payload: dict[str, Any]) -> AdapterResult:
     ):
         if field_name in payload:
             metrics[field_name] = copy.deepcopy(payload[field_name])
+    # r2e_gym partial credit: Gym returns reward 0.0 both when the agent never
+    # produced a runnable patch and when it did but pytest failed. patch_exists
+    # is the strongest signal we have that the eval harness moved past patch
+    # apply into test execution — reward that intermediate progress with 0.1
+    # so GRPO can distinguish it from a total no-op.
+    if (
+        environment == "r2e_gym"
+        and isinstance(reward, (int, float))
+        and not isinstance(reward, bool)
+        and float(reward) == 0.0
+        and metrics.get("patch_exists") is True
+    ):
+        reward = 0.1
     artifact_ref = payload.get("artifact_ref")
     if artifact_ref is not None and not isinstance(artifact_ref, str):
         artifact_ref = None

@@ -245,6 +245,8 @@ export default defineConfig({
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
+                { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
                 { text: 'Configuration', link: '/en/guide/configuration' }
               ]
@@ -277,6 +279,7 @@ export default defineConfig({
               items: [
                 { text: 'Reproducibility Bundle', link: '/en/guide/reproducibility' },
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
+                { text: 'S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
                 { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
               ]
@@ -355,6 +358,8 @@ export default defineConfig({
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
+                { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
+                { text: 'REINFORCE++ 训练与数值验证报告', link: '/zh/guide/reinforce-plus-plus-training-report' },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
                 { text: '配置说明', link: '/zh/guide/configuration' }
               ]
@@ -387,6 +392,7 @@ export default defineConfig({
               items: [
                 { text: '可复现实验清单', link: '/zh/guide/reproducibility' },
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
+                { text: 'S3 模型加载', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
               ]

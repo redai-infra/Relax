@@ -98,10 +98,20 @@ def _tracked_run(
     try:
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             proc.kill()
-            stdout, stderr = proc.communicate()
-            raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+            # Reap the killed child, but do NOT drain the pipe again: `apptainer
+            # exec` runs the command through a `starter` child, and anything the
+            # command spawned inside the sandbox survives killing that child
+            # while still holding the inherited stdout fd. A second, unbounded
+            # `communicate()` then waits for an EOF that never arrives and wedges
+            # this worker for good (observed: an agent-authored command that
+            # deadlocked pinned a session for 20+ minutes, stalling the whole
+            # rollout step until the sandbox-side survivor was killed by hand).
+            # POSIX `_communicate` already attached the partial output to `exc`,
+            # so nothing is lost -- this mirrors what `subprocess.run` does.
+            proc.wait()
+            raise subprocess.TimeoutExpired(cmd, timeout, output=exc.stdout, stderr=exc.stderr) from None
         except BaseException:
             proc.kill()
             proc.wait()
@@ -783,7 +793,6 @@ class AgentServer:
             str(environment_config.get("executable", "apptainer")),
             list(environment_config.get("global_args", [])),
         )
-        _stop_mswe_instances(*self.apptainer_args)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self._tmp_root.mkdir(parents=True, exist_ok=True)
         self.tmp_base.mkdir(parents=True, exist_ok=True)

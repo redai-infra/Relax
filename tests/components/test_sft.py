@@ -2,13 +2,21 @@
 
 """Unit tests for SFT producer component (loop-only, no Ray runtime)."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
 
 from relax.engine.sft.dataset.streaming import ProcessedSample
+
+
+@pytest.fixture(autouse=True)
+def stub_processor_pool_module(monkeypatch):
+    module = ModuleType("relax.utils.data.processor_pool")
+    module.ProcessorPool = object
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", module)
 
 
 def _make_processed(idx: int = 0, n_tokens: int = 8) -> ProcessedSample:
@@ -228,3 +236,43 @@ async def test_sft_loop_advances_step(monkeypatch):
     assert fake_client.async_put.await_count == 3
     seen_partitions = [c.kwargs.get("partition_id") for c in fake_client.async_put.call_args_list]
     assert seen_partitions == ["sft_0", "sft_1", "sft_2"]
+
+
+@pytest.mark.asyncio
+async def test_sft_resume_only_produces_remaining_steps():
+    from relax.components.sft import SFT
+
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = _make_args(num_rollout=5)
+    sft.step = 2
+    sft._stop_event = MagicMock()
+    sft._stop_event.is_set = MagicMock(return_value=False)
+
+    async def _produce_one_step():
+        sft.step += 1
+
+    sft._produce_one_step = AsyncMock(side_effect=_produce_one_step)
+
+    await sft._async_run()
+
+    assert sft.step == 5
+    assert sft._produce_one_step.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_step", [5, 6])
+async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
+    from relax.components.sft import SFT
+
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = _make_args(num_rollout=5)
+    sft.step = start_step
+    sft._stop_event = MagicMock()
+    sft._stop_event.is_set = MagicMock(return_value=False)
+    sft._produce_one_step = AsyncMock()
+
+    await sft._async_run()
+
+    sft._produce_one_step.assert_not_awaited()

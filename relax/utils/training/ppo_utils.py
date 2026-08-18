@@ -333,6 +333,42 @@ def compute_cispo_loss(
 
 
 @torch.compile(dynamic=True)
+def compute_rloo_loss(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes the RLOO (REINFORCE Leave-One-Out) loss.
+
+    RLOO uses a dedicated *unclipped* REINFORCE objective. The leave-one-out
+    baseline is computed upstream (see ``compute_rloo_leave_one_out_rewards``),
+    so here we only apply the policy-gradient term:
+
+        pg_loss = -stop_gradient(A) * log π_θ(y)
+
+    Gradients flow ONLY through ``log_probs``; ``advantages`` is detached.
+    This is mathematically equivalent to CISPO with the importance ratio fixed
+    to 1 (on-policy). ``clipfrac`` is always zero — it serves as a wiring
+    self-check that the unclipped path is active.
+
+    Reference: Ahmadian et al. 2024 (arXiv:2402.14740); Kool et al. 2019.
+
+    Args:
+        log_probs: Current policy log-probabilities (gradient source).
+            Shape: [total_tokens]
+        advantages: Leave-one-out advantage values, shape matches log_probs.
+
+    Returns:
+        pg_loss: Element-wise RLOO loss (negative objective for minimization).
+            Shape matches input. NO reduction applied (caller handles masking).
+        clipfrac: Element-wise zero tensor (unclipped — wiring self-check).
+            Shape matches input.
+    """
+    pg_loss = -(advantages.detach() * log_probs)
+    clipfrac = torch.zeros_like(log_probs)
+    return pg_loss, clipfrac
+
+
+@torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
@@ -417,6 +453,50 @@ def get_grpo_returns(
     return returns
 
 
+def compute_rloo_leave_one_out_rewards(group_rewards: torch.Tensor) -> torch.Tensor:
+    """Compute RLOO leave-one-out advantages for a single reward group.
+
+    For G samples with rewards r_1..r_G, the leave-one-out baseline for
+    sample i is the mean of all *other* samples:
+
+        baseline_i = sum_{j != i}(r_j) / (G - 1)
+        A_i = r_i - baseline_i = G/(G-1) * (r_i - mean(r))
+
+    The implementation uses the scaled identity form (right-hand side) which is
+    numerically equivalent but vectorised. Unlike GRPO, RLOO does NOT divide by
+    the group standard deviation — the advantage preserves the reward scale and
+    is unbiased because baseline_i is independent of r_i.
+
+    Args:
+        group_rewards: 1-D tensor of per-sample rewards for one group.
+            Length G must be >= 2 (G-1=0 is undefined).
+
+    Returns:
+        1-D tensor of leave-one-out advantages, same length as input.
+
+    Raises:
+        ValueError: If input is not 1-D, has fewer than 2 elements, or
+            contains non-finite values.
+    """
+    if group_rewards.dim() != 1:
+        raise ValueError(
+            f"compute_rloo_leave_one_out_rewards expects a 1-D tensor (one group), "
+            f"got shape {tuple(group_rewards.shape)}. A 2-D input would be silently "
+            f"treated as a single oversized group and produce wrong results."
+        )
+    group_size = group_rewards.shape[0]
+    if group_size < 2:
+        raise ValueError(
+            f"RLOO requires n_samples_per_prompt >= 2 (group size {group_size} "
+            f"makes the leave-one-out baseline undefined: division by G-1=0)."
+        )
+    if not torch.isfinite(group_rewards).all():
+        raise ValueError(f"RLOO group contains non-finite reward(s): {group_rewards}. All rewards must be finite.")
+    mean_reward = group_rewards.mean()
+    scale = group_size / (group_size - 1)
+    return scale * (group_rewards - mean_reward)
+
+
 def get_reinforce_plus_plus_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
@@ -444,6 +524,17 @@ def get_reinforce_plus_plus_returns(
     """
     from megatron.core import mpu
 
+    num_responses = len(rewards)
+    if not (
+        len(kl) == num_responses
+        and len(loss_masks) == num_responses
+        and len(response_lengths) == num_responses
+        and len(total_lengths) == num_responses
+    ):
+        raise ValueError(
+            "rewards, kl, loss_masks, response_lengths, and total_lengths must contain the same number of responses."
+        )
+
     cp_size = mpu.get_context_parallel_world_size()
 
     final_returns_chunks = []
@@ -461,10 +552,27 @@ def get_reinforce_plus_plus_returns(
 
         # Step 3: Compute returns on full response kl tensor.
         full_mask = loss_masks[i]
-        assert full_mask.sum().item() > 0, f"Sequence at index {i} is fully masked."
-        masked_kl = full_kl_response * full_mask
+        if full_kl_response.shape != full_mask.shape:
+            raise ValueError(
+                f"KL and loss mask for response {i} must have the same shape, "
+                f"got {full_kl_response.shape} and {full_mask.shape}."
+            )
+        valid_mask = full_mask != 0
+        if not torch.any(valid_mask):
+            returns_for_seq = torch.zeros_like(full_kl_response)
+            if cp_size > 1:
+                from relax.backends.megatron.cp_utils import slice_log_prob_with_cp
+
+                returns_for_seq = slice_log_prob_with_cp(returns_for_seq, total_len, response_len)
+            final_returns_chunks.append(returns_for_seq)
+            continue
+
+        # Multiplication is insufficient here because NaN * 0 is still NaN.
+        # Select valid values before any return arithmetic so masked padding can
+        # never contaminate a valid token.
+        masked_kl = torch.where(valid_mask, full_kl_response, torch.zeros_like(full_kl_response))
         token_level_rewards = -kl_coef * masked_kl
-        last_idx = full_mask.nonzero(as_tuple=True)[0][-1]
+        last_idx = valid_mask.nonzero(as_tuple=True)[0][-1]
         token_level_rewards[last_idx] += rewards[i]
 
         returns_for_seq = torch.zeros_like(token_level_rewards)
@@ -473,6 +581,7 @@ def get_reinforce_plus_plus_returns(
             # G_t = r_t + gamma * G_{t+1}
             running_return = token_level_rewards[t] + gamma * running_return
             returns_for_seq[t] = running_return
+        returns_for_seq = torch.where(valid_mask, returns_for_seq, torch.zeros_like(returns_for_seq))
 
         # Step 4: Pick up the results corresponding to our local chunk's parts.
         if cp_size > 1:
@@ -491,7 +600,6 @@ def get_reinforce_plus_plus_baseline_advantages(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
-    kl_coef: float,
 ) -> list[torch.Tensor]:
     """Calculates the unwhitened advantages for the REINFORCE++-baseline
     algorithm.
@@ -501,19 +609,28 @@ def get_reinforce_plus_plus_baseline_advantages(
     Args:
         rewards (Tensor): A tensor of scalar rewards, where the group-wise
                                 baseline has already been subtracted.
-        kl (list[Tensor]): A list of per-token KL divergence tensors. Used to
-                                 get the shape for broadcasting.
+        kl (list[Tensor]): A list of per-token tensors used only to determine
+            the local response shapes.
         loss_masks (list[Tensor]): A list of per-token loss masks.
-        kl_coef (float): Coefficient for the KL penalty.
 
     Returns:
         list[Tensor]: A list of tensors containing the unwhitened advantages.
     """
-    # Broadcast to get unwhitened advantages
-    unwhitened_advantages = [
-        torch.ones_like(kl_tensor) * reward_val - kl_coef * kl_tensor
-        for kl_tensor, reward_val in zip(kl, rewards, strict=False)
-    ]
+    if not (len(rewards) == len(kl) == len(loss_masks)):
+        raise ValueError("rewards, token shapes, and loss_masks must contain the same number of responses.")
+
+    # Token KL is intentionally not part of this advantage. The baseline
+    # variant applies reference regularization as a separate k2 loss.
+    unwhitened_advantages = []
+    for response_index, (kl_tensor, reward_val, loss_mask) in enumerate(zip(kl, rewards, loss_masks, strict=True)):
+        if kl_tensor.shape != loss_mask.shape:
+            raise ValueError(
+                f"Token shape and loss mask for response {response_index} must match, "
+                f"got {kl_tensor.shape} and {loss_mask.shape}."
+            )
+        valid_mask = loss_mask != 0
+        broadcast_reward = torch.ones_like(kl_tensor) * reward_val
+        unwhitened_advantages.append(torch.where(valid_mask, broadcast_reward, torch.zeros_like(kl_tensor)))
 
     return unwhitened_advantages
 

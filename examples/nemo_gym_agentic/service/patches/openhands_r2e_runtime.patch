@@ -1,8 +1,8 @@
 diff --git a/evaluation/benchmarks/swe_bench/run_infer.py b/evaluation/benchmarks/swe_bench/run_infer.py
-index 87d65bf9..14e5e538 100644
+index 485d2c831..ace42c99a 100644
 --- a/evaluation/benchmarks/swe_bench/run_infer.py
 +++ b/evaluation/benchmarks/swe_bench/run_infer.py
-@@ -827,6 +827,7 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+@@ -823,6 +823,7 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
  
          # Detach so the current branch can be moved safely.
          'git checkout --detach "$BASE" && '
@@ -10,7 +10,7 @@ index 87d65bf9..14e5e538 100644
  
          'echo && '
          'echo "Resetting local branches that are descendants of base..." && '
-@@ -915,7 +916,8 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+@@ -914,7 +915,8 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
              extra={'msg_type': 'ACTION'},
          )
          nuclear_reset_cmd = (
@@ -20,7 +20,7 @@ index 87d65bf9..14e5e538 100644
              'ORIG_BRANCH=$(git symbolic-ref --short -q HEAD || echo main) && '
              'echo "Base commit: $BASE, restoring branch: $ORIG_BRANCH" && '
  
-@@ -933,6 +936,9 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+@@ -932,6 +934,9 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
              'git for-each-ref --format="delete %(refname)" refs/heads '
              '| git update-ref --stdin && '
  
@@ -30,7 +30,7 @@ index 87d65bf9..14e5e538 100644
              # Strip transient operation refs.
              'git_dir=$(git rev-parse --git-dir) && '
              'rm -f "$git_dir"/FETCH_HEAD "$git_dir"/ORIG_HEAD '
-@@ -1517,7 +1519,11 @@ def complete_runtime(
+@@ -1512,7 +1517,11 @@ def complete_runtime(
          else:
              assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
  
@@ -43,7 +43,7 @@ index 87d65bf9..14e5e538 100644
  
      # Remove binary diffs from the patch
      git_patch = remove_binary_diffs(git_patch)
-@@ -1660,8 +1666,11 @@ def process_instance(
+@@ -1658,8 +1667,11 @@ def process_instance(
          # Check if we have replay data for this instance
          replay_events = None
          if instance.instance_id in REPLAY_DATA:
@@ -57,3 +57,22 @@ index 87d65bf9..14e5e538 100644
              logger.info(
                  f'Replay mode: replaying {len(replay_events)} events for {instance.instance_id}'
              )
+@@ -1692,7 +1704,17 @@ def process_instance(
+             )
+         else:
+             complete_runtime_fn = complete_runtime
+-        return_val = complete_runtime_fn(runtime, instance)
++        if state.last_error:
++            # Agent-side error (e.g. context_length_exceeded) usually leaves
++            # the sandbox tmux pane mid-command; running complete_runtime
++            # would block on 600s hard_timeouts in the recovery ladder.
++            logger.warning(
++                f'Skipping complete_runtime for {instance.instance_id} '
++                f'due to agent error: {state.last_error!r}'
++            )
++            return_val = {'git_patch': ''}
++        else:
++            return_val = complete_runtime_fn(runtime, instance)
+         git_patch = return_val['git_patch']
+         logger.info(
+             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'

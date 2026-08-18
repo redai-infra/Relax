@@ -11,6 +11,7 @@ from relax.utils.data.processing_utils import load_processor, load_tokenizer
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.types import Sample
 
 
@@ -169,6 +170,7 @@ class RolloutDataSource(DataSource):
         self.dataset = None
 
         if args.rollout_global_dataset:
+            prepare_model_maybe_update_args(args, completeness="metadata")
             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
             processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
