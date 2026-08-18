@@ -81,6 +81,31 @@ def test_gradient_comparator_reports_full_vector_rel_l2_and_cosine(tmp_path: Pat
     assert comparison["full_parameter_cosine"] == 1.0
 
 
+def test_pre_sync_gradient_capture_records_unreduced_main_grad(tmp_path: Path, monkeypatch) -> None:
+    model = torch.nn.Linear(3, 2, bias=True)
+    model.weight.main_grad = torch.arange(6, dtype=torch.float32).reshape_as(model.weight)
+    model.bias.main_grad = torch.tensor([7.0, 8.0], dtype=torch.float32)
+    state = {
+        **hook._STATE,
+        "output_dir": tmp_path,
+        "rank": 3,
+        "pre_sync_gradients_captured": False,
+        "pre_sync_gradient_targets": ("weight", "bias"),
+    }
+    monkeypatch.setattr(hook, "_STATE", state)
+
+    hook._capture_pre_sync_gradients([model], torch.tensor(11))
+
+    summary = __import__("json").loads((tmp_path / "pre_sync_gradients" / "summary_rank3.json").read_text())
+    assert summary["local_num_tokens"] == 11
+    assert summary["capture_point"] == "before DDP/CP gradient synchronization and token normalization"
+    assert [record["name"] for record in summary["tensors"]] == ["chunk000.bias", "chunk000.weight"]
+    for record in summary["tensors"]:
+        saved = torch.load(tmp_path / "pre_sync_gradients" / record["file"], weights_only=True)
+        expected = model.bias.main_grad if record["name"].endswith("bias") else model.weight.main_grad
+        assert torch.equal(saved, expected)
+
+
 def test_reconstruct_gradient_joins_distributed_optimizer_shards(tmp_path: Path) -> None:
     records = []
     for rank, (start, values) in enumerate(((0, torch.tensor([1.0, 2.0])), (2, torch.tensor([3.0, 4.0])))):

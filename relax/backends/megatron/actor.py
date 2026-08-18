@@ -85,6 +85,7 @@ from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
     build_rollout_minibatch_plan,
+    canonicalize_p3o_strict_dp_rollout,
     concat_rollout_batches,
     get_data_iterator,
     log_perf_data,
@@ -913,6 +914,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.rollout_data_postprocess(self.args)
 
             log_rollout_data(rollout_id, self.args, rollout_data)
+
+            if canonicalize_p3o_strict_dp_rollout(self.args, rollout_data):
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
             # Train
             if self.args.use_routing_replay:

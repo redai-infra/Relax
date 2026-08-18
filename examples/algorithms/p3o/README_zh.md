@@ -88,6 +88,17 @@ recomputation。当前支持的合同是标准 zig-zag THD 且 tensor parallel s
 当前随附的 batch-invariant TE GEMM 无法遵守跨多个 micro-batch 的 `main_grad`
 累积合同。该绕行使用稳定的 TE/DDP 累积路径，可能降低吞吐或增加瞬时梯度显存。
 
+当 data parallel size 大于 1 时，严格 P3O 还会按全局 DP-rank 顺序在每个 replica
+上收集最终训练 batch。DP rank 0 保留真实 loss mask，其余 replica 使用零 loss mask
+执行相同的 micro-batch 调度，从而保持全部 DP/CP collective 对齐；既有的 DP×CP 求和
+归约随后传播唯一的 canonical CUDA backward 结果。该路径可消除 rank-local backward
+漂移，但会有意重复前后向计算，因此严格模式不提供 DP 训练加速。
+严格路径还会使用 Megatron eager fused-cross-entropy helper：模块导入时已经被
+`torch.compile` 装饰的 wrapper 会被显式解除，因为多个 replica 并发执行同一
+canonical micro-batch 时，其 Triton autotune launcher 不可用。
+当前 strict-DP 合同要求每个 optimizer step 只有一个 rollout mini；如果存在多个
+mini 边界会 fail closed，不会静默重排。
+
 正式默认值为 G=16、global batch 64、micro-batch 1、rollout batch 4、response
 length 4096 和 30 个 optimizer step（`--num-rollout 30`）。计划配对 seed 为 42、
 123 和 2026。smoke 使用 G=4、global batch 16、response length 128 和 1 个

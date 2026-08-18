@@ -50,6 +50,49 @@ def test_p3o_partition_modes_disable_fused_wgrad_accumulation(monkeypatch: pytes
     assert args.gradient_accumulation_fusion is False
 
 
+def test_p3o_partition_modes_disable_jit_fuser(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: None)
+    calls = []
+    monkeypatch.setattr(initialize, "_disable_p3o_compiled_fused_cross_entropy", lambda: calls.append("disabled"))
+    args = _args(disable_jit_fuser=False)
+
+    initialize._configure_p3o_partition_invariance(args)
+
+    assert args.disable_jit_fuser is True
+    assert calls == ["disabled"]
+
+
+def test_p3o_unwraps_fused_cross_entropy_functions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from megatron.core.fusions import fused_cross_entropy
+
+    def original(*args, **kwargs):
+        return args, kwargs
+
+    def compiled(*args, **kwargs):
+        raise AssertionError((args, kwargs))
+
+    compiled._torchdynamo_orig_callable = original
+    for name in (
+        "calculate_logits_max",
+        "calculate_predicted_logits",
+        "calculate_cross_entropy_loss",
+        "calculate_gradients",
+    ):
+        monkeypatch.setattr(fused_cross_entropy, name, compiled)
+
+    initialize._disable_p3o_compiled_fused_cross_entropy()
+
+    assert all(
+        getattr(fused_cross_entropy, name) is original
+        for name in (
+            "calculate_logits_max",
+            "calculate_predicted_logits",
+            "calculate_cross_entropy_loss",
+            "calculate_gradients",
+        )
+    )
+
+
 def test_non_p3o_does_not_change_partition_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(initialize, "enable_batch_invariant_mode", lambda: calls.append("enabled"))

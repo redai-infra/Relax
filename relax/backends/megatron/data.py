@@ -168,6 +168,99 @@ def concat_rollout_batches(rollout_batches: Sequence[RolloutBatch]) -> RolloutBa
     return merged
 
 
+def _cpu_detached_rollout_value(value: Any) -> Any:
+    """Copy one rollout value into a Gloo-serializable CPU form."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, list):
+        return [_cpu_detached_rollout_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_detached_rollout_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _cpu_detached_rollout_value(item) for key, item in value.items()}
+    return deepcopy(value)
+
+
+def _merge_p3o_strict_dp_rollout_batches(
+    rollout_batches: Sequence[RolloutBatch],
+    *,
+    is_anchor: bool,
+) -> RolloutBatch:
+    """Build one global strict-P3O batch and keep loss on one DP replica.
+
+    Every DP replica executes the same globally ordered micro-batches so the
+    schedule and any CP collectives remain aligned. Only DP rank zero keeps the
+    real loss mask; other replicas contribute an exact zero to the existing
+    DP×CP gradient reduction.
+    """
+    local_step_counts = []
+    for batch in rollout_batches:
+        counts = batch.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
+        local_sample_count = len(batch.get("total_lengths", []))
+        if not isinstance(counts, list) or len(counts) != 1 or counts[0] != local_sample_count:
+            raise RuntimeError(
+                "P3O strict DP canonicalization currently requires exactly one rollout mini per optimizer step; "
+                f"got counts={counts}, local_sample_count={local_sample_count}"
+            )
+        local_step_counts.append(counts[0])
+
+    merged = concat_rollout_batches(rollout_batches)
+    global_sample_count = len(merged.get("total_lengths", []))
+    if global_sample_count <= 0:
+        raise ValueError("P3O strict DP canonicalization requires at least one global sample")
+    merged[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [sum(local_step_counts)]
+    if not is_anchor:
+        loss_masks = merged.get("loss_masks")
+        if not isinstance(loss_masks, list) or len(loss_masks) != global_sample_count:
+            raise ValueError("P3O strict DP canonicalization requires one loss mask per sample")
+        merged["loss_masks"] = [
+            torch.zeros_like(mask) if isinstance(mask, torch.Tensor) else [0 for _ in mask] for mask in loss_masks
+        ]
+    return merged
+
+
+def canonicalize_p3o_strict_dp_rollout(args: Namespace, rollout_data: RolloutBatch) -> bool:
+    """Canonicalize strict-P3O training onto DP rank zero.
+
+    Rank-local CUDA backward is deterministic but not invariant across physical
+    DP rank mappings. Gather the final training batch within each fixed-CP data
+    parallel group, preserve global sample order, and execute real loss only on
+    DP rank zero. Existing summed DP×CP gradient and token-count reductions then
+    propagate exactly one canonical gradient to every optimizer shard.
+
+    Returns ``True`` when the rollout was replaced and its iterator must be
+    rebuilt, otherwise ``False``.
+    """
+    if getattr(args, "advantage_estimator", None) != "p3o":
+        return False
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    if dp_size <= 1:
+        return False
+    if not getattr(args, "deterministic_mode", False) or not getattr(args, "batch_invariant_mode", False):
+        raise RuntimeError("P3O strict DP canonicalization requires deterministic and batch-invariant modes")
+    if getattr(args, "use_routing_replay", False):
+        raise RuntimeError("P3O strict DP canonicalization does not support routing replay")
+
+    dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+    dp_gloo_group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
+    gathered: list[RolloutBatch | None] = [None for _ in range(dp_size)]
+    dist.all_gather_object(
+        gathered,
+        _cpu_detached_rollout_value(rollout_data),
+        group=dp_gloo_group,
+    )
+    if any(batch is None for batch in gathered):
+        raise RuntimeError("P3O strict DP canonicalization did not receive every DP rollout shard")
+    canonical = _merge_p3o_strict_dp_rollout_batches(
+        [batch for batch in gathered if batch is not None],
+        is_anchor=dp_rank == 0,
+    )
+    canonical = move_tensors_to_device(canonical, device_utils.make_current_torch_device())
+    rollout_data.clear()
+    rollout_data.update(canonical)
+    return True
+
+
 PAD_RULES = {
     # shape like [1, 128, 1036]
     "input_features": dict(

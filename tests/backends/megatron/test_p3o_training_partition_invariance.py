@@ -203,3 +203,44 @@ def test_p3o_full_training_backward_matches_dp1_across_dp_and_cp2(tmp_path: Path
         assert cosine >= 1 - 1e-9, name
         torch.testing.assert_close(candidate["loss"], reference["loss"], rtol=1e-6, atol=1e-9)
         assert candidate["valid_tokens"].item() == reference["valid_tokens"].item()
+
+
+def test_p3o_strict_dp_rollout_merge_keeps_one_loss_anchor() -> None:
+    from relax.backends.megatron.data import _merge_p3o_strict_dp_rollout_batches
+
+    batches = [
+        {
+            "tokens": [torch.tensor([rank + 1, rank + 2])],
+            "total_lengths": [2],
+            "response_lengths": [2],
+            "loss_masks": [torch.ones(2, dtype=torch.int64)],
+            "advantages": [torch.tensor([float(rank + 1), float(rank + 1)])],
+            "rollout_mini_local_sample_counts": [1],
+            "dynamic_global_batch_size": 2,
+        }
+        for rank in range(2)
+    ]
+
+    anchor = _merge_p3o_strict_dp_rollout_batches(batches, is_anchor=True)
+    replica = _merge_p3o_strict_dp_rollout_batches(batches, is_anchor=False)
+
+    assert anchor["total_lengths"] == [2, 2]
+    assert anchor["rollout_mini_local_sample_counts"] == [2]
+    assert [mask.tolist() for mask in anchor["loss_masks"]] == [[1, 1], [1, 1]]
+    assert [mask.tolist() for mask in replica["loss_masks"]] == [[0, 0], [0, 0]]
+    assert [value.tolist() for value in replica["advantages"]] == [[1.0, 1.0], [2.0, 2.0]]
+
+
+def test_p3o_strict_dp_rollout_merge_rejects_multiple_rollout_minis() -> None:
+    from relax.backends.megatron.data import _merge_p3o_strict_dp_rollout_batches
+
+    batch = {
+        "tokens": [torch.tensor([1]), torch.tensor([2])],
+        "total_lengths": [1, 1],
+        "response_lengths": [1, 1],
+        "loss_masks": [torch.ones(1), torch.ones(1)],
+        "rollout_mini_local_sample_counts": [1, 1],
+    }
+
+    with pytest.raises(RuntimeError, match="exactly one rollout mini"):
+        _merge_p3o_strict_dp_rollout_batches([batch], is_anchor=True)

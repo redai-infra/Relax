@@ -17,6 +17,21 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def _disable_p3o_compiled_fused_cross_entropy() -> None:
+    """Restore eager fused-CE helpers already decorated at import time."""
+    from megatron.core.fusions import fused_cross_entropy
+
+    for name in (
+        "calculate_logits_max",
+        "calculate_predicted_logits",
+        "calculate_cross_entropy_loss",
+        "calculate_gradients",
+    ):
+        function = getattr(fused_cross_entropy, name)
+        original = getattr(function, "_torchdynamo_orig_callable", getattr(function, "__wrapped__", function))
+        setattr(fused_cross_entropy, name, original)
+
+
 def _configure_p3o_partition_invariance(args: Namespace) -> None:
     """Enable batch-invariant kernels and fail closed for incomplete P3O
     mode."""
@@ -37,6 +52,13 @@ def _configure_p3o_partition_invariance(args: Namespace) -> None:
         # the batch-invariant kernels, but use TE/DDP's stable unfused gradient
         # accumulation path for the complete optimizer step.
         args.gradient_accumulation_fusion = False
+        # Canonical DP replicas execute identical shapes concurrently. The
+        # repository's optional jit_fuser wrapper routes fused CE through a
+        # TorchInductor autotune path that is not valid for this strict setup;
+        # use the existing eager fallback while keeping TE/FlashAttention's
+        # deterministic kernels enabled.
+        args.disable_jit_fuser = True
+        _disable_p3o_compiled_fused_cross_entropy()
     if batch_invariant_mode:
         enable_batch_invariant_mode()
 

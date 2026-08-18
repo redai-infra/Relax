@@ -108,6 +108,20 @@ batch-invariant TE GEMM cannot honor its multi-micro-batch `main_grad`
 accumulation contract. This uses the stable TE/DDP accumulation path and may
 reduce throughput or increase transient gradient memory.
 
+When data parallel size is greater than one, strict P3O also gathers the final
+training batch in global DP-rank order on every replica. DP rank zero keeps the
+real loss masks; the other replicas execute the same micro-batch schedule with
+zero loss masks so all DP/CP collectives remain aligned. The existing summed
+DP×CP reduction then propagates one canonical CUDA backward result. This
+removes rank-local backward drift, but deliberately duplicates forward/backward
+compute and provides no DP training-speedup in strict mode.
+The strict path also uses Megatron's eager fused-cross-entropy helpers: wrappers
+decorated with `torch.compile` at import time are explicitly unwrapped because
+their Triton autotune launcher is not valid when multiple replicas execute the
+same canonical micro-batch concurrently.
+The current strict-DP contract requires one rollout mini per optimizer step and
+fails closed instead of silently reordering multiple mini boundaries.
+
 Formal defaults are G=16, global batch 64, micro-batch 1, rollout batch 4,
 response length 4096, and 30 optimizer steps (`--num-rollout 30`). The planned
 paired seeds are 42, 123, and 2026. Smoke remains G=4, global batch 16,

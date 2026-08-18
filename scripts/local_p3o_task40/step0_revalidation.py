@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any, Iterator
@@ -18,6 +19,13 @@ from typing import Any, Iterator
 
 EXPECTED_FIXTURE_SHA256 = "48538d165386dc94006613d857c022a7ba2e979bdc31bc617374eee2dc3c35b8"
 FORMAT_VERSION = 1
+DEFAULT_PRE_SYNC_GRADIENT_TARGETS = (
+    "decoder.final_layernorm.weight",
+    "decoder.layers.0.mlp.linear_fc1.layer_norm_weight",
+    "decoder.layers.0.self_attention.linear_qkv.bias",
+    "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
+    "decoder.layers.0.self_attention.linear_qkv.weight",
+)
 _STATE: dict[str, Any] = {
     "args": None,
     "output_dir": None,
@@ -28,6 +36,9 @@ _STATE: dict[str, Any] = {
     "parameter_capture_error": None,
     "parameter_capture_thread": None,
     "gradients_captured": False,
+    "pre_sync_gradients_captured": False,
+    "pre_sync_gradient_targets": DEFAULT_PRE_SYNC_GRADIENT_TARGETS,
+    "strict_dp_anchor": True,
     "optimizer_ids": set(),
 }
 
@@ -264,6 +275,82 @@ def _capture_prepared_gradient_shards(model: Any, optimizer: Any) -> None:
     _STATE["gradients_captured"] = True
 
 
+def _capture_pre_sync_gradients(model: Any, num_tokens: Any) -> None:
+    """Capture selected full local gradients before DDP/CP synchronization.
+
+    The normal Batch-7 gradient artifact is intentionally post-finalization.
+    This diagnostic snapshot keeps a small, named subset of ``main_grad``
+    tensors at the finalizer entry so local CUDA backward/accumulation drift
+    can be separated from the following reduce-scatter/all-reduce and token
+    normalization.
+    """
+    import torch
+
+    if _STATE["pre_sync_gradients_captured"]:
+        raise RuntimeError("Task40 Batch 7 attempted to capture pre-sync gradients more than once")
+    output_dir: Path = _STATE["output_dir"]
+    rank = int(_STATE["rank"])
+    targets = tuple(str(value) for value in _STATE["pre_sync_gradient_targets"])
+    gradient_dir = output_dir / "pre_sync_gradients"
+    vector_dir = gradient_dir / f"rank{rank:05d}"
+    vector_dir.mkdir(parents=True, exist_ok=False)
+
+    tensors = []
+    selected = sorted(
+        ((name, parameter) for name, parameter in _named_parameters(model) if any(key in name for key in targets)),
+        key=lambda item: item[0],
+    )
+    if not selected:
+        raise RuntimeError(f"Task40 Batch 7 pre-sync gradient targets matched no parameters: {targets}")
+    for index, (name, parameter) in enumerate(selected):
+        gradient = getattr(parameter, "main_grad", None)
+        if gradient is None:
+            gradient = parameter.grad
+        if gradient is None:
+            raise RuntimeError(f"Task40 Batch 7 pre-sync gradient is missing for {name}")
+        cpu, raw = _tensor_bytes(gradient)
+        values = cpu.to(torch.float64)
+        file_name = f"tensor_{index:03d}.pt"
+        torch.save(cpu, vector_dir / file_name)
+        l2_sq = float(torch.sum(values * values))
+        tensors.append(
+            {
+                "name": name,
+                "parameter_shape": list(parameter.shape),
+                "shape": list(cpu.shape),
+                "dtype": str(cpu.dtype),
+                "numel": cpu.numel(),
+                "finite": bool(torch.isfinite(values).all()),
+                "l2_sq": l2_sq,
+                "l2_norm": l2_sq**0.5,
+                "max_abs": float(values.abs().max()) if values.numel() else 0.0,
+                "sum": float(values.sum()),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "file": f"rank{rank:05d}/{file_name}",
+            }
+        )
+
+    local_num_tokens = _cpu(num_tokens)
+    if isinstance(local_num_tokens, torch.Tensor):
+        local_num_tokens = int(local_num_tokens.reshape(()))
+    elif local_num_tokens is not None:
+        local_num_tokens = int(local_num_tokens)
+    _write_json(
+        gradient_dir / f"summary_rank{rank}.json",
+        {
+            "format_version": FORMAT_VERSION,
+            "rank": rank,
+            "capture_point": "before DDP/CP gradient synchronization and token normalization",
+            "local_num_tokens": local_num_tokens,
+            "targets": list(targets),
+            "tensor_count": len(tensors),
+            "all_finite": all(record["finite"] for record in tensors),
+            "tensors": tensors,
+        },
+    )
+    _STATE["pre_sync_gradients_captured"] = True
+
+
 def configure(args: Any) -> None:
     """Install the Batch-7 BF16-only oracle observers."""
     import torch
@@ -294,7 +381,21 @@ def configure(args: Any) -> None:
     output_dir = Path(args.dump_details).parent / "oracle"
     output_dir.mkdir(parents=True, exist_ok=True)
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    _STATE.update({"args": args, "output_dir": output_dir, "rank": rank})
+    configured_targets = os.environ.get("P3O_B7_PRE_SYNC_GRADIENT_TARGETS", "").strip()
+    pre_sync_gradient_targets = (
+        tuple(value.strip() for value in configured_targets.split(",") if value.strip())
+        if configured_targets
+        else DEFAULT_PRE_SYNC_GRADIENT_TARGETS
+    )
+    _STATE.update(
+        {
+            "args": args,
+            "output_dir": output_dir,
+            "rank": rank,
+            "pre_sync_gradient_targets": pre_sync_gradient_targets,
+            "strict_dp_anchor": mpu.get_data_parallel_rank(with_context_parallel=False) == 0,
+        }
+    )
     runtime = {
         "format_version": FORMAT_VERSION,
         "rank": rank,
@@ -322,6 +423,8 @@ def configure(args: Any) -> None:
             "joined before optimizer prepare/update"
         ),
         "gradient_capture_point": "after DistributedOptimizer.prepare_grads and before clipping/update",
+        "pre_sync_gradient_capture_point": "before DDP/CP gradient synchronization and token normalization",
+        "pre_sync_gradient_targets": list(pre_sync_gradient_targets),
     }
     _write_json(output_dir / f"runtime_rank{rank}.json", runtime)
 
@@ -331,7 +434,7 @@ def configure(args: Any) -> None:
     def observed_local_stats(local_args: Any, batch: dict[str, Any], log_probs: list[Any]) -> Any:
         result = original_local_stats(local_args, batch, log_probs)
         local_counter = int(_STATE["local_counter"])
-        if not batch.get("__is_dummy__", False):
+        if not batch.get("__is_dummy__", False) and bool(_STATE["strict_dp_anchor"]):
             current = torch.cat(log_probs, dim=0)
             behavior = torch.cat(batch["rollout_log_probs"], dim=0)
             valid_mask = p3o_step.get_cp_local_valid_mask(
@@ -412,6 +515,22 @@ def before_train_step(
     if optimizer_id in _STATE["optimizer_ids"]:
         raise RuntimeError("Task40 Batch 7 optimizer step observer was already installed")
     _STATE["optimizer_ids"].add(optimizer_id)
+    from megatron.core.utils import get_model_config
+
+    config = get_model_config(model[0])
+    original_finalize_model_grads = config.finalize_model_grads_func
+    if original_finalize_model_grads is None:
+        raise RuntimeError("Task40 Batch 7 requires Megatron's gradient finalizer")
+
+    def observed_finalize_model_grads(
+        finalizer_model: Any,
+        num_tokens: Any = None,
+        **finalizer_kwargs: Any,
+    ) -> Any:
+        _capture_pre_sync_gradients(finalizer_model, num_tokens)
+        return original_finalize_model_grads(finalizer_model, num_tokens, **finalizer_kwargs)
+
+    config.finalize_model_grads_func = observed_finalize_model_grads
     original_prepare_grads = optimizer.prepare_grads
 
     def observed_prepare_grads(*prepare_args: Any, **prepare_kwargs: Any) -> Any:
