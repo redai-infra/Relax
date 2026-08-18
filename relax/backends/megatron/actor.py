@@ -1719,6 +1719,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._use_dcs_hybrid_weight_sync:
             with timer("dcs_update_weights"):
                 run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+            self._advance_keep_old_actor_queue()  # DCS push bypasses update_weights(), so roll it here too
         else:
             with timer("cuda_ipc_update_weights"):
                 self.update_weights()
@@ -2103,6 +2104,21 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()
 
+    def _advance_keep_old_actor_queue(self) -> None:
+        # Must run after every weight push to rollout, not just update_weights()'s
+        # cuda_ipc path, or old_actor stays pinned at the init checkpoint.
+        if not getattr(self.args, "keep_old_actor", False):
+            return
+        if self.args.update_weights_interval == 1:
+            logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+            # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
+            # First copy rollout_actor to old_actor
+            self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
+            # Then copy current actor to rollout_actor
+            self.weights_backuper.backup("rollout_actor")
+        else:
+            self.weights_backuper.backup("old_actor")
+
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
@@ -2168,16 +2184,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
                     )
 
-            if getattr(self.args, "keep_old_actor", False):
-                if self.args.update_weights_interval == 1:
-                    logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
-                    # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
-                    # First copy rollout_actor to old_actor
-                    self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
-                    # Then copy current actor to rollout_actor
-                    self.weights_backuper.backup("rollout_actor")
-                else:
-                    self.weights_backuper.backup("old_actor")
+            self._advance_keep_old_actor_queue()
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
