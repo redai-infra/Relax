@@ -963,7 +963,20 @@ def post_process_rollout_data(args, rollout_data):
         ]
 
 
-class StreamingTQIterator:
+class StreamingIteratorBase:
+    """Marker base for data iterators that stream ready-to-train micro-batch
+    dicts (with ``__loss_scale__`` pre-injected) instead of a pre-materialized
+    sample table.
+
+    ``relax/backends/megatron/model.py`` dispatches to the ``no_sync``-accumulate
+    streaming forward/backward schedules (``relax/backends/megatron/streaming_schedules.py``)
+    for any iterator of this type, rather than only ``StreamingTQIterator`` —
+    see ``_HybridChunkIterator`` in ``relax/backends/megatron/actor.py`` for the
+    other producer.
+    """
+
+
+class StreamingTQIterator(StreamingIteratorBase):
     """Streaming iterator that pulls micro-batches from TransferQueue on
     demand.
 

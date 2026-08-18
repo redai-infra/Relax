@@ -272,7 +272,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--num-iters-per-train-update",
                 type=int,
                 default=1,
-                help="Fully async pipeline num of iters every global batch.",
+                help=(
+                    "Fully async pipeline num of iters every global batch: sizes TransferQueue "
+                    "GET/PUT chunks for forward-only log-prob passes and producer-side rollout "
+                    "chunking. Under --hybrid (with --use-dynamic-batch-size and no virtual "
+                    "pipeline parallelism), values > 1 additionally split each training update's "
+                    "fetch+forward+backward into this many pipelined TransferQueue chunks, "
+                    "accumulating gradients via Megatron's native no_sync mechanism so each "
+                    "update still ends in exactly one optimizer.step() (see "
+                    "MegatronTrainRayActor._train_hybrid_chunked) — no extra optimizer steps, "
+                    "no policy drift."
+                ),
             )
             return parser
 

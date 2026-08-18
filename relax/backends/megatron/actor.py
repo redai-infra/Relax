@@ -42,6 +42,7 @@ from relax.utils import tracking_utils
 from relax.utils.async_utils import run
 from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
+    StreamingIteratorBase,
     StreamingTQIterator,
     create_stream_dataloader,
     get_data_from_transfer_queue,
@@ -81,6 +82,7 @@ from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    RolloutMiniBatchPlan,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     get_data_iterator,
@@ -140,6 +142,356 @@ def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
         return value
 
     return {k: _slice(v) for k, v in rollout_data.items()}
+
+
+# Mirrors the field list `train_one_step`'s `forward_step` closure requests via
+# `get_batch` (relax/backends/megatron/model.py) — kept in sync manually since that
+# closure is private. OPD fields are appended per-instance via `consume_opd_train_data`.
+_HYBRID_CHUNK_FIELD_KEYS = [
+    "tokens",
+    "multimodal_train_inputs",
+    "packed_seq_params",
+    "total_lengths",
+    "response_lengths",
+    "loss_masks",
+    "log_probs",
+    "ref_log_probs",
+    "values",
+    "advantages",
+    "returns",
+    "rollout_log_probs",
+    "max_seq_lens",
+]
+
+
+class _HybridChunkIterator(MicroBatchListIterator, StreamingIteratorBase):
+    """Pipelines one ``train_hybrid`` "mini" (one real optimizer step's worth
+    of data) into ``args.num_iters_per_train_update`` TransferQueue chunks.
+
+    Each chunk is fetched, forwarded (ref/teacher/actor — role-major, so each
+    role is switched into at most once per mini instead of once per chunk:
+    ``_switch_model`` does a full weight restore plus a device sync, so switch
+    *count* matters), and given its own local advantages/returns. That's safe
+    here specifically because ``--hybrid`` forces ``--fully-async``, which
+    forces ``assert not args.normalize_advantages`` at arg-parse time — the
+    only cross-sample step in ``compute_advantages_and_returns`` — so
+    advantage/return math has no cross-chunk dependency on this path.
+
+    The resulting microbatches are exposed via ``MicroBatchListIterator``'s
+    ``(batch_dict, meta)`` interface with ``__loss_scale__`` injected, and
+    ``StreamingIteratorBase`` makes ``train()``/``train_one_step``
+    (relax/backends/megatron/model.py) dispatch them through Megatron's
+    ``no_sync``-accumulate streaming schedule
+    (relax/backends/megatron/streaming_schedules.py) — every chunk's backward
+    accumulates into the grad buffer under one shared ``no_sync()`` region and
+    grads are synced/optimizer-stepped exactly once for the whole mini, so
+    weights never move mid-mini. That's what avoids the drift a previous
+    ``num_iters_per_train_update``-based chunking attempt caused (see the
+    comment on ``train_hybrid``): there is no intermediate ``optimizer.step()``
+    for later chunks' log-probs/ratios to go stale against.
+    """
+
+    def __init__(
+        self,
+        actor: "MegatronTrainRayActor",
+        rollout_id: int,
+        mini_idx: int,
+        plan: RolloutMiniBatchPlan,
+        data_fields: list[str],
+        task_name: str,
+        chunks: list[RolloutBatch] | None = None,
+    ) -> None:
+        args = actor.args
+        num_chunks = args.num_iters_per_train_update
+        if chunks is None:
+            chunks, chunk_iterators = self._fetch_and_forward_pipelined(
+                actor, rollout_id, mini_idx, plan, data_fields, task_name, num_chunks
+            )
+        else:
+            if len(chunks) != num_chunks:
+                raise RuntimeError(
+                    f"train_hybrid debug chunks length mismatch: expected {num_chunks} "
+                    f"(--num-iters-per-train-update), got {len(chunks)}."
+                )
+            chunk_iterators = self._forward_role_major(actor, chunks)
+
+        loss_scale = 1.0 / plan.mini_global_samples * mpu.get_data_parallel_world_size(with_context_parallel=True)
+
+        opd_keys: list[str] = []
+        consume_opd_train_data(opd_keys, args)
+        field_keys = _HYBRID_CHUNK_FIELD_KEYS + opd_keys
+
+        mbs: list[tuple[dict, Any]] = []
+        for chunk, (data_iterator, num_microbatches) in zip(chunks, chunk_iterators, strict=True):
+            if args.compute_advantages_and_returns:
+                assert not args.normalize_advantages, (
+                    "--num-iters-per-train-update > 1 computes advantages per chunk; this is only "
+                    "correct when advantage/return math has no cross-chunk statistics. "
+                    "--normalize-advantages is already rejected under --fully-async/--hybrid at "
+                    "arg-parse time (see slime_validate_args) — this assert is defense in depth."
+                )
+                compute_advantages_and_returns(args, chunk)
+            di = data_iterator[0]
+            di.reset()
+            for _ in range(num_microbatches[0]):
+                mbs.append((di.get_next(field_keys), None))
+
+        super().__init__(mbs, loss_scale=loss_scale)
+
+    @staticmethod
+    def _validate_chunk_batch_size(actor: "MegatronTrainRayActor", plan: RolloutMiniBatchPlan, num_chunks: int) -> int:
+        # Chunk boundaries must land on whole prompt-group boundaries (n_samples_per_prompt
+        # samples/group): the producer already PUTs data to TransferQueue in whole-group
+        # batches (transfer_batch_size derivation in relax/engine/rollout/sglang_rollout.py
+        # and relax/agentic/pipeline/transfer.py both floor-divide by n_samples_per_prompt),
+        # and the group-aware TQ sampler expects GET requests aligned the same way. A chunk
+        # size that isn't a multiple of n_samples_per_prompt asks for a slice that splits a
+        # group across two chunks, which the sampler can never satisfy — it doesn't error,
+        # it just blocks until TransferQueue's own client-side timeout fires deep inside
+        # get_meta(), which is a much more confusing failure than validating this up front.
+        n_samples_per_prompt = max(1, getattr(actor.args, "n_samples_per_prompt", 1) or 1)
+        chunk_batch_size = plan.mini_local_sample_request // num_chunks
+        if plan.mini_local_sample_request % num_chunks != 0 or chunk_batch_size % n_samples_per_prompt != 0:
+            total_groups = plan.mini_local_sample_request // n_samples_per_prompt
+            raise ValueError(
+                "--num-iters-per-train-update must evenly divide the per-DP mini's prompt-group "
+                f"count so every chunk stays aligned to whole prompt groups. Got "
+                f"mini_local_sample_request={plan.mini_local_sample_request} samples / "
+                f"n_samples_per_prompt={n_samples_per_prompt} = {total_groups} groups, "
+                f"num_iters_per_train_update={num_chunks} does not divide {total_groups} evenly."
+            )
+        return chunk_batch_size
+
+    @staticmethod
+    def _compute_roles(actor: "MegatronTrainRayActor") -> list[tuple[str, str]]:
+        """Ordered (role, store_prefix) pairs whose forward pass actually runs
+        this mini, matching the dispatch in ``_forward_role_major``. Empty when
+        ``--compute-advantages-and-returns`` is off, or when ``--use-rollout-
+        logprobs`` skips the (only remaining) actor forward.
+
+        Routing-replay bookkeeping (``ROUTING_REPLAY_STAGE`` /
+        ``fill_routing_replay`` / ``RoutingReplay.clear_all_forward``) is
+        deliberately absent from the pipelined caller below —
+        ``_train_hybrid_chunked`` already asserts ``not (use_routing_replay or
+        use_rollout_routing_replay)`` before this class is ever constructed, so
+        those branches are provably dead here.
+        """
+        args = actor.args
+        if not args.compute_advantages_and_returns:
+            return []
+        roles: list[tuple[str, str]] = []
+        if "ref" in actor.weights_backuper.backup_tags:
+            roles.append(("ref", "ref_"))
+        if "teacher" in actor.weights_backuper.backup_tags:
+            roles.append(("teacher", "teacher_"))
+        if not args.use_rollout_logprobs or args.get_mismatch_metrics:
+            roles.append(("old_actor" if args.keep_old_actor else "actor", ""))
+        return roles
+
+    @classmethod
+    def _fetch_and_forward_pipelined(
+        cls,
+        actor: "MegatronTrainRayActor",
+        rollout_id: int,
+        mini_idx: int,
+        plan: RolloutMiniBatchPlan,
+        data_fields: list[str],
+        task_name: str,
+        num_chunks: int,
+    ) -> tuple[list[RolloutBatch], list[tuple[list[DataIterator], list[int]]]]:
+        """Fetch all chunks and run their forward passes, overlapping each
+        chunk's TransferQueue fetch with the *previous* chunk's forward compute
+        wherever real compute exists to hide it behind.
+
+        Safety boundary (see class docstring): only the meta-only warm
+        (``tq_client.get_meta``, a plain Ray RPC) runs on a background thread.
+        The actual data fetch — ``get_data`` plus the TP broadcast in
+        ``get_data_from_transfer_queue`` — always runs synchronously on the
+        main thread, in lockstep with every other rank, because that broadcast
+        shares the tensor-model-parallel process group with the forward pass's
+        own collectives; running it concurrently from a second thread risks an
+        out-of-order NCCL call on that same group. This mirrors exactly the
+        tail-prefetch already proven in
+        ``StreamingTQIterator._warm_next_batch_index`` / ``_emit_data_batch``
+        (relax/utils/data/stream_dataloader.py) for the non-hybrid fully-async
+        path.
+        """
+        args = actor.args
+        chunk_batch_size = cls._validate_chunk_batch_size(actor, plan, num_chunks)
+        compute_roles = cls._compute_roles(actor)
+        partition_id = sft_partition_id(args, rollout_id)
+
+        warm_executor = None
+        if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
+            from concurrent.futures import ThreadPoolExecutor
+
+            warm_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hybrid-chunk-warm")
+
+        def fetch_one(chunk_idx: int) -> RolloutBatch:
+            batch_index = mini_idx * num_chunks + chunk_idx
+            last_warn = time.monotonic()
+            chunk = None
+            while chunk is None:
+                chunk, _batch_meta = actor._get_data_from_transfer_queue(
+                    task_name, rollout_id, data_fields, chunk_batch_size, batch_index
+                )
+                if chunk is None:
+                    now = time.monotonic()
+                    if now - last_warn >= 60.0:
+                        logger.warning(
+                            "train_hybrid num_iters_per_train_update chunk fetch stalled: "
+                            "rollout_id=%s mini_idx=%s chunk_idx=%s/%s batch_index=%s task=%s size=%s.",
+                            rollout_id,
+                            mini_idx,
+                            chunk_idx,
+                            num_chunks,
+                            batch_index,
+                            task_name,
+                            chunk_batch_size,
+                        )
+                        last_warn = now
+                    time.sleep(0.1)
+                    continue
+                if len(chunk["total_lengths"]) != chunk_batch_size:
+                    raise RuntimeError(
+                        f"train_hybrid chunk size mismatch for rollout_id={rollout_id} mini_idx={mini_idx} "
+                        f"chunk_idx={chunk_idx}: expected {chunk_batch_size}, got {len(chunk['total_lengths'])}."
+                    )
+            return chunk
+
+        def warm_one(chunk_idx: int) -> None:
+            if warm_executor is None or chunk_idx >= num_chunks:
+                return
+            batch_index = mini_idx * num_chunks + chunk_idx
+            sampling_config = {
+                "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+                "task_name": task_name,
+            }
+
+            def _task() -> None:
+                try:
+                    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
+                    actor.data_system_client.get_meta(
+                        data_fields=data_fields,
+                        batch_size=chunk_batch_size,
+                        partition_id=partition_id,
+                        sampling_config=config,
+                        task_name=task_name,
+                    )
+                except Exception as e:  # noqa: BLE001 - best-effort; real fetch retries on miss
+                    logger.debug("[_HybridChunkIterator] warm chunk_idx=%d failed: %s", chunk_idx, e)
+
+            try:
+                warm_executor.submit(_task)
+            except RuntimeError:
+                pass  # executor already shut down
+
+        chunks: list[RolloutBatch] = [fetch_one(0)]
+        warm_one(1)
+
+        chunk_iterators: list[tuple[list[DataIterator], list[int]]] = []
+        chunk_logprob_iterators: list[tuple[list[DataIterator], list[int]]] = []
+
+        def prepare(chunk: RolloutBatch) -> tuple[list[DataIterator], list[int]]:
+            data_iterator, num_microbatches = get_data_iterator(args, actor.model, chunk)
+            if args.use_dynamic_batch_size and args.log_probs_max_tokens_per_gpu != args.max_tokens_per_gpu:
+                data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
+                    args, actor.model, chunk, max_tokens_per_gpu=args.log_probs_max_tokens_per_gpu
+                )
+            else:
+                data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
+            chunk_iterators.append((data_iterator, num_microbatches))
+            chunk_logprob_iterators.append((data_iterator_logprobs, num_microbatches_logprobs))
+            return data_iterator_logprobs, num_microbatches_logprobs
+
+        if not compute_roles:
+            # No forward compute exists to hide a fetch behind — fall back to
+            # straight-line sequential fetch, same as before this change.
+            for chunk_idx in range(1, num_chunks):
+                chunks.append(fetch_one(chunk_idx))
+            if warm_executor is not None:
+                warm_executor.shutdown(wait=False)
+            for chunk in chunks:
+                prepare(chunk)
+            return chunks, chunk_iterators
+
+        # First compute role: interleave fetch(chunk i+1) / warm(chunk i+2) with
+        # forward(chunk i) so the *next* chunk's TransferQueue round trip overlaps
+        # this chunk's GPU compute instead of happening back-to-back beforehand.
+        first_role, first_prefix = compute_roles[0]
+        actor._switch_model(first_role)
+        for chunk_idx in range(num_chunks):
+            if chunk_idx > 0:
+                chunks.append(fetch_one(chunk_idx))  # already warmed by the previous iteration
+                warm_one(chunk_idx + 1)
+            dip, nmp = prepare(chunks[chunk_idx])
+            chunks[chunk_idx].update(actor.compute_log_prob(dip, nmp, store_prefix=first_prefix))
+
+        if warm_executor is not None:
+            warm_executor.shutdown(wait=False)
+
+        # Remaining roles (if any): all chunks are resident now, no more fetching.
+        for role, prefix in compute_roles[1:]:
+            actor._switch_model(role)
+            iterators = chunk_logprob_iterators if role in ("ref", "teacher") else chunk_iterators
+            for chunk, (dip, nmp) in zip(chunks, iterators, strict=True):
+                chunk.update(actor.compute_log_prob(dip, nmp, store_prefix=prefix))
+
+        return chunks, chunk_iterators
+
+    @staticmethod
+    def _forward_role_major(
+        actor: "MegatronTrainRayActor", chunks: list[RolloutBatch]
+    ) -> list[tuple[list[DataIterator], list[int]]]:
+        """Run ref/teacher/actor forward passes for all chunks of one mini,
+        switching into each role at most once (see class docstring)."""
+        args = actor.args
+        chunk_iterators: list[tuple[list[DataIterator], list[int]]] = []
+        chunk_logprob_iterators: list[tuple[list[DataIterator], list[int]]] = []
+        for chunk in chunks:
+            data_iterator, num_microbatches = get_data_iterator(args, actor.model, chunk)
+            if args.use_dynamic_batch_size and args.log_probs_max_tokens_per_gpu != args.max_tokens_per_gpu:
+                data_iterator_logprobs, num_microbatches_logprobs = get_data_iterator(
+                    args, actor.model, chunk, max_tokens_per_gpu=args.log_probs_max_tokens_per_gpu
+                )
+            else:
+                data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
+            chunk_iterators.append((data_iterator, num_microbatches))
+            chunk_logprob_iterators.append((data_iterator_logprobs, num_microbatches_logprobs))
+
+            if args.use_rollout_routing_replay:
+                actor.fill_routing_replay(data_iterator, num_microbatches, chunk)
+
+        if not args.compute_advantages_and_returns:
+            return chunk_iterators
+
+        if "ref" in actor.weights_backuper.backup_tags:
+            if args.use_routing_replay:
+                os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+            actor._switch_model("ref")
+            for chunk, (dip, nmp) in zip(chunks, chunk_logprob_iterators, strict=True):
+                chunk.update(actor.compute_log_prob(dip, nmp, store_prefix="ref_"))
+
+        if "teacher" in actor.weights_backuper.backup_tags:
+            if args.use_routing_replay:
+                os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+            actor._switch_model("teacher")
+            for chunk, (dip, nmp) in zip(chunks, chunk_logprob_iterators, strict=True):
+                chunk.update(actor.compute_log_prob(dip, nmp, store_prefix="teacher_"))
+
+        actor._switch_model("old_actor" if args.keep_old_actor else "actor")
+        if not args.use_rollout_logprobs or args.get_mismatch_metrics:
+            for chunk, (di, nm) in zip(chunks, chunk_iterators, strict=True):
+                if args.use_routing_replay:
+                    if args.use_rollout_routing_replay:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                    else:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                chunk.update(actor.compute_log_prob(di, nm, store_prefix=""))
+                if args.use_rollout_routing_replay:
+                    RoutingReplay.clear_all_forward()
+
+        return chunk_iterators
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -1236,21 +1588,232 @@ class MegatronTrainRayActor(TrainRayActor):
         fully-async's streaming data pipeline. Actor and rollout run on separate GPUs,
         but actor/ref/actor_fwd share the same GPUs via role switching.
 
-        Data is processed in sub-batches (controlled by --num-steps-per-rollout via
-        build_rollout_minibatch_plan) to reduce peak GPU memory during forward passes,
-        matching fully-async behavior. Advantages are computed after all sub-batches
-        are collected to ensure correct global normalization across the full batch
-        and DP group. The merged batch is then trained as a single optimizer step
-        (get_data_iterator derives its own microbatch chunking from
-        --micro-batch-size / --max-tokens-per-gpu, same as colocate/fully-async);
-        peak training-side memory is bounded by that per-microbatch chunking alone,
-        not by splitting into multiple separate optimizer.step() calls — the latter
-        would let later chunks train against a policy that earlier chunks' steps
-        already moved away from rollout_log_probs/log_probs.
+        Two sub-batch-count knobs are in play, and they mean different things:
+
+        - ``--num-steps-per-rollout`` (-> ``plan.num_rollout_minis``, see
+          ``build_rollout_minibatch_plan``): genuinely separate, intentional
+          optimizer.step() calls per rollout (e.g. multi-epoch PPO). Each mini is
+          exactly one ``global_batch_size`` worth of data. Untouched by this method's
+          two code paths below — both honor it identically.
+        - ``--num-iters-per-train-update``: splits the fetch+forward+backward of ONE
+          mini into N pipelined TransferQueue chunks *without* adding any extra
+          optimizer.step() — see ``_train_hybrid_chunked``.
+
+        Dispatches to one of two implementations:
+
+        - ``_train_hybrid_chunked`` (when ``--num-iters-per-train-update`` > 1, dynamic
+          batch size, no virtual pipeline parallelism, not debug_train_only): each mini's
+          fetch/forward/backward is split into N chunks via ``_HybridChunkIterator``,
+          which reuses Megatron's ``no_sync``-accumulate streaming schedule
+          (relax/backends/megatron/streaming_schedules.py) so the whole mini still ends
+          in exactly one ``optimizer.step()`` — weights never move mid-mini, so later
+          chunks' log-probs/ratios never go stale against an already-updated policy.
+        - ``_train_hybrid_merged`` (default, N=1, or any of the above preconditions
+          unmet): the original single-shot path — collect all of a mini's sub-batches,
+          merge, compute advantages with correct global normalization, then train as one
+          `get_data_iterator`-derived step. A *previous* attempt to split this via
+          ``--num-iters-per-train-update`` was reverted because it emitted a separate
+          ``optimizer.step()`` per chunk, so chunk 2+ computed their PPO ratio against a
+          policy that chunk 1's step had already moved away from — real, unintended
+          policy drift. ``_train_hybrid_chunked`` does not reintroduce that failure mode
+          (see its docstring).
         """
-        logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
         plan = build_rollout_minibatch_plan(self.args, dp_size)
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+        use_chunked_pipeline = (
+            self.args.num_iters_per_train_update > 1
+            and self.args.use_dynamic_batch_size
+            and vpp_size == 1
+            and not self.args.debug_train_only
+        )
+
+        if use_chunked_pipeline:
+            rollout_data = self._train_hybrid_chunked(rollout_id, plan)
+        else:
+            rollout_data = self._train_hybrid_merged(rollout_id, plan)
+
+        train_dump_utils.save_debug_train_data(
+            self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
+        )
+
+        if self.args.use_routing_replay:
+            RoutingReplay.clear_all()
+
+        # Update CPU actor weight backup
+        self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
+
+        # Update ref model if needed
+        if (
+            self.args.ref_update_interval is not None
+            and (rollout_id + 1) % self.args.ref_update_interval == 0
+            and "ref" in self.weights_backuper.backup_tags
+        ):
+            with timer("ref_model_update"):
+                if is_megatron_main_rank():
+                    logger.info(f"Updating ref model at rollout_id {rollout_id}")
+                self.weights_backuper.backup("ref")
+
+        total_lengths = rollout_data["total_lengths"]
+        all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+        dist.all_gather_object(
+            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+        )
+        all_total_lengths = sum(all_total_lengths, [])  # flatten
+        Timer().seq_lens = all_total_lengths
+        mm_inputs = rollout_data.get("multimodal_train_inputs")
+        if mm_inputs is not None:
+            images_seqlens = _extract_images_seqlens(mm_inputs)
+            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().images_seqlens = sum(all_images_seqlens, [])
+            audio_seqlens = _extract_audio_seqlens(mm_inputs)
+            all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().audio_seqlens = sum(all_audio_seqlens, [])
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+
+        is_train_done = (rollout_id + 1) == self.args.num_rollout
+        if self.args.save is not None and (
+            self.args.rotate_ckpt
+            or self.args.save_interval is not None
+            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
+        ):
+            self.save_model(rollout_id, force_sync=is_train_done)
+
+        if self.args.debug_train_only:
+            # In debug_train_only mode no rollout/eval services exist, so skip the
+            # weight-sync + eval coordination below (mirrors `train`'s debug path
+            # which never touches those services). Metrics are still flushed.
+            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+            return
+
+        # Mirror train_async's pause/resume coordination so the rollout service
+        # has a chance to finish its in-flight step (and refill any partition
+        # gaps it owes) before we swap weights. Without this gate the rollout
+        # can race ahead while train_hybrid is still mid-consume on a
+        # partially-filled partition, deadlocking against the staleness bound.
+        self._wait_for_previous_eval()
+        self._check_services_health()
+
+        # Push weights to rollout. --hybrid-weight-sync-backend selects the
+        # mechanism: cuda_ipc (default) goes through update_weights(), the same
+        # colocate-style path used before DCS support was added; dcs reads the
+        # "actor" snapshot tag via checkpoint_engine_client (see
+        # _create_checkpoint_engine_client). Both are always synchronous — see
+        # the comment in __init__ on why overlapping the dcs push with the next
+        # training iteration on a background thread was tried and reverted
+        # (cross-thread collective deadlock risk against Megatron's own process
+        # groups).
+        # TEMPORARY: neither branch's existing timing (update_weights() has a @timer
+        # decorator, but perf/update_weights_time never surfaces in the perf-report
+        # dict — likely a different Timer() bucket than what gets flushed there) shows
+        # up in the logged perf dict, so there's no apples-to-apples wall-time
+        # comparison between dcs and cuda_ipc. Explicit with-timer blocks on both
+        # branches guarantee both use the exact same (proven-working) mechanism.
+        # Remove once compared.
+        if self._use_dcs_hybrid_weight_sync:
+            with timer("dcs_update_weights"):
+                run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
+        else:
+            with timer("cuda_ipc_update_weights"):
+                self.update_weights()
+        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+        dist.barrier(group=get_gloo_group())
+        self._run_step_evaluation(rollout_id, end_update_weight=True)
+
+        # On the final training step the rollout component has already
+        # exited its main loop, so the eval just triggered above will not
+        # be awaited anywhere. Block until it finishes; otherwise the
+        # controller's atexit shutdown races with eval and tears down the
+        # SGLang engines mid-flight.
+        if is_train_done:
+            self._wait_for_previous_eval()
+
+    def _train_hybrid_chunked(self, rollout_id: int, plan: RolloutMiniBatchPlan) -> RolloutBatch:
+        """Pipelined path: split each mini's fetch+forward+backward into
+        ``args.num_iters_per_train_update`` TransferQueue chunks via
+        ``_HybridChunkIterator`` (see its docstring for the no-drift argument),
+        one iterator per mini, then a single `train()` call — Megatron's
+        streaming dispatch (``StreamingIteratorBase``, model.py) runs each
+        mini's chunks through the ``no_sync``-accumulate schedule, so each mini
+        still ends in exactly one ``optimizer.step()``, same as
+        ``_train_hybrid_merged``."""
+        assert not (self.args.use_routing_replay or self.args.use_rollout_routing_replay), (
+            "--num-iters-per-train-update > 1 does not support routing replay yet: MoE EP "
+            "all-to-all ordering assumes one coherent forward-pass call sequence, which "
+            "per-chunk role-major forwarding does not preserve. Use --num-iters-per-train-update=1 "
+            "(or disable routing replay) for now."
+        )
+        logger.info(
+            f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid "
+            f"(chunked, num_iters_per_train_update={self.args.num_iters_per_train_update})."
+        )
+        data_fields = [
+            "tokens",
+            "total_lengths",
+            "response_lengths",
+            "loss_masks",
+            "rollout_log_probs",
+            "rewards",
+            "raw_reward",
+        ]
+        if self.args.multimodal_keys is not None:
+            data_fields.append("multimodal_train_inputs")
+        if self.args.use_opd and self.args.opd_type == "sglang":
+            data_fields.append("teacher_log_probs")
+
+        if self._active_model_tag != "actor":
+            self._switch_model("actor")
+
+        data_iterator = [
+            _HybridChunkIterator(self, rollout_id, mini_idx, plan, data_fields, "train")
+            for mini_idx in range(plan.num_rollout_minis)
+        ]
+        num_microbatches = [1 for _ in range(plan.num_rollout_minis)]  # streaming schedule ignores this value
+
+        data_for_log: list = []
+        for iterator in data_iterator:
+            data_for_log.extend(iterator.get_buffer())
+        rollout_data = merge_dict_list(data_for_log)
+
+        with inverse_timer("train_wait"), timer("train"):
+            if self.rollout_data_postprocess is not None:
+                self.rollout_data_postprocess(self.args)
+
+            log_rollout_data(rollout_id, self.args, rollout_data)
+
+            if self.args.use_routing_replay:
+                os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            with timer("actor_train"):
+                train(
+                    rollout_id,
+                    self.model,
+                    self.optimizer,
+                    self.opt_param_scheduler,
+                    data_iterator,
+                    num_microbatches,
+                )
+
+            self.prof.step(rollout_id=rollout_id)
+
+        return rollout_data
+
+    def _train_hybrid_merged(self, rollout_id: int, plan: RolloutMiniBatchPlan) -> RolloutBatch:
+        """Original single-shot path: collect all of a mini's sub-batches from
+        TransferQueue, merge, compute advantages with correct global
+        normalization, then train the merged batch as one
+        ``get_data_iterator``-derived step.
+
+        Used whenever the ``_train_hybrid_chunked`` preconditions aren't met
+        (default N=1, VPP, debug_train_only, or fixed micro-batch-size hybrid
+        mode).
+        """
+        logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train_hybrid.")
         batch_size = plan.mini_local_sample_request
 
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
@@ -1361,21 +1924,13 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # ── Phase 3: train on the fully merged batch. Deliberately do NOT set
-            # ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY here (that would force
+            # ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY here — that would force
             # get_data_iterator to split into multiple *separate* optimizer.step()
-            # calls, one per chunk — the previous num_iters_per_train_update-based
-            # re-chunking did exactly that, and it means chunk 2+ compute their
-            # PPO-style ratio against a policy that chunk 1's step has already
-            # moved away from rollout_log_probs/log_probs: real policy drift that
-            # isn't present anywhere else in the codebase at this granularity).
-            # Leaving the key unset lets get_data_iterator fall back to its
-            # global_batch_size-derived step count (same path colocate/fully-async
-            # use), which is 1 step under the standard on-policy sizing
-            # (global_batch_size == rollout_batch_size * n_samples_per_prompt).
-            # Peak training-side memory is still bounded the normal Megatron way,
-            # via --micro-batch-size / --max-tokens-per-gpu chunking microbatches
-            # *within* that single step (same params, gradients only accumulate,
-            # optimizer.step() fires once) — no drift, no separate CLI knob needed.
+            # calls, one per chunk (see train_hybrid's docstring for why that's
+            # unsafe). Leaving the key unset gives 1 step under the standard
+            # on-policy sizing (global_batch_size == rollout_batch_size *
+            # n_samples_per_prompt); --micro-batch-size / --max-tokens-per-gpu still
+            # chunk microbatches *within* that single step the normal Megatron way.
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -1391,97 +1946,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
-        train_dump_utils.save_debug_train_data(
-            self.args, rollout_id=rollout_id, rollout_data=rollout_data, tokenizer=self.tokenizer
-        )
-
-        if self.args.use_routing_replay:
-            RoutingReplay.clear_all()
-
-        # Update CPU actor weight backup
-        self.weights_backuper.backup("actor", on_device=self._weights_backup_on_device)
-
-        # Update ref model if needed
-        if (
-            self.args.ref_update_interval is not None
-            and (rollout_id + 1) % self.args.ref_update_interval == 0
-            and "ref" in self.weights_backuper.backup_tags
-        ):
-            with timer("ref_model_update"):
-                if is_megatron_main_rank():
-                    logger.info(f"Updating ref model at rollout_id {rollout_id}")
-                self.weights_backuper.backup("ref")
-
-        total_lengths = rollout_data["total_lengths"]
-        all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-        dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
-        )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
-        Timer().seq_lens = all_total_lengths
-        mm_inputs = rollout_data.get("multimodal_train_inputs")
-        if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-            dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
-            )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
-            audio_seqlens = _extract_audio_seqlens(mm_inputs)
-            all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-            dist.all_gather_object(
-                all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
-            )
-            Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
-
-        is_train_done = (rollout_id + 1) == self.args.num_rollout
-        if self.args.save is not None and (
-            self.args.rotate_ckpt
-            or self.args.save_interval is not None
-            and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
-        ):
-            self.save_model(rollout_id, force_sync=is_train_done)
-
-        if self.args.debug_train_only:
-            # In debug_train_only mode no rollout/eval services exist, so skip the
-            # weight-sync + eval coordination below (mirrors `train`'s debug path
-            # which never touches those services). Metrics are still flushed.
-            tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-            return
-
-        # Mirror train_async's pause/resume coordination so the rollout service
-        # has a chance to finish its in-flight step (and refill any partition
-        # gaps it owes) before we swap weights. Without this gate the rollout
-        # can race ahead while train_hybrid is still mid-consume on a
-        # partially-filled partition, deadlocking against the staleness bound.
-        self._wait_for_previous_eval()
-        self._check_services_health()
-
-        # Push weights to rollout. --hybrid-weight-sync-backend selects the
-        # mechanism: cuda_ipc (default) goes through update_weights(), the same
-        # colocate-style path used before DCS support was added; dcs reads the
-        # "actor" snapshot tag via checkpoint_engine_client (see
-        # _create_checkpoint_engine_client). Both are always synchronous — see
-        # the comment in __init__ on why overlapping the dcs push with the next
-        # training iteration on a background thread was tried and reverted
-        # (cross-thread collective deadlock risk against Megatron's own process
-        # groups).
-        if self._use_dcs_hybrid_weight_sync:
-            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only=True))
-        else:
-            self.update_weights()
-        tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-        dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id, end_update_weight=True)
-
-        # On the final training step the rollout component has already
-        # exited its main loop, so the eval just triggered above will not
-        # be awaited anywhere. Block until it finishes; otherwise the
-        # controller's atexit shutdown races with eval and tears down the
-        # SGLang engines mid-flight.
-        if is_train_done:
-            self._wait_for_previous_eval()
+        return rollout_data
 
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
