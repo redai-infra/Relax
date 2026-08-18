@@ -324,6 +324,99 @@ def test_dr_grpo_cp_padding_preserves_token_count_and_reduction() -> None:
     assert all(torch.equal(value, reduced_values[0]) for value in reduced_values[1:])
 
 
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_get_cp_local_num_tokens_counts_fully_masked_response_as_zero(cp_size: int) -> None:
+    """Every CP degree must count real unmasked tokens, with no per-sample clamp.
+
+    A filtered sample stays in the batch with an all-zero loss_mask. Clamping
+    its count to 1 at CP=1 made that branch report one more token than CP>1 for
+    the same data -- the asymmetry behind the CP-dependent Dr.GRPO denominator.
+    """
+    total_lengths = [16, 8]
+    response_lengths = [8, 4]
+    loss_masks = [torch.ones(8, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)]
+
+    total = sum(
+        cp_utils_module.get_cp_local_num_tokens(
+            total_lengths,
+            response_lengths,
+            loss_masks,
+            dynamic_cp_size=cp_size,
+            dynamic_cp_rank=cp_rank,
+        )
+        for cp_rank in range(cp_size)
+    )
+
+    assert float(total) == 8.0, f"cp_size={cp_size}"
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_get_cp_local_num_tokens_is_zero_when_every_response_is_masked(cp_size: int) -> None:
+    """A fully-filtered window yields a zero denominator, not a clamped one.
+
+    Callers must guard their own division; Megatron's ``finalize_model_grads``
+    already skips its ``1 / num_tokens`` scaling when the count is not positive.
+    """
+    loss_masks = [torch.zeros(8, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)]
+
+    total = sum(
+        cp_utils_module.get_cp_local_num_tokens(
+            [16, 8], [8, 4], loss_masks, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
+        )
+        for cp_rank in range(cp_size)
+    )
+
+    assert float(total) == 0.0, f"cp_size={cp_size}"
+
+
+def test_dr_grpo_flags_fully_masked_window_and_leaves_others_alone(monkeypatch) -> None:
+    """A window whose every response is filtered must be flagged and zero-scaled.
+
+    The gradient is then exactly zero, but stepping is not a no-op: Adam still
+    decays its moments and the scheduler still burns a global batch of LR
+    budget. ``train_one_step`` skips both when it sees this flag.
+    """
+    monkeypatch.setattr(loss_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loss_module.mpu, "get_data_parallel_group", lambda **kwargs: None)
+
+    metadata = loss_module.prepare_policy_optimizer_window_metadata(
+        Namespace(advantage_estimator="dr_grpo", rollout_max_response_len=4),
+        # Window 0: every response fully masked. Window 1: one masked, one kept.
+        {"loss_masks": [torch.zeros(4), torch.zeros(4), torch.zeros(4), torch.ones(4)]},
+        [2, 2],
+    )
+
+    assert float(metadata[0]["__dr_grpo_window_scale__"]) == 0.0
+    assert bool(metadata[0]["__optimizer_window_empty__"]) is True
+    # A partially masked window still trains, and must not be skipped.
+    assert float(metadata[1]["__dr_grpo_window_scale__"]) == 0.5
+    assert bool(metadata[1]["__optimizer_window_empty__"]) is False
+
+
+def test_optimizer_window_empty_flag_reaches_every_micro_batch(monkeypatch):
+    """Every micro-batch of a window must carry that window's own verdict.
+
+    ``train_one_step`` reads the flag off the batch in ``forward_step`` rather
+    than taking it as an argument, so this delivery path is what it relies on.
+    """
+    monkeypatch.setattr(loss_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loss_module.mpu, "get_data_parallel_group", lambda **kwargs: None)
+
+    num_microbatches = [2, 1]
+    metadata = loss_module.prepare_policy_optimizer_window_metadata(
+        Namespace(advantage_estimator="dr_grpo", rollout_max_response_len=4),
+        # Window 0 (2 micro-batches) fully masked; window 1 (1 micro-batch) trains.
+        {"loss_masks": [torch.zeros(4), torch.zeros(4), torch.ones(4)]},
+        [2, 1],
+    )
+    iterator = data_module.DataIterator({"loss_masks": [torch.zeros(4)] * 3}, micro_batch_size=1)
+    data_module.bind_optimizer_window_metadata([iterator], num_microbatches, metadata)
+
+    flags = [bool(iterator.get_next(["loss_masks"])["__optimizer_window_empty__"]) for _ in range(3)]
+
+    assert flags == [True, True, False]
+
+
 def test_dr_grpo_long_response_weight_is_proportional_to_valid_tokens(monkeypatch) -> None:
     monkeypatch.setattr(loss_module.dist, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_group", lambda **kwargs: None)
@@ -530,6 +623,11 @@ ENTROPY_COEF = 0.01
 KL_LOSS_COEF = 0.01
 REFERENCE_LOG_PROB = -0.5
 
+# One response whose entire loss_mask is zeroed, as --rollout-sample-filter-path
+# does. Index 1 carries 896 valid tokens, well above any rounding slack.
+FULLY_MASKED_INDEX = 1
+FROZEN_MASKED_RESPONSE_TOKENS = FROZEN_RESPONSE_TOKENS - 896  # 4034
+
 # Four responses that share advantage -3 but differ ~73x in valid token count.
 # Their gradients must stay proportional to those counts, which is the
 # long-vs-short weighting claim at a far wider spread than a toy two-sample
@@ -559,20 +657,32 @@ def _build_loss_mask(response_length: int, variant: int) -> list[int]:
     return loss_mask
 
 
-def _build_window() -> list[dict]:
-    """16 responses ordered so contiguous DP shards are token-imbalanced."""
+def _build_window(fully_masked_indices: tuple[int, ...] = ()) -> list[dict]:
+    """16 responses ordered so contiguous DP shards are token-imbalanced.
+
+    ``fully_masked_indices`` zeroes those responses' entire loss_mask, which is
+    what ``--rollout-sample-filter-path`` does to a filtered sample (utils.py
+    keeps the sample in the batch and sets ``loss_mask = [0] * response_length``).
+    The default empty tuple reproduces the frozen fixture exactly.
+    """
     window = []
     for length_block, response_length in enumerate(RESPONSE_LENGTH_BLOCKS):
         for group_index in range(GROUP_SIZE):
             offset = (length_block + group_index) % GROUP_SIZE
+            index = length_block * GROUP_SIZE + group_index
+            loss_mask = (
+                [0] * response_length
+                if index in fully_masked_indices
+                else _build_loss_mask(response_length, group_index)
+            )
             window.append(
                 {
-                    "index": length_block * GROUP_SIZE + group_index,
+                    "index": index,
                     "group_index": group_index,
                     "prompt_length": PROMPT_LENGTHS[offset],
                     "response_length": response_length,
                     "reward": REWARD_VALUES[offset],
-                    "loss_mask": _build_loss_mask(response_length, group_index),
+                    "loss_mask": loss_mask,
                 }
             )
     return window
@@ -791,9 +901,10 @@ def _reduce_window(
     use_bridge_padding=False,
     collect_gradients=False,
     cp_group=None,
+    fully_masked_indices=(),
 ):
     """Run one optimizer window end to end and return the reported metrics."""
-    window = _build_window()
+    window = _build_window(fully_masked_indices)
     advantages = _production_advantages(advantage_estimator)
     shard = NUM_RESPONSES // dp_size
     local = window[dp_rank * shard : (dp_rank + 1) * shard]
@@ -841,6 +952,12 @@ def _reduce_window(
             if cp_size > 1:
                 dist.all_reduce(gradient, group=cp_group)
             reported.setdefault("__gradients__", {})[index] = gradient.item()
+            # Replay finalize_model_grads' 1 / (all-reduced token count) scaling.
+            # A pre-finalizer gradient cannot see a mismatch between that
+            # denominator and the count folded into alpha -- where CP-topology
+            # dependence hides.
+            scaling = 1.0 / values[0] if values[0] > 0 else 1.0
+            reported.setdefault("__gradients_after_finalizer__", {})[index] = gradient.item() * scaling
     return reported
 
 
@@ -939,6 +1056,7 @@ def _topology_worker(rank: int, dp_size: int, cp_size: int, port: int) -> None:
         _assert_entropy_and_kl_combination(dp_size, dp_rank, cp_size)
         _assert_opsm_forced_branch(dp_size, dp_rank, cp_size)
         _assert_response_weight_tracks_valid_tokens(dp_size, dp_rank, cp_size, cp_groups[dp_rank])
+        _assert_fully_masked_response_keeps_denominators_aligned(dp_size, dp_rank, cp_size, cp_groups[dp_rank])
     finally:
         dist.destroy_process_group()
 
@@ -1086,6 +1204,45 @@ def _assert_response_weight_tracks_valid_tokens(dp_size, dp_rank, cp_size, cp_gr
     # Responses differing only in valid token count must not tie: a per-sample
     # mean would make all four gradients equal.
     assert len({round(gradients[index], 12) for index in SAME_ADVANTAGE_INDICES}) == len(SAME_ADVANTAGE_INDICES)
+
+
+def _assert_fully_masked_response_keeps_denominators_aligned(dp_size, dp_rank, cp_size, cp_group) -> None:
+    """A fully-masked response must not change the gradient at any CP degree.
+
+    Dr.GRPO reaches ``S / (N * B)`` indirectly: it scales the loss by
+    ``alpha = T_metadata / (N * B)`` and lets Megatron's finalizer divide the
+    summed gradient by ``T_finalizer``. The target is only hit when those two
+    independently computed counts are equal, so the post-finalizer gradient is
+    ``-advantage * valid_tokens / (N * B)`` with T cancelling out -- an oracle
+    that never mentions T, and so fails loudly if the two definitions drift.
+    """
+    reported = _reduce_window(
+        advantage_estimator="dr_grpo",
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        cp_size=cp_size,
+        dp_with_cp_group=dist.group.WORLD,
+        collect_gradients=True,
+        cp_group=cp_group,
+        fully_masked_indices=(FULLY_MASKED_INDEX,),
+    )
+    context = f"fully-masked response DP{dp_size}/CP{cp_size}"
+
+    # The finalizer denominator and the count alpha was built from, both pinned
+    # to the real token total. A reintroduced CP=1 clamp reports 4035 here.
+    assert reported["__response_tokens__"] == FROZEN_MASKED_RESPONSE_TOKENS, context
+    assert reported["__alpha__"] == FROZEN_MASKED_RESPONSE_TOKENS / (NUM_RESPONSES * RESPONSE_BUDGET), context
+
+    window = {response["index"]: response for response in _build_window((FULLY_MASKED_INDEX,))}
+    advantages = _production_advantages("dr_grpo")
+    for index, gradient in reported["__gradients_after_finalizer__"].items():
+        valid_tokens = sum(window[index]["loss_mask"])
+        expected = -advantages[index] * valid_tokens / (NUM_RESPONSES * RESPONSE_BUDGET)
+        assert abs(gradient - expected) < 1e-12, f"{context} index={index}"
+
+    # The filtered response itself must contribute nothing, not one phantom token.
+    if FULLY_MASKED_INDEX in reported["__gradients_after_finalizer__"]:
+        assert reported["__gradients_after_finalizer__"][FULLY_MASKED_INDEX] == 0.0, context
 
 
 @pytest.mark.parametrize(("dp_size", "cp_size"), TOPOLOGIES)

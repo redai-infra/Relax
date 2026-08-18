@@ -986,6 +986,7 @@ def train_one_step(
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
     main_loss_has_tokens = False
+    optimizer_window_empty_flag = None
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -1005,7 +1006,7 @@ def train_one_step(
             (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
         """
 
-        nonlocal main_loss_has_tokens
+        nonlocal main_loss_has_tokens, optimizer_window_empty_flag
         is_vl_model = getattr(args, "is_vl_model", False)
         sft_chunked = _should_use_sft_chunked(args)
         # Get the batch.
@@ -1038,6 +1039,8 @@ def train_one_step(
             )
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
+
+        optimizer_window_empty_flag = batch.get("__optimizer_window_empty__", None)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
@@ -1190,9 +1193,19 @@ def train_one_step(
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
     valid_step = True
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    optimizer_window_is_empty = optimizer_window_empty_flag is not None and bool(optimizer_window_empty_flag)
+    if optimizer_window_is_empty:
+        logger.warning(
+            "Skipping optimizer step: optimizer window has no loss-contributing tokens (rollout_id=%d, step_id=%d)",
+            rollout_id,
+            step_id,
+        )
+        valid_step = False
+        update_successful, grad_norm, num_zeros_in_grad = False, 0.0, None
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+    if valid_step and not getattr(args, "check_for_nan_in_loss_and_grad", True):
         # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
         # Detect overflow via the documented (False, None, None) return signature.
         found_inf_flag = not update_successful and grad_norm is None and num_zeros_in_grad is None
@@ -1215,7 +1228,7 @@ def train_one_step(
         # Update learning rate.
         assert update_successful
         opt_param_scheduler.step(increment=args.global_batch_size)
-    else:
+    elif not optimizer_window_is_empty:
         grad_norm = float("nan")
 
     if critic_value_head_snapshot is not None:
@@ -1255,7 +1268,7 @@ def train_one_step(
             # already counted once. A `* cp_size` here would over-weight metrics by
             # CP degree under dynamic CP (and is a no-op under static CP, where the
             # count previously carried the cancelling cp factor).
-            loss_reduced[key] = value / num_samples_or_tokens
+            loss_reduced[key] = value / num_samples_or_tokens if num_samples_or_tokens else 0.0
         return loss_reduced, grad_norm
     return {}, grad_norm
 

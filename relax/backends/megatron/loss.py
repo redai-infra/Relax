@@ -765,7 +765,11 @@ def prepare_policy_optimizer_window_metadata(
         stats = torch.stack(step_stats)
         dist.all_reduce(stats, group=mpu.get_data_parallel_group(with_context_parallel=False))
         step_loss_scales = stats[:, 1] / (stats[:, 0] * args.rollout_max_response_len)
-        return [{"__dr_grpo_window_scale__": scale} for scale in step_loss_scales]
+        step_window_empty = stats[:, 1] <= 0
+        return [
+            {"__dr_grpo_window_scale__": scale, "__optimizer_window_empty__": window_empty}
+            for scale, window_empty in zip(step_loss_scales, step_window_empty, strict=True)
+        ]
 
     return None
 
