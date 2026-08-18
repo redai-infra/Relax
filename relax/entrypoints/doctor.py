@@ -122,17 +122,24 @@ def _redact_error(message: str, argv: list[str]) -> str:
     return message
 
 
-def _active_roles(args) -> list[str]:
-    from relax.core.optional_roles import register_extra_roles
-    from relax.core.registry import ALGOS, process_role
+def _error_report(error: BaseException, argv: list[str]) -> dict:
+    message = _redact_error(f"{type(error).__name__}: {error}", argv)
+    error_text, marker, suggestion = message.partition(" Fix: ")
+    if isinstance(error, ModuleNotFoundError):
+        missing = getattr(error, "name", None) or "the missing module"
+        suggestion = f"install {missing!r} and the project requirements in the active environment"
+    elif "Upgrade with:" in message:
+        error_text, suggestion = message.split("Upgrade with:", 1)
+        suggestion = f"upgrade with:{suggestion}"
+    elif not marker:
+        suggestion = "correct the invalid option described above and rerun the check"
+    return {"status": "error", "error": error_text.rstrip(), "suggestion": suggestion.strip().rstrip(".")}
 
-    algorithm = "sft" if getattr(args, "loss_type", None) == "sft" else args.advantage_estimator
-    implementations = ALGOS[algorithm].copy()
-    extras = register_extra_roles(args, implementations)
-    resource = getattr(args, "resource", {})
-    roles = [str(role) for role in process_role(args) if role in implementations and str(role) in resource]
-    roles.extend(str(role) for role in extras if role in implementations and str(role) in resource)
-    return list(dict.fromkeys(roles))
+
+def _active_roles(args) -> list[str]:
+    from relax.utils.arguments import resolve_configured_roles
+
+    return resolve_configured_roles(args)
 
 
 def _resource_summary(args, roles: list[str]) -> dict:
@@ -141,7 +148,11 @@ def _resource_summary(args, roles: list[str]) -> dict:
     shared_roles = {"actor", "rollout", "genrm"}
     if getattr(args, "advantage_estimator", None) == "ppo" and resource.get("critic") == resource.get("actor"):
         shared_roles.add("critic")
-    shares_gpus = bool(getattr(args, "colocate", False) and not getattr(args, "hybrid", False))
+    shares_gpus = bool(
+        getattr(args, "colocate", False)
+        and not getattr(args, "hybrid", False)
+        and {"actor", "rollout"}.issubset(active)
+    )
     if shares_gpus:
         shared_gpu = max((spec[1] for role, spec in active.items() if role in shared_roles), default=0)
         independent_gpu = sum(spec[1] for role, spec in active.items() if role not in shared_roles)
@@ -193,19 +204,20 @@ def main(argv=None) -> int:
         # rather than StringIO while suppressing their verbose argument dumps.
         with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
             with redirect_stdout(stdout), redirect_stderr(stderr):
-                from relax.utils.arguments import parse_args, validate_preflight_args
+                from relax.utils.arguments import parse_args
 
                 args = parse_args(strict=True)
-                validate_preflight_args(args)
         _print_report(_report(args, training_argv), options.format)
         return 0
     except (Exception, SystemExit) as error:
-        message = _redact_error(f"{type(error).__name__}: {error}", training_argv)
-        payload = {"status": "error", "error": message}
+        payload = _error_report(error, training_argv)
         if options.format == "json":
             print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
         else:
-            print(f"Relax configuration check: FAILED\n{message}", file=sys.stderr)
+            print(
+                f"Relax configuration check: FAILED\n{payload['error']}\nFix: {payload['suggestion']}",
+                file=sys.stderr,
+            )
         return 1
     finally:
         sys.argv = original_argv

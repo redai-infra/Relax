@@ -21,6 +21,6 @@ Use `--format json` for machine-readable output:
 python -m relax.entrypoints.doctor --format json -- <training arguments>
 ```
 
-A valid configuration exits with code `0` and prints the merged configuration, active roles, GPU requirement, and expected training command. Invalid or unknown options return a non-zero exit code with the original validation message and a suggested correction where available.
+A valid configuration exits with code `0` and prints the merged configuration, active roles, GPU requirement, and expected training command. Invalid or unknown options return a non-zero exit code with the original validation message and a suggested correction.
 
 The command does not execute shell scripts. Expand a recipe first and pass the resulting training arguments directly. Sensitive values such as API keys, tokens, passwords, credentials, and `--wandb-key` are redacted from reports.

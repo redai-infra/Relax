@@ -83,29 +83,39 @@ def training_argv(tmp_path):
 
 
 def _error_cases():
-    path = Path(__file__).parent / "fixtures" / "doctor_errors.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    path = Path(__file__).parent / "fixtures" / "doctor_errors.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.mark.parametrize("case", _error_cases(), ids=lambda case: case["name"])
-def test_error_library_uses_real_parser(monkeypatch, training_argv, case):
-    from relax.backends.megatron import arguments as megatron_arguments
-    from relax.utils import arguments
-
+def test_error_library_uses_real_doctor(training_argv, case, capsys):
     argv = list(training_argv)
     if case.get("remove_prompt"):
         index = argv.index("--prompt-data")
         del argv[index : index + 2]
+    for flag in case.get("remove_flags", []):
+        argv.remove(flag)
     argv.extend(case["args"])
 
-    monkeypatch.setattr(megatron_arguments, "validate_args", lambda args: args)
-    monkeypatch.setattr(arguments, "sglang_validate_args", lambda args: None)
-    monkeypatch.setattr(arguments.sys, "argv", ["relax.entrypoints.train", *argv])
+    assert doctor.main(["--format", "json", "--", *argv]) == 1
+    captured = capsys.readouterr()
+    report = json.loads(captured.err)
+    assert case["contains"] in report["error"]
+    assert case["fix"] in report["suggestion"]
+    assert "Traceback" not in captured.err
 
-    with pytest.raises((AssertionError, FileNotFoundError, ValueError)) as error:
-        parsed = arguments.parse_args(strict=True)
-        arguments.validate_preflight_args(parsed)
-    assert case["contains"] in str(error.value)
+
+def test_valid_generalized_dataset_path_returns_success(training_argv, tmp_path, capsys):
+    second_prompt = tmp_path / "prompt-2.jsonl"
+    second_prompt.write_text('{"prompt": "2+2", "label": "4"}\n', encoding="utf-8")
+    prompt_index = training_argv.index("--prompt-data") + 1
+    training_argv[prompt_index] = f"[{training_argv[prompt_index]},{second_prompt}]@[0:2]"
+
+    assert doctor.main(["--format", "json", "--", *training_argv]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "ok"
+    assert report["roles"] == ["actor", "rollout"]
+    assert report["resources"]["total_gpus"] == 1
 
 
 def test_report_uses_registry_roles_and_colocate_resources():
@@ -145,6 +155,54 @@ def test_hybrid_resources_are_not_colocated():
 
     assert report["resources"]["total_gpus"] == 16
     assert report["resources"]["shares_actor_rollout_gpus"] is False
+
+
+def test_sft_report_does_not_claim_actor_rollout_gpu_sharing():
+    args = Namespace(
+        loss_type="sft",
+        advantage_estimator="grpo",
+        debug_rollout_only=False,
+        debug_train_only=False,
+        hybrid=False,
+        fully_async=False,
+        colocate=True,
+        genrm_model_path=None,
+        sft_predict_interval=None,
+        resource={"sft": [1, 0], "actor": [1, 8]},
+    )
+
+    report = doctor._report(args, [])
+
+    assert report["roles"] == ["sft", "actor"]
+    assert report["resources"]["total_gpus"] == 8
+    assert report["resources"]["shares_actor_rollout_gpus"] is False
+
+
+def test_preflight_rejects_zero_gpu_for_an_active_model_role():
+    from relax.utils.arguments import validate_preflight_args
+
+    args = Namespace(
+        loss_type="rl",
+        advantage_estimator="grpo",
+        debug_rollout_only=False,
+        debug_train_only=False,
+        hybrid=False,
+        fully_async=True,
+        true_on_policy_mode=True,
+        genrm_model_path=None,
+        resource={
+            "actor": [1, 1],
+            "rollout": [1, 1],
+            "reference": [1, 0],
+            "advantages": [1, 0],
+        },
+        prompt_data=None,
+        eval_prompt_data=None,
+        eval_datasets=[],
+    )
+
+    with pytest.raises(ValueError, match="Active model role.*num_gpus > 0"):
+        validate_preflight_args(args)
 
 
 def test_redacts_success_and_error_output():
@@ -223,4 +281,25 @@ def test_main_returns_nonzero_without_traceback(monkeypatch, capsys):
     assert doctor.main(["--", "--resource", "{}"]) == 1
     captured = capsys.readouterr()
     assert "bad config" in captured.err
+    assert "Fix:" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_missing_dependency_has_install_suggestion(monkeypatch, capsys):
+    from relax.utils import arguments
+
+    missing = ModuleNotFoundError("No module named 'example_backend'")
+    missing.name = "example_backend"
+    monkeypatch.setattr(arguments, "parse_args", lambda strict: (_ for _ in ()).throw(missing))
+
+    assert doctor.main(["--format", "json", "--", "--resource", "{}"]) == 1
+    report = json.loads(capsys.readouterr().err)
+    assert "example_backend" in report["error"]
+    assert "install 'example_backend'" in report["suggestion"]
+
+
+def test_outdated_dependency_preserves_upgrade_command():
+    report = doctor._error_report(RuntimeError("dependency is old. Upgrade with: pip install dependency"), [])
+
+    assert report["error"] == "RuntimeError: dependency is old."
+    assert report["suggestion"] == "upgrade with: pip install dependency"
