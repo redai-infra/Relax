@@ -22,7 +22,7 @@ The three warmup-excluded window means (token/s) were:
 | P+R | 1,556.00 | 1,565.52 | 1,575.02 |
 | P+S | 1,198.25 | 1,178.24 | 1,190.35 |
 
-Every formal run conserved 256 actor samples per update and exactly 40 optimizer updates; measured image count was 1 per sample, metrics were finite, and all five selected GPUs have steady NVML samples. The analyzer reports `measurement_scope=steady_state`, `validation=passed`, two independent seeds, and 30 measured optimizer steps per run. The raw campaign artifacts are under `/data01/LWX/relax-task21/campaigns/STEADY40-ALL-IDLE-e2be8cd-20260817-210540-GPU01267/analysis/`.
+Every formal run conserved 256 actor samples per update and exactly 40 optimizer updates; measured image count was 1 per sample, metrics were finite, and all five selected GPUs have steady NVML samples. The analyzer reports `measurement_scope=steady_state`, `validation=passed`, two independent seeds, and 30 measured optimizer steps per run. The reviewable campaign report and paired CSVs are checked in under [`steady-state/`](steady-state/); the report records the benchmark commit separately from later documentation and merge-conflict fixes.
 
 ## Protocol
 

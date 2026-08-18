@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -110,6 +111,7 @@ class GatewaySettings:
     callback_allowed_hosts: frozenset[str]
     gym_commit: str
     config_fingerprint: str
+    callback_allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
     lease_scan_interval_s: float = 0.25
     cleanup_grace_s: float = 30.0
     callback_proxy: str | None = field(default=None, repr=False)
@@ -139,10 +141,19 @@ class GatewaySettings:
 
         raw_hosts = values.get("NEMO_GYM_CALLBACK_ALLOWED_HOSTS", "")
         allowed_hosts = frozenset(host.strip().lower() for host in raw_hosts.split(",") if host.strip())
-        if not allowed_hosts:
-            raise GatewayConfigError("NEMO_GYM_CALLBACK_ALLOWED_HOSTS must contain at least one exact hostname")
         if "*" in allowed_hosts:
             raise GatewayConfigError("Wildcard callback hosts are not supported")
+        raw_networks = values.get("NEMO_GYM_CALLBACK_ALLOWED_NETWORKS", "")
+        try:
+            allowed_networks = tuple(
+                ipaddress.ip_network(value.strip(), strict=True) for value in raw_networks.split(",") if value.strip()
+            )
+        except ValueError as exc:
+            raise GatewayConfigError("NEMO_GYM_CALLBACK_ALLOWED_NETWORKS must contain valid CIDR networks") from exc
+        if any(network.prefixlen == 0 for network in allowed_networks):
+            raise GatewayConfigError("NEMO_GYM_CALLBACK_ALLOWED_NETWORKS must not contain a default-route network")
+        if not allowed_hosts and not allowed_networks:
+            raise GatewayConfigError("At least one exact callback hostname or CIDR network must be configured")
 
         raw_callback_proxy = values.get("NEMO_GYM_CALLBACK_PROXY", "").strip()
         callback_proxy = (
@@ -167,6 +178,7 @@ class GatewaySettings:
             callback_allowed_hosts=allowed_hosts,
             gym_commit=values.get("NEMO_GYM_COMMIT", "unknown"),
             config_fingerprint=fingerprint,
+            callback_allowed_networks=allowed_networks,
             lease_scan_interval_s=_positive_number(
                 values.get("NEMO_GYM_LEASE_SCAN_INTERVAL_S", 0.25),
                 field_name="NEMO_GYM_LEASE_SCAN_INTERVAL_S",
@@ -188,6 +200,7 @@ def validate_callback_url(
     base_url: str,
     allowed_hosts: frozenset[str],
     *,
+    allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (),
     require_tls: bool = False,
 ) -> None:
     parsed = urlparse(base_url)
@@ -199,7 +212,14 @@ def validate_callback_url(
         raise GatewayConfigError("model_endpoint.base_url must not contain user info")
     if parsed.fragment:
         raise GatewayConfigError("model_endpoint.base_url must not contain a fragment")
-    if parsed.hostname.lower() not in allowed_hosts:
+    callback_host = parsed.hostname.lower()
+    host_allowed = callback_host in allowed_hosts
+    try:
+        callback_ip = ipaddress.ip_address(callback_host)
+    except ValueError:
+        callback_ip = None
+    network_allowed = callback_ip is not None and any(callback_ip in network for network in allowed_networks)
+    if not host_allowed and not network_allowed:
         raise GatewayConfigError("model_endpoint.base_url host is not in the callback allowlist")
 
 

@@ -92,6 +92,64 @@ def _maybe_log_per_rank_fetch_diag(rollout_data: list) -> None:
     )
 
 
+def _agree_on_fetch(
+    rollout_data: list,
+    fetch_once: Callable[[], list],
+    include_pipeline: bool,
+    context: str,
+) -> list:
+    """Make model-parallel ranks for one logical DP slot agree on data state.
+
+    In ``per_rank_fetch`` every TP/CP/PP rank calls ``get_meta`` itself. Ranks
+    arriving before the producer fills ``ready_indexes`` can get empty meta,
+    while later ranks get real samples and warm the TQ sampler replay state for
+    this ``batch_index``. Empty ranks can then re-fetch the same logical request
+    and converge.
+
+    The reduction sums ``[has_data, not has_data]`` over TP x CP, plus PP when
+    pipeline stages are in lockstep: ``missing == 0`` means everyone holds the
+    batch, while ``got == 0`` is a normal empty poll. We intentionally do not
+    synchronize the data-parallel group because different DP ranks consume
+    different TQ slices and may legitimately arrive at different times.
+    """
+    groups = [mpu.get_tensor_and_context_parallel_group()]
+    if include_pipeline:
+        groups.append(mpu.get_pipeline_model_parallel_group())
+    max_retries = Envs.RELAX_FETCH_SPLIT_MAX_RETRIES
+
+    for attempt in range(max_retries + 1):
+        has_data = rollout_data[1] is not None and rollout_data[1].size > 0
+        tally = torch.tensor(
+            [1, 0] if has_data else [0, 1],
+            dtype=torch.int32,
+            device=device_utils.make_current_torch_device(),
+        )
+        for group in groups:
+            dist.all_reduce(tally, op=dist.ReduceOp.SUM, group=group)
+        got, missing = tally.tolist()
+
+        if not missing or not got:
+            return rollout_data
+        if not has_data:
+            logger.warning(
+                "[per_rank_fetch] %s: %d/%d ranks got data, re-fetching (attempt %d)",
+                context,
+                got,
+                got + missing,
+                attempt + 1,
+            )
+            # Ranks holding data block in the next agreement all-reduce while
+            # empty ranks repeat the rank-local TQ RPC.
+            time.sleep(0.25)
+            rollout_data = fetch_once()
+
+    raise RuntimeError(
+        f"[per_rank_fetch] {context}: model-parallel replica still split after {max_retries} retries "
+        f"({got}/{got + missing} ranks have data); continuing would desync the next collective. "
+        f"Raise RELAX_FETCH_SPLIT_MAX_RETRIES if the producer is legitimately this slow."
+    )
+
+
 def _maybe_log_tgd_pickle_diag(rollout_data: list, should_fetch: bool) -> None:
     """Opt-in diagnostic: log pickle cost and per-field byte size on the
     tp_rank-0 fetcher so we can see how much of ``broadcast_object_list`` is
@@ -595,10 +653,10 @@ def get_data_from_transfer_queue(
         broadcast_pp: Whether to broadcast across pipeline parallel ranks.
             True for colocate mode, False for fully async mode.
         per_rank_fetch: When True, every TP/PP rank independently calls
-            ``get_meta`` + ``get_data`` (relying on the TQ sampler's
-            ``(partition_id, task_name, dp_rank, batch_index)`` cache to
-            return identical sample id lists across ranks), and all TP/PP
-            broadcasts are skipped.  Trades a single rank-0 pickle + one
+            ``get_meta`` + ``get_data`` (relying on the TQ sampler's replay
+            state for the same logical ``dp_rank`` and ``batch_index`` to return
+            identical sample id lists across model-parallel ranks), and all
+            TP/PP broadcasts are skipped.  Trades a single rank-0 pickle + one
             NCCL bcast for N parallel ZMQ deserialises — wins when pickle
             dominates ``tgd_bcast_tp_time``.  Caller must ensure
             ``rollout_routed_experts`` is not in ``data_fields`` (its bcast
@@ -608,7 +666,6 @@ def get_data_from_transfer_queue(
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
         If no data is available, both elements are None.
     """
-
     # Compose request configuration and ask the queue for metadata.
     config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
     if token_budget is not None:
@@ -632,10 +689,9 @@ def get_data_from_transfer_queue(
     # returns to main_loop → 16 idle + 16 hung on TP2/PP2/CP8/DP1.
     if per_rank_fetch:
         # Each rank pulls its own copy from TQ; broadcasts are skipped below.
-        # Safe because the TQ sampler caches the meta on
-        # (partition_id, task_name, dp_rank, batch_index) so all ranks within
-        # a DP group receive byte-identical samples (see transfer_queue
-        # sampler/*_sampler.py).
+        # Safe because all model-parallel ranks present the same logical
+        # dp_rank/batch_index to the TQ sampler, so cache/replay returns
+        # byte-identical sample ids.
         should_fetch = True
     elif broadcast_pp:
         # Colocate mode: only (tp_rank, pp_rank, cp_rank) == (0, 0, 0) fetches data
@@ -654,36 +710,50 @@ def get_data_from_transfer_queue(
     # In per_rank_fetch mode every rank records a real value (no broadcast
     # below) so the metric becomes wall-clock fetch+deserialise per rank.
     fetch_timer_name = "per_rank_fetch" if per_rank_fetch else "tgd_fetch"
+
+    def _fetch_once() -> list:
+        """One get_meta (+ get_data) round-trip on this rank."""
+        if token_budget is not None:
+            batch_meta = tq_client.get_meta(
+                data_fields=data_fields,
+                token_budget=token_budget,
+                partition_id=partition_id,
+                sampling_config=config,
+                task_name=task_name,
+            )  # type: ignore
+        else:
+            batch_meta = tq_client.get_meta(
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                sampling_config=config,
+                task_name=task_name,
+            )  # type: ignore
+
+        if batch_meta.size == 0:
+            # Keep the (empty) meta so its extra_info (e.g. dummy_round) rides
+            # the broadcast to every consumer rank — the consumer decides
+            # real vs dummy vs end from what it fetched, no extra RPC.
+            return [None, batch_meta]
+        return [tq_client.get_data(batch_meta), batch_meta]
+
     with timer(fetch_timer_name):
         if should_fetch:
-            if token_budget is not None:
-                batch_meta = tq_client.get_meta(
-                    data_fields=data_fields,
-                    token_budget=token_budget,
-                    partition_id=partition_id,
-                    sampling_config=config,
-                    task_name=task_name,
-                )  # type: ignore
-            else:
-                batch_meta = tq_client.get_meta(
-                    data_fields=data_fields,
-                    batch_size=batch_size,
-                    partition_id=partition_id,
-                    sampling_config=config,
-                    task_name=task_name,
-                )  # type: ignore
-
-            if batch_meta.size == 0:
-                # Keep the (empty) meta so its extra_info (e.g. dummy_round) rides
-                # the broadcast to every consumer rank — the consumer decides
-                # real vs dummy vs end from what it fetched, no extra RPC.
-                rollout_data = [None, batch_meta]
-            else:
-                rollout_data = [tq_client.get_data(batch_meta), batch_meta]
+            rollout_data = _fetch_once()
         else:
             # Non-fetching ranks start with an empty placeholder and
             # will receive the real data via broadcast.
             rollout_data = [None, None]
+
+    if per_rank_fetch:
+        # No broadcast follows, so a producer race can split this logical DP
+        # rank into "got data" and "empty meta" model-parallel subsets.
+        rollout_data = _agree_on_fetch(
+            rollout_data,
+            _fetch_once,
+            include_pipeline=broadcast_pp,
+            context=f"partition={partition_id} batch_index={batch_index}",
+        )
 
     # Use an explicit device so the communication backend (e.g. NCCL)
     # can bind to a known device context.

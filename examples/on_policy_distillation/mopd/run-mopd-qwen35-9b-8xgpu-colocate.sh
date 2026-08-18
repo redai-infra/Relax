@@ -26,7 +26,6 @@ set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
 export RELAX_OPD_PREEXPANDED_PATCH=1
-# Forward the patch flag into the Ray runtime env so remote-node teachers see it.
 export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
@@ -48,8 +47,6 @@ STUDENT_MODEL_NAME="${STUDENT_MODEL_NAME:-Qwen3.5-9B}"
 TEXT_TEACHER_MODEL_NAME="${TEXT_TEACHER_MODEL_NAME:-Qwen3.5-9B-dapo-teacher-hf}"
 VL_TEACHER_MODEL_NAME="${VL_TEACHER_MODEL_NAME:-Qwen3.5-9B-vl-teacher-hf}"
 PROMPT_SET="${PROMPT_SET:-${DATA_DIR}/MOPD/train.parquet}"
-# Derive eval set from PROMPT_SET's directory so overriding PROMPT_SET alone is
-# enough. Use the small balanced subset for fast monitoring.
 EVAL_SET="${EVAL_SET:-${PROMPT_SET%/*}/test_small.parquet}"
 
 ACTOR_GPUS="${ACTOR_GPUS:-8}"
@@ -70,14 +67,6 @@ ROLLOUT_ARGS=(
    --label-key label
    --metadata-key extra_info
    --apply-chat-template
-   # NOTE: --rollout-shuffle is intentionally OMITTED. prepare_data.py already
-   # (a) shuffles within each data_source and (b) interleaves the two sources so
-   # every contiguous 64-sample window (== one DP rank's per-step slice) holds
-   # both text and image samples. --rollout-shuffle re-permutes the whole epoch
-   # and destroys that interleaving, letting a DP-local step draw zero image
-   # samples — which leaves the student's vision-encoder params with no gradient
-   # and crashes Megatron grad-sync ("0/98 params have grad available"). Keep the
-   # deterministic interleaved order instead.
 
    --multimodal-keys '{"image":"images"}'
 
@@ -95,7 +84,6 @@ ROLLOUT_ARGS=(
    --use-streaming-dataset
 )
 
-# Teacher routes: data_source (stamped by prepare_data.py) -> HF checkpoint path.
 TEACHER_ROUTES="{\"dapo-math-17k\":\"${MODEL_DIR}/${TEXT_TEACHER_MODEL_NAME}/\",\"multimodal-open-r1\":\"${MODEL_DIR}/${VL_TEACHER_MODEL_NAME}/\"}"
 
 OPD_ARGS=(
@@ -133,17 +121,6 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
    --use-distributed-optimizer
-   # --overlap-grad-reduce / --overlap-param-gather are intentionally DISABLED.
-   # With overlap on, Megatron fires each grad bucket's async all-reduce only once
-   # EVERY param in that bucket has a gradient (via backward hooks). This student is
-   # multimodal: its vision-encoder params (the "98-param" bucket) get no gradient on
-   # steps whose batch happens not to exercise the vision tower, so that bucket never
-   # completes, the all-reduce is never issued, and finish_grad_sync asserts
-   # "Communication call has not been issued for this bucket (0/98 params have grad
-   # available)" — a data-dependent crash at random steps (observed at steps 3/8/1).
-   # Without overlap, finish_grad_sync issues a synchronous all-reduce for every
-   # bucket unconditionally (see Megatron param_and_grad_buffer.py:682), so a
-   # conditionally-unused module is harmless (its grad is simply zero that step).
    --accumulate-allreduce-grads-in-fp32
 )
 
@@ -169,8 +146,6 @@ MISC_ARGS=(
    --no-rope-fusion
 )
 
-# Student colocate on the full actor pool: TP=4, PP=1, DP=2 (actor 8 GPU).
-# Mirrors the proven text recipe scripts/training/text/run-qwen35-9B-8xgpu.sh.
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
@@ -189,7 +164,6 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.7
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup
-   --sglang-disable-cuda-graph
 )
 
 RESOURCE_JSON="{\"actor\": [1, ${ACTOR_GPUS}], \"rollout\": [1, ${ROLLOUT_GPUS}], \"teacher\": [1, ${TEACHER_GPUS}]}"

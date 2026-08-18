@@ -37,12 +37,21 @@ sif_name    = <repo>_final_<commit>.sif
 启动脚本使用：
 
 ```text
-${R2E_GYM_SIF_DIR}/{instance_id}.sif
+${R2E_GYM_SIF_DIR}/${R2E_GYM_SIF_PREFIX}{instance_id}.sif
 ```
 
 固定 commit 的 SWE agent 会在识别到 `R2E-Gym` dataset name 后完成该映射。若报
 `No container file found`，先同时检查 task JSONL、manifest、实际 SIF 文件名和 resolved config，
 不要只确认目录存在。
+
+共享目录使用额外前缀时，不要为数千个 SIF 建软链。分别设置 `--sif-dir` 和
+`--sif-prefix r2egym_`；remote launcher 会只读挂载该目录，local launcher 会直接读取它。prefix
+只能是文件名前缀，不能包含 `/`。
+
+Docker-in-Docker 下要区分“当前开发容器可见”和“外层 Docker daemon 可见”。如果共享目录是只在
+开发容器内挂载的 FUSE 文件系统，`ls` 能看到它并不代表 remote launcher 能 bind mount。remote
+launcher 会在替换已有容器前用临时容器检查 repo、数据和 SIF 路径；检查失败时先在 Docker 宿主
+挂载这些路径，不能通过批量软链规避 mount namespace 问题。
 
 ## 4. 正确 base commit 不是 fix commit
 

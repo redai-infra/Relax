@@ -36,21 +36,35 @@ NeMo Gym 将一个 environment 定义为任务数据、agent harness、verifier 
 对于 GSM8K 这类无状态任务，单独写 reward 函数更简单；集成的主要价值体现在 Workplace Assistant、
 R2E-Gym 这类多轮、有状态或带 sandbox 的任务。
 
+## 使用 Skill 接入新环境
+
+新增或调试 `examples/nemo_gym_agentic/recipes/` 下的 recipe 时，请使用仓库内的
+[`nemo-gym-recipe-integration`](../../skills/nemo-gym-recipe-integration/SKILL.md) skill：
+
+```text
+/nemo-gym-recipe-integration <nemo-gym-environment>
+```
+
+该 skill 会按“准备数据、启动本地 NeMo Gym 服务、启动远端 Relax 训练”三个步骤指导接入，并覆盖
+verifier 验证、callback 网络、资源清理和失败排查。
+
 ## Recipe 索引
 
 每个 recipe 都有独立的从零运行文档和接入踩坑记录。不要从总览中拼接 recipe 命令。
 
 | Recipe              | 用途                                                  | Sandbox                            | 当前参考配置             | 文档                                                                                                |
 | ------------------- | ----------------------------------------------------- | ---------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
+| Calendar            | 长对话历史、日程约束和可验证二值 reward               | 无                                 | Qwen3-4B，8K             | [README](recipes/calendar/README.md) · [PITFAIL](recipes/calendar/PITFAIL.md)                       |
 | GSM8K               | 最快验证 trial、callback 和数值 reward；无工具        | 无                                 | Qwen3-4B，8K             | [README](recipes/gsm8k/README.md) · [PITFAIL](recipes/gsm8k/PITFAIL.md)                             |
 | Workplace Assistant | 多轮工具调用、五组有状态数据库、最终状态 verifier     | 进程内会话状态，不依赖 OCI sandbox | Qwen3-4B，8K             | [README](recipes/workplace-assistant/README.md) · [PITFAIL](recipes/workplace-assistant/PITFAIL.md) |
 | R2E-Gym             | 代码仓库修改、OpenHands、Apptainer、可执行测试 reward | 每题独立 SIF，必须有 Apptainer     | Qwen3-4B 集成 smoke，32K | [README](recipes/r2e-gym/README.md) · [PITFAIL](recipes/r2e-gym/PITFAIL.md)                         |
 
 选择建议：
 
-1. 首次检查协议用 GSM8K。
-2. 验证真正的 tool call/session/reward 用 Workplace Assistant。
-3. 验证长程代码 agent、sandbox 和执行式 reward 用 R2E-Gym。
+1. 验证长历史和约束 verifier 用 Calendar。
+2. 首次检查协议用 GSM8K。
+3. 验证真正的 tool call/session/reward 用 Workplace Assistant。
+4. 验证长程代码 agent、sandbox 和执行式 reward 用 R2E-Gym。
 
 ## 总体架构
 
@@ -303,6 +317,9 @@ examples/nemo_gym_agentic/
 │   ├── protocol.py                   # relax-nemo-gym/v1 wire types
 │   └── result.py                     # Gym terminal result -> Relax output
 ├── recipes/
+│   ├── calendar/                     # 三步 Calendar recipe
+│   │   ├── README.md / PITFAIL.md
+│   │   └── prepare / start / run 脚本
 │   ├── gsm8k/
 │   │   ├── README.md / PITFAIL.md
 │   │   ├── prepare_gsm8k.sh / start_gsm8k_gym.sh

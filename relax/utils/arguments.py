@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import warnings
 from typing import Any
 
@@ -479,6 +480,51 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "and to genrm / teacher SGLang engines. Coordinated per node per checkpoint path, "
                     "so each unique checkpoint is streamed at most once per node."
                 ),
+            )
+            parser.add_argument(
+                "--disable-s3-model-download",
+                action="store_true",
+                default=False,
+                help="Disable Relax-managed S3-to-SHM model materialization",
+            )
+            parser.add_argument(
+                "--disable-s3-model-cleanup",
+                action="store_true",
+                default=False,
+                help="Keep downloaded S3 model weight shards in SHM after service initialization",
+            )
+            parser.add_argument(
+                "--s3-model-download-workers",
+                type=int,
+                default=20,
+                help="Number of concurrent workers used to download an S3 model to SHM",
+            )
+            parser.add_argument(
+                "--s3-model-shm-root",
+                type=str,
+                default="/dev/shm",
+                help=(
+                    "S3 model SHM root; it must already exist on every model consumer node, "
+                    "otherwise loading fails without falling back to disk"
+                ),
+            )
+            parser.add_argument(
+                "--s3-model-endpoint",
+                type=str,
+                default=None,
+                help="Optional endpoint URL for an S3-compatible model store",
+            )
+            parser.add_argument(
+                "--s3-model-use-placeholder-credentials",
+                action="store_true",
+                default=False,
+                help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+            )
+            parser.add_argument(
+                "--s3-model-use-path-style",
+                action="store_true",
+                default=False,
+                help="Use path-style addressing for an S3-compatible model store",
             )
             parser.add_argument(
                 "--custom-model-provider-path",
@@ -1670,6 +1716,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The model will be saved to `save_hf.format(rollout_id)`. "
                 ),
             )
+            parser.add_argument(
+                "--save-hf-dtype",
+                type=str,
+                choices=["bf16", "fp8"],
+                default="bf16",
+                help=(
+                    "Precision for online --save-hf export. 'bf16' (default) preserves prior "
+                    "behavior; 'fp8' streams e4m3 quantized shards. FP8 requires --save-hf and "
+                    "an --hf-checkpoint backed by safetensors."
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-fp8-quant-mode",
+                type=str,
+                choices=["block", "channel", "tensor"],
+                default="block",
+                help="FP8 quantization strategy for --save-hf-dtype fp8 (default: block).",
+            )
+            parser.add_argument(
+                "--save-hf-fp8-block-size",
+                type=int,
+                nargs=2,
+                default=None,
+                metavar=("ROWS", "COLS"),
+                help="Block shape for block FP8; defaults to (128, 128) when quant-mode=block.",
+            )
+            parser.add_argument(
+                "--save-hf-post-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Dotted path (module.func) to a callable invoked on WORLD rank 0 after each "
+                    "HF checkpoint is written. Signature: "
+                    "`hook(args, hf_path: str, rollout_id: int, *, dtype: str, is_lora: bool) -> None`. "
+                    "Called synchronously; heavy work (uploads, RPCs) must be enqueued to a background "
+                    "thread by the hook itself. Exceptions are logged and swallowed."
+                ),
+            )
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
@@ -1739,11 +1823,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "rloo",
                 ],
                 default="grpo",
                 help=(
                     "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
-                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator."
+                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
+                    "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
             )
             parser.add_argument(
@@ -2104,6 +2190,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
+            parser.add_argument(
+                "--load-forge-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Path (or {rollout_id} template) to a dumped rollout .pt replayed by "
+                    "relax.engine.rollout.forge_load.generate_rollout. A path without the placeholder is "
+                    "a literal file reused for every rollout; a path with {rollout_id} loads a per-rollout "
+                    "file. Unlike --load-debug-rollout-data, this does NOT set skip_sglang, so sglang, "
+                    "router, weight sync and the colocate offload/onload dance stay live (the point: "
+                    "measuring real colocate memory at long context)."
+                ),
+            )
             parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
@@ -2609,8 +2708,62 @@ def _pre_parse_mode():
     return temp_args
 
 
+def _pre_parse_cli_model_source():
+    """Build a serializable model source from the generic CLI."""
+    from relax.utils.model_source import ModelSource
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--hf-checkpoint", help="Hugging Face checkpoint path or model URI")
+    parser.add_argument(
+        "--disable-s3-model-download",
+        action="store_true",
+        help="Disable Relax-managed S3-to-SHM model materialization",
+    )
+    parser.add_argument(
+        "--s3-model-endpoint",
+        help="Optional endpoint URL for an S3-compatible model store",
+    )
+    parser.add_argument(
+        "--s3-model-use-placeholder-credentials",
+        action="store_true",
+        help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
+    )
+    parser.add_argument(
+        "--s3-model-use-path-style",
+        action="store_true",
+        help="Use path-style addressing for an S3-compatible model store",
+    )
+    pre, _ = parser.parse_known_args()
+    if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
+        return None
+    return ModelSource(
+        uri=pre.hf_checkpoint,
+        endpoint=pre.s3_model_endpoint,
+        credential_mode="placeholder" if pre.s3_model_use_placeholder_credentials else "default",
+        addressing_style="path" if pre.s3_model_use_path_style else "auto",
+    )
+
+
 def parse_args(add_custom_arguments=None):
+    """Parse Relax arguments with an optional registered model source."""
+    from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
+
+    original_argv = sys.argv
+    provider_source = resolve_model_source(original_argv)
+    if provider_source is not None:
+        sys.argv = apply_model_source_to_argv(original_argv, provider_source)
+    try:
+        return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
+    finally:
+        sys.argv = original_argv
+
+
+def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    model_source = provider_source or _pre_parse_cli_model_source()
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2633,7 +2786,11 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
+        skip_hf_validate=(
+            pre.debug_rollout_only
+            or pre.skip_hf_validate
+            or (model_source is not None and is_s3_uri(model_source.uri))
+        ),
     )
 
     # Merge pre-parsed args into the main namespace
@@ -2648,6 +2805,15 @@ def parse_args(add_custom_arguments=None):
     if teacher_sglang_ns is not None:
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
+
+    # Preserve whether the user explicitly requested a rollout start before
+    # validation derives 0 for an apparent HF/cold-start load. Actor init uses
+    # this provenance to recover from a checkpoint-readiness race without
+    # overriding an intentional --start-rollout-id.
+    args._start_rollout_id_explicit = args.start_rollout_id is not None
+
+    # Serialize the driver-derived descriptor with args to every Ray actor.
+    args.model_source = model_source
 
     slime_validate_args(args)
 
@@ -2729,6 +2895,41 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
     elif timeout <= 0:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
+
+
+def validate_save_hf_fp8_args(args) -> None:
+    """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
+    default."""
+    dtype = getattr(args, "save_hf_dtype", "bf16")
+    if dtype != "fp8":
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
+
+    from relax.utils.quant_cast.fp8 import validate_fp8_options
+
+    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
+    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    if strategy == "block" and block_size is None:
+        block_size = [128, 128]
+        args.save_hf_fp8_block_size = block_size
+    validate_fp8_options(strategy, block_size)
+
+
+def validate_save_hf_post_hook_args(args) -> None:
+    """Validate --save-hf-post-hook-path resolves and is paired with --save-
+    hf."""
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
+
+    from relax.utils.misc import load_function
+
+    hook = load_function(hook_path)
+    if not callable(hook):
+        raise TypeError(f"--save-hf-post-hook-path {hook_path!r} is not callable: got {type(hook).__name__}")
 
 
 def _validate_agentic_rollout_args(args) -> None:
@@ -3023,12 +3224,22 @@ def slime_validate_args(args):
     _normalize_sft_max_in_flight_steps(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
+    validate_save_hf_fp8_args(args)
+    validate_save_hf_post_hook_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
             "The options 'partial_rollout' and 'use_rollout_routing_replay' cannot be enabled simultaneously. "
             "'use_rollout_routing_replay' addresses mismatch problem between training and inference, "
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
+        )
+
+    if not is_sft and args.advantage_estimator == "rloo" and args.kl_coef != 0:
+        raise ValueError(
+            "--advantage-estimator rloo does not support nonzero --kl-coef: reward-side KL shaping "
+            "is not implemented for the completion-level leave-one-out signal. Set --kl-coef 0; "
+            "for a supported direct KL penalty, provide --ref-load and use --use-kl-loss with "
+            "--kl-loss-coef."
         )
 
     if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
@@ -3109,7 +3320,29 @@ def slime_validate_args(args):
 
     _validate_reinforce_plus_plus_args(args, is_sft)
 
+    if args.rollout_batch_size is None:
+        if args.global_batch_size is None:
+            raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
+        if args.n_samples_per_prompt <= 0:
+            raise ValueError("--n-samples-per-prompt must be positive when deriving --rollout-batch-size.")
+        if args.advantage_estimator == "rloo" and args.global_batch_size % args.n_samples_per_prompt != 0:
+            raise ValueError(
+                "--global-batch-size must be divisible by --n-samples-per-prompt for RLOO when "
+                "--rollout-batch-size is omitted, got "
+                f"{args.global_batch_size} % {args.n_samples_per_prompt} != 0."
+            )
+        args.rollout_batch_size = args.global_batch_size // args.n_samples_per_prompt
+        logger.info(
+            f"--rollout-batch-size not set; derived as global_batch_size ({args.global_batch_size}) "
+            f"// n_samples_per_prompt ({args.n_samples_per_prompt}) = {args.rollout_batch_size}"
+        )
+
     if not is_sft:
+        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
+            assert args.normalize_advantages, (
+                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
+                "require advantage normalization. Please add `--normalize-advantages` to your command."
+            )
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
@@ -3355,8 +3588,6 @@ def slime_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-            if args.use_critic:
-                args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
     elif args.colocate and genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True
@@ -3429,13 +3660,11 @@ def slime_validate_args(args):
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
-    if args.rollout_batch_size is None:
-        if args.global_batch_size is None:
-            raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
-        args.rollout_batch_size = args.global_batch_size // args.n_samples_per_prompt
-        logger.info(
-            f"--rollout-batch-size not set; derived as global_batch_size ({args.global_batch_size}) "
-            f"// n_samples_per_prompt ({args.n_samples_per_prompt}) = {args.rollout_batch_size}"
+    if args.advantage_estimator == "rloo" and args.num_steps_per_rollout not in (None, 1):
+        raise ValueError(
+            "--advantage-estimator rloo requires --num-steps-per-rollout 1 "
+            "(the unclipped objective has no ratio correction, so repeated updates on the same "
+            "rollout would be off-policy)."
         )
 
     if args.num_steps_per_rollout is not None:
@@ -3449,6 +3678,59 @@ def slime_validate_args(args):
         args.global_batch_size = global_batch_size
 
     _validate_hybrid_pipeline_args(args)
+
+    if args.advantage_estimator == "rloo":
+        if args.n_samples_per_prompt < 2:
+            raise ValueError(
+                "--advantage-estimator rloo requires --n-samples-per-prompt >= 2 "
+                "(the leave-one-out baseline divides by G-1; G=1 is undefined)."
+            )
+        if args.fully_async or getattr(args, "hybrid", False):
+            raise ValueError(
+                "--advantage-estimator rloo only supports synchronous (colocate) training. "
+                "Please remove --fully-async / --hybrid."
+            )
+        if not args.calculate_per_token_loss:
+            raise ValueError(
+                "--advantage-estimator rloo requires --calculate-per-token-loss so policy loss is "
+                "normalized by the global number of valid response tokens. The per-sample token-mean "
+                "reducer would reweight unequal-length responses by 1 / response_length."
+            )
+        if args.max_staleness != 0:
+            raise ValueError(
+                "--advantage-estimator rloo requires --max-staleness 0: the unclipped objective has no "
+                "importance-ratio correction for stale rollout data."
+            )
+        if not args.rewards_normalization:
+            raise ValueError(
+                "--advantage-estimator rloo requires rewards normalization to be enabled "
+                "(the leave-one-out baseline is computed inside the group-reward path that "
+                "--disable-rewards-normalization skips). Please remove --disable-rewards-normalization."
+            )
+        if args.normalize_advantages:
+            raise ValueError(
+                "--advantage-estimator rloo is incompatible with --normalize-advantages: "
+                "the latter re-whitens advantages after DP sharding "
+                "(distributed_masked_whiten in loss.py), which re-introduces the std "
+                "normalization RLOO removes and makes the result depend on the DP partition. "
+                "Please remove --normalize-advantages."
+            )
+        if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
+            raise ValueError(
+                "--advantage-estimator rloo requires exactly one optimizer update per rollout "
+                "(the unclipped objective has no ratio correction, so a second update on the "
+                "same rollout is off-policy without correction). This means "
+                "rollout_batch_size * n_samples_per_prompt must equal global_batch_size, "
+                f"got {args.rollout_batch_size} * {args.n_samples_per_prompt} = "
+                f"{args.rollout_batch_size * args.n_samples_per_prompt} != "
+                f"{args.global_batch_size}."
+            )
+        if args.partial_rollout or args.use_dynamic_global_batch_size:
+            raise ValueError(
+                "--advantage-estimator rloo is incompatible with --partial-rollout / "
+                "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
+                "at runtime, breaking the one-update-per-rollout guarantee."
+            )
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False

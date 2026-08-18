@@ -18,6 +18,8 @@ RUN python -m pip install --no-cache-dir uv==0.9.30 \
     && uv sync --frozen --extra sandbox
 
 COPY examples/nemo_gym_agentic/service/patches/workplace_assistant_cleanup.patch /tmp/workplace_assistant_cleanup.patch
+COPY examples/nemo_gym_agentic/service/patches/nemo_gym_http_error_traceback.patch \
+    /tmp/nemo_gym_http_error_traceback.patch
 COPY examples/nemo_gym_agentic/service/patches/swe_agents_r2e.patch /tmp/swe_agents_r2e.patch
 COPY examples/nemo_gym_agentic/service/patches/openhands_setup_portability.patch \
     /tmp/openhands_setup_portability.patch
@@ -32,7 +34,8 @@ COPY examples/nemo_gym_agentic/service/patches/openhands_r2e_runtime_setup.patch
 COPY examples/nemo_gym_agentic/service/nemo_gym_gateway_model \
     /opt/nemo-gym/responses_api_models/relax_gateway_model
 
-RUN git -C /opt/nemo-gym apply /tmp/workplace_assistant_cleanup.patch \
+RUN git -C /opt/nemo-gym apply /tmp/nemo_gym_http_error_traceback.patch \
+    && git -C /opt/nemo-gym apply /tmp/workplace_assistant_cleanup.patch \
     && git -C /opt/nemo-gym apply /tmp/swe_agents_r2e.patch \
     && git -C /opt/nemo-gym apply /tmp/openhands_r2e_runtime_setup.patch \
     && git -C /opt/nemo-gym apply /tmp/openhands_setup_portability.patch \
@@ -54,6 +57,7 @@ RUN git -C /opt/nemo-gym apply /tmp/workplace_assistant_cleanup.patch \
       "openai==${GYM_OPENAI_VERSION}" \
     && for server_dir in \
       responses_api_agents/simple_agent \
+      resources_servers/calendar \
       resources_servers/example_multi_step \
       resources_servers/math_with_judge \
       resources_servers/workplace_assistant \

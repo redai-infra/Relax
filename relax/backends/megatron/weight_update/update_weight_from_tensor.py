@@ -532,7 +532,9 @@ def _send_to_colocated_engine(
     ]
 
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-        converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
+        # An empty local chunk contributes no bucket; FlattenedTensorBucket
+        # rejects an empty named_tensors list, so skip building one.
+        converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors} if hf_named_tensors else {}
     else:
         converted_named_tensors_by_dtypes = {}
         for name, tensor in hf_named_tensors:
@@ -564,15 +566,35 @@ def _send_to_colocated_engine(
 
     refs = []
     if dist.get_rank() == ipc_gather_src:
-        # TODO: here we assume all ranks have the same number of dtypes, not sure if that is correct.
-        num_dtypes = len(serialized_named_tensors[0])
-        for i in range(num_dtypes):
-            refs.append(
-                ipc_engine.update_weights_from_tensor.remote(
-                    serialized_named_tensors=[tensors[i] for tensors in serialized_named_tensors],
-                    load_format="flattened_bucket",
-                    weight_version=str(weight_version),
-                )
-            )
+        # Ranks can contribute uneven bucket counts: under PP/EP/MoE layouts a TP
+        # rank may legitimately hold no HF tensors for a chunk. Pad short ranks
+        # with an empty bucket so every engine call gets one entry per rank. When
+        # all ranks are empty num_buckets is 0 and no update is issued.
+        num_buckets = max(len(tensors) for tensors in serialized_named_tensors)
+        empty_serialized_tensor = None
+        for i in range(num_buckets):
+            serialized_tensors_for_bucket = []
+            for tensors in serialized_named_tensors:
+                if i < len(tensors):
+                    serialized_tensors_for_bucket.append(tensors[i])
+                    continue
+                if empty_serialized_tensor is None:
+                    empty_tensor_data = _empty_flattened_tensor_data(cur_device)
+                    long_live_tensors.append(empty_tensor_data)
+                    empty_serialized_tensor = MultiprocessingSerializer.serialize(empty_tensor_data, output_str=True)
+                serialized_tensors_for_bucket.append(empty_serialized_tensor)
+            kwargs = {
+                "serialized_named_tensors": serialized_tensors_for_bucket,
+                "load_format": "flattened_bucket",
+                "weight_version": str(weight_version),
+            }
+            refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _empty_flattened_tensor_data(device):
+    return {
+        "flattened_tensor": torch.empty(0, dtype=torch.uint8, device=device),
+        "metadata": [],
+    }

@@ -2,7 +2,7 @@
 
 Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。本文档覆盖 PPO 与主要 GRPO-family 算法（OPD 在线策略蒸馏请参阅[单独文档](./on-policy-distillation.md)）。
 
-GRPO、CISPO、GSPO 与 SAPO 使用相同的服务拓扑，可以直接在现有脚本中替换算法参数块。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
+GRPO、RLOO、CISPO、GSPO 与 SAPO 使用相同的 Actor/Rollout 服务拓扑；其中 RLOO 仅支持同步模式，并要求固定批量不变量。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
 REINFORCE++ 与 REINFORCE++-baseline 同样复用 GRPO 服务拓扑，但 return、全局归一化和 KL 契约由算法单独定义。启用任一 estimator 前，请先阅读 [REINFORCE++ 训练文档](../guide/reinforce-plus-plus.md)。
 
@@ -41,6 +41,76 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## RLOO
+
+RLOO（REINFORCE Leave-One-Out）使用同一 prompt 的其他采样结果作为无偏基线。Relax 实现的是同步 RLOO，并采用不裁剪的 REINFORCE 策略损失，不使用 PPO ratio 或 clipping。
+
+参考论文：[Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs](https://arxiv.org/abs/2402.14740)。
+
+### 算法原理
+
+对一个 prompt 采样 $G$ 条 response、得到标量奖励 $r_i$ 时，leave-one-out 基线与 advantage 为：
+
+$$b_i = \frac{1}{G-1}\sum_{j\ne i}r_j, \qquad A_i = r_i-b_i = \frac{G}{G-1}(r_i-\bar r)$$
+
+与 GRPO 不同，RLOO 不除以组内标准差。逐 token 损失为：
+
+$$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$$
+
+每条样本的标量 advantage 会广播到 response token。Relax 会屏蔽 padding，并按全局有效 response token 数 $N_{\mathrm{eff}}$ 归一化 token loss 之和：
+
+$$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
+
+这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
+
+### 约束与参数
+
+| 参数 | 要求 | 说明 |
+|------|------|------|
+| `--advantage-estimator rloo` | 必填 | 启用 RLOO |
+| `--n-samples-per-prompt` | 至少为 `2` | 组大小 $G$；更大的组可提高 LOO 基线稳定性，但增加 rollout 成本 |
+| `--rollout-batch-size × --n-samples-per-prompt` | 等于 `--global-batch-size` | 每个 rollout 恰好执行一次 optimizer update |
+| `--num-steps-per-rollout` | 不设置或为 `1` | 禁止对同一 rollout 重复执行未经 ratio 校正的更新 |
+| `--calculate-per-token-loss` | 开启 | 使用全局有效 token 归一化；per-response token mean 会按 $1/T_i$ 重新加权不等长 response |
+| `--kl-coef` | `0` | RLOO 尚未实现 reward-side KL shaping；提供有效的 `--ref-load <checkpoint>` 后，可使用受支持的 `--use-kl-loss --kl-loss-coef <value>` 直接 KL loss |
+| `--max-staleness` | `0` | 非裁剪目标没有 importance-ratio correction，因此拒绝 stale rollout |
+| reward normalization | 开启 | RLOO 的组变换位于 normalized-reward 路径 |
+| `--normalize-advantages` | 关闭 | DP 切分后的再次白化会改变 RLOO 语义，并使结果依赖分区 |
+| `--fully-async`、`--hybrid`、`--partial-rollout`、`--use-dynamic-global-batch-size` | 关闭 | RLOO 当前要求同步、固定大小的 rollout batch |
+
+只要保持批量等式，便可根据硬件调整批量参数。例如 `ROLLOUT_BATCH_SIZE=4`、`N_SAMPLES=8`、`GLOBAL_BATCH_SIZE=32` 仍保持每 rollout 一次更新，同时比 `16 × 8 = 128` 降低每步显存压力。
+
+### 诊断指标
+
+训练 rollout 日志会发布以下最终指标名：
+
+- `rollout/rloo/baseline_mean`：LOO baseline 均值（等于组奖励均值；保留为显式 baseline 轨迹）
+- `rollout/rloo/adv_abs_mean`：RLOO advantage 的平均绝对值
+- `rollout/rloo/no_signal_frac`：属于零 advantage 样本的有效 loss token 比例
+- `rollout/rloo/empty_response_frac`：response 字面为空的样本比例
+- `rollout/rloo/zero_adv_group_frac`：所有 advantage 都为零的完整组比例
+- `rollout/rloo/dropped_group_frac`：因组大小不完整而未纳入诊断的已观察组比例
+
+这些诊断只用于训练 rollout，属于纯观测统计，不影响训练路径。Eval 使用独立的采样组大小，不会记录具有误导性的 `eval/*/rloo/*` 全零指标。当自定义 reward post-processor 或 agentic custom-advantage hook 替换标准 RLOO 信号时，也会省略这些指标，因为此时无法仅靠 raw reward 重建 optimizer 的真实输入。
+
+### 快速开始
+
+使用 Qwen3-0.6B GSM8K 专用 recipe；批量与 rollout 数均可通过环境变量覆盖：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+NUM_ROLLOUT=60 \
+ROLLOUT_BATCH_SIZE=4 \
+N_SAMPLES=8 \
+GLOBAL_BATCH_SIZE=32 \
+bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
+```
+
+设置 `ADVANTAGE_ESTIMATOR=grpo` 可在相同 recipe 与 seed 下运行对照臂。该 recipe 会把清洗后的 GSM8K 写入可写的 artifact cache（可用 `RLOO_DATA_CACHE_DIR` 覆盖），并在问题后追加最终答案须使用 `\boxed{...}` 的指令，以匹配 `math` reward parser 的输入契约。
 
 ---
 
@@ -215,6 +285,7 @@ SAPO_ARGS=(
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
+| **RLOO** | Leave-one-out 基线 | 非裁剪 REINFORCE | 可选 KL loss（同 GRPO） |
 
 ## 下一步
 

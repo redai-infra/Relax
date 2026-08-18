@@ -35,10 +35,13 @@ N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:=8}"
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 AGENT_SERVER_URL="http://127.0.0.1:8765"
 AGENT_SERVER_WORK_DIR="${EXP_ROOT}/agent_server"
-# 64 (was 128): fewer concurrent apptainer launches -> less contention on the
-# shared FS reading SIFs, lower `instance start` failure rate, and far fewer
-# threads/processes on the colocated node. Override via env if needed.
-AGENT_SERVER_TRAIN_CONCURRENCY="${AGENT_SERVER_TRAIN_CONCURRENCY:=64}"
+# Must be >= (prepare pool groups) * N_SAMPLES_PER_PROMPT, i.e. the number of
+# sessions the prepare pool launches at once. A group is only admitted once ALL
+# its samples reach the prepare gate, and a gate-blocked session holds its
+# server thread the whole time -- so a smaller cap spreads the slots thinly over
+# every group, no group ever completes, and the step deadlocks. Lower it only
+# together with --agentic-prepare-pool-size.
+AGENT_SERVER_TRAIN_CONCURRENCY="${AGENT_SERVER_TRAIN_CONCURRENCY:=128}"
 AGENT_SERVER_EVAL_CONCURRENCY="${AGENT_SERVER_EVAL_CONCURRENCY:=64}"
 # Shuffle the training sample order (per-epoch reshuffle seeded by SEED+epoch).
 AGENT_SERVER_SHUFFLE="${AGENT_SERVER_SHUFFLE:=1}"
