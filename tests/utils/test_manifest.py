@@ -54,6 +54,7 @@ def test_sanitizer_covers_reviewed_secret_shapes() -> None:
         "bare_ray": "ray-head:6379",
         "ipv6": "fd00::1234",
         "patch": "+ HF_TOKEN=patch-secret-value",
+        "callback": "https://example.com/path?token=unit-test-secret&verbose=1",
         "tokenizer": "qwen-tokenizer",
     }
 
@@ -68,11 +69,13 @@ def test_sanitizer_covers_reviewed_secret_shapes() -> None:
         "ray-head:6379",
         "fd00::1234",
         "patch-secret-value",
+        "unit-test-secret",
         "dXNlcjpwYXNz",
         "top secret",
     ):
         assert leaked not in serialized
     assert sanitized["tokenizer"] == "qwen-tokenizer"
+    assert sanitized["callback"] == f"https://example.com/path?token={manifest.REDACTED}&verbose=1"
     assert manifest.sanitize_value("ray-head", "master_addr") == "<internal-host>"
     assert manifest.sanitize_value("ray-head", "ray_head_ip") == "<internal-host>"
     assert manifest.sanitize_value("ray-head", "node_address") == "<internal-host>"
@@ -432,7 +435,8 @@ def test_reproduction_script_is_complete_and_rejects_redacted_commands() -> None
 
     script = manifest.build_reproduction_script(recorded, "manifest.json")
 
-    assert "relax.utils.manifest validate manifest.json" in script
+    validation = "python -m relax.utils.manifest validate manifest.json"
+    assert validation in script
     assert "git checkout abc123" in script
     assert "torch==2.11.0" in script
     assert "export CUDA_VISIBLE_DEVICES=0" in script
@@ -445,6 +449,9 @@ def test_reproduction_script_is_complete_and_rejects_redacted_commands() -> None
     assert "export PYTHONBUFFERED=16" in script
     assert "export PYTHONHOME" not in script
     assert "python -m relax.entrypoints.train --help" in script
+    assert script.index("git checkout abc123") < script.index(validation)
+    assert script.index("python -m pip install torch==2.11.0") < script.index(validation)
+    assert script.index("export PYTHONBUFFERED=16") < script.index(validation)
     recorded["command"]["argv"].append("<home>/models/qwen")
     assert '"${HOME}"/models/qwen' in manifest.build_reproduction_script(recorded, "manifest.json")
     recorded["command"]["argv"].pop()

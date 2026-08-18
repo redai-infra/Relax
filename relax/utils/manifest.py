@@ -53,6 +53,7 @@ _AUTHORIZATION = re.compile(
 )
 _BEARER = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
 _URL_PASSWORD = re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^/@\s:]+:)([^/@\s]+)(@)")
+_URL_QUERY_PARAMETER = re.compile(r"([?&;])([^=&#;\s]+)(=)([^&#;\s]*)")
 _IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
 _INTERNAL_HOST = re.compile(r"(?i)(?<![\w.-])(?:[A-Z0-9-]+\.)+(?:internal|corp|local|cluster\.local)(?::\d+)?")
@@ -99,6 +100,11 @@ def _mask_sensitive_assignment(match: re.Match) -> str:
     return f"{match.group(1)}{REDACTED}" if _SECRET_KEY.search(key) else match.group(0)
 
 
+def _mask_sensitive_url_parameter(match: re.Match) -> str:
+    key = re.sub(r"[^A-Za-z0-9]+", "_", match.group(2)).strip("_")
+    return f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}" if _SECRET_KEY.search(key) else match.group(0)
+
+
 def _sanitize_string(value: str) -> str:
     stripped = value.strip()
     if stripped[:1] in {"{", "["}:
@@ -111,6 +117,7 @@ def _sanitize_string(value: str) -> str:
     value = _AUTHORIZATION.sub(r"\1<redacted>", value)
     value = _BEARER.sub(r"\1<redacted>", value)
     value = _URL_PASSWORD.sub(r"\1<redacted>\3", value)
+    value = _URL_QUERY_PARAMETER.sub(_mask_sensitive_url_parameter, value)
     value = _ASSIGNMENT.sub(_mask_sensitive_assignment, value)
     value = _INTERNAL_HOST.sub("<internal-host>", value)
     value = _BARE_HOST_PORT.sub("<internal-host>", value)
@@ -770,7 +777,6 @@ def build_reproduction_script(manifest: Mapping[str, Any], manifest_path: str) -
     ):
         raise ManifestError("Recorded command is missing or contains redacted values")
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    lines.append(f"python -m relax.utils.manifest validate {shlex.quote(manifest_path)}")
     commit = normalized.get("code", {}).get("relax", {}).get("commit")
     if commit:
         lines.append(f"git checkout {shlex.quote(str(commit))}")
@@ -780,6 +786,7 @@ def build_reproduction_script(manifest: Mapping[str, Any], manifest_path: str) -
         lines.append(f"python -m pip install {' '.join(shlex.quote(spec) for spec in specs)}")
     for name, value in _reproduction_environment(normalized).items():
         lines.append(f"export {name}={shlex.quote(value)}")
+    lines.append(f"python -m relax.utils.manifest validate {shlex.quote(manifest_path)}")
     command = []
     for item in argv:
         if item.startswith("<home>"):
