@@ -180,6 +180,9 @@ class GenerateState(metaclass=SingletonMeta):
         # image-processor call run while step N's actor training is in flight, not
         # after step N+1 starts. Persisted across reset() calls so the future
         # submitted at the end of step N is consumed at the beginning of step N+1.
+        # Resolves to (samples, watermark) — watermark lets the consumer reconcile
+        # against partial/oversample groups added to the buffer after the snapshot
+        # (see _prefetch_and_preprocess_next_step and pop_recently_added).
         if not hasattr(self, "prefetched_samples_future"):
             self.prefetched_samples_future: concurrent.futures.Future | None = None
         # How many groups the previous step left short of its transfer-queue target
@@ -768,7 +771,7 @@ async def _dedup_encode_group(args: Namespace, group: list[Sample]) -> None:
 
 async def _prefetch_and_preprocess_next_step(
     args: Namespace, data_buffer: Any, num_samples: int
-) -> list[list[Sample]]:
+) -> tuple[list[list[Sample]], int]:
     """Fetch the next step's raw samples and, when --dedup-multimodal-
     preprocess is on, run the per-group dedup encoding for them too — both
     scheduled on the persistent async-loop thread (see
@@ -783,12 +786,19 @@ async def _prefetch_and_preprocess_next_step(
     end up unused this step are carried back to the buffer for a later step
     (see generate_rollout_async), not discarded, so eagerly encoding them isn't
     wasted work even when they go unused immediately.
+
+    Returns the add-sequence watermark alongside the samples (see
+    RolloutDataSourceWithBuffer.get_samples_and_watermark) — this snapshot is
+    taken before this step's own partial/oversample groups exist, so the
+    caller must reconcile against it (via pop_recently_added) before actually
+    submitting these samples, rather than assuming the snapshot is still
+    current by then.
     """
     loop = asyncio.get_running_loop()
-    ref = data_buffer.get_samples.remote(num_samples)
-    samples = await loop.run_in_executor(None, ray.get, ref)
+    ref = data_buffer.get_samples_and_watermark.remote(num_samples)
+    samples, watermark = await loop.run_in_executor(None, ray.get, ref)
     await asyncio.gather(*(_dedup_encode_group(args, group) for group in samples))
-    return samples
+    return samples, watermark
 
 
 async def _fire_prefetch(args: Namespace, data_buffer: Any, state: "GenerateState") -> None:
@@ -1127,7 +1137,24 @@ async def generate_rollout_async(
                 future = state.prefetched_samples_future
                 state.prefetched_samples_future = None
                 logger.info(f"Rollout step {rollout_id}: using pre-fetched(+preprocessed) data from previous step")
-                samples = await asyncio.wrap_future(future)
+                samples, watermark = await asyncio.wrap_future(future)
+                # The snapshot behind `samples` was taken before the previous step's own
+                # partial/oversample groups were written back (see
+                # _prefetch_and_preprocess_next_step's docstring) — reconcile against the
+                # buffer now, swapping an equal number of those (already-encoded, still
+                # perfectly usable) prefetched groups back out for whichever partial/
+                # oversample groups landed after the snapshot, so those groups don't sit an
+                # extra step waiting in the buffer just because they missed the snapshot.
+                swap_ref = data_source.pop_recently_added.remote(watermark, len(samples))
+                swapped_in = await loop.run_in_executor(None, ray.get, swap_ref)
+                if swapped_in:
+                    displaced = samples[-len(swapped_in) :]
+                    samples = samples[: -len(swapped_in)] + swapped_in
+                    data_source.return_samples.remote(displaced)
+                    logger.info(
+                        f"Rollout step {rollout_id}: reconciled {len(swapped_in)} partial/oversample "
+                        "group(s) into the pre-fetched batch"
+                    )
             else:
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
                 samples = await loop.run_in_executor(None, ray.get, ref)
