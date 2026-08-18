@@ -1,4 +1,6 @@
+import importlib.util
 import json
+import os
 import subprocess
 from argparse import Namespace
 from pathlib import Path
@@ -82,13 +84,27 @@ def training_argv(tmp_path):
     ]
 
 
+@pytest.fixture
+def optional_sglang_backend(monkeypatch):
+    """Keep the real Relax parser while isolating an unavailable optional
+    backend."""
+    force_missing = os.environ.get("RELAX_TEST_WITHOUT_SGLANG") == "1"
+    if not force_missing and importlib.util.find_spec("sglang") is not None:
+        return
+
+    from relax.utils import arguments
+
+    monkeypatch.setattr(arguments, "_parse_sglang_namespaces", lambda: (Namespace(), Namespace()))
+    monkeypatch.setattr(arguments, "_validate_sglang_args", lambda _args: None)
+
+
 def _error_cases():
     path = Path(__file__).parent / "fixtures" / "doctor_errors.jsonl"
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 @pytest.mark.parametrize("case", _error_cases(), ids=lambda case: case["name"])
-def test_error_library_uses_real_doctor(training_argv, case, capsys):
+def test_error_library_uses_real_doctor(training_argv, case, capsys, optional_sglang_backend):
     argv = list(training_argv)
     if case.get("remove_prompt"):
         index = argv.index("--prompt-data")
@@ -105,7 +121,7 @@ def test_error_library_uses_real_doctor(training_argv, case, capsys):
     assert "Traceback" not in captured.err
 
 
-def test_valid_generalized_dataset_path_returns_success(training_argv, tmp_path, capsys):
+def test_valid_generalized_dataset_path_returns_success(training_argv, tmp_path, capsys, optional_sglang_backend):
     second_prompt = tmp_path / "prompt-2.jsonl"
     second_prompt.write_text('{"prompt": "2+2", "label": "4"}\n', encoding="utf-8")
     prompt_index = training_argv.index("--prompt-data") + 1
@@ -238,7 +254,7 @@ def test_normal_token_and_key_configuration_is_not_redacted():
     assert doctor._redact(config) == config
 
 
-def test_main_does_not_start_runtime(monkeypatch, training_argv, capsys):
+def test_main_does_not_start_runtime(monkeypatch, training_argv, capsys, optional_sglang_backend):
     from relax.backends.megatron import arguments as megatron_arguments
     from relax.utils import arguments
 
@@ -246,7 +262,7 @@ def test_main_does_not_start_runtime(monkeypatch, training_argv, capsys):
         raise AssertionError("runtime side effect attempted")
 
     monkeypatch.setattr(megatron_arguments, "validate_args", lambda args: args)
-    monkeypatch.setattr(arguments, "sglang_validate_args", lambda args: None)
+    monkeypatch.setattr(arguments, "_validate_sglang_args", lambda args: None)
     monkeypatch.setattr(ray, "init", forbidden)
     monkeypatch.setattr(serve, "start", forbidden)
     monkeypatch.setattr(torch.cuda, "set_device", forbidden)

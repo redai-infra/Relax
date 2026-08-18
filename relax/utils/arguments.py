@@ -11,8 +11,6 @@ from typing import Any
 import yaml
 from sglang_router.launch_router import RouterArgs
 
-from relax.backends.sglang.arguments import sglang_parse_args
-from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -40,6 +38,19 @@ _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-infra/'
     'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
 )
+
+
+def _parse_sglang_namespaces():
+    """Load SGLang only for modes that actually start rollout servers."""
+    from relax.backends.sglang.arguments import sglang_parse_args
+
+    return sglang_parse_args(), teacher_sglang_parse_args()
+
+
+def _validate_sglang_args(args) -> None:
+    from relax.backends.sglang.arguments import validate_args
+
+    validate_args(args)
 
 
 @contextmanager
@@ -2741,8 +2752,7 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     sglang_ns = None
     teacher_sglang_ns = None
     if not skip_sglang:
-        sglang_ns = sglang_parse_args()
-        teacher_sglang_ns = teacher_sglang_parse_args()
+        sglang_ns, teacher_sglang_ns = _parse_sglang_namespaces()
 
     # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
@@ -2787,7 +2797,7 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
         args = megatron_validate_args(args)
 
     if not args.debug_train_only:
-        sglang_validate_args(args)
+        _validate_sglang_args(args)
 
     # Only fully-async mode relies on the newer TransferQueue (e.g.
     # StreamingTokenBudgetSampler), so gate the version requirement on it.
@@ -3124,8 +3134,6 @@ def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
-
-    _validate_resource_config(args)
 
     is_sft = args.loss_type in ("sft", "sft_loss", "sft-loss")
     if is_sft:
