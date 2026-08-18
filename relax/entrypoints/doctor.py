@@ -13,7 +13,21 @@ from contextlib import redirect_stderr, redirect_stdout
 
 
 _SENSITIVE_VALUE_OPTIONS = {"--agent-env", "--train-env-vars"}
-_SECRET_NAMES = {"key", "token", "password", "secret", "credential", "credentials", "wandb_key"}
+_SECRET_NAMES = {
+    "api_key",
+    "access_key",
+    "auth_token",
+    "bearer_token",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "private_key",
+    "secret",
+    "secret_key",
+    "token",
+    "wandb_key",
+}
 _SECRET_SUFFIXES = (
     "_api_key",
     "_access_key",
@@ -143,11 +157,15 @@ def _active_roles(args) -> list[str]:
 
 
 def _resource_summary(args, roles: list[str]) -> dict:
+    from relax.utils.opd.opd_utils import is_managed_opd_teacher_colocate
+
     resource = getattr(args, "resource", {})
     active = {role: resource[role] for role in roles if role in resource}
     shared_roles = {"actor", "rollout", "genrm"}
     if getattr(args, "advantage_estimator", None) == "ppo" and resource.get("critic") == resource.get("actor"):
         shared_roles.add("critic")
+    if is_managed_opd_teacher_colocate(args):
+        shared_roles.add("teacher")
     shares_gpus = bool(
         getattr(args, "colocate", False)
         and not getattr(args, "hybrid", False)

@@ -3101,7 +3101,10 @@ def resolve_configured_roles(args) -> list[str]:
     extras = register_extra_roles(args, implementations)
     candidates = [*process_role(args), *extras]
     resource = getattr(args, "resource", {})
-    return list(dict.fromkeys(str(role) for role in candidates if role in implementations and str(role) in resource))
+    roles = list(dict.fromkeys(str(role) for role in candidates if role in implementations and str(role) in resource))
+    if is_managed_opd_teacher_enabled(args) and not getattr(args, "debug_train_only", False):
+        roles.append("teacher")
+    return roles
 
 
 def validate_preflight_args(args) -> None:

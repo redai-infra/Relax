@@ -183,6 +183,59 @@ def test_hybrid_resources_are_not_colocated(megatron_backend):
     assert report["resources"]["shares_actor_rollout_gpus"] is False
 
 
+@pytest.mark.parametrize(
+    ("colocate", "expected_total", "expected_sharing"),
+    [(True, 8, True), (False, 16, False)],
+)
+def test_managed_opd_teacher_resources_follow_runtime_placement(
+    megatron_backend, colocate, expected_total, expected_sharing
+):
+    args = Namespace(
+        loss_type="rl",
+        advantage_estimator="grpo",
+        debug_rollout_only=False,
+        debug_train_only=False,
+        hybrid=False,
+        fully_async=False,
+        colocate=colocate,
+        genrm_model_path=None,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="/models/teacher",
+        opd_teacher_routes=None,
+        resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4]},
+    )
+
+    report = doctor._report(args, [])
+
+    assert report["roles"] == ["actor", "rollout", "teacher"]
+    assert report["resources"]["total_gpus"] == expected_total
+    assert report["resources"]["shares_actor_rollout_gpus"] is expected_sharing
+
+
+def test_debug_train_only_omits_managed_opd_teacher(megatron_backend):
+    args = Namespace(
+        loss_type="rl",
+        advantage_estimator="grpo",
+        debug_rollout_only=False,
+        debug_train_only=True,
+        hybrid=False,
+        fully_async=False,
+        colocate=False,
+        genrm_model_path=None,
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="/models/teacher",
+        opd_teacher_routes=None,
+        resource={"actor": [1, 8], "teacher": [1, 4]},
+    )
+
+    report = doctor._report(args, [])
+
+    assert report["roles"] == ["actor"]
+    assert report["resources"]["total_gpus"] == 8
+
+
 def test_sft_report_does_not_claim_actor_rollout_gpu_sharing(megatron_backend):
     args = Namespace(
         loss_type="sft",
@@ -262,6 +315,22 @@ def test_normal_token_and_key_configuration_is_not_redacted():
     config = {"tokenizer_model": "/model", "max_tokens_per_gpu": 4096, "reward_key": "score"}
 
     assert doctor._redact(config) == config
+
+
+def test_bare_credential_names_are_redacted():
+    config = {
+        "api_key": "API_SECRET",
+        "access_key": "ACCESS_SECRET",
+        "auth_token": "AUTH_SECRET",
+        "private_key": "PRIVATE_SECRET",
+    }
+    argv = ["--api-key", "API_SECRET"]
+
+    sanitized = json.dumps(doctor._redact(config)) + " ".join(doctor._redact_argv(argv))
+    error = doctor._redact_error("bad API_SECRET", argv)
+
+    for secret in config.values():
+        assert secret not in sanitized + error
 
 
 def test_main_does_not_start_runtime(monkeypatch, training_argv, capsys, optional_sglang_backend, megatron_backend):
