@@ -5,13 +5,15 @@
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
+from collections.abc import Iterator
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-from tests.backends.megatron._megatron_stub import stubbed_megatron_modules
+from tests.backends.megatron._megatron_stub import stubbed_megatron_modules, temporarily_stub_module
 
 
 with stubbed_megatron_modules(("megatron", "ray", "tensordict")):
@@ -32,6 +34,14 @@ def _stub_cp_world_size(monkeypatch):
     # developer environments use the module stubs above. Keep these unit tests
     # hermetic in both cases instead of querying an uninitialized PP group.
     monkeypatch.setattr(p3o_step.mpu, "is_pipeline_last_stage", lambda ignore_virtual=False: True)
+
+
+@pytest.fixture(autouse=True)
+def _stub_p3o_model_import() -> Iterator[None]:
+    model_module = ModuleType("relax.backends.megatron.model")
+    model_module._p3o_full_sequence_post_process = lambda *_args, **_kwargs: nullcontext()
+    with temporarily_stub_module("relax.backends.megatron.model", model_module):
+        yield
 
 
 def _stats(values: tuple[float, float, float]) -> P3OSufficientStats:
