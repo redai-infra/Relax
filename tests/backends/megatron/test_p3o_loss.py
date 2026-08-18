@@ -83,6 +83,7 @@ def test_get_p3o_context_rejects_unknown_scope():
 
 
 def test_p3o_loss_reports_complete_schema_without_reference_kl(monkeypatch):
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     step_context = P3OStepContext(
         normalized_ess=torch.tensor(0.75, dtype=torch.float64),
         adaptive_cap=torch.tensor(0.75, dtype=torch.float64),
