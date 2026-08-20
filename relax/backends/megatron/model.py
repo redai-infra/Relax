@@ -955,6 +955,7 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
     optimizer and scheduler updates.
     """
     signal = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Sum the per-microbatch CP-local token counts, then reduce over DP+CP so
         # every last-stage TP rank observes the same global count (mirrors the
@@ -965,13 +966,22 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
             group=mpu.get_data_parallel_group(with_context_parallel=True),
         )
         signal[0] = 1 if num_tokens_local.item() == 0 else 0
-    # All ranks must enter the broadcast so the collective completes; non-last
-    # stages keep the sentinel value overwritten by the last-stage decision.
-    torch.distributed.broadcast(
-        signal,
-        src=mpu.get_pipeline_model_parallel_world_size() - 1,
-        group=mpu.get_pipeline_model_parallel_group(),
-    )
+        if pp_size > 1:
+            # Non-last stages did not join the all-reduce; propagate the
+            # decision across the pipeline group so every rank agrees.
+            torch.distributed.broadcast(
+                signal,
+                src=pp_size - 1,
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+    elif pp_size > 1:
+        # Non-last stages must enter the broadcast so the collective completes;
+        # they keep the sentinel value overwritten by the last-stage decision.
+        torch.distributed.broadcast(
+            signal,
+            src=pp_size - 1,
+            group=mpu.get_pipeline_model_parallel_group(),
+        )
     return bool(signal.item())
 
 

@@ -33,30 +33,118 @@ def _two_microbatch_losses(zero: bool) -> list[dict[str, object]]:
     )
 
 
-def test_is_global_zero_token_step_true(model_module, monkeypatch):
+def _patch_mpu(
+    monkeypatch,
+    model_module,
+    *,
+    pp_size: int,
+    is_last_stage: bool,
+    all_reduce_impl,
+    broadcast_impl,
+):
     mpu = model_module.mpu
     dist = model_module.torch.distributed
-    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda ignore_virtual=False: True)
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda ignore_virtual=False: is_last_stage)
     monkeypatch.setattr(mpu, "get_data_parallel_group", lambda with_context_parallel=False: object())
-    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: pp_size)
     monkeypatch.setattr(mpu, "get_pipeline_model_parallel_group", lambda: object())
-    monkeypatch.setattr(dist, "all_reduce", lambda tensor, group=None: None)
-    monkeypatch.setattr(dist, "broadcast", lambda tensor, src=0, group=None: None)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce_impl)
+    monkeypatch.setattr(dist, "broadcast", broadcast_impl)
 
+
+def test_is_global_zero_token_step_true_pp1_no_broadcast(model_module, monkeypatch):
+    """PP=1: every rank is the last stage, so the all-reduced count is already
+    consistent locally and no pipeline broadcast is required."""
+    calls = {"all_reduce": 0, "broadcast": 0}
+
+    def all_reduce(tensor, group=None):
+        calls["all_reduce"] += 1
+        # Zero token count: leave the tensor as-is.
+
+    def broadcast(tensor, src=0, group=None):
+        calls["broadcast"] += 1
+
+    _patch_mpu(
+        monkeypatch,
+        model_module,
+        pp_size=1,
+        is_last_stage=True,
+        all_reduce_impl=all_reduce,
+        broadcast_impl=broadcast,
+    )
     assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is True
+    assert calls == {"all_reduce": 1, "broadcast": 0}
 
 
-def test_is_global_zero_token_step_false(model_module, monkeypatch):
-    mpu = model_module.mpu
-    dist = model_module.torch.distributed
-    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda ignore_virtual=False: True)
-    monkeypatch.setattr(mpu, "get_data_parallel_group", lambda with_context_parallel=False: object())
-    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_group", lambda: object())
-    monkeypatch.setattr(dist, "all_reduce", lambda tensor, group=None: None)
-    monkeypatch.setattr(dist, "broadcast", lambda tensor, src=0, group=None: None)
+def test_is_global_zero_token_step_false_pp1_no_broadcast(model_module, monkeypatch):
+    """PP=1 with a nonzero token count: the local all-reduced count is
+    nonzero."""
+    calls = {"all_reduce": 0, "broadcast": 0}
 
+    def all_reduce(tensor, group=None):
+        calls["all_reduce"] += 1
+        tensor.fill_(10)  # nonzero global token count
+
+    def broadcast(tensor, src=0, group=None):
+        calls["broadcast"] += 1
+
+    _patch_mpu(
+        monkeypatch,
+        model_module,
+        pp_size=1,
+        is_last_stage=True,
+        all_reduce_impl=all_reduce,
+        broadcast_impl=broadcast,
+    )
     assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=False)) is False
+    assert calls == {"all_reduce": 1, "broadcast": 0}
+
+
+def test_is_global_zero_token_step_last_stage_pp2_broadcasts(model_module, monkeypatch):
+    """PP>1: the last stage reduces the count then broadcasts the decision."""
+    calls = {"all_reduce": 0, "broadcast": 0}
+
+    def all_reduce(tensor, group=None):
+        calls["all_reduce"] += 1
+
+    def broadcast(tensor, src=0, group=None):
+        calls["broadcast"] += 1
+        assert src == 1  # pp_size - 1
+
+    _patch_mpu(
+        monkeypatch,
+        model_module,
+        pp_size=2,
+        is_last_stage=True,
+        all_reduce_impl=all_reduce,
+        broadcast_impl=broadcast,
+    )
+    assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is True
+    assert calls == {"all_reduce": 1, "broadcast": 1}
+
+
+def test_is_global_zero_token_step_non_last_stage_pp2_enters_broadcast(model_module, monkeypatch):
+    """PP>1: a non-last stage skips the all-reduce but must join the broadcast
+    so the collective completes."""
+    calls = {"all_reduce": 0, "broadcast": 0}
+
+    def all_reduce(tensor, group=None):
+        calls["all_reduce"] += 1
+
+    def broadcast(tensor, src=0, group=None):
+        calls["broadcast"] += 1
+        assert src == 1
+
+    _patch_mpu(
+        monkeypatch,
+        model_module,
+        pp_size=2,
+        is_last_stage=False,
+        all_reduce_impl=all_reduce,
+        broadcast_impl=broadcast,
+    )
+    assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is False
+    assert calls == {"all_reduce": 0, "broadcast": 1}
 
 
 def _make_args() -> SimpleNamespace:
