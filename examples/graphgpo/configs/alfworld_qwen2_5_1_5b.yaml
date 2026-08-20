@@ -1,0 +1,30 @@
+# GraphGPO ALFWorld text-only environment configuration.
+# Paths expand from ALFWORLD_DATA at runtime.
+
+dataset:
+  data_path: "$ALFWORLD_DATA/json_2.1.1/train"
+  eval_id_data_path: "$ALFWORLD_DATA/json_2.1.1/valid_seen"
+  eval_ood_data_path: "$ALFWORLD_DATA/json_2.1.1/valid_unseen"
+  num_train_games: -1
+  num_eval_games: -1
+
+logic:
+  domain: "$ALFWORLD_DATA/logic/alfred.pddl"
+  grammar: "$ALFWORLD_DATA/logic/alfred.twl2"
+
+env:
+  type: "AlfredTWEnv"
+  domain_randomization: false
+  task_types: [1, 2, 3, 4, 5, 6]
+  expert_timeout_steps: 150
+  expert_type: "handcoded"
+  goal_desc_human_anns_prob: 0.0
+
+general:
+  random_seed: 42
+  use_cuda: false
+  training_method: "dqn"
+
+rl:
+  training:
+    max_nb_steps_per_episode: 50

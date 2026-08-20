@@ -43,6 +43,14 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .data import get_rollout_valid_row_flags
+
+
+def _metric_num_samples(batch: RolloutBatch) -> int:
+    """Count only real rows when variable-row tail padding is present."""
+
+    valid_row_flags = get_rollout_valid_row_flags(batch)
+    return sum(valid_row_flags) if valid_row_flags is not None else len(batch["response_lengths"])
 
 
 def get_responses(
@@ -1363,7 +1371,7 @@ def loss_function(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
-    num_samples = len(batch["response_lengths"])
+    num_samples = _metric_num_samples(batch)
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
