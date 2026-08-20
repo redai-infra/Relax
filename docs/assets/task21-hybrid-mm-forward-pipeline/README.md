@@ -22,6 +22,25 @@ The three warmup-excluded window means (token/s) were:
 | P+R | 1,556.00 | 1,565.52 | 1,575.02 |
 | P+S | 1,198.25 | 1,178.24 | 1,190.35 |
 
+## 40-step training curves
+
+The gradient norm, training loss, and raw reward curves below come from the same eight formal real-training runs used for the steady-state throughput result. They show every optimizer step from `0` through `39`; the shaded `0-9` interval is warmup, thick lines are the two-seed means, thin lines are the individual seeds, and bands span the two seed values at each step. The values are plotted directly from the TensorBoard scalar exports without smoothing or interpolation. The underlying per-step data are available in [`task21_steady_training_curves.csv`](steady-state/task21_steady_training_curves.csv).
+
+| Condition | Steady grad norm mean (max) | Steady loss mean | Steady raw reward mean |
+| --- | ---: | ---: | ---: |
+| B | 0.67076 (2.20789) | 0.01818 | 0.42181 |
+| P | 0.75002 (3.24743) | 0.01381 | 0.41393 |
+| P+R | 1.43510 (43.00600) | 0.01920 | 0.41706 |
+| P+S | 0.62810 (2.39713) | 0.01823 | 0.41888 |
+
+![40-step gradient norm](steady-state/task21_steady_grad_norm.png)
+
+P+R seed `20260817` has one finite gradient-norm spike at step `21` (`43.00600`). It returns to the surrounding range on the next step, and the corresponding loss (`0.02013`) and raw reward (`0.39453`) remain within the observed trajectories rather than diverging.
+
+![40-step training loss](steady-state/task21_steady_loss.png)
+
+![40-step raw reward](steady-state/task21_steady_reward.png)
+
 Every formal run conserved 256 actor samples per update and exactly 40 optimizer updates; measured image count was 1 per sample, metrics were finite, and all five selected GPUs have steady NVML samples. The analyzer reports `measurement_scope=steady_state`, `validation=passed`, two independent seeds, and 30 measured optimizer steps per run. The reviewable campaign report and paired CSVs are checked in under [`steady-state/`](steady-state/); the report records the benchmark commit separately from later documentation and merge-conflict fixes.
 
 ## Protocol
