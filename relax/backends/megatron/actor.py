@@ -57,7 +57,12 @@ from relax.utils.opd.opd_utils import (
     consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
-from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from relax.utils.reloadable_process_group import (
+    all_process_groups_active,
+    destroy_process_groups,
+    monkey_patch_torch_dist,
+    reload_process_groups,
+)
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -105,6 +110,9 @@ logger = logging.getLogger(__name__)
 
 
 ROLLOUT_MINI_BATCH_METAS_KEY = "rollout_mini_batch_metas"
+PG_ACTIVE = "active"
+PG_PAUSED_LIVE = "paused_live"
+PG_DESTROYED = "destroyed"
 
 
 def _split_by_rollout_mini_counts(values: Any, counts: list[int]) -> list[Any]:
@@ -229,6 +237,10 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        self._training_pg_state = PG_ACTIVE
+        self._preserve_pg_for_weight_sync_eligible = False
+        self._preserve_pg_for_weight_sync_ready = False
+        self._preserved_pg_canary_passed = False
 
         # Train-state offload for colocate sleep/wake. Picks torch_memory_saver
         # (VMM pause) or manual selective CPU offload based on TMS availability;
@@ -347,6 +359,13 @@ class MegatronTrainRayActor(TrainRayActor):
                     lock=self.lock,
                 )
             )
+        self._preserve_pg_for_weight_sync_eligible = self._all_ranks_agree(self._local_pg_preservation_eligibility())
+        if is_megatron_main_rank():
+            logger.info(
+                "[weight-sync-pg] short-window preservation eligible=%s; "
+                "the legacy lifecycle remains active until a local IPC weight sync succeeds",
+                self._preserve_pg_for_weight_sync_eligible,
+            )
         # empty cache after initialization
         clear_memory()
 
@@ -375,8 +394,63 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    def _all_ranks_agree(self, value: bool) -> bool:
+        decision = torch.tensor([int(value)], dtype=torch.int32)
+        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=get_gloo_group())
+        return bool(decision.item())
+
+    def _local_pg_preservation_eligibility(self) -> bool:
+        """Conservative capability gate for the colocated IPC weight-sync
+        path."""
+        return bool(
+            self.role == "actor"
+            and self.args.colocate
+            and self.args.offload_train
+            and self._per_step_rollout
+            # The canary below only certifies communicators against the TMS
+            # (VMM pause) offload path; the selective-offload strategy has not
+            # been validated for group preservation.
+            and self._train_state_offloader.uses_tms
+            and not self.args.use_critic
+            and not self.args.fully_async
+            and getattr(self.args, "enable_weights_backuper", False)
+            and isinstance(getattr(self, "weight_updater", None), UpdateWeightFromTensor)
+            and mpu.get_pipeline_model_parallel_world_size() == 1
+            and mpu.get_context_parallel_world_size() == 1
+            and mpu.get_expert_model_parallel_world_size() == 1
+            and not device_utils.is_klx()
+        )
+
+    def _run_preserved_pg_canary(self) -> bool:
+        """Verify the TP/DP communicators still work after the train-state
+        offload."""
+        local_success = True
+        try:
+            groups = (
+                mpu.get_tensor_model_parallel_group(),
+                mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            # The canary allocates a scratch tensor that must not be tracked by
+            # the offloader, otherwise it would be paused on the next sleep().
+            with self._train_state_offloader.disable_during_update():
+                for group in groups:
+                    world_size = dist.get_world_size(group=group)
+                    if world_size <= 1:
+                        continue
+                    value = torch.ones(1, device=device_utils.make_current_torch_device())
+                    dist.all_reduce(value, group=group)
+                    if value.item() != world_size:
+                        raise RuntimeError(
+                            f"preserved process-group canary mismatch: got={value.item()}, expected={world_size}"
+                        )
+                device_utils.synchronize()
+        except Exception:
+            local_success = False
+            logger.exception("[weight-sync-pg] post-pause communicator canary failed")
+        return self._all_ranks_agree(local_success)
+
     @timer
-    def sleep(self) -> None:
+    def sleep(self, *, preserve_process_groups_for_weight_sync: bool = False) -> None:
         assert self.args.offload_train
 
         clear_memory(clear_host_memory=True)
@@ -393,9 +467,34 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
+        preserve_process_groups = bool(
+            preserve_process_groups_for_weight_sync
+            and self._preserve_pg_for_weight_sync_ready
+            and self._training_pg_state == PG_ACTIVE
+            and all_process_groups_active()
+        )
+        preserve_process_groups = self._all_ranks_agree(preserve_process_groups)
+        if preserve_process_groups:
+            # All ranks must enter TMS pause with the same communicator state.
+            dist.barrier(group=get_gloo_group())
+        else:
+            destroy_process_groups()
 
         self._train_state_offloader.offload()
+
+        if preserve_process_groups:
+            self._training_pg_state = PG_PAUSED_LIVE
+            if not self._preserved_pg_canary_passed:
+                self._preserved_pg_canary_passed = self._run_preserved_pg_canary()
+                if not self._preserved_pg_canary_passed:
+                    logger.warning("[weight-sync-pg] disabling short-window preservation after canary failure")
+                    self._preserve_pg_for_weight_sync_ready = False
+                    destroy_process_groups()
+                    self._training_pg_state = PG_DESTROYED
+                elif dist.get_rank() == 0:
+                    logger.info("[weight-sync-pg] post-pause TP/DP communicator canary passed")
+        else:
+            self._training_pg_state = PG_DESTROYED
 
         print_memory("after offload model")
 
@@ -408,6 +507,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+        self._training_pg_state = PG_ACTIVE
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:
@@ -967,7 +1067,7 @@ class MegatronTrainRayActor(TrainRayActor):
         has_rollout = getattr(self, "rollout_manager", None) is not None
         if self._per_step_rollout:
             if self.args.offload_train:
-                self.sleep()
+                self.sleep(preserve_process_groups_for_weight_sync=has_rollout)
             if has_rollout:
                 self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
@@ -1583,6 +1683,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # touch GPU tensors.
         if self.args.offload_train and self._per_step_rollout:
             reload_process_groups()
+            self._training_pg_state = PG_ACTIVE
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
@@ -1606,11 +1707,25 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()
+            self._training_pg_state = PG_DESTROYED
 
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
+
+        preserved_process_groups = self._training_pg_state == PG_PAUSED_LIVE
+        try:
+            self._update_weights_impl(preserved_process_groups)
+        except BaseException:
+            # Never leak training communicators into rollout after a partial
+            # SGLang resume or failed weight transfer.
+            if preserved_process_groups and self._training_pg_state == PG_PAUSED_LIVE:
+                destroy_process_groups(post_destroy_delay=0)
+                self._training_pg_state = PG_DESTROYED
+            raise
+
+    def _update_weights_impl(self, preserved_process_groups: bool) -> None:
 
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
@@ -1645,8 +1760,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if reconnect_rollout_engines:
             self.wake_up()
-        elif self.args.offload_train:
+        elif self.args.offload_train and not preserved_process_groups:
             reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+            self._training_pg_state = PG_PAUSED_LIVE
+        elif preserved_process_groups and dist.get_rank() == 0:
+            logger.info("[weight-sync-pg] reusing live training process groups for weight export")
 
         if num_new_engines > 0 or reconnect_rollout_engines:
             self.weight_updater.connect_rollout_engines(
@@ -1682,10 +1800,22 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
+
+        if self._preserve_pg_for_weight_sync_eligible:
+            local_ipc_sync = isinstance(self.weight_updater, UpdateWeightFromTensor) and not getattr(
+                self.weight_updater, "use_distribute", True
+            )
+            self._preserve_pg_for_weight_sync_ready = self._all_ranks_agree(local_ipc_sync)
+            if self._preserve_pg_for_weight_sync_ready and dist.get_rank() == 0:
+                logger.info("[weight-sync-pg] local IPC sync validated; enabling short-window preservation")
+
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
-            destroy_process_groups()
+            device_utils.synchronize()
+            dist.barrier(group=get_gloo_group())
+            destroy_process_groups(defer_post_destroy_delay=preserved_process_groups)
+            self._training_pg_state = PG_DESTROYED
 
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight

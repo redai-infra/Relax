@@ -15,6 +15,27 @@ logger = get_logger(__name__)
 
 old_new_group_dict = {}
 _wrap_low_level_call_enabled = False
+_port_release_deadline_by_pid = {}
+
+
+def _defer_port_release_wait(pid: int, delay: float) -> None:
+    """Overlap NCCL socket cooldown with useful work before the next reload."""
+    if delay <= 0:
+        return
+    _port_release_deadline_by_pid[pid] = max(
+        _port_release_deadline_by_pid.get(pid, 0.0),
+        time.monotonic() + delay,
+    )
+
+
+def _wait_for_deferred_port_release(pid: int) -> None:
+    deadline = _port_release_deadline_by_pid.pop(pid, None)
+    if deadline is None:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        logger.info(f"Waiting {remaining:.2f}s for deferred NCCL socket port release")
+        time.sleep(remaining)
 
 
 def monkey_patch_torch_dist(args=None):
@@ -151,7 +172,11 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         return getattr(self.group, name)
 
     @staticmethod
-    def destroy_process_groups(post_destroy_delay: float = 2.0):
+    def destroy_process_groups(
+        post_destroy_delay: float = 2.0,
+        *,
+        defer_post_destroy_delay: bool = False,
+    ):
         pid = os.getpid()
         destroyed_count = 0
         for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
@@ -172,15 +197,23 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         if destroyed_count > 0 and post_destroy_delay > 0:
             # Wait for OS to release NCCL socket ports (TCP TIME_WAIT),
             # preventing "Address already in use" on subsequent reload.
-            logger.info(
-                f"Destroyed {destroyed_count} process groups, waiting {post_destroy_delay}s "
-                "for NCCL socket port release"
-            )
-            time.sleep(post_destroy_delay)
+            if defer_post_destroy_delay:
+                logger.info(
+                    f"Destroyed {destroyed_count} process groups; deferring up to "
+                    f"{post_destroy_delay}s of NCCL socket cooldown until reload"
+                )
+                _defer_port_release_wait(pid, post_destroy_delay)
+            else:
+                logger.info(
+                    f"Destroyed {destroyed_count} process groups, waiting {post_destroy_delay}s "
+                    "for NCCL socket port release"
+                )
+                time.sleep(post_destroy_delay)
 
     @staticmethod
     def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
         pid = os.getpid()
+        _wait_for_deferred_port_release(pid)
         reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
         logger.info(f"Reloading {len(reloadable_groups)} process groups in pid {pid}")
         old_new_group = old_new_group_dict.get(pid)
@@ -334,11 +367,24 @@ def _should_skip_reload_and_destroy() -> bool:
     return device_utils.is_klx()
 
 
-def destroy_process_groups(post_destroy_delay: float = 2.0):
+def destroy_process_groups(
+    post_destroy_delay: float = 2.0,
+    *,
+    defer_post_destroy_delay: bool = False,
+):
     """Destroy all reloadable process groups."""
     if _should_skip_reload_and_destroy():
         return
-    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
+    ReloadableProcessGroup.destroy_process_groups(
+        post_destroy_delay=post_destroy_delay,
+        defer_post_destroy_delay=defer_post_destroy_delay,
+    )
+
+
+def all_process_groups_active() -> bool:
+    """Return whether this process has reloadable groups and all are live."""
+    groups = ReloadableProcessGroup.GROUPS.get(os.getpid(), [])
+    return bool(groups) and all(group.group is not None for group in groups)
 
 
 def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
