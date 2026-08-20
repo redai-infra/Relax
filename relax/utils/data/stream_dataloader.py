@@ -611,6 +611,13 @@ def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast
     return out
 
 
+def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
+    if not value.is_nested:
+        return value.tolist()
+
+    return [sample.item() if sample.numel() == 1 else sample.tolist() for sample in value.unbind()]
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -885,7 +892,7 @@ def get_data_from_transfer_queue(
         for k, v in rollout_data.items():
             # Convert length/reward-style fields to Python lists.
             if "lengths" in k or "reward" in k:
-                new_rollout_data[k] = v.tolist()
+                new_rollout_data[k] = _tensor_to_python_values(v)
             elif k == "multimodal_train_inputs":
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
