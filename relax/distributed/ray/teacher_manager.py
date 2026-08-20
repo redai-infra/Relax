@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 
+import os
+
 import ray
 from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -40,6 +42,11 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
         # passed through from the driver. RELAX_OPD_PREEXPANDED_PATCH affects the
         # teacher engine only; RELAX_OPD_PER_POS_TOKEN_IDS affects teacher + student.
         "RELAX_OPD_PREEXPANDED_PATCH": str(int(Envs.RELAX_OPD_PREEXPANDED_PATCH)),
+        "RELAX_OPD_ENTROPY_PATCH": (
+            "1"
+            if getattr(args, "use_eopd", False) and getattr(args, "opd_type", "") == "sglang"
+            else os.environ.get("RELAX_OPD_ENTROPY_PATCH", "0")
+        ),
         "RELAX_OPD_PER_POS_TOKEN_IDS": str(int(Envs.RELAX_OPD_PER_POS_TOKEN_IDS)),
         "RELAX_OPD_TOKEN_IDS_LOGPROB_K": Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
         "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",

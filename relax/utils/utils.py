@@ -599,16 +599,25 @@ def recovery_load_path(args: Namespace) -> Optional[str]:
 def compute_dp_size(config) -> int:
     """Compute data-parallel size from config for the actor role.
 
-    For Megatron backend: dp_size = total_actor_gpus / (tp * pp * cp)
+    For Megatron backend: dp_size = training_gpus / (tp * pp * cp)
+    In OPD colocate mode the actor placement group bundles both training and
+    teacher GPUs, so ``actor_num_gpus_per_node * actor_num_nodes`` (the
+    training-only slice) is used instead of the raw resource count.
     """
     _, actor_total_gpus = config.resource.get("actor", (1, 1))
+    actor_num_gpus = getattr(config, "actor_num_gpus_per_node", None)
+    actor_num_nodes = getattr(config, "actor_num_nodes", None)
+    if actor_num_gpus and actor_num_nodes:
+        training_gpus = min(actor_num_gpus * actor_num_nodes, actor_total_gpus)
+    else:
+        training_gpus = actor_total_gpus
     tp = getattr(config, "tensor_model_parallel_size", 1)
     pp = getattr(config, "pipeline_model_parallel_size", 1)
     cp = getattr(config, "context_parallel_size", 1)
-    dp_size = actor_total_gpus // (tp * pp * cp)
+    dp_size = training_gpus // (tp * pp * cp)
     if dp_size <= 0:
         raise ValueError(
-            f"Computed dp_size={dp_size} is invalid. actor_total_gpus={actor_total_gpus}, tp={tp}, pp={pp}, cp={cp}"
+            f"Computed dp_size={dp_size} is invalid. training_gpus={training_gpus}, tp={tp}, pp={pp}, cp={cp}"
         )
     return dp_size
 

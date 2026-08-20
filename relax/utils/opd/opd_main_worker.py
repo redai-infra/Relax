@@ -40,16 +40,40 @@ class LogprobResponse:
             return None
         val = self._b64_decode(self.meta.get(f"{prefix}_val_b64"), "float32")
         n = val.size // top_k
-        if n <= 0:
+        if n > 0:
+            if response_length is None:
+                response_length = n
+            if response_length <= 0 or n < response_length:
+                return None
+            take = response_length * top_k
+            lps = val[-take:].reshape(response_length, top_k)
+            idx = self._b64_decode(self.meta.get(f"{prefix}_idx_b64"), "int32")
+            ids = idx[-take:].reshape(response_length, top_k) if idx.size >= take else None
+            return ids, lps
+        legacy = self.meta.get(prefix)
+        if legacy:
+            return self._parse_legacy_topk(legacy, response_length, top_k)
+        return None
+
+    @staticmethod
+    def _parse_legacy_topk(
+        entries: list, response_length: int | None, top_k: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        if not entries:
             return None
+        n = len(entries)
         if response_length is None:
             response_length = n
         if response_length <= 0 or n < response_length:
             return None
-        take = response_length * top_k
-        lps = val[-take:].reshape(response_length, top_k)
-        idx = self._b64_decode(self.meta.get(f"{prefix}_idx_b64"), "int32")
-        ids = idx[-take:].reshape(response_length, top_k) if idx.size >= take else None
+        ids = np.zeros((response_length, top_k), dtype=np.int32)
+        lps = np.full((response_length, top_k), -1e9, dtype=np.float32)
+        for i, pos in enumerate(entries[-response_length:]):
+            if pos is None:
+                continue
+            for j, item in enumerate(pos[:top_k]):
+                lps[i, j] = item[0]
+                ids[i, j] = item[1]
         return ids, lps
 
     def base_logprobs_1d(self) -> np.ndarray | None:
@@ -72,6 +96,41 @@ class LogprobResponse:
         pair = self._decode_topk_2d("input_token_ids_logprobs", response_length, top_k)
         return pair[1] if pair is not None else None
 
+    def entropy_1d(self) -> np.ndarray | None:
+        """Decode per-token entropy injected by the EOPD entropy patch."""
+        raw = self.meta.get("relax_input_entropy_b64")
+        if not raw:
+            _ci = self.meta.get("customized_info")
+            if _ci and isinstance(_ci, dict) and "relax_input_entropy_b64" in _ci:
+                raw = _ci["relax_input_entropy_b64"]
+        if not raw:
+            return None
+        if isinstance(raw, list):
+            arrays = [self._b64_decode(s, "float32") for s in raw if s]
+            val = (
+                np.concatenate(arrays)
+                if len(arrays) > 1
+                else (arrays[0] if arrays else np.array([], dtype=np.float32))
+            )
+        else:
+            val = self._b64_decode(raw, "float32")
+        return val if val.size else None
+
+    def entropy_from_topk(self, top_k: int, vocab_size: int, response_length: int | None = None) -> np.ndarray | None:
+        """Estimate per-token entropy from top-K logprobs (no patch needed)."""
+        pair = self._decode_topk_2d("input_top_logprobs", response_length, top_k)
+        if pair is None:
+            return None
+        _, logps = pair
+        probs = np.exp(logps.astype(np.float64))
+        topk_mass = probs.sum(axis=-1)
+        topk_entropy = -(probs * logps).sum(axis=-1)
+        remaining_mass = np.maximum(1.0 - topk_mass, 1e-30)
+        remaining_count = max(vocab_size - top_k, 1)
+        remaining_per_token = remaining_mass / remaining_count
+        remaining_entropy = -remaining_mass * np.log(remaining_per_token + 1e-30)
+        return (topk_entropy + remaining_entropy).astype(np.float32)
+
 
 def build_prefill_payload_base(input_ids: list[int], logprob_start_len: int) -> dict:
     return {
@@ -85,18 +144,23 @@ def build_prefill_payload_base(input_ids: list[int], logprob_start_len: int) -> 
 class SampledTokenWorker:
     TRANSFER_TEACHER_LOG_PROBS = "teacher_log_probs"
     TRANSFER_STUDENT_LOG_PROBS = "rollout_log_probs"
+    TRANSFER_TEACHER_ENTROPY = "teacher_entropy"
 
     @classmethod
     def from_args(cls, args) -> "SampledTokenWorker":
         return cls()
 
-    def sampled_transfer_fields(self) -> list[str]:
-        return [self.TRANSFER_TEACHER_LOG_PROBS, self.TRANSFER_STUDENT_LOG_PROBS]
+    def sampled_transfer_fields(self, eopd: bool = False) -> list[str]:
+        fields = [self.TRANSFER_TEACHER_LOG_PROBS, self.TRANSFER_STUDENT_LOG_PROBS]
+        if eopd:
+            fields.append(self.TRANSFER_TEACHER_ENTROPY)
+        return fields
 
 
 class TopkWorker:
     TRANSFER_TOKEN_IDS = "opd_topk_token_ids"
     TRANSFER_TEACHER_LOG_PROBS = "opd_topk_teacher_log_probs"
+    TRANSFER_TEACHER_ENTROPY = "teacher_entropy"
     # only as_adv
     TRANSFER_STUDENT_LOG_PROBS = "opd_topk_student_log_probs"
     # only union
@@ -269,12 +333,14 @@ class TopkWorker:
         out[self.TRANSFER_K_LENGTHS] = k_lengths
         return out
 
-    def topk_transfer_fields(self) -> list[str]:
+    def topk_transfer_fields(self, eopd: bool = False) -> list[str]:
         fields: list[str] = [self.TRANSFER_TOKEN_IDS, self.TRANSFER_TEACHER_LOG_PROBS]
         if self.is_advantage:
             fields.append(self.TRANSFER_STUDENT_LOG_PROBS)
         if self.spec.name == "union":
             fields.append(self.TRANSFER_K_LENGTHS)
+        if eopd:
+            fields.append(self.TRANSFER_TEACHER_ENTROPY)
         return fields
 
 

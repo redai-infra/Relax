@@ -32,6 +32,7 @@ class Sample:
     abort_count: int = 0  # Number of times this sample has been aborted
 
     teacher_log_probs: list[float] | None = None
+    teacher_entropy: list[float] | None = None
     student_topk_token_ids: np.ndarray | None = None
     student_topk_log_probs: np.ndarray | None = None
     teacher_at_student_topk_log_probs: np.ndarray | None = None

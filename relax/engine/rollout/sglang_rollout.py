@@ -598,7 +598,7 @@ async def generate_and_rm(
             sample.reward = await async_rm(args, sample)
 
         if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
+            await state.opd_manager.prefill(sample, _encode_multimodal_inputs, include_student=False)
 
     return sample
 
@@ -932,6 +932,22 @@ async def generate_rollout_async(
             if args.fully_async
             else args.rollout_batch_size
         )  # Samples per batch to transfer
+
+        # In non-fully_async (colocate) mode the SGLang engine is idle once
+        # the batch is full — safe to run student-at-teacher top-K prefill
+        # before the transfer task serialises sample attributes.
+        if not args.fully_async and state.opd_manager and len(batch_to_transfer) >= transfer_batch_size:
+            _pf_samples: list[Sample] = []
+            for _g in batch_to_transfer:
+                if isinstance(_g[0], list):
+                    for _sub in _g:
+                        _pf_samples.extend(_sub)
+                else:
+                    _pf_samples.extend(_g)
+            if _pf_samples:
+                logger.info(f"[OPD] Batch student prefill: {len(_pf_samples)} samples")
+                await state.opd_manager.prefill_student(_pf_samples, _encode_multimodal_inputs)
+
         # in fully async mode, we transfer all remaining samples when we reach the target size
         if len(batch_to_transfer) >= transfer_batch_size:
             if total_transfer_samples <= num_old_samples:
@@ -998,6 +1014,18 @@ async def generate_rollout_async(
                     )
 
     if len(batch_to_transfer) > 0:
+        if not args.fully_async and state.opd_manager:
+            _pf_samples: list[Sample] = []
+            for _g in batch_to_transfer:
+                if isinstance(_g[0], list):
+                    for _sub in _g:
+                        _pf_samples.extend(_sub)
+                else:
+                    _pf_samples.extend(_g)
+            if _pf_samples:
+                logger.info(f"[OPD] Batch student prefill (leftover): {len(_pf_samples)} samples")
+                await state.opd_manager.prefill_student(_pf_samples, _encode_multimodal_inputs)
+
         n = len(batch_to_transfer)
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)

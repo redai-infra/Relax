@@ -35,7 +35,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
-from relax.utils.opd.opd_utils import consume_opd_train_data
+from relax.utils.opd.opd_utils import consume_opd_train_data, get_megatron_opd_batch_keys
 from relax.utils.timer import timer
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
@@ -705,6 +705,7 @@ def forward_only(
     num_microbatches: Sequence[int],
     store_prefix: str = "",
     per_sample_output: bool = True,
+    with_entropy: bool | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -842,7 +843,7 @@ def forward_only(
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
-            with_entropy=args.use_rollout_entropy,
+            with_entropy=with_entropy if with_entropy is not None else args.use_rollout_entropy,
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
             loss_masks=batch.get("loss_masks", None),
@@ -1013,6 +1014,7 @@ def train_one_step(
             _opd_keys: list[str] = []
             if args.use_opd:
                 consume_opd_train_data(_opd_keys, args)
+                _opd_keys.extend(get_megatron_opd_batch_keys(args))
             batch = get_batch(
                 data_iterator,
                 [

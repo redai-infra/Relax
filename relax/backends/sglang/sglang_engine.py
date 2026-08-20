@@ -162,20 +162,32 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def _patched_run_scheduler_process(*args, **kwargs):
-    """Scheduler-subprocess entry used for the routing-replay path.
+    """Scheduler-subprocess entry that applies env-gated patches.
 
-    This wrapper is only installed when ``--optimize-routing-replay`` is
-    enabled (see ``_launch_server_with_patches``), so the routing-replay async
-    D→H patch is applied **unconditionally** here, preserving the original
-    behavior.
+    Patches that target ``LogitsProcessor`` or other scheduler-resident objects
+    must be applied here — the scheduler is a separate ``mp.Process`` and does
+    NOT inherit monkey-patches from the http-server process.
     """
-    from relax.backends.sglang.routing_replay_patch import apply_patch
+    if os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1":
+        from relax.backends.sglang.routing_replay_patch import apply_patch
 
-    apply_patch()
+        apply_patch()
+
+    if os.environ.get("RELAX_OPD_ENTROPY_PATCH", "0") == "1":
+        from relax.utils.opd.opd_sglang_entropy_patch import apply_opd_entropy_patch
+
+        apply_opd_entropy_patch()
 
     from sglang.srt.managers.scheduler import run_scheduler_process
 
     return run_scheduler_process(*args, **kwargs)
+
+
+def _needs_scheduler_patches() -> bool:
+    return (
+        os.environ.get("RELAX_OPTIMIZE_ROUTING_REPLAY", "0") == "1"
+        or os.environ.get("RELAX_OPD_ENTROPY_PATCH", "0") == "1"
+    )
 
 
 def _launch_server_with_patches(server_args: ServerArgs):
@@ -185,8 +197,8 @@ def _launch_server_with_patches(server_args: ServerArgs):
     - main process: OPD pre-expanded multimodal patch
       (``RELAX_OPD_PREEXPANDED_PATCH=1``).
     - scheduler subprocess: routing-replay (``RELAX_OPTIMIZE_ROUTING_REPLAY=1``)
-      installs ``_patched_run_scheduler_process``, which applies the
-      routing-replay patch unconditionally.
+      and entropy patch (``RELAX_OPD_ENTROPY_PATCH=1``) are applied via
+      ``_patched_run_scheduler_process``.
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
@@ -195,7 +207,7 @@ def _launch_server_with_patches(server_args: ServerArgs):
 
         apply_opd_preexpanded_patch()
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    if _needs_scheduler_patches():
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -243,9 +255,11 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     optimize = Envs.RELAX_OPTIMIZE_ROUTING_REPLAY
     opd_patch = Envs.RELAX_OPD_PREEXPANDED_PATCH
     per_pos = Envs.RELAX_OPD_PER_POS_TOKEN_IDS
+    entropy_patch = os.environ.get("RELAX_OPD_ENTROPY_PATCH", "0") == "1"
     logger.info(
         "Launching SGLang server with independently-gated patches: "
-        f"routing_replay={optimize}, opd_preexpanded={opd_patch}, per_pos_token_ids={per_pos}"
+        f"routing_replay={optimize}, opd_preexpanded={opd_patch}, "
+        f"per_pos_token_ids={per_pos}, entropy={entropy_patch}"
     )
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args,))

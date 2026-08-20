@@ -534,6 +534,7 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches: list[int],
         store_prefix: str = "",
         collect_topk: bool = False,
+        with_entropy: bool | None = None,
     ) -> dict[str, list[torch.Tensor]]:
         with timer(f"{store_prefix}log_probs"):
             log_prob_func = get_log_probs_and_entropy
@@ -546,6 +547,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_iterator,
                 num_microbatches,
                 store_prefix=store_prefix,
+                with_entropy=with_entropy,
             )
 
     def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
@@ -847,8 +849,14 @@ class MegatronTrainRayActor(TrainRayActor):
                             num_microbatches_logprobs,
                             store_prefix="teacher_",
                             collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
+                            with_entropy=getattr(self.args, "use_eopd", False) or None,
                         )
                     )
+                    if self.args.use_opd and getattr(self.args, "opd_token_selection", "") == "teacher_topk":
+                        if "teacher_topk_token_ids" in rollout_data:
+                            rollout_data["opd_topk_token_ids"] = rollout_data["teacher_topk_token_ids"]
+                        if "teacher_topk_log_probs" in rollout_data:
+                            rollout_data["opd_topk_teacher_log_probs"] = rollout_data["teacher_topk_log_probs"]
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
@@ -1116,8 +1124,19 @@ class MegatronTrainRayActor(TrainRayActor):
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                 self._switch_model("teacher")
                 sub_batch.update(
-                    self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="teacher_")
+                    self.compute_log_prob(
+                        data_iterator_logprobs,
+                        num_microbatches_logprobs,
+                        store_prefix="teacher_",
+                        collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
+                        with_entropy=getattr(self.args, "use_eopd", False) or None,
+                    )
                 )
+                if self.args.use_opd and getattr(self.args, "opd_token_selection", "") == "teacher_topk":
+                    if "teacher_topk_token_ids" in sub_batch:
+                        sub_batch["opd_topk_token_ids"] = sub_batch["teacher_topk_token_ids"]
+                    if "teacher_topk_log_probs" in sub_batch:
+                        sub_batch["opd_topk_teacher_log_probs"] = sub_batch["teacher_topk_log_probs"]
 
             # Actor forward
             self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
@@ -2175,6 +2194,7 @@ class MegatronTrainRayActor(TrainRayActor):
             "ref_log_probs",
             "rollout_log_probs",
             "teacher_log_probs",
+            "teacher_entropy",
             "values",
             "advantages",
             "returns",
