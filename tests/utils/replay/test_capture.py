@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from relax.utils.replay import capture, capture_hooks
-from relax.utils.replay.bundle import BundleReader
+from relax.utils.replay.bundle import BundleReader, IncompleteBundleError
 from relax.utils.replay.capture import (
     CaptureConfig,
     CaptureManager,
@@ -469,6 +469,11 @@ def test_capture_cohort_try_finalize(tmp_path):
     assert path0 == cohort / "rank-0"
     assert (cohort / "COMPLETE.0").is_file()
     assert not (cohort / "COMPLETE").is_file()
+    rank0_complete = json.loads((path0 / "COMPLETE").read_text(encoding="utf-8"))
+    assert rank0_complete["ranks"] == [0]
+    assert rank0_complete["expected_ranks"] == [0, 1]
+    with pytest.raises(IncompleteBundleError, match="incomplete"):
+        BundleReader(path0).load()
 
     record1 = make_capture_record("b-cohort")
     record1.capture_rank = 1

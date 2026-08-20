@@ -174,12 +174,19 @@ class BundleWriter:
             sha256=sha256_file(path),
         )
 
-    def finalize(self, ranks: list[int]) -> dict[str, Any]:
+    def finalize(self, ranks: list[int], *, expected_ranks: list[int] | None = None) -> dict[str, Any]:
         """Flush metadata, write COMPLETE sentinels and atomically publish.
 
-        Returns the rank-local COMPLETE.<rank> payload so a multi-rank caller
-        can publish the cohort shard without reading the bundle back.
+        ranks is the shard set stored in this rank-local bundle.
+        expected_ranks is the full producer set and defaults to ranks. A
+        multi-rank capture persists expected_ranks so the reader can require
+        the parent cohort COMPLETE.
+
+        Returns the rank-local COMPLETE.<rank> payload so a multi-rank
+        caller can publish the cohort shard without reading the bundle
+        back.
         """
+        expected = list(expected_ranks) if expected_ranks is not None else list(ranks)
         self._manifest.payloads = dict(self._payloads)
         _write_json(self._tmp_path / _MANIFEST, manifest_to_dict(self._manifest))
         _write_json(self._tmp_path / _INDEX, index_to_dict(self._index))
@@ -190,9 +197,13 @@ class BundleWriter:
             **_identity_anchor(self._index.identity),
             "payloads": {name: spec.sha256 for name, spec in self._payloads.items()},
             "metadata": metadata,
+            "expected_ranks": expected,
         }
         _write_json(self._tmp_path / f"{_COMPLETE}.{self._rank}", rank_complete)
-        _write_json(self._tmp_path / _COMPLETE, {"ranks": ranks, "metadata": metadata})
+        _write_json(
+            self._tmp_path / _COMPLETE,
+            {"ranks": list(ranks), "metadata": metadata, "expected_ranks": expected},
+        )
 
         if self._final_path.exists():
             raise FileExistsError(f"bundle already exists at {self._final_path}")
@@ -238,8 +249,9 @@ def try_finalize_cohort(path: str | Path, ranks: list[int]) -> bool:
     writer thread; concurrent finalizers atomically replace COMPLETE.
 
     The cohort COMPLETE is a coordinator sentinel (ranks + per-rank shards),
-    not a BundleReader target. Replay still loads rank-<n>/ which keeps the
-    rank-local COMPLETE of {ranks, metadata checksums}.
+    not a BundleReader target. Replay still loads rank-<n>/; that rank-local
+    COMPLETE records expected_ranks so the reader can require this parent
+    sentinel before treating a multi-rank capture as complete.
     """
     cohort_dir = Path(path)
     complete_path = cohort_dir / _COMPLETE
@@ -271,6 +283,39 @@ def try_finalize_cohort(path: str | Path, ranks: list[int]) -> bool:
     return True
 
 
+def parse_expected_ranks(complete_raw: dict[str, Any]) -> list[int] | None:
+    """Return expected_ranks from a COMPLETE payload, or None if unset."""
+    recorded = complete_raw.get("expected_ranks")
+    if recorded is None:
+        return None
+    if not isinstance(recorded, list) or not recorded or not all(isinstance(rank, int) for rank in recorded):
+        raise IncompleteBundleError(f"malformed {_COMPLETE}: 'expected_ranks' must be a non-empty integer list")
+    return [int(rank) for rank in recorded]
+
+
+def cohort_expected_ranks(cohort_dir: str | Path) -> list[int] | None:
+    """Read a multi-rank expected_ranks list from any COMPLETE.<rank> shard.
+
+    Returns None when the directory has no shard, or every shard is single-
+    rank. Used by the CLI selector and as a fallback for legacy rank-local
+    bundles that did not persist expected_ranks on COMPLETE.
+    """
+    cohort_dir = Path(cohort_dir)
+    if not cohort_dir.is_dir():
+        return None
+    for path in sorted(cohort_dir.iterdir()):
+        if not path.name.startswith(f"{_COMPLETE}.") or not path.is_file():
+            continue
+        try:
+            shard = _read_json(path)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        recorded = shard.get("expected_ranks")
+        if isinstance(recorded, list) and len(recorded) > 1 and all(isinstance(rank, int) for rank in recorded):
+            return [int(rank) for rank in recorded]
+    return None
+
+
 class IncompleteBundleError(ValueError):
     """Raised when a bundle is missing a sentinel, shard or payload."""
 
@@ -285,7 +330,8 @@ class BundleReader:
         """Load manifest, index, expected outputs and tensor payloads.
 
         allow_partial_read is for inspection of incomplete bundles; replay and
-        validate always require a complete bundle.
+        validate always require a complete bundle, including the parent cohort
+        COMPLETE when expected_ranks has more than one producer.
         """
         if not self._path.is_dir():
             raise IncompleteBundleError(f"bundle directory not found: {self._path}")
@@ -297,6 +343,7 @@ class BundleReader:
         complete_raw = _read_json(complete)
         ranks = self._parse_ranks(complete_raw)
         if not allow_partial_read:
+            self._require_parent_cohort_complete(complete_raw)
             self._validate_metadata_checksums(complete_raw.get("metadata"), required=True)
 
         manifest = manifest_from_dict(_read_json(self._path / _MANIFEST))
@@ -322,6 +369,23 @@ class BundleReader:
         if not isinstance(ranks, list) or not all(isinstance(rank, int) for rank in ranks):
             raise IncompleteBundleError(f"malformed {_COMPLETE}: missing integer 'ranks' list")
         return ranks
+
+    def _require_parent_cohort_complete(self, complete_raw: dict[str, Any]) -> None:
+        """Fail closed when a multi-rank rank-local bundle's cohort is open."""
+        expected = parse_expected_ranks(complete_raw)
+        if expected is None and self._path.name.startswith("rank-"):
+            expected = cohort_expected_ranks(self._path.parent)
+        if expected is None or len(expected) <= 1:
+            return
+        parent = self._path.parent
+        complete_path = parent / _COMPLETE
+        if not complete_path.is_file():
+            raise IncompleteBundleError(
+                f"cohort {parent} is incomplete (missing {_COMPLETE}) for multi-rank bundle {self._path}"
+            )
+        parent_ranks = _read_json(complete_path).get("ranks")
+        if not isinstance(parent_ranks, list) or list(parent_ranks) != list(expected):
+            raise IncompleteBundleError(f"cohort {parent} ranks {parent_ranks!r} != expected_ranks {list(expected)!r}")
 
     def _validate_metadata_checksums(self, recorded: object, *, required: bool) -> None:
         if not isinstance(recorded, dict):

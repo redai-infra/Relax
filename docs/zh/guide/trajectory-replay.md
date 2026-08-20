@@ -110,7 +110,9 @@ bundle b-00001 — first divergent stage: reward.post_process
 stage 的 rank 上启用捕获（这些 rank 持有 post-forward payload），其余 rank 保持沉默。
 单 producer 写 `<DIR>/<bundle>/`；多 producer 写 `<DIR>/<bundle>/rank-<rank>/`，各
 producer 的 writer 线程在写完 `COMPLETE.<rank>` 后 **try-finalize**（缺人就返回，
-到齐才写最终 `COMPLETE`），训练线程不等待：
+到齐才写最终 `COMPLETE`），训练线程不等待。rank-local 的 `COMPLETE` 会写入
+`expected_ranks`；`validate` / `replay`（以及 `BundleReader`）在父目录最终
+`COMPLETE` 出现前拒绝多 rank 的 `rank-*` 路径，直接传入 `rank-0/` 也不能绕过：
 
 ```text
 <DIR>/
@@ -118,7 +120,7 @@ producer 的 writer 线程在写完 `COMPLETE.<rank>` 后 **try-finalize**（缺
     COMPLETE.0          # 该 rank 的身份、owned payloads、checksum
     COMPLETE.1
     COMPLETE            # 全部预期 rank 到齐后才出现
-    rank-0/             # rank-local 完整 bundle，可单独 replay
+    rank-0/             # rank-local bundle；多 rank replay 需要父目录 COMPLETE
     rank-1/
 ```
 

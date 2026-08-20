@@ -364,7 +364,7 @@ def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> P
     writer = BundleWriter(rank_path, manifest, index, expected_outputs, rank=rank)
     for name, tensor in record.tensors.items():
         writer.write_payload(name, tensor.detach().cpu().contiguous())
-    rank_complete = writer.finalize(ranks=[rank])
+    rank_complete = writer.finalize(ranks=[rank], expected_ranks=expected)
     if multi:
         _publish_cohort_and_finalize(
             cohort_dir,

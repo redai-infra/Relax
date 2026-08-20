@@ -231,3 +231,31 @@ def test_try_finalize_cohort_waits_then_completes(tmp_path):
     assert complete["ranks"] == [0, 1]
     assert complete["shards"]["1"]["payloads"] == {"y": "def"}
     assert try_finalize_cohort(cohort, [0, 1]) is True
+
+
+def test_bundle_reader_requires_parent_cohort_complete(tmp_path):
+    cohort = tmp_path / "cohort"
+    bundle, _, _ = build_grpo_bundle(cohort / "rank-0")
+    complete_path = bundle / "COMPLETE"
+    complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    complete["expected_ranks"] = [0, 1]
+    complete_path.write_text(json.dumps(complete), encoding="utf-8")
+    with pytest.raises(IncompleteBundleError, match="incomplete"):
+        BundleReader(bundle).load()
+
+    (cohort / "COMPLETE").write_text(json.dumps({"ranks": [0, 1], "shards": {}}), encoding="utf-8")
+    loaded = BundleReader(bundle).load()
+    assert loaded.manifest.bundle_id == "b-00001"
+
+
+def test_bundle_reader_infers_expected_ranks_from_parent_shard(tmp_path):
+    cohort = tmp_path / "cohort"
+    bundle, _, _ = build_grpo_bundle(cohort / "rank-0")
+    complete_path = bundle / "COMPLETE"
+    complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    complete.pop("expected_ranks", None)
+    complete_path.write_text(json.dumps(complete), encoding="utf-8")
+    identity = Identity(actor_step_id=ActorStepId(rollout_id=120, step_id=0))
+    write_cohort_shard(cohort, rank=0, identity=identity, expected_ranks=[0, 1], payloads={"x": "abc"})
+    with pytest.raises(IncompleteBundleError, match="incomplete"):
+        BundleReader(bundle).load()

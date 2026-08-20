@@ -73,8 +73,12 @@ def test_cli_replay_step_requires_cohort_complete(tmp_path):
     record0 = make_capture_record("replay-120-0")
     record0.capture_rank = 0
     record0.expected_ranks = [0, 1]
-    build_bundle_from_record(record0, tmp_path)
+    rank0 = build_bundle_from_record(record0, tmp_path)
     assert main(["replay", str(tmp_path), "--step", "120:0"]) == 1
+    assert main(["replay", str(rank0)]) == 1
+    assert main(["replay", str(tmp_path)]) == 1
+    assert main(["validate", str(rank0)]) == 1
+    assert main(["inspect", str(rank0)]) == 0
 
     record1 = make_capture_record("replay-120-0")
     record1.capture_rank = 1
@@ -82,3 +86,5 @@ def test_cli_replay_step_requires_cohort_complete(tmp_path):
     rank1 = build_bundle_from_record(record1, tmp_path)
     assert main(["replay", str(tmp_path), "--step", "120:0"]) == 0
     assert main(["replay", str(rank1), "--step", "120:0"]) == 0
+    assert main(["replay", str(rank0)]) == 0
+    assert main(["validate", str(rank0)]) == 0

@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.replay.bundle import cohort_expected_ranks
 from relax.utils.replay.report import ReplayReport
 from relax.utils.replay.runner import replay as run_replay
 from relax.utils.replay.schema import index_from_dict, manifest_from_dict
@@ -137,24 +138,13 @@ def _cohort_complete(cohort_dir: Path) -> bool:
     return (cohort_dir / "COMPLETE").is_file()
 
 
-def _cohort_expected_ranks(cohort_dir: Path) -> list[int] | None:
-    for path in sorted(cohort_dir.iterdir()):
-        if not path.name.startswith("COMPLETE.") or not path.is_file():
-            continue
-        shard = json.loads(path.read_text(encoding="utf-8"))
-        recorded = shard.get("expected_ranks")
-        if isinstance(recorded, list) and len(recorded) > 1:
-            return [int(rank) for rank in recorded]
-    return None
-
-
 def _select_matching_bundle(hits: list[Path], selector: str) -> Path:
     """Pick one hit; multi-rank rank-* siblings require the cohort COMPLETE."""
     parents = {path.parent for path in hits}
     rank_local = all(path.name.startswith("rank-") for path in hits)
     if rank_local and len(parents) == 1:
         parent = next(iter(parents))
-        needs_complete = len(hits) > 1 or _cohort_expected_ranks(parent) is not None
+        needs_complete = len(hits) > 1 or cohort_expected_ranks(parent) is not None
         if needs_complete and not _cohort_complete(parent):
             raise ValueError(f"cohort {parent} is incomplete (missing COMPLETE) for {selector}")
         return sorted(hits, key=lambda path: path.name)[0]

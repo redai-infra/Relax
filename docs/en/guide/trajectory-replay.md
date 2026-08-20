@@ -113,7 +113,10 @@ ranks stay silent. A single producer writes `<DIR>/<bundle>/`; multiple producer
 write `<DIR>/<bundle>/rank-<rank>/`. Each producer's writer thread
 **try-finalizes** after publishing `COMPLETE.<rank>` (returns immediately if
 peers are missing; writes the final `COMPLETE` once every producer has landed).
-The training thread never waits:
+Each rank-local `COMPLETE` records `expected_ranks`. `validate` / `replay`
+(and `BundleReader`) refuse a multi-rank `rank-*` path until the parent
+cohort's final `COMPLETE` exists — passing `rank-0/` directly does not bypass
+that check. The training thread never waits:
 
 ```text
 <DIR>/
@@ -121,7 +124,7 @@ The training thread never waits:
     COMPLETE.0          # this rank's identity, owned payloads, checksums
     COMPLETE.1
     COMPLETE            # appears only after every expected rank has flushed
-    rank-0/             # rank-local complete bundle; replayable on its own
+    rank-0/             # rank-local bundle; multi-rank replay needs parent COMPLETE
     rank-1/
 ```
 
