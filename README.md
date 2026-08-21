@@ -108,16 +108,16 @@ ______________________________________________________________________
 
 Relax is designed for **omni-modal RL training** — text, vision, and audio in one unified framework. Multimodal data is configured via the `--multimodal-keys` flag, with complete image/video/audio processing pipelines under `relax/utils/multimodal/` for fine-grained control over image token counts, video frame sampling, and audio sample rates.
 
-| Model Family   | Sizes                                                       | Modality              | Typical Tasks                                        | Backend  |
-| :------------- | :---------------------------------------------------------- | :-------------------- | :--------------------------------------------------- | :------- |
-| **Qwen3**      | 4B, 30B-A3B (MoE)                                           | Text                  | Math reasoning, code, multi-turn dialogue, tool use  | Megatron |
-| **Qwen3-VL**   | 4B, 30B-A3B                                                 | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **Qwen3.5**    | 30B-A3B                                                     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **Qwen3-Omni** | 30B-A3B                                                     | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
-| **Qwen3.6**    | 35B-A3B (MoE)                                               | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **GLM5**       | 744B-A40B (MoE)                                             | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
-| **Kimi K2.6**  | ~1T-A32B (MoE)                                              | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
-| **dots.mcore** | [dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr) | Vision + Language     | OCR, document understanding, multimodal reasoning    | Megatron |
+| Model Family                                                    | Sizes             | Modality              | Typical Tasks                                        | Backend  |
+| :-------------------------------------------------------------- | :---------------- | :-------------------- | :--------------------------------------------------- | :------- |
+| **Qwen3**                                                       | 4B, 30B-A3B (MoE) | Text                  | Math reasoning, code, multi-turn dialogue, tool use  | Megatron |
+| **Qwen3-VL**                                                    | 4B, 30B-A3B       | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **Qwen3.5**                                                     | 30B-A3B           | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **Qwen3-Omni**                                                  | 30B-A3B           | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
+| **Qwen3.6**                                                     | 35B-A3B (MoE)     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **GLM5**                                                        | 744B-A40B (MoE)   | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
+| **Kimi K2.6**                                                   | ~1T-A32B (MoE)    | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
+| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                | Vision + Language     | OCR, document understanding, multimodal reasoning    | Megatron |
 
 > 📖 New architectures are integrated via [Megatron Bridge](relax/backends/megatron/mbridge/) for automatic HF ↔ Megatron weight conversion.
 

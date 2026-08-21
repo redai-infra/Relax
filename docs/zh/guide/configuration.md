@@ -208,7 +208,7 @@
 | `--use-dynamic-batch-size` | flag | False | 启用动态批处理。根据样本长度动态打包，使每个 micro-batch 的总 Token 数接近 `--max-tokens-per-gpu` 限制 |
 | `--max-tokens-per-gpu` | int | None | 每个 GPU 的最大 Token 数。启用动态批处理时必须设置。使用 CP 时应设为约 `max_response_len / cp_size` |
 | `--log-probs-max-tokens-per-gpu` | int | None | 计算 log probs 时每个 GPU 的最大 Token 数。None 时等于 `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | 使用 `karmarkar_karp` 算法在数据并行 rank 间平衡 Token 数量。仅在 colocate 模式下可用，不支持 `--fully-async`。注意同一 Prompt 的不同响应可能被分到不同训练步 |
+| `--balance-data` | flag | False | 在静态/序列长度均衡路径上使用 `karmarkar_karp` 在数据并行 rank 间平衡 Token 数量。全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡；该 flag 可传入但不会额外改变行为。注意同一 Prompt 的不同响应可能被分到不同训练步 |
 
 ---
 

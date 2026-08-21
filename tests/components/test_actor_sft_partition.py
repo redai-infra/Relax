@@ -69,3 +69,18 @@ def test_actor_training_partition_remains_the_normal_readiness_signal():
 
     assert actor_training_input_ready(cfg, 0, ["sft_0"])
     assert not actor_training_input_ready(cfg, 0, ["sft_eval_0_n2_0"])
+
+
+def test_actor_resume_uses_backend_step_over_auto_cold_start():
+    from relax.components.actor import _resolve_start_rollout_id
+
+    assert _resolve_start_rollout_id(0, 200, explicitly_set=False) == 200
+
+
+def test_actor_cold_start_and_explicit_step_are_preserved():
+    from relax.components.actor import _resolve_start_rollout_id
+
+    assert _resolve_start_rollout_id(0, 1, explicitly_set=False) == 0
+    assert _resolve_start_rollout_id(0, 200, explicitly_set=True) == 0
+    assert _resolve_start_rollout_id(100, 200, explicitly_set=True) == 100
+    assert _resolve_start_rollout_id(None, 200, explicitly_set=False) == 200

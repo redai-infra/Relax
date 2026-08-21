@@ -41,6 +41,7 @@ from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     LORA_ADAPTER_NAME,
@@ -443,7 +444,7 @@ class DeviceDirectBackend(CommBackend):
                 try:
                     self._model_update_groups = init_process_group(
                         backend=self.backend_type,
-                        init_method=f"tcp://{master_address}:{master_port}",
+                        init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
                         world_size=world_size,
                         rank=0,
                         group_name=self._group_name,

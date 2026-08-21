@@ -60,6 +60,7 @@ NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${NEMO_GYM_CALLBACK_ALLOWED_HOSTS:-${R2E_RAY_HE
 R2E_DATA_DIR="${R2E_DATA_DIR:-/data/nemo-gym/r2e-gym}"
 R2E_GYM_DATA="${R2E_GYM_DATA:-${R2E_DATA_DIR}/r2e_gym_train.jsonl}"
 R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-${R2E_DATA_DIR}/sif}"
+R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"
 R2E_GYM_SUBMISSION_ID="${R2E_GYM_SUBMISSION_ID:-${default_submission_id}-$(date -u +%Y%m%d-%H%M%S)}"
 R2E_GYM_WORKING_DIR="${R2E_GYM_WORKING_DIR:-${EXAMPLE_DIR}}"
 R2E_GYM_START_SCRIPT="${R2E_GYM_START_SCRIPT:-recipes/r2e-gym/start_r2e_gym_local.sh}"
@@ -72,6 +73,7 @@ echo "  dashboard=${RAY_DASHBOARD_ADDRESS}"
 echo "  gym_host=${GYM_HOST}"
 echo "  data=${R2E_GYM_DATA}"
 echo "  sif_dir=${R2E_GYM_SIF_DIR}"
+echo "  sif_prefix=${R2E_GYM_SIF_PREFIX:-<none>}"
 echo "  submission_id=${R2E_GYM_SUBMISSION_ID}"
 
 runtime_env="$(
@@ -103,4 +105,6 @@ exec "${RAY_CLI}" job submit \
     -- bash "${R2E_GYM_START_SCRIPT}" \
         --data-dir "${R2E_DATA_DIR}" \
         --mode "${R2E_GYM_MODE}" \
+        --sif-dir "${R2E_GYM_SIF_DIR}" \
+        --sif-prefix "${R2E_GYM_SIF_PREFIX}" \
         --max-concurrency "${R2E_GYM_MAX_CONCURRENCY}"

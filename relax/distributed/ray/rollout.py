@@ -22,6 +22,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
+from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
@@ -50,6 +51,7 @@ from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -450,6 +452,17 @@ class EngineGroup:
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+
+        validate_server_group_gpu_indices(
+            worker_type=self.worker_type,
+            gpu_offset=self.gpu_offset,
+            num_gpus_per_engine=self.num_gpus_per_engine,
+            num_gpu_per_engine=num_gpu_per_engine,
+            num_engines=len(self.all_engines),
+            num_available_gpus=len(reordered_gpu_ids),
+            rollout_num_gpus=self.args.rollout_num_gpus,
+            rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
+        )
 
         RolloutRayActor = ray.remote(SGLangEngine)
 
@@ -1231,6 +1244,7 @@ class RolloutManager(ReloadableMixin):
             try:
                 from relax.utils.data.processing_utils import load_tokenizer
 
+                prepare_model_maybe_update_args(self.args, completeness="metadata")
                 self._tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
                 logger.info(f"Loaded tokenizer from {self.args.hf_checkpoint}")
             except Exception as e:
@@ -3917,7 +3931,10 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             continue
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            log_dict |= dict_add_prefix(
+                compute_metrics_from_samples(args, samples, include_rloo_diagnostics=False),
+                f"eval/{key}/",
+            )
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -3961,7 +3978,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     tracking_utils.flush_metrics(args, step)
 
 
-def compute_metrics_from_samples(args, samples):
+def compute_metrics_from_samples(args, samples, *, include_rloo_diagnostics: bool = True):
     response_lengths = [sample.effective_response_length for sample in samples]
     multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
 
@@ -3971,7 +3988,11 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_min_mean_max_stats(
         [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
     )
-    log_dict |= compute_rollout_explicit_reward_metrics(args, samples)
+    log_dict |= compute_rollout_explicit_reward_metrics(
+        args,
+        samples,
+        include_rloo_diagnostics=include_rloo_diagnostics,
+    )
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
@@ -4046,7 +4067,7 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
 
 
 def _compute_spec_metrics(args, all_samples: list[Sample]):
-    if args.sglang_speculative_algorithm is None:
+    if getattr(args, "sglang_speculative_algorithm", None) is None:
         return {}
     num_samples = len(all_samples)
     metrics = {}

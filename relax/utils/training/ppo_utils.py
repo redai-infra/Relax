@@ -333,6 +333,42 @@ def compute_cispo_loss(
 
 
 @torch.compile(dynamic=True)
+def compute_rloo_loss(
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Computes the RLOO (REINFORCE Leave-One-Out) loss.
+
+    RLOO uses a dedicated *unclipped* REINFORCE objective. The leave-one-out
+    baseline is computed upstream (see ``compute_rloo_leave_one_out_rewards``),
+    so here we only apply the policy-gradient term:
+
+        pg_loss = -stop_gradient(A) * log π_θ(y)
+
+    Gradients flow ONLY through ``log_probs``; ``advantages`` is detached.
+    This is mathematically equivalent to CISPO with the importance ratio fixed
+    to 1 (on-policy). ``clipfrac`` is always zero — it serves as a wiring
+    self-check that the unclipped path is active.
+
+    Reference: Ahmadian et al. 2024 (arXiv:2402.14740); Kool et al. 2019.
+
+    Args:
+        log_probs: Current policy log-probabilities (gradient source).
+            Shape: [total_tokens]
+        advantages: Leave-one-out advantage values, shape matches log_probs.
+
+    Returns:
+        pg_loss: Element-wise RLOO loss (negative objective for minimization).
+            Shape matches input. NO reduction applied (caller handles masking).
+        clipfrac: Element-wise zero tensor (unclipped — wiring self-check).
+            Shape matches input.
+    """
+    pg_loss = -(advantages.detach() * log_probs)
+    clipfrac = torch.zeros_like(log_probs)
+    return pg_loss, clipfrac
+
+
+@torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
@@ -415,6 +451,50 @@ def get_grpo_returns(
     for i in range(len(rewards)):
         returns.append(torch.ones_like(kl[i]) * rewards[i])
     return returns
+
+
+def compute_rloo_leave_one_out_rewards(group_rewards: torch.Tensor) -> torch.Tensor:
+    """Compute RLOO leave-one-out advantages for a single reward group.
+
+    For G samples with rewards r_1..r_G, the leave-one-out baseline for
+    sample i is the mean of all *other* samples:
+
+        baseline_i = sum_{j != i}(r_j) / (G - 1)
+        A_i = r_i - baseline_i = G/(G-1) * (r_i - mean(r))
+
+    The implementation uses the scaled identity form (right-hand side) which is
+    numerically equivalent but vectorised. Unlike GRPO, RLOO does NOT divide by
+    the group standard deviation — the advantage preserves the reward scale and
+    is unbiased because baseline_i is independent of r_i.
+
+    Args:
+        group_rewards: 1-D tensor of per-sample rewards for one group.
+            Length G must be >= 2 (G-1=0 is undefined).
+
+    Returns:
+        1-D tensor of leave-one-out advantages, same length as input.
+
+    Raises:
+        ValueError: If input is not 1-D, has fewer than 2 elements, or
+            contains non-finite values.
+    """
+    if group_rewards.dim() != 1:
+        raise ValueError(
+            f"compute_rloo_leave_one_out_rewards expects a 1-D tensor (one group), "
+            f"got shape {tuple(group_rewards.shape)}. A 2-D input would be silently "
+            f"treated as a single oversized group and produce wrong results."
+        )
+    group_size = group_rewards.shape[0]
+    if group_size < 2:
+        raise ValueError(
+            f"RLOO requires n_samples_per_prompt >= 2 (group size {group_size} "
+            f"makes the leave-one-out baseline undefined: division by G-1=0)."
+        )
+    if not torch.isfinite(group_rewards).all():
+        raise ValueError(f"RLOO group contains non-finite reward(s): {group_rewards}. All rewards must be finite.")
+    mean_reward = group_rewards.mean()
+    scale = group_size / (group_size - 1)
+    return scale * (group_rewards - mean_reward)
 
 
 def get_reinforce_plus_plus_returns(

@@ -20,6 +20,7 @@ from relax.agentic.pipeline.runtime import (
 )
 from relax.agentic.profile import TRACE_KEY
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
+from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import (
@@ -202,6 +203,7 @@ class AgenticResidentPipeline:
         self.runtime_domain: RuntimeDomain | None = None
         self.transfer_domain: TransferDomain | None = None
         self.reward_domain: RewardDomain | None = None
+        self.opd_manager: opd.OpdManager | None = None
         self.resident_dataflow_task: asyncio.Task | None = None
         self.resident_dataflow_progress_event: asyncio.Event | None = None
         self.resident_dataflow_lock: asyncio.Lock | None = None
@@ -373,10 +375,18 @@ class AgenticResidentPipeline:
 
         ready_reward_groups = reward_domain.drain_ready_dispatch(max_groups=transfer_domain.remaining_ready_capacity())
         if ready_reward_groups:
+            if self.opd_manager is not None:
+                await self._opd_prefill_groups(ready_reward_groups)
             for group in ready_reward_groups:
                 transfer_domain.enqueue_ready_groups([group])
             progressed = True
         return progressed
+
+    async def _opd_prefill_groups(self, groups: list[list[Sample]]) -> None:
+        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+
+        for group in groups:
+            await self.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     async def _pump_transfer_once(self) -> bool:
         transfer_domain = self.transfer_domain
@@ -525,6 +535,8 @@ class AgenticResidentPipeline:
                     args=args,
                     data_system_client=data_system_client,
                 )
+            if self.opd_manager is None and opd.is_opd_enabled(args):
+                self.opd_manager = opd.OpdManager(args)
             prepare_domain.configure(
                 runtime_driver=runtime_domain,
                 pool_target_group_count=pool_target_group_count,

@@ -11,7 +11,7 @@ python scripts/data/prepare_ultrafeedback_preferences.py \
   --output-dir /data/task31-ultrafeedback
 ```
 
-命令会生成 train/eval JSONL、Parquet 以及 `manifest.json`。训练前应将生成结果与仓库中的 [`task31-ultrafeedback-v1.json`](../../../scripts/data/manifests/task31-ultrafeedback-v1.json) 对比。manifest 固定 source revision、选中的 prompt ID、拒绝原因计数和输出文件 SHA-256；派生数据文件本身不提交到 Git。
+命令会生成 train/eval JSONL、Parquet 以及 `manifest.json`。对于已发布的 Task 31 子集，训练前应将生成结果与[可复现性证据包](https://github.com/user-attachments/files/31305744/task31-pr1-dpo-evidence-public-v2.tar.gz)中的 manifest 对比。manifest 固定 source revision、选中的 prompt ID、拒绝原因计数和输出文件 SHA-256；派生数据文件本身不提交到 Git。
 
 每行输入承载一个完整 preference pair：
 
