@@ -498,6 +498,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to recompute the loss function to save memory during training.",
             )
             parser.add_argument(
+                "--skip-zero-advantage-backward",
+                action="store_true",
+                default=False,
+                help=(
+                    "For supported synchronous Megatron policy training, keep the model forward and metrics "
+                    "for micro-batches whose effective advantages are all zero, but omit their zero-gradient "
+                    "backward graph. Disabled by default."
+                ),
+            )
+            parser.add_argument(
                 "--recompute-loss-function-use-reentrant",
                 action=argparse.BooleanOptionalAction,
                 default=True,

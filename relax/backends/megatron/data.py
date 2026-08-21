@@ -38,6 +38,37 @@ from .cp_utils import (
 
 logger = get_logger(__name__)
 
+_ZERO_EFFECTIVE_ADVANTAGE_KEY = "__zero_effective_advantage__"
+
+
+def prepare_zero_advantage_backward_metadata(rollout_data: RolloutBatch) -> None:
+    """Materialize per-sample zero-advantage metadata once before training."""
+    advantages = rollout_data.get("advantages")
+    loss_masks = rollout_data.get("loss_masks")
+    if not isinstance(advantages, (list, tuple)) or not isinstance(loss_masks, (list, tuple)):
+        raise ValueError("advantages and loss_masks must be lists or tuples")
+    if not advantages or len(advantages) != len(loss_masks):
+        raise ValueError("advantages and loss_masks must have the same non-zero length")
+
+    zero_effective_advantages = []
+    for advantage, loss_mask in zip(advantages, loss_masks, strict=True):
+        if not isinstance(advantage, torch.Tensor) or not isinstance(loss_mask, torch.Tensor):
+            raise TypeError("advantages and loss_masks must contain tensors")
+        if advantage.shape != loss_mask.shape:
+            raise ValueError(f"advantage and loss mask shapes must match, got {advantage.shape} and {loss_mask.shape}")
+        if advantage.device != loss_mask.device:
+            raise ValueError(
+                f"advantage and loss mask devices must match, got {advantage.device} and {loss_mask.device}"
+            )
+        zero_effective_advantages.append(
+            torch.all(torch.isfinite(advantage) & torch.isfinite(loss_mask) & ((advantage == 0) | ~loss_mask.bool()))
+        )
+
+    # This is a single synchronization at the rollout planning boundary. The
+    # model/loss hot path consumes only the resulting Python booleans.
+    rollout_data[_ZERO_EFFECTIVE_ADVANTAGE_KEY] = torch.stack(zero_effective_advantages).cpu().tolist()
+
+
 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY = "rollout_mini_local_sample_counts"
 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY = "rollout_mini_global_sample_counts"
 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY = "rollout_mini_prompt_group_counts"
@@ -257,7 +288,7 @@ def get_batch(
     qkv_format: str = "thd",
     allgather_cp: bool = False,
     is_vl_model: bool = False,
-) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
+) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | bool | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
     Steps:
