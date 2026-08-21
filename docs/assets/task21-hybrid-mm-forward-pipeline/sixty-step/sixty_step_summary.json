@@ -1,0 +1,44 @@
+{
+  "campaign": "CURVE60-BR-e2be8cd-20260821-1120-GPU01247",
+  "benchmark_commit": "e2be8cd158609cc2dfae72b7ba92df72cacb3091",
+  "seed": 20260820,
+  "steps": 60,
+  "runs": {
+    "B": {
+      "run_id": "CURVE60-BR-e2be8cd-20260821-1120-GPU01247-B60-GPU01247-seed20260820-attempt1",
+      "processor_pool": 0,
+      "reuse_train_forward_logprobs": 0,
+      "pipeline_forward": 0,
+      "pipeline_overlap": 0,
+      "training_exit_status": 0,
+      "validation_exit_status": 0,
+      "exit_status": 0,
+      "validation": "passed",
+      "steady_metrics": {
+        "step_token_per_s": 964.6778241641581,
+        "step_time_s_mean": 203.61846618652345,
+        "step_resp_token_per_s": 484.37247388817775,
+        "raw_reward_mean": 0.44359375,
+        "grad_norm_max": 4.891648769378662
+      }
+    },
+    "P+R": {
+      "run_id": "CURVE60-BR-e2be8cd-20260821-1120-GPU01247-R60-GPU01247-seed20260820-attempt1",
+      "processor_pool": 8,
+      "reuse_train_forward_logprobs": 1,
+      "pipeline_forward": 0,
+      "pipeline_overlap": 0,
+      "training_exit_status": 0,
+      "validation_exit_status": 0,
+      "exit_status": 0,
+      "validation": "passed",
+      "steady_metrics": {
+        "step_token_per_s": 1475.1722095006298,
+        "step_time_s_mean": 131.71488632202147,
+        "step_resp_token_per_s": 734.8835291716828,
+        "raw_reward_mean": 0.438046875,
+        "grad_norm_max": 3.0623481273651123
+      }
+    }
+  }
+}

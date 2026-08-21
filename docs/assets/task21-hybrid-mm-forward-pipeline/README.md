@@ -22,26 +22,44 @@ The three warmup-excluded window means (token/s) were:
 | P+R | 1,556.00 | 1,565.52 | 1,575.02 |
 | P+S | 1,198.25 | 1,178.24 | 1,190.35 |
 
-## 40-step training curves
+## 60-step P+R training curves
 
-The gradient norm, training loss, and raw reward curves below come from the same eight formal real-training runs used for the steady-state throughput result. They show every optimizer step from `0` through `39`; the shaded `0-9` interval is warmup, thick lines are the two-seed means, thin lines are the individual seeds, and bands span the two seed values at each step. The values are plotted directly from the TensorBoard scalar exports without smoothing or interpolation. The underlying per-step data are available in [`task21_steady_training_curves.csv`](steady-state/task21_steady_training_curves.csv).
+The earlier 40-step curve section is superseded by this 60-optimizer-step
+follow-up, added after review requested at least 50 training steps. It pairs a
+fresh B control with P+R on seed `20260820`, the same Qwen3-VL-8B workload and
+five-GPU layout. The curves show every optimizer step from `0` through `59`
+directly from TensorBoard scalar exports, without smoothing or interpolation;
+the shaded `0-9` interval is warmup. This follow-up is curve evidence only: the
+complete four-condition B/P/P+R/P+S throughput matrix remains the validated
+40-step campaign above.
 
-| Condition | Steady grad norm mean (max) | Steady loss mean | Steady raw reward mean |
-| --- | ---: | ---: | ---: |
-| B | 0.67076 (2.20789) | 0.01818 | 0.42181 |
-| P | 0.75002 (3.24743) | 0.01381 | 0.41393 |
-| P+R | 1.43510 (43.00600) | 0.01920 | 0.41706 |
-| P+S | 0.62810 (2.39713) | 0.01823 | 0.41888 |
+| Condition | Steady token throughput | Mean step time | Response-token throughput | Raw reward mean | Grad-norm max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B60 | 964.68 token/s | 203.62 s | 484.37 token/s | 0.44359 | 4.89165 |
+| P+R60 | 1,475.17 token/s | 131.71 s | 734.88 token/s | 0.43805 | 3.06235 |
 
-![40-step gradient norm](steady-state/task21_steady_grad_norm.png)
+P+R60 is `1.529x` the B60 token throughput and reduces mean step time by
+`35.31%` in this supplemental same-seed comparison. Both runs completed all 60
+steps with finite `train/grad_norm`, `train/loss`, and `rollout/raw_reward`
+series; training, validation, and final exit status are all zero.
 
-P+R seed `20260817` has one finite gradient-norm spike at step `21` (`43.00600`). It returns to the surrounding range on the next step, and the corresponding loss (`0.02013`) and raw reward (`0.39453`) remain within the observed trajectories rather than diverging.
+![60-step gradient norm](sixty-step/task21_60step_grad_norm.png)
 
-![40-step training loss](steady-state/task21_steady_loss.png)
+![60-step training loss](sixty-step/task21_60step_loss.png)
 
-![40-step raw reward](steady-state/task21_steady_reward.png)
+![60-step raw reward](sixty-step/task21_60step_reward.png)
 
-Every formal run conserved 256 actor samples per update and exactly 40 optimizer updates; measured image count was 1 per sample, metrics were finite, and all five selected GPUs have steady NVML samples. The analyzer reports `measurement_scope=steady_state`, `validation=passed`, two independent seeds, and 30 measured optimizer steps per run. The reviewable campaign report and paired CSVs are checked in under [`steady-state/`](steady-state/); the report records the benchmark commit separately from later documentation and merge-conflict fixes.
+The per-step data and machine-readable run summary are available in
+[`sixty_step_training_curves.csv`](sixty-step/sixty_step_training_curves.csv)
+and [`sixty_step_summary.json`](sixty-step/sixty_step_summary.json). The
+P+R attribution is `MM_PROCESSOR_POOL_SIZE=8`,
+`HYBRID_REUSE_TRAIN_LOGPROBS=1`, and `HYBRID_PIPELINE_FORWARD=0`; the queue
+records this run under its `R60` label.
+
+Every formal 40-step run still conserves 256 actor samples per update and has
+finite metrics with steady NVML evidence. The analyzer reports
+`measurement_scope=steady_state`, `validation=passed`, and the full B/P/P+R/P+S
+matrix remains under [`steady-state/`](steady-state/).
 
 ## Protocol
 
