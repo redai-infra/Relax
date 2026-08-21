@@ -11,7 +11,7 @@ python scripts/data/prepare_ultrafeedback_preferences.py \
   --output-dir /data/task31-ultrafeedback
 ```
 
-The command creates train/eval JSONL and Parquet files plus `manifest.json`. Compare the generated manifest with the checked-in [`task31-ultrafeedback-v1.json`](../../../scripts/data/manifests/task31-ultrafeedback-v1.json) before training. The manifest fixes the source revision, selected prompt IDs, rejection counts, and output SHA-256 values. Derived dataset files are intentionally not stored in Git.
+The command creates train/eval JSONL and Parquet files plus `manifest.json`. For the published Task 31 subset, compare the generated manifest with the [reproducibility evidence bundle](https://github.com/user-attachments/files/31305744/task31-pr1-dpo-evidence-public-v2.tar.gz) before training. The manifest fixes the source revision, selected prompt IDs, rejection counts, and output SHA-256 values. Derived dataset files are intentionally not stored in Git.
 
 Each input row contains one complete preference pair:
 
