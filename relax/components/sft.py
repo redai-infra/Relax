@@ -44,6 +44,7 @@ from relax.engine.sft.debug_print import print_first_sample
 from relax.engine.sft.runtime import is_preference_mode
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
 
@@ -101,6 +102,7 @@ class SFT(Base):
     def _init_data_pipeline(self) -> None:
         if self._dataset is not None:
             return
+        prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         if not is_preference_mode(self.config):
             try:
@@ -508,9 +510,7 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
-            for _ in range(self.config.num_rollout):
-                if self._stop_event.is_set():
-                    break
+            while self.step < self.config.num_rollout and not self._stop_event.is_set():
                 await self._produce_one_step()
         except Exception as exc:
             error_msg = f"SFT producer crashed at step {self.step}: {type(exc).__name__}: {str(exc)}"

@@ -125,8 +125,9 @@ class Advantages(Base):
 
         This function extracts rewards, log-probs, values, and masks from
         `rollout_data`, computes KL divergences, then applies the chosen advantage
-        estimator. Supported methods: "grpo", "gspo", "sapo", "ppo",
-        "reinforce_plus_plus", and "reinforce_plus_plus_baseline".
+        estimator. Supported methods: "grpo", "gspo", "sapo", "cispo",
+        "rloo", "ppo", "reinforce_plus_plus", and
+        "reinforce_plus_plus_baseline".
 
         Early returns if both `log_probs` and `values` are None (intermediate
         pipeline stages).
@@ -172,7 +173,7 @@ class Advantages(Base):
                 for i in range(len(log_probs))
             ]
 
-        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
+        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
             rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
             returns = get_grpo_returns(rewards, kl)
             advantages = list(returns)  # make a copy

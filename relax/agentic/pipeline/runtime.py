@@ -52,6 +52,7 @@ from relax.agentic.session.state import (
 from relax.utils.http_utils import post
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.types import Sample
 
 
@@ -3305,6 +3306,7 @@ def _bootstrap_processor_pool(args: Any):
         return None
     from relax.utils.data.processor_pool import ProcessorPool
 
+    prepare_model_maybe_update_args(args, completeness="metadata")
     return ProcessorPool(
         model_path=args.hf_checkpoint,
         pool_size=pool_size,
@@ -3340,6 +3342,7 @@ def agentic_target_session_count_from_args(args: Any) -> int:
 
 
 def get_agentic_runtime_resources(args: Any) -> RuntimeDomainResources:
+    prepare_model_maybe_update_args(args, completeness="metadata")
     hf_checkpoint = args.hf_checkpoint
     pool_size = args.mm_processor_pool_size
     cache_key = (hf_checkpoint, pool_size)

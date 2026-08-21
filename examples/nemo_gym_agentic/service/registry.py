@@ -9,6 +9,7 @@ import copy
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import time
 from collections.abc import AsyncIterator
@@ -20,6 +21,9 @@ from typing import Any
 from ..app.protocol import PROTOCOL_VERSION, TrialRequest, TrialStatus
 from .config import EnvironmentSpec, GatewayConfigError, GatewaySettings, validate_callback_url
 from .run_adapter import AdapterResult, CleanupResult, RunAdapter, RunHandle, TrialRunContext
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class TrialNotFound(KeyError):
@@ -148,6 +152,7 @@ class GatewayRegistry:
         validate_callback_url(
             request.model_endpoint.base_url,
             self.settings.callback_allowed_hosts,
+            allowed_networks=self.settings.callback_allowed_networks,
             require_tls=self.settings.callback_proxy is not None,
         )
         fingerprint = self._payload_fingerprint(payload)
@@ -300,6 +305,13 @@ class GatewayRegistry:
         except asyncio.CancelledError:
             return
         except Exception:
+            logger.exception(
+                "NeMo Gym trial failed request_id=%s rollout_id=%s environment=%s config=%s",
+                record.request_id,
+                record.rollout_id,
+                record.spec.environment,
+                record.spec.config,
+            )
             await self._begin_cancellation(
                 record,
                 cause="agent_error",

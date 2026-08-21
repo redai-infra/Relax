@@ -84,24 +84,6 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 NUM_GPUS="${NUM_GPUS:-8}"
 NNODES="${WORLD_SIZE:-2}"
 
-# infer cpu threads num ──────────────────────────────────────────────────
-NUM_GPUS_TOTAL="${NUM_GPUS_TOTAL:-8}"
-if [ -z "${CPU_THREADS_PER_ACTOR:-}" ]; then
-    _cores_per_socket=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ {gsub(/ /,"",$2); print $2; exit}')
-    _sockets=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\):/ {gsub(/ /,"",$2); print $2; exit}')
-    if [ -n "${_cores_per_socket}" ] && [ -n "${_sockets}" ] && [ "${_sockets}" -gt 0 ]; then
-        _total_phys=$((_cores_per_socket * _sockets))
-        CPU_THREADS_PER_ACTOR=$((_total_phys / NUM_GPUS_TOTAL))
-        # clamp to [4, 64], avoid bad values
-        [ "${CPU_THREADS_PER_ACTOR}" -lt 4 ] && CPU_THREADS_PER_ACTOR=4
-        [ "${CPU_THREADS_PER_ACTOR}" -gt 64 ] && CPU_THREADS_PER_ACTOR=64
-    else
-        CPU_THREADS_PER_ACTOR=24
-    fi
-fi
-echo "[cpu-threads] NUM_GPUS_TOTAL=${NUM_GPUS_TOTAL} CPU_THREADS_PER_ACTOR=${CPU_THREADS_PER_ACTOR}"
-export CPU_THREADS_PER_ACTOR
-
 # ── head node vs worker node ───────────────────────────────────────────────
 if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
     # ── HEAD NODE ───────────────────────────────────────────────────────────
@@ -159,7 +141,7 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
    \"SGLANG_HEALTH_CHECK_TIMEOUT\": \"${SGLANG_HEALTH_CHECK_TIMEOUT:-180}\",
    \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\",
    \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
-   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-1}\",
+   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-0}\",
    \"NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK\": \"${NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK:-1}\",
    \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
 

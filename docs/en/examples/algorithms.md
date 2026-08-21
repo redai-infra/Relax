@@ -2,7 +2,7 @@
 
 Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-GRPO, CISPO, GSPO, and SAPO share the same service topology, so their argument blocks can be swapped in existing scripts. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+GRPO, RLOO, CISPO, GSPO, and SAPO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
 REINFORCE++ and REINFORCE++-baseline also reuse the GRPO service topology, but
 their return, global normalization and KL contracts are algorithm-specific.
@@ -44,6 +44,76 @@ DATA_DIR=/path/to/data \
 EXP_DIR=/path/to/exp \
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
+
+---
+
+## RLOO
+
+RLOO (REINFORCE Leave-One-Out) uses the other samples for the same prompt as an unbiased baseline. Relax implements synchronous RLOO with an unclipped REINFORCE policy loss; it does not use PPO ratios or clipping.
+
+Reference: [Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs](https://arxiv.org/abs/2402.14740).
+
+### How It Works
+
+For a prompt with $G$ sampled responses and scalar rewards $r_i$, the leave-one-out baseline and advantage are:
+
+$$b_i = \frac{1}{G-1}\sum_{j\ne i}r_j, \qquad A_i = r_i-b_i = \frac{G}{G-1}(r_i-\bar r)$$
+
+Unlike GRPO, RLOO does not divide by the group standard deviation. The token loss is:
+
+$$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$$
+
+Each sample's scalar advantage is broadcast to its response tokens. Relax masks padding and normalizes the summed loss by the global number of valid response tokens $N_{\mathrm{eff}}$:
+
+$$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
+
+This global-token reduction does not apply a separate $1/T_i$ weight to each response. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
+
+### Requirements and Parameters
+
+| Parameter | Requirement | Description |
+|-----------|-------------|-------------|
+| `--advantage-estimator rloo` | required | Enable RLOO |
+| `--n-samples-per-prompt` | at least `2` | Group size $G$; larger groups provide a more stable LOO baseline at higher rollout cost |
+| `--rollout-batch-size × --n-samples-per-prompt` | equals `--global-batch-size` | Exactly one optimizer update per rollout |
+| `--num-steps-per-rollout` | unset or `1` | Reusing the same rollout for multiple unclipped updates is rejected |
+| `--calculate-per-token-loss` | enabled | Use global valid-token normalization; per-response token means would reweight unequal-length responses by $1/T_i$ |
+| `--kl-coef` | `0` | Reward-side KL shaping is not implemented for RLOO; with a valid `--ref-load <checkpoint>`, use `--use-kl-loss --kl-loss-coef <value>` for the supported direct KL penalty |
+| `--max-staleness` | `0` | Stale rollouts are rejected because the unclipped objective has no importance-ratio correction |
+| reward normalization | enabled | RLOO's group transformation runs in the normalized-reward path |
+| `--normalize-advantages` | disabled | Post-DP whitening would change RLOO semantics and make results partition-dependent |
+| `--fully-async`, `--hybrid`, `--partial-rollout`, `--use-dynamic-global-batch-size` | disabled | RLOO currently requires synchronous, fixed-size rollout batches |
+
+The batch sizes are hardware-tunable as long as their equality is preserved. For example, `ROLLOUT_BATCH_SIZE=4`, `N_SAMPLES=8`, and `GLOBAL_BATCH_SIZE=32` retain one update per rollout while reducing per-step memory relative to `16 × 8 = 128`.
+
+### Diagnostics
+
+Training rollout logs publish the following final metric names:
+
+- `rollout/rloo/baseline_mean`: mean LOO baseline (equal to the mean group reward; retained as an explicit baseline trace)
+- `rollout/rloo/adv_abs_mean`: mean absolute RLOO advantage
+- `rollout/rloo/no_signal_frac`: fraction of effective loss tokens attached to zero-advantage samples
+- `rollout/rloo/empty_response_frac`: fraction of samples with a literally empty response
+- `rollout/rloo/zero_adv_group_frac`: fraction of complete groups with zero advantages throughout
+- `rollout/rloo/dropped_group_frac`: fraction of observed groups omitted from diagnostics because their size is incomplete
+
+These diagnostics are training-only, purely observational rollout statistics; they do not affect the training path. Evaluation uses its own sampling group size and does not emit misleading `eval/*/rloo/*` values. They are also omitted when a custom reward post-processor or agentic custom-advantage hook replaces the standard RLOO signal, because raw rewards cannot reconstruct the optimizer input in those modes.
+
+### Quick Start
+
+Use the dedicated Qwen3-0.6B GSM8K recipe. Its batch and rollout settings can be overridden with environment variables:
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+NUM_ROLLOUT=60 \
+ROLLOUT_BATCH_SIZE=4 \
+N_SAMPLES=8 \
+GLOBAL_BATCH_SIZE=32 \
+bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
+```
+
+Set `ADVANTAGE_ESTIMATOR=grpo` to run a control arm with the same recipe and seeds. The recipe writes normalized GSM8K data to a writable artifact cache (override with `RLOO_DATA_CACHE_DIR`) and appends an instruction to emit the final answer as `\boxed{...}`, matching the `math` reward parser contract.
 
 ---
 
@@ -218,6 +288,7 @@ SAPO_ARGS=(
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
+| **RLOO** | Leave-one-out baseline | Unclipped REINFORCE | Optional KL loss (same as GRPO) |
 
 ## Next Steps
 
