@@ -1,5 +1,34 @@
 # Task 21: Hybrid-async multimodal pipeline benchmark results
 
+## Method
+
+The reference Hybrid path receives rollout samples through the TransferQueue,
+runs any required old-policy/reference forwards on actor GPUs, computes
+advantages over the merged rollout batch, and then performs the optimizer
+forward/backward pass. This PR isolates three changes to that path:
+
+- **ProcessorPool (P):** multimodal Hugging Face preprocessing runs in spawned
+  worker processes and returns the same prompt IDs and training tensors through
+  an IPC-safe payload. This removes Python GIL contention from the rollout event
+  loop without changing model execution or the sample contract.
+- **Train-forward reuse (R):** in the guarded true-on-policy case, the dedicated
+  actor old-policy forward is omitted. The optimizer forward supplies both the
+  differentiable policy log-probability and its detached old-policy value, so
+  their PPO ratio is exactly one while gradients still flow through the current
+  policy. When rollout and train weights may differ, TIS continues to compare
+  the detached train-side value with the rollout-engine log-probability.
+- **Schedule-matched chunk forwarding (S):** the actor restores its weights once,
+  then fetches and forwards each fixed-size TransferQueue chunk as it becomes
+  available. Chunks are merged by global sample index, and training replays the
+  recorded dynamic-microbatch grouping so scheduling does not introduce an
+  artificial PPO ratio.
+
+All controls are default-off. Reuse fails closed unless forwards are
+deterministic, exactly one optimizer mini maps to each rollout partition, and
+the rollout log-probabilities have the expected context-parallel layout. Chunk
+forwarding has its own topology and feature compatibility checks and cannot be
+combined with reuse in the reference launcher.
+
 ## Steady-state result
 
 The formal steady-state campaign completed on commit `e2be8cd158609cc2dfae72b7ba92df72cacb3091` using physical GPUs `0,1,2,6,7`: actor TP2 x CP2 x DP1 on four GPUs and one rollout engine on one GPU. Each B/P/P+R/P+S condition used two paired seeds (`20260816`, `20260817`), 40 optimizer updates, 10 warmup updates, and measured windows `10-19`, `20-29`, and `30-39`.
