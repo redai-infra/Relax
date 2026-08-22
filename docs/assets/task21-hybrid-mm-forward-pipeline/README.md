@@ -29,45 +29,39 @@ the rollout log-probabilities have the expected context-parallel layout. Chunk
 forwarding has its own topology and feature compatibility checks and cannot be
 combined with reuse in the reference launcher.
 
-## Steady-state result
+## 60-step steady-state result
 
-The formal steady-state campaign completed on commit `e2be8cd158609cc2dfae72b7ba92df72cacb3091` using physical GPUs `0,1,2,6,7`: actor TP2 x CP2 x DP1 on four GPUs and one rollout engine on one GPU. Each B/P/P+R/P+S condition used two paired seeds (`20260816`, `20260817`), 40 optimizer updates, 10 warmup updates, and measured windows `10-19`, `20-29`, and `30-39`.
+The superseding steady-state campaign ran B/P/P+R/P+S on benchmark commit
+`e2be8cd158609cc2dfae72b7ba92df72cacb3091` with paired seeds `20260820` and
+`20260821`. Every formal run used a fresh process, 60 optimizer updates, physical
+RTX A6000 GPUs `0,1,2,4,7`, actor TP2 x CP2 x DP1 on four GPUs, and one rollout
+engine on one GPU. Steps `0-9` are warmup; the declared steady window is `10-59`.
 
-| Condition | Steady token throughput (mean, range) | Samples/s (mean) | Geomean vs reference |
-|---|---:|---:|---:|
-| B | 1,209.50 (1,144.11-1,274.89) token/s | 1.562 | reference |
-| P | 1,197.49 (1,184.17-1,210.81) token/s | 1.516 | -0.85% token/s vs B |
-| P+R | 1,565.68 (1,559.71-1,571.65) token/s | 1.988 | **+29.64% token/s vs B**; +30.75% vs P |
-| P+S | 1,188.79 (1,142.59-1,234.99) token/s | 1.498 | -1.64% token/s vs B |
+| Condition | Steady token throughput mean (range) | Mean step time | Paired geometric-mean result |
+| --- | ---: | ---: | ---: |
+| B | 1,103.25 (964.68-1,241.83) token/s | 179.62 s | reference |
+| P | 1,157.92 (1,131.16-1,184.69) token/s | 170.52 s | +5.77% vs B |
+| P+R | 1,522.04 (1,475.17-1,568.91) token/s | 129.21 s | **+39.00% vs B**, **+31.42% vs P** |
+| P+S | 1,229.04 (1,136.58-1,321.50) token/s | 162.82 s | +11.97% vs B, +5.87% vs P |
 
-P+R is positive in both paired seeds (`+36.33%`, `+23.28%` token/s vs B), with a 21.50% geometric-mean step-time reduction. The ProcessorPool-only and chunk-overlap paths do not show a sustained throughput gain in this campaign; their values remain reported as attributable ablations rather than being combined into the P+R claim.
+P+R is the only path that improves token throughput against both B and P in
+both paired seeds. Its per-seed gains are `+52.92%` and `+26.34%` vs B, and
+`+24.52%` and `+38.70%` vs P. The paired geometric-mean step-time reduction is
+`27.43%` vs B and `24.19%` vs P.
 
-The three warmup-excluded window means (token/s) were:
+ProcessorPool alone has a positive paired geometric mean but is not consistent
+per seed (`+22.81%`, `-8.91%` vs B). P+S is positive against B in both seeds
+(`+17.82%`, `+6.42%`), but its incremental result over P changes sign
+(`-4.06%`, `+16.83%`). Those ablations remain reported, but the sustained
+throughput claim is limited to P+R.
 
-| Condition | 10-19 | 20-29 | 30-39 |
-|---|---:|---:|---:|
-| B | 1,221.46 | 1,188.81 | 1,219.31 |
-| P | 1,202.85 | 1,204.60 | 1,185.82 |
-| P+R | 1,556.00 | 1,565.52 | 1,575.02 |
-| P+S | 1,198.25 | 1,178.24 | 1,190.35 |
-
-## 60-step P+R training curves
-
-This 60-optimizer-step benchmark pairs a fresh B control with P+R on seed
-`20260820`, using the same Qwen3-VL-8B workload and five-GPU layout. The curves
-show every optimizer step from `0` through `59` directly from TensorBoard
-scalar exports, without smoothing or interpolation; the shaded `0-9` interval
-is warmup.
-
-| Condition | Steady token throughput | Mean step time | Response-token throughput | Raw reward mean | Grad-norm max |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| B60 | 964.68 token/s | 203.62 s | 484.37 token/s | 0.44359 | 4.89165 |
-| P+R60 | 1,475.17 token/s | 131.71 s | 734.88 token/s | 0.43805 | 3.06235 |
-
-P+R60 is `1.529x` the B60 token throughput and reduces mean step time by
-`35.31%` in this same-seed comparison. Both runs completed all 60
-steps with finite `train/grad_norm`, `train/loss`, and `rollout/raw_reward`
-series; training, validation, and final exit status are all zero.
+All eight included runs completed 60/60 optimizer steps with
+`training_exit_status=0`, `validation_exit_status=0`, `exit_status=0`, finite
+loss/reward/gradient series, and `validation=passed`. One S60 attempt interrupted
+by an external GPU lease was excluded; the automatic retry completed and is the
+formal seed-`20260820` S60 run. Curves below show all steps directly from
+TensorBoard scalar exports without smoothing or interpolation; the band is the
+two-seed range and the shaded `0-9` interval is warmup.
 
 ![60-step gradient norm](sixty-step/task21_60step_grad_norm.png)
 
@@ -75,14 +69,14 @@ series; training, validation, and final exit status are all zero.
 
 ![60-step raw reward](sixty-step/task21_60step_reward.png)
 
-The per-step data and machine-readable run summary are available in
+The per-step data, compact summary, full campaign report, and paired CSVs are
+available in
 [`sixty_step_training_curves.csv`](sixty-step/sixty_step_training_curves.csv)
-and [`sixty_step_summary.json`](sixty-step/sixty_step_summary.json). The
-P+R attribution is `MM_PROCESSOR_POOL_SIZE=8`,
-`HYBRID_REUSE_TRAIN_LOGPROBS=1`, and `HYBRID_PIPELINE_FORWARD=0`; the queue
-records this run under its `R60` label.
+and [`sixty_step_summary.json`](sixty-step/sixty_step_summary.json), with the
+complete analyzer output in
+[`sixty_step_campaign_report.json`](sixty-step/sixty_step_campaign_report.json).
 
-## Protocol
+## Historical first-step protocol
 
 - Performance-code commit: `780c742793fea54acdb28cb40ffb591fb909ba51`.
 - Base commit: `9a5674afde12f608698ab4f60cdb9849a0eb6cb3`.
@@ -96,7 +90,7 @@ TP2 x CP2 x DP1 profile. They do not establish steady-state training
 throughput. A steady-state claim requires multi-step runs with warmup excluded
 and later measurement windows declared before analysis.
 
-## Result summary
+## Historical first-step result summary
 
 | Metric | Baseline | Experiment | Result |
 |---|---:|---:|---:|
