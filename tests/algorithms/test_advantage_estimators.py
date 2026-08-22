@@ -289,3 +289,41 @@ def test_a_huge_but_finite_spread_is_still_whitened():
     out = whiten_scalar(torch.tensor([1e38, -1e38, 0.0]))
     assert not torch.equal(out, torch.zeros_like(out))
     assert torch.isfinite(out).all()
+
+
+def test_finite_float32_extremes_are_whitened_not_silently_zeroed():
+    """`distributed_mean_std` returns `std.to(values.dtype)`.
+
+    Two finite float32 values whose unbiased std exceeds float32's range gave a
+    `std` of `inf` once cast back, and the division returned an all-zero batch
+    with no error. The comment that removed the old guard argued this could not
+    happen; it could, with two samples.
+    """
+    limit = torch.finfo(torch.float32).max
+    values = torch.tensor([-limit, limit], dtype=torch.float32)
+    assert torch.isfinite(values).all()
+
+    out = whiten_scalar(values)
+    assert torch.isfinite(out).all()
+    assert out[0] < 0 < out[1]
+    assert not torch.equal(out, torch.zeros_like(out))
+
+
+def test_a_float32_subtraction_that_used_to_overflow_now_does_not():
+    """The second path, which a guard on `std` alone would not have caught.
+
+    Here the mean and the std are both finite in float32; it is `values - mean`
+    that overflowed, putting `-inf` in the result.
+    """
+    limit = torch.finfo(torch.float32).max
+    values = torch.tensor([limit] * 10 + [-limit], dtype=torch.float32)
+
+    out = whiten_scalar(values)
+    assert torch.isfinite(out).all()
+    assert out[-1] < out[0]
+
+
+def test_whitening_keeps_the_callers_dtype():
+    """The float64 work is internal; the caller gets back what it passed in."""
+    assert whiten_scalar(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)).dtype == torch.float32
+    assert whiten_scalar(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)).dtype == torch.float64

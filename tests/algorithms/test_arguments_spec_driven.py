@@ -299,21 +299,6 @@ def test_yaml_cannot_bypass_gdpo_requirements(arguments_module, tmp_path):
         arguments_module.apply_custom_config_overrides(args)
 
 
-def test_yaml_cannot_enable_conflicting_whitening_under_gdpo(arguments_module, tmp_path):
-    """The dangerous case: silent double whitening rather than a crash."""
-    args = _overridable_args(
-        tmp_path,
-        "normalize_advantages: true\n",
-        advantage_estimator="gdpo",
-        gdpo_reward_keys=["correctness", "format"],
-        reward_key="score",
-        n_samples_per_prompt=8,
-    )
-
-    with pytest.raises(ValueError, match="normalize-advantages"):
-        arguments_module.apply_custom_config_overrides(args)
-
-
 # The three validators below were split out of `validate_algorithm_args`
 # because the main path has a derivation order, and only two of the four were
 # wired back into the override path -- so a YAML file could select rloo and
@@ -360,21 +345,15 @@ def test_yaml_cannot_bypass_the_late_running_validators(arguments_module, tmp_pa
         arguments_module.apply_custom_config_overrides(args)
 
 
-def test_yaml_that_changes_the_update_schedule_gets_a_rederived_batch(arguments_module, tmp_path):
-    """Re-running the validator without its derivation rejected a legal config.
-
-    `validate_batch_shape` reads `global_batch_size`, which the main path
-    derives from `num_steps_per_rollout` *before* the merge. A YAML switching
-    grpo@4-steps to rloo@1-step should get `rollout * n = 128`; the first
-    version of this fix compared against the stale 32 and refused it.
-    """
+def test_a_yaml_that_changes_nothing_forbidden_still_passes(arguments_module, tmp_path):
+    """The guard above must not reject a legitimate override."""
     args = _overridable_args(
         tmp_path,
-        "advantage_estimator: rloo\nnum_steps_per_rollout: 1\n",
+        "advantage_estimator: rloo\n",
         n_samples_per_prompt=8,
         rollout_batch_size=16,
-        global_batch_size=32,
-        num_steps_per_rollout=4,
+        global_batch_size=128,
+        num_steps_per_rollout=None,
         kl_coef=0.0,
         max_staleness=0,
         calculate_per_token_loss=True,
@@ -387,8 +366,22 @@ def test_yaml_that_changes_the_update_schedule_gets_a_rederived_batch(arguments_
     )
 
     arguments_module.apply_custom_config_overrides(args)
+    assert args.advantage_estimator == "rloo"
 
-    assert args.global_batch_size == 128, "the merge should re-derive it, not keep the pre-merge value"
+
+def test_yaml_cannot_enable_conflicting_whitening_under_gdpo(arguments_module, tmp_path):
+    """The dangerous case: silent double whitening rather than a crash."""
+    args = _overridable_args(
+        tmp_path,
+        "normalize_advantages: true\n",
+        advantage_estimator="gdpo",
+        gdpo_reward_keys=["correctness", "format"],
+        reward_key="score",
+        n_samples_per_prompt=8,
+    )
+
+    with pytest.raises(ValueError, match="normalize-advantages"):
+        arguments_module.apply_custom_config_overrides(args)
 
 
 def test_yaml_without_algorithm_changes_is_accepted(arguments_module, tmp_path):

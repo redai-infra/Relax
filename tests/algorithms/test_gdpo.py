@@ -457,7 +457,6 @@ def test_sample_get_reward_components_matches_the_test_double():
 
 def test_warns_once_when_every_component_collapses_in_every_group(caplog):
     """A batch that produces no gradient at all must not be silent."""
-    import logging
 
     samples = _mk([0, 0, 0, 0], [1.0] * 4, [0.5] * 4)
     with caplog.at_level(logging.WARNING):
@@ -468,7 +467,6 @@ def test_warns_once_when_every_component_collapses_in_every_group(caplog):
 
 
 def test_does_not_warn_when_some_signal_survives(caplog):
-    import logging
 
     samples = _mk([0, 0, 0, 0], [1.0] * 4, [1.0, 0.0, 1.0, 0.0])
     with caplog.at_level(logging.WARNING):
@@ -478,7 +476,6 @@ def test_does_not_warn_when_some_signal_survives(caplog):
 
 
 def test_does_not_warn_when_only_some_groups_collapse(caplog):
-    import logging
 
     samples = _mk(
         [0, 0, 0, 0, 1, 1, 1, 1],
@@ -888,26 +885,56 @@ def test_float32_columns_are_what_made_the_residue_dangerous():
     assert whiten_scalar(residue).abs().amax() > 0.5
 
 
-def test_the_worst_measured_residue_after_removing_the_floor():
-    """The limit the removal accepts, measured rather than asserted safe.
+def test_the_cancellation_residue_grows_without_bound_with_the_base_magnitude():
+    """The unsolved limitation, measured across three decades rather than at
+    one point.
 
-    An ill-conditioned constant sum -- 1e9 with a spread of 0.1 -- does not
-    cancel exactly. In a batch made only of such groups, step 3 divides that
-    remainder by its own tiny std and it reaches the optimizer. This pins the
-    magnitude: 2.6e-3, against real advantages of order 1.
+    This test used to be called `test_the_worst_measured_residue_after_removing_the_floor`
+    and asserted `< 5e-3` at a single base of 1e9. The name claimed a bound the
+    measurement never established: the residue of a constant sum is roughly
+    `ulp(C) / spread`, so it grows with C, and once its std passes `GDPO_EPS`
+    step 3 stops clamping the amplification. At 1e13 what reaches a batch of
+    such groups is O(1) -- the same order the removed noise floor was justified
+    by.
 
-    That is the whole cost of dropping the floor, and it is three orders below
-    what the floor itself destroyed (see the two tests after this one).
+    Nothing in the reward stage detects this; see `combine_group` for why the
+    two mechanisms tried so far could not. The test exists so the limitation is
+    a measured fact in the suite rather than a sentence in a docstring.
     """
-    base = 1e9
-    rows = [[base - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)]
-    group = torch.tensor(rows, dtype=torch.float64)
+    weights = torch.tensor([1.0, 1.0], dtype=torch.float64)
+    reaching_training = {}
+    for base in (1e8, 1e9, 1e11, 1e13):
+        group = torch.tensor([[base - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)], dtype=torch.float64)
+        combined = combine_group(group, weights)
+        reaching_training[base] = float(whiten_scalar(combined.float()).abs().amax())
 
-    combined = combine_group(group, torch.tensor([1.0, 1.0], dtype=torch.float64))
-    assert 0.0 < float(combined.abs().amax()) < 1e-6
+    assert reaching_training[1e8] < 1e-3, reaching_training
+    assert reaching_training[1e9] < 5e-3, reaching_training
+    assert reaching_training[1e13] > 0.5, reaching_training
+    assert reaching_training[1e13] > 100 * reaching_training[1e9], reaching_training
 
-    reaching_training = whiten_scalar(combined.float())
-    assert float(reaching_training.abs().amax()) < 5e-3
+
+def test_a_healthy_batch_dilutes_the_cancellation_residue():
+    """The same groups, sized against the batch they actually train in.
+
+    Eq. 7 centres each group, so a batch holding healthy groups sets the
+    whitening scale and the degenerate group's remainder lands four orders
+    lower than the figures above. Those figures are batch-of-one worst cases,
+    not what a mixed rollout sees -- stated here because the same distinction
+    was elided once already.
+    """
+    weights = torch.tensor([1.0, 1.0], dtype=torch.float64)
+    torch.manual_seed(0)
+    healthy = [combine_group(torch.rand(4, 2, dtype=torch.float64) * 10, weights) for _ in range(8)]
+    degenerate = combine_group(
+        torch.tensor([[1e9 - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)], dtype=torch.float64), weights
+    )
+
+    alone = float(whiten_scalar(degenerate.float()).abs().amax())
+    mixed = whiten_scalar(torch.cat(healthy + [degenerate]).float())
+
+    assert alone > 1e-3
+    assert float(mixed[-4:].abs().amax()) < 1e-5
 
 
 def test_the_floor_would_have_zeroed_a_real_signal_two_columns_are_enough():
@@ -947,55 +974,83 @@ def test_a_large_but_readable_reward_keeps_its_signal():
     assert float(combined.abs().amax()) > 0.1
 
 
-# ---------------- the residual diagnostic reports, it does not correct ------
+# ---------------- the filter asks the same question the trainer will ---------
 
 
-def test_a_near_cancellation_is_reported_and_left_alone(caplog):
-    """The replacement for the floor: a log line, and the value untouched."""
-    base = 1e9
-    samples = [_S(0, {"correctness": base - delta, "format": delta}) for delta in (0.1, 0.2, 0.3, 0.7)]
-    args = _args(weights=[1.0, 1.0], n=4)
+def test_the_filter_and_the_normalizer_never_disagree_about_a_group():
+    """One question, one answer. The two used to differ by a tolerance.
 
-    with caplog.at_level(logging.WARNING):
-        out = REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 4)
+    `group_carries_reward_signal` decides whether a prompt group enters
+    training; `normalize_gdpo_decoupled` computes what it trains on. A group
+    the filter keeps must be one the normalizer gives a within-group ranking,
+    and vice versa -- otherwise the sampler is selecting on a different
+    criterion than the algorithm optimises.
+    """
+    cases = [
+        ("a healthy group", [(0.0, 3.0), (1.0, 2.5), (2.0, 0.5), (3.0, 0.0)], [1.0, 1.0]),
+        ("components that cancel", [(r, _CONSTANT_SUM_C - r) for r in _CONSTANT_SUM_R], [0.5, 0.5]),
+        ("a component muted by a zero weight", [(5.0, 1.0), (5.0, 2.0), (5.0, 4.0)], [1.0, 0.0]),
+        ("every component flat", [(5.0, 3.0), (5.0, 3.0), (5.0, 3.0)], [1.0, 1.0]),
+        ("weights that nearly cancel", [(1.0, 1.0), (2.0, 2.0), (4.0, 4.0)], [1.0, -0.999999]),
+    ]
+    for label, rows, weights in cases:
+        samples = [_S(0, {"correctness": a, "format": b}) for a, b in rows]
+        args = _args(weights=weights, n=len(rows))
 
-    assert "rounding error rather than reward signal" in caplog.text
-    assert any(value != 0.0 for value in out), "reported, not zeroed"
+        kept = group_carries_reward_signal(args, samples)
+        combined = torch.tensor(REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * len(rows)))
+        trainable = bool(combined.float().amin() != combined.float().amax())
+
+        assert kept is trainable, f"{label}: filter says {kept}, the advantage says {trainable}"
 
 
-def test_a_well_conditioned_batch_is_not_reported(caplog):
-    samples = [_S(0, {"correctness": float(i), "format": float(i * i)}) for i in range(4)]
-    args = _args(weights=[1.0, 1.0], n=4)
+def test_the_filter_keeps_a_group_the_ratio_criterion_used_to_discard():
+    """The consultation's counterexample, kept as a regression guard.
 
-    with caplog.at_level(logging.WARNING):
-        REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 4)
+    Two reward components in [0.4, 0.6] with a real, orthogonal 1e-8 difference
+    between samples -- not rounding: the ranking it induces is exact. The
+    removed relative-ratio criterion scored this at 5e-8 and dropped it, while
+    the advantage it would have produced is 0.43 in a batch of its own.
+    """
+    x, y = [-1.0, -1.0, 1.0, 1.0], [-1.0, 1.0, -1.0, 1.0]
+    rows = [(0.5 + 0.1 * a, 0.5 - 0.1 * a + 1e-8 * b) for a, b in zip(x, y, strict=True)]
+    samples = [_S(0, {"correctness": a, "format": b}) for a, b in rows]
+    args = _args(weights=[1000.0, 1000.0], n=4)
 
-    assert "rounding error" not in caplog.text
+    assert group_carries_reward_signal(args, samples) is True
+
+    combined = torch.tensor(REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 4))
+    assert float(whiten_scalar(combined.float()).abs().amax()) > 0.4
 
 
-def test_the_filter_drops_a_cancelling_group_and_the_normalizer_still_reports_it():
-    """The deliberate asymmetry, pinned.
+def test_the_filter_drops_a_group_whose_combination_is_exactly_zero():
+    """The other direction: exact zero needs no tolerance to detect."""
+    for rows, weights in (
+        ([(5.0, 1.0), (5.0, 2.0), (5.0, 4.0)], [1.0, 0.0]),
+        ([(5.0, 3.0), (5.0, 3.0), (5.0, 3.0)], [1.0, 1.0]),
+    ):
+        samples = [_S(0, {"correctness": a, "format": b}) for a, b in rows]
+        args = _args(weights=weights, n=len(rows))
+        assert group_carries_reward_signal(args, samples) is False
 
-    Both go through `combine_group`, so they see the same 1.4e-10. They then do
-    different things with it, and that is the design:
 
-    * the filter answers "is this group worth training on", and a tolerance is
-      the right tool for that question -- the same judgement GRPO's `std > 0`
-      makes;
-    * the normalizer answers "what is this group's advantage", and returns what
-      Eq. 7 computes, untouched.
+def test_a_cancelling_group_survives_on_its_rounding_and_that_is_recorded():
+    """The accepted cost of having no tolerance, pinned so it is not a
+    surprise.
 
-    Collapsing these back into one answer is what the noise floor did. If a
-    future change makes the normalizer return hard zeros here, this fails.
+    Two components summing to a constant leave a remainder that is rounding,
+    not reward content. Nothing detects that, so the group is kept and trained
+    on. In a batch of its own the remainder reaches the optimizer at 1.2e-6;
+    mixed with healthy groups it is four orders smaller still.
     """
     samples = [_S(0, {"correctness": r, "format": _CONSTANT_SUM_C - r}) for r in _CONSTANT_SUM_R]
     args = _args(weights=[0.5, 0.5], n=3)
 
-    assert group_carries_reward_signal(args, samples) is False
+    assert group_carries_reward_signal(args, samples) is True
 
-    combined = REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3)
-    assert combined != [0.0, 0.0, 0.0], "the reward stage does not edit the value it reports on"
-    assert max(abs(value) for value in combined) < 1e-9
+    combined = torch.tensor(REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3))
+    assert 0.0 < float(combined.abs().amax()) < 1e-9
+    assert float(whiten_scalar(combined.float()).abs().amax()) < 1e-5
 
 
 # ---------------- weights keep float64 until the transport cast -------------

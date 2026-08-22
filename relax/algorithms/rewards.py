@@ -30,19 +30,6 @@ _FLOAT32_MAX = float(torch.finfo(torch.float32).max)
 """Largest finite float32. Rewards are carried as float32 from here on, so a
 value above this is an overflow waiting to happen rather than a large reward."""
 
-_RESIDUAL_RATIO = 1e-6
-"""How far below the scale of its own terms a combined signal has to fall
-before :func:`combined_signal_is_residual` calls it rounding.
-
-Six orders, and the gap it sits in is wide. Above it: a real combination of
-unit-variance columns has magnitude of order 1 against a scale of order
-``sum_k |w_k|``, so ratios run around ``1/K`` -- 0.5 for two components, 0.06
-for sixteen. Below it: the float64 cancellations measured here come out at
-exactly 0, at 1.9e-16, and in the worst ill-conditioned case found (a constant
-sum at 1e9 with a 0.1 spread) at 1.3e-7. Nothing observed lands between 1e-7
-and 1e-2, so the exact value is not load-bearing -- it only decides whether a
-diagnostic line is printed."""
-
 
 def group_positions(samples: list[Any], expected_size: int) -> dict[int, list[int]]:
     """Map ``Sample.group_index`` to the positions it occupies in ``samples``.
@@ -230,9 +217,9 @@ def extract_reward_components(samples: list[Any], keys: list[str]) -> torch.Tens
     # standardisation that follows is ill-conditioned exactly when two
     # components cancel: `C - r` loses the low bits on a float32 cast, and
     # dividing what is left by a near-zero std turns those lost bits into a
-    # full-scale advantage. Keeping the width here is what makes the residue
-    # small enough for `combine_group`'s noise floor to be able to tell signal
-    # from rounding at all -- in float32 the residue is larger than the signal.
+    # full-scale advantage. Keeping the width here is the only thing that keeps
+    # that residue below the signal at all: in float32 it is larger, and step 3
+    # returns advantages of order 1 for a group that carries none.
     # The float32 range check above still stands: the combined reward is cast
     # back down further along, so a value that cannot survive that cast is
     # still a bug worth reporting at the reward function that produced it.
@@ -260,9 +247,10 @@ def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
     Standardising is ill-conditioned when a column barely varies: it divides
     by a std that is near zero, so the *relative* error in the result grows
     like ``max|x| / std``. That is not a corner case here -- it is precisely
-    what two columns summing to a constant look like, and it is why
-    :func:`component_noise_scale` exists and why the columns now arrive in
-    float64. See :func:`combine_group` for what is done with the estimate.
+    what two columns summing to a constant look like, and it is why the columns
+    arrive here in float64: in float32 the residue of that cancellation was
+    larger than the signal it was left over from. See :func:`combine_group` for
+    the part of this that is still unsolved.
     """
     work = group.double()
     centered = work - work.mean(dim=0, keepdim=True)
@@ -273,65 +261,47 @@ def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
     return scaled.to(group.dtype)
 
 
-def combined_signal_is_residual(group: torch.Tensor, weights: torch.Tensor, combined: torch.Tensor) -> bool:
-    """Whether a group's combined advantage is rounding rather than signal.
-
-    Purely observational -- nothing here changes what reaches training. It
-    exists because ``combine_group`` deliberately does not: two components
-    summing to a constant standardise to exact opposites and *should* cancel to
-    zero, and in float64 they usually do exactly that. When they do not, the
-    remainder is the rounding error of an ill-conditioned division, and the
-    caller is worth telling.
-
-    Compares the combined magnitude against the scale of the terms that were
-    added: ``sum_k |w_k| * max|z_k|``. The standardised columns are recomputed
-    here rather than passed in, so that :func:`combine_group` stays the only
-    place Eq. 7 is written down -- open-coding it at the call site is how the
-    strict and observational paths came apart the last time. A genuine combination is within a couple
-    of orders of that scale; a cancellation remnant is nine or more below it.
-    The threshold is loose on purpose -- it decides whether to log a line, so
-    the cost of being wrong in either direction is a log line.
-    """
-    standardized = standardize_group_components(group)
-    scale = float((weights.double().abs() * standardized.double().abs().amax(dim=0)).sum())
-    if scale == 0.0:
-        return False
-    magnitude = float(combined.abs().amax())
-    return 0.0 < magnitude < _RESIDUAL_RATIO * scale
-
-
 def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """GDPO steps 1 and 2 for one ``[G, K]`` prompt group: ``sum_k w_k z_ik``.
 
-    Eq. 7 and nothing else. An all-or-nothing noise floor used to sit at the
-    end of this function, zeroing the result when it fell below
-    ``8 * sum(|w_k| * noise_k)``. It is gone, and the reason is worth keeping
-    written down because the argument for it sounded good:
+    Eq. 7 and nothing else. Two things used to sit at the end of this function
+    and both are gone; the reasons are worth keeping because both sounded good.
 
-    * The floor was meant to stop an ill-conditioned cancellation from becoming
-      a gradient. Measurement says the float64 columns already do that. Two
-      components summing to a constant cancel to about 1e-10 rather than to
-      exactly zero, but step 3 divides by ``std + GDPO_EPS`` and
-      ``GDPO_EPS = 1e-4`` caps the amplification: what reaches the optimizer is
-      1.2e-6, and the worst pathological case found (a constant sum at 1e9 with
-      a 0.1 spread, in a batch containing nothing else) reaches 2.6e-3 -- not
-      the O(1) the floor was justified by.
-    * Against that, the floor demonstrably destroyed real signal. It grew as
-      ``sum`` over components while any per-column noise measure is a ``max``,
-      so with 16 components each individually cleaner than 1% it reached 0.82
-      and zeroed a true combined signal of 0.03. Two components at
-      ``base = 4.05e13`` were enough: floor 0.148, signal 0.033.
+    **The noise floor** returned zeros when the result fell below
+    ``8 * sum(|w_k| * noise_k)``. It is not in Eq. 7, and the tests written to
+    document it proved it destroyed real signal: two components at
+    ``base = 4.05e13``, every column measuring under 1% noise, gave a floor of
+    0.148 against a true signal of 0.033. It grew as a sum over components
+    while any per-column noise measure is a max, so sixteen clean columns
+    reached 0.82.
 
-    So it traded a 1e-3 worst case for a 1e-1 one, and did it silently. A
-    numerically degenerate group is now reported by
-    :func:`combined_signal_is_residual` and trains on its own tiny value, which
-    is what Eq. 7 says it should be.
+    **Its replacement, a relative "is this rounding?" ratio**, lasted one round
+    longer and was worse, because it was wrong in kind rather than in
+    calibration. ``magnitude`` scales with the *difference* between the weights
+    while ``sum_k |w_k| max|z_k|`` scales with their *magnitude*, so the ratio
+    measured the weight configuration and not the data: at ``G = 2`` it reduces
+    exactly to ``|w1 - w2| / (|w1| + |w2|)``, independent of every reward value
+    in the group. Measured on real inputs it was inverted in both directions at
+    once -- it discarded a group whose final advantage was 0.43 and kept one
+    whose 1.08 was pure rounding.
 
-    Note what this function does *not* decide. Whether such a group is worth
-    keeping at all is a filtering question, asked separately by
-    :func:`group_carries_reward_signal`, and that one does apply a tolerance.
-    Deciding it here would mean editing the training signal to record a
-    judgement about it, which is the mistake the floor was.
+    That is not fixable by moving the threshold. For ``G >= 3`` the centred
+    subspace is at least two-dimensional, so ``z_2 = -z_1 + delta * u`` with
+    ``u`` orthogonal to ``z_1`` and ``delta`` arbitrarily small is a genuine
+    signal with an arbitrarily small ratio. No universal threshold separates
+    "the components nearly cancel" from "the arithmetic nearly cancelled".
+
+    **What is left unsolved, stated plainly rather than argued away.** Two
+    components summing to a constant do not cancel exactly, and the remainder
+    grows with the magnitude they are centred on -- roughly ``ulp(C) / spread``.
+    At ``C = 1e9`` it reaches the optimizer as 2.6e-3; at ``C = 1e13``, or with
+    both columns large and straddling a binade, as O(1). Nothing in this file
+    detects that, and the two mechanisms tried so far could not: a conditioning
+    bound cannot prove a small result is *not* signal, and screening on the
+    post-whitening magnitude needs the whole batch, which a per-group function
+    does not have. Those figures are for a batch made only of such groups; Eq. 7
+    is centred per group, so in a batch that also holds healthy groups the same
+    remainder arrives around 1e-7.
     """
     standardized = standardize_group_components(group)
     return (standardized.double() * weights.double()).sum(dim=1)
@@ -407,32 +377,10 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
 
     combined = torch.zeros(len(samples), dtype=torch.float64)
     silent_groups = 0
-    residual_groups = 0
     for positions in positions_by_group.values():
-        group = components[positions]
-        combined[positions] = combine_group(group, weight_tensor)
+        combined[positions] = combine_group(components[positions], weight_tensor)
         if not bool(combined[positions].any()):
             silent_groups += 1
-        elif combined_signal_is_residual(group, weight_tensor, combined[positions]):
-            residual_groups += 1
-
-    if residual_groups:
-        # Not an error and not a correction: these groups train on the value
-        # Eq. 7 gives them. But a combined signal six orders below the terms
-        # that produced it is the arithmetic's rounding, not the reward's
-        # content, and the run should not have to infer that from a flat loss
-        # curve. See `combine_group` for why nothing is zeroed here.
-        logger.warning(
-            "GDPO: %d of %d groups in this batch combined to a value far below the scale of their "
-            "own standardised components (keys=%s, weights=%s). Those components very nearly cancel, "
-            "so what is left is rounding error rather than reward signal. The advantages are kept as "
-            "computed; check whether these rewards are near-duplicates of each other with opposing "
-            "weights.",
-            residual_groups,
-            len(positions_by_group),
-            keys,
-            weights,
-        )
 
     if silent_groups == len(positions_by_group):
         # Every group came out at exactly zero, so this batch produces no
@@ -526,16 +474,20 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
     # question `normalize_gdpo_decoupled` will. Open-coding it is how the two
     # came apart before.
     #
-    # A tolerance *is* applied here, and it is not the removed noise floor: this
-    # decides whether a group is worth keeping, not what it trains on. The
-    # difference is the whole point of the split. Two components summing to a
-    # constant cancel to about 1e-10, which reaches the optimizer as 1.2e-6 --
-    # an exact `.any()` would call that signal and keep a group that contributes
-    # nothing, which is the behaviour this helper was written to fix.
-    combined = combine_group(components, weights)
-    if combined_signal_is_residual(components, weights, combined):
-        return False
-    return bool(combined.any())
+    # Exactly the test the single-reward branch above makes, on exactly the
+    # values the trainer will receive: `min != max` in float32. Not `.any()` --
+    # a group whose combined advantages are all equal and nonzero carries no
+    # within-group ranking either, and step 3 would whiten it to zero. Not a
+    # tolerance of any kind: a threshold here decides whether a prompt group
+    # enters training, and no threshold on this quantity can tell a genuine
+    # near-cancellation from a rounding one (see `combine_group`).
+    #
+    # The consequence is deliberate and it has a cost. A group whose components
+    # sum to a constant survives this test on its rounding remainder and is
+    # trained on; in a mixed batch that remainder reaches the optimizer around
+    # 1e-7, and it wastes the group. That is the price of not guessing.
+    combined = combine_group(components, weights).float()
+    return bool(combined.amin() != combined.amax())
 
 
 def observed_reward_signal(args: Any, samples: list[Any]) -> bool | None:

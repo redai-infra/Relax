@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-from relax.algorithms.rewards import group_carries_reward_signal
+from relax.algorithms.rewards import group_carries_reward_signal, zero_std_group_label
 from relax.engine.filters.base_types import DynamicFilterOutput
 from relax.utils.types import Sample
 
@@ -34,7 +34,17 @@ def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     longer guaranteed to be side-effect-free on bad data.
     """
     keep = group_carries_reward_signal(args, samples)
-    return DynamicFilterOutput(
-        keep=keep,
-        reason=None if keep else f"zero_std_{round(samples[0].get_reward_value(args), 1)}",
-    )
+    if keep:
+        return DynamicFilterOutput(keep=True, reason=None)
+
+    # The label goes through `zero_std_group_label`, which is the same helper
+    # the zero-std metrics use and already refuses the three ways this can
+    # crash: `reward` is None, `args.reward_key` selects a None out of a dict,
+    # or the dict has no such key at all. This line used to read
+    # `samples[0].get_reward_value(args)` directly and had none of that -- a
+    # multi-reward run whose rewards carry the `--gdpo-reward-keys` but not the
+    # `--reward-key` scalar passes the signal test above (it only reads the
+    # component keys) and then took the rollout down here with a `KeyError`,
+    # while the metrics side handled the identical input.
+    label = zero_std_group_label(args, samples)
+    return DynamicFilterOutput(keep=False, reason="zero_std" if label is None else f"zero_std_{label}")

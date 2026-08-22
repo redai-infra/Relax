@@ -159,7 +159,6 @@ class AlgorithmSpec:
     handled in ``relax/utils/arguments.py``.
     """
 
-    min_group_size: int = 1
     allows_reward_post_process_hooks: bool = True
     """False when a user-supplied reward hook would silently disable the
     algorithm's own reward stage.

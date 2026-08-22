@@ -222,6 +222,33 @@ def test_builtin_filter_is_unchanged_for_single_reward_algorithms():
     assert check_reward_nonzero_std(_grpo_args(), varied).keep is True
 
 
+def test_the_drop_label_survives_a_reward_without_the_scalar_key():
+    """The label line used to take the rollout down instead of labelling.
+
+    A multi-reward run only needs `--gdpo-reward-keys` in each reward dict; the
+    signal test above reads nothing else. But the label was built from
+    `samples[0].get_reward_value(args)`, which reads `--reward-key`, and only
+    on the drop path -- so a group that was flat *and* carried no scalar key
+    raised `KeyError` out of the rollout loop. `zero_std_group_label` already
+    refused exactly this input on the metrics side; the filter now uses it too.
+    """
+    from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
+
+    class _NoScalar:
+        group_index = 0
+        reward = {"correctness": 1.0, "format": 2.0}
+
+        def get_reward_value(self, args):
+            return self.reward[args.reward_key]
+
+        def get_reward_components(self, keys):
+            return [self.reward[key] for key in keys]
+
+    out = check_reward_nonzero_std(_gdpo_args(), [_NoScalar(), _NoScalar(), _NoScalar(), _NoScalar()])
+    assert out.keep is False
+    assert out.reason == "zero_std"
+
+
 # ---------------- the zero-std metrics (metrics_group_verdict) ----------------
 #
 # There are two copies of `_compute_zero_std_metrics`, and only the agentic one
