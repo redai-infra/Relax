@@ -7,6 +7,7 @@ directly in plain Python, independently of the tensor implementation, so a
 mistake in one is unlikely to be mirrored in the other.
 """
 
+import logging
 import math
 from types import SimpleNamespace
 
@@ -17,10 +18,10 @@ torch = pytest.importorskip("torch")
 
 from relax.algorithms import get_algorithm  # noqa: E402
 from relax.algorithms.advantages import whiten_scalar  # noqa: E402
+from relax.algorithms.numerics import GDPO_EPS  # noqa: E402
 from relax.algorithms.rewards import (  # noqa: E402
     REWARD_NORMALIZERS,
     combine_group,
-    component_noise_scale,
     extract_reward_components,
     group_carries_reward_signal,
     standardize_group_components,
@@ -768,7 +769,12 @@ def test_a_single_segment_is_still_size_checked():
         _gdpo_adv([1.0, 2.0, 3.0, 4.0, 5.0], mini_batch_sizes=[4])
 
 
-# ---------------- the noise floor (see combine_group) ----------------
+# ---------------- Eq. 7, and what happens when it cancels ----------------
+#
+# A noise floor used to sit at the end of `combine_group`, zeroing the result
+# when it fell below `8 * sum(|w_k| * noise_k)`. It is gone; these tests pin
+# both halves of why -- that it was not needed, and that it destroyed real
+# signal -- so that reintroducing it fails here rather than in a training run.
 
 
 _CONSTANT_SUM_C = 308.95172119140625
@@ -785,174 +791,270 @@ def _constant_sum_group():
     return torch.tensor([[r, _CONSTANT_SUM_C - r] for r in _CONSTANT_SUM_R], dtype=torch.float64)
 
 
-def test_components_that_cancel_produce_exactly_zero_not_amplified_rounding():
-    """Equal weights on two components summing to a constant must cancel.
+def _eq7_oracle(rows, weights, eps=0.0):
+    """Eq. 4 then Eq. 7, in plain Python, from the paper's definitions.
 
-    In float32 this group came out of step 2 at [-0.086, 0.173, -0.086] and out
-    of step 3 -- which divides by the std of that very residue -- at [-0.577,
-    1.154, -0.577]. Finite, plausible, and pointing wherever the last bits of
-    the reward happened to fall.
+    Independent of the implementation on purpose: no torch, no shared helper,
+    nothing imported from `relax`. `eps` is the one place the implementation
+    knowingly departs from the paper -- `standardize_group_components` divides
+    by `std + GDPO_EPS` rather than by `std` -- and it is a parameter here so
+    the tests can show both that the deviation is exactly that and that it
+    vanishes wherever the group standard deviation dominates it.
     """
-    combined = combine_group(_constant_sum_group(), torch.tensor([0.5, 0.5]))
-    assert combined.tolist() == [0.0, 0.0, 0.0]
-    assert whiten_scalar(combined).tolist() == [0.0, 0.0, 0.0]
+    columns = list(zip(*rows, strict=True))
+    standardized = []
+    for column in columns:
+        mean = sum(column) / len(column)
+        variance = sum((value - mean) ** 2 for value in column) / (len(column) - 1)
+        standardized.append([(value - mean) / (variance**0.5 + eps) for value in column])
+    return [sum(weight * standardized[k][i] for k, weight in enumerate(weights)) for i in range(len(rows))]
+
+
+def test_combine_group_is_eq7_and_nothing_else():
+    """Against an independent transcription of the paper, not a helper."""
+    rows = [[1.0, 4.0], [2.0, 0.5], [4.0, -1.0], [8.0, 2.5]]
+    weights = [0.75, -0.25]
+
+    got = combine_group(torch.tensor(rows, dtype=torch.float64), torch.tensor(weights, dtype=torch.float64))
+    want = _eq7_oracle(rows, weights, eps=GDPO_EPS)
+
+    assert got.dtype == torch.float64
+    for left, right in zip(got.tolist(), want, strict=True):
+        assert abs(left - right) < 1e-12, (got.tolist(), want)
+
+
+def test_the_clamped_denominator_is_the_only_departure_from_the_paper():
+    """At a group std of ~1e4, GDPO_EPS is 1e-8 relative and disappears.
+
+    Pins that the implementation is Eq. 7 plus that one clamp and nothing else:
+    scale the same group up and it converges on the unclamped oracle.
+    """
+    rows = [[1e4, 4e4], [2e4, 0.5e4], [4e4, -1e4], [8e4, 2.5e4]]
+    weights = [0.75, -0.25]
+
+    got = combine_group(torch.tensor(rows, dtype=torch.float64), torch.tensor(weights, dtype=torch.float64))
+    want = _eq7_oracle(rows, weights)  # eps=0: the paper exactly
+
+    for left, right in zip(got.tolist(), want, strict=True):
+        assert abs(left - right) < 1e-8, (got.tolist(), want)
+
+
+def test_eq7_holds_for_a_small_combined_value_too():
+    """The retired floor zeroed results like this one; Eq.
+
+    7 keeps them.
+    """
+    rows = [[1.0, 1.0], [2.0, 2.0], [4.0, 4.0], [8.0, 8.001]]
+    weights = [1.0, -1.0]
+
+    got = combine_group(torch.tensor(rows, dtype=torch.float64), torch.tensor(weights, dtype=torch.float64))
+    want = _eq7_oracle(rows, weights, eps=GDPO_EPS)
+
+    assert 0.0 < float(got.abs().amax()) < 0.01, "this group is the interesting kind: real but tiny"
+    for left, right in zip(got.tolist(), want, strict=True):
+        assert abs(left - right) < 1e-12
+
+
+def test_components_that_cancel_reach_the_optimizer_as_1e_minus_6():
+    """The number the floor's removal is judged on, measured end to end.
+
+    This is the group the floor was built for. Eq. 7 leaves 1.4e-10 rather than
+    a hard zero, and step 3 -- which divides by the std of that very residue --
+    turns it into 1.2e-6. That is the fake gradient, and it is six orders below
+    a real advantage.
+
+    In float32 the same group came out of step 2 at [-0.086, 0.173, -0.086] and
+    out of step 3 at [-0.577, 1.154, -0.577]. Finite, plausible, and pointing
+    wherever the last bits of the reward happened to fall. That is the case the
+    float64 columns fixed; the floor was never what fixed it.
+    """
+    combined = combine_group(_constant_sum_group(), torch.tensor([0.5, 0.5], dtype=torch.float64))
+
+    assert 0.0 < float(combined.abs().amax()) < 1e-9
+    assert float(whiten_scalar(combined).abs().amax()) < 1e-5
 
 
 def test_float32_columns_are_what_made_the_residue_dangerous():
-    """The dtype is the half that stops a full-scale fake advantage.
+    """The dtype is what stops a full-scale fake advantage, not the floor.
 
-    Pins the claim `combine_group` makes about the split of responsibility. If
-    someone narrows `extract_reward_components` back to float32 on the grounds
-    that "the floor handles it", the residue returns to being larger than the
-    signal and this fails.
+    If someone narrows `extract_reward_components` back to float32, the residue
+    returns to being larger than the signal and this fails.
     """
-    weights = torch.tensor([0.5, 0.5])
+    weights = torch.tensor([0.5, 0.5], dtype=torch.float64)
     narrow = _constant_sum_group().float().double()
 
-    residue = (standardize_group_components(narrow).double() * weights.double()).sum(dim=1)
+    residue = (standardize_group_components(narrow).double() * weights).sum(dim=1)
     assert residue.abs().amax() > 1e-3
     assert whiten_scalar(residue).abs().amax() > 0.5
 
 
-def test_float64_alone_leaves_a_residue_small_but_not_zero():
-    """The floor's job is exact detectability, not magnitude.
+def test_the_worst_measured_residue_after_removing_the_floor():
+    """The limit the removal accepts, measured rather than asserted safe.
 
-    Also pins that it is `GDPO_EPS` capping step 3, not luck: without it the
-    residue would be divided by its own std and come back to order 1.
+    An ill-conditioned constant sum -- 1e9 with a spread of 0.1 -- does not
+    cancel exactly. In a batch made only of such groups, step 3 divides that
+    remainder by its own tiny std and it reaches the optimizer. This pins the
+    magnitude: 2.6e-3, against real advantages of order 1.
+
+    That is the whole cost of dropping the floor, and it is three orders below
+    what the floor itself destroyed (see the two tests after this one).
     """
-    group = _constant_sum_group()
-    weights = torch.tensor([0.5, 0.5])
-    unfloored = (standardize_group_components(group).double() * weights.double()).sum(dim=1)
+    base = 1e9
+    rows = [[base - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)]
+    group = torch.tensor(rows, dtype=torch.float64)
 
-    assert 0.0 < float(unfloored.abs().amax()) < 1e-8
-    assert float(whiten_scalar(unfloored).abs().amax()) < 1e-4
+    combined = combine_group(group, torch.tensor([1.0, 1.0], dtype=torch.float64))
+    assert 0.0 < float(combined.abs().amax()) < 1e-6
 
-
-def test_the_floor_leaves_a_well_conditioned_group_alone():
-    """The margin is fifteen orders of magnitude, so nothing real is
-    suppressed."""
-    group = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]], dtype=torch.float64)
-    weights = torch.tensor([0.5, 0.5])
-
-    combined = combine_group(group, weights)
-    floor = component_noise_scale(group)
-
-    assert combined.abs().amax() > 0.1
-    assert float(floor.amax()) < 1e-14
+    reaching_training = whiten_scalar(combined.float())
+    assert float(reaching_training.abs().amax()) < 5e-3
 
 
-def test_noise_scale_is_zero_for_a_collapsed_column():
-    """A collapsed column contributes exact zeros, so it contributes no
-    error."""
-    group = torch.tensor([[1.0, 5.0], [0.0, 5.0], [1.0, 5.0]], dtype=torch.float64)
-    assert component_noise_scale(group)[1].item() == 0.0
+def test_the_floor_would_have_zeroed_a_real_signal_two_columns_are_enough():
+    """The measurement that retired it: every column clean, signal destroyed.
 
-
-def test_the_filter_agrees_with_the_normalizer_on_a_cancelling_group():
-    """Both go through `combine_group`, so they cannot disagree about this."""
-    samples = [_S(0, {"correctness": r, "format": _CONSTANT_SUM_C - r}) for r in _CONSTANT_SUM_R]
-    args = _args(weights=[0.5, 0.5], n=3)
-
-    assert group_carries_reward_signal(args, samples) is False
-    assert REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3) == [0.0, 0.0, 0.0]
-
-
-# ---------------- where the floor still swallows signal (a known limit) ----
-#
-# A guard that raised above a fixed per-column noise level used to live in
-# `combine_group`. It was removed because it could not be made to hold, and
-# these tests pin the measurements that showed why: each one is a group the
-# guard would have let through while the floor zeroes a real signal. They are
-# characterisation tests -- they assert the limitation, so that anyone who
-# fixes it sees them fail rather than discovering the behaviour from a run.
-
-
-def _offset_group(base, delta):
-    """A component varying by `delta` around `base`, plus a well-conditioned
-    one."""
-    return torch.tensor([[base + i * delta, float(i)] for i in range(3)], dtype=torch.float64)
-
-
-def test_the_floor_zeroes_a_real_signal_two_columns_are_enough():
-    """`noise` under 1% per column, and the floor still takes the group.
-
-    This is the measurement that retired the per-column guard: any threshold
-    high enough to leave the cancelling group alone sits above this one.
+    Kept as a live test rather than a comment, so that reintroducing any all-
+    or-nothing floor of this shape fails immediately.
     """
     base = 4.05e13
-    # float64 throughout: `extract_reward_components` builds float64 precisely
-    # so this offset survives, and in float32 `base + 1.0` would not move at all.
     group = torch.tensor([[base, base + 2.0], [base + 1.0, base + 1.0], [base + 2.0, base + 0.1]], dtype=torch.float64)
-    weights = torch.tensor([1.0, 1.0])
+    weights = torch.tensor([1.0, 1.0], dtype=torch.float64)
 
-    noise = component_noise_scale(group)
-    unfloored = (standardize_group_components(group).double() * weights.double()).sum(dim=1)
-
-    assert float(noise.amax()) < 0.01  # every column reads as clean...
-    assert float(unfloored.abs().amax()) > 0.03  # ...and the signal is real...
-    assert combine_group(group, weights).tolist() == [0.0, 0.0, 0.0]  # ...and lost anyway
+    combined = combine_group(group, weights)
+    assert float(combined.abs().amax()) > 0.03, "the signal is real"
+    assert combined.tolist() != [0.0, 0.0, 0.0], "and it survives"
 
 
-def test_the_floor_grows_with_the_component_count():
-    """The floor is a weighted *sum*, so more components raise it.
-
-    No per-column bound can see this: the columns stay equally clean as the
-    floor climbs past the signal.
-    """
+def test_the_floor_would_have_grown_with_the_component_count():
+    """Sixteen individually clean columns; the old floor reached 0.82."""
     base = 2.9e13
     rows = []
     for i in range(3):
-        up = [base + float(i)] * 8
-        down = [base + float(2 - i)] * 8
-        rows.append(up + down)
+        rows.append([base + float(i)] * 8 + [base + float(2 - i)] * 8)
     group = torch.tensor(rows, dtype=torch.float64)
     group[2, 0] += 0.1  # a real difference, 12% of that column's spread
-    weights = torch.ones(16)
+    weights = torch.ones(16, dtype=torch.float64)
 
-    noise = component_noise_scale(group)
-    floor = 8.0 * float((weights.double().abs() * noise).sum())
-
-    assert float(noise.amax()) < 0.01  # per column: clean
-    assert floor > 0.5  # summed over 16 columns: not
-    assert combine_group(group, weights).tolist() == [0.0, 0.0, 0.0]
-
-
-def test_the_noise_estimate_assumes_float64_provenance():
-    """A reward computed in float32 carries ~5e8x more error than this bound.
-
-    The estimate uses float64's eps, so a column whose variation is entirely
-    float32 rounding measures as clean and standardises to full scale.
-    """
-    base = 1e9
-    ulp32 = float(torch.tensor(base, dtype=torch.float32).item() * 2**-23)
-    group = torch.tensor([[base + i * ulp32, float(i)] for i in range(3)], dtype=torch.float64)
-
-    assert float(component_noise_scale(group).amax()) < 1e-8  # reads as pristine
-    assert float(combine_group(group, torch.tensor([1.0, 1.0])).abs().amax()) > 1.0  # full-scale garbage
-
-
-def test_the_noise_estimate_is_a_fraction_only_above_gdpo_eps():
-    """Below GDPO_EPS the denominator is clamped, so `noise` understates.
-
-    Reading `component_noise_scale` as "what fraction of the standardised value
-    is rounding" is only valid while std dominates GDPO_EPS.
-    """
-    group = torch.tensor([[1e9 + i * 1e-6, float(i)] for i in range(3)], dtype=torch.float64)
-
-    noise = float(component_noise_scale(group).amax())
-    standardized = standardize_group_components(group)
-    actual = noise / float(standardized[:, 0].abs().amax())
-
-    assert noise < 0.01  # the estimate says "clean"
-    assert actual > 0.15  # the real contamination is over 15%
-
-
-def test_the_cancelling_group_still_reaches_the_floor():
-    """The group the floor exists for still comes out as exactly zero."""
-    assert combine_group(_constant_sum_group(), torch.tensor([0.5, 0.5])).tolist() == [0.0, 0.0, 0.0]
+    combined = combine_group(group, weights)
+    assert float(combined.abs().amax()) > 0.02
+    assert combined.tolist() != [0.0, 0.0, 0.0]
 
 
 def test_a_large_but_readable_reward_keeps_its_signal():
     """1e9 with a spread of 0.1 still carries eight significant digits."""
-    combined = combine_group(_offset_group(1e9, 0.1), torch.tensor([0.5, 0.5]))
+    group = torch.tensor([[1e9 + i * 0.1, float(i)] for i in range(3)], dtype=torch.float64)
+    combined = combine_group(group, torch.tensor([0.5, 0.5], dtype=torch.float64))
     assert float(combined.abs().amax()) > 0.1
+
+
+# ---------------- the residual diagnostic reports, it does not correct ------
+
+
+def test_a_near_cancellation_is_reported_and_left_alone(caplog):
+    """The replacement for the floor: a log line, and the value untouched."""
+    base = 1e9
+    samples = [_S(0, {"correctness": base - delta, "format": delta}) for delta in (0.1, 0.2, 0.3, 0.7)]
+    args = _args(weights=[1.0, 1.0], n=4)
+
+    with caplog.at_level(logging.WARNING):
+        out = REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 4)
+
+    assert "rounding error rather than reward signal" in caplog.text
+    assert any(value != 0.0 for value in out), "reported, not zeroed"
+
+
+def test_a_well_conditioned_batch_is_not_reported(caplog):
+    samples = [_S(0, {"correctness": float(i), "format": float(i * i)}) for i in range(4)]
+    args = _args(weights=[1.0, 1.0], n=4)
+
+    with caplog.at_level(logging.WARNING):
+        REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 4)
+
+    assert "rounding error" not in caplog.text
+
+
+def test_the_filter_drops_a_cancelling_group_and_the_normalizer_still_reports_it():
+    """The deliberate asymmetry, pinned.
+
+    Both go through `combine_group`, so they see the same 1.4e-10. They then do
+    different things with it, and that is the design:
+
+    * the filter answers "is this group worth training on", and a tolerance is
+      the right tool for that question -- the same judgement GRPO's `std > 0`
+      makes;
+    * the normalizer answers "what is this group's advantage", and returns what
+      Eq. 7 computes, untouched.
+
+    Collapsing these back into one answer is what the noise floor did. If a
+    future change makes the normalizer return hard zeros here, this fails.
+    """
+    samples = [_S(0, {"correctness": r, "format": _CONSTANT_SUM_C - r}) for r in _CONSTANT_SUM_R]
+    args = _args(weights=[0.5, 0.5], n=3)
+
+    assert group_carries_reward_signal(args, samples) is False
+
+    combined = REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3)
+    assert combined != [0.0, 0.0, 0.0], "the reward stage does not edit the value it reports on"
+    assert max(abs(value) for value in combined) < 1e-9
+
+
+# ---------------- weights keep float64 until the transport cast -------------
+
+
+def test_weights_closer_than_float32_stay_distinct():
+    """Two configured weights that collapse to one float32 must not collapse
+    here.
+
+    16777216 and 16777217 are consecutive integers, and the second is the first
+    integer float32 cannot represent. Casting the weight vector before the
+    multiplication made these two anti-correlated components cancel to exactly
+    zero; in float64 they combine to about +-1.
+    """
+    rows = [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
+    group = torch.tensor(rows, dtype=torch.float64)
+
+    exact = combine_group(group, torch.tensor([16777216.0, 16777217.0], dtype=torch.float64))
+    quantised = combine_group(group, torch.tensor([16777216.0, 16777217.0], dtype=torch.float32).double())
+
+    assert float(quantised.abs().amax()) < 1e-6, "this is what the float32 cast used to produce"
+    assert float(exact.abs().amax()) > 0.9
+
+
+def test_the_normalizer_uses_the_configured_weights_not_their_float32_image():
+    samples = [_S(0, {"correctness": a, "format": b}) for a, b in ((1.0, 0.0), (0.0, 1.0), (1.0, 0.0))]
+    args = _args(weights=[16777216.0, 16777217.0], n=3)
+
+    out = REWARD_NORMALIZERS["gdpo_decoupled"](args, samples, [0.0] * 3)
+
+    assert max(abs(value) for value in out) > 0.9, out
+
+
+# ---------------- the float32 hand-off must fail loudly ---------------------
+
+
+def test_whitening_raises_on_a_reward_that_overflowed_the_transport_dtype():
+    """float64-finite, float32-inf. This used to be read as zero variance.
+
+    Two same-direction components at weight 3e38 combine to about 6e38: finite
+    where the reward stage checks it, `inf` once it is cast for transport.
+    """
+    combined = torch.tensor([-5.9994e38, 0.0, 5.9994e38], dtype=torch.float64)
+    assert torch.isfinite(combined).all(), "the reward stage sees nothing wrong"
+
+    with pytest.raises(ValueError, match="non-finite advantage"):
+        whiten_scalar(combined.float())
+
+
+def test_a_float32_extreme_that_does_not_overflow_is_whitened_normally():
+    """The companion non-check: `distributed_mean_std` works in float64.
+
+    The removed "non-finite std means collapse" branch could not fire from
+    finite float32 input, and this is why -- the largest float32 squared is
+    1.2e77, nowhere near float64's range. Pins that the input check above is
+    the only guard needed.
+    """
+    combined = torch.tensor([-3.4e38, 0.0, 3.4e38], dtype=torch.float32)
+    whitened = whiten_scalar(combined)
+
+    assert torch.isfinite(whitened).all()
+    assert float(whitened.abs().amax()) > 0.5

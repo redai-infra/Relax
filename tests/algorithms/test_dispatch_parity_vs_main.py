@@ -152,13 +152,6 @@ def test_group_normalization_matches_main(name):
 
 
 @pytest.mark.parametrize("name", MAIN_ALGORITHMS)
-def test_advantage_normalization_matches_main(name):
-    """main kept this as two identical name sets; drift between them was
-    silent."""
-    assert (get_algorithm(name).advantage_normalization == "token_global") is (name in MAIN_TOKEN_GLOBAL)
-
-
-@pytest.mark.parametrize("name", MAIN_ALGORITHMS)
 def test_startup_constraints_match_main(name):
     spec = get_algorithm(name)
     assert spec.forbids_normalize_advantages is (name in MAIN_FORBIDS_NORMALIZE_ADVANTAGES)

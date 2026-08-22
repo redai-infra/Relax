@@ -56,12 +56,33 @@ def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | No
 
     A batch where every value is identical returns exact zeros; see
     :func:`relax.algorithms.numerics.is_collapsed`.
+
+    A batch containing a non-finite value raises. It used to return zeros, on
+    the reasoning that a non-finite standard deviation is "no spread" -- but
+    "every sample scored the same" and "the arithmetic overflowed" are opposite
+    diagnoses, and only the second one is reachable here. The reward stage checks
+    finiteness in float64; the values reach this function in float32
+    (``dict_to_tensordict`` casts the rewards column, and ``_as_reward_tensor``
+    casts again), so a combined reward of 5.999e38 is finite where it was
+    checked and ``inf`` where it is used. Silently zeroing that turned an
+    overflow into a batch that trains on nothing and reports no error.
     """
+    if not torch.isfinite(values).all():
+        raise ValueError(
+            "GDPO batch whitening received a non-finite advantage. The reward stage verified these "
+            "in float64, so this is the float32 hand-off overflowing: the combined reward fits in "
+            "float64 but not in the dtype it is carried and trained in. Rescale the reward "
+            "components or their --gdpo-reward-weights."
+        )
     if is_collapsed(values, process_group=process_group):
         return torch.zeros_like(values)
+    # No second check on `std`. There used to be one, reading a non-finite std
+    # as collapse and returning zeros -- which is what let the overflow above
+    # pass silently. It is not replaced by a raise either, because with finite
+    # float32 input it cannot fire: `distributed_mean_std` accumulates in
+    # float64, where the largest float32 squared is 1.2e77 against float64's
+    # 1.8e308, so the sum of squares would need ~1e153 samples to overflow.
     mean, std = distributed_mean_std(values, process_group=process_group)
-    if not torch.isfinite(std):
-        return torch.zeros_like(values)
     return (values - mean) / (std + GDPO_EPS)
 
 

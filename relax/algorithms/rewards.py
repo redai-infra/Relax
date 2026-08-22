@@ -30,13 +30,18 @@ _FLOAT32_MAX = float(torch.finfo(torch.float32).max)
 """Largest finite float32. Rewards are carried as float32 from here on, so a
 value above this is an overflow waiting to happen rather than a large reward."""
 
-_NOISE_FLOOR_SAFETY = 8.0
-"""Headroom on :func:`component_noise_scale`'s first-order error bound.
+_RESIDUAL_RATIO = 1e-6
+"""How far below the scale of its own terms a combined signal has to fall
+before :func:`combined_signal_is_residual` calls it rounding.
 
-The bound is an estimate, not a proof, so it gets an order of magnitude. It can
-afford to: on well-conditioned rewards the bound sits fifteen orders of
-magnitude below the signal, so any value in this neighbourhood suppresses
-exactly the same things."""
+Six orders, and the gap it sits in is wide. Above it: a real combination of
+unit-variance columns has magnitude of order 1 against a scale of order
+``sum_k |w_k|``, so ratios run around ``1/K`` -- 0.5 for two components, 0.06
+for sixteen. Below it: the float64 cancellations measured here come out at
+exactly 0, at 1.9e-16, and in the worst ill-conditioned case found (a constant
+sum at 1e9 with a 0.1 spread) at 1.3e-7. Nothing observed lands between 1e-7
+and 1e-2, so the exact value is not load-bearing -- it only decides whether a
+diagnostic line is printed."""
 
 
 def group_positions(samples: list[Any], expected_size: int) -> dict[int, list[int]]:
@@ -141,6 +146,7 @@ def normalize_group_leave_one_out(args: Any, samples: list[Any], raw_rewards: li
         normalized_rewards[positions] = compute_rloo_leave_one_out_rewards(group_rewards)
 
     return normalized_rewards.tolist()
+
 
 def resolve_gdpo_keys(args: Any) -> list[str]:
     """The reward components GDPO normalises independently."""
@@ -267,108 +273,68 @@ def standardize_group_components(group: torch.Tensor) -> torch.Tensor:
     return scaled.to(group.dtype)
 
 
-def component_noise_scale(group: torch.Tensor) -> torch.Tensor:
-    """Per-column bound on how much of :func:`standardize_group_components` is
-    rounding.
+def combined_signal_is_residual(group: torch.Tensor, weights: torch.Tensor, combined: torch.Tensor) -> bool:
+    """Whether a group's combined advantage is rounding rather than signal.
 
-    Returns one value per column: the magnitude below which that column's
-    standardised values are indistinguishable from the arithmetic that
-    produced them.
+    Purely observational -- nothing here changes what reaches training. It
+    exists because ``combine_group`` deliberately does not: two components
+    summing to a constant standardise to exact opposites and *should* cancel to
+    zero, and in float64 they usually do exactly that. When they do not, the
+    remainder is the rounding error of an ill-conditioned division, and the
+    caller is worth telling.
 
-    The bound is the condition number of the standardisation. Each input
-    carries a relative representation error of about ``eps``, i.e. an absolute
-    error of ``eps * max|x|``. Dividing by ``std + GDPO_EPS`` scales that error
-    up by the same factor it scales the signal, so the error in the output is
-    ``eps * max|x| / (std + GDPO_EPS)``.
-
-    Two properties make this usable rather than a tuning knob:
-
-    * On a well-conditioned column it is negligible. Rewards around 1.0 with a
-      std of 0.1 give ``2.2e-16 * 1 / 0.1 ~ 2e-15`` against signal of order 1
-      -- fifteen orders of margin, so nothing real is ever suppressed.
-    * On the pathological column it matches what actually happens. For the
-      constant-sum group in ``test_gdpo.py`` the bound comes to ~5.1e-10 and
-      the residue measures 4.1e-10.
-
-    A collapsed column contributes exactly zero (not ``0/eps`` noise), so it
-    contributes no error either.
+    Compares the combined magnitude against the scale of the terms that were
+    added: ``sum_k |w_k| * max|z_k|``. The standardised columns are recomputed
+    here rather than passed in, so that :func:`combine_group` stays the only
+    place Eq. 7 is written down -- open-coding it at the call site is how the
+    strict and observational paths came apart the last time. A genuine combination is within a couple
+    of orders of that scale; a cancellation remnant is nine or more below it.
+    The threshold is loose on purpose -- it decides whether to log a line, so
+    the cost of being wrong in either direction is a log line.
     """
-    work = group.double()
-    eps = torch.finfo(work.dtype).eps
-    std = work.std(dim=0)
-    scale = work.abs().amax(dim=0)
-    noise = eps * scale / (std + GDPO_EPS)
-    return torch.where(collapsed_columns(group, dim=0), torch.zeros_like(noise), noise)
+    standardized = standardize_group_components(group)
+    scale = float((weights.double().abs() * standardized.double().abs().amax(dim=0)).sum())
+    if scale == 0.0:
+        return False
+    magnitude = float(combined.abs().amax())
+    return 0.0 < magnitude < _RESIDUAL_RATIO * scale
 
 
 def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """GDPO steps 1 and 2 for one ``[G, K]`` prompt group, with a noise floor.
+    """GDPO steps 1 and 2 for one ``[G, K]`` prompt group: ``sum_k w_k z_ik``.
 
-    Two components summing to a constant should standardise to exact opposites
-    and cancel. What is left instead is the rounding error of an
-    ill-conditioned division, and it does not stay small: step 3 divides by the
-    std of that very residue.
+    Eq. 7 and nothing else. An all-or-nothing noise floor used to sit at the
+    end of this function, zeroing the result when it fell below
+    ``8 * sum(|w_k| * noise_k)``. It is gone, and the reason is worth keeping
+    written down because the argument for it sounded good:
 
-    Two separate things keep that from becoming a gradient, and it is worth
-    being exact about which does what, because the tempting summary -- "the
-    floor stops a full-scale fake advantage" -- is not true:
+    * The floor was meant to stop an ill-conditioned cancellation from becoming
+      a gradient. Measurement says the float64 columns already do that. Two
+      components summing to a constant cancel to about 1e-10 rather than to
+      exactly zero, but step 3 divides by ``std + GDPO_EPS`` and
+      ``GDPO_EPS = 1e-4`` caps the amplification: what reaches the optimizer is
+      1.2e-6, and the worst pathological case found (a constant sum at 1e9 with
+      a 0.1 spread, in a batch containing nothing else) reaches 2.6e-3 -- not
+      the O(1) the floor was justified by.
+    * Against that, the floor demonstrably destroyed real signal. It grew as
+      ``sum`` over components while any per-column noise measure is a ``max``,
+      so with 16 components each individually cleaner than 1% it reached 0.82
+      and zeroed a true combined signal of 0.03. Two components at
+      ``base = 4.05e13`` were enough: floor 0.148, signal 0.033.
 
-    * **The float64 columns do the heavy lifting.** In float32 the residue was
-      of order 1e-1, larger than the signal itself, and step 3 returned
-      advantages of order 1. In float64 it is of order 1e-10, and ``GDPO_EPS``
-      in step 3's denominator caps the amplification, so the worst case is
-      already down to ~1e-6. No floor is needed to avoid a fake gradient.
-    * **The floor makes the cancellation exactly detectable.** 1e-6 is not
-      zero, and several consumers test for zero:
-      :func:`group_carries_reward_signal` would keep a group contributing
-      nothing, and the all-groups-silent warning would never fire. Rounding a
-      residue to the zero it mathematically is turns a "too small to matter"
-      into a "recognisably absent".
+    So it traded a 1e-3 worst case for a 1e-1 one, and did it silently. A
+    numerically degenerate group is now reported by
+    :func:`combined_signal_is_residual` and trains on its own tiny value, which
+    is what Eq. 7 says it should be.
 
-    The comparison is per group and all-or-nothing, matching how a collapsed
-    column is already handled. ``_NOISE_FLOOR_SAFETY`` is the one judgement
-    call; given the fifteen orders of margin on well-conditioned input, its
-    exact value changes nothing that is not already noise.
-
-    **Where the floor still swallows signal, measured rather than assumed.**
-    A guard that raised above a fixed per-column noise level used to live here.
-    It was removed because it could not be made to hold: the floor is
-    ``8 * sum(|w_k| * noise_k)`` while any per-column test is a max, so the two
-    do not even scale together. Three measurements, all reproducible on CPU:
-
-    * **The floor outgrows any per-column bound.** With 16 components at
-      ``noise_k = 0.0064`` each -- every column individually cleaner than 1% --
-      the floor reaches 0.82 and zeroes a real combined signal of 0.03..0.07.
-      More components means a higher floor at unchanged per-column noise.
-    * **Two components are enough.** At ``base = 4.05e13`` the columns measure
-      ``noise = [0.0090, 0.0095]`` and the floor, 0.148, zeroes a combined
-      signal of 0.033.
-    * **The estimate assumes float64 provenance.** ``eps`` here is float64's.
-      A reward computed in float32 (a ``torch.float32`` tensor's ``.item()``,
-      an ``np.float32``) carries ~5e8 times more error than this bound admits:
-      a column varying by exactly one float32 ulp at 1e9 measures
-      ``noise = 1.9e-9`` and standardises to a full-scale ±2, which no bound
-      derived from float64 ``eps`` can see.
-
-    A fourth, for anyone reading ``component_noise_scale`` as a fraction: it is
-    one only while ``std >> GDPO_EPS``. At ``std << GDPO_EPS`` the denominator
-    is clamped and the standardised column no longer has unit variance --
-    ``base=1e9`` with a spread of 1e-6 measures ``noise = 0.0022`` while the
-    true relative contamination is 20.7%.
-
-    So a group can be a hundredth of a percent from "clean" per column and
-    still lose its gradient here, silently. That is a real limitation of this
-    design, not a tuning problem; fixing it needs the floor and the diagnostic
-    to be the same quantity, which is a larger change than this function.
+    Note what this function does *not* decide. Whether such a group is worth
+    keeping at all is a filtering question, asked separately by
+    :func:`group_carries_reward_signal`, and that one does apply a tolerance.
+    Deciding it here would mean editing the training signal to record a
+    judgement about it, which is the mistake the floor was.
     """
-    noise = component_noise_scale(group)
     standardized = standardize_group_components(group)
-    combined = (standardized.double() * weights.double()).sum(dim=1)
-
-    floor = _NOISE_FLOOR_SAFETY * float((weights.double().abs() * noise).sum())
-    if float(combined.abs().amax()) <= floor:
-        return torch.zeros_like(combined)
-    return combined
+    return (standardized.double() * weights.double()).sum(dim=1)
 
 
 def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[float]) -> list[float]:
@@ -409,19 +375,31 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     components = extract_reward_components(samples, keys)
     positions_by_group = group_positions(samples, args.n_samples_per_prompt)
 
-    weight_tensor = torch.tensor(weights, dtype=torch.float32)
-    if not torch.isfinite(weight_tensor).all():
+    # float64, matching the components. The weights used to be cast to float32
+    # here, one stage before the arithmetic needed it, and that quantisation was
+    # observable: [16777216, 16777217] are two distinct configured weights that
+    # become the same float32, so a pair of anti-correlated components that
+    # should combine to about +-1 combined to exactly 0 instead. The cast to the
+    # transport dtype belongs at the end of the pipeline, not at the start.
+    weight_tensor = torch.tensor(weights, dtype=torch.float64)
+
+    # The two checks below are still about float32, and deliberately: the
+    # combined reward is carried to the trainer in float32 (`dict_to_tensordict`),
+    # so a weight vector that cannot survive that cast produces a run that trains
+    # on nothing. Asking here rather than after the multiplication is what lets
+    # the message name the weights instead of the arithmetic.
+    if not torch.isfinite(weight_tensor.float()).all():
         # `resolve_gdpo_weights` checked `math.isfinite` on the Python floats.
         # That is a different question: 1e300 is finite in float64 and `inf`
-        # once it lands in this tensor.
+        # once it reaches the transport dtype.
         raise ValueError(
             f"--gdpo-reward-weights {weights} contains a value that overflows float32; "
             f"the largest representable is {_FLOAT32_MAX:.6g}."
         )
-    if float(weight_tensor.abs().sum()) == 0.0:
+    if float(weight_tensor.float().abs().sum()) == 0.0:
         # Same gap in the other direction: 1e-50 is a nonzero Python float that
         # flushes to zero in float32, so a weight vector that passed the
-        # "not all zero" check can still be all zeros by the time it multiplies.
+        # "not all zero" check can still be all zeros by the time it matters.
         raise ValueError(
             f"--gdpo-reward-weights {weights} are all zero once cast to float32; "
             "the combined advantage would be identically 0."
@@ -429,10 +407,32 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
 
     combined = torch.zeros(len(samples), dtype=torch.float64)
     silent_groups = 0
+    residual_groups = 0
     for positions in positions_by_group.values():
-        combined[positions] = combine_group(components[positions], weight_tensor)
+        group = components[positions]
+        combined[positions] = combine_group(group, weight_tensor)
         if not bool(combined[positions].any()):
             silent_groups += 1
+        elif combined_signal_is_residual(group, weight_tensor, combined[positions]):
+            residual_groups += 1
+
+    if residual_groups:
+        # Not an error and not a correction: these groups train on the value
+        # Eq. 7 gives them. But a combined signal six orders below the terms
+        # that produced it is the arithmetic's rounding, not the reward's
+        # content, and the run should not have to infer that from a flat loss
+        # curve. See `combine_group` for why nothing is zeroed here.
+        logger.warning(
+            "GDPO: %d of %d groups in this batch combined to a value far below the scale of their "
+            "own standardised components (keys=%s, weights=%s). Those components very nearly cancel, "
+            "so what is left is rounding error rather than reward signal. The advantages are kept as "
+            "computed; check whether these rewards are near-duplicates of each other with opposing "
+            "weights.",
+            residual_groups,
+            len(positions_by_group),
+            keys,
+            weights,
+        )
 
     if silent_groups == len(positions_by_group):
         # Every group came out at exactly zero, so this batch produces no
@@ -516,12 +516,26 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
         return bool(rewards.amin() != rewards.amax())
 
     keys = resolve_gdpo_keys(args)
-    weights = torch.tensor(resolve_gdpo_weights(args, keys), dtype=torch.float32)
+    # float64, the same dtype `normalize_gdpo_decoupled` weights with. A float32
+    # weight tensor here would answer this question for a *different* weight
+    # vector than the one training uses, whenever two configured weights are
+    # closer together than float32 can represent.
+    weights = torch.tensor(resolve_gdpo_weights(args, keys), dtype=torch.float64)
     components = extract_reward_components(samples, keys)
-    # `combine_group`, not steps 1 and 2 open-coded: this has to answer the
-    # same question `normalize_gdpo_decoupled` will, including the noise floor.
-    # Open-coding it is how the two came apart before.
-    return bool(combine_group(components, weights).any())
+    # `combine_group`, not steps 1 and 2 open-coded: this has to answer the same
+    # question `normalize_gdpo_decoupled` will. Open-coding it is how the two
+    # came apart before.
+    #
+    # A tolerance *is* applied here, and it is not the removed noise floor: this
+    # decides whether a group is worth keeping, not what it trains on. The
+    # difference is the whole point of the split. Two components summing to a
+    # constant cancel to about 1e-10, which reaches the optimizer as 1.2e-6 --
+    # an exact `.any()` would call that signal and keep a group that contributes
+    # nothing, which is the behaviour this helper was written to fix.
+    combined = combine_group(components, weights)
+    if combined_signal_is_residual(components, weights, combined):
+        return False
+    return bool(combined.any())
 
 
 def observed_reward_signal(args: Any, samples: list[Any]) -> bool | None:

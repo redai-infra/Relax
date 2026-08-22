@@ -265,24 +265,27 @@ def test_compute_advantages_and_returns_accepts_a_process_group_kwarg():
 
 
 @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
-def test_a_non_finite_value_gives_zeros_rather_than_poisoning_the_gradient(bad):
-    """The `not torch.isfinite(std)` guard in whiten_scalar, which coverage
-    showed no test reached.
+def test_a_non_finite_value_raises_rather_than_reading_as_zero_variance(bad):
+    """This used to return zeros, and the zeros were the bug.
 
-    A single inf or nan among the rewards makes the batch std non-finite.
-    Without the guard the division propagates nan into every advantage in the
-    batch and from there into the gradient, where it is far harder to trace
-    back. Reward functions are user code, so this is reachable input, not a
-    hypothetical.
+    A single inf or nan among the rewards makes the batch std non-finite, and
+    the old guard read that as "no spread" and returned an all-zero batch. The
+    two states are opposites: one says every sample scored the same, the other
+    says the arithmetic broke. Reporting the second as the first is how an
+    overflow at the float32 hand-off became a run that trained on nothing and
+    logged nothing -- the combined reward is verified finite in float64 by the
+    reward stage and can still be `inf` by the time it is used.
+
+    Reward functions are user code, so this is reachable input.
     """
     values = torch.tensor([1.0, bad, 2.0, 3.0])
-    out = whiten_scalar(values)
-    assert torch.equal(out, torch.zeros_like(values))
+    with pytest.raises(ValueError, match="non-finite advantage"):
+        whiten_scalar(values)
 
 
 def test_a_huge_but_finite_spread_is_still_whitened():
-    """The guard must catch non-finite, not merely large -- otherwise it would
-    silently discard batches it should scale."""
+    """The check must catch non-finite, not merely large -- otherwise it would
+    reject batches it should scale."""
     out = whiten_scalar(torch.tensor([1e38, -1e38, 0.0]))
     assert not torch.equal(out, torch.zeros_like(out))
     assert torch.isfinite(out).all()

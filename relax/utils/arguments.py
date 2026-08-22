@@ -3184,6 +3184,7 @@ def _validate_multi_reward_args(args, spec) -> None:
             args.reward_key,
         )
 
+
 def validate_reward_side_kl(args, is_sft: bool) -> None:
     """Reject ``--kl-coef`` for estimators that have nowhere to put it.
 
