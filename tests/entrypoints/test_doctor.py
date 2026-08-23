@@ -158,16 +158,51 @@ def test_empty_dataset_directory_returns_nonzero(
     assert "add a .jsonl or .parquet file" in report["suggestion"]
 
 
-def test_custom_sft_dataset_owns_its_path_semantics(tmp_path):
+def test_custom_sft_dataset_owns_its_training_path_semantics():
     from relax.utils.arguments import _validate_dataset_paths
 
-    custom_data_source = tmp_path / "custom-data-source"
-    custom_data_source.mkdir()
     args = Namespace(
         loss_type="sft",
         custom_dataset_class_path="example.CustomDataset",
-        prompt_data=str(custom_data_source),
+        prompt_data="custom://dataset-id",
         eval_prompt_data=None,
+    )
+
+    _validate_dataset_paths(args)
+
+
+def test_custom_sft_dataset_still_validates_builtin_eval_path(tmp_path):
+    from relax.utils.arguments import _validate_dataset_paths
+
+    missing_eval = tmp_path / "missing-eval.jsonl"
+    args = Namespace(
+        loss_type="sft",
+        custom_dataset_class_path="example.CustomDataset",
+        prompt_data="custom://dataset-id",
+        eval_prompt_data=["eval", str(missing_eval)],
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing-eval.jsonl"):
+        _validate_dataset_paths(args)
+
+
+@pytest.mark.parametrize(
+    ("rollout_global_dataset", "data_source_path"),
+    [
+        (False, "relax.engine.rollout.data_source.RolloutDataSourceWithBuffer"),
+        (True, "example.CustomDataSource"),
+    ],
+)
+def test_rl_skips_prompt_path_not_owned_by_builtin_loader(rollout_global_dataset, data_source_path):
+    from relax.utils.arguments import _validate_dataset_paths
+
+    args = Namespace(
+        loss_type="rl",
+        rollout_global_dataset=rollout_global_dataset,
+        data_source_path=data_source_path,
+        prompt_data="custom://dataset-id",
+        eval_prompt_data=None,
+        eval_datasets=[],
     )
 
     _validate_dataset_paths(args)

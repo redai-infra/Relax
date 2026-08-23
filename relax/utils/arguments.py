@@ -38,6 +38,11 @@ _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-infra/'
     'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
 )
+_DEFAULT_ROLLOUT_DATA_SOURCE = "relax.engine.rollout.data_source.RolloutDataSourceWithBuffer"
+_BUILTIN_ROLLOUT_DATA_SOURCES = {
+    "relax.engine.rollout.data_source.RolloutDataSource",
+    _DEFAULT_ROLLOUT_DATA_SOURCE,
+}
 
 
 def _parse_sglang_namespaces():
@@ -1196,7 +1201,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--data-source-path",
                 type=str,
-                default="relax.engine.rollout.data_source.RolloutDataSourceWithBuffer",
+                default=_DEFAULT_ROLLOUT_DATA_SOURCE,
                 help="The data source class for rollout data.",
             )
             parser.add_argument(
@@ -3082,13 +3087,25 @@ def _validate_resource_config(args) -> None:
 def _validate_dataset_paths(args) -> None:
     from relax.utils.data.data_utils import resolve_path_plan
 
-    if getattr(args, "loss_type", None) == "sft" and getattr(args, "custom_dataset_class_path", None):
-        return
-
     prompt_data = getattr(args, "prompt_data", None)
-    path_specs = [prompt_data] if isinstance(prompt_data, str) else list(prompt_data or [])
+    is_sft = getattr(args, "loss_type", None) == "sft"
+    if is_sft:
+        uses_builtin_prompt_data = not getattr(args, "custom_dataset_class_path", None)
+    else:
+        uses_builtin_prompt_data = (
+            bool(getattr(args, "rollout_global_dataset", True))
+            and getattr(
+                args,
+                "data_source_path",
+                _DEFAULT_ROLLOUT_DATA_SOURCE,
+            )
+            in _BUILTIN_ROLLOUT_DATA_SOURCES
+        )
+    path_specs = []
+    if uses_builtin_prompt_data:
+        path_specs = [prompt_data] if isinstance(prompt_data, str) else list(prompt_data or [])
     eval_prompt_data = list(getattr(args, "eval_prompt_data", None) or [])
-    if getattr(args, "loss_type", None) == "sft":
+    if is_sft:
         path_specs.extend(eval_prompt_data[1::2])
     else:
         path_specs.extend(dataset.path for dataset in getattr(args, "eval_datasets", []) or [])
