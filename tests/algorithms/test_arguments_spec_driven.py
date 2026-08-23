@@ -603,3 +603,19 @@ def test_unusable_gdpo_weights_are_rejected_at_startup(arguments_module, weights
 def test_usable_gdpo_weights_still_pass(arguments_module):
     """A weight may legitimately be zero, as long as they are not all zero."""
     arguments_module.validate_algorithm_args(_args(gdpo_reward_weights=[0.0, 1.0]))
+
+
+def test_gdpo_rejects_reward_side_kl(arguments_module):
+    """`advantage_gdpo` passes `kl` to `get_grpo_returns`, which reads its
+    shape.
+
+    So `--kl-coef` costs a reference forward pass and changes no advantage.
+    Saying so is free here: GDPO is new, and nothing existing is refused.
+    """
+    with pytest.raises(ValueError, match="does not support nonzero --kl-coef"):
+        arguments_module.validate_reward_side_kl(_args(kl_coef=0.01), is_sft=False)
+
+
+def test_gdpo_still_allows_the_separate_kl_loss(arguments_module):
+    """The rejection is about reward shaping, not about KL regularisation."""
+    arguments_module.validate_reward_side_kl(_args(kl_coef=0.0, use_kl_loss=True, kl_loss_coef=0.01), is_sft=False)

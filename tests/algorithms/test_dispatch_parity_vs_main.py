@@ -97,6 +97,10 @@ MAIN_TOKEN_GLOBAL = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
 MAIN_FORBIDS_NORMALIZE_ADVANTAGES = {"rloo"}
 MAIN_REQUIRES_REWARDS_NORMALIZATION = {"rloo", "reinforce_plus_plus_baseline"}
 MAIN_FORBIDS_REWARD_SIDE_KL = {"rloo", "reinforce_plus_plus_baseline"}
+# gdpo is not on main, so it has no row to match; it declares this too, for a
+# reason recorded in its spec entry (the whole `grpo_broadcast` family discards
+# the reward-side KL value, and only a new algorithm can say so without
+# rejecting a configuration someone already runs).
 MAIN_REQUIRES_GLOBAL_TOKEN_LOSS = {"rloo"}
 MAIN_REQUIRES_ON_POLICY_UPDATES = {"rloo"}
 MAIN_MIN_GROUP_SIZE = {"rloo": 2, "reinforce_plus_plus_baseline": 2}

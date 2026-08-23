@@ -240,6 +240,15 @@ ALGORITHM_SPECS: dict[str, AlgorithmSpec] = {
         uses_reward_components=True,
         # Step 1 divides by an unbiased group std, undefined for a single sample.
         min_group_size=2,
+        # `advantage_gdpo` hands `kl` to `get_grpo_returns`, which uses it only
+        # for shape -- the values are discarded, so `--kl-coef` buys a reference
+        # forward pass and changes nothing. Declaring it here is free for a new
+        # algorithm: no existing configuration is rejected. The four older
+        # members of the `grpo_broadcast` family have exactly the same property
+        # and are deliberately left alone, because refusing a flag they accept
+        # today is an upstream decision rather than this PR's. `--use-kl-loss`
+        # with `--kl-loss-coef` is unaffected either way.
+        forbids_reward_side_kl=True,
         # Either reward hook short-circuits reward post-processing, which would
         # silently skip steps 1 and 2 while the run still reports itself as GDPO.
         allows_reward_post_process_hooks=False,

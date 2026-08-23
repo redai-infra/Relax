@@ -85,6 +85,17 @@ def _run(rank, world_size, port, mode, out):
             # Each shard is constant on its own but the batch is not.
             values = torch.tensor([0.7, 0.7] if rank == 0 else [1.4, 1.4], dtype=torch.float32)
             out[rank] = [is_collapsed(values, process_group=group)]
+        elif mode == "non_finite_on_one_rank":
+            # Only rank 1's shard is bad. A local `isfinite` raise here strands
+            # rank 0 inside `is_collapsed`'s all-reduce, which is the deadlock
+            # this case exists to catch. Recorded rather than raised, for the
+            # same reason as the segment cases below: a hang and a rejection
+            # look identical from outside if the exception propagates.
+            values = torch.tensor([1.0, 3.0] if rank == 0 else [1.0, float("inf")], dtype=torch.float32)
+            try:
+                out[rank] = whiten_scalar(values, process_group=group).tolist()
+            except ValueError as exc:
+                out[rank] = f"ValueError: {exc}"
         elif mode in _SEGMENT_MODES:
             from relax.algorithms.advantages import _whiten_by_segment
 
@@ -224,3 +235,22 @@ def test_malformed_metadata_on_one_rank_fails_both():
     assert isinstance(out[1], str) and "sum to" in out[1], out[1]
     assert isinstance(out[0], str), f"rank 0 did not fail with its peer: {out[0]!r}"
     assert "another rank reported malformed" in out[0], out[0]
+
+
+def test_a_non_finite_shard_fails_both_ranks_instead_of_hanging_one():
+    """The check in front of `is_collapsed`'s collective has to be collective.
+
+    Only rank 1 holds the infinity. With a local `isfinite` raise, rank 1 left
+    and rank 0 blocked forever in the reduction it never reached -- the same
+    failure `_agree_on_segmentation` was written to prevent, reintroduced by a
+    check that looks self-contained.
+
+    Both ranks must come back, and both must come back refusing. A rank that
+    hangs makes this test time out rather than fail, which is the point: the
+    assertion below can only run if nobody was stranded.
+    """
+    out = _spawn("non_finite_on_one_rank")
+
+    for rank in (0, 1):
+        assert isinstance(out[rank], str), f"rank {rank} returned {out[rank]!r} instead of refusing"
+        assert "non-finite advantage" in out[rank], rank

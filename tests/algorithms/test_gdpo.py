@@ -463,7 +463,7 @@ def test_warns_once_when_every_component_collapses_in_every_group(caplog):
         out = _normalize(_args(), samples)
 
     assert out == [0.0] * 4
-    assert sum("combined to exactly zero" in r.message for r in caplog.records) == 1
+    assert sum("does not vary within the group" in r.message for r in caplog.records) == 1
 
 
 def test_does_not_warn_when_some_signal_survives(caplog):
@@ -472,7 +472,7 @@ def test_does_not_warn_when_some_signal_survives(caplog):
     with caplog.at_level(logging.WARNING):
         _normalize(_args(), samples)
 
-    assert not any("combined to exactly zero" in r.message for r in caplog.records)
+    assert not any("does not vary within the group" in r.message for r in caplog.records)
 
 
 def test_does_not_warn_when_only_some_groups_collapse(caplog):
@@ -485,7 +485,7 @@ def test_does_not_warn_when_only_some_groups_collapse(caplog):
     with caplog.at_level(logging.WARNING):
         _normalize(_args(), samples)
 
-    assert not any("combined to exactly zero" in r.message for r in caplog.records)
+    assert not any("does not vary within the group" in r.message for r in caplog.records)
 
 
 # ---------------- reward value contract ----------------

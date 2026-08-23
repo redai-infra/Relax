@@ -408,8 +408,14 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
     combined = torch.zeros(len(samples), dtype=torch.float64)
     silent_groups = 0
     for positions in positions_by_group.values():
-        combined[positions] = combine_group(components[positions], weight_tensor)
-        if not bool(combined[positions].any()):
+        group_combined = combine_group(components[positions], weight_tensor)
+        combined[positions] = group_combined
+        # The same predicate `group_carries_reward_signal` applies, on the same
+        # float32 view. It used to be `.any()` on the float64 values, which is a
+        # different question -- the warning and the sampler could disagree about
+        # the same group, and the one the operator sees is the warning.
+        as_transported = group_combined.float()
+        if bool(as_transported.amin() == as_transported.amax()):
             silent_groups += 1
 
     if silent_groups == len(positions_by_group):
@@ -419,9 +425,10 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
         # format); the other way in is components that cancel. Worth one line,
         # because the symptom downstream is simply "loss does not move".
         logger.warning(
-            "GDPO: all %d groups of this batch combined to exactly zero (keys=%s); the batch "
-            "contributes no gradient. Either these rewards do not vary across rollouts of the "
-            "same prompt, or they cancel under the configured weights (weights=%s).",
+            "GDPO: all %d groups of this batch combined to a value that does not vary within the "
+            "group once cast to float32 (keys=%s); the batch contributes no gradient. Either these "
+            "rewards do not vary across rollouts of the same prompt, or they cancel under the "
+            "configured weights (weights=%s).",
             silent_groups,
             keys,
             weights,
