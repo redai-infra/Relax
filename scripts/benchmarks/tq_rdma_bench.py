@@ -110,7 +110,6 @@ def build_tq_config(config_name: str, args: argparse.Namespace, num_storage_unit
             backend="MooncakeStore",
             protocol=cfg["protocol"],
             device=args.device,
-            gdr=False,
             fallback_reason="",
         )
         backend_dict = build_mooncake_config(eff, master_address=master_addr, global_segment_size=8 * 1024**3)

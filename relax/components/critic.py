@@ -42,7 +42,6 @@ class Critic(Base):
 
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
-            requested_gdr=getattr(self.config, "tq_use_gdr", False),
             role=self.role,
             lease_owner=self,
         )

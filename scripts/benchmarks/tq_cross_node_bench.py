@@ -421,7 +421,7 @@ def build_conf(protocol: str, master: str, device: str, segment_gib: int):
         backend = build_simple_storage_config(total_storage_size=None, num_data_storage_units=2)
     else:
         validate_mooncake_runtime_contract()
-        eff = EffectiveConfig(backend="MooncakeStore", protocol=protocol, device=device, gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol=protocol, device=device, fallback_reason="")
         backend = build_mooncake_config(eff, master_address=master, global_segment_size=segment_gib * 1024**3)
     return OmegaConf.create(
         {

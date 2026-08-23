@@ -269,8 +269,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "never uses RDMA even if hardware is available. 'auto' probes "
                     "RDMA capability at startup and degrades to TCP/SimpleStorage if "
                     "unavailable (with a WARNING). 'required' fails fast on probe "
-                    "failure instead of degrading; it covers the transport only, not "
-                    "GDR (see --tq-use-gdr). Only effective with "
+                    "failure instead of degrading. Only effective with "
                     "--tq-storage-backend mooncake."
                 ),
             )
@@ -283,20 +282,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(default) lets Mooncake auto-select. On multi-NIC hosts the "
                     "auto-selected device may fail cross-node; specify explicitly if "
                     "needed."
-                ),
-            )
-            parser.add_argument(
-                "--tq-use-gdr",
-                action=argparse.BooleanOptionalAction,
-                default=False,
-                help=(
-                    "EXPERIMENTAL: enable GPU Direct RDMA (GDR) staging for "
-                    "MooncakeStore. Eligibility is NOT probed at startup (the probe "
-                    "runs in a separate Ray task with no CUDA context), so each "
-                    "worker decides at runtime: without an initialised CUDA context "
-                    "it falls back to host RDMA with a WARNING, and "
-                    "--tq-rdma-mode=required does not fail fast on that. Requires "
-                    "RDMA protocol. Default off."
                 ),
             )
             return parser

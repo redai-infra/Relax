@@ -451,7 +451,6 @@ class Controller:
             probe_results,
             requested_backend=backend,
             requested_device=device,
-            use_gdr=getattr(self.config, "tq_use_gdr", False),
             rdma_mode=mode,
         )
 
@@ -467,37 +466,15 @@ class Controller:
 
         # 5. Build backend dict (may fall back to SimpleStorage on capacity error).
         backend_dict, cap_error = build_backend_config(self.config, effective, total_storage_size=total_storage_size)
-        actual_backend = "MooncakeStore" if "MooncakeStore" in backend_dict else "SimpleStorage"
 
         # 6. Capacity fallback is also auto-only. Explicit Mooncake/TCP and
         #    required-RDMA requests fail instead of silently changing backend.
         if mode != "auto" and cap_error:
             raise RuntimeError(f"--tq-rdma-mode={mode} but segment capacity insufficient: {cap_error}")
 
-        # 7. GDR is EXPERIMENTAL in this phase: --tq-rdma-mode=required only
-        #    covers the *transport* (MooncakeStore + RDMA), not GDR.  The probe
-        #    cannot decide GDR eligibility -- it runs as a separate Ray task
-        #    where torch.cuda.is_initialized() is always False -- so the real
-        #    check happens per worker in the runtime client
-        #    (mooncake_client.py:87), which silently falls back to host RDMA.
-        use_gdr = getattr(self.config, "tq_use_gdr", False)
-        if use_gdr and (effective.protocol != "rdma" or actual_backend != "MooncakeStore"):
-            logger.warning(
-                "[dataplane] --tq-use-gdr requested but the effective path is not RDMA "
-                f"(protocol={effective.protocol}, backend={actual_backend}); GDR inactive."
-            )
-        elif use_gdr:
-            logger.warning(
-                "[dataplane] --tq-use-gdr is EXPERIMENTAL: eligibility is not probed, and "
-                "workers without an initialised CUDA context fall back to host RDMA silently. "
-                "--tq-rdma-mode=required does NOT fail fast on unavailable GDR."
-            )
-
-        # 8. Log requested vs effective so the startup log alone explains the
+        # 7. Log requested vs effective so the startup log alone explains the
         #    decision, plus one summary block per probed node.
-        logger.info(
-            f"[dataplane] requested: backend={backend} rdma_mode={mode} device={device or 'auto'} gdr={use_gdr}"
-        )
+        logger.info(f"[dataplane] requested: backend={backend} rdma_mode={mode} device={device or 'auto'}")
         for result in probe_results:
             logger.info(f"[dataplane] probe result:\n{result.summary()}")
         if cap_error:

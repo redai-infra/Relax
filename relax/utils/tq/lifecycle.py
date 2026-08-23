@@ -102,6 +102,13 @@ def _backend_signature(conf: Any) -> tuple[Any, ...]:
             _get_config_value(mooncake, "global_segment_size"),
             _get_config_value(mooncake, "local_buffer_size"),
             bool(_get_config_value(mooncake, "hard_pin", False)),
+            # Retained although Relax now always builds ``use_gdr=False``: this
+            # process may attach to a controller created by an older build that
+            # still enabled GDR, and upstream ``tq.init`` ignores the caller's
+            # conf when attaching (interface.py:130-135), so the worker would
+            # silently run the unverified GDR path.  Delete together with the
+            # rest of the signature machinery once the exclusive-cluster
+            # simplification drops compatibility attach.
             bool(_get_config_value(mooncake, "use_gdr", False)),
         )
     simple = _get_config_value(backend, "SimpleStorage", {})
@@ -293,42 +300,6 @@ def _close_local_tq_client() -> None:
         pass
 
 
-def log_tq_gdr_runtime_status(*, requested: bool, role: str) -> str:
-    """Log requested GDR intent separately from the local client's status.
-
-    ``enabled_unverified`` means the client selected its GDR staging path, but
-    Relax has not proved that a transfer traversed GDR on the wire.  This
-    avoids claiming job-wide GDR effectiveness from a driver-side capability
-    probe.
-    """
-    if not requested:
-        return "not_requested"
-
-    status = "unknown"
-    detail = "client introspection unavailable"
-    try:
-        manager = tq.get_client().storage_manager
-        store_client = getattr(manager, "storage_client", None)
-        if store_client is None or type(manager).__name__ != "MooncakeStorageManager":
-            status = "inactive"
-            detail = f"manager={type(manager).__name__}"
-        elif getattr(store_client, "protocol", "") != "rdma":
-            status = "inactive"
-            detail = f"protocol={getattr(store_client, 'protocol', 'unknown')}"
-        elif getattr(store_client, "_gdr_staging", None) is None:
-            status = "host_rdma_fallback"
-            detail = "GDR staging unavailable in this worker"
-        else:
-            status = "enabled_unverified"
-            detail = "local GDR path selected; wire effectiveness is unknown"
-    except Exception as e:  # pragma: no cover - environment/version dependent
-        detail = str(e)
-
-    log = logger.warning if status != "enabled_unverified" else logger.info
-    log(f"[dataplane:gdr] role={role} requested=true status={status} experimental=true detail={detail}")
-    return status
-
-
 def _resolve_attach_timeout() -> float:
     """Attach deadline in seconds; override via
     ``RELAX_TQ_ATTACH_TIMEOUT_SECONDS``."""
@@ -407,13 +378,11 @@ def _bounded_tq_init(conf: Any, deadline: float, *, role: str) -> None:
 def attach_tq_client(
     conf: Any,
     *,
-    requested_gdr: bool,
     role: str,
     timeout: float | None = None,
     lease_owner: Any | None = None,
 ) -> Any:
-    """Attach a component process within a bounded deadline and report its
-    local experimental GDR state.
+    """Attach a component process within a bounded deadline.
 
     The deadline covers both waiting for a served controller config and
     ``tq.init`` itself, because either phase can hang unboundedly (get_config
@@ -435,7 +404,6 @@ def attach_tq_client(
         _await_controller_config(deadline)
         _bounded_tq_init(conf, deadline, role=role)
         client = tq.get_client()
-        log_tq_gdr_runtime_status(requested=requested_gdr, role=role)
 
         _TQ_CLIENT_GENERATION += 1
         _CURRENT_TQ_CLIENT_GENERATION = _TQ_CLIENT_GENERATION
@@ -501,7 +469,7 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
     def _handshake(handshake_conf: Any) -> None:
         from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 
-        attach_tq_client(handshake_conf, requested_gdr=False, role="attach-handshake")
+        attach_tq_client(handshake_conf, role="attach-handshake")
         detach_tq_client()
 
     refs: list[Any] = []

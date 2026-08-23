@@ -60,7 +60,6 @@ class ProbeResult:
     checks: tuple[CheckResult, ...]
     effective_protocol: str | None  # "rdma" | "tcp" | None
     effective_device: str
-    gdr_eligible: bool
     errors: tuple[str, ...] = ()
 
     @property
@@ -70,10 +69,7 @@ class ProbeResult:
 
     def summary(self) -> str:
         """Return a multi-line human-readable report of this node's probe."""
-        header = (
-            f"[probe:{self.node}] protocol={self.effective_protocol} "
-            f"device={self.effective_device} gdr={self.gdr_eligible}"
-        )
+        header = f"[probe:{self.node}] protocol={self.effective_protocol} device={self.effective_device}"
         lines = [header]
         for c in self.checks:
             tag = "ok" if c.ok else "FAIL"
@@ -88,18 +84,13 @@ class EffectiveConfig:
     backend: str  # "MooncakeStore" or "SimpleStorage"
     protocol: str  # "rdma" or "tcp"
     device: str
-    gdr: bool
     fallback_reason: str  # "" if no fallback occurred
 
     def log_line(self) -> str:
         """Return the single-line startup log string for this effective
         config."""
-        gdr_status = "unknown" if self.gdr else "off"
         dev = self.device or "auto"
-        base = (
-            f"[dataplane] backend={self.backend} protocol={self.protocol} device={dev} "
-            f"gdr_requested={str(self.gdr).lower()} gdr_status={gdr_status}"
-        )
+        base = f"[dataplane] backend={self.backend} protocol={self.protocol} device={dev}"
         if self.fallback_reason:
             return f"{base} fallback={self.fallback_reason}"
         return base
@@ -369,20 +360,11 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
         elif not memlock_ok:
             errors.append("memlock too low for RDMA MR registration")
 
-    # GDR eligibility == RDMA transport available.  The actual CUDA-context
-    # check (mooncake_client.py:87) runs in the *client* worker process at
-    # runtime, NOT in this probe task -- a separate Ray task always reports
-    # torch.cuda.is_initialized() == False, so probing it here would make GDR
-    # permanently unreachable.  We assert transport capability only; the
-    # runtime client performs the CUDA check and warns/falls back if needed.
-    gdr_eligible = effective_protocol == "rdma"
-
     return ProbeResult(
         node=node,
         checks=tuple(checks),
         effective_protocol=effective_protocol,
         effective_device=effective_device,
-        gdr_eligible=gdr_eligible,
         errors=tuple(errors),
     )
 
@@ -433,7 +415,6 @@ def _degenerate_result(node: str, error: str) -> ProbeResult:
         checks=tuple(),
         effective_protocol=None,
         effective_device="",
-        gdr_eligible=False,
         errors=(error,),
     )
 
@@ -516,7 +497,6 @@ def reduce_results(
     *,
     requested_backend: str,
     requested_device: str,
-    use_gdr: bool,
     fallback_backend: str = "SimpleStorage",
     rdma_mode: str = "auto",
 ) -> EffectiveConfig:
@@ -530,8 +510,6 @@ def reduce_results(
         ``--tq-storage-backend`` value (``"simple"`` or ``"mooncake"``).
     requested_device
         ``--tq-rdma-device`` value.
-    use_gdr
-        ``--tq-use-gdr`` value.
     fallback_backend
         Backend to degrade to when probe fails in auto mode.
     rdma_mode
@@ -545,7 +523,6 @@ def reduce_results(
             backend="SimpleStorage",
             protocol="tcp",
             device="",
-            gdr=False,
             fallback_reason="",
         )
 
@@ -554,7 +531,6 @@ def reduce_results(
             backend="SimpleStorage",
             protocol="tcp",
             device="",
-            gdr=False,
             fallback_reason="no probe results",
         )
 
@@ -574,7 +550,6 @@ def reduce_results(
             backend=fallback_backend,
             protocol="tcp",
             device="",
-            gdr=False,
             fallback_reason=reason,
         )
 
@@ -583,7 +558,6 @@ def reduce_results(
             backend="MooncakeStore",
             protocol="tcp",
             device="",
-            gdr=False,
             fallback_reason="",
         )
 
@@ -596,16 +570,12 @@ def reduce_results(
                     backend="MooncakeStore",
                     protocol="tcp",
                     device=requested_device,
-                    gdr=False,
                     fallback_reason=f"device_mismatch:{requested_device}",
                 )
         return EffectiveConfig(
             backend="MooncakeStore",
             protocol="rdma",
             device=requested_device,
-            # probe_node defines GDR eligibility as RDMA transport readiness;
-            # CUDA staging is deliberately decided and logged by each worker.
-            gdr=use_gdr,
             fallback_reason="",
         )
 
@@ -615,7 +585,6 @@ def reduce_results(
         backend="MooncakeStore",
         protocol="tcp",
         device=requested_device,
-        gdr=False,
         fallback_reason=f"rdma_unavailable:{','.join(rdma_failed)}",
     )
 
@@ -634,19 +603,11 @@ def validate_config(args: Any) -> list[str]:
     errors: list[str] = []
     backend = getattr(args, "tq_storage_backend", "simple")
     mode = getattr(args, "tq_rdma_mode", "off")
-    use_gdr = getattr(args, "tq_use_gdr", False)
 
     if backend == "simple" and mode != "off":
         errors.append(
             f"--tq-rdma-mode={mode} is meaningless with --tq-storage-backend=simple "
             "(RDMA only applies to MooncakeStore). Set --tq-rdma-mode=off or "
             "--tq-storage-backend=mooncake."
-        )
-    if backend == "simple" and use_gdr:
-        errors.append("--tq-use-gdr requires --tq-storage-backend=mooncake.")
-    if use_gdr and mode == "off":
-        errors.append(
-            "--tq-use-gdr is set but --tq-rdma-mode=off; GDR requires RDMA transport. "
-            "Set --tq-rdma-mode=auto or required."
         )
     return errors

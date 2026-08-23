@@ -75,7 +75,6 @@ def _probe(node: str, protocol: str | None = "rdma", device: str = "rdma0") -> P
         checks=(),
         effective_protocol=protocol,
         effective_device=device if protocol else "",
-        gdr_eligible=protocol == "rdma",
         errors=() if protocol else ("mooncake not importable",),
     )
 
@@ -463,12 +462,11 @@ class TestWorkerDetach:
         monkeypatch.setattr(tq_lifecycle, "_await_controller_config", lambda deadline: None)
         monkeypatch.setattr(tq_lifecycle, "_bounded_tq_init", lambda conf, deadline, role: None)
         monkeypatch.setattr(tq_lifecycle.tq, "get_client", lambda: client)
-        monkeypatch.setattr(tq_lifecycle, "log_tq_gdr_runtime_status", lambda **kwargs: "not_requested")
 
         old_owner = SimpleNamespace()
         new_owner = SimpleNamespace()
-        assert tq_lifecycle.attach_tq_client({}, requested_gdr=False, role="old", lease_owner=old_owner) is client
-        assert tq_lifecycle.attach_tq_client({}, requested_gdr=False, role="new", lease_owner=new_owner) is client
+        assert tq_lifecycle.attach_tq_client({}, role="old", lease_owner=old_owner) is client
+        assert tq_lifecycle.attach_tq_client({}, role="new", lease_owner=new_owner) is client
         assert new_owner._tq_client_generation > old_owner._tq_client_generation
 
         calls = []
@@ -502,43 +500,6 @@ class TestWorkerDetach:
 
 
 # ---------------------------------------------------------------------------
-# GDR requested-vs-runtime status
-# ---------------------------------------------------------------------------
-
-
-class MooncakeStorageManager:
-    def __init__(self, storage_client):
-        self.storage_client = storage_client
-
-
-class TestGdrRuntimeStatus:
-    def test_not_requested_is_distinct(self):
-        assert tq_lifecycle.log_tq_gdr_runtime_status(requested=False, role="test") == "not_requested"
-
-    def test_requested_on_simple_backend_is_inactive(self, monkeypatch):
-        fake = MagicMock()
-        fake.get_client.return_value = MagicMock(storage_manager=MagicMock())
-        monkeypatch.setattr(tq_lifecycle, "tq", fake)
-        assert tq_lifecycle.log_tq_gdr_runtime_status(requested=True, role="test") == "inactive"
-
-    def test_requested_without_worker_staging_reports_host_fallback(self, monkeypatch):
-        store = MagicMock(protocol="rdma")
-        store._gdr_staging = None
-        fake = MagicMock()
-        fake.get_client.return_value = MagicMock(storage_manager=MooncakeStorageManager(store))
-        monkeypatch.setattr(tq_lifecycle, "tq", fake)
-        assert tq_lifecycle.log_tq_gdr_runtime_status(requested=True, role="test") == "host_rdma_fallback"
-
-    def test_local_gdr_path_never_claims_verified_effectiveness(self, monkeypatch):
-        store = MagicMock(protocol="rdma")
-        store._gdr_staging = object()
-        fake = MagicMock()
-        fake.get_client.return_value = MagicMock(storage_manager=MooncakeStorageManager(store))
-        monkeypatch.setattr(tq_lifecycle, "tq", fake)
-        assert tq_lifecycle.log_tq_gdr_runtime_status(requested=True, role="test") == "enabled_unverified"
-
-
-# ---------------------------------------------------------------------------
 # Owner-aware initialization transaction
 # ---------------------------------------------------------------------------
 
@@ -549,7 +510,7 @@ class TestInitializeTqWithFallback:
         return {"controller": {}, "backend": {"storage_backend": backend}}
 
     @staticmethod
-    def _mooncake_conf(protocol: str) -> dict:
+    def _mooncake_conf(protocol: str, *, use_gdr: bool = False) -> dict:
         return {
             "controller": {},
             "backend": {
@@ -558,6 +519,7 @@ class TestInitializeTqWithFallback:
                     "protocol": protocol,
                     "master_server_address": "master.invalid:50051",
                     "hard_pin": True,
+                    "use_gdr": use_gdr,
                 },
             },
         }
@@ -624,6 +586,20 @@ class TestInitializeTqWithFallback:
         result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
         assert result.config is stored
         assert result.owns_controller is False
+        assert calls["attempts"] == []
+
+    def test_attach_rejects_legacy_gdr_controller(self, monkeypatch):
+        """A controller left behind by a GDR-enabled build is not compatible.
+
+        Relax now always requests host RDMA (``use_gdr=False``), but upstream
+        ``tq.init`` ignores the caller's conf when attaching, so accepting such
+        a controller would silently run this worker on the unverified GDR path.
+        """
+        requested = self._mooncake_conf("rdma")
+        stored = self._mooncake_conf("rdma", use_gdr=True)
+        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="different backend config"):
+            tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
         assert calls["attempts"] == []
 
     def test_attach_rejects_different_polling_mode(self, monkeypatch):
@@ -1009,9 +985,7 @@ class TestAutomaticDegradation:
     """AND-reduction turns any node's failure into a job-level downgrade."""
 
     def test_all_nodes_rdma_stays_rdma(self):
-        eff = reduce_results(
-            [_probe("a"), _probe("b")], requested_backend="mooncake", requested_device="", use_gdr=False
-        )
+        eff = reduce_results([_probe("a"), _probe("b")], requested_backend="mooncake", requested_device="")
         assert (eff.backend, eff.protocol, eff.fallback_reason) == ("MooncakeStore", "rdma", "")
 
     def test_one_node_without_mooncake_degrades_whole_job(self):
@@ -1020,7 +994,6 @@ class TestAutomaticDegradation:
             [_probe("a"), _probe("b", protocol=None)],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "SimpleStorage"
         assert "mooncake_unavailable" in eff.fallback_reason and "b" in eff.fallback_reason
@@ -1032,9 +1005,7 @@ class TestAutomaticDegradation:
 
         degenerate = _degenerate_result("b", "probe task raised")
         assert degenerate.effective_protocol is None
-        eff = reduce_results(
-            [_probe("a"), degenerate], requested_backend="mooncake", requested_device="", use_gdr=False
-        )
+        eff = reduce_results([_probe("a"), degenerate], requested_backend="mooncake", requested_device="")
         assert eff.backend == "SimpleStorage"
 
     def test_one_node_tcp_only_degrades_transport_not_backend(self):
@@ -1042,7 +1013,6 @@ class TestAutomaticDegradation:
             [_probe("a"), _probe("b", protocol="tcp")],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert (eff.backend, eff.protocol) == ("MooncakeStore", "tcp")
         assert eff.fallback_reason

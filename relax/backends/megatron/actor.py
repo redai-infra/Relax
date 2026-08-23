@@ -203,7 +203,6 @@ class MegatronTrainRayActor(TrainRayActor):
             repatch(args)
         self.data_system_client = attach_tq_client(
             args.tq_config,
-            requested_gdr=getattr(args, "tq_use_gdr", False),
             role=role,
             lease_owner=self,
         )

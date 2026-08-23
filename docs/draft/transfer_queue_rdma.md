@@ -8,22 +8,19 @@ Relax 的数据面（rollout ↔ train 之间的样本传输）默认走 Transfe
 
 ## 配置入口
 
-只暴露四个表达使用意图的参数，Mooncake 底层参数（endpoint、buffer、segment、timeout、master 策略）不做 CLI，走内部默认与部署环境。
+只暴露三个表达使用意图的参数，Mooncake 底层参数（endpoint、buffer、segment、timeout、master 策略）不做 CLI，走内部默认与部署环境。
 
 | 参数 | 取值 | 说明 |
 |---|---|---|
 | `--tq-storage-backend` | `simple`（默认）/ `mooncake` | `simple` 保留接入前的存储与 controller 所有权语义，并共享新增的有界 attach/失败清理 |
 | `--tq-rdma-mode` | `off`（默认）/ `auto` / `required` | `off` 即使有硬件也不用 RDMA；`auto` 探测失败自动降级；`required` 探测失败直接报错退出 |
 | `--tq-rdma-device` | 设备名，如 `mlx5_bond_0`；空为自动 | 多网卡机器上自动选择可能选错，跨节点时建议显式指定 |
-| `--tq-use-gdr` | 默认关 | **实验性**，见下文 |
 
-`--tq-rdma-mode=required` 只覆盖**传输层**（MooncakeStore + RDMA 可用性与 segment 容量），不覆盖 GDR。
+`--tq-rdma-mode=required` 覆盖的是**传输层**：MooncakeStore + RDMA 可用性与 segment 容量。
 
-### GDR 为实验性
+### 首期只交付 host RDMA
 
-GDR 的可用性无法由 driver 的启动探测代表：探测跑在独立 Ray task 中，该进程没有初始化 CUDA context；真正创建 staging buffer 的是每个 worker 的 TQ 客户端。因此首期不宣称 job 级 GDR 已验证，`required` 也不对 GDR 做 fail-fast。
-
-每个 worker 附加 TQ 后都会记录两层信息：`requested=true` 表示用户请求开启；`status=host_rdma_fallback/enabled_unverified/inactive/unknown` 表示该 worker 的本地观察。即使本地 staging buffer 已创建也只记为 `enabled_unverified`，不等同于线上流量已经证明走 GDR。
+数据面 payload 先经过主机内存再通过 RDMA 跨节点传输。GDR（GPU Direct RDMA）不在本期范围内：它不是任务书要求，可用性也无法由 driver 的启动探测代表（探测进程没有初始化 CUDA context），因此 Relax 把 Mooncake 的 `use_gdr` 固定为 `false`，不提供开关。如后续出现真实需求，GDR 应由独立 PR 实现并单独验证。
 
 ## 启动流程与降级
 
@@ -40,7 +37,6 @@ driver 在**第一次 `tq.init` 之前**完成探测并生成 job 级唯一的 e
 降级阶梯：
 
 ```
-GDR → host RDMA        （worker 运行时判定，记录 requested 与实际状态）
 RDMA → Mooncake/TCP    （任一节点无 RDMA 能力，或指定设备缺失）
 Mooncake → SimpleStorage（任一节点 mooncake/master 不可用、运行时正确性契约不满足，或 segment 预检不足）
 ```
@@ -50,15 +46,15 @@ Mooncake → SimpleStorage（任一节点 mooncake/master 不可用、运行时�
 正常启动会打三段，排障时先看这三段：
 
 ```
-[dataplane] requested: backend=mooncake rdma_mode=auto device=mlx5_bond_0 gdr=False
+[dataplane] requested: backend=mooncake rdma_mode=auto device=mlx5_bond_0
 [dataplane] probe result:
-[probe:<ip>] protocol=rdma device=mlx5_bond_0 gdr=True
+[probe:<ip>] protocol=rdma device=mlx5_bond_0
   [ok] mooncake_import: version=0.3.10.post2
   [ok] rdma_devices: mlx5_bond_0, ...
   [ok] port_state: ACTIVE
   [ok] gid: ...
   [ok] memlock: unlimited
-[dataplane] backend=MooncakeStore protocol=rdma device=mlx5_bond_0 gdr_requested=false gdr_status=off
+[dataplane] backend=MooncakeStore protocol=rdma device=mlx5_bond_0
 ```
 
 第三段带 `fallback=...` 就说明发生了降级，原因直接写在里面（例如 `fallback=mooncake_unavailable:<node-id>`）。

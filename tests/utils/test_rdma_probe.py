@@ -66,7 +66,6 @@ def _make_probe(
         checks=(CheckResult("mooncake_import", True),),
         effective_protocol=protocol,
         effective_device=device,
-        gdr_eligible=protocol == "rdma",
     )
 
 
@@ -75,7 +74,6 @@ def _make_args(**kwargs) -> argparse.Namespace:
         tq_storage_backend="mooncake",
         tq_rdma_mode="auto",
         tq_rdma_device="",
-        tq_use_gdr=False,
         num_data_storage_units=1,
         max_staleness=0,
         n_samples_per_prompt=1,
@@ -101,16 +99,6 @@ class TestValidateConfig:
         assert len(errors) == 1
         assert "simple" in errors[0]
 
-    def test_simple_backend_with_gdr_rejected(self):
-        args = _make_args(tq_storage_backend="simple", tq_rdma_mode="off", tq_use_gdr=True)
-        errors = validate_config(args)
-        assert any("--tq-use-gdr" in e for e in errors)
-
-    def test_gdr_without_rdma_rejected(self):
-        args = _make_args(tq_storage_backend="mooncake", tq_rdma_mode="off", tq_use_gdr=True)
-        errors = validate_config(args)
-        assert any("rdma-mode=off" in e for e in errors)
-
     def test_valid_simple_off(self):
         args = _make_args(tq_storage_backend="simple", tq_rdma_mode="off")
         assert validate_config(args) == []
@@ -119,8 +107,8 @@ class TestValidateConfig:
         args = _make_args(tq_storage_backend="mooncake", tq_rdma_mode="auto")
         assert validate_config(args) == []
 
-    def test_valid_mooncake_required_gdr(self):
-        args = _make_args(tq_storage_backend="mooncake", tq_rdma_mode="required", tq_use_gdr=True)
+    def test_valid_mooncake_required(self):
+        args = _make_args(tq_storage_backend="mooncake", tq_rdma_mode="required")
         assert validate_config(args) == []
 
 
@@ -137,18 +125,15 @@ class TestReduceResults:
             [_make_probe()],
             requested_backend="simple",
             requested_device="rdma0",
-            use_gdr=False,
         )
         assert eff.backend == "SimpleStorage"
         assert eff.protocol == "tcp"
-        assert eff.gdr is False
 
     def test_all_nodes_rdma(self):
         eff = reduce_results(
             [_make_probe(protocol="rdma"), _make_probe(protocol="rdma", node="node-B")],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "MooncakeStore"
         assert eff.protocol == "rdma"
@@ -159,7 +144,6 @@ class TestReduceResults:
             [_make_probe(protocol="rdma"), _make_probe(protocol=None, node="node-B")],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "SimpleStorage"
         assert "node-B" in eff.fallback_reason
@@ -169,28 +153,16 @@ class TestReduceResults:
             [_make_probe(protocol="rdma"), _make_probe(protocol="tcp", node="node-B")],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "MooncakeStore"
         assert eff.protocol == "tcp"
         assert "node-B" in eff.fallback_reason
-
-    def test_gdr_request_is_forwarded_for_rdma(self):
-        eff = reduce_results(
-            [_make_probe(), _make_probe(node="node-B")],
-            requested_backend="mooncake",
-            requested_device="",
-            use_gdr=True,
-        )
-        assert eff.gdr is True
-        assert eff.fallback_reason == ""
 
     def test_requested_device_must_match_every_rdma_node(self):
         eff = reduce_results(
             [_make_probe(device="rdma0"), _make_probe(device="rdma1", node="node-B")],
             requested_backend="mooncake",
             requested_device="rdma0",
-            use_gdr=False,
         )
         assert eff.protocol == "tcp"
         assert eff.fallback_reason == "device_mismatch:rdma0"
@@ -200,7 +172,6 @@ class TestReduceResults:
             [],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "SimpleStorage"
 
@@ -209,7 +180,6 @@ class TestReduceResults:
             [_make_probe(protocol="rdma"), _make_probe(protocol="tcp", node="node-B")],
             requested_backend="mooncake",
             requested_device="rdma0",
-            use_gdr=False,
             rdma_mode="off",
         )
         assert (eff.backend, eff.protocol, eff.device) == ("MooncakeStore", "tcp", "")
@@ -220,7 +190,6 @@ class TestReduceResults:
             [_make_probe(protocol=None)],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
             rdma_mode="off",
         )
         assert eff.backend == "SimpleStorage"
@@ -244,7 +213,6 @@ class TestProbeNode:
                 result = probe_node("")
         # mooncake importable but no RDMA device → tcp
         assert result.effective_protocol == "tcp"
-        assert result.gdr_eligible is False
 
     def test_active_rdma_device_gives_rdma(self):
         """When all checks pass, protocol should be rdma."""
@@ -273,7 +241,6 @@ class TestProbeNode:
         assert result.effective_protocol == "rdma"
         assert result.ok
         assert result.effective_device == "rdma0"
-        assert result.gdr_eligible is True
 
     @staticmethod
     def _multi_hca_open(active_device: str):
@@ -430,7 +397,6 @@ class TestProbeClusterNodes:
             results,
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "SimpleStorage"
         assert "n1" in eff.fallback_reason
@@ -441,14 +407,12 @@ class TestProbeClusterNodes:
             checks=(CheckResult("master_reachable", False),),
             effective_protocol=None,
             effective_device="",
-            gdr_eligible=False,
             errors=("master unreachable",),
         )
         eff = reduce_results(
             [_make_probe(protocol="rdma", node="n0"), unavailable],
             requested_backend="mooncake",
             requested_device="",
-            use_gdr=False,
         )
         assert eff.backend == "SimpleStorage"
         assert eff.fallback_reason == "master_unreachable:n1"
@@ -477,7 +441,7 @@ class TestTqConfigBuilder:
     def test_storage_backend_key_selects_the_manager(self):
         """``tq.init`` reads ``backend.storage_backend``; omitting it silently
         keeps SimpleStorage."""
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="rdma0", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="rdma0", fallback_reason="")
         assert build_mooncake_config(eff, master_address="master.example:50051")["storage_backend"] == "MooncakeStore"
         assert (
             build_simple_storage_config(total_storage_size=1, num_data_storage_units=1)["storage_backend"]
@@ -485,19 +449,21 @@ class TestTqConfigBuilder:
         )
 
     def test_mooncake_config_has_hard_pin_true(self):
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="rdma0", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="rdma0", fallback_reason="")
         cfg = build_mooncake_config(eff, master_address="master.example:50051")
         mc = cfg["MooncakeStore"]
         assert mc["protocol"] == "rdma"
         assert mc["device_name"] == "rdma0"
         assert mc["hard_pin"] is True  # no silent eviction
         assert mc["auto_init"] is False  # external master
-        assert mc["use_gdr"] is False
 
-    def test_mooncake_config_gdr_propagated(self):
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=True, fallback_reason="")
-        cfg = build_mooncake_config(eff, master_address="master.example:50051")
-        assert cfg["MooncakeStore"]["use_gdr"] is True
+    def test_mooncake_config_pins_host_rdma(self):
+        """This phase ships host RDMA only: ``use_gdr`` is always False and no
+        GDR staging buffer is configured."""
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", fallback_reason="")
+        mc = build_mooncake_config(eff, master_address="master.example:50051")["MooncakeStore"]
+        assert mc["use_gdr"] is False
+        assert "gdr_staging_buffer_mb" not in mc
 
     def test_master_address_is_required(self, monkeypatch):
         # A loopback default would point every node at itself in multi-node
@@ -505,7 +471,7 @@ class TestTqConfigBuilder:
         monkeypatch.delenv("MC_MASTER_ADDRESS", raising=False)
         with pytest.raises(RuntimeError, match="MC_MASTER_ADDRESS"):
             resolve_mooncake_master_address()
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="tcp", device="", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="tcp", device="", fallback_reason="")
         with pytest.raises(RuntimeError, match="MC_MASTER_ADDRESS"):
             build_mooncake_config(eff)
 
@@ -548,14 +514,14 @@ class TestTqConfigBuilder:
 
     def test_segment_capacity_text_only_passes(self):
         args = _make_args(multimodal_keys=None)
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", fallback_reason="")
         assert validate_segment_capacity(args, eff) is None
 
     def test_segment_capacity_multimodal_large_batch_fails(self):
         args = _make_args(
             multimodal_keys=["pixel_values"], rollout_batch_size=256, n_samples_per_prompt=8, max_staleness=1
         )
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", fallback_reason="")
         err = validate_segment_capacity(args, eff)
         assert err is not None
         assert "insufficient" in err.lower()
@@ -601,7 +567,7 @@ class TestTqConfigBuilder:
             use_dynamic_global_batch_size=True,
             over_sampling_batch_size=64,
         )
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", fallback_reason="")
         err = validate_segment_capacity(args, eff)
         assert err is not None
         assert "effective_batch=64" in err
@@ -617,7 +583,7 @@ class TestTqConfigBuilder:
         args = _make_args(
             multimodal_keys=["pixel_values"], rollout_batch_size=32, n_samples_per_prompt=1, max_staleness=1
         )
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", fallback_reason="")
         err = validate_segment_capacity(args, eff)
         assert err is not None and "RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB" in err
 
@@ -625,7 +591,7 @@ class TestTqConfigBuilder:
         args = _make_args(
             multimodal_keys=["pixel_values"], rollout_batch_size=32, n_samples_per_prompt=1, max_staleness=1
         )
-        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", gdr=False, fallback_reason="")
+        eff = EffectiveConfig(backend="MooncakeStore", protocol="rdma", device="", fallback_reason="")
         monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "8")
         assert validate_segment_capacity(args, eff) is None
 

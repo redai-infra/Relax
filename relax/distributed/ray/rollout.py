@@ -815,7 +815,6 @@ class RolloutManager(ReloadableMixin):
 
         self.data_system_client = attach_tq_client(
             self.args.tq_config,
-            requested_gdr=getattr(self.args, "tq_use_gdr", False),
             role="rollout_worker",
             lease_owner=self,
         )

@@ -3,9 +3,9 @@
 """Build TransferQueue backend config dicts from Relax CLI args.
 
 This module is the single place that maps Relax-side *intent* flags
-(``--tq-storage-backend``, ``--tq-rdma-mode``, ``--tq-rdma-device``,
-``--tq-use-gdr``) plus an :class:`~relax.utils.rdma_probe.EffectiveConfig`
-into the OmegaConf dict that ``tq.init`` expects.
+(``--tq-storage-backend``, ``--tq-rdma-mode``, ``--tq-rdma-device``) plus an
+:class:`~relax.utils.rdma_probe.EffectiveConfig` into the OmegaConf dict that
+``tq.init`` expects.
 
 Mooncake internals (endpoint, buffer size, segment size, master address,
 timeout) are intentionally *not* exposed as CLI flags — they come from
@@ -32,7 +32,6 @@ logger = get_logger(__name__)
 
 _DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024**3  # 4 GiB per client (config.yaml:52)
 _DEFAULT_LOCAL_BUFFER_SIZE = 1 * 1024**3  # 1 GiB per client (config.yaml:54)
-_DEFAULT_GDR_STAGING_MB = 1024  # config.yaml:103
 _DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"  # config.yaml:42-43
 
 
@@ -163,9 +162,11 @@ def build_mooncake_config(
             "local_buffer_size": _DEFAULT_LOCAL_BUFFER_SIZE,
             # Do NOT silently evict produced-but-unconsumed data.
             "hard_pin": True,
-            # GDR
-            "use_gdr": effective.gdr,
-            "gdr_staging_buffer_mb": _DEFAULT_GDR_STAGING_MB,
+            # Host RDMA only in this phase: GDR is pinned off here rather than
+            # left to the upstream default so the payload always traverses host
+            # memory.  A GDR path needs its own probe/verification and lands in
+            # a separate change (mooncake_client.py:75-88 for the client side).
+            "use_gdr": False,
         },
     }
     return cfg
