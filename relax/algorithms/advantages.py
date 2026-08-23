@@ -19,7 +19,7 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 
-from relax.algorithms.numerics import GDPO_EPS, distributed_mean_std, is_collapsed
+from relax.algorithms.numerics import GDPO_EPS, any_rank_has_non_finite, distributed_mean_std, is_collapsed
 from relax.algorithms.spec import get_algorithm
 from relax.utils.training.ppo_utils import (
     get_advantages_and_returns_batch,
@@ -89,7 +89,11 @@ def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | No
     The result is normalised, so it is bounded by the batch's own spread and
     casts back to the caller's dtype without overflowing.
     """
-    if not torch.isfinite(values).all():
+    # Collective, not a local `isfinite`. The `is_collapsed` reduction is two
+    # lines below, so a rank that raised here on its own would hang every other
+    # rank in the group -- the deadlock `_agree_on_segmentation` was written to
+    # prevent, reintroduced by a check that looks purely local.
+    if any_rank_has_non_finite(values, process_group=process_group):
         raise ValueError(
             "GDPO batch whitening received a non-finite advantage. The reward stage verified these "
             "in float64, so this is the float32 hand-off overflowing: the combined reward fits in "
@@ -100,10 +104,25 @@ def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | No
     # float64 copy: a batch differing only below float32's resolution trains on
     # nothing, so it counts as collapsed here even though float64 can still tell
     # the values apart.
+    if not values.is_floating_point():
+        # `.to(values.dtype)` at the end would truncate every z-score to the
+        # integer 0 and hand back a silently all-zero batch. The previous
+        # version returned floats here by accident of the division; neither is
+        # a contract worth having, so say so instead.
+        raise ValueError(f"GDPO batch whitening needs a floating-point tensor, got {values.dtype}.")
     if is_collapsed(values, process_group=process_group):
         return torch.zeros_like(values)
     work = values.double()
     mean, std = distributed_mean_std(work, process_group=process_group)
+    if not (torch.isfinite(mean) and torch.isfinite(std)):
+        # Unreachable from float32 -- the largest float32 squared is 1.2e77
+        # against float64's 1.8e308 -- but reachable from a float64 caller near
+        # its own maximum, where the squares overflow inside the reduction.
+        # Left unchecked that is the all-zero batch again, one dtype up.
+        raise ValueError(
+            f"GDPO batch whitening overflowed computing {values.dtype} statistics in float64. "
+            "Rescale the reward components or their --gdpo-reward-weights."
+        )
     return ((work - mean) / (std + GDPO_EPS)).to(values.dtype)
 
 

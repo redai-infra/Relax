@@ -162,8 +162,9 @@ def resolve_gdpo_weights(args: Any, keys: list[str]) -> list[float]:
     resolved = [float(w) for w in weights]
     for key, weight in zip(keys, resolved, strict=True):
         # argparse happily parses "nan" and "inf" for a float option. Unchecked,
-        # the weighted sum turns non-finite, whiten_scalar reads a non-finite std
-        # as a collapse, and the batch silently produces zero advantages.
+        # the weighted sum turns non-finite and whiten_scalar refuses the batch.
+        # It used to read a non-finite std as a collapse and return zeros
+        # silently; catching the weight here still gives the better message.
         if not math.isfinite(weight):
             raise ValueError(f"--gdpo-reward-weights for {key!r} is {weight}, which is not finite.")
     if all(weight == 0.0 for weight in resolved):
@@ -291,17 +292,46 @@ def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     signal with an arbitrarily small ratio. No universal threshold separates
     "the components nearly cancel" from "the arithmetic nearly cancelled".
 
+    (An earlier version of this paragraph added that at ``G = 2`` the ratio
+    reduces to ``|w1 - w2| / (|w1| + |w2|)`` "independent of every reward value
+    in the group". That holds only when the two standardised columns come out
+    as exact opposites. Two columns that move *together* give a ratio of 1 for
+    same-signed weights -- fully data-dependent. The G >= 3 construction above
+    is what actually settles it.)
+
     **What is left unsolved, stated plainly rather than argued away.** Two
     components summing to a constant do not cancel exactly, and the remainder
-    grows with the magnitude they are centred on -- roughly ``ulp(C) / spread``.
-    At ``C = 1e9`` it reaches the optimizer as 2.6e-3; at ``C = 1e13``, or with
-    both columns large and straddling a binade, as O(1). Nothing in this file
-    detects that, and the two mechanisms tried so far could not: a conditioning
-    bound cannot prove a small result is *not* signal, and screening on the
-    post-whitening magnitude needs the whole batch, which a per-group function
-    does not have. Those figures are for a batch made only of such groups; Eq. 7
-    is centred per group, so in a batch that also holds healthy groups the same
-    remainder arrives around 1e-7.
+    grows with the magnitude they are centred on -- roughly ``ulp(C) / spread``
+    for the Eq. 7 output. Nothing in this file detects it, and the two
+    mechanisms tried so far could not: a conditioning bound cannot prove a
+    small result is *not* signal, and screening on the post-whitening magnitude
+    needs the whole batch, which a per-group function does not have.
+
+    What reaches the optimizer, measured (``[C - d, d]`` for
+    ``d in (0.1, 0.2, 0.3, 0.7)``, equal weights):
+
+    ============  =========================  ===================================
+    ``C``         its own whitening unit     sharing one with 8 healthy groups
+    ============  =========================  ===================================
+    ``1e8``       2.3e-4                     2.7e-8
+    ``1e9``       2.6e-3                     3.1e-7
+    ``1e11``      2.0e-1                     3.3e-5
+    ``1e13``      1.2                        5.2e-3
+    ============  =========================  ===================================
+
+    Read the second column carefully, because an earlier version of this
+    docstring quoted only its ``1e9`` entry and called it "around 1e-7" as if
+    it were the general case. Sharing a whitening unit with healthy groups
+    divides the remainder by *their* standard deviation -- a constant factor of
+    a few hundred here. It does not slow the growth with ``C``, and at
+    ``C = 1e13`` a mixed unit still delivers 5e-3.
+
+    "Whitening unit" is also not "the rollout". :func:`~relax.algorithms.
+    advantages._whiten_by_segment` whitens each *training batch* separately, so
+    a degenerate group only gets that division if healthy groups land in the
+    same training batch. Isolate it into its own segment and it returns to the
+    first column -- 2.6e-3 at ``C = 1e9``. Nothing arranges that mixing; it is
+    a property of how the rollout happened to be split.
     """
     standardized = standardize_group_components(group)
     return (standardized.double() * weights.double()).sum(dim=1)
@@ -406,8 +436,8 @@ def normalize_gdpo_decoupled(args: Any, samples: list[Any], raw_rewards: list[fl
         # out of date. What can still reach infinity is the weighting: float64
         # weights near its own maximum, or a reward near float64's range rather
         # than float32's. Left unchecked the `inf` reaches `whiten_scalar`,
-        # reads as a non-finite std, and the batch is silently zeroed -- the
-        # exact failure the per-value check exists to prevent, one stage later.
+        # which now raises on it -- but at that point the message can only name
+        # the batch, not the reward that produced it.
         raise ValueError(
             "GDPO produced a non-finite combined advantage from finite inputs; the "
             f"arithmetic overflowed. Rescale the rewards (keys={keys}) or their weights."
@@ -426,7 +456,7 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
 
     For a multi-reward algorithm the honest test is not "did any component
     vary" but "is the combined advantage this algorithm will actually compute
-    non-zero". Those differ: a zero weight mutes a varying component, and two
+    vary in float32". Those differ: a zero weight mutes a varying component, and two
     components whose standardised values are exact opposites cancel. Asking
     the cheaper question keeps groups that then contribute no gradient, and
     under-reports the zero-std metrics. Steps 1 and 2 are per-group and cheap,
@@ -474,11 +504,22 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
     # question `normalize_gdpo_decoupled` will. Open-coding it is how the two
     # came apart before.
     #
-    # Exactly the test the single-reward branch above makes, on exactly the
-    # values the trainer will receive: `min != max` in float32. Not `.any()` --
-    # a group whose combined advantages are all equal and nonzero carries no
-    # within-group ranking either, and step 3 would whiten it to zero. Not a
-    # tolerance of any kind: a threshold here decides whether a prompt group
+    # The same *form* the single-reward branch above uses, on the values the
+    # trainer will receive: `min != max` in float32. Not the same question,
+    # though -- that branch reads the raw reward, this one reads the output of
+    # Eq. 4 and Eq. 7, and the two disagree on a group whose components sum to
+    # a constant (the scalar is flat, the combination is rounding).
+    #
+    # `min != max` rather than `.any()` because it matches that branch, and
+    # here the two coincide anyway: Eq. 4 centres every column, so the combined
+    # values sum to zero within the group and "all equal" forces "all zero".
+    # That is a borrowed invariant, not a property of this function --
+    # `test_eq7_centres_every_group` pins it, because without it a group could
+    # be constant and nonzero, and such a group is *not* whitened away by step
+    # 3 (step 3 works per training batch, so it would come out as a constant
+    # nonzero advantage).
+    #
+    # No tolerance of any kind: a threshold here decides whether a prompt group
     # enters training, and no threshold on this quantity can tell a genuine
     # near-cancellation from a rounding one (see `combine_group`).
     #

@@ -231,6 +231,12 @@ def test_the_drop_label_survives_a_reward_without_the_scalar_key():
     on the drop path -- so a group that was flat *and* carried no scalar key
     raised `KeyError` out of the rollout loop. `zero_std_group_label` already
     refused exactly this input on the metrics side; the filter now uses it too.
+
+    It gets its own reason rather than joining `zero_std_*`. Swallowing it into
+    the flat-group bucket trades a loud crash for a silent one: a reward schema
+    that always omits the scalar would drop every such group and resample
+    forever, and the only signal would be a zero-std count that looks like
+    ordinary prompt flatness.
     """
     from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
 
@@ -246,7 +252,10 @@ def test_the_drop_label_survives_a_reward_without_the_scalar_key():
 
     out = check_reward_nonzero_std(_gdpo_args(), [_NoScalar(), _NoScalar(), _NoScalar(), _NoScalar()])
     assert out.keep is False
-    assert out.reason == "zero_std"
+    assert out.reason == "unreadable_reward", (
+        "a reward missing a key the run requires must not be filed as 'this group was flat' -- "
+        "a schema that always omits it would drop and resample forever behind a zero-std metric"
+    )
 
 
 # ---------------- the zero-std metrics (metrics_group_verdict) ----------------

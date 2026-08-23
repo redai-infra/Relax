@@ -345,6 +345,37 @@ def test_yaml_cannot_bypass_the_late_running_validators(arguments_module, tmp_pa
         arguments_module.apply_custom_config_overrides(args)
 
 
+def test_yaml_that_changes_the_update_schedule_gets_a_rederived_batch(arguments_module, tmp_path):
+    """Re-running the validator without its derivation rejected a legal config.
+
+    `validate_batch_shape` reads `global_batch_size`, which the main path
+    derives from `num_steps_per_rollout` *before* the merge. A YAML switching
+    grpo@4-steps to rloo@1-step should get `rollout * n = 128`; the first
+    version of this fix compared against the stale 32 and refused it.
+    """
+    args = _overridable_args(
+        tmp_path,
+        "advantage_estimator: rloo\nnum_steps_per_rollout: 1\n",
+        n_samples_per_prompt=8,
+        rollout_batch_size=16,
+        global_batch_size=32,
+        num_steps_per_rollout=4,
+        kl_coef=0.0,
+        max_staleness=0,
+        calculate_per_token_loss=True,
+        rewards_normalization=True,
+        normalize_advantages=False,
+        partial_rollout=False,
+        use_dynamic_global_batch_size=False,
+        hybrid=False,
+        fully_async=False,
+    )
+
+    arguments_module.apply_custom_config_overrides(args)
+
+    assert args.global_batch_size == 128, "the merge should re-derive it, not keep the pre-merge value"
+
+
 def test_a_yaml_that_changes_nothing_forbidden_still_passes(arguments_module, tmp_path):
     """The guard above must not reject a legitimate override."""
     args = _overridable_args(

@@ -68,6 +68,30 @@ by :func:`is_collapsed` and zeroed.
 """
 
 
+def any_rank_has_non_finite(values: torch.Tensor, *, process_group: dist.ProcessGroup | None = None) -> bool:
+    """Whether *any* rank's shard holds a NaN or an infinity.
+
+    A local ``isfinite`` check in front of a collective is a deadlock: the rank
+    that finds the bad value raises and leaves, and every other rank blocks
+    forever in the reduction it never reaches. That is the same failure
+    :func:`relax.algorithms.advantages._agree_on_segmentation` exists to
+    prevent, and it is easy to reintroduce because the local check looks
+    self-contained.
+
+    One MAX all-reduce of a 0/1 flag, so every rank gets the same answer and
+    the caller can raise on all of them together. Without a group the reduction
+    is skipped and the answer is simply the local one.
+    """
+    bad = torch.tensor(
+        float(not bool(torch.isfinite(values).all())),
+        dtype=torch.float32,
+        device=values.device,
+    )
+    if process_group is not None:
+        dist.all_reduce(bad, op=dist.ReduceOp.MAX, group=process_group)
+    return bool(bad.item())
+
+
 def is_collapsed(values: torch.Tensor, *, process_group: dist.ProcessGroup | None = None) -> bool:
     """Whether every value is identical, i.e. the spread carries no signal.
 

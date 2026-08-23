@@ -17,7 +17,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from relax.algorithms import get_algorithm  # noqa: E402
-from relax.algorithms.advantages import whiten_scalar  # noqa: E402
+from relax.algorithms.advantages import _whiten_by_segment, whiten_scalar  # noqa: E402
 from relax.algorithms.numerics import GDPO_EPS  # noqa: E402
 from relax.algorithms.rewards import (  # noqa: E402
     REWARD_NORMALIZERS,
@@ -885,7 +885,7 @@ def test_float32_columns_are_what_made_the_residue_dangerous():
     assert whiten_scalar(residue).abs().amax() > 0.5
 
 
-def test_the_cancellation_residue_grows_without_bound_with_the_base_magnitude():
+def test_the_cancellation_residue_grows_with_the_base_magnitude():
     """The unsolved limitation, measured across three decades rather than at
     one point.
 
@@ -896,6 +896,11 @@ def test_the_cancellation_residue_grows_without_bound_with_the_base_magnitude():
     step 3 stops clamping the amplification. At 1e13 what reaches a batch of
     such groups is O(1) -- the same order the removed noise floor was justified
     by.
+
+    "grows", not "grows without bound", which the previous name claimed: each
+    standardised column is itself bounded, so the combination saturates rather
+    than diverging. What the assertions below pin is the growth across the
+    range that matters, not an unbounded limit.
 
     Nothing in the reward stage detects this; see `combine_group` for why the
     two mechanisms tried so far could not. The test exists so the limitation is
@@ -908,33 +913,66 @@ def test_the_cancellation_residue_grows_without_bound_with_the_base_magnitude():
         combined = combine_group(group, weights)
         reaching_training[base] = float(whiten_scalar(combined.float()).abs().amax())
 
-    assert reaching_training[1e8] < 1e-3, reaching_training
-    assert reaching_training[1e9] < 5e-3, reaching_training
-    assert reaching_training[1e13] > 0.5, reaching_training
+    bases = sorted(reaching_training)
+    for lower, higher in zip(bases, bases[1:], strict=False):
+        assert reaching_training[higher] > reaching_training[lower], reaching_training
+    # Growth is close to linear in the base while the residue is small, and
+    # flattens once step 3 stops clamping: 1e8 -> 1e9 is 11x, 1e11 -> 1e13 only
+    # 6x. Pinning a per-decade factor would be pinning the saturation.
+    assert reaching_training[1e9] > 10 * reaching_training[1e8], reaching_training
     assert reaching_training[1e13] > 100 * reaching_training[1e9], reaching_training
+    assert reaching_training[1e13] > 0.5, reaching_training
 
 
-def test_a_healthy_batch_dilutes_the_cancellation_residue():
-    """The same groups, sized against the batch they actually train in.
+@pytest.mark.parametrize(
+    ("base", "alone_above", "shared_below"),
+    [(1e9, 1e-3, 1e-5), (1e11, 1e-1, 1e-3), (1e13, 0.5, 1e-1)],
+)
+def test_sharing_a_whitening_unit_divides_the_residue_but_does_not_stop_it(base, alone_above, shared_below):
+    """What healthy groups actually buy, across three decades rather than one.
 
-    Eq. 7 centres each group, so a batch holding healthy groups sets the
-    whitening scale and the degenerate group's remainder lands four orders
-    lower than the figures above. Those figures are batch-of-one worst cases,
-    not what a mixed rollout sees -- stated here because the same distinction
-    was elided once already.
+    An earlier version of this test measured only `base=1e9`, and the docstring
+    it supported turned that single number into "in a batch that also holds
+    healthy groups the remainder arrives around 1e-7". Sharing a whitening unit
+    divides the remainder by the healthy groups' standard deviation -- a couple
+    of hundred here -- and that factor does not grow with the base. At 1e13 a
+    shared unit still delivers ~5e-3.
     """
     weights = torch.tensor([1.0, 1.0], dtype=torch.float64)
     torch.manual_seed(0)
     healthy = [combine_group(torch.rand(4, 2, dtype=torch.float64) * 10, weights) for _ in range(8)]
     degenerate = combine_group(
-        torch.tensor([[1e9 - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)], dtype=torch.float64), weights
+        torch.tensor([[base - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)], dtype=torch.float64), weights
     )
 
     alone = float(whiten_scalar(degenerate.float()).abs().amax())
-    mixed = whiten_scalar(torch.cat(healthy + [degenerate]).float())
+    shared = whiten_scalar(torch.cat(healthy + [degenerate]).float())
 
-    assert alone > 1e-3
-    assert float(mixed[-4:].abs().amax()) < 1e-5
+    assert alone > alone_above
+    assert float(shared[-4:].abs().amax()) < shared_below
+
+
+def test_a_whitening_unit_of_its_own_removes_the_dilution_entirely():
+    """`_whiten_by_segment` whitens each training batch, not the rollout.
+
+    So the division above only happens when healthy groups land in the *same*
+    training batch. Nothing arranges that; it is a property of how the rollout
+    was split. Isolated into its own segment, the same group is back to its
+    batch-of-one value.
+    """
+    weights = torch.tensor([1.0, 1.0], dtype=torch.float64)
+    torch.manual_seed(0)
+    healthy = [combine_group(torch.rand(4, 2, dtype=torch.float64) * 10, weights) for _ in range(2)]
+    degenerate = combine_group(
+        torch.tensor([[1e9 - delta, delta] for delta in (0.1, 0.2, 0.3, 0.7)], dtype=torch.float64), weights
+    )
+    values = torch.cat(healthy + [degenerate]).float()
+
+    together = whiten_scalar(values)
+    apart = _whiten_by_segment(values, [8, 4], None)
+
+    assert float(together[-4:].abs().amax()) < 1e-5
+    assert float(apart[-4:].abs().amax()) > 1e-3
 
 
 def test_the_floor_would_have_zeroed_a_real_signal_two_columns_are_enough():
@@ -1002,6 +1040,44 @@ def test_the_filter_and_the_normalizer_never_disagree_about_a_group():
         trainable = bool(combined.float().amin() != combined.float().amax())
 
         assert kept is trainable, f"{label}: filter says {kept}, the advantage says {trainable}"
+
+
+def test_eq7_centres_every_group():
+    """The invariant the filter's safety is borrowed from, pinned.
+
+    `group_carries_reward_signal` uses `min != max`, and that is only
+    equivalent to "carries signal" because Eq. 4 centres each column, forcing
+    the combined values to sum to zero within the group -- so "all equal" means
+    "all zero". Nothing else enforces it. A future fast path that combined
+    uncentred values would let a group come out constant and nonzero, which
+    `min != max` would drop and step 3 would *not* whiten away, and no other
+    test in this file would go red.
+    """
+    torch.manual_seed(0)
+    scales = torch.tensor([1.0, 1e6, 1e-6], dtype=torch.float64)
+    for _ in range(200):
+        group = torch.randn(4, 3, dtype=torch.float64) * scales
+        weights = torch.randn(3, dtype=torch.float64) * 1e9
+        combined = combine_group(group, weights)
+        magnitude = float(combined.abs().amax())
+        if magnitude == 0.0:
+            continue
+        assert abs(float(combined.mean())) / magnitude < 1e-12, combined
+
+
+def test_a_constant_nonzero_group_would_not_be_whitened_away():
+    """Why the invariant above is load-bearing rather than decorative.
+
+    Step 3 whitens a training batch, not a group. Were Eq. 7 ever to emit a
+    constant nonzero group, dropping it on `min != max` would be discarding
+    something that does reach the optimizer -- as a constant offset shared by
+    the whole group.
+    """
+    constant = torch.tensor([5.0, 5.0, 5.0])
+    healthy = torch.tensor([-1.0, 0.0, 1.0])
+    whitened = whiten_scalar(torch.cat([constant, healthy]))
+
+    assert float(whitened[:3].abs().amax()) > 0.5
 
 
 def test_the_filter_keeps_a_group_the_ratio_criterion_used_to_discard():
