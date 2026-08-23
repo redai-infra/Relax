@@ -226,39 +226,6 @@ def _get_stored_config(timeout: float = 10.0) -> Any:
     return conf
 
 
-def _close_local_tq_client() -> None:
-    """Detach this process without deleting global TQ data or controller."""
-    client = None
-    store_client = None
-    try:
-        client = tq.get_client()
-        store_client = getattr(client.storage_manager, "storage_client", None)
-    except (AssertionError, AttributeError):
-        pass
-
-    if store_client is not None and hasattr(store_client, "close"):
-        try:
-            store_client.close()
-        except Exception as e:  # pragma: no cover - best-effort local cleanup
-            logger.warning(f"[dataplane] Failed to close attached MooncakeStore client ({safe_exception_kind(e)}).")
-
-    if client is not None and hasattr(client, "close"):
-        try:
-            client.close()
-        except Exception as e:  # pragma: no cover - best-effort local cleanup
-            logger.warning(f"[dataplane] Failed to close attached TransferQueue client ({safe_exception_kind(e)}).")
-
-    # TransferQueue has no public detach-only API. Reset only process-local
-    # handles; never touch _TQ_STORAGE or the named controller actor.
-    try:
-        from transfer_queue import interface as tq_interface
-
-        tq_interface._TQ_CLIENT = None
-        tq_interface._TQ_CONTROLLER = None
-    except (ImportError, AttributeError):  # pragma: no cover - version dependent
-        pass
-
-
 def _resolve_attach_timeout() -> float:
     """Attach deadline in seconds; override via
     ``RELAX_TQ_ATTACH_TIMEOUT_SECONDS``."""
@@ -373,7 +340,35 @@ def detach_tq_client() -> None:
     generation lease.  Force-killed workers still fall back to the master-side
     TTL.
     """
-    _close_local_tq_client()
+    client = None
+    store_client = None
+    try:
+        client = tq.get_client()
+        store_client = getattr(client.storage_manager, "storage_client", None)
+    except (AssertionError, AttributeError):
+        pass
+
+    if store_client is not None and hasattr(store_client, "close"):
+        try:
+            store_client.close()
+        except Exception as e:  # pragma: no cover - best-effort local cleanup
+            logger.warning(f"[dataplane] Failed to close attached MooncakeStore client ({safe_exception_kind(e)}).")
+
+    if client is not None and hasattr(client, "close"):
+        try:
+            client.close()
+        except Exception as e:  # pragma: no cover - best-effort local cleanup
+            logger.warning(f"[dataplane] Failed to close attached TransferQueue client ({safe_exception_kind(e)}).")
+
+    # TransferQueue has no public detach-only API. Reset only process-local
+    # handles; never touch _TQ_STORAGE or the named controller actor.
+    try:
+        from transfer_queue import interface as tq_interface
+
+        tq_interface._TQ_CLIENT = None
+        tq_interface._TQ_CONTROLLER = None
+    except (ImportError, AttributeError):  # pragma: no cover - version dependent
+        pass
 
 
 def _alive_node_ids() -> list[str]:

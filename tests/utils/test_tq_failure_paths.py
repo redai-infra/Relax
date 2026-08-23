@@ -531,11 +531,21 @@ class TestAssertMooncakeRdmaConfigured:
 class TestWorkerDetach:
     """detach_tq_client and the teardown hooks that must invoke it."""
 
-    def test_detach_delegates_to_local_close(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(tq_lifecycle, "_close_local_tq_client", lambda: calls.append(True))
+    def test_detach_closes_clients_and_resets_process_handles(self, monkeypatch):
+        storage_client = MagicMock()
+        client = MagicMock(storage_manager=SimpleNamespace(storage_client=storage_client))
+        fake_tq = MagicMock()
+        fake_tq.get_client.return_value = client
+        fake_interface = SimpleNamespace(_TQ_CLIENT=client, _TQ_CONTROLLER=object())
+        monkeypatch.setattr(tq_lifecycle.tq, "interface", fake_interface, raising=False)
+        monkeypatch.setattr(tq_lifecycle, "tq", fake_tq)
+
         tq_lifecycle.detach_tq_client()
-        assert calls == [True]
+
+        storage_client.close.assert_called_once_with()
+        client.close.assert_called_once_with()
+        assert fake_interface._TQ_CLIENT is None
+        assert fake_interface._TQ_CONTROLLER is None
 
     @pytest.mark.parametrize("has_client", [True, False], ids=["attached", "not-attached"])
     def test_component_del_detaches_only_an_attached_client(self, monkeypatch, has_client):
