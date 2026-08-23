@@ -20,7 +20,7 @@ from typing import Any
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.rdma_probe import EffectiveConfig
-from relax.utils.tq_correctness import ensure_mooncake_correctness_guards
+from relax.utils.tq.correctness import ensure_mooncake_correctness_guards
 
 
 logger = get_logger(__name__)

@@ -14,7 +14,7 @@ Covers the four gaps the maintainer review called out, which the existing
   (``list[dict]`` / NonTensorStack) actually takes — real Qwen-VL fixture when
   available, production-structured synthetic otherwise
 * automatic degradation as pytest (was a manual two-node script)
-* the controller reaper / teardown helpers (now in ``relax.utils.tq_lifecycle``)
+* the controller reaper / teardown helpers (now in ``relax.utils.tq.lifecycle``)
 
 Everything except the MooncakeStore round-trip runs with stubs, so it is
 CI-safe; the round-trip skips unless a reachable mooncake master is configured.
@@ -39,8 +39,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
-from relax.utils import tq_lifecycle
 from relax.utils.rdma_probe import ProbeResult, reduce_results
+from relax.utils.tq import lifecycle as tq_lifecycle
 
 
 def _has_real_submodule(dotted: str) -> bool:
@@ -140,8 +140,8 @@ def _mm_slow_path_worker(result_queue, protocol: str) -> None:
     status = "error"
     detail = "roundtrip did not run"
     try:
-        from relax.utils.payload_digest import diff_digests, leaf_digests
         from tests.utils.mm_payload_fixtures import mm_train_data
+        from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
 
         train_data, source = mm_train_data(4)
         samples = train_data["multimodal_train_inputs"]
@@ -1068,7 +1068,7 @@ class TestMooncakeByteExact:
     def _client(protocol: str):
         from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
 
-        from relax.utils.tq_correctness import ensure_mooncake_correctness_guards
+        from relax.utils.tq.correctness import ensure_mooncake_correctness_guards
 
         ensure_mooncake_correctness_guards()
         return MooncakeStoreClient(

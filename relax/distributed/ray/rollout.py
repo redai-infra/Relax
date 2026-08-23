@@ -51,7 +51,7 @@ from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
-from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,

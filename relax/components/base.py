@@ -100,7 +100,7 @@ class Base:
         if getattr(self, "data_system_client", None) is None or generation is None:
             return
         try:
-            from relax.utils.tq_lifecycle import detach_tq_client
+            from relax.utils.tq.lifecycle import detach_tq_client
 
             detach_tq_client(generation)
             self._tq_client_generation = None

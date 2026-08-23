@@ -38,7 +38,7 @@ from relax.engine.sft.debug_print import print_first_sample
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
-from relax.utils.tq_lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
 

@@ -60,7 +60,7 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
-from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields

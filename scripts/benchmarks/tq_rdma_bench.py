@@ -87,7 +87,7 @@ CONFIG_MAP = {
 def build_tq_config(config_name: str, args: argparse.Namespace, num_storage_units: int = 1):
     """Build the tq.init config dict for a given benchmark config.
 
-    Reuses :mod:`relax.utils.tq_config` builders so the benchmark cannot drift
+    Reuses :mod:`relax.utils.tq.config` builders so the benchmark cannot drift
     from the production config shape (single source of truth for
     keys/defaults).
     """
@@ -95,7 +95,7 @@ def build_tq_config(config_name: str, args: argparse.Namespace, num_storage_unit
     from transfer_queue import GRPOGroupNSampler
 
     from relax.utils.rdma_probe import EffectiveConfig
-    from relax.utils.tq_config import build_mooncake_config, build_simple_storage_config
+    from relax.utils.tq.config import build_mooncake_config, build_simple_storage_config
 
     cfg = CONFIG_MAP[config_name]
     sampler = GRPOGroupNSampler(n_samples_per_prompt=1)
@@ -210,7 +210,7 @@ def run_one(config_name: str, payload: dict, args: argparse.Namespace) -> dict:
     import transfer_queue as tq
 
     if CONFIG_MAP[config_name]["backend"] == "MooncakeStore":
-        from relax.utils.tq_config import validate_mooncake_runtime_contract
+        from relax.utils.tq.config import validate_mooncake_runtime_contract
 
         validate_mooncake_runtime_contract()
 

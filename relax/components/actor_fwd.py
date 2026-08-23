@@ -11,7 +11,7 @@ from ray import serve
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
-from relax.utils.tq_lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()

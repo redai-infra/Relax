@@ -410,7 +410,7 @@ def build_conf(protocol: str, master: str, device: str, segment_gib: int):
     from transfer_queue import GRPOGroupNSampler
 
     from relax.utils.rdma_probe import EffectiveConfig
-    from relax.utils.tq_config import (
+    from relax.utils.tq.config import (
         build_mooncake_config,
         build_simple_storage_config,
         validate_mooncake_runtime_contract,

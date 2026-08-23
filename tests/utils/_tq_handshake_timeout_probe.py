@@ -85,7 +85,7 @@ def main(probe_dir: Path) -> None:
         _temp_dir=str(probe_dir / "ray"),
     )
     try:
-        from relax.utils import tq_lifecycle
+        from relax.utils.tq import lifecycle as tq_lifecycle
 
         conf = {"backend": {"storage_backend": "SimpleStorage"}, "controller": {}}
 

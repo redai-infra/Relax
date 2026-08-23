@@ -157,24 +157,20 @@ def _backend_description(conf: Any) -> str:
     return f"MooncakeStore/{_get_config_value(mooncake, 'protocol', 'tcp')}"
 
 
-def _uses_mooncake(conf: Any) -> bool:
-    backend = _get_config_value(conf, "backend", {})
-    return _get_config_value(backend, "storage_backend", "SimpleStorage") == "MooncakeStore"
-
-
 def uses_mooncake(conf: Any) -> bool:
     """True when ``conf`` selects the MooncakeStore backend.
 
     Public so the Controller can decide whether the cluster-wide attach
     handshake is required for the stored job-level config.
     """
-    return _uses_mooncake(conf)
+    backend = _get_config_value(conf, "backend", {})
+    return _get_config_value(backend, "storage_backend", "SimpleStorage") == "MooncakeStore"
 
 
 def _prepare_mooncake_runtime(conf: Any) -> None:
-    if not _uses_mooncake(conf):
+    if not uses_mooncake(conf):
         return
-    from relax.utils.tq_config import validate_mooncake_runtime_contract
+    from relax.utils.tq.config import validate_mooncake_runtime_contract
 
     validate_mooncake_runtime_contract()
 
@@ -503,7 +499,7 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
 
     @ray.remote(num_cpus=0, max_retries=0, max_calls=1)
     def _handshake(handshake_conf: Any) -> None:
-        from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
+        from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 
         attach_tq_client(handshake_conf, requested_gdr=False, role="attach-handshake")
         detach_tq_client()

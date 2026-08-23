@@ -19,7 +19,7 @@ from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
-from relax.utils.tq_lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()

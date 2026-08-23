@@ -332,9 +332,9 @@ class TestRealMultimodalFullLink:
         """Real assembly (dict_to_tensordict) -> tq put/get -> leaf-level
         SHA-256 equality for every sample, aligned by sample_id (the sampler
         may reorder rows)."""
-        from relax.utils.payload_digest import diff_digests, leaf_digests
         from relax.utils.utils import dict_to_tensordict
         from tests.utils.mm_payload_fixtures import mm_train_data
+        from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
 
         num_samples = 4
         train_data, source = mm_train_data(num_samples)

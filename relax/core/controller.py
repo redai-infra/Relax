@@ -49,13 +49,13 @@ from relax.utils.opd.opd_utils import (
 )
 from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate_config
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
-from relax.utils.tq_config import (
+from relax.utils.tq.config import (
     build_backend_config,
     resolve_mooncake_master_address,
     resolve_tq_capacity_batch_size,
     validate_mooncake_runtime_contract,
 )
-from relax.utils.tq_lifecycle import (
+from relax.utils.tq.lifecycle import (
     TqInitResult,
     close_tq_owner,
     initialize_tq_with_fallback,
@@ -326,7 +326,7 @@ class Controller:
 
         fallback_config = None
         if backend_config.get("storage_backend") == "MooncakeStore":
-            from relax.utils.tq_config import build_simple_storage_config
+            from relax.utils.tq.config import build_simple_storage_config
 
             fallback_config = OmegaConf.create(
                 {
@@ -414,7 +414,7 @@ class Controller:
         # 2. SimpleStorage short-circuit (default, zero behavior change).
         #    ``mooncake + off`` is MooncakeStore/TCP, not SimpleStorage.
         if backend == "simple":
-            from relax.utils.tq_config import build_simple_storage_config
+            from relax.utils.tq.config import build_simple_storage_config
 
             return build_simple_storage_config(
                 total_storage_size=total_storage_size,
@@ -434,7 +434,7 @@ class Controller:
                     f"--tq-rdma-mode={mode} but the installed TransferQueue "
                     f"does not satisfy the Mooncake correctness contract: {e}"
                 ) from e
-            from relax.utils.tq_config import build_simple_storage_config
+            from relax.utils.tq.config import build_simple_storage_config
 
             logger.warning(
                 "[dataplane] Installed TransferQueue does not satisfy the Mooncake "
@@ -512,7 +512,7 @@ class Controller:
 
         Default in-process path keeps upstream's plain ``tq.close()``;
         owner-mediated runs delegate to
-        :func:`relax.utils.tq_lifecycle.close_tq_owner`.
+        :func:`relax.utils.tq.lifecycle.close_tq_owner`.
         """
         if self._tq_legacy_init:
             self._tq_legacy_init = False

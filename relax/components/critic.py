@@ -15,7 +15,7 @@ from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import sft_partition_id
 from relax.utils.async_utils import run
-from relax.utils.tq_lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 @serve.deployment(

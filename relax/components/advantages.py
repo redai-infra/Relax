@@ -16,7 +16,7 @@ from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
     consume_opd_advantage_data,
 )
-from relax.utils.tq_lifecycle import attach_tq_client
+from relax.utils.tq.lifecycle import attach_tq_client
 from relax.utils.training.ppo_utils import (
     compute_approx_kl,
     get_advantages_and_returns_batch,

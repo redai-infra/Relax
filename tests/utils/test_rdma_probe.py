@@ -30,7 +30,7 @@ from relax.utils.rdma_probe import (
     reduce_results,
     validate_config,
 )
-from relax.utils.tq_config import (
+from relax.utils.tq.config import (
     build_mooncake_config,
     build_simple_storage_config,
     estimate_payload_bytes,
@@ -630,7 +630,7 @@ class TestTqConfigBuilder:
         assert validate_segment_capacity(args, eff) is None
 
     def test_segment_size_env_override_rejects_garbage(self, monkeypatch):
-        from relax.utils.tq_config import resolve_global_segment_size
+        from relax.utils.tq.config import resolve_global_segment_size
 
         monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "four")
         with pytest.raises(RuntimeError, match="RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB"):

@@ -28,7 +28,7 @@ from typing import Any
 
 import torch
 
-from relax.utils.payload_digest import diff_digests, leaf_digests
+from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
