@@ -1,13 +1,16 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""RDMA capability probe and graded-degradation state machine for
-MooncakeStore.
+"""RDMA capability probe and fallback decision for MooncakeStore.
 
 This module runs **before** ``tq.init`` to decide the job-level effective
 ``{backend, protocol, device}`` triple.  The probe is intentionally side-effect
 free: it only reads ``/sys``/``resource``/mooncake introspection and performs a
 short handshake.  The result is AND-reduced across all data-plane nodes by the
 driver so that every worker converges on the *same* effective config.
+
+Only two outcomes exist: MooncakeStore over host RDMA, or the original
+SimpleStorage.  Mooncake/TCP survives as a benchmark baseline only, so there is
+no intermediate transport to degrade through.
 
 Key constraint (F10 in the RFC): probing must happen *before* ``tq.init``.
 If the named actor ``TransferQueueController`` is created before the probe
@@ -28,6 +31,9 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+# Accepted ``--tq-rdma-mode`` values; ``off`` keeps the SimpleStorage path.
+TQ_RDMA_MODES = frozenset({"off", "auto", "required"})
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -87,10 +93,16 @@ class EffectiveConfig:
     fallback_reason: str  # "" if no fallback occurred
 
     def log_line(self) -> str:
-        """Return the single-line startup log string for this effective
-        config."""
-        dev = self.device or "auto"
-        base = f"[dataplane] backend={self.backend} protocol={self.protocol} device={dev}"
+        """Return the single-line startup log string for this effective config.
+
+        SimpleStorage deliberately reports no protocol: naming one would imply
+        the data plane went through a Mooncake transport, and Mooncake/TCP is
+        not a production path.
+        """
+        if self.backend != "MooncakeStore":
+            base = f"[dataplane] backend={self.backend}"
+        else:
+            base = f"[dataplane] backend={self.backend} protocol={self.protocol} device={self.device or 'auto'}"
         if self.fallback_reason:
             return f"{base} fallback={self.fallback_reason}"
         return base
@@ -291,7 +303,7 @@ def _check_health_check() -> CheckResult:  # pragma: no cover - retained for ad-
 # NOTE: ``health_check()`` is intentionally NOT probed because it depends on
 # local Mooncake client initialization. External-master reachability is checked
 # directly with a bounded TCP connect, then authoritatively by ``tq.init``.
-def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool = True) -> ProbeResult:
+def probe_node(device: str = "", master_address: str = "") -> ProbeResult:
     """Run all capability checks on the current node.
 
     Parameters
@@ -299,20 +311,14 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
     device
         Explicit RDMA device name; empty = scan every HCA and select one
         whose ACTIVE port and usable GID both pass.
-    probe_rdma
-        When ``False``, validate only Mooncake importability and master
-        reachability, then select TCP. Used by ``--tq-rdma-mode=off`` so an
-        explicitly requested Mooncake/TCP backend never depends on RDMA
-        hardware.
     """
     node = socket.gethostname()
     checks: list[CheckResult] = []
     errors: list[str] = []
 
     checks.append(_check_mooncake_import())
-    if probe_rdma:
-        checks.append(_check_rdma_devices())
-        checks.append(_check_memlock())
+    checks.append(_check_rdma_devices())
+    checks.append(_check_memlock())
 
     # Mooncake is externally managed by Relax deployments. When an endpoint is
     # supplied, it must already be reachable from every data-plane node before
@@ -320,11 +326,8 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
     if master_address:
         checks.append(_check_master_reachable(master_address))
 
-    # Device-dependent checks are irrelevant when RDMA is explicitly off.
-    selected_device = ""
-    if probe_rdma:
-        selected_device, device_checks = _select_usable_rdma_device(device)
-        checks.extend(device_checks)
+    selected_device, device_checks = _select_usable_rdma_device(device)
+    checks.extend(device_checks)
 
     # Determine effective protocol via graded degradation.
     mooncake_ok = any(c.name == "mooncake_import" and c.ok for c in checks)
@@ -335,21 +338,22 @@ def probe_node(device: str = "", master_address: str = "", *, probe_rdma: bool =
     master_ok = not master_address or any(c.name == "master_reachable" and c.ok for c in checks)
 
     effective_protocol: str | None
-    effective_device = device if probe_rdma else ""
+    effective_device = device
     if not mooncake_ok:
         effective_protocol = None
         errors.append("mooncake not importable")
     elif not master_ok:
         effective_protocol = None
         errors.append("master unreachable")
-    elif not probe_rdma:
-        effective_protocol = "tcp"
     elif rdma_dev_ok and port_ok and gid_ok and memlock_ok:
         effective_protocol = "rdma"
         # Report the jointly validated device (ACTIVE port + usable GID).
         effective_device = selected_device or effective_device
     else:
-        # mooncake usable but RDMA incomplete -> degrade to TCP (still MooncakeStore).
+        # Mooncake is usable but this node cannot do RDMA.  ``tcp`` is recorded
+        # so the reduction can distinguish "no RDMA here" from "no Mooncake at
+        # all" in its fallback reason; Mooncake/TCP is not a production
+        # transport (it survives only as a benchmark baseline).
         effective_protocol = "tcp"
         if not rdma_dev_ok:
             errors.append("no RDMA device")
@@ -424,7 +428,6 @@ def probe_cluster_nodes(
     master_address: str = "",
     *,
     timeout: float = 60.0,
-    probe_rdma: bool = True,
 ) -> list[ProbeResult]:
     """Probe every alive GPU-bearing node and return one result per node.
 
@@ -445,9 +448,7 @@ def probe_cluster_nodes(
     driver result when no GPU workers are discoverable (single-node/local dev).
     """
     node_ids = _alive_gpu_nodes()
-    driver_result = (
-        probe_node(device, master_address) if probe_rdma else probe_node(device, master_address, probe_rdma=False)
-    )
+    driver_result = probe_node(device, master_address)
     if not node_ids:
         logger.debug("No alive GPU nodes discovered; probing driver node only.")
         return [driver_result]
@@ -456,16 +457,16 @@ def probe_cluster_nodes(
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     @ray.remote(num_cpus=0.001)
-    def _probe_on_node(dev: str, master: str, should_probe_rdma: bool) -> ProbeResult:
+    def _probe_on_node(dev: str, master: str) -> ProbeResult:
         from relax.utils.rdma_probe import probe_node as _probe
 
-        return _probe(dev, master, probe_rdma=should_probe_rdma)
+        return _probe(dev, master)
 
     refs: list[Any] = []
     id_by_ref: dict[Any, str] = {}
     for node_id in node_ids:
         strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        ref = _probe_on_node.options(scheduling_strategy=strategy).remote(device, master_address, probe_rdma)
+        ref = _probe_on_node.options(scheduling_strategy=strategy).remote(device, master_address)
         refs.append(ref)
         id_by_ref[ref] = node_id
 
@@ -495,37 +496,22 @@ def probe_cluster_nodes(
 def reduce_results(
     results: list[ProbeResult],
     *,
-    requested_backend: str,
     requested_device: str,
-    fallback_backend: str = "SimpleStorage",
-    rdma_mode: str = "auto",
 ) -> EffectiveConfig:
     """AND-reduce per-node results into a single job-level effective config.
+
+    The only two outcomes are MooncakeStore over host RDMA and the original
+    SimpleStorage: Mooncake/TCP is a benchmark baseline, not a production
+    transport, so it is never selected here and there is no intermediate rung
+    to degrade through.
 
     Parameters
     ----------
     results
         One :class:`ProbeResult` per data-plane node.
-    requested_backend
-        ``--tq-storage-backend`` value (``"simple"`` or ``"mooncake"``).
     requested_device
         ``--tq-rdma-device`` value.
-    fallback_backend
-        Backend to degrade to when probe fails in auto mode.
-    rdma_mode
-        ``off`` selects Mooncake/TCP after validating Mooncake and master
-        availability. ``auto`` and ``required`` reduce the probed RDMA
-        capability normally; the caller decides whether a fallback is fatal.
     """
-    # SimpleStorage short-circuits: no probing needed.
-    if requested_backend == "simple":
-        return EffectiveConfig(
-            backend="SimpleStorage",
-            protocol="tcp",
-            device="",
-            fallback_reason="",
-        )
-
     if not results:
         return EffectiveConfig(
             backend="SimpleStorage",
@@ -535,43 +521,15 @@ def reduce_results(
         )
 
     # AND reduction: the job can only run at the lowest common capability.
-    any_no_mooncake = any(r.effective_protocol is None for r in results)
-    all_rdma = all(r.effective_protocol == "rdma" for r in results)
-
-    if any_no_mooncake:
-        failed_nodes = [r.node for r in results if r.effective_protocol is None]
-        master_failed_nodes = [r.node for r in results if "master unreachable" in r.errors]
-        reason = (
-            f"master_unreachable:{','.join(master_failed_nodes)}"
-            if master_failed_nodes
-            else f"mooncake_unavailable:{','.join(failed_nodes)}"
-        )
-        return EffectiveConfig(
-            backend=fallback_backend,
-            protocol="tcp",
-            device="",
-            fallback_reason=reason,
-        )
-
-    if rdma_mode == "off":
-        return EffectiveConfig(
-            backend="MooncakeStore",
-            protocol="tcp",
-            device="",
-            fallback_reason="",
-        )
-
-    if all_rdma:
-        # Device: if any node lacks the requested device, fall back to tcp.
-        if requested_device:
-            device_ok = all(r.effective_device == requested_device for r in results)
-            if not device_ok:
-                return EffectiveConfig(
-                    backend="MooncakeStore",
-                    protocol="tcp",
-                    device=requested_device,
-                    fallback_reason=f"device_mismatch:{requested_device}",
-                )
+    if all(r.effective_protocol == "rdma" for r in results):
+        # Device: every node must expose the explicitly requested device.
+        if requested_device and any(r.effective_device != requested_device for r in results):
+            return EffectiveConfig(
+                backend="SimpleStorage",
+                protocol="tcp",
+                device="",
+                fallback_reason=f"device_mismatch:{requested_device}",
+            )
         return EffectiveConfig(
             backend="MooncakeStore",
             protocol="rdma",
@@ -579,13 +537,21 @@ def reduce_results(
             fallback_reason="",
         )
 
-    # Some nodes can't do RDMA → degrade to TCP (still MooncakeStore).
-    rdma_failed = [r.node for r in results if r.effective_protocol != "rdma"]
+    no_mooncake_nodes = [r.node for r in results if r.effective_protocol is None]
+    if no_mooncake_nodes:
+        master_failed_nodes = [r.node for r in results if "master unreachable" in r.errors]
+        reason = (
+            f"master_unreachable:{','.join(master_failed_nodes)}"
+            if master_failed_nodes
+            else f"mooncake_unavailable:{','.join(no_mooncake_nodes)}"
+        )
+    else:
+        reason = f"rdma_unavailable:{','.join(r.node for r in results if r.effective_protocol != 'rdma')}"
     return EffectiveConfig(
-        backend="MooncakeStore",
+        backend="SimpleStorage",
         protocol="tcp",
-        device=requested_device,
-        fallback_reason=f"rdma_unavailable:{','.join(rdma_failed)}",
+        device="",
+        fallback_reason=reason,
     )
 
 
@@ -595,19 +561,16 @@ def reduce_results(
 
 
 def validate_config(args: Any) -> list[str]:
-    """Return a list of error messages for invalid flag combinations.
+    """Return a list of error messages for an invalid RDMA configuration.
 
     Called at startup *before* probing.  An empty list means the config is
     structurally valid (semantic/runtime validity is checked by the probe).
+    ``argparse`` already constrains the mode for CLI runs; this also covers
+    configs restored from a checkpoint or built programmatically.
     """
     errors: list[str] = []
-    backend = getattr(args, "tq_storage_backend", "simple")
     mode = getattr(args, "tq_rdma_mode", "off")
 
-    if backend == "simple" and mode != "off":
-        errors.append(
-            f"--tq-rdma-mode={mode} is meaningless with --tq-storage-backend=simple "
-            "(RDMA only applies to MooncakeStore). Set --tq-rdma-mode=off or "
-            "--tq-storage-backend=mooncake."
-        )
+    if mode not in TQ_RDMA_MODES:
+        errors.append(f"--tq-rdma-mode={mode!r} must be one of {', '.join(sorted(TQ_RDMA_MODES))}.")
     return errors

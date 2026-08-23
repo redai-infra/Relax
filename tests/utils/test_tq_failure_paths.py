@@ -985,16 +985,12 @@ class TestAutomaticDegradation:
     """AND-reduction turns any node's failure into a job-level downgrade."""
 
     def test_all_nodes_rdma_stays_rdma(self):
-        eff = reduce_results([_probe("a"), _probe("b")], requested_backend="mooncake", requested_device="")
+        eff = reduce_results([_probe("a"), _probe("b")], requested_device="")
         assert (eff.backend, eff.protocol, eff.fallback_reason) == ("MooncakeStore", "rdma", "")
 
     def test_one_node_without_mooncake_degrades_whole_job(self):
         """Mirrors the PYTHONPATH-poisoning case of the two-node script."""
-        eff = reduce_results(
-            [_probe("a"), _probe("b", protocol=None)],
-            requested_backend="mooncake",
-            requested_device="",
-        )
+        eff = reduce_results([_probe("a"), _probe("b", protocol=None)], requested_device="")
         assert eff.backend == "SimpleStorage"
         assert "mooncake_unavailable" in eff.fallback_reason and "b" in eff.fallback_reason
 
@@ -1005,16 +1001,12 @@ class TestAutomaticDegradation:
 
         degenerate = _degenerate_result("b", "probe task raised")
         assert degenerate.effective_protocol is None
-        eff = reduce_results([_probe("a"), degenerate], requested_backend="mooncake", requested_device="")
+        eff = reduce_results([_probe("a"), degenerate], requested_device="")
         assert eff.backend == "SimpleStorage"
 
-    def test_one_node_tcp_only_degrades_transport_not_backend(self):
-        eff = reduce_results(
-            [_probe("a"), _probe("b", protocol="tcp")],
-            requested_backend="mooncake",
-            requested_device="",
-        )
-        assert (eff.backend, eff.protocol) == ("MooncakeStore", "tcp")
+    def test_one_node_without_rdma_degrades_whole_job_to_simple(self):
+        eff = reduce_results([_probe("a"), _probe("b", protocol="tcp")], requested_device="")
+        assert (eff.backend, eff.protocol) == ("SimpleStorage", "tcp")
         assert eff.fallback_reason
 
 

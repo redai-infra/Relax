@@ -250,27 +250,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # buffer, segment, timeout, master strategy) are handled via internal
             # defaults / deployment environment, not CLI flags.
             parser.add_argument(
-                "--tq-storage-backend",
-                choices=["simple", "mooncake"],
-                default="simple",
-                help=(
-                    "TransferQueue storage backend. 'simple' (default) uses "
-                    "SimpleStorage/ZMQ and is equivalent to current behavior. "
-                    "'mooncake' uses MooncakeStore, which supports RDMA transport "
-                    "via --tq-rdma-mode."
-                ),
-            )
-            parser.add_argument(
                 "--tq-rdma-mode",
                 choices=["off", "auto", "required"],
                 default="off",
                 help=(
-                    "RDMA transport mode for MooncakeStore backend. 'off' (default) "
-                    "never uses RDMA even if hardware is available. 'auto' probes "
-                    "RDMA capability at startup and degrades to TCP/SimpleStorage if "
-                    "unavailable (with a WARNING). 'required' fails fast on probe "
-                    "failure instead of degrading. Only effective with "
-                    "--tq-storage-backend mooncake."
+                    "TransferQueue data-plane transport. 'off' (default) uses "
+                    "SimpleStorage/ZMQ and is equivalent to current behavior. "
+                    "'auto' attempts MooncakeStore over host RDMA and falls back "
+                    "to SimpleStorage when it is unavailable (with a WARNING). "
+                    "'required' fails fast instead of falling back."
                 ),
             )
             parser.add_argument(

@@ -71,7 +71,6 @@ def _make_probe(
 
 def _make_args(**kwargs) -> argparse.Namespace:
     defaults = dict(
-        tq_storage_backend="mooncake",
         tq_rdma_mode="auto",
         tq_rdma_device="",
         num_data_storage_units=1,
@@ -91,25 +90,21 @@ def _make_args(**kwargs) -> argparse.Namespace:
 
 
 class TestValidateConfig:
-    """validate_config: structural flag-combination checks before any probe."""
+    """validate_config: structural mode check before any probe."""
 
-    def test_simple_backend_with_rdma_mode_rejected(self):
-        args = _make_args(tq_storage_backend="simple", tq_rdma_mode="auto")
-        errors = validate_config(args)
+    @pytest.mark.parametrize("mode", ["off", "auto", "required"])
+    def test_accepts_every_supported_mode(self, mode):
+        assert validate_config(_make_args(tq_rdma_mode=mode)) == []
+
+    def test_rejects_unknown_mode(self):
+        """Guards configs restored from a checkpoint or built without
+        argparse."""
+        errors = validate_config(_make_args(tq_rdma_mode="mooncake"))
         assert len(errors) == 1
-        assert "simple" in errors[0]
+        assert "--tq-rdma-mode" in errors[0]
 
-    def test_valid_simple_off(self):
-        args = _make_args(tq_storage_backend="simple", tq_rdma_mode="off")
-        assert validate_config(args) == []
-
-    def test_valid_mooncake_auto(self):
-        args = _make_args(tq_storage_backend="mooncake", tq_rdma_mode="auto")
-        assert validate_config(args) == []
-
-    def test_valid_mooncake_required(self):
-        args = _make_args(tq_storage_backend="mooncake", tq_rdma_mode="required")
-        assert validate_config(args) == []
+    def test_missing_attribute_defaults_to_off(self):
+        assert validate_config(argparse.Namespace()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -118,21 +113,15 @@ class TestValidateConfig:
 
 
 class TestReduceResults:
-    """reduce_results: per-node ProbeResult -> job-level EffectiveConfig (AND reduction)."""
+    """reduce_results: per-node ProbeResult -> job-level EffectiveConfig (AND reduction).
 
-    def test_simple_backend_short_circuits(self):
-        eff = reduce_results(
-            [_make_probe()],
-            requested_backend="simple",
-            requested_device="rdma0",
-        )
-        assert eff.backend == "SimpleStorage"
-        assert eff.protocol == "tcp"
+    The only two outcomes are MooncakeStore/RDMA and SimpleStorage; Mooncake/TCP
+    is a benchmark baseline and must never be selected as a production backend.
+    """
 
     def test_all_nodes_rdma(self):
         eff = reduce_results(
             [_make_probe(protocol="rdma"), _make_probe(protocol="rdma", node="node-B")],
-            requested_backend="mooncake",
             requested_device="",
         )
         assert eff.backend == "MooncakeStore"
@@ -142,58 +131,32 @@ class TestReduceResults:
     def test_one_node_no_mooncake_falls_back(self):
         eff = reduce_results(
             [_make_probe(protocol="rdma"), _make_probe(protocol=None, node="node-B")],
-            requested_backend="mooncake",
             requested_device="",
         )
         assert eff.backend == "SimpleStorage"
+        assert "mooncake_unavailable" in eff.fallback_reason
         assert "node-B" in eff.fallback_reason
 
-    def test_one_node_no_rdma_degrades_to_tcp(self):
+    def test_one_node_without_rdma_falls_back_to_simple_not_tcp(self):
         eff = reduce_results(
             [_make_probe(protocol="rdma"), _make_probe(protocol="tcp", node="node-B")],
-            requested_backend="mooncake",
             requested_device="",
         )
-        assert eff.backend == "MooncakeStore"
-        assert eff.protocol == "tcp"
-        assert "node-B" in eff.fallback_reason
+        assert (eff.backend, eff.protocol, eff.device) == ("SimpleStorage", "tcp", "")
+        assert eff.fallback_reason == "rdma_unavailable:node-B"
 
     def test_requested_device_must_match_every_rdma_node(self):
         eff = reduce_results(
             [_make_probe(device="rdma0"), _make_probe(device="rdma1", node="node-B")],
-            requested_backend="mooncake",
             requested_device="rdma0",
         )
-        assert eff.protocol == "tcp"
+        assert eff.backend == "SimpleStorage"
         assert eff.fallback_reason == "device_mismatch:rdma0"
 
     def test_empty_results_falls_back(self):
-        eff = reduce_results(
-            [],
-            requested_backend="mooncake",
-            requested_device="",
-        )
+        eff = reduce_results([], requested_device="")
         assert eff.backend == "SimpleStorage"
-
-    def test_off_mode_keeps_mooncake_and_selects_tcp(self):
-        eff = reduce_results(
-            [_make_probe(protocol="rdma"), _make_probe(protocol="tcp", node="node-B")],
-            requested_backend="mooncake",
-            requested_device="rdma0",
-            rdma_mode="off",
-        )
-        assert (eff.backend, eff.protocol, eff.device) == ("MooncakeStore", "tcp", "")
-        assert eff.fallback_reason == ""
-
-    def test_off_mode_reports_mooncake_unavailable(self):
-        eff = reduce_results(
-            [_make_probe(protocol=None)],
-            requested_backend="mooncake",
-            requested_device="",
-            rdma_mode="off",
-        )
-        assert eff.backend == "SimpleStorage"
-        assert "mooncake_unavailable" in eff.fallback_reason
+        assert eff.fallback_reason == "no probe results"
 
 
 # ---------------------------------------------------------------------------
@@ -332,21 +295,19 @@ class TestProbeNode:
         result = _check_master_reachable("127.0.0.1:1", timeout=0.01)
         assert result.ok is False
 
-    def test_off_mode_probe_does_not_touch_rdma_hardware(self, monkeypatch):
+    def test_master_unreachable_blocks_mooncake(self, monkeypatch):
+        """An unreachable master is not a transport degradation: without it the
+        job cannot run MooncakeStore at all."""
         monkeypatch.setattr(rdma_probe, "_check_mooncake_import", lambda: CheckResult("mooncake_import", True))
         monkeypatch.setattr(
             rdma_probe,
             "_check_master_reachable",
-            lambda address: CheckResult("master_reachable", True, address),
+            lambda address: CheckResult("master_reachable", False, address),
         )
-        monkeypatch.setattr(
-            rdma_probe,
-            "_check_rdma_devices",
-            lambda: (_ for _ in ()).throw(AssertionError("RDMA probe must not run")),
-        )
-        result = probe_node("", "master.example:50051", probe_rdma=False)
-        assert result.effective_protocol == "tcp"
-        assert {check.name for check in result.checks} == {"mooncake_import", "master_reachable"}
+        result = probe_node("", "master.example:50051")
+        assert result.effective_protocol is None
+        assert result.ok is False
+        assert "master unreachable" in result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -393,11 +354,7 @@ class TestProbeClusterNodes:
             _make_probe(protocol="rdma", node="n0"),
             _degenerate_result("n1", "probe_task_failed:boom"),
         ]
-        eff = reduce_results(
-            results,
-            requested_backend="mooncake",
-            requested_device="",
-        )
+        eff = reduce_results(results, requested_device="")
         assert eff.backend == "SimpleStorage"
         assert "n1" in eff.fallback_reason
 
@@ -409,11 +366,7 @@ class TestProbeClusterNodes:
             effective_device="",
             errors=("master unreachable",),
         )
-        eff = reduce_results(
-            [_make_probe(protocol="rdma", node="n0"), unavailable],
-            requested_backend="mooncake",
-            requested_device="",
-        )
+        eff = reduce_results([_make_probe(protocol="rdma", node="n0"), unavailable], requested_device="")
         assert eff.backend == "SimpleStorage"
         assert eff.fallback_reason == "master_unreachable:n1"
 

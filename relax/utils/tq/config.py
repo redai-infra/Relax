@@ -3,7 +3,7 @@
 """Build TransferQueue backend config dicts from Relax CLI args.
 
 This module is the single place that maps Relax-side *intent* flags
-(``--tq-storage-backend``, ``--tq-rdma-mode``, ``--tq-rdma-device``) plus an
+(``--tq-rdma-mode``, ``--tq-rdma-device``) plus an
 :class:`~relax.utils.rdma_probe.EffectiveConfig` into the OmegaConf dict that
 ``tq.init`` expects.
 

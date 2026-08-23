@@ -310,7 +310,7 @@ class Controller:
             flags={"allow_objects": True},
         )
 
-        if getattr(self.config, "tq_storage_backend", "simple") == "simple":
+        if getattr(self.config, "tq_rdma_mode", "off") == "off":
             # Preserve the upstream SimpleStorage ownership model: the first
             # tq.init runs inside Controller and no _TransferQueueOwner actor
             # is created.  Lifecycle hardening still applies: the F10 reaper
@@ -396,24 +396,21 @@ class Controller:
     def _resolve_tq_backend(self, total_storage_size: int) -> dict:
         """Resolve the TransferQueue ``backend`` config dict.
 
-        ``--tq-storage-backend=simple`` retains the previous storage and
-        ownership semantics while sharing the bounded worker-attach and
-        failure-cleanup hardening.  When MooncakeStore is requested, this runs
-        the RDMA capability probe *before* ``tq.init``, applies graded
-        degradation, and emits the startup log line.
+        ``--tq-rdma-mode=off`` retains the previous SimpleStorage and ownership
+        semantics while sharing the bounded worker-attach and failure-cleanup
+        hardening.  ``auto``/``required`` run the RDMA capability probe
+        *before* ``tq.init`` and emit the startup log line; ``auto`` falls back
+        to SimpleStorage, ``required`` fails fast.
         """
-        # 1. Validate flag combinations (structural, before any probe).
+        # 1. Validate the requested mode (structural, before any probe).
         #    getattr defaults keep old checkpoints / non-argparse configs safe.
         errors = validate_config(self.config)
         if errors:
             raise ValueError("Invalid TransferQueue RDMA configuration:\n  " + "\n  ".join(errors))
 
-        backend = getattr(self.config, "tq_storage_backend", "simple")
         mode = getattr(self.config, "tq_rdma_mode", "off")
 
-        # 2. SimpleStorage short-circuit (default, zero behavior change).
-        #    ``mooncake + off`` is MooncakeStore/TCP, not SimpleStorage.
-        if backend == "simple":
+        def _simple_storage() -> dict:
             from relax.utils.tq.config import build_simple_storage_config
 
             return build_simple_storage_config(
@@ -421,7 +418,23 @@ class Controller:
                 num_data_storage_units=self.config.num_data_storage_units,
             )
 
-        # 3. MooncakeStore path: probe → reduce → effective config.
+        def _fall_back_or_raise(reason: str, error: Exception) -> dict:
+            """Every host-RDMA precondition failure funnels through here.
+
+            ``auto`` converges the whole job on SimpleStorage; ``required`` re-
+            raises so an operator who demanded RDMA never runs silently
+            downgraded.
+            """
+            if mode != "auto":
+                raise RuntimeError(f"--tq-rdma-mode={mode} but {reason}: {error}") from error
+            logger.warning(f"[dataplane] {reason}; auto fallback to SimpleStorage: {error}")
+            return _simple_storage()
+
+        # 2. SimpleStorage short-circuit (default, zero behavior change).
+        if mode == "off":
+            return _simple_storage()
+
+        # 3. Host-RDMA path: probe → reduce → effective config.
         #    The driver fans the probe out to every alive GPU node via Ray
         #    (probe_cluster_nodes), then AND-reduces to a single job-level
         #    effective config so all data-plane workers converge identically.
@@ -429,37 +442,25 @@ class Controller:
         try:
             validate_mooncake_runtime_contract()
         except RuntimeError as e:
-            if mode != "auto":
-                raise RuntimeError(
-                    f"--tq-rdma-mode={mode} but the installed TransferQueue "
-                    f"does not satisfy the Mooncake correctness contract: {e}"
-                ) from e
-            from relax.utils.tq.config import build_simple_storage_config
-
-            logger.warning(
-                "[dataplane] Installed TransferQueue does not satisfy the Mooncake "
-                f"correctness contract; auto fallback to SimpleStorage: {e}"
+            return _fall_back_or_raise(
+                "the installed TransferQueue does not satisfy the Mooncake correctness contract", e
             )
-            return build_simple_storage_config(
-                total_storage_size=total_storage_size,
-                num_data_storage_units=self.config.num_data_storage_units,
-            )
-        master_address = resolve_mooncake_master_address()
-        probe_results = probe_cluster_nodes(device, master_address, probe_rdma=mode != "off")
+        try:
+            master_address = resolve_mooncake_master_address()
+        except RuntimeError as e:
+            # A missing/invalid MC_MASTER_ADDRESS makes MooncakeStore
+            # unreachable for the whole job, so it degrades like any other
+            # unmet precondition rather than aborting an ``auto`` run.
+            return _fall_back_or_raise("the Mooncake master endpoint is not configured", e)
+        probe_results = probe_cluster_nodes(device, master_address)
 
-        effective = reduce_results(
-            probe_results,
-            requested_backend=backend,
-            requested_device=device,
-            rdma_mode=mode,
-        )
+        effective = reduce_results(probe_results, requested_device=device)
 
-        # 4. Only auto mode may degrade. ``off`` explicitly requests
-        #    Mooncake/TCP, while ``required`` explicitly requires RDMA.
+        # 4. Only auto mode may fall back; ``required`` demands host RDMA.
         if mode != "auto" and effective.fallback_reason:
             detail = "\n".join(r.summary() for r in probe_results)
             raise RuntimeError(
-                f"--tq-rdma-mode={mode} but the requested Mooncake path is unavailable: "
+                f"--tq-rdma-mode={mode} but host RDMA is unavailable: "
                 f"{effective.fallback_reason}.\n"
                 f"Probe details:\n{detail}"
             )
@@ -467,19 +468,19 @@ class Controller:
         # 5. Build backend dict (may fall back to SimpleStorage on capacity error).
         backend_dict, cap_error = build_backend_config(self.config, effective, total_storage_size=total_storage_size)
 
-        # 6. Capacity fallback is also auto-only. Explicit Mooncake/TCP and
-        #    required-RDMA requests fail instead of silently changing backend.
+        # 6. Capacity fallback is also auto-only; ``required`` fails instead of
+        #    silently changing backend.
         if mode != "auto" and cap_error:
             raise RuntimeError(f"--tq-rdma-mode={mode} but segment capacity insufficient: {cap_error}")
 
         # 7. Log requested vs effective so the startup log alone explains the
         #    decision, plus one summary block per probed node.
-        logger.info(f"[dataplane] requested: backend={backend} rdma_mode={mode} device={device or 'auto'}")
+        logger.info(f"[dataplane] requested: rdma_mode={mode} device={device or 'auto'}")
         for result in probe_results:
             logger.info(f"[dataplane] probe result:\n{result.summary()}")
         if cap_error:
             logger.warning(f"[dataplane] MooncakeStore capacity fallback to SimpleStorage: {cap_error}")
-            logger.info("[dataplane] backend=SimpleStorage protocol=tcp (capacity fallback)")
+            logger.info("[dataplane] backend=SimpleStorage fallback=segment_capacity_insufficient")
         else:
             logger.info(effective.log_line())
         return backend_dict
