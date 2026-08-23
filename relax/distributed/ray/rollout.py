@@ -816,7 +816,6 @@ class RolloutManager(ReloadableMixin):
         self.data_system_client = attach_tq_client(
             self.args.tq_config,
             role="rollout_worker",
-            lease_owner=self,
         )
 
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
@@ -922,10 +921,8 @@ class RolloutManager(ReloadableMixin):
         self._shutdown_all_engines()
         # Deregister this worker's Mooncake segment before the actor dies so a
         # fast restart does not hit stale endpoints until client_ttl expires.
-        generation = getattr(self, "_tq_client_generation", None)
-        if generation is not None:
-            detach_tq_client(generation)
-        self._tq_client_generation = None
+        if getattr(self, "data_system_client", None) is not None:
+            detach_tq_client()
         self.data_system_client = None
 
     def _shutdown_all_engines(self, timeout: float = 15.0):

@@ -38,7 +38,6 @@ class ActorFwd(Base):
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
             role=self.role,
-            lease_owner=self,
         )
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
         self.actor_model.init_and_wait(config, role=self.role, with_ref=False)

@@ -84,7 +84,6 @@ class SFT(Base):
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
             role=self.role,
-            lease_owner=self,
         )
 
         self._dataset: Any | None = None

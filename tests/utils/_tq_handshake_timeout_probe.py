@@ -144,6 +144,20 @@ def main(probe_dir: Path) -> None:
         assert (successor_pid, successor_create_time) != timed_out_identity
         assert successor_mutated is False
         assert late_marker_exists is False
+
+        # The dedicated initializer uses the same fail-closed termination
+        # barrier.  This exercises the actual RayActorError transition rather
+        # than relying only on mocked ray.kill/ray.wait behavior.
+        owner = tq_lifecycle._TransferQueueOwner.remote()
+        ray.get(owner.ready.remote())
+        tq_lifecycle._stop_owner_actor(owner, timeout=10.0)
+        try:
+            after_stop_ref = owner.ready.remote()
+            ray.get(after_stop_ref)
+        except ray.exceptions.RayActorError:
+            pass
+        else:
+            raise AssertionError("owner accepted work after terminal cleanup was confirmed")
     finally:
         ray.shutdown()
 

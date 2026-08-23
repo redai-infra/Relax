@@ -22,7 +22,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.utils.tq.lifecycle import TqConfigurationMismatch
 from tests.core.test_controller_s3_model_cleanup import controller
 from tests.utils.test_arguments_opd_teacher_colocate import (
     arguments_module as _arguments_module_fixture,
@@ -140,7 +139,7 @@ class TestOffMode:
         monkeypatch.setattr(
             controller,
             "reap_unusable_tq_controller",
-            lambda: (_ for _ in ()).throw(TqConfigurationMismatch("exclusive cluster is not clean")),
+            lambda: (_ for _ in ()).throw(RuntimeError("exclusive cluster is not clean")),
         )
         monkeypatch.setattr(
             controller.tq,
@@ -148,7 +147,7 @@ class TestOffMode:
             lambda **_kwargs: pytest.fail("existing controller must be rejected before tq.init"),
         )
 
-        with pytest.raises(TqConfigurationMismatch, match="exclusive cluster"):
+        with pytest.raises(RuntimeError, match="exclusive cluster"):
             instance._initialize_data_system()
 
         assert instance._tq_owner is None
@@ -391,10 +390,10 @@ class _AttachRecorder:
         monkeypatch.setattr(controller, "initialize_tq_with_fallback", fake_initialize)
 
 
-def _confirm(config, *, owner="mooncake-owner", owns_controller=True, fallback_config="simple-conf"):
+def _confirm(config, *, owner="mooncake-owner", fallback_config="simple-conf"):
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
-    init_result = controller.TqInitResult(config="mooncake-conf", owner=owner if owns_controller else None)
+    init_result = controller.TqInitResult(config="mooncake-conf", owner=owner)
     return instance._confirm_mooncake_attach(init_result, fallback_config)
 
 
@@ -443,14 +442,6 @@ class TestAttachHandshakeCleanupChain:
         assert recorder.events == ["handshake", "close"]
         assert recorder.initialized == []
 
-    def test_attached_session_never_tears_down_a_foreign_controller(self, monkeypatch):
-        """A job that only attached must not close state it does not own."""
-        recorder = _AttachRecorder(monkeypatch, failures=["node-B: attach timed out"])
-        with pytest.raises(RuntimeError, match="attach handshake reported"):
-            _confirm(_config(), owns_controller=False)
-        assert recorder.events == ["handshake"]
-        assert recorder.closed == []
-
     def test_unexpected_driver_exception_closes_owner_and_is_sanitized(self, monkeypatch):
         secret = "worker endpoint and traceback path must stay private"
         recorder = _AttachRecorder(monkeypatch, verify_error=RuntimeError(secret))
@@ -459,13 +450,6 @@ class TestAttachHandshakeCleanupChain:
         assert recorder.events == ["handshake", "close"]
         assert recorder.initialized == []
         assert secret not in str(excinfo.value)
-
-    def test_unexpected_driver_exception_never_closes_foreign_owner(self, monkeypatch):
-        recorder = _AttachRecorder(monkeypatch, verify_error=RuntimeError("private detail"))
-        with pytest.raises(RuntimeError, match="orchestration failed"):
-            _confirm(_config(), owns_controller=False)
-        assert recorder.events == ["handshake"]
-        assert recorder.closed == []
 
     def test_unconfirmed_worker_isolation_closes_owner_and_aborts(self, monkeypatch):
         recorder = _AttachRecorder(

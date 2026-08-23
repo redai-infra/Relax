@@ -361,7 +361,7 @@ class Controller:
         self.config.tq_config = init_result.config
         if init_result.fallback_reason:
             logger.warning(f"[dataplane] effective backend=SimpleStorage fallback={init_result.fallback_reason}")
-        logger.info(f"[dataplane] controller ownership={'owner' if init_result.owns_controller else 'attached'}")
+        logger.info("[dataplane] controller ownership=owner")
 
     def _confirm_mooncake_attach(self, init_result: TqInitResult, fallback_config) -> TqInitResult:
         """Validate Mooncake attach/setup on every alive Ray node.
@@ -382,8 +382,6 @@ class Controller:
         """
 
         def _close_owned_attempt() -> None:
-            if not init_result.owns_controller:
-                return
             try:
                 close_tq_owner(init_result.owner)
             finally:
@@ -410,10 +408,8 @@ class Controller:
 
         detail = "; ".join(failures)
         mode = getattr(self.config, "tq_rdma_mode", "off")
-        if mode != "auto" or not init_result.owns_controller or fallback_config is None:
-            # ``required`` must fail loudly, and a job that merely attached to a
-            # foreign controller must never tear it down or replace its backend
-            # unilaterally.
+        if mode != "auto" or fallback_config is None:
+            # ``required`` must fail loudly after cleaning this job's owner.
             _close_owned_attempt()
             raise RuntimeError(
                 f"Mooncake attach handshake reported {len(failures)} failure(s) (--tq-rdma-mode={mode}): {detail}"

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import multiprocessing
 import os
 import queue
@@ -283,7 +284,7 @@ class TestReapUnusableController:
 
     def test_healthy_controller_fails_without_being_killed(self, monkeypatch):
         killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_result={"backend": {}})
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="exclusive, clean Ray cluster"):
+        with pytest.raises(RuntimeError, match="exclusive, clean Ray cluster"):
             tq_lifecycle.reap_unusable_tq_controller()
         assert killed == []
 
@@ -325,7 +326,7 @@ class TestReapUnusableController:
             lambda *_args, **_kwargs: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.RayError(private_detail)),
         )
 
-        with pytest.raises(tq_lifecycle.TqControllerInspectionError) as excinfo:
+        with pytest.raises(RuntimeError) as excinfo:
             tq_lifecycle._get_stored_config()
 
         assert private_detail not in str(excinfo.value)
@@ -353,28 +354,21 @@ class TestCloseTqAndUnmount:
         store_client = MagicMock()
         calls = self._fake_tq(monkeypatch, store_client=store_client)
         store_client.close.side_effect = lambda: calls.append("store.close")
-        tq_lifecycle.close_tq_and_unmount(is_owner=True)
+        tq_lifecycle.close_tq_and_unmount()
         # Order matters: tq.close() still needs the store alive for remove_all().
         assert calls == ["tq.close", "store.close"]
 
     def test_simple_storage_teardown_is_noop_beyond_close(self, monkeypatch):
         calls = self._fake_tq(monkeypatch, store_client=None)
-        tq_lifecycle.close_tq_and_unmount(is_owner=True)
+        tq_lifecycle.close_tq_and_unmount()
         assert calls == ["tq.close"]
 
     def test_uninitialised_tq_does_not_raise(self, monkeypatch):
         fake = MagicMock()
         fake.get_client.side_effect = AssertionError("Please initialize the TransferQueue first")
         monkeypatch.setattr(tq_lifecycle, "tq", fake)
-        tq_lifecycle.close_tq_and_unmount(is_owner=True)  # must not raise
+        tq_lifecycle.close_tq_and_unmount()  # must not raise
         fake.close.assert_called_once()
-
-    def test_attached_process_never_calls_global_close(self, monkeypatch):
-        store_client = MagicMock()
-        calls = self._fake_tq(monkeypatch, store_client=store_client)
-        tq_lifecycle.close_tq_and_unmount(is_owner=False)
-        assert calls == []
-        store_client.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -727,53 +721,50 @@ class TestWorkerDetach:
         tq_lifecycle.detach_tq_client()
         assert calls == [True]
 
-    def test_stale_generation_does_not_close_successor(self, monkeypatch):
-        client = object()
-        monkeypatch.setattr(tq_lifecycle, "_TQ_CLIENT_GENERATION", 0)
-        monkeypatch.setattr(tq_lifecycle, "_CURRENT_TQ_CLIENT_GENERATION", None)
-        monkeypatch.setattr(tq_lifecycle, "_prepare_mooncake_runtime", lambda conf: None)
-        monkeypatch.setattr(tq_lifecycle, "_await_controller_config", lambda deadline: None)
-        monkeypatch.setattr(tq_lifecycle, "_bounded_tq_init", lambda conf, deadline, role: None)
-        monkeypatch.setattr(tq_lifecycle.tq, "get_client", lambda: client)
-
-        old_owner = SimpleNamespace()
-        new_owner = SimpleNamespace()
-        assert tq_lifecycle.attach_tq_client({}, role="old", lease_owner=old_owner) is client
-        assert tq_lifecycle.attach_tq_client({}, role="new", lease_owner=new_owner) is client
-        assert new_owner._tq_client_generation > old_owner._tq_client_generation
-
-        calls = []
-        monkeypatch.setattr(tq_lifecycle, "_close_local_tq_client", lambda: calls.append(True))
-        tq_lifecycle.detach_tq_client(old_owner._tq_client_generation)
-        assert calls == []
-        tq_lifecycle.detach_tq_client(new_owner._tq_client_generation)
-        assert calls == [True]
-
     def test_component_del_detaches_attached_client(self, monkeypatch):
         from relax.components.base import Base
 
         calls = []
-        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda generation: calls.append(generation))
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
         component = Base()
         component.data_system_client = object()
-        component._tq_client_generation = 7
         component.__del__()
-        assert calls == [7]
+        assert calls == [True]
         assert component.data_system_client is None
-        assert component._tq_client_generation is None
 
     def test_component_del_without_client_is_noop(self, monkeypatch):
         from relax.components.base import Base
 
         calls = []
-        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda generation: calls.append(generation))
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
         component = Base()
         component.__del__()
         assert calls == []
 
 
+class TestExclusiveLifecycleSurface:
+    """Phase 4 must not grow the removed shared-cluster machinery back."""
+
+    def test_token_generation_and_foreign_owner_symbols_are_absent(self):
+        removed = (
+            "OWNER_TOKEN_FIELD",
+            "TqConfigurationMismatch",
+            "TqControllerInspectionError",
+            "TqControllerMissingConfig",
+            "_TQ_CLIENT_GENERATION",
+            "_CURRENT_TQ_CLIENT_GENERATION",
+        )
+        for name in removed:
+            assert not hasattr(tq_lifecycle, name)
+
+    def test_attach_and_teardown_signatures_express_single_process_owner(self):
+        assert "lease_owner" not in inspect.signature(tq_lifecycle.attach_tq_client).parameters
+        assert list(inspect.signature(tq_lifecycle.detach_tq_client).parameters) == []
+        assert list(inspect.signature(tq_lifecycle.close_tq_and_unmount).parameters) == []
+
+
 # ---------------------------------------------------------------------------
-# Owner-aware initialization transaction
+# Exclusive-owner initialization transaction
 # ---------------------------------------------------------------------------
 
 
@@ -783,98 +774,155 @@ class TestInitializeTqWithFallback:
         return {"controller": {}, "backend": {"storage_backend": backend}}
 
     @staticmethod
-    def _mooncake_conf(protocol: str, *, use_gdr: bool = False) -> dict:
-        return {
-            "controller": {},
-            "backend": {
-                "storage_backend": "MooncakeStore",
-                "MooncakeStore": {
-                    "protocol": protocol,
-                    "master_server_address": "master.invalid:50051",
-                    "hard_pin": True,
-                    "use_gdr": use_gdr,
-                },
-            },
-        }
-
-    @staticmethod
-    def _patch_transaction(monkeypatch, *, init_effects: list[object], reap_error: BaseException | None = None):
-        calls: dict[str, list] = {"reap": [], "attempts": []}
+    def _patch_transaction(
+        monkeypatch,
+        *,
+        init_effects: list[object],
+        start_effects: list[object] | None = None,
+        reap_effects: list[BaseException | None] | None = None,
+    ) -> list[str]:
+        events: list[str] = []
         effects = iter(init_effects)
+        owners = iter(start_effects or [f"owner-{index}" for index in range(len(init_effects))])
+        reaps = iter(reap_effects or [])
 
         def fake_reap():
-            calls["reap"].append(True)
-            if reap_error is not None:
-                raise reap_error
+            events.append("reap")
+            effect = next(reaps, None)
+            if effect is not None:
+                raise effect
 
         monkeypatch.setattr(tq_lifecycle, "reap_unusable_tq_controller", fake_reap)
 
-        def fake_start(conf, *, timeout):
-            calls["attempts"].append(conf)
+        def fake_start(*, timeout):
+            events.append("start")
+            effect = next(owners)
+            if isinstance(effect, BaseException):
+                raise effect
+            return effect
+
+        def fake_initialize(owner, conf, *, timeout):
+            backend = conf["backend"]["storage_backend"]
+            events.append(f"init:{backend}")
             effect = next(effects)
             if isinstance(effect, BaseException):
                 raise effect
-            return tq_lifecycle.TqInitResult(config=conf, owner=effect)
+            return tq_lifecycle.TqInitResult(config=conf, owner=owner)
 
         monkeypatch.setattr(tq_lifecycle, "_start_owner", fake_start)
-        return calls
+        monkeypatch.setattr(tq_lifecycle, "_initialize_owner", fake_initialize)
+        return events
 
     def test_simple_path_also_runs_pre_init_reaper_and_becomes_owner(self, monkeypatch):
         conf = self._conf("SimpleStorage")
-        calls = self._patch_transaction(monkeypatch, init_effects=["owner"])
+        events = self._patch_transaction(monkeypatch, init_effects=[None])
         result = tq_lifecycle.initialize_tq_with_fallback(conf, mode="off")
-        assert result.owns_controller is True
-        assert len(calls["reap"]) == 1
+        assert result.owner == "owner-0"
+        assert events == ["reap", "start", "init:SimpleStorage"]
 
     @pytest.mark.parametrize("mode", ["off", "auto", "required"])
     def test_healthy_existing_controller_fails_exclusive_without_starting_owner(self, monkeypatch, mode):
         requested = self._conf("SimpleStorage")
-        mismatch = tq_lifecycle.TqConfigurationMismatch("exclusive cluster is not clean")
-        calls = self._patch_transaction(monkeypatch, init_effects=[], reap_error=mismatch)
+        mismatch = RuntimeError("exclusive cluster is not clean")
+        events = self._patch_transaction(monkeypatch, init_effects=[], reap_effects=[mismatch])
 
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="exclusive cluster"):
+        with pytest.raises(RuntimeError, match="exclusive cluster"):
             tq_lifecycle.initialize_tq_with_fallback(
                 requested,
                 mode=mode,
                 fallback_conf=self._conf("SimpleStorage"),
             )
 
-        assert calls["attempts"] == []
+        assert events == ["reap"]
 
     def test_auto_cleans_failed_mooncake_then_retries_simple_once(self, monkeypatch):
         primary = self._conf("MooncakeStore")
         fallback = self._conf("SimpleStorage")
-        calls = self._patch_transaction(
+        events = self._patch_transaction(
             monkeypatch,
-            init_effects=[RuntimeError("master unavailable"), "fallback-owner"],
+            init_effects=[tq_lifecycle.TqInitializationError("master unavailable"), None],
         )
         result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
         assert result.config["backend"]["storage_backend"] == "SimpleStorage"
-        assert result.fallback_reason == "mooncake_init_failed:RuntimeError"
-        assert len(calls["attempts"]) == 2
-        assert len(calls["reap"]) == 2
+        assert result.fallback_reason == "mooncake_init_failed:TqInitializationError"
+        assert events == [
+            "reap",
+            "start",
+            "init:MooncakeStore",
+            "reap",
+            "start",
+            "init:SimpleStorage",
+        ]
 
     def test_required_cleans_failed_init_without_fallback(self, monkeypatch):
         primary = self._conf("MooncakeStore")
         fallback = self._conf("SimpleStorage")
-        calls = self._patch_transaction(
+        events = self._patch_transaction(
             monkeypatch,
-            init_effects=[RuntimeError("master unavailable")],
+            init_effects=[tq_lifecycle.TqInitializationError("master unavailable")],
         )
-        with pytest.raises(RuntimeError, match="master unavailable"):
+        with pytest.raises(tq_lifecycle.TqInitializationError, match="master unavailable"):
             tq_lifecycle.initialize_tq_with_fallback(primary, mode="required", fallback_conf=fallback)
-        assert len(calls["attempts"]) == 1
+        assert events == ["reap", "start", "init:MooncakeStore"]
 
     def test_timeout_auto_retries_only_after_isolated_owner_cleanup(self, monkeypatch):
         primary = self._conf("MooncakeStore")
         fallback = self._conf("SimpleStorage")
-        calls = self._patch_transaction(
+        events = self._patch_transaction(
             monkeypatch,
-            init_effects=[tq_lifecycle.TqInitializationTimeout("timed out"), "fallback-owner"],
+            init_effects=[tq_lifecycle.TqInitializationTimeout("timed out"), None],
         )
         result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
         assert result.config["backend"]["storage_backend"] == "SimpleStorage"
-        assert len(calls["attempts"]) == 2
+        assert events[-3:] == ["reap", "start", "init:SimpleStorage"]
+
+    def test_cleanup_failure_aborts_auto_before_second_gate(self, monkeypatch):
+        events = self._patch_transaction(
+            monkeypatch,
+            init_effects=[tq_lifecycle.TqCleanupTimeout("owner still running")],
+        )
+
+        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match="still running"):
+            tq_lifecycle.initialize_tq_with_fallback(
+                self._conf("MooncakeStore"),
+                mode="auto",
+                fallback_conf=self._conf("SimpleStorage"),
+            )
+
+        assert events == ["reap", "start", "init:MooncakeStore"]
+
+    def test_second_gate_failure_aborts_before_fallback_owner(self, monkeypatch):
+        gate_error = RuntimeError("residual controller state is unknown")
+        events = self._patch_transaction(
+            monkeypatch,
+            init_effects=[tq_lifecycle.TqInitializationError("master unavailable")],
+            reap_effects=[None, gate_error],
+        )
+
+        with pytest.raises(RuntimeError, match="fallback initialization failed"):
+            tq_lifecycle.initialize_tq_with_fallback(
+                self._conf("MooncakeStore"),
+                mode="auto",
+                fallback_conf=self._conf("SimpleStorage"),
+            )
+
+        assert events == ["reap", "start", "init:MooncakeStore", "reap"]
+
+    def test_owner_creation_failure_is_not_a_candidate_fallback(self, monkeypatch):
+        events = self._patch_transaction(
+            monkeypatch,
+            init_effects=[],
+            start_effects=[RuntimeError("owner scheduling failed")],
+        )
+
+        with pytest.raises(RuntimeError, match="owner scheduling failed"):
+            tq_lifecycle.initialize_tq_with_fallback(
+                self._conf("MooncakeStore"),
+                mode="auto",
+                fallback_conf=self._conf("SimpleStorage"),
+            )
+
+        assert events == ["reap", "start"]
 
 
 class _RemoteMethod:
@@ -887,106 +935,148 @@ class _RemoteMethod:
 
 class _FakeOwner:
     def __init__(self):
+        self.ready = _RemoteMethod("ready-ref")
         self.initialize = _RemoteMethod("initialize-ref")
         self.close = _RemoteMethod("close-ref")
-        self.detach = _RemoteMethod("detach-ref")
+        self.termination_probe = _RemoteMethod("termination-ref")
 
 
 class TestOwnerProcessBoundary:
-    def test_start_timeout_cleans_the_isolated_owner_before_raising(self, monkeypatch):
+    def test_start_scheduling_timeout_stops_owner_without_entering_init(self, monkeypatch):
         owner = _FakeOwner()
-        cleaned: list[tuple[object, str]] = []
+        stopped: list[object] = []
         monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "remote", lambda: owner)
 
         def timed_out(ref, *, timeout):
-            assert ref == "initialize-ref"
+            assert ref == "ready-ref"
             raise tq_lifecycle.ray.exceptions.GetTimeoutError("test timeout")
 
         monkeypatch.setattr(tq_lifecycle.ray, "get", timed_out)
-        monkeypatch.setattr(
-            tq_lifecycle,
-            "_cleanup_failed_owner",
-            lambda handle, token: cleaned.append((handle, token)),
-        )
+        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle, **_kwargs: stopped.append(handle))
 
-        with pytest.raises(tq_lifecycle.TqInitializationTimeout):
-            tq_lifecycle._start_owner({"controller": {}}, timeout=0.1)
-        assert cleaned[0][0] is owner
-        assert cleaned[0][1]
+        with pytest.raises(RuntimeError, match="owner creation failed"):
+            tq_lifecycle._start_owner(timeout=0.1)
+        assert stopped == [owner]
 
-    def test_concurrent_initializer_with_different_config_detaches_and_fails(self, monkeypatch):
+    def test_start_success_returns_scheduled_owner(self, monkeypatch):
         owner = _FakeOwner()
-        stopped: list[object] = []
-        requested = TestInitializeTqWithFallback._mooncake_conf("rdma")
-        stored = TestInitializeTqWithFallback._conf("SimpleStorage")
         monkeypatch.setattr(tq_lifecycle._TransferQueueOwner, "remote", lambda: owner)
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: None)
+
+        assert tq_lifecycle._start_owner(timeout=1) is owner
+
+    def test_initialize_success_returns_the_exclusive_owner(self, monkeypatch):
+        owner = _FakeOwner()
+        stored = TestInitializeTqWithFallback._conf("SimpleStorage")
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: stored)
+
+        result = tq_lifecycle._initialize_owner(owner, stored, timeout=1)
+
+        assert result.config is stored
+        assert result.owner is owner
+
+    def test_initialize_timeout_cleans_owner_before_candidate_failure(self, monkeypatch):
+        owner = _FakeOwner()
+        cleaned: list[object] = []
         monkeypatch.setattr(
             tq_lifecycle.ray,
             "get",
-            lambda ref, timeout: (stored, False) if ref == "initialize-ref" else None,
+            lambda _ref, timeout: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.GetTimeoutError("timeout")),
         )
-        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle: stopped.append(handle))
+        monkeypatch.setattr(tq_lifecycle, "_cleanup_failed_owner", lambda handle: cleaned.append(handle))
 
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="concurrent TransferQueue initializer"):
-            tq_lifecycle._start_owner(requested, timeout=1)
-        assert stopped == [owner]
+        with pytest.raises(tq_lifecycle.TqInitializationTimeout):
+            tq_lifecycle._initialize_owner(owner, {}, timeout=0.1)
 
-    @pytest.mark.parametrize("stored_token,should_kill", [("ours", True), ("theirs", False)])
-    def test_failed_owner_cleanup_respects_controller_owner_token(self, monkeypatch, stored_token, should_kill):
+        assert cleaned == [owner]
+
+    def test_initialize_error_is_sanitized_only_after_cleanup(self, monkeypatch):
         owner = _FakeOwner()
-        stopped: list[object] = []
-        killed: list[bool] = []
-        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: None)
-        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle: stopped.append(handle))
+        cleaned: list[object] = []
+        private_detail = "private endpoint and traceback path"
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "get",
+            lambda _ref, timeout: (_ for _ in ()).throw(RuntimeError(private_detail)),
+        )
+        monkeypatch.setattr(tq_lifecycle, "_cleanup_failed_owner", lambda handle: cleaned.append(handle))
+
+        with pytest.raises(tq_lifecycle.TqInitializationError) as excinfo:
+            tq_lifecycle._initialize_owner(owner, {}, timeout=0.1)
+
+        assert cleaned == [owner]
+        assert private_detail not in str(excinfo.value)
+
+    def test_stop_owner_requires_terminal_probe_result(self, monkeypatch):
+        owner = _FakeOwner()
+        killed: list[tuple[object, bool]] = []
+        monkeypatch.setattr(tq_lifecycle.ray, "kill", lambda handle, no_restart: killed.append((handle, no_restart)))
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "get",
+            lambda _ref: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.RayActorError(error_msg="dead")),
+        )
+
+        tq_lifecycle._stop_owner_actor(owner, timeout=0.1)
+
+        assert killed == [(owner, True)]
+
+    def test_stop_owner_fails_closed_when_probe_remains_pending(self, monkeypatch):
+        owner = _FakeOwner()
+        monkeypatch.setattr(tq_lifecycle.ray, "kill", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: ([], list(refs)))
+
+        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match="remained pending"):
+            tq_lifecycle._stop_owner_actor(owner, timeout=0.1)
+
+    def test_stop_owner_rejects_a_probe_that_returns_normally(self, monkeypatch):
+        owner = _FakeOwner()
+        monkeypatch.setattr(tq_lifecycle.ray, "kill", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: None)
+
+        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match="returned normally"):
+            tq_lifecycle._stop_owner_actor(owner, timeout=0.1)
+
+    def test_failed_owner_cleanup_waits_for_owner_then_reaps_controller(self, monkeypatch):
+        owner = _FakeOwner()
+        events: list[str] = []
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref, timeout: events.append("close"))
         monkeypatch.setattr(
             tq_lifecycle,
-            "_get_stored_config",
-            lambda timeout: {"controller": {tq_lifecycle.OWNER_TOKEN_FIELD: stored_token}},
+            "_stop_owner_actor",
+            lambda handle, **_kwargs: events.append("owner-terminal"),
         )
-        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda: killed.append(True))
-
-        tq_lifecycle._cleanup_failed_owner(owner, "ours")
-        assert stopped == [owner]
-        assert bool(killed) is should_kill
-
-    def test_failed_owner_cleanup_does_not_kill_when_controller_inspection_fails(self, monkeypatch):
-        owner = _FakeOwner()
-        stopped: list[object] = []
-        killed: list[bool] = []
-        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: None)
-        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle: stopped.append(handle))
         monkeypatch.setattr(
             tq_lifecycle,
-            "_get_stored_config",
-            lambda timeout: (_ for _ in ()).throw(
-                tq_lifecycle.TqControllerInspectionError("controller inspection failed (RayError)")
-            ),
+            "kill_tq_controller_and_wait",
+            lambda **_kwargs: events.append("controller-gone"),
         )
-        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda: killed.append(True))
 
-        with pytest.raises(tq_lifecycle.TqControllerInspectionError):
-            tq_lifecycle._cleanup_failed_owner(owner, "ours")
+        tq_lifecycle._cleanup_failed_owner(owner)
 
-        assert stopped == [owner]
-        assert killed == []
+        assert events == ["close", "owner-terminal", "controller-gone"]
 
-    def test_failed_owner_cleanup_reaps_proven_half_initialised_controller(self, monkeypatch):
+    def test_unconfirmed_owner_aborts_before_controller_cleanup(self, monkeypatch):
         owner = _FakeOwner()
-        killed: list[bool] = []
-        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: None)
-        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda _handle: None)
+        controller_cleanup: list[bool] = []
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref, timeout: None)
         monkeypatch.setattr(
             tq_lifecycle,
-            "_get_stored_config",
-            lambda timeout: (_ for _ in ()).throw(
-                tq_lifecycle.TqControllerMissingConfig("controller returned no config")
-            ),
+            "_stop_owner_actor",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(tq_lifecycle.TqCleanupTimeout("owner pending")),
         )
-        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda: killed.append(True))
+        monkeypatch.setattr(
+            tq_lifecycle,
+            "kill_tq_controller_and_wait",
+            lambda **_kwargs: controller_cleanup.append(True),
+        )
 
-        tq_lifecycle._cleanup_failed_owner(owner, "ours")
+        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match="owner pending"):
+            tq_lifecycle._cleanup_failed_owner(owner)
 
-        assert killed == [True]
+        assert controller_cleanup == []
 
     def test_owner_close_failure_still_reaps_global_controller(self, monkeypatch):
         owner = _FakeOwner()
@@ -997,9 +1087,8 @@ class TestOwnerProcessBoundary:
             "get",
             lambda ref, timeout: (_ for _ in ()).throw(RuntimeError("close failed")),
         )
-        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle: stopped.append(handle))
-        monkeypatch.setattr(tq_lifecycle, "_controller_exists", lambda: True)
-        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda: killed.append(True))
+        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle, **_kwargs: stopped.append(handle))
+        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda **_kwargs: killed.append(True))
 
         with pytest.raises(RuntimeError, match="owner cleanup failed"):
             tq_lifecycle.close_tq_owner(owner)

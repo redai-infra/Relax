@@ -108,14 +108,15 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 
 ## 资源所有权与安全清理
 
-首期按**单任务独占 Ray 集群**实现，**不承诺同一节点上多个 Relax job 并发**：多 job 并发、端口租约、master 共享机制都不在首期范围内。
+首期按**单任务独占 Ray 集群**实现：同一 Ray cluster 在初始化和运行期间只能有一个 Relax job，操作者不得并发启动第二个 job。多 job admission、端口租约和 master 共享机制都不在首期范围内；删除 token/signature 后，`reap → tq.init` 不再承担并发 initializer 仲裁。
 
 清理只动本作业拥有的资源：
 
 - 不使用任何 `pkill` / `killall`
 - `tq.init` 之前会检查已存在的 `TransferQueueController` 命名 actor：**只有取不到 config（半初始化）、明确超时或 actor 已死时才回收**；其他 GCS/control-plane 异常只做脱敏后中止，不据此杀 actor
 - 健康的既有 controller 保持不动，但启动会明确失败，**不会 attach，也不会在退出时关闭它**；操作者应先停止前一作业并清理其 TQ 状态，确保 Ray 集群干净
-- 首次初始化在专用 owner actor 中执行，config 内保存随机 owner token；若初始化失败，只有 token 仍匹配时才回收该次初始化创建的全局 actor；若并发 initializer 抢先创建了健康 controller，本次启动只做本地 detach 后失败
+- 首次初始化在专用 owner actor 中执行；owner 调度成功后才进入 candidate 初始化。初始化失败时先 bounded best-effort close，再 force-kill owner，并通过预先排队且永不正常返回的 termination probe 确认 owner 进程已经终止；随后才清理并确认 named controller 注销。任一步无法确认都会中止，禁止进入 fallback
+- 因为集群在每次初始化前已经通过 clean-cluster gate，owner 失败后出现的 controller 按本次尝试的残留处理。该判断依赖上面的“禁止并发启动第二个 Relax job”硬前提，不提供 concurrent initializer winner 兼容
 - 全局 `tq.close()` 只能由 owner actor 调用；actor、critic、rollout 等附加 worker 只能做本地 detach
 - 任一长生命周期 train actor 初始化失败时，driver 会 force-kill 整个 train actor group，并通过预先排队的终止 probe 确认 actor task 已进入终态后再传播失败，防止超时的原生初始化线程稍后修改可复用进程的 TQ 全局状态
 - master 进程始终不被 Relax 触碰
@@ -151,7 +152,7 @@ Mock/本机测试和真实双节点 RDMA 测试必须分别报告，前者不能
 
 | 层级 | 验证内容 | 通过标准 |
 |---|---|---|
-| CI/mock | 模式校验、master 端点格式、容量预检、owner 超时/清理/token、attach 握手的 manager/config 契约与拆除顺序、auto/required、有限重试、写失败不发布状态 | `tests/utils/tq/test_config.py`、`tests/core/test_controller_tq_backend.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
+| CI/mock | 模式校验、master 端点格式、容量预检、owner 超时与终止确认、controller 清理、attach 握手的 manager/config 契约与拆除顺序、auto/required、有限重试、写失败不发布状态 | `tests/utils/tq/test_config.py`、`tests/core/test_controller_tq_backend.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
 | 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性；`multimodal_train_inputs` 以生产容器（`list[dict]` / NonTensorStack，存储层非张量路径）全链路逐叶子 SHA-256 一致 | `tests/utils/test_tq_dataplane_behavior.py` 通过（含 `TestRealMultimodalFullLink`） |
 | 真实 Mooncake | TCP/RDMA direct-client：混合 dtype 稠密张量逐字节一致；`list[dict]` 非张量 msgpack 慢路径逐叶子一致（每协议独立 spawn 子进程，规避 0.3.10 会话内协议切换问题） | `TestMooncakeByteExact` 的 TCP/RDMA 各两档均通过，不得 skip |
 | 真实多模态载荷 | 真实数据集图像走完整生产预处理链（`build_messages` → `apply_chat_template` → `process_vision_info` → HF processor → `remap_mm_train_inputs`）生成 fixture；上述两级多模态用例检测到 fixture 后自动升级为真实载荷档 | fixture 存在时以 `[real]` 档通过；无 fixture 环境回退 `[synthetic]`（生产同构状，CI 兜底）；交付报告须注明真实档在何处跑过 |

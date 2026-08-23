@@ -43,7 +43,6 @@ class Critic(Base):
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
             role=self.role,
-            lease_owner=self,
         )
 
         self.critic_model = allocate_train_group(

@@ -25,7 +25,6 @@ import math
 import os
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,33 +38,25 @@ logger = get_logger(__name__)
 
 CONTROLLER_NAME = "TransferQueueController"
 CONTROLLER_NAMESPACE = "transfer_queue"
-OWNER_TOKEN_FIELD = "relax_owner_token"
 DEFAULT_TQ_INIT_TIMEOUT_SECONDS = 60.0
 DEFAULT_TQ_ATTACH_TIMEOUT_SECONDS = 60.0
-
-# TransferQueue stores its client in process-global module state.  A generation
-# identifies the most recent component that claimed that client so a delayed
-# destructor from an in-place reload cannot close its successor's connection.
-_TQ_CLIENT_LEASE_LOCK = threading.RLock()
-_TQ_CLIENT_GENERATION = 0
-_CURRENT_TQ_CLIENT_GENERATION: int | None = None
 
 
 @dataclass(frozen=True)
 class TqInitResult:
-    """Result of an owner-aware TransferQueue initialization transaction."""
+    """Result of an exclusive-owner TransferQueue initialization."""
 
     config: Any
-    owner: Any | None
+    owner: Any
     fallback_reason: str = ""
-
-    @property
-    def owns_controller(self) -> bool:
-        return self.owner is not None
 
 
 class TqInitializationTimeout(TimeoutError):
     """Raised when ``tq.init`` does not finish within the bounded timeout."""
+
+
+class TqInitializationError(RuntimeError):
+    """Raised after a failed ``tq.init`` candidate is fully cleaned."""
 
 
 class TqAttachTimeout(TimeoutError):
@@ -73,19 +64,7 @@ class TqAttachTimeout(TimeoutError):
 
 
 class TqCleanupTimeout(TimeoutError):
-    """Raised when a TQ controller cannot be confirmed gone after cleanup."""
-
-
-class TqConfigurationMismatch(RuntimeError):
-    """Raised when an existing controller uses an incompatible job config."""
-
-
-class TqControllerInspectionError(RuntimeError):
-    """Raised when Ray cannot prove the named controller's current state."""
-
-
-class TqControllerMissingConfig(RuntimeError):
-    """Raised when a reachable controller is provably half-initialised."""
+    """Raised when an owner or controller cannot be confirmed gone."""
 
 
 class TqHandshakeIsolationError(RuntimeError):
@@ -193,7 +172,7 @@ def reap_unusable_tq_controller(get_config_timeout: float = 10.0) -> bool:
         raise RuntimeError(f"Failed to inspect TransferQueueController ({safe_exception_kind(error)})") from None
 
     if conf is not None:
-        raise TqConfigurationMismatch(
+        raise RuntimeError(
             "A healthy TransferQueueController already exists. The initial RDMA release requires an exclusive, "
             "clean Ray cluster; stop the previous Relax job or remove its TQ state before retrying."
         )
@@ -201,30 +180,6 @@ def reap_unusable_tq_controller(get_config_timeout: float = 10.0) -> bool:
     logger.warning("[dataplane] TransferQueueController has no stored config (half-initialised); reaping it.")
     kill_tq_controller_and_wait()
     return True
-
-
-def _controller_exists() -> bool:
-    try:
-        ray.get_actor(CONTROLLER_NAME, namespace=CONTROLLER_NAMESPACE)
-        return True
-    except ValueError:
-        return False
-    except ray.exceptions.RayError as error:
-        raise RuntimeError(f"Failed to query TransferQueueController ({safe_exception_kind(error)})") from None
-
-
-def _set_owner_token(conf: Any, token: str) -> None:
-    controller = conf.controller if hasattr(conf, "controller") else conf["controller"]
-    controller[OWNER_TOKEN_FIELD] = token
-
-
-def _get_owner_token(conf: Any) -> str:
-    if conf is None:
-        return ""
-    controller = conf.controller if hasattr(conf, "controller") else conf.get("controller", {})
-    if hasattr(controller, "get"):
-        return str(controller.get(OWNER_TOKEN_FIELD, ""))
-    return ""
 
 
 def assert_mooncake_rdma_configured() -> None:
@@ -265,11 +220,9 @@ def _get_stored_config(timeout: float = 10.0) -> Any:
     except ValueError:
         raise
     except ray.exceptions.RayError as error:
-        raise TqControllerInspectionError(
-            f"Failed to read TransferQueueController config ({safe_exception_kind(error)})"
-        ) from None
+        raise RuntimeError(f"Failed to read TransferQueueController config ({safe_exception_kind(error)})") from None
     if conf is None:
-        raise TqControllerMissingConfig("TransferQueueController returned no config after tq.init completed")
+        raise RuntimeError("TransferQueueController returned no config after tq.init completed")
     return conf
 
 
@@ -386,7 +339,6 @@ def attach_tq_client(
     *,
     role: str,
     timeout: float | None = None,
-    lease_owner: Any | None = None,
 ) -> Any:
     """Attach a component process within a bounded deadline.
 
@@ -395,30 +347,20 @@ def attach_tq_client(
     polling and mooncake endpoint setup respectively).  ``None`` resolves the
     deadline from ``RELAX_TQ_ATTACH_TIMEOUT_SECONDS`` (default 60 s).
 
-    When ``lease_owner`` is provided, its private generation token is updated
-    after a successful attach.  Teardown must pass that token to
-    :func:`detach_tq_client`; stale owners then leave a newer process-global
-    client untouched.
+    The initial release assumes one component/replica per Ray actor process.
+    Components therefore own the one process-global TQ client they attach and
+    unconditionally detach it during teardown.
     """
-    global _CURRENT_TQ_CLIENT_GENERATION, _TQ_CLIENT_GENERATION
-
-    with _TQ_CLIENT_LEASE_LOCK:
-        if timeout is None:
-            timeout = _resolve_attach_timeout()
-        deadline = time.monotonic() + timeout
-        _prepare_mooncake_runtime(conf)
-        _await_controller_config(deadline)
-        _bounded_tq_init(conf, deadline, role=role)
-        client = tq.get_client()
-
-        _TQ_CLIENT_GENERATION += 1
-        _CURRENT_TQ_CLIENT_GENERATION = _TQ_CLIENT_GENERATION
-        if lease_owner is not None:
-            lease_owner._tq_client_generation = _CURRENT_TQ_CLIENT_GENERATION
-    return client
+    if timeout is None:
+        timeout = _resolve_attach_timeout()
+    deadline = time.monotonic() + timeout
+    _prepare_mooncake_runtime(conf)
+    _await_controller_config(deadline)
+    _bounded_tq_init(conf, deadline, role=role)
+    return tq.get_client()
 
 
-def detach_tq_client(generation: int | None = None) -> None:
+def detach_tq_client() -> None:
     """Detach this worker's TQ client (attach-only inverse of
     :func:`attach_tq_client`).
 
@@ -426,26 +368,12 @@ def detach_tq_client(generation: int | None = None) -> None:
     from the master immediately instead of lingering until ``client_ttl``
     expires — a stale endpoint breaks fast restarts with "Failed to open
     segment".  Only process-local handles are touched (never the named
-    controller or globally stored data).  A component teardown passes the
-    generation recorded by :func:`attach_tq_client`; a stale generation means
-    another component has since claimed the process-global client and is left
-    untouched.  ``None`` remains an unconditional detach for short-lived
-    attach handshakes and owner cleanup.  Force-killed workers still fall back
-    to the master-side TTL.
+    controller or globally stored data).  The initial release assumes one
+    component/replica per Ray actor process, so there is no cross-instance
+    generation lease.  Force-killed workers still fall back to the master-side
+    TTL.
     """
-    global _CURRENT_TQ_CLIENT_GENERATION
-
-    with _TQ_CLIENT_LEASE_LOCK:
-        if generation is not None and generation != _CURRENT_TQ_CLIENT_GENERATION:
-            logger.debug(
-                "[dataplane] Skipping stale TQ detach: "
-                f"owner_generation={generation} current_generation={_CURRENT_TQ_CLIENT_GENERATION}"
-            )
-            return
-        try:
-            _close_local_tq_client()
-        finally:
-            _CURRENT_TQ_CLIENT_GENERATION = None
+    _close_local_tq_client()
 
 
 def _alive_node_ids() -> list[str]:
@@ -572,22 +500,17 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
     return failures
 
 
-def close_tq_and_unmount(*, is_owner: bool) -> None:
+def close_tq_and_unmount() -> None:
     """Close TransferQueue and unmount the MooncakeStore segment.
 
     Order matters: ``tq.close()`` still needs the store alive for its
     ``remove_all()``, so the client handle is captured first and unmounted
     after. SimpleStorage has no ``storage_client``, so this is a no-op there.
 
-    Global ``tq.close()`` is owner-only because upstream kills the named
-    controller even in a process that merely attached to it.  Non-owners only
-    detach their process-local client.
+    This function is reachable only inside the dedicated owner actor. Workers
+    call :func:`detach_tq_client` instead because upstream ``tq.close()`` kills
+    the named controller even from an attached process.
     """
-    if not is_owner:
-        logger.info("[dataplane] Detaching local TQ client; global controller is owned by another process.")
-        detach_tq_client()
-        return
-
     store_client = None
     try:
         store_client = getattr(tq.get_client().storage_manager, "storage_client", None)
@@ -608,117 +531,117 @@ def close_tq_and_unmount(*, is_owner: bool) -> None:
 class _TransferQueueOwner:
     """Process boundary for first-time TQ initialization and global cleanup."""
 
-    def __init__(self) -> None:
-        self._owns_controller = False
+    def ready(self) -> None:
+        """Scheduling barrier used before ``tq.init`` enters fallback scope."""
 
-    def initialize(self, conf: Any, owner_token: str) -> tuple[Any, bool]:
+    def termination_probe(self) -> None:
+        """Never return; a terminal ref proves this actor process was
+        killed."""
+        threading.Event().wait()
+
+    def initialize(self, conf: Any) -> Any:
         _prepare_mooncake_runtime(conf)
-        _set_owner_token(conf, owner_token)
         tq.init(conf=conf)
-        stored_conf = _get_stored_config()
-        self._owns_controller = _get_owner_token(stored_conf) == owner_token
-        return stored_conf, self._owns_controller
+        return _get_stored_config()
 
     def close(self) -> None:
-        close_tq_and_unmount(is_owner=self._owns_controller)
-
-    def detach(self) -> None:
-        detach_tq_client()
+        close_tq_and_unmount()
 
 
-def _stop_owner_actor(owner: Any) -> None:
+def _stop_owner_actor(owner: Any, *, timeout: float = 10.0) -> None:
+    """Force-kill ``owner`` and prove its process reached a terminal state."""
+    probe_ref = None
+    control_error = ""
     try:
-        ray.kill(owner)
-    except Exception as e:  # pragma: no cover - actor may already be dead
-        logger.debug(f"[dataplane] TQ owner actor already stopped ({safe_exception_kind(e)}).")
+        # Queue behind any blocked initialize/close call. It can only become
+        # ready after the actor dies because the method never returns.
+        probe_ref = owner.termination_probe.remote()
+    except ray.exceptions.RayActorError:
+        return  # Already terminal before cleanup reached it.
+    except Exception as error:
+        control_error = f"termination probe submission ({safe_exception_kind(error)})"
+
+    try:
+        ray.kill(owner, no_restart=True)
+    except ray.exceptions.RayActorError:
+        pass
+    except Exception as error:
+        kind = safe_exception_kind(error)
+        control_error = f"{control_error}, " if control_error else ""
+        control_error += f"actor kill ({kind})"
+
+    pending: list[Any] = []
+    if probe_ref is not None:
+        try:
+            ready, pending = ray.wait([probe_ref], num_returns=1, timeout=timeout)
+        except Exception as error:
+            ready = []
+            control_error = f"{control_error}, " if control_error else ""
+            control_error += f"termination wait ({safe_exception_kind(error)})"
+        for ref in ready:
+            try:
+                ray.get(ref)
+            except ray.exceptions.RayActorError:
+                pass
+            except Exception as error:
+                control_error = f"{control_error}, " if control_error else ""
+                control_error += f"termination probe result ({safe_exception_kind(error)})"
+            else:
+                control_error = f"{control_error}, " if control_error else ""
+                control_error += "termination probe returned normally"
+
+    if control_error or pending or probe_ref is None:
+        detail = control_error or "termination could not be observed"
+        if pending:
+            detail = f"{detail}, " if detail else ""
+            detail += "termination probe remained pending"
+        raise TqCleanupTimeout(f"Failed to confirm TransferQueue owner cleanup: {detail}") from None
 
 
-def _cleanup_failed_owner(owner: Any, owner_token: str, *, timeout: float = 10.0) -> None:
-    """Stop a failed initializer and remove only controller state it owns.
-
-    A concurrent initializer may win the global named-actor race.  In that case
-    this actor only attached, so neither its cleanup RPC nor this driver is
-    allowed to kill the winning controller.
-    """
+def _cleanup_failed_owner(owner: Any, *, timeout: float = 10.0) -> None:
+    """Stop a failed initializer and remove its exclusive-cluster state."""
     try:
         ray.get(owner.close.remote(), timeout=timeout)
     except Exception as e:
         logger.warning(f"[dataplane] TQ owner cleanup RPC failed; killing owner actor ({safe_exception_kind(e)}).")
-    finally:
-        _stop_owner_actor(owner)
+    _stop_owner_actor(owner, timeout=timeout)
 
-    try:
-        stored_conf = _get_stored_config(timeout=timeout)
-    except ValueError:
-        return
-    except TqControllerMissingConfig as error:
-        logger.warning(
-            "[dataplane] Failed initializer left a half-initialised TQ controller "
-            f"({safe_exception_kind(error)}); reaping it."
-        )
-        kill_tq_controller_and_wait()
-        return
-    except TqControllerInspectionError:
-        # The owner process has already been stopped, but a transient GCS error
-        # cannot prove that any visible controller belongs to this attempt.
-        # Fail closed instead of risking another job's healthy controller.
-        raise
-    except Exception as error:
-        raise TqControllerInspectionError(
-            f"Unexpected failure while inspecting TransferQueueController ({safe_exception_kind(error)})"
-        ) from None
-
-    stored_token = _get_owner_token(stored_conf)
-    if stored_token == owner_token:
-        logger.warning("[dataplane] Failed initializer left its TQ controller behind; reaping owned state.")
-        kill_tq_controller_and_wait()
-    else:
-        logger.info(
-            "[dataplane] Failed initializer had attached to a concurrently owned "
-            "TQ controller; leaving global state intact."
-        )
+    # Only remove global state after the actor is confirmed terminal. A
+    # pre-kill existence query races with a late controller creation by the
+    # blocked native initializer. The exclusive-cluster precondition proves
+    # any controller visible here belongs to this attempt.
+    kill_tq_controller_and_wait(timeout=timeout)
 
 
-def _start_owner(conf: Any, *, timeout: float) -> TqInitResult:
-    owner_token = uuid.uuid4().hex
+def _start_owner(*, timeout: float) -> Any:
+    """Create and schedule the isolated owner before candidate fallback."""
     try:
         owner = _TransferQueueOwner.remote()
-    except ray.exceptions.RayError as error:
+        ray.get(owner.ready.remote(), timeout=timeout)
+    except Exception as error:
+        if "owner" in locals():
+            _stop_owner_actor(owner, timeout=timeout)
         raise RuntimeError(f"TransferQueue owner creation failed ({safe_exception_kind(error)})") from None
+    return owner
+
+
+def _initialize_owner(owner: Any, conf: Any, *, timeout: float) -> TqInitResult:
+    """Initialize one candidate and fully clean its owner on failure."""
     try:
-        stored_conf, owns_controller = ray.get(owner.initialize.remote(conf, owner_token), timeout=timeout)
+        stored_conf = ray.get(owner.initialize.remote(conf), timeout=timeout)
     except ray.exceptions.GetTimeoutError:
-        _cleanup_failed_owner(owner, owner_token)
+        _cleanup_failed_owner(owner)
         raise TqInitializationTimeout(f"tq.init did not finish within {timeout:.0f}s") from None
     except Exception as error:
-        _cleanup_failed_owner(owner, owner_token)
-        if isinstance(error, ray.exceptions.RayError):
-            raise RuntimeError(f"TransferQueue owner initialization failed ({safe_exception_kind(error)})") from None
-        raise
-
-    if owns_controller:
-        return TqInitResult(config=stored_conf, owner=owner)
-
-    # A controller appeared after the exclusive-cluster pre-check.  This owner
-    # only attached to it, so detach locally and fail instead of silently sharing
-    # global state with a concurrent initializer.
-    try:
-        ray.get(owner.detach.remote(), timeout=10.0)
-    except ray.exceptions.RayError as error:
-        raise RuntimeError(
-            f"TransferQueue concurrent-initializer detach failed ({safe_exception_kind(error)})"
+        _cleanup_failed_owner(owner)
+        raise TqInitializationError(
+            f"TransferQueue owner initialization failed ({safe_exception_kind(error)})"
         ) from None
-    finally:
-        _stop_owner_actor(owner)
-    raise TqConfigurationMismatch(
-        "A concurrent TransferQueue initializer created a healthy controller. "
-        "Detached without modifying it; the initial RDMA release requires an exclusive Ray cluster."
-    )
+    return TqInitResult(config=stored_conf, owner=owner)
 
 
 def close_tq_owner(owner: Any | None, *, timeout: float = 30.0) -> None:
-    """Ask the owner process to close global TQ state; attached sessions no-
-    op."""
+    """Ask the exclusive owner process to close global TQ state."""
     if owner is None:
         return
     close_error: Exception | None = None
@@ -726,12 +649,10 @@ def close_tq_owner(owner: Any | None, *, timeout: float = 30.0) -> None:
         ray.get(owner.close.remote(), timeout=timeout)
     except Exception as e:
         close_error = e
-    finally:
-        _stop_owner_actor(owner)
-    # Do not proceed to a subsequent initialization until the actor name has
-    # actually left GCS.
-    if _controller_exists():
-        kill_tq_controller_and_wait()
+    _stop_owner_actor(owner, timeout=timeout)
+    # Ensure the controller has left GCS even when owner.close() failed before
+    # reaching upstream tq.close(). This is a no-op when it is already gone.
+    kill_tq_controller_and_wait(timeout=timeout)
     if close_error is not None:
         raise RuntimeError(f"TransferQueue owner cleanup failed ({safe_exception_kind(close_error)})") from None
 
@@ -743,21 +664,25 @@ def initialize_tq_with_fallback(
     fallback_conf: Any | None = None,
     timeout: float = DEFAULT_TQ_INIT_TIMEOUT_SECONDS,
 ) -> TqInitResult:
-    """Initialize TQ atomically with owner tracking and one safe auto fallback.
+    """Initialize TQ with one exclusive owner and one safe auto fallback.
 
     ``fallback_conf`` must be the equivalent SimpleStorage configuration.  It
     is used only for ``mode='auto'`` after a real Mooncake ``tq.init`` failure.
     ``required`` always cleans up and re-raises the original error.
     """
 
-    def _attempt(attempt_conf: Any) -> TqInitResult:
-        reap_unusable_tq_controller()
-        return _start_owner(attempt_conf, timeout=timeout)
+    def _attempt(owner: Any, attempt_conf: Any) -> TqInitResult:
+        return _initialize_owner(owner, attempt_conf, timeout=timeout)
 
+    # Keep the exclusive-cluster gate outside the auto fallback boundary. A
+    # healthy pre-existing controller is not an RDMA candidate failure and
+    # must never be converted into a SimpleStorage attach attempt.
+    reap_unusable_tq_controller()
+    owner = _start_owner(timeout=timeout)
     try:
-        return _attempt(conf)
-    except Exception as primary_error:
-        if isinstance(primary_error, TqConfigurationMismatch) or mode != "auto" or fallback_conf is None:
+        return _attempt(owner, conf)
+    except (TqInitializationTimeout, TqInitializationError) as primary_error:
+        if mode != "auto" or fallback_conf is None:
             raise
 
         reason = f"mooncake_init_failed:{type(primary_error).__name__}"
@@ -766,7 +691,11 @@ def initialize_tq_with_fallback(
             "cleaned partial state and retrying once with SimpleStorage."
         )
         try:
-            result = _attempt(fallback_conf)
+            # Failed-owner cleanup must leave a clean cluster. Re-check before
+            # starting the fallback so unknown residual state fails closed.
+            reap_unusable_tq_controller()
+            fallback_owner = _start_owner(timeout=timeout)
+            result = _attempt(fallback_owner, fallback_conf)
         except Exception as fallback_error:
             raise RuntimeError(
                 "TransferQueue SimpleStorage fallback initialization failed after "

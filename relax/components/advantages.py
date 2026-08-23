@@ -42,7 +42,6 @@ class Advantages(Base):
         self.data_system_client = attach_tq_client(
             self.config.tq_config,
             role="advantages",
-            lease_owner=self,
         )
         self.step = 0
 
