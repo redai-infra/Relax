@@ -103,9 +103,11 @@ def main(probe_dir: Path) -> None:
         ).remote(conf)
         assert ray.get(controller.get_config.remote()) == conf
 
-        failures = tq_lifecycle.verify_cluster_attach(conf, timeout=2.0)
+        failures = tq_lifecycle.verify_cluster_attach(conf, timeout=0.3)
         assert len(failures) == 1
-        assert "did not finish" in failures[0]
+        # The public failure summary is deliberately scrubbed: the underlying
+        # RayTaskError contains worker addresses, PIDs and traceback paths.
+        assert failures[0].endswith("handshake task failed (RayTaskError)")
         assert started_path.exists(), "the production handshake never entered tq.init"
         timed_out_pid_text, timed_out_create_time_text = started_path.read_text(encoding="utf-8").split(",")
         timed_out_identity = (int(timed_out_pid_text), float(timed_out_create_time_text))

@@ -2,11 +2,11 @@
 
 """Failure-path tests for the TransferQueue dataplane enablement.
 
-Covers the four gaps the maintainer review called out, which the existing
-``test_rdma_probe.py`` (pure config/probe logic) and
+Covers the four gaps the maintainer review called out, which
+``tests/utils/tq/test_config.py`` (pure config construction/validation) and
 ``test_tq_dataplane_behavior.py`` (real TQ on SimpleStorage) did not:
 
-* timeout -- controller ``get_config`` timeout and probe-task timeout
+* timeout -- controller ``get_config`` timeout and attach-handshake timeout
 * disconnect -- store errors surface instead of returning corrupt data
 * retry -- ``batch_get_into`` / ``batch_upsert_from`` retry-then-raise
 * byte-exactness on **MooncakeStore** (SimpleStorage-only before), including
@@ -39,7 +39,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
-from relax.utils.rdma_probe import ProbeResult, reduce_results
 from relax.utils.tq import lifecycle as tq_lifecycle
 
 
@@ -66,17 +65,6 @@ _RUN_REAL_CAPACITY = os.environ.get("RELAX_RUN_REAL_MOONCAKE_CAPACITY_TEST") == 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _probe(node: str, protocol: str | None = "rdma", device: str = "rdma0") -> ProbeResult:
-    """Build a ProbeResult without running any real probe."""
-    return ProbeResult(
-        node=node,
-        checks=(),
-        effective_protocol=protocol,
-        effective_device=device if protocol else "",
-        errors=() if protocol else ("mooncake not importable",),
-    )
 
 
 def _master_address() -> str:
@@ -272,6 +260,9 @@ class TestReapUnusableController:
         """Stub the ray module used by tq_lifecycle; record kill calls."""
         killed: list = []
         fake = MagicMock()
+        # Exception handlers require real exception classes; a bare MagicMock
+        # here would make ``except ray.exceptions.RayError`` invalid at runtime.
+        fake.exceptions = tq_lifecycle.ray.exceptions
         if actor is None:
             fake.get_actor.side_effect = ValueError("actor not found")
         else:
@@ -290,9 +281,10 @@ class TestReapUnusableController:
         assert tq_lifecycle.reap_unusable_tq_controller() is False
         assert killed == []
 
-    def test_healthy_controller_is_left_alone(self, monkeypatch):
+    def test_healthy_controller_fails_without_being_killed(self, monkeypatch):
         killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_result={"backend": {}})
-        assert tq_lifecycle.reap_unusable_tq_controller() is False
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="exclusive, clean Ray cluster"):
+            tq_lifecycle.reap_unusable_tq_controller()
         assert killed == []
 
     def test_half_initialised_controller_is_reaped(self, monkeypatch):
@@ -303,14 +295,40 @@ class TestReapUnusableController:
 
     def test_get_config_timeout_is_reaped(self, monkeypatch):
         """An unresponsive controller must not turn tq.init into a hang."""
-        killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=TimeoutError("get_config timed out"))
+        error = tq_lifecycle.ray.exceptions.GetTimeoutError("private timeout detail")
+        killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=error)
         assert tq_lifecycle.reap_unusable_tq_controller() is True
         assert killed == ["killed"]
 
     def test_dead_actor_is_reaped(self, monkeypatch):
-        killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=RuntimeError("ActorDiedError"))
+        error = tq_lifecycle.ray.exceptions.RayActorError(error_msg="private actor detail")
+        killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=error)
         assert tq_lifecycle.reap_unusable_tq_controller() is True
         assert killed == ["killed"]
+
+    def test_other_ray_error_fails_closed_without_killing_or_leaking_detail(self, monkeypatch):
+        private_detail = "private control-plane endpoint and traceback"
+        error = tq_lifecycle.ray.exceptions.RayError(private_detail)
+        killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=error)
+
+        with pytest.raises(RuntimeError, match="Failed to inspect") as excinfo:
+            tq_lifecycle.reap_unusable_tq_controller()
+
+        assert killed == []
+        assert private_detail not in str(excinfo.value)
+
+    def test_stored_config_ray_error_is_sanitized(self, monkeypatch):
+        private_detail = "private GCS endpoint and traceback"
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "get_actor",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.RayError(private_detail)),
+        )
+
+        with pytest.raises(tq_lifecycle.TqControllerInspectionError) as excinfo:
+            tq_lifecycle._get_stored_config()
+
+        assert private_detail not in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +390,13 @@ class TestBoundedAttach:
         with pytest.raises(RuntimeError, match="RELAX_TQ_ATTACH_TIMEOUT_SECONDS"):
             tq_lifecycle._resolve_attach_timeout()
 
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_attach_timeout_env_rejects_non_finite_values(self, monkeypatch, value):
+        monkeypatch.setenv("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", value)
+        with pytest.raises(RuntimeError, match="finite positive") as excinfo:
+            tq_lifecycle._resolve_attach_timeout()
+        assert value not in str(excinfo.value)
+
     def test_attach_timeout_env_override_is_used(self, monkeypatch):
         monkeypatch.setenv("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", "12.5")
         assert tq_lifecycle._resolve_attach_timeout() == 12.5
@@ -406,17 +431,265 @@ class TestBoundedAttach:
     def test_cluster_attach_handshake_worker_is_one_shot(self, monkeypatch):
         remote_options = {}
 
+        class _Task:
+            def options(self, **_kwargs):
+                return self
+
+            def remote(self, *_args):
+                return object()
+
         def record_remote_options(**options):
             remote_options.update(options)
-            return lambda function: function
+            return lambda _function: _Task()
 
         monkeypatch.setattr(tq_lifecycle.ray, "remote", record_remote_options)
-        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: [])
-        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda *args, **kwargs: ([], []))
+        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: ["a" * 56])
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: None)
 
         assert tq_lifecycle.verify_cluster_attach({}, timeout=0.1) == []
         assert remote_options["max_calls"] == 1
         assert remote_options["max_retries"] == 0
+
+    def test_cluster_attach_with_no_alive_nodes_fails_closed_without_scheduling(self, monkeypatch):
+        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: [])
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "remote",
+            lambda **_kwargs: pytest.fail("zero-node validation must not create a remote worker"),
+        )
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "wait",
+            lambda *_args, **_kwargs: pytest.fail("zero-node validation must not call ray.wait"),
+        )
+
+        assert tq_lifecycle.verify_cluster_attach({}, timeout=0.1) == ["cluster: no alive Ray nodes discovered"]
+
+    def test_alive_node_without_node_id_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(tq_lifecycle.ray, "nodes", lambda: [{"Alive": True}])
+        failures = tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
+        assert failures == ["cluster: node discovery failed (RuntimeError)"]
+
+    @staticmethod
+    def _capture_handshake(monkeypatch):
+        """Return ``(captured_args, get_worker)`` for the real nested worker.
+
+        ``verify_cluster_attach`` defines ``_handshake`` inline, so the only
+        way to exercise its body — and therefore its ``finally`` detach — is to
+        grab the function Ray's decorator receives.
+        """
+        captured: list[tuple] = []
+        worker: list = []
+
+        class _Task:
+            def options(self, **_kwargs):
+                return self
+
+            def remote(self, *args):
+                captured.append(args)
+                return object()
+
+        def fake_remote(**_options):
+            def decorate(function):
+                worker.append(function)
+                return _Task()
+
+            return decorate
+
+        monkeypatch.setattr(tq_lifecycle.ray, "remote", fake_remote)
+        # Ray validates node IDs as 28-byte hex, so use a well-formed one.
+        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: ["a" * 56])
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **kwargs: (list(refs), []))
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref: None)
+        return captured, worker
+
+    def test_handshake_checks_mooncake_config_only_for_mooncake(self, monkeypatch):
+        """The Mooncake flag controls the manager/config assertion.
+
+        SimpleStorage has no Mooncake protocol configuration to verify.
+        """
+        captured, _worker = self._capture_handshake(monkeypatch)
+
+        mooncake_conf = {"backend": {"storage_backend": "MooncakeStore"}}
+        assert tq_lifecycle.verify_cluster_attach(mooncake_conf, timeout=0.1) == []
+        assert captured[-1][1] is True
+        assert captured[-1][2] == 0.1
+
+        simple_conf = {"backend": {"storage_backend": "SimpleStorage"}}
+        assert tq_lifecycle.verify_cluster_attach(simple_conf, timeout=0.1) == []
+        assert captured[-1][1] is False
+
+    def _run_worker(self, monkeypatch, *, assert_error=None):
+        """Execute the real ``_handshake`` body and record its call order."""
+        _captured, worker = self._capture_handshake(monkeypatch)
+        tq_lifecycle.verify_cluster_attach({"backend": {"storage_backend": "MooncakeStore"}}, timeout=0.1)
+        assert worker, "Ray decorator never received the handshake function"
+
+        events: list[str] = []
+
+        def fake_attach(conf, *, role, timeout):
+            events.append(f"attach:{role}:{timeout}")
+            return object()
+
+        def fake_assert():
+            events.append("assert")
+            if assert_error is not None:
+                raise assert_error
+
+        monkeypatch.setattr(tq_lifecycle, "attach_tq_client", fake_attach)
+        monkeypatch.setattr(tq_lifecycle, "assert_mooncake_rdma_configured", fake_assert)
+        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: events.append("detach"))
+        return worker[0], events
+
+    def test_handshake_worker_attaches_asserts_then_detaches(self, monkeypatch):
+        handshake, events = self._run_worker(monkeypatch)
+        handshake({"backend": {"storage_backend": "MooncakeStore"}}, True, 0.1)
+        assert events == ["attach:attach-handshake:0.1", "assert", "detach"]
+
+    def test_handshake_worker_detaches_even_when_the_assertion_fails(self, monkeypatch):
+        """A rejected transport must not leave this node's segment registered.
+
+        Without the ``finally`` the segment would linger until the master's
+        ``client_ttl`` expires and break fast restarts.
+        """
+        handshake, events = self._run_worker(monkeypatch, assert_error=RuntimeError("protocol=tcp"))
+        with pytest.raises(RuntimeError, match="protocol=tcp"):
+            handshake({"backend": {"storage_backend": "MooncakeStore"}}, True, 0.1)
+        assert events == ["attach:attach-handshake:0.1", "assert", "detach"]
+
+    def test_handshake_worker_skips_the_assertion_for_simple_storage(self, monkeypatch):
+        handshake, events = self._run_worker(monkeypatch)
+        handshake({"backend": {"storage_backend": "SimpleStorage"}}, False, 0.1)
+        assert events == ["attach:attach-handshake:0.1", "detach"]
+
+    def test_ready_task_failure_is_sanitized(self, monkeypatch):
+        self._capture_handshake(monkeypatch)
+        secret = "worker endpoint and traceback path must stay private"
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: (_ for _ in ()).throw(RuntimeError(secret)))
+
+        failures = tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
+
+        assert failures[0].endswith("handshake task failed (RuntimeError)")
+        assert secret not in failures[0]
+
+    def test_partial_scheduling_failure_cancels_submitted_workers(self, monkeypatch):
+        first_ref = object()
+        cancellations: list[tuple[object, bool]] = []
+
+        class _Task:
+            calls = 0
+
+            def options(self, **_kwargs):
+                return self
+
+            def remote(self, *_args):
+                self.calls += 1
+                if self.calls == 1:
+                    return first_ref
+                raise RuntimeError("private scheduling detail")
+
+        monkeypatch.setattr(tq_lifecycle.ray, "remote", lambda **_kwargs: lambda _function: _Task())
+        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: ["a" * 56, "b" * 56])
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "cancel",
+            lambda ref, force: cancellations.append((ref, force)),
+        )
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+
+        failures = tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
+
+        assert failures == ["cluster: handshake scheduling failed (RuntimeError)"]
+        assert cancellations == [(first_ref, True)]
+
+    def test_wait_failure_cancels_and_confirms_submitted_workers(self, monkeypatch):
+        captured, _worker = self._capture_handshake(monkeypatch)
+        wait_calls = 0
+        cancellations: list[tuple[object, bool]] = []
+
+        def fake_wait(submitted, **_kwargs):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                raise RuntimeError("private wait detail")
+            return list(submitted), []
+
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", fake_wait)
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "cancel",
+            lambda ref, force: cancellations.append((ref, force)),
+        )
+        assert captured == []
+
+        failures = tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
+
+        assert failures == ["cluster: handshake wait failed (RuntimeError)"]
+        assert len(cancellations) == 1 and cancellations[0][1] is True
+
+    def test_unconfirmed_pending_worker_aborts_fallback_boundary(self, monkeypatch):
+        self._capture_handshake(monkeypatch)
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: ([], list(refs)))
+        monkeypatch.setattr(tq_lifecycle.ray, "cancel", lambda _ref, force: None)
+
+        with pytest.raises(tq_lifecycle.TqHandshakeIsolationError, match="could not be confirmed stopped"):
+            tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
+
+    def test_cancel_failure_aborts_fallback_boundary_without_leaking_detail(self, monkeypatch):
+        self._capture_handshake(monkeypatch)
+        private_detail = "private worker address and traceback path"
+        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: ([], list(refs)))
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "cancel",
+            lambda _ref, force: (_ for _ in ()).throw(RuntimeError(private_detail)),
+        )
+
+        with pytest.raises(tq_lifecycle.TqHandshakeIsolationError) as excinfo:
+            tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
+        assert private_detail not in str(excinfo.value)
+
+
+class TestAssertMooncakeRdmaConfigured:
+    """The client field proves configured intent, not negotiated transport.
+
+    ``tq.init`` ignores the caller's conf when attaching to an existing
+    controller, so the manager and configured protocol must still match the
+    job-level contract.  Wire proof remains a benchmark responsibility.
+    """
+
+    class MooncakeStorageManager:
+        """Name matters: the production check compares
+        ``type(...).__name__``."""
+
+        def __init__(self, storage_client):
+            self.storage_client = storage_client
+
+    def _patch_client(self, monkeypatch, manager):
+        fake = MagicMock()
+        fake.get_client.return_value = MagicMock(storage_manager=manager)
+        monkeypatch.setattr(tq_lifecycle, "tq", fake)
+
+    def test_accepts_mooncake_rdma(self, monkeypatch):
+        self._patch_client(monkeypatch, self.MooncakeStorageManager(MagicMock(protocol="rdma")))
+        tq_lifecycle.assert_mooncake_rdma_configured()
+
+    def test_rejects_non_mooncake_manager(self, monkeypatch):
+        self._patch_client(monkeypatch, MagicMock())
+        with pytest.raises(RuntimeError, match="not MooncakeStorageManager"):
+            tq_lifecycle.assert_mooncake_rdma_configured()
+
+    def test_rejects_missing_storage_client(self, monkeypatch):
+        self._patch_client(monkeypatch, self.MooncakeStorageManager(None))
+        with pytest.raises(RuntimeError, match="no storage_client"):
+            tq_lifecycle.assert_mooncake_rdma_configured()
+
+    @pytest.mark.parametrize("protocol", ["tcp", None, ""])
+    def test_rejects_non_rdma_protocol(self, monkeypatch, protocol):
+        self._patch_client(monkeypatch, self.MooncakeStorageManager(MagicMock(protocol=protocol)))
+        with pytest.raises(RuntimeError, match="not configured for protocol=rdma"):
+            tq_lifecycle.assert_mooncake_rdma_configured()
 
     def test_cluster_attach_timeout_does_not_leave_process_global_state(self):
         """The one-shot worker dies before its abandoned tq.init can mutate
@@ -525,13 +798,16 @@ class TestInitializeTqWithFallback:
         }
 
     @staticmethod
-    def _patch_transaction(monkeypatch, *, existed: bool, init_effects: list[object], stored_conf=None):
+    def _patch_transaction(monkeypatch, *, init_effects: list[object], reap_error: BaseException | None = None):
         calls: dict[str, list] = {"reap": [], "attempts": []}
         effects = iter(init_effects)
 
-        monkeypatch.setattr(tq_lifecycle, "reap_unusable_tq_controller", lambda: calls["reap"].append(True))
-        monkeypatch.setattr(tq_lifecycle, "_controller_exists", lambda: existed)
-        monkeypatch.setattr(tq_lifecycle, "_get_stored_config", lambda: stored_conf)
+        def fake_reap():
+            calls["reap"].append(True)
+            if reap_error is not None:
+                raise reap_error
+
+        monkeypatch.setattr(tq_lifecycle, "reap_unusable_tq_controller", fake_reap)
 
         def fake_start(conf, *, timeout):
             calls["attempts"].append(conf)
@@ -545,101 +821,24 @@ class TestInitializeTqWithFallback:
 
     def test_simple_path_also_runs_pre_init_reaper_and_becomes_owner(self, monkeypatch):
         conf = self._conf("SimpleStorage")
-        calls = self._patch_transaction(monkeypatch, existed=False, init_effects=["owner"])
+        calls = self._patch_transaction(monkeypatch, init_effects=["owner"])
         result = tq_lifecycle.initialize_tq_with_fallback(conf, mode="off")
         assert result.owns_controller is True
         assert len(calls["reap"]) == 1
 
-    def test_attach_is_not_owner(self, monkeypatch):
+    @pytest.mark.parametrize("mode", ["off", "auto", "required"])
+    def test_healthy_existing_controller_fails_exclusive_without_starting_owner(self, monkeypatch, mode):
         requested = self._conf("SimpleStorage")
-        stored = self._conf("SimpleStorage")
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
-        assert result.owns_controller is False
-        assert result.config is stored
-        assert calls["attempts"] == []
+        mismatch = tq_lifecycle.TqConfigurationMismatch("exclusive cluster is not clean")
+        calls = self._patch_transaction(monkeypatch, init_effects=[], reap_error=mismatch)
 
-    def test_attach_rejects_different_backend_without_closing_owner(self, monkeypatch):
-        requested = self._mooncake_conf("rdma")
-        stored = self._conf("SimpleStorage")
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="different backend config"):
+        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="exclusive cluster"):
             tq_lifecycle.initialize_tq_with_fallback(
                 requested,
-                mode="auto",
+                mode=mode,
                 fallback_conf=self._conf("SimpleStorage"),
             )
-        assert calls["attempts"] == []
 
-    def test_attach_rejects_different_mooncake_protocol(self, monkeypatch):
-        requested = self._mooncake_conf("rdma")
-        stored = self._mooncake_conf("tcp")
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="requested=MooncakeStore/rdma"):
-            tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
-        assert calls["attempts"] == []
-
-    def test_attach_accepts_matching_mooncake_config(self, monkeypatch):
-        requested = self._mooncake_conf("rdma")
-        stored = self._mooncake_conf("rdma")
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
-        assert result.config is stored
-        assert result.owns_controller is False
-        assert calls["attempts"] == []
-
-    def test_attach_rejects_legacy_gdr_controller(self, monkeypatch):
-        """A controller left behind by a GDR-enabled build is not compatible.
-
-        Relax now always requests host RDMA (``use_gdr=False``), but upstream
-        ``tq.init`` ignores the caller's conf when attaching, so accepting such
-        a controller would silently run this worker on the unverified GDR path.
-        """
-        requested = self._mooncake_conf("rdma")
-        stored = self._mooncake_conf("rdma", use_gdr=True)
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="different backend config"):
-            tq_lifecycle.initialize_tq_with_fallback(requested, mode="required")
-        assert calls["attempts"] == []
-
-    def test_attach_rejects_different_polling_mode(self, monkeypatch):
-        requested = self._conf("SimpleStorage")
-        requested["controller"]["polling_mode"] = True
-        stored = self._conf("SimpleStorage")
-        stored["controller"]["polling_mode"] = False
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="controller sampling contract"):
-            tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
-        assert calls["attempts"] == []
-
-    def test_attach_rejects_different_sampler_type(self, monkeypatch):
-        requested = self._conf("SimpleStorage")
-        requested["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2)
-        stored = self._conf("SimpleStorage")
-        stored["controller"]["sampler"] = _SamplerB(n_samples_per_prompt=2)
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="controller sampling contract"):
-            tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
-        assert calls["attempts"] == []
-
-    def test_attach_rejects_different_sampler_public_config(self, monkeypatch):
-        requested = self._conf("SimpleStorage")
-        requested["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2)
-        stored = self._conf("SimpleStorage")
-        stored["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=4)
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        with pytest.raises(tq_lifecycle.TqConfigurationMismatch, match="controller sampling contract"):
-            tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
-        assert calls["attempts"] == []
-
-    def test_attach_ignores_sampler_private_runtime_state(self, monkeypatch):
-        requested = self._conf("SimpleStorage")
-        requested["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2, state={"request": 1})
-        stored = self._conf("SimpleStorage")
-        stored["controller"]["sampler"] = _SamplerA(n_samples_per_prompt=2, state={"stored": 3})
-        calls = self._patch_transaction(monkeypatch, existed=True, init_effects=[], stored_conf=stored)
-        result = tq_lifecycle.initialize_tq_with_fallback(requested, mode="off")
-        assert result.config is stored
         assert calls["attempts"] == []
 
     def test_auto_cleans_failed_mooncake_then_retries_simple_once(self, monkeypatch):
@@ -647,7 +846,6 @@ class TestInitializeTqWithFallback:
         fallback = self._conf("SimpleStorage")
         calls = self._patch_transaction(
             monkeypatch,
-            existed=False,
             init_effects=[RuntimeError("master unavailable"), "fallback-owner"],
         )
         result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
@@ -661,7 +859,6 @@ class TestInitializeTqWithFallback:
         fallback = self._conf("SimpleStorage")
         calls = self._patch_transaction(
             monkeypatch,
-            existed=False,
             init_effects=[RuntimeError("master unavailable")],
         )
         with pytest.raises(RuntimeError, match="master unavailable"):
@@ -673,22 +870,11 @@ class TestInitializeTqWithFallback:
         fallback = self._conf("SimpleStorage")
         calls = self._patch_transaction(
             monkeypatch,
-            existed=False,
             init_effects=[tq_lifecycle.TqInitializationTimeout("timed out"), "fallback-owner"],
         )
         result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
         assert result.config["backend"]["storage_backend"] == "SimpleStorage"
         assert len(calls["attempts"]) == 2
-
-
-class _SamplerA:
-    def __init__(self, n_samples_per_prompt: int, state: dict | None = None):
-        self.n_samples_per_prompt = n_samples_per_prompt
-        self._states = state or {}
-
-
-class _SamplerB(_SamplerA):
-    pass
 
 
 class _RemoteMethod:
@@ -762,6 +948,45 @@ class TestOwnerProcessBoundary:
         tq_lifecycle._cleanup_failed_owner(owner, "ours")
         assert stopped == [owner]
         assert bool(killed) is should_kill
+
+    def test_failed_owner_cleanup_does_not_kill_when_controller_inspection_fails(self, monkeypatch):
+        owner = _FakeOwner()
+        stopped: list[object] = []
+        killed: list[bool] = []
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: None)
+        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle: stopped.append(handle))
+        monkeypatch.setattr(
+            tq_lifecycle,
+            "_get_stored_config",
+            lambda timeout: (_ for _ in ()).throw(
+                tq_lifecycle.TqControllerInspectionError("controller inspection failed (RayError)")
+            ),
+        )
+        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda: killed.append(True))
+
+        with pytest.raises(tq_lifecycle.TqControllerInspectionError):
+            tq_lifecycle._cleanup_failed_owner(owner, "ours")
+
+        assert stopped == [owner]
+        assert killed == []
+
+    def test_failed_owner_cleanup_reaps_proven_half_initialised_controller(self, monkeypatch):
+        owner = _FakeOwner()
+        killed: list[bool] = []
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda ref, timeout: None)
+        monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda _handle: None)
+        monkeypatch.setattr(
+            tq_lifecycle,
+            "_get_stored_config",
+            lambda timeout: (_ for _ in ()).throw(
+                tq_lifecycle.TqControllerMissingConfig("controller returned no config")
+            ),
+        )
+        monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda: killed.append(True))
+
+        tq_lifecycle._cleanup_failed_owner(owner, "ours")
+
+        assert killed == [True]
 
     def test_owner_close_failure_still_reaps_global_controller(self, monkeypatch):
         owner = _FakeOwner()
@@ -974,40 +1199,6 @@ def test_real_mooncake_capacity_overflow_is_bounded_and_loud():
     status, detail = result_queue.get(timeout=2)
     assert status == "error", detail
     assert "batch_upsert_from failed" in detail or "capacity" in detail.lower(), detail
-
-
-# ---------------------------------------------------------------------------
-# Automatic degradation (was the manual two-node fault_inject_multinode.py)
-# ---------------------------------------------------------------------------
-
-
-class TestAutomaticDegradation:
-    """AND-reduction turns any node's failure into a job-level downgrade."""
-
-    def test_all_nodes_rdma_stays_rdma(self):
-        eff = reduce_results([_probe("a"), _probe("b")], requested_device="")
-        assert (eff.backend, eff.protocol, eff.fallback_reason) == ("MooncakeStore", "rdma", "")
-
-    def test_one_node_without_mooncake_degrades_whole_job(self):
-        """Mirrors the PYTHONPATH-poisoning case of the two-node script."""
-        eff = reduce_results([_probe("a"), _probe("b", protocol=None)], requested_device="")
-        assert eff.backend == "SimpleStorage"
-        assert "mooncake_unavailable" in eff.fallback_reason and "b" in eff.fallback_reason
-
-    def test_crashed_probe_task_degrades_whole_job(self):
-        """A probe task that raises becomes a degenerate result, never
-        dropped."""
-        from relax.utils.rdma_probe import _degenerate_result
-
-        degenerate = _degenerate_result("b", "probe task raised")
-        assert degenerate.effective_protocol is None
-        eff = reduce_results([_probe("a"), degenerate], requested_device="")
-        assert eff.backend == "SimpleStorage"
-
-    def test_one_node_without_rdma_degrades_whole_job_to_simple(self):
-        eff = reduce_results([_probe("a"), _probe("b", protocol="tcp")], requested_device="")
-        assert (eff.backend, eff.protocol) == ("SimpleStorage", "tcp")
-        assert eff.fallback_reason
 
 
 # ---------------------------------------------------------------------------

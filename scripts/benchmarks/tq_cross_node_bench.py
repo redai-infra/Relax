@@ -409,7 +409,6 @@ def build_conf(protocol: str, master: str, device: str, segment_gib: int):
     from omegaconf import OmegaConf
     from transfer_queue import GRPOGroupNSampler
 
-    from relax.utils.rdma_probe import EffectiveConfig
     from relax.utils.tq.config import (
         build_mooncake_config,
         build_simple_storage_config,
@@ -421,8 +420,13 @@ def build_conf(protocol: str, master: str, device: str, segment_gib: int):
         backend = build_simple_storage_config(total_storage_size=None, num_data_storage_units=2)
     else:
         validate_mooncake_runtime_contract()
-        eff = EffectiveConfig(backend="MooncakeStore", protocol=protocol, device=device, fallback_reason="")
-        backend = build_mooncake_config(eff, master_address=master, global_segment_size=segment_gib * 1024**3)
+        # ``protocol="tcp"`` is the C1 baseline; production only builds "rdma".
+        backend = build_mooncake_config(
+            master_address=master,
+            device=device,
+            protocol=protocol,
+            global_segment_size=segment_gib * 1024**3,
+        )
     return OmegaConf.create(
         {
             "controller": {"sampler": GRPOGroupNSampler(n_samples_per_prompt=1), "polling_mode": True},

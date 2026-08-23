@@ -41,7 +41,7 @@ class ActorFwd(Base):
             lease_owner=self,
         )
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
-        ray.get(self.actor_model.async_init(config, role=self.role, with_ref=False))
+        self.actor_model.init_and_wait(config, role=self.role, with_ref=False)
         self.step = 0
 
     async def run(self) -> None:

@@ -21,6 +21,7 @@ Two problems these helpers exist for:
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -79,89 +80,38 @@ class TqConfigurationMismatch(RuntimeError):
     """Raised when an existing controller uses an incompatible job config."""
 
 
+class TqControllerInspectionError(RuntimeError):
+    """Raised when Ray cannot prove the named controller's current state."""
+
+
+class TqControllerMissingConfig(RuntimeError):
+    """Raised when a reachable controller is provably half-initialised."""
+
+
+class TqHandshakeIsolationError(RuntimeError):
+    """Raised when timed-out handshake workers cannot be confirmed stopped."""
+
+
+def safe_exception_kind(error: BaseException) -> str:
+    """Return a log-safe exception category without rendering its payload.
+
+    Ray exception strings can contain worker IPs, process IDs and remote
+    traceback paths.  Lifecycle logs and job-level failure summaries therefore
+    record only the stable exception class.
+    """
+    ray_task_error_type = getattr(getattr(ray, "exceptions", None), "RayTaskError", None)
+    if isinstance(ray_task_error_type, type) and isinstance(error, ray_task_error_type):
+        return "RayTaskError"
+    name = type(error).__name__
+    return name if name.isidentifier() else "Exception"
+
+
 def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
         return default
     if hasattr(config, "get"):
         return config.get(key, default)
     return getattr(config, key, default)
-
-
-def _backend_signature(conf: Any) -> tuple[Any, ...]:
-    """Return the backend fields that must agree for a safe attach."""
-    backend = _get_config_value(conf, "backend", {})
-    storage_backend = _get_config_value(backend, "storage_backend", "SimpleStorage")
-    if storage_backend == "MooncakeStore":
-        mooncake = _get_config_value(backend, "MooncakeStore", {})
-        return (
-            storage_backend,
-            _get_config_value(mooncake, "protocol", "tcp"),
-            _get_config_value(mooncake, "device_name", "") or "",
-            _get_config_value(mooncake, "master_server_address", ""),
-            _get_config_value(mooncake, "metadata_server", ""),
-            _get_config_value(mooncake, "global_segment_size"),
-            _get_config_value(mooncake, "local_buffer_size"),
-            bool(_get_config_value(mooncake, "hard_pin", False)),
-            # Retained although Relax now always builds ``use_gdr=False``: this
-            # process may attach to a controller created by an older build that
-            # still enabled GDR, and upstream ``tq.init`` ignores the caller's
-            # conf when attaching (interface.py:130-135), so the worker would
-            # silently run the unverified GDR path.  Delete together with the
-            # rest of the signature machinery once the exclusive-cluster
-            # simplification drops compatibility attach.
-            bool(_get_config_value(mooncake, "use_gdr", False)),
-        )
-    simple = _get_config_value(backend, "SimpleStorage", {})
-    return (
-        "SimpleStorage",
-        _get_config_value(simple, "total_storage_size"),
-        _get_config_value(simple, "num_data_storage_units"),
-    )
-
-
-def _sampler_signature(sampler: Any) -> tuple[Any, ...]:
-    """Return sampler identity and immutable construction-time parameters.
-
-    TransferQueue samplers keep mutable scheduling state in underscore-prefixed
-    attributes.  Those caches legitimately differ between processes and must
-    not prevent an attach; public attributes describe the sampling contract
-    that workers and the existing controller must agree on.
-    """
-    if sampler is None:
-        return (None, ())
-    if isinstance(sampler, str):
-        return ("string", sampler)
-    if isinstance(sampler, type):
-        return ("class", f"{sampler.__module__}.{sampler.__qualname__}")
-
-    sampler_type = f"{type(sampler).__module__}.{type(sampler).__qualname__}"
-    try:
-        public_config = tuple(
-            sorted((name, value) for name, value in vars(sampler).items() if not name.startswith("_"))
-        )
-    except TypeError:
-        public_config = ()
-    return (sampler_type, public_config)
-
-
-def _configuration_signature(conf: Any) -> tuple[Any, ...]:
-    """Return fields that must agree for workers to share a controller."""
-    controller = _get_config_value(conf, "controller", {})
-    return (
-        _backend_signature(conf),
-        bool(_get_config_value(controller, "polling_mode", False)),
-        _sampler_signature(_get_config_value(controller, "sampler")),
-    )
-
-
-def _backend_description(conf: Any) -> str:
-    """Describe the backend without logging endpoints or host information."""
-    backend = _get_config_value(conf, "backend", {})
-    storage_backend = _get_config_value(backend, "storage_backend", "SimpleStorage")
-    if storage_backend != "MooncakeStore":
-        return "SimpleStorage"
-    mooncake = _get_config_value(backend, "MooncakeStore", {})
-    return f"MooncakeStore/{_get_config_value(mooncake, 'protocol', 'tcp')}"
 
 
 def uses_mooncake(conf: Any) -> bool:
@@ -197,7 +147,7 @@ def kill_tq_controller_and_wait(timeout: float = 20.0) -> None:
     except ValueError:
         return  # actor does not exist — nothing to kill or wait for.
     except Exception as e:
-        raise RuntimeError(f"Failed to kill TransferQueueController: {e}") from e
+        raise RuntimeError(f"Failed to kill TransferQueueController ({safe_exception_kind(e)})") from None
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -205,32 +155,48 @@ def kill_tq_controller_and_wait(timeout: float = 20.0) -> None:
             ray.get_actor(CONTROLLER_NAME, namespace=CONTROLLER_NAMESPACE)
         except ValueError:
             return
+        except ray.exceptions.RayError as error:
+            raise RuntimeError(
+                f"Failed to confirm TransferQueueController cleanup ({safe_exception_kind(error)})"
+            ) from None
         time.sleep(0.4)
     raise TqCleanupTimeout(f"TransferQueueController still resolvable after {timeout}s")
 
 
 def reap_unusable_tq_controller(get_config_timeout: float = 10.0) -> bool:
-    """Kill the TransferQueueController only if it cannot serve a config.
+    """Require a clean exclusive cluster, reaping only unusable TQ state.
 
-    Returns ``True`` when a controller was reaped.  A controller that *does*
-    return a config is left alone: it belongs to whoever created it, attaching
-    to it is the intended behavior, and this keeps the guard within "clean up
-    only what this job owns" (no broad pkill/killall).
+    Returns ``True`` when a half-initialised or unresponsive controller was
+    reaped.  A healthy controller is never attached or killed: the initial RDMA
+    release supports one Relax job per Ray cluster, so healthy existing state
+    means the cluster is not clean and startup fails explicitly.
     """
     try:
         existing = ray.get_actor(CONTROLLER_NAME, namespace=CONTROLLER_NAMESPACE)
     except ValueError:
         return False  # nothing there — nothing to reap.
+    except ray.exceptions.RayError as error:
+        raise RuntimeError(f"Failed to query TransferQueueController ({safe_exception_kind(error)})") from None
 
     try:
         conf = ray.get(existing.get_config.remote(), timeout=get_config_timeout)
-    except Exception as e:  # actor dead, unresponsive, or API missing
-        logger.warning(f"[dataplane] Existing TransferQueueController is unusable ({e}); reaping it.")
+    except (ray.exceptions.GetTimeoutError, ray.exceptions.RayActorError) as error:
+        # Only a proven timeout/dead actor is safe to classify as unusable.
+        # Other RayError subclasses can be transient GCS/control-plane failures;
+        # killing a healthy controller on those would violate the exclusive-job
+        # ownership boundary.
+        logger.warning(
+            f"[dataplane] Existing TransferQueueController is unusable ({safe_exception_kind(error)}); reaping it."
+        )
         conf = None
+    except ray.exceptions.RayError as error:
+        raise RuntimeError(f"Failed to inspect TransferQueueController ({safe_exception_kind(error)})") from None
 
     if conf is not None:
-        logger.info("[dataplane] Existing TransferQueueController is healthy; tq.init will attach to it.")
-        return False
+        raise TqConfigurationMismatch(
+            "A healthy TransferQueueController already exists. The initial RDMA release requires an exclusive, "
+            "clean Ray cluster; stop the previous Relax job or remove its TQ state before retrying."
+        )
 
     logger.warning("[dataplane] TransferQueueController has no stored config (half-initialised); reaping it.")
     kill_tq_controller_and_wait()
@@ -243,6 +209,8 @@ def _controller_exists() -> bool:
         return True
     except ValueError:
         return False
+    except ray.exceptions.RayError as error:
+        raise RuntimeError(f"Failed to query TransferQueueController ({safe_exception_kind(error)})") from None
 
 
 def _set_owner_token(conf: Any, token: str) -> None:
@@ -259,11 +227,49 @@ def _get_owner_token(conf: Any) -> str:
     return ""
 
 
+def assert_mooncake_rdma_configured() -> None:
+    """Fail unless the attached client configuration requests Mooncake/RDMA.
+
+    A successful :func:`attach_tq_client` only proves ``tq.init`` returned
+    without raising.  This check also establishes that the stored controller
+    config produced a Mooncake manager and an RDMA-configured storage client:
+    ``tq.init`` ignores the caller's conf when attaching to an existing
+    controller (``interface.py:130-135``).  ``storage_client.protocol`` is the
+    configured request, not a negotiated transport signal, so this is not
+    proof that bytes traversed an HCA or that a native transport fallback is
+    impossible.  Wire-level proof remains the benchmark's counter check.
+
+    Raises
+    ------
+    RuntimeError
+        When the storage manager is not MooncakeStore, when no storage client
+        is present, or when the client's configured protocol is not ``rdma``.
+    """
+    manager = tq.get_client().storage_manager
+    if type(manager).__name__ != "MooncakeStorageManager":
+        raise RuntimeError("attached storage manager is not MooncakeStorageManager")
+
+    store_client = getattr(manager, "storage_client", None)
+    if store_client is None:
+        raise RuntimeError("MooncakeStorageManager exposes no storage_client after attach")
+
+    protocol = getattr(store_client, "protocol", None)
+    if protocol != "rdma":
+        raise RuntimeError("MooncakeStore client is not configured for protocol=rdma")
+
+
 def _get_stored_config(timeout: float = 10.0) -> Any:
-    controller = ray.get_actor(CONTROLLER_NAME, namespace=CONTROLLER_NAMESPACE)
-    conf = ray.get(controller.get_config.remote(), timeout=timeout)
+    try:
+        controller = ray.get_actor(CONTROLLER_NAME, namespace=CONTROLLER_NAMESPACE)
+        conf = ray.get(controller.get_config.remote(), timeout=timeout)
+    except ValueError:
+        raise
+    except ray.exceptions.RayError as error:
+        raise TqControllerInspectionError(
+            f"Failed to read TransferQueueController config ({safe_exception_kind(error)})"
+        ) from None
     if conf is None:
-        raise RuntimeError("TransferQueueController returned no config after tq.init completed")
+        raise TqControllerMissingConfig("TransferQueueController returned no config after tq.init completed")
     return conf
 
 
@@ -281,13 +287,13 @@ def _close_local_tq_client() -> None:
         try:
             store_client.close()
         except Exception as e:  # pragma: no cover - best-effort local cleanup
-            logger.warning(f"[dataplane] Failed to close attached MooncakeStore client: {e}")
+            logger.warning(f"[dataplane] Failed to close attached MooncakeStore client ({safe_exception_kind(e)}).")
 
     if client is not None and hasattr(client, "close"):
         try:
             client.close()
         except Exception as e:  # pragma: no cover - best-effort local cleanup
-            logger.warning(f"[dataplane] Failed to close attached TransferQueue client: {e}")
+            logger.warning(f"[dataplane] Failed to close attached TransferQueue client ({safe_exception_kind(e)}).")
 
     # TransferQueue has no public detach-only API. Reset only process-local
     # handles; never touch _TQ_STORAGE or the named controller actor.
@@ -308,10 +314,10 @@ def _resolve_attach_timeout() -> float:
         return DEFAULT_TQ_ATTACH_TIMEOUT_SECONDS
     try:
         value = float(raw)
-    except ValueError as error:
-        raise RuntimeError(f"RELAX_TQ_ATTACH_TIMEOUT_SECONDS={raw!r} must be a positive number of seconds") from error
-    if value <= 0:
-        raise RuntimeError(f"RELAX_TQ_ATTACH_TIMEOUT_SECONDS={raw!r} must be a positive number of seconds")
+    except ValueError:
+        raise RuntimeError("RELAX_TQ_ATTACH_TIMEOUT_SECONDS must be a finite positive number of seconds") from None
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError("RELAX_TQ_ATTACH_TIMEOUT_SECONDS must be a finite positive number of seconds")
     return value
 
 
@@ -335,7 +341,7 @@ def _await_controller_config(deadline: float) -> None:
         try:
             conf = ray.get(controller.get_config.remote(), timeout=max(min(remaining, 10.0), 0.1))
         except Exception as e:
-            last_error = f"get_config failed: {e}"
+            last_error = f"get_config failed ({safe_exception_kind(e)})"
             time.sleep(min(0.5, max(deadline - time.monotonic(), 0.0)))
             continue
         if conf is not None:
@@ -445,7 +451,41 @@ def detach_tq_client(generation: int | None = None) -> None:
 def _alive_node_ids() -> list[str]:
     """Every alive node: TQ endpoints (Serve replicas and 0-CPU actors) carry
     no placement binding, so any alive node may end up hosting one."""
-    return [n["NodeID"] for n in ray.nodes() if n.get("Alive")]
+    node_ids: list[str] = []
+    for node in ray.nodes():
+        if not node.get("Alive"):
+            continue
+        node_id = node.get("NodeID")
+        if not isinstance(node_id, str) or not node_id:
+            raise RuntimeError("an alive Ray node has no valid NodeID")
+        node_ids.append(node_id)
+    return node_ids
+
+
+def _cancel_handshake_tasks(refs: list[Any], *, timeout: float = 10.0) -> bool:
+    """Force-cancel submitted one-shot workers and confirm every ref is ready.
+
+    A timed-out worker may still own a daemon ``tq.init`` thread.  The caller
+    may only tear down Mooncake and start SimpleStorage after Ray confirms the
+    force-cancelled task refs have reached a terminal state.
+    """
+    cancellation_failed = False
+    for ref in refs:
+        try:
+            ray.cancel(ref, force=True)
+        except Exception as error:  # pragma: no cover - Ray control-plane failure
+            cancellation_failed = True
+            logger.warning(f"[dataplane] Failed to force-cancel a TQ handshake worker ({safe_exception_kind(error)}).")
+    if cancellation_failed:
+        return False
+    try:
+        _ready, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+    except Exception as error:  # pragma: no cover - Ray control-plane failure
+        logger.warning(
+            f"[dataplane] Could not confirm TQ handshake worker cancellation ({safe_exception_kind(error)})."
+        )
+        return False
+    return not pending
 
 
 def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[str]:
@@ -453,45 +493,81 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
     summaries.
 
     Each one-shot task performs the same bounded :func:`attach_tq_client` a
-    worker would perform (real stored config, real storage client) and detaches
-    immediately, so it validates the *actual endpoints* instead of a ``/sys``
-    capability heuristic on a node the scheduler may never use.  The worker is
-    not reused because a timed-out ``tq.init`` daemon thread cannot be stopped
-    safely in-process.  An empty return means every alive node attached within
-    the deadline; the driver aggregates failures and decides one job-level
-    outcome.
+    worker would perform (real stored config, real storage client), confirms a
+    Mooncake manager whose client is configured for ``protocol=rdma``, and
+    detaches immediately.  This validates actual attach/setup and configuration
+    agreement rather than a ``/sys`` heuristic; it is not negotiated-transport
+    or wire proof.  The worker is not reused because a timed-out ``tq.init``
+    daemon thread cannot be stopped safely in-process.  An empty return means
+    every alive node attached within the deadline; the driver aggregates
+    failures and decides one job-level outcome.
     """
     if timeout is None:
         timeout = _resolve_attach_timeout()
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    @ray.remote(num_cpus=0, max_retries=0, max_calls=1)
-    def _handshake(handshake_conf: Any) -> None:
-        from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
+    try:
+        node_ids = _alive_node_ids()
+    except Exception as error:
+        return [f"cluster: node discovery failed ({safe_exception_kind(error)})"]
+    if not node_ids:
+        return ["cluster: no alive Ray nodes discovered"]
 
-        attach_tq_client(handshake_conf, role="attach-handshake")
-        detach_tq_client()
+    expects_mooncake = uses_mooncake(conf)
 
     refs: list[Any] = []
     id_by_ref: dict[Any, str] = {}
-    for node_id in _alive_node_ids():
-        strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        ref = _handshake.options(scheduling_strategy=strategy).remote(conf)
-        refs.append(ref)
-        id_by_ref[ref] = node_id
+    try:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        @ray.remote(num_cpus=0, max_retries=0, max_calls=1)
+        def _handshake(handshake_conf: Any, check_mooncake: bool, attach_timeout: float) -> None:
+            from relax.utils.tq.lifecycle import (
+                assert_mooncake_rdma_configured,
+                attach_tq_client,
+                detach_tq_client,
+            )
+
+            attach_tq_client(handshake_conf, role="attach-handshake", timeout=attach_timeout)
+            try:
+                if check_mooncake:
+                    assert_mooncake_rdma_configured()
+            finally:
+                # A failed assertion must not leak this node's registered
+                # segment; without the detach it lingers until client_ttl.
+                detach_tq_client()
+
+        for node_id in node_ids:
+            strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+            ref = _handshake.options(scheduling_strategy=strategy).remote(conf, expects_mooncake, timeout)
+            refs.append(ref)
+            id_by_ref[ref] = node_id
+    except Exception as error:
+        if refs and not _cancel_handshake_tasks(refs):
+            raise TqHandshakeIsolationError(
+                "submitted TQ handshake workers could not be confirmed stopped after scheduling failed"
+            ) from None
+        return [f"cluster: handshake scheduling failed ({safe_exception_kind(error)})"]
 
     # Grace beyond the per-node attach deadline covers task scheduling and
     # worker startup on a busy cluster.
     wait_bound = timeout + 30.0
-    ready, pending = ray.wait(refs, num_returns=len(refs), timeout=wait_bound)
+    try:
+        ready, pending = ray.wait(refs, num_returns=len(refs), timeout=wait_bound)
+    except Exception as error:
+        if not _cancel_handshake_tasks(refs):
+            raise TqHandshakeIsolationError(
+                "submitted TQ handshake workers could not be confirmed stopped after wait failed"
+            ) from None
+        return [f"cluster: handshake wait failed ({safe_exception_kind(error)})"]
     failures: list[str] = []
     for ref in ready:
         try:
             ray.get(ref)
-        except Exception as e:
-            failures.append(f"node {id_by_ref[ref][:12]}: {e}")
+        except Exception as error:
+            failures.append(f"node {id_by_ref[ref][:12]}: handshake task failed ({safe_exception_kind(error)})")
+    if pending and not _cancel_handshake_tasks(pending):
+        raise TqHandshakeIsolationError("timed-out TQ handshake workers could not be confirmed stopped")
     for ref in pending:
-        ray.cancel(ref, force=True)
         failures.append(f"node {id_by_ref[ref][:12]}: handshake did not return within {wait_bound:.0f}s")
     return failures
 
@@ -525,7 +601,7 @@ def close_tq_and_unmount(*, is_owner: bool) -> None:
             store_client.close()
             logger.info("[dataplane] Unmounted MooncakeStore segment on teardown.")
         except Exception as e:  # pragma: no cover - best-effort cleanup
-            logger.warning(f"[dataplane] Failed to unmount MooncakeStore segment: {e}")
+            logger.warning(f"[dataplane] Failed to unmount MooncakeStore segment ({safe_exception_kind(e)}).")
 
 
 @ray.remote(num_cpus=0)
@@ -554,7 +630,7 @@ def _stop_owner_actor(owner: Any) -> None:
     try:
         ray.kill(owner)
     except Exception as e:  # pragma: no cover - actor may already be dead
-        logger.debug(f"[dataplane] TQ owner actor already stopped: {e}")
+        logger.debug(f"[dataplane] TQ owner actor already stopped ({safe_exception_kind(e)}).")
 
 
 def _cleanup_failed_owner(owner: Any, owner_token: str, *, timeout: float = 10.0) -> None:
@@ -567,7 +643,7 @@ def _cleanup_failed_owner(owner: Any, owner_token: str, *, timeout: float = 10.0
     try:
         ray.get(owner.close.remote(), timeout=timeout)
     except Exception as e:
-        logger.warning(f"[dataplane] TQ owner cleanup RPC failed; killing owner actor: {e}")
+        logger.warning(f"[dataplane] TQ owner cleanup RPC failed; killing owner actor ({safe_exception_kind(e)}).")
     finally:
         _stop_owner_actor(owner)
 
@@ -575,10 +651,22 @@ def _cleanup_failed_owner(owner: Any, owner_token: str, *, timeout: float = 10.0
         stored_conf = _get_stored_config(timeout=timeout)
     except ValueError:
         return
-    except Exception as e:
-        logger.warning(f"[dataplane] Failed initializer left an unusable TQ controller ({e}); reaping it.")
+    except TqControllerMissingConfig as error:
+        logger.warning(
+            "[dataplane] Failed initializer left a half-initialised TQ controller "
+            f"({safe_exception_kind(error)}); reaping it."
+        )
         kill_tq_controller_and_wait()
         return
+    except TqControllerInspectionError:
+        # The owner process has already been stopped, but a transient GCS error
+        # cannot prove that any visible controller belongs to this attempt.
+        # Fail closed instead of risking another job's healthy controller.
+        raise
+    except Exception as error:
+        raise TqControllerInspectionError(
+            f"Unexpected failure while inspecting TransferQueueController ({safe_exception_kind(error)})"
+        ) from None
 
     stored_token = _get_owner_token(stored_conf)
     if stored_token == owner_token:
@@ -592,35 +680,40 @@ def _cleanup_failed_owner(owner: Any, owner_token: str, *, timeout: float = 10.0
 
 
 def _start_owner(conf: Any, *, timeout: float) -> TqInitResult:
-    owner = _TransferQueueOwner.remote()
     owner_token = uuid.uuid4().hex
     try:
+        owner = _TransferQueueOwner.remote()
+    except ray.exceptions.RayError as error:
+        raise RuntimeError(f"TransferQueue owner creation failed ({safe_exception_kind(error)})") from None
+    try:
         stored_conf, owns_controller = ray.get(owner.initialize.remote(conf, owner_token), timeout=timeout)
-    except ray.exceptions.GetTimeoutError as e:
+    except ray.exceptions.GetTimeoutError:
         _cleanup_failed_owner(owner, owner_token)
-        raise TqInitializationTimeout(f"tq.init did not finish within {timeout:.0f}s") from e
-    except Exception:
+        raise TqInitializationTimeout(f"tq.init did not finish within {timeout:.0f}s") from None
+    except Exception as error:
         _cleanup_failed_owner(owner, owner_token)
+        if isinstance(error, ray.exceptions.RayError):
+            raise RuntimeError(f"TransferQueue owner initialization failed ({safe_exception_kind(error)})") from None
         raise
 
     if owns_controller:
         return TqInitResult(config=stored_conf, owner=owner)
 
-    # A concurrent initializer won the named-actor race. This process is only
-    # attached and must never retain an actor capable of global tq.close().
-    config_mismatch = _configuration_signature(stored_conf) != _configuration_signature(conf)
+    # A controller appeared after the exclusive-cluster pre-check.  This owner
+    # only attached to it, so detach locally and fail instead of silently sharing
+    # global state with a concurrent initializer.
     try:
         ray.get(owner.detach.remote(), timeout=10.0)
+    except ray.exceptions.RayError as error:
+        raise RuntimeError(
+            f"TransferQueue concurrent-initializer detach failed ({safe_exception_kind(error)})"
+        ) from None
     finally:
         _stop_owner_actor(owner)
-    if config_mismatch:
-        raise TqConfigurationMismatch(
-            "A concurrent TransferQueue initializer won with a different backend config or controller sampling "
-            "contract "
-            f"(requested={_backend_description(conf)}, stored={_backend_description(stored_conf)}). "
-            "Detached without modifying the winning controller."
-        )
-    return TqInitResult(config=stored_conf, owner=None)
+    raise TqConfigurationMismatch(
+        "A concurrent TransferQueue initializer created a healthy controller. "
+        "Detached without modifying it; the initial RDMA release requires an exclusive Ray cluster."
+    )
 
 
 def close_tq_owner(owner: Any | None, *, timeout: float = 30.0) -> None:
@@ -640,7 +733,7 @@ def close_tq_owner(owner: Any | None, *, timeout: float = 30.0) -> None:
     if _controller_exists():
         kill_tq_controller_and_wait()
     if close_error is not None:
-        raise RuntimeError(f"TransferQueue owner cleanup failed: {close_error}") from close_error
+        raise RuntimeError(f"TransferQueue owner cleanup failed ({safe_exception_kind(close_error)})") from None
 
 
 def initialize_tq_with_fallback(
@@ -659,18 +752,6 @@ def initialize_tq_with_fallback(
 
     def _attempt(attempt_conf: Any) -> TqInitResult:
         reap_unusable_tq_controller()
-        if _controller_exists():
-            # Attach semantics: use the controller's actual config. Upstream
-            # tq.init(conf) returns the caller-provided config even when ignored.
-            stored_conf = _get_stored_config()
-            if _configuration_signature(stored_conf) != _configuration_signature(attempt_conf):
-                raise TqConfigurationMismatch(
-                    "Refusing to attach to an existing TransferQueueController with a different backend config "
-                    "or controller sampling contract "
-                    f"(requested={_backend_description(attempt_conf)}, stored={_backend_description(stored_conf)}). "
-                    "Only the owner may close the existing controller."
-                )
-            return TqInitResult(config=stored_conf, owner=None)
         return _start_owner(attempt_conf, timeout=timeout)
 
     try:
@@ -681,7 +762,7 @@ def initialize_tq_with_fallback(
 
         reason = f"mooncake_init_failed:{type(primary_error).__name__}"
         logger.warning(
-            f"[dataplane] Mooncake tq.init failed ({primary_error}); "
+            f"[dataplane] Mooncake tq.init failed ({safe_exception_kind(primary_error)}); "
             "cleaned partial state and retrying once with SimpleStorage."
         )
         try:
@@ -689,8 +770,9 @@ def initialize_tq_with_fallback(
         except Exception as fallback_error:
             raise RuntimeError(
                 "TransferQueue SimpleStorage fallback initialization failed after "
-                f"Mooncake initialization error: {primary_error}"
-            ) from fallback_error
+                f"Mooncake initialization error ({safe_exception_kind(primary_error)}); "
+                f"fallback error ({safe_exception_kind(fallback_error)})"
+            ) from None
         return TqInitResult(
             config=result.config,
             owner=result.owner,

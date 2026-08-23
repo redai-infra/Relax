@@ -94,7 +94,6 @@ def build_tq_config(config_name: str, args: argparse.Namespace, num_storage_unit
     from omegaconf import OmegaConf
     from transfer_queue import GRPOGroupNSampler
 
-    from relax.utils.rdma_probe import EffectiveConfig
     from relax.utils.tq.config import build_mooncake_config, build_simple_storage_config
 
     cfg = CONFIG_MAP[config_name]
@@ -106,13 +105,12 @@ def build_tq_config(config_name: str, args: argparse.Namespace, num_storage_unit
         )
     else:
         master_addr = args.master_address or os.environ.get("MC_MASTER_ADDRESS", "localhost:50051")
-        eff = EffectiveConfig(
-            backend="MooncakeStore",
-            protocol=cfg["protocol"],
+        backend_dict = build_mooncake_config(
+            master_address=master_addr,
             device=args.device,
-            fallback_reason="",
+            protocol=cfg["protocol"],
+            global_segment_size=8 * 1024**3,
         )
-        backend_dict = build_mooncake_config(eff, master_address=master_addr, global_segment_size=8 * 1024**3)
 
     return OmegaConf.create(
         {

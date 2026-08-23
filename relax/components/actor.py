@@ -77,13 +77,11 @@ class Actor(Base):
             lease_owner=self,
         )
 
-        self.steps = ray.get(
-            self.actor_model.async_init(
-                config,
-                role=self.role,
-                with_ref=config.kl_coef != 0 or config.use_kl_loss,
-                with_opd_teacher=self.config.opd_teacher_load,
-            )
+        self.steps = self.actor_model.init_and_wait(
+            config,
+            role=self.role,
+            with_ref=config.kl_coef != 0 or config.use_kl_loss,
+            with_opd_teacher=self.config.opd_teacher_load,
         )
 
         assert len(set(self.steps)) == 1

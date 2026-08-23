@@ -2,14 +2,11 @@
 
 """Fail-closed capability validation for TransferQueue's Mooncake backend.
 
-Relax refuses to run MooncakeStore unless the installed TransferQueue and
-mooncake expose the primitives that make silent data loss detectable.  This
-module validates capabilities and environment only; it never modifies
-TransferQueue at runtime.  The temporary runtime patches that harden the
-remaining gaps of the pinned revision (per-retry result validation, raising
-removal failures, and a strict production-status ACK) are maintained in a
-separate version-gated PR so their exact applicability and removal condition
-stay reviewable on their own.
+Relax validates the capabilities and environment it can inspect without
+modifying TransferQueue at runtime.  Per-retry result-length validation and a
+strict production-status ACK must be fixed in upstream TransferQueue and then
+consumed through an updated, capability-marked pin; method-name checks alone do
+not prove those semantics.
 
 The pinned mooncake 0.3.10 additionally corrupts TCP-protocol transfers
 through its auto-enabled memcpy fast path, so that path is force-disabled
@@ -39,7 +36,7 @@ def _enforce_safe_memcpy() -> None:
     override = os.environ.get("MC_STORE_MEMCPY", "").strip()
     if override not in ("", "0"):
         raise RuntimeError(
-            f"MC_STORE_MEMCPY={override!r} is rejected: the pinned mooncake 0.3.10 "
+            "MC_STORE_MEMCPY explicitly enables an unsafe value: the pinned mooncake 0.3.10 "
             "memcpy fast path silently truncates TCP transfers and can SIGSEGV. "
             "Unset MC_STORE_MEMCPY; Relax forces it to 0 on this version."
         )
@@ -49,8 +46,9 @@ def _enforce_safe_memcpy() -> None:
 def ensure_mooncake_correctness_guards() -> None:
     """Validate that the installed stack can run MooncakeStore safely.
 
-    Read-only: checks the memcpy environment contract and that the pinned
+    Enforces the memcpy environment contract and checks that the pinned
     TransferQueue ships the Mooncake retry APIs Relax's data plane relies on.
+    It does not modify TransferQueue code or objects at runtime.
     """
     _enforce_safe_memcpy()
     try:

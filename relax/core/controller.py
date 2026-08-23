@@ -47,19 +47,21 @@ from relax.utils.opd.opd_utils import (
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
-from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate_config
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
 from relax.utils.tq.config import (
     build_backend_config,
     resolve_mooncake_master_address,
     resolve_tq_capacity_batch_size,
+    validate_config,
     validate_mooncake_runtime_contract,
 )
 from relax.utils.tq.lifecycle import (
+    TqHandshakeIsolationError,
     TqInitResult,
     close_tq_owner,
     initialize_tq_with_fallback,
     reap_unusable_tq_controller,
+    safe_exception_kind,
     uses_mooncake,
     verify_cluster_attach,
 )
@@ -153,9 +155,11 @@ class Controller:
         # is launched (RL is resolved later in placement_group.py).
         resolve_sft_num_rollout(self.config)
 
-        # Initialize data management system
-        self._initialize_data_system()
         try:
+            # Include data-system initialization in the constructor cleanup
+            # transaction: a cluster-handshake orchestration error can happen
+            # after the owner actor has created global TQ state.
+            self._initialize_data_system()
             self.dcs, self.config.coordinator_url = create_dcs_deployment()
 
             self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
@@ -198,11 +202,13 @@ class Controller:
             # so the TQ owner (and any TransferQueueController it owns) would
             # be orphaned and the next launch would attach with owner=None,
             # making its shutdown a no-op. Close what this job created.
-            logger.error("Controller construction failed after TQ initialization; closing TQ owner.")
+            logger.error("Controller construction failed; closing any initialized TQ state.")
             try:
                 self._close_data_system()
             except Exception as cleanup_error:  # pragma: no cover - best effort
-                logger.warning(f"TQ owner cleanup during failed construction failed: {cleanup_error}")
+                logger.warning(
+                    f"TQ owner cleanup during failed construction failed ({safe_exception_kind(cleanup_error)})."
+                )
             raise
 
     def _cleanup_s3_model_weights_after_init(self) -> None:
@@ -344,6 +350,11 @@ class Controller:
             mode=getattr(self.config, "tq_rdma_mode", "off"),
             fallback_conf=fallback_config,
         )
+        # The owner becomes this Controller's cleanup responsibility before
+        # the cluster handshake.  Otherwise a driver-side scheduling error can
+        # escape while ``self._tq_owner`` is still None and orphan global TQ
+        # state during constructor failure.
+        self._tq_owner = init_result.owner
         if uses_mooncake(init_result.config):
             init_result = self._confirm_mooncake_attach(init_result, fallback_config)
         self._tq_owner = init_result.owner
@@ -353,18 +364,46 @@ class Controller:
         logger.info(f"[dataplane] controller ownership={'owner' if init_result.owns_controller else 'attached'}")
 
     def _confirm_mooncake_attach(self, init_result: TqInitResult, fallback_config) -> TqInitResult:
-        """Bounded attach handshake on every alive node before the job-level
-        Mooncake config is confirmed.
+        """Validate Mooncake attach/setup on every alive Ray node.
 
-        The RDMA probe cannot cover this: TQ clients live in Ray Serve replicas
-        and 0-CPU actors with no placement binding, so they may land on nodes
-        the GPU-only probe never saw, and a worker-side ``tq.init`` has no
-        timeout of its own.  The handshake attaches (bounded) from every alive
-        node and reports failures back here, so ``auto`` degrades the whole job
-        to one backend instead of hanging or failing a single replica mid-
-        deployment.
+        There is no static ``/sys`` probe.  TQ clients live in Ray Serve
+        replicas and 0-CPU actors with no placement binding, so they may land
+        on any alive node, and a worker-side ``tq.init`` has no timeout of its
+        own.  Each alive node therefore performs a bounded attach with the
+        stored config, confirms a Mooncake manager whose client is configured
+        for RDMA, and detaches.  This is configuration/setup evidence, not
+        negotiated-transport or wire proof.
+        Failures are aggregated here so ``auto`` converges the whole job on one
+        backend instead of failing a single replica mid-deployment.
+
+        On failure the Mooncake state created for this attempt is torn down
+        *before* any SimpleStorage initialisation: a surviving half-initialised
+        controller would make the next ``tq.init`` poll forever (F10).
         """
-        failures = verify_cluster_attach(init_result.config)
+
+        def _close_owned_attempt() -> None:
+            if not init_result.owns_controller:
+                return
+            try:
+                close_tq_owner(init_result.owner)
+            finally:
+                self._tq_owner = None
+
+        try:
+            failures = verify_cluster_attach(init_result.config)
+        except TqHandshakeIsolationError:
+            _close_owned_attempt()
+            raise RuntimeError(
+                "Mooncake attach handshake workers could not be confirmed stopped; global fallback is unsafe"
+            ) from None
+        except Exception as error:
+            # Defensive boundary: verify_cluster_attach normally converts
+            # driver failures into stable summaries.  An unexpected exception
+            # still must not strand the owner created for this attempt.
+            _close_owned_attempt()
+            raise RuntimeError(
+                f"Mooncake attach handshake orchestration failed ({safe_exception_kind(error)})"
+            ) from None
         if not failures:
             logger.info("[dataplane] Mooncake attach handshake passed on all alive nodes.")
             return init_result
@@ -372,38 +411,45 @@ class Controller:
         detail = "; ".join(failures)
         mode = getattr(self.config, "tq_rdma_mode", "off")
         if mode != "auto" or not init_result.owns_controller or fallback_config is None:
-            # off/required must fail loudly, and a job that merely attached to
-            # a foreign controller must never tear it down or replace its
-            # backend unilaterally.
-            if init_result.owns_controller:
-                close_tq_owner(init_result.owner)
+            # ``required`` must fail loudly, and a job that merely attached to a
+            # foreign controller must never tear it down or replace its backend
+            # unilaterally.
+            _close_owned_attempt()
             raise RuntimeError(
-                f"Mooncake attach handshake failed on {len(failures)} node(s) (--tq-rdma-mode={mode}): {detail}"
+                f"Mooncake attach handshake reported {len(failures)} failure(s) (--tq-rdma-mode={mode}): {detail}"
             )
 
         logger.warning(
-            f"[dataplane] Mooncake attach handshake failed on {len(failures)} node(s) ({detail}); "
+            f"[dataplane] Mooncake attach handshake reported {len(failures)} failure(s) ({detail}); "
             "closing Mooncake state and converging the whole job to SimpleStorage."
         )
-        close_tq_owner(init_result.owner)
+        # A cleanup failure leaves global TQ state unknown, so it must propagate
+        # instead of starting SimpleStorage on top of a possibly dirty cluster.
+        _close_owned_attempt()
         fallback_result = initialize_tq_with_fallback(fallback_config, mode="auto")
+        self._tq_owner = fallback_result.owner
         return TqInitResult(
             config=fallback_result.config,
             owner=fallback_result.owner,
-            fallback_reason=f"attach_handshake_failed:{len(failures)}_nodes",
+            fallback_reason=f"attach_handshake_failed:{len(failures)}_failures",
         )
 
     def _resolve_tq_backend(self, total_storage_size: int) -> dict:
         """Resolve the TransferQueue ``backend`` config dict.
 
-        ``--tq-rdma-mode=off`` retains the previous SimpleStorage and ownership
-        semantics while sharing the bounded worker-attach and failure-cleanup
-        hardening.  ``auto``/``required`` run the RDMA capability probe
-        *before* ``tq.init`` and emit the startup log line; ``auto`` falls back
-        to SimpleStorage, ``required`` fails fast.
+        This method only validates *configuration*: the requested mode, the
+        TransferQueue correctness contract, the master endpoint and the segment
+        capacity.  It deliberately performs no hardware capability probe -- a
+        ``/sys`` scan cannot see which nodes the scheduler will actually use,
+        and host-RDMA capability is established afterwards by the real attach
+        handshake in :meth:`_confirm_mooncake_attach`.
+
+        ``off`` retains the previous SimpleStorage and ownership semantics.  For
+        ``auto``/``required``, any unmet precondition either falls back to
+        SimpleStorage (``auto``) or fails fast (``required``).
         """
-        # 1. Validate the requested mode (structural, before any probe).
-        #    getattr defaults keep old checkpoints / non-argparse configs safe.
+        # 1. Validate the requested mode. A malformed mode is a configuration
+        #    error, never a reason to silently run on SimpleStorage.
         errors = validate_config(self.config)
         if errors:
             raise ValueError("Invalid TransferQueue RDMA configuration:\n  " + "\n  ".join(errors))
@@ -419,14 +465,14 @@ class Controller:
             )
 
         def _fall_back_or_raise(reason: str, error: Exception) -> dict:
-            """Every host-RDMA precondition failure funnels through here.
+            """Every unmet host-RDMA precondition funnels through here.
 
             ``auto`` converges the whole job on SimpleStorage; ``required`` re-
             raises so an operator who demanded RDMA never runs silently
             downgraded.
             """
             if mode != "auto":
-                raise RuntimeError(f"--tq-rdma-mode={mode} but {reason}: {error}") from error
+                raise RuntimeError(f"--tq-rdma-mode={mode} but {reason}: {error}") from None
             logger.warning(f"[dataplane] {reason}; auto fallback to SimpleStorage: {error}")
             return _simple_storage()
 
@@ -434,10 +480,7 @@ class Controller:
         if mode == "off":
             return _simple_storage()
 
-        # 3. Host-RDMA path: probe → reduce → effective config.
-        #    The driver fans the probe out to every alive GPU node via Ray
-        #    (probe_cluster_nodes), then AND-reduces to a single job-level
-        #    effective config so all data-plane workers converge identically.
+        # 3. Configuration preconditions for the host-RDMA path.
         device = getattr(self.config, "tq_rdma_device", "")
         try:
             validate_mooncake_runtime_contract()
@@ -452,37 +495,29 @@ class Controller:
             # unreachable for the whole job, so it degrades like any other
             # unmet precondition rather than aborting an ``auto`` run.
             return _fall_back_or_raise("the Mooncake master endpoint is not configured", e)
-        probe_results = probe_cluster_nodes(device, master_address)
 
-        effective = reduce_results(probe_results, requested_device=device)
-
-        # 4. Only auto mode may fall back; ``required`` demands host RDMA.
-        if mode != "auto" and effective.fallback_reason:
-            detail = "\n".join(r.summary() for r in probe_results)
-            raise RuntimeError(
-                f"--tq-rdma-mode={mode} but host RDMA is unavailable: "
-                f"{effective.fallback_reason}.\n"
-                f"Probe details:\n{detail}"
+        # 4. Build the backend dict.  Capacity validation reports an
+        #    insufficient segment via ``cap_error``, but it can also *raise* for
+        #    an unusable capacity input (garbage
+        #    ``RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB``, missing ``seq_length``); both
+        #    are configuration failures and must degrade identically.
+        try:
+            backend_dict, cap_error = build_backend_config(
+                self.config,
+                device=device,
+                master_address=master_address,
+                total_storage_size=total_storage_size,
             )
-
-        # 5. Build backend dict (may fall back to SimpleStorage on capacity error).
-        backend_dict, cap_error = build_backend_config(self.config, effective, total_storage_size=total_storage_size)
-
-        # 6. Capacity fallback is also auto-only; ``required`` fails instead of
-        #    silently changing backend.
-        if mode != "auto" and cap_error:
-            raise RuntimeError(f"--tq-rdma-mode={mode} but segment capacity insufficient: {cap_error}")
-
-        # 7. Log requested vs effective so the startup log alone explains the
-        #    decision, plus one summary block per probed node.
-        logger.info(f"[dataplane] requested: rdma_mode={mode} device={device or 'auto'}")
-        for result in probe_results:
-            logger.info(f"[dataplane] probe result:\n{result.summary()}")
+        except RuntimeError as e:
+            return _fall_back_or_raise("the segment-capacity configuration is unusable", e)
         if cap_error:
-            logger.warning(f"[dataplane] MooncakeStore capacity fallback to SimpleStorage: {cap_error}")
-            logger.info("[dataplane] backend=SimpleStorage fallback=segment_capacity_insufficient")
-        else:
-            logger.info(effective.log_line())
+            return _fall_back_or_raise("segment capacity insufficient", RuntimeError(cap_error))
+
+        # 5. One startup line stating what was requested and what will run. The
+        #    effective transport is only confirmed once the cluster-wide attach
+        #    handshake passes.
+        logger.info(f"[dataplane] requested: rdma_mode={mode} device={device or 'auto'}")
+        logger.info(f"[dataplane] backend=MooncakeStore protocol=rdma device={device or 'auto'} (pending handshake)")
         return backend_dict
 
     def _close_data_system(self) -> None:

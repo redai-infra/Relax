@@ -50,7 +50,7 @@ class Critic(Base):
             args=config, num_gpus=num_gpus, pg=pgs, role=self.role, runtime_env=runtime_env
         )
 
-        ray.get(self.critic_model.async_init(config, role=self.role, with_ref=False))
+        self.critic_model.init_and_wait(config, role=self.role, with_ref=False)
         self.step = getattr(self.config, "start_rollout_id", None) or 0
         # Wired by controller in colocate PPO to gate wake_up on SGLang offload.
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None

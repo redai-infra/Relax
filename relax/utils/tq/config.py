@@ -3,9 +3,10 @@
 """Build TransferQueue backend config dicts from Relax CLI args.
 
 This module is the single place that maps Relax-side *intent* flags
-(``--tq-rdma-mode``, ``--tq-rdma-device``) plus an
-:class:`~relax.utils.rdma_probe.EffectiveConfig` into the OmegaConf dict that
-``tq.init`` expects.
+(``--tq-rdma-mode``, ``--tq-rdma-device``) into the OmegaConf dict that
+``tq.init`` expects, and the only place that validates the configuration
+preconditions for MooncakeStore.  Actual host-RDMA capability is established by
+the real attach handshake in :mod:`relax.utils.tq.lifecycle`, not here.
 
 Mooncake internals (endpoint, buffer size, segment size, master address,
 timeout) are intentionally *not* exposed as CLI flags — they come from
@@ -15,15 +16,18 @@ internal defaults or the deployment environment, per maintainer guidance.
 from __future__ import annotations
 
 import inspect
+import math
 import os
 from typing import Any
 
 from relax.utils.logging_utils import get_logger
-from relax.utils.rdma_probe import EffectiveConfig
 from relax.utils.tq.correctness import ensure_mooncake_correctness_guards
 
 
 logger = get_logger(__name__)
+
+# Accepted ``--tq-rdma-mode`` values; ``off`` keeps the SimpleStorage path.
+TQ_RDMA_MODES = frozenset({"off", "auto", "required"})
 
 # ---------------------------------------------------------------------------
 # Defaults (kept here rather than in config.yaml so they are visible to
@@ -35,13 +39,71 @@ _DEFAULT_LOCAL_BUFFER_SIZE = 1 * 1024**3  # 1 GiB per client (config.yaml:54)
 _DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"  # config.yaml:42-43
 
 
+def validate_config(args: Any) -> list[str]:
+    """Return error messages for an invalid RDMA configuration.
+
+    Called at startup before anything is initialised.  An empty list means the
+    requested mode is structurally valid; whether host RDMA actually works is
+    decided later by the real attach handshake.  ``argparse`` already
+    constrains the mode for CLI runs, so this also covers configs restored from
+    a checkpoint or built programmatically.
+    """
+    errors: list[str] = []
+    mode = getattr(args, "tq_rdma_mode", "off")
+    device = getattr(args, "tq_rdma_device", "")
+
+    if not isinstance(mode, str) or mode not in TQ_RDMA_MODES:
+        errors.append(f"--tq-rdma-mode must be one of {', '.join(sorted(TQ_RDMA_MODES))}.")
+    if not isinstance(device, str):
+        errors.append("--tq-rdma-device must be a string.")
+    elif device and any(character.isspace() or not character.isprintable() for character in device):
+        errors.append("--tq-rdma-device must be empty or a single printable device name without whitespace.")
+    return errors
+
+
+def _split_host_port(address: str) -> tuple[str, int]:
+    """Parse ``host:port`` (and bracketed IPv6) or raise ``ValueError``.
+
+    Format-only: no DNS resolution and no connection attempt, so this stays a
+    configuration check rather than becoming another capability probe.
+
+    Failure messages name the *kind* of defect and never echo ``address``: the
+    caller logs them, and a deployment endpoint is internal infrastructure
+    detail that must not leak into job logs.
+    """
+    value = address.strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0 or end + 2 > len(value) or value[end + 1] != ":":
+            raise ValueError("bracketed endpoint must be [host]:port")
+        host, port_text = value[1:end], value[end + 2 :]
+    else:
+        host, separator, port_text = value.rpartition(":")
+        if not separator:
+            raise ValueError("endpoint must be host:port")
+        if ":" in host:
+            # A bare IPv6 literal: rpartition would silently treat its last
+            # group as the port (``fe80::1`` -> host ``fe80:``, port 1).
+            raise ValueError("IPv6 endpoint must be bracketed as [host]:port")
+    if not host:
+        raise ValueError("endpoint has an empty host")
+    if any(character.isspace() or not character.isprintable() for character in host):
+        raise ValueError("endpoint host must not contain whitespace or control characters")
+    if not port_text.isdigit():
+        raise ValueError("endpoint port must be a decimal number")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("endpoint port is outside 1-65535")
+    return host, port
+
+
 def resolve_mooncake_master_address() -> str:
     """Return the externally managed Mooncake master endpoint.
 
-    ``MC_MASTER_ADDRESS`` is required.  A loopback default would make every
-    node of a multi-node job treat its own localhost as the master, so the
-    reachability probe would degrade ``auto`` runs and abort ``off``/
-    ``required`` runs even when a shared master is healthy elsewhere.
+    ``MC_MASTER_ADDRESS`` is required and must parse as ``host:port``.  A
+    loopback default would make every node of a multi-node job treat its own
+    localhost as the master, so ``auto`` would degrade and ``required`` would
+    abort even when a shared master is healthy elsewhere.
     """
     address = os.environ.get("MC_MASTER_ADDRESS", "").strip()
     if not address:
@@ -50,6 +112,10 @@ def resolve_mooncake_master_address() -> str:
             "managed mooncake master on every node; Relax never assumes a loopback "
             "endpoint."
         )
+    try:
+        _split_host_port(address)
+    except ValueError as error:
+        raise RuntimeError(f"MC_MASTER_ADDRESS is not a usable endpoint: {error}") from error
     return address
 
 
@@ -67,26 +133,35 @@ def resolve_global_segment_size() -> int:
         return _DEFAULT_GLOBAL_SEGMENT_SIZE
     try:
         gib = float(raw)
-    except ValueError as error:
-        raise RuntimeError(f"RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB={raw!r} must be a positive number of GiB") from error
-    if gib <= 0:
-        raise RuntimeError(f"RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB={raw!r} must be a positive number of GiB")
-    return int(gib * 1024**3)
+    except ValueError:
+        raise RuntimeError("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB must be a finite positive number of GiB") from None
+    if not math.isfinite(gib) or gib <= 0:
+        raise RuntimeError("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB must be a finite positive number of GiB")
+    size_bytes = int(gib * 1024**3)
+    if size_bytes <= 0:
+        raise RuntimeError("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB must resolve to at least one byte")
+    return size_bytes
 
 
 def validate_mooncake_runtime_contract() -> None:
-    """Install and validate the Mooncake loss-prevention contract.
+    """Validate the Relax-side portion of the Mooncake safety contract.
 
-    A version number alone is insufficient for development builds. Relax
-    therefore installs process-local guards that validate every batch response,
-    propagate removal failures, and require a positive production-status ACK.
-    Every process calls this before creating or attaching a Mooncake client.
+    The environment guard and available read-only capability checks run before
+    every Mooncake client is created or attached.  Retry result-length and
+    positive-ACK correctness must be supplied by the pinned upstream
+    TransferQueue revision; this function does not monkey-patch that package.
     """
     ensure_mooncake_correctness_guards()
 
     from transfer_queue.storage.managers.base import KVStorageManager
 
-    put_source = inspect.getsource(KVStorageManager.put_data)
+    try:
+        put_source = inspect.getsource(KVStorageManager.put_data)
+    except (OSError, TypeError):
+        # No retrievable source (compiled/stripped install): the ordering
+        # contract cannot be proven, so fail like any other unmet gate instead
+        # of escaping this RuntimeError-only boundary.
+        raise RuntimeError("Cannot verify TransferQueue put/notify ordering because source is unavailable") from None
     storage_call = put_source.find("self.storage_client.put")
     ready_notify = put_source.find("self.notify_data_update")
     if storage_call < 0 or ready_notify < 0 or storage_call > ready_notify:
@@ -118,29 +193,38 @@ def build_simple_storage_config(total_storage_size: int | None, num_data_storage
 
 
 def build_mooncake_config(
-    effective: EffectiveConfig,
     *,
-    master_address: str | None = None,
+    master_address: str,
+    device: str = "",
+    protocol: str = "rdma",
     global_segment_size: int | None = None,
 ) -> dict[str, Any]:
     """Build the ``backend`` dict for MooncakeStore.
 
     Parameters
     ----------
-    effective
-        The job-level :class:`EffectiveConfig` after probing.
     master_address
-        External master server address.  If ``None``, read from the required
-        ``MC_MASTER_ADDRESS`` env var (see
-        :func:`resolve_mooncake_master_address`).
+        External master server address, already validated by
+        :func:`resolve_mooncake_master_address`.  It is passed in rather than
+        re-read from the environment so the value that was checked is the value
+        that gets used.
+    device
+        Explicit RDMA device name; empty lets Mooncake select one natively.
+    protocol
+        Transport. Production only ever builds ``rdma``; ``tcp`` exists solely
+        for the C1 benchmark baseline.
     global_segment_size
         Override the per-client segment size.  ``None`` resolves from
         ``RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB`` (default 4 GiB, see
         :func:`resolve_global_segment_size`).  Benchmarks may pass a larger
         value (e.g. 8 GiB) to avoid staging-buffer pressure.
     """
-    if master_address is None:
-        master_address = resolve_mooncake_master_address()
+    if global_segment_size is None:
+        segment_size = resolve_global_segment_size()
+    elif isinstance(global_segment_size, bool) or not isinstance(global_segment_size, int) or global_segment_size <= 0:
+        raise ValueError("global_segment_size must be a positive integer number of bytes")
+    else:
+        segment_size = global_segment_size
 
     cfg: dict[str, Any] = {
         # Selects the manager inside ``tq.init`` (interface.py reads
@@ -150,15 +234,15 @@ def build_mooncake_config(
         "storage_backend": "MooncakeStore",
         "MooncakeStore": {
             # Transport
-            "protocol": effective.protocol,  # "rdma" or "tcp"
-            "device_name": effective.device,
+            "protocol": protocol,
+            "device_name": device,
             # Master / metadata — externally managed, never auto-init.
             "auto_init": False,
             "master_server_address": master_address,
             "metadata_server": _DEFAULT_METADATA_SERVER,
             "local_hostname": "",  # empty = auto-detect via Ray node IP
             # Memory
-            "global_segment_size": global_segment_size or resolve_global_segment_size(),
+            "global_segment_size": segment_size,
             "local_buffer_size": _DEFAULT_LOCAL_BUFFER_SIZE,
             # Do NOT silently evict produced-but-unconsumed data.
             "hard_pin": True,
@@ -228,17 +312,14 @@ def estimate_payload_bytes(args: Any) -> int:
     return capacity_batch * n_samples * per_sample
 
 
-def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | None:
+def validate_segment_capacity(args: Any) -> str | None:
     """Return an error message if segment capacity is insufficient, else None.
 
-    Only checked for MooncakeStore (SimpleStorage manages its own capacity via
-    ``total_storage_size``).  The check is conservative: it uses the *per-
-    client* segment size (``global_segment_size``) against the in-flight upper
-    bound.
+    Only meaningful for MooncakeStore (SimpleStorage manages its own capacity
+    via ``total_storage_size``), so callers invoke it on the Mooncake path
+    only. The check is conservative: it compares the *per-client* segment size
+    (``global_segment_size``) against the in-flight upper bound.
     """
-    if effective.backend != "MooncakeStore":
-        return None
-
     max_staleness = getattr(args, "max_staleness", 0)
     capacity_batch = resolve_tq_capacity_batch_size(args)
     payload = estimate_payload_bytes(args)
@@ -263,23 +344,20 @@ def validate_segment_capacity(args: Any, effective: EffectiveConfig) -> str | No
 
 def build_backend_config(
     args: Any,
-    effective: EffectiveConfig,
     *,
+    device: str,
+    master_address: str,
     total_storage_size: int,
 ) -> tuple[dict[str, Any], str | None]:
-    """Return ``(backend_config_dict, error_or_none)``.
+    """Return ``(backend_config_dict, error_or_none)`` for the host-RDMA path.
 
-    On error, ``backend_config_dict`` is a safe SimpleStorage fallback and
-    ``error`` explains why MooncakeStore was rejected.
+    ``master_address`` must already be validated by
+    :func:`resolve_mooncake_master_address`; it is threaded through so the
+    checked value is the one the client receives.  On a capacity error the
+    returned dict is a safe SimpleStorage fallback and ``error`` explains why
+    MooncakeStore was rejected -- the caller decides whether that is fatal.
     """
-    if effective.backend == "SimpleStorage":
-        return build_simple_storage_config(
-            total_storage_size=total_storage_size,
-            num_data_storage_units=args.num_data_storage_units,
-        ), None
-
-    # MooncakeStore path.
-    cap_error = validate_segment_capacity(args, effective)
+    cap_error = validate_segment_capacity(args)
     if cap_error:
         logger.error(cap_error)
         return build_simple_storage_config(
@@ -287,4 +365,4 @@ def build_backend_config(
             num_data_storage_units=args.num_data_storage_units,
         ), cap_error
 
-    return build_mooncake_config(effective), None
+    return build_mooncake_config(master_address=master_address, device=device), None

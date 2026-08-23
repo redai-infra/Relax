@@ -4,7 +4,9 @@
 
 Relax 的数据面（rollout ↔ train 之间的样本传输）默认走 TransferQueue 的 SimpleStorage/ZMQ。本特性把 TransferQueue 已有的 MooncakeStore 后端接出来，使数据面可以走 RDMA，并在能力不足时安全回退。
 
-首期只做配置接入、能力探测与一致回退，**不改变 payload 形状与数据分发语义**。默认参数仍使用 SimpleStorage 及原有 controller 所有权模型；同时所有 worker attach（包括 SimpleStorage）新增默认 60 秒 deadline，半初始化 controller 会被回收，Controller 构造失败时会关闭本进程已经完成的 legacy `tq.init`。
+首期只做配置接入、真实 attach 能力判定与一致回退，**不改变 payload 形状与数据分发语义**。默认参数仍使用 SimpleStorage 及原有 controller 所有权模型；同时所有 worker attach（包括 SimpleStorage）新增默认 60 秒 deadline，半初始化 controller 会被回收，Controller 构造失败时会关闭本进程已经完成的 legacy `tq.init`。
+
+> 与 RFC #217 的差异：RFC 要求"在首次 `tq.init` 之前完成静态节点探测"（F10）来避免挂死。按维护者的瘦身要求，静态探测已删除，防挂死改由这些机制保证：`tq.init` 在隔离的 owner actor 中执行并带超时、每次初始化前回收半初始化的 controller、拆除时等待 controller 真正从 GCS 注销、handshake 使用一次性 Ray worker（`max_calls=1`/`max_retries=0`）使超时的 `tq.init` 线程随进程退出。
 
 ## 配置入口
 
@@ -25,41 +27,58 @@ Relax 的数据面（rollout ↔ train 之间的样本传输）默认走 Transfe
 
 ## 启动流程与降级
 
-driver 在**第一次 `tq.init` 之前**完成探测并生成 job 级唯一的 effective config，其余组件（actor / critic / rollout / sft / advantages / actor_fwd）都读同一份，不各自决策。`off` 直接短路到 SimpleStorage，不做任何探测。
+driver 在**第一次 `tq.init` 之前**完成所有配置校验，并生成 job 级唯一的 backend config，其余组件（actor / critic / rollout / sft / advantages / actor_fwd）都读同一份，不各自决策。`off` 直接短路到 SimpleStorage，不做任何 Mooncake/RDMA 检查。
 
-1. 校验 `--tq-rdma-mode` 取值
-2. `probe_cluster_nodes()` 通过 Ray 把探测任务绑定到每个**存活且有 GPU** 的节点，并额外探测 driver（driver 也会创建 Mooncake owner client）；各节点读取本机 `/sys`、mooncake 状态，并在 2 秒上限内检查外部 master 的 TCP 可达性；超时或崩溃的节点转为退化结果，不静默丢弃
-3. `reduce_results()` 做 AND 归约：只有所有节点都具备 host RDMA 才选 MooncakeStore，否则整个作业回退 SimpleStorage
-4. Mooncake 生效前，driver 在**每个存活节点**（不限 GPU，因为 Serve replica 与 0-CPU actor 没有 placement 绑定）用真实配置各跑一次**有界 attach 握手**并立即 detach；`auto` 下任一节点失败则统一关闭 Mooncake 状态、全作业收敛到 SimpleStorage，`required` 下启动失败并列出失败节点
-5. `required` 模式下若发生任何回退，直接抛异常并打印每个节点的探测明细
+Relax **不做静态硬件探测**：不扫描 `/sys/class/infiniband`，不读 GID 表，不推断 `memlock`。这类启发式覆盖不到真实调度位置（TQ client 跑在 Ray Serve replica 与 0-CPU actor 里，没有 placement 绑定），而且容易与 Mooncake 底层实现漂移。运行时可用性以真实 attach/setup 的结果为准；线路是否确实经过 RDMA 仍由真机 wire-proof 验收确认。
 
-第 4 步不是轻量探针：每个节点都会创建真实 Mooncake client，并按配置请求挂载/注册完整 client segment（默认 `global_segment_size=4 GiB`，另有默认 1 GiB local buffer），完成后立即释放。具体物理 RSS、锁页与注册方式取决于 Mooncake 实现，但启动阶段会出现节点级瞬时内存/注册资源尖峰；CPU-only head 也在覆盖范围内。节点内存或 `memlock` 不足会表现为 attach 握手失败：`auto` 下整个作业统一回退 SimpleStorage，`required` 下启动失败。调大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 时必须把这份每节点启动资源足迹一并纳入容量规划。
+1. 校验 `--tq-rdma-mode` 取值（非法值始终报错，不回退）
+2. 校验 TransferQueue/Mooncake 正确性契约
+3. 校验 `MC_MASTER_ADDRESS` 存在且是可用的 `host:port`（只查格式，不做 DNS 解析和连通性探测）
+4. segment 容量预检：按 token 预算推导最坏情况 payload，对比 client segment 大小
+5. driver 在独立 owner actor 中执行 `tq.init`，随后在**每个存活节点**调度一次性 handshake worker：真实 attach/setup → 确认 storage manager 是 `MooncakeStorageManager` 且 client 配置请求 `protocol=rdma` → detach
+6. 汇总各节点结果：零存活节点、节点发现/任务调度失败或任一节点 attach 失败都按失败处理；`auto` 只有在确认所有一次性 worker 已终止后，才会**先完整拆除 Mooncake 状态**（owner close + controller 退出等待 + segment unmount），再收敛到 SimpleStorage；`required` 下启动失败并列出失败摘要
+
+第 5 步不是轻量探针：每个节点都会创建真实 Mooncake client，并按配置请求挂载/注册完整 client segment（默认 `global_segment_size=4 GiB`，另有默认 1 GiB local buffer），完成后立即释放。具体物理 RSS、锁页与注册方式取决于 Mooncake 实现，但启动阶段会出现节点级瞬时内存/注册资源尖峰；CPU-only head 也在覆盖范围内。节点内存或 `memlock` 不足会表现为 attach 握手失败：`auto` 下整个作业统一回退 SimpleStorage，`required` 下启动失败。调大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 时必须把这份每节点启动资源足迹一并纳入容量规划。
 
 回退只有一档：
 
 ```
 MooncakeStore/host-RDMA → SimpleStorage
-（任一节点无 RDMA 能力或指定设备缺失、mooncake/master 不可用、
-  运行时正确性契约不满足，或 segment 容量预检不足）
+（正确性契约不满足、master 未配置或格式非法、segment 容量预检不足，
+  或全节点真实 attach/setup 未通过）
 ```
+
+### 启动耗时
+
+`auto` 在 RDMA 不可用的集群上会比 `off` 慢，因为它要真的走一遍完整流程才能得出结论：owner `tq.init`（上限 60 s）→ 全节点 handshake（每节点 attach 上限 60 s，driver 侧等待上限 90 s）→ 拆除（owner close 上限 30 s，外加等待 controller 从 GCS 注销）→ SimpleStorage 初始化。最坏情况下启动阶段可能达到**分钟级**。这是用启动时延换取"判定基于真实 endpoint"的取舍；确定不需要 RDMA 的作业应显式用 `--tq-rdma-mode=off`，它不触发上述任何步骤。
 
 ## 启动日志怎么读
 
-正常启动会打三段，排障时先看这三段：
+正常启动会打这几段，排障时先看它们：
 
 ```
 [dataplane] requested: rdma_mode=auto device=mlx5_bond_0
-[dataplane] probe result:
-[probe:<ip>] protocol=rdma device=mlx5_bond_0
-  [ok] mooncake_import: version=0.3.10.post2
-  [ok] rdma_devices: mlx5_bond_0, ...
-  [ok] port_state: ACTIVE
-  [ok] gid: ...
-  [ok] memlock: unlimited
-[dataplane] backend=MooncakeStore protocol=rdma device=mlx5_bond_0
+[dataplane] backend=MooncakeStore protocol=rdma device=mlx5_bond_0 (pending handshake)
+[dataplane] Mooncake attach handshake passed on all alive nodes.
 ```
 
-第三段带 `fallback=...` 就说明发生了降级，原因直接写在里面（例如 `fallback=mooncake_unavailable:<node-id>`）。
+`(pending handshake)` 表示配置校验已通过但能力尚未确认；只有最后一行出现才说明每个存活节点都完成了真实 attach/setup，storage manager 是 MooncakeStore，且 Mooncake client 的配置请求为 `protocol=rdma`。
+
+注意这条断言的强度：它核对的是 client 的**配置意图和 setup 结果**，不是 negotiated transport，也不能单独证明数据包没有经过 TCP。线路级证明（IB counter 增长、非 RDMA 数据接口 counter 不增长）由 benchmark 的 `--require-wire-proof` 提供，见下方验收章节。
+
+发生回退时会看到：
+
+```
+[dataplane] <失败原因>; auto fallback to SimpleStorage: <错误详情>
+```
+
+或 handshake 阶段失败：
+
+```
+[dataplane] Mooncake attach handshake reported N failure(s) (<稳定的失败类型摘要>); closing Mooncake state and converging the whole job to SimpleStorage.
+```
+
+`required` 模式下这两种情况都是启动失败并抛出同样的原因，不会出现回退日志。
 
 ## Mooncake master 生命周期
 
@@ -73,16 +92,16 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 
 然后给**每个节点**的作业环境设置 `MC_MASTER_ADDRESS=<master-host>:50051`。Relax 不会假定 loopback 端点（多节点作业里每个节点都把自己的 localhost 当 master 会导致误降级或误中止），因此未设置或格式非法时：`auto` 记 WARNING 并回退 SimpleStorage，`required` 启动失败。
 
-启动前置条件：部署侧必须先启动 master，所有 GPU 节点和 driver 都能解析并连接 `MC_MASTER_ADDRESS`，防火墙允许 master RPC 端口；作业镜像中的 TQ 必须包含本文“正确性依赖”所列修复。Relax 不负责拉起、重启或终止 master。
+启动前置条件：部署侧必须先启动 master，所有存活 Ray 节点和 driver 都能解析并连接 `MC_MASTER_ADDRESS`，防火墙允许 master RPC 端口；作业镜像中的 TQ 必须包含本文“正确性依赖”所列修复。Relax 不负责拉起、重启或终止 master。
 
 三种情形下的行为：
 
 | 情形 | 表现 | 处理 |
 |---|---|---|
-| **`MC_MASTER_ADDRESS` 未配置或格式非法** | `auto` 记 WARNING 后回退 SimpleStorage（不做探测）；`required` 启动失败 | 给每个节点的作业环境设置 `MC_MASTER_ADDRESS=<host>:<port>` |
-| **master 在探测时不可达** | `auto` 统一降级到 SimpleStorage；`required` 启动失败并列出失败节点 | 先确认 master、DNS/路由和 `MC_MASTER_ADDRESS` |
-| **master 探测通过、但 `tq.init` 时失败/超时** | 第一次初始化在独立 owner actor 中执行，driver 最多等待 60 秒。失败后回收该 actor 及其拥有的半初始化 controller；`auto` 只重试一次 SimpleStorage，`required` 清理后抛出原始错误 | 查看 `mooncake_init_failed:*`、master 日志和 owner 清理日志 |
-| **attach 握手在某节点失败/超时** | driver 汇总各节点结果：`auto` 关闭 Mooncake 状态并统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`required` 启动失败并列出节点。握手使用一次性 Ray worker，超时的 `tq.init` watchdog thread 不会污染后续任务 | 检查失败节点到 master 的连通性、RDMA 状态、可用内存与 `memlock`；握手会瞬时创建完整 client segment，CPU-only head 也会执行 |
+| **`MC_MASTER_ADDRESS` 未配置或格式非法** | `auto` 记 WARNING 后回退 SimpleStorage（不初始化任何 Mooncake 状态）；`required` 启动失败 | 给每个节点的作业环境设置 `MC_MASTER_ADDRESS=<host>:<port>` |
+| **master 不可达** | 没有单独的可达性探测：master 连不上会表现为 owner `tq.init` 或各节点 attach 握手失败，按下面两行处理 | 先确认 master 进程、DNS/路由和防火墙 |
+| **`tq.init` 失败/超时** | 第一次初始化在独立 owner actor 中执行，driver 最多等待 60 秒。失败后回收该 actor 及其拥有的半初始化 controller；`auto` 只重试一次 SimpleStorage，`required` 清理后抛出不含 endpoint/PID/路径的稳定错误类型摘要 | 查看 `mooncake_init_failed:*`、master 日志和 owner 清理日志 |
+| **attach 握手在某节点失败/超时/protocol 不符** | driver 汇总各节点结果：`auto` 先完整关闭 Mooncake 状态再统一回退 SimpleStorage（日志 `attach_handshake_failed:*`）；`required` 启动失败并列出节点。握手使用一次性 Ray worker，超时的 `tq.init` watchdog thread 不会污染后续任务；拆除失败会直接抛错而不是带着未知状态继续 | 检查失败节点到 master 的连通性、RDMA 状态、可用内存与 `memlock`；握手会瞬时创建完整 client segment，CPU-only head 也会执行 |
 | **worker attach 卡住**（controller 半初始化 / mooncake setup 挂起） | 每个 worker 的 attach 有统一 deadline（默认 60 s，`RELAX_TQ_ATTACH_TIMEOUT_SECONDS` 可调）：先有界等待 controller 提供配置，再在 watchdog 线程里跑 `tq.init`；超时该 worker 立刻失败而不是无限挂起 | 看 `TqAttachTimeout` 报错中的阶段描述 |
 | **正常退出**（作业结束或全局重启） | 只有 owner actor 调用全局 `tq.close()`，随后显式 `storage_client.close()` 卸载 segment；附加 worker 只关闭本地 client，不能删除全局数据或 controller。master 本身不动 | 无需操作 |
 | **异常退出**（worker 被 kill / OOM / 节点掉线） | Python 层不执行，segment 仍在 master 注册。master 要等 `client_ttl`（默认 30 s）才判定客户端过期，期间新作业的 put 会打到死端点并报 `Failed to open segment ... Connection refused` | 等 30 s 后重启，或部署侧调小 `-client_ttl` |
@@ -94,24 +113,28 @@ setsid mooncake_master -rpc_port=50051 -metrics_port=9004 > /var/log/mooncake_ma
 清理只动本作业拥有的资源：
 
 - 不使用任何 `pkill` / `killall`
-- `tq.init` 之前会检查已存在的 `TransferQueueController` 命名 actor：**只有取不到 config（半初始化）或 actor 已死时才回收**，健康的 controller 保持不动并正常 attach
-- 首次初始化在专用 owner actor 中执行，config 内保存随机 owner token；清理只有在 token 匹配或 controller 确认不可用时才回收全局 actor，避免初始化竞争中的附加者误杀所有者
+- `tq.init` 之前会检查已存在的 `TransferQueueController` 命名 actor：**只有取不到 config（半初始化）、明确超时或 actor 已死时才回收**；其他 GCS/control-plane 异常只做脱敏后中止，不据此杀 actor
+- 健康的既有 controller 保持不动，但启动会明确失败，**不会 attach，也不会在退出时关闭它**；操作者应先停止前一作业并清理其 TQ 状态，确保 Ray 集群干净
+- 首次初始化在专用 owner actor 中执行，config 内保存随机 owner token；若初始化失败，只有 token 仍匹配时才回收该次初始化创建的全局 actor；若并发 initializer 抢先创建了健康 controller，本次启动只做本地 detach 后失败
 - 全局 `tq.close()` 只能由 owner actor 调用；actor、critic、rollout 等附加 worker 只能做本地 detach
+- 任一长生命周期 train actor 初始化失败时，driver 会 force-kill 整个 train actor group，并通过预先排队的终止 probe 确认 actor task 已进入终态后再传播失败，防止超时的原生初始化线程稍后修改可复用进程的 TQ 全局状态
 - master 进程始终不被 Relax 触碰
 
 ## 容量不足与正确性依赖
 
-Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经生产但尚未消费的数据。启动前按 **token 预算推导最坏情况 payload** 检查 client segment（默认 4 GiB）：文本按 `seq_length × 32 B`，多模态样本另加 `seq_length × 784 像素/token × 12 B`（ViT patch 14、merge 2、float32 RGB，例如 8k 序列约 77 MiB/样本），再乘 rollout batch、采样数与 `staleness+1`；`auto` 预检不足时回退 SimpleStorage，`required`/`off` 直接失败。segment 大小可用 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 调整，容量校验与客户端配置读取同一个值。该上界是保守推导，不能替代运行时错误处理。
+Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经生产但尚未消费的数据。启动前按 **token 预算推导最坏情况 payload** 检查 client segment（默认 4 GiB）：文本按 `seq_length × 32 B`，多模态样本另加 `seq_length × 784 像素/token × 12 B`（ViT patch 14、merge 2、float32 RGB，例如 8k 序列约 77 MiB/样本），再乘 rollout batch、采样数与 `staleness+1`；`auto` 预检不足时回退 SimpleStorage，`required` 直接失败。`off` 不进入 Mooncake 配置与容量检查。segment 大小可用 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 调整，容量校验与客户端配置读取同一个值。该上界是保守推导，不能替代运行时错误处理。
 
-运行时依赖固定到 TransferQueue commit `58054a33834aadbcf76aacd6b1e32e25c030f2c9`，并在 Mooncake 启动前检查以下能力：
+当前运行时依赖固定到 TransferQueue commit `58054a33834aadbcf76aacd6b1e32e25c030f2c9`。Relax 在 Mooncake 启动前能检查 retry method 是否存在，以及 `KVStorageManager.put_data` 的源码顺序；这些检查**不能证明**当前 pin 已具备完整的 fail-closed 语义。
 
-- `batch_upsert_from` / `batch_get_into` 对每个 key 的返回码做有限次数重试，耗尽后抛异常，不能把失败当成功或无限重试；
-- `KVStorageManager.put_data` 必须先等待 storage put 成功，之后才能更新 production-ready 状态；写入失败时不通知消费者；
-- Relax 的契约测试用失败 store 验证“写失败、production 状态不更新”，并用隔离 master 的真机故障注入验证物理容量溢出在 30 秒内显式失败。
+启用 Mooncake/RDMA 前，上游 TransferQueue PR 必须同时补齐：
 
-因此，上游曾出现的“返回码未检查导致静默丢数据”不是已知限制，而是 Mooncake 启用的硬门槛：`auto` 在契约不满足时禁用 Mooncake 并回退，`required` 拒绝启动。Docker 镜像固定上述修复 commit，运行时检查用于防止环境被旧包覆盖。
+- `batch_upsert_from` / `batch_get_into` 的**每次 retry** 都校验返回结果与请求 key 等长，短结果必须显式失败；
+- `NOTIFY_DATA_UPDATE_ACK` 必须检查 positive ACK，controller 拒绝更新时 producer 不得按成功返回；
+- 合入修复后更新 Relax 的明确 commit pin，并以稳定的 version/capability marker 校验，而不是仅凭 method name 或源码文本推断能力。
 
-正确性守卫强制 `MC_STORE_MEMCPY=0` 且 **fail-closed**：mooncake 0.3.10 在 TCP-only 环境会自动启用 memcpy 快拷贝路径，该路径存在已确认的静默截断缺陷（现象与处置见排障表）；RDMA 会话本就自动禁用 memcpy，不受影响。由于缺陷在当前 pin 上已实证，显式导出 `MC_STORE_MEMCPY=1` 会在启动时被直接拒绝，待 pin 升级到修复版本后再按版本重新放开。另外，针对 pin 版本剩余缺口的运行时补丁（逐次重试返回码校验、严格 production-status ACK）已拆分到独立的版本门控分支 `feat/tq-mooncake-loss-guards`（`relax/utils/tq_mooncake_patches.py`），本 PR 只保留只读的能力校验。
+在上述上游 PR 与新 pin 落地前，这个正确性门槛仍是明确的合入 blocker；本 PR 不通过 monkey patch 改写 TransferQueue。Relax 侧继续保留失败 store 的“写失败、production 状态不更新”契约测试，以及隔离 master 的物理容量溢出故障注入。
+
+正确性守卫强制 `MC_STORE_MEMCPY=0` 且 **fail-closed**：mooncake 0.3.10 在 TCP-only 环境会自动启用 memcpy 快拷贝路径，该路径存在已确认的静默截断缺陷（现象与处置见排障表）；RDMA 会话本就自动禁用 memcpy，不受影响。由于缺陷在当前 pin 上已实证，显式导出 `MC_STORE_MEMCPY=1` 会在启动时被直接拒绝，待 pin 升级到修复版本后再按版本重新放开。
 
 真机容量故障注入会故意创建 64 MiB segment 并写入 96 MiB，仅允许在独立、可丢弃的 master 上运行：
 
@@ -128,11 +151,12 @@ Mock/本机测试和真实双节点 RDMA 测试必须分别报告，前者不能
 
 | 层级 | 验证内容 | 通过标准 |
 |---|---|---|
-| CI/mock | 参数矩阵、节点 AND 归约、master 不可达、owner 超时/清理/token、auto/required、有限重试、写失败不发布状态 | `tests/utils/test_rdma_probe.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
+| CI/mock | 模式校验、master 端点格式、容量预检、owner 超时/清理/token、attach 握手的 manager/config 契约与拆除顺序、auto/required、有限重试、写失败不发布状态 | `tests/utils/tq/test_config.py`、`tests/core/test_controller_tq_backend.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
 | 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性；`multimodal_train_inputs` 以生产容器（`list[dict]` / NonTensorStack，存储层非张量路径）全链路逐叶子 SHA-256 一致 | `tests/utils/test_tq_dataplane_behavior.py` 通过（含 `TestRealMultimodalFullLink`） |
 | 真实 Mooncake | TCP/RDMA direct-client：混合 dtype 稠密张量逐字节一致；`list[dict]` 非张量 msgpack 慢路径逐叶子一致（每协议独立 spawn 子进程，规避 0.3.10 会话内协议切换问题） | `TestMooncakeByteExact` 的 TCP/RDMA 各两档均通过，不得 skip |
 | 真实多模态载荷 | 真实数据集图像走完整生产预处理链（`build_messages` → `apply_chat_template` → `process_vision_info` → HF processor → `remap_mm_train_inputs`）生成 fixture；上述两级多模态用例检测到 fixture 后自动升级为真实载荷档 | fixture 存在时以 `[real]` 档通过；无 fixture 环境回退 `[synthetic]`（生产同构状，CI 兜底）；交付报告须注明真实档在何处跑过 |
 | 真实双节点 | 同一拓扑的 SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic、production-shaped multimodal、real-multimodal 三种 profile；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的逐字段 SHA-256 全部 PASS；`--require-wire-proof` 证明 RDMA 档 IB counter 增长且 TCP 档网络 counter 增长；CSV 留档并报告均值、median、stddev |
+| 真实回退（`auto` + 某节点 RDMA 不可用） | 静态探测删除后，`auto` 会真的创建 Mooncake owner 与 named controller，再在 handshake 阶段失败并拆除，因此这条路径必须实测 | 逐条确认：① 日志显示 Mooncake owner `tq.init` **成功**、随后 handshake 阶段失败（否则实际只测到 owner 初始化失败，覆盖不到拆除）；② 最终存在且仅存在一个预期的 SimpleStorage `TransferQueueController`；③ 该 controller 的 stored config 确认为 SimpleStorage；④ SimpleStorage 的 put/get 正常工作；⑤ 旧 Mooncake owner actor 与其 client 均已消失；⑥ Mooncake segment 已从 master 卸载——若测的是强杀/超时路径，需等过 `client_ttl`（默认 30 s）再检查 |
 
 真实多模态 fixture 生成（需要本地数据集 parquet 与 Qwen-VL 模型目录；产物写入 `tests/fixtures/`，已 gitignore，不入库）：
 
@@ -178,9 +202,10 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
-| 启动日志 `backend=SimpleStorage fallback=mooncake_unavailable:<node>` | 该节点上 `import mooncake` 失败 | 检查该节点的 `mooncake-transfer-engine` 安装；镜像是否一致 |
-| 启动日志 `MooncakeStore capacity fallback to SimpleStorage` | 保守的最坏情况容量上界超过 client segment；多模态按“每个 token 都可能是 vision token”估算，8k 序列约 77 MiB/样本，再乘 batch、采样数与 `staleness+1`，很容易超过默认 4 GiB | 按容量日志核对参数；减少 batch / `n_samples_per_prompt` / `max_staleness`，或调大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 并同步规划每节点 attach 的瞬时资源足迹 |
-| `backend=SimpleStorage fallback=rdma_unavailable:<node>`，但机器有 RDMA 卡 | 端口非 ACTIVE、GID 取不到、`memlock` 过低，或指定的 `--tq-rdma-device` 在部分节点不存在 | 看 `probe result` 里哪一项 FAIL；`memlock` 需要 unlimited |
+| 启动日志 `the installed TransferQueue does not satisfy the Mooncake correctness contract; auto fallback to SimpleStorage` | 镜像里的 TransferQueue/Mooncake 缺少本文“正确性依赖”所列能力 | 核对该节点的 `transfer_queue` / `mooncake-transfer-engine` 版本；镜像是否一致 |
+| 启动日志 `the Mooncake master endpoint is not configured` 或 `segment capacity insufficient` / `the segment-capacity configuration is unusable` | 分别是 `MC_MASTER_ADDRESS` 缺失/格式非法、最坏情况容量上界超过 client segment、以及 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 或 `seq_length` 本身不可用 | 容量类问题按日志核对参数；减少 batch / `n_samples_per_prompt` / `max_staleness`，或调大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 并同步规划每节点 attach 的瞬时资源足迹 |
+| `Mooncake attach handshake reported N failure(s)`，摘要为 `handshake task failed (...)` 或 `handshake did not return ...` | 该节点 native setup、Ray task 或 attach 超时；日志只保留稳定的错误类型，不回显 endpoint、PID、路径或底层异常正文 | 在失败节点上按下方“选卡核验”逐项确认，并检查 master 连通性、Ray worker 日志与 `memlock` |
+| handshake 报错含 `attached storage manager is not MooncakeStorageManager` | 该进程 attach 到的不是预期 Mooncake controller（例如集群里残留了上一次作业的 SimpleStorage controller） | 确认集群干净：本期按单任务独占集群设计，不接管他人的 controller |
 | `backend=SimpleStorage fallback=...`，但预期跑 RDMA，且日志显示 master 未配置 | `auto` 下 `MC_MASTER_ADDRESS` 缺失或格式非法会记 WARNING 后回退 SimpleStorage（`required` 直接失败） | 给每个节点的作业环境设置 `MC_MASTER_ADDRESS=<host>:<port>` |
 | `setup failed with error code: -1` | master 不可达 | 检查 master 进程与 `MC_MASTER_ADDRESS` |
 | `Failed to open segment ... Connection refused` | 上一轮客户端异常退出，死 segment 仍在 master 注册 | 等 `client_ttl`（30 s）过期后重试 |
@@ -193,7 +218,7 @@ PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
 
 ### 选卡核验
 
-指定设备前先确认端口状态与 GID：
+Relax 不再自动扫描这些内容——启动只判断真实 attach/setup 与配置契约是否通过，具体哪一项硬件条件不满足需要在失败节点上手工核验。指定设备前先确认端口状态与 GID：
 
 ```bash
 ls /sys/class/infiniband/                                   # 有哪些设备

@@ -10,6 +10,7 @@ identity from value equality for NaNs, signed zero, and nested tensors.
 from __future__ import annotations
 
 import hashlib
+import struct
 from typing import Any
 
 import numpy as np
@@ -37,6 +38,11 @@ def _scalar_digest(value: Any) -> LeafDigest:
         raw = value
     elif isinstance(value, str):
         raw = value.encode("utf-8")
+    elif isinstance(value, float):
+        # ``repr(float('nan'))`` discards the NaN payload bits.  Pack the
+        # Python double directly so distinct NaNs and signed zero remain
+        # byte-distinguishable just like tensor/ndarray leaves.
+        raw = struct.pack("!d", value)
     else:
         raw = repr(value).encode("utf-8")
     return (f"py.{type(value).__name__}", "", hashlib.sha256(raw).hexdigest())
@@ -48,6 +54,15 @@ def _unwrap_non_tensor(value: Any) -> Any:
     if type(value).__name__ == "NonTensorData":
         return value.data
     return value
+
+
+def _dict_child_path(prefix: str, key: Any) -> str:
+    """Render a dict key without colliding with nested/list paths."""
+    if not isinstance(key, str):
+        raise TypeError(f"Unsupported payload dict key at {prefix}: {type(key).__name__}")
+    if key.isidentifier():
+        return f"{prefix}.{key}"
+    return f"{prefix}[{key!r}]"
 
 
 def leaf_digests(payload: Any, prefix: str = "payload") -> dict[str, LeafDigest]:
@@ -63,8 +78,11 @@ def leaf_digests(payload: Any, prefix: str = "payload") -> dict[str, LeafDigest]
     elif isinstance(payload, np.ndarray):
         digests[prefix] = _ndarray_digest(payload)
     elif isinstance(payload, dict):
+        for key in payload:
+            if not isinstance(key, str):
+                raise TypeError(f"Unsupported payload dict key at {prefix}: {type(key).__name__}")
         for key in sorted(payload):
-            digests.update(leaf_digests(payload[key], f"{prefix}.{key}"))
+            digests.update(leaf_digests(payload[key], _dict_child_path(prefix, key)))
     elif isinstance(payload, (list, tuple)):
         for index, item in enumerate(payload):
             digests.update(leaf_digests(item, f"{prefix}[{index}]"))
