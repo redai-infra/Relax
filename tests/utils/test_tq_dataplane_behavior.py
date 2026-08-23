@@ -322,13 +322,13 @@ class TestRealMultimodalFullLink:
     *non-tensor* path (SimpleStorage: pickled objects; MooncakeStore: msgpack
     pack/unpack), which none of the dense-tensor tests above touch.
 
-    Payload source is reported in every assertion: ``real`` (fixture from
-    ``scripts/benchmarks/make_multimodal_fixture.py`` — actual dataset images
-    through the production Qwen-VL processor chain) or ``synthetic``
-    (production-structured fallback, CI-safe).
+    Payload source is reported in every assertion: ``real`` (an external
+    fixture built from actual dataset images through the production Qwen-VL
+    processor chain) or ``synthetic`` (production-structured fallback,
+    CI-safe).
     """
 
-    def test_multimodal_list_dict_full_link_byte_exact(self, tq_factory):
+    def test_multimodal_list_dict_full_link_byte_exact(self, tq_factory, record_property):
         """Real assembly (dict_to_tensordict) -> tq put/get -> leaf-level
         SHA-256 equality for every sample, aligned by sample_id (the sampler
         may reorder rows)."""
@@ -338,6 +338,7 @@ class TestRealMultimodalFullLink:
 
         num_samples = 4
         train_data, source = mm_train_data(num_samples)
+        record_property("multimodal_payload_source", source)
         train_data = dict(train_data)
         train_data["sample_id"] = list(range(num_samples))
         batch = dict_to_tensordict(train_data, batch_size=num_samples)

@@ -210,6 +210,11 @@ class TestBackendConfigDicts:
         mc = build_mooncake_config(master_address=_MASTER)["MooncakeStore"]
         assert mc["master_server_address"] == _MASTER
 
+    @pytest.mark.parametrize("master", ["not-an-endpoint", "host:0", "fe80::1", 50051])
+    def test_builder_rejects_unvalidated_master_address(self, master):
+        with pytest.raises(ValueError, match="master_address"):
+            build_mooncake_config(master_address=master)
+
     @pytest.mark.parametrize("segment_size", [0, -1, True, 1.5])
     def test_explicit_segment_size_must_be_a_positive_integer(self, segment_size):
         with pytest.raises(ValueError, match="positive integer"):

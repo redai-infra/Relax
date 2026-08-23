@@ -4,8 +4,8 @@
 
 Two tiers, selected automatically:
 
-* **real** — a fixture produced by ``scripts/benchmarks/make_multimodal_fixture.py``
-  (real dataset images through the production Qwen-VL processing chain).
+* **real** — an external acceptance fixture containing real dataset images
+  processed through the production Qwen-VL chain.
   Found via ``$RELAX_MM_FIXTURE`` or ``tests/fixtures/tq_multimodal_fixture.pt``.
   The fixture's leaf manifest is re-verified on load so a corrupted file can
   never silently pass as ground truth.
@@ -16,8 +16,8 @@ Two tiers, selected automatically:
   ``t*h*w == patches`` (Qwen3-VL patch-16 geometry), which is MooncakeStore's
   non-tensor msgpack slow path — NOT the dense-tensor fast path.
 
-Tests must report which tier ran (the returned ``source`` string) so real-
-payload acceptance is auditable in CI logs.
+Tests record the returned ``source`` string as a pytest/JUnit property so real-
+payload acceptance is auditable in CI artifacts.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.torch_version import TorchVersion
 
 from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
 
@@ -51,27 +52,36 @@ def load_real_fixture(max_samples: int | None = None) -> dict[str, Any] | None:
     path = fixture_path()
     if not path.is_file():
         return None
-    bundle = torch.load(path, map_location="cpu", weights_only=False)
-    train_data = bundle["train_data"]
-    manifest = bundle["manifest"]
-    recomputed: dict[str, Any] = {}
-    for index, sample in enumerate(train_data["multimodal_train_inputs"]):
-        recomputed.update(leaf_digests(sample, f"sample[{index}].multimodal_train_inputs"))
-        recomputed.update(
-            leaf_digests(torch.tensor(train_data["tokens"][index], dtype=torch.int64), f"sample[{index}].tokens")
-        )
-    problems = diff_digests(manifest, recomputed)
+    try:
+        with torch.serialization.safe_globals([TorchVersion]):
+            bundle = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise RuntimeError(
+            f"External multimodal fixture could not be safely loaded ({type(error).__name__})"
+        ) from None
+    try:
+        train_data = bundle["train_data"]
+        manifest = bundle["manifest"]
+        recomputed: dict[str, Any] = {}
+        for index, sample in enumerate(train_data["multimodal_train_inputs"]):
+            recomputed.update(leaf_digests(sample, f"sample[{index}].multimodal_train_inputs"))
+            recomputed.update(
+                leaf_digests(torch.tensor(train_data["tokens"][index], dtype=torch.int64), f"sample[{index}].tokens")
+            )
+        problems = diff_digests(manifest, recomputed)
+    except Exception as error:
+        raise RuntimeError(f"External multimodal fixture has an invalid schema ({type(error).__name__})") from None
     if problems:
         raise RuntimeError(
-            f"Multimodal fixture {path} failed its own manifest ({len(problems)} leaf mismatches); "
-            f"regenerate it with scripts/benchmarks/make_multimodal_fixture.py. First: {problems[0]}"
+            f"External multimodal fixture failed its manifest ({len(problems)} leaf mismatches); "
+            "replace it with a verified acceptance artifact."
         )
     if max_samples is not None:
         train_data = {
             "tokens": train_data["tokens"][:max_samples],
             "multimodal_train_inputs": train_data["multimodal_train_inputs"][:max_samples],
         }
-    return {"meta": bundle["meta"], "train_data": train_data}
+    return {"train_data": train_data}
 
 
 def synthetic_mm_train_data(num_samples: int, seed: int = 20260813) -> dict[str, list[Any]]:
@@ -98,8 +108,7 @@ def mm_train_data(num_samples: int) -> tuple[dict[str, list[Any]], str]:
     """Real-fixture ``train_data`` when available, else synthetic.
 
     Returns ``(train_data, source)`` where source is ``"real"`` /
-    ``"synthetic"``; tests embed it in assertion ids so acceptance logs show
-    which tier actually ran.
+    ``"synthetic"``; callers record it in their acceptance results.
     """
     bundle = load_real_fixture(max_samples=num_samples)
     if bundle is not None and len(bundle["train_data"]["tokens"]) >= num_samples:

@@ -204,10 +204,9 @@ def build_mooncake_config(
     Parameters
     ----------
     master_address
-        External master server address, already validated by
-        :func:`resolve_mooncake_master_address`.  It is passed in rather than
-        re-read from the environment so the value that was checked is the value
-        that gets used.
+        External master server address. It is validated here as well as by
+        :func:`resolve_mooncake_master_address` so direct benchmark callers
+        cannot bypass the format contract.
     device
         Explicit RDMA device name; empty lets Mooncake select one natively.
     protocol
@@ -219,6 +218,14 @@ def build_mooncake_config(
         :func:`resolve_global_segment_size`).  Benchmarks may pass a larger
         value (e.g. 8 GiB) to avoid staging-buffer pressure.
     """
+    if not isinstance(master_address, str):
+        raise ValueError("master_address must be a host:port string")
+    try:
+        _split_host_port(master_address)
+    except ValueError as error:
+        raise ValueError(f"master_address is not a usable endpoint: {error}") from None
+    master_address = master_address.strip()
+
     if global_segment_size is None:
         segment_size = resolve_global_segment_size()
     elif isinstance(global_segment_size, bool) or not isinstance(global_segment_size, int) or global_segment_size <= 0:

@@ -5,13 +5,13 @@
 from __future__ import annotations
 
 import struct
+import warnings
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
-from relax.utils.payload_digest import leaf_digests as benchmark_leaf_digests
 from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
 
 
@@ -45,31 +45,29 @@ def test_leaf_digests_distinguishes_raw_bytes_from_value_equality():
     ]
 
 
-@pytest.mark.parametrize("digest_fn", [leaf_digests, benchmark_leaf_digests], ids=["test-helper", "benchmark-helper"])
-def test_scalar_nan_payload_bits_are_not_collapsed_by_repr(digest_fn):
+def test_scalar_nan_payload_bits_are_not_collapsed_by_repr():
     first = struct.unpack("!d", bytes.fromhex("7ff8000000000001"))[0]
     second = struct.unpack("!d", bytes.fromhex("7ff8000000000002"))[0]
 
     assert repr(first) == repr(second) == "nan"
-    assert digest_fn(first) != digest_fn(second)
+    assert leaf_digests(first) != leaf_digests(second)
 
 
-@pytest.mark.parametrize("digest_fn", [leaf_digests, benchmark_leaf_digests], ids=["test-helper", "benchmark-helper"])
-def test_dict_paths_do_not_collapse_dotted_keys_into_nested_keys(digest_fn):
-    digests = digest_fn({"a.b": 1, "a": {"b": 2}})
+def test_dict_paths_do_not_collapse_dotted_keys_into_nested_keys():
+    digests = leaf_digests({"a.b": 1, "a": {"b": 2}})
 
     assert len(digests) == 2
     assert set(digests) == {"payload['a.b']", "payload.a.b"}
 
 
-@pytest.mark.parametrize("digest_fn", [leaf_digests, benchmark_leaf_digests], ids=["test-helper", "benchmark-helper"])
-def test_non_string_dict_keys_fail_loudly(digest_fn):
+def test_non_string_dict_keys_fail_loudly():
     with pytest.raises(TypeError, match="Unsupported payload dict key at payload: int"):
-        digest_fn({1: "value"})
+        leaf_digests({1: "value"})
 
 
 def test_leaf_digests_preserves_dtype_shape_and_nested_tensor_rows():
-    with pytest.warns(UserWarning, match="prototype stage"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
         nested = torch.nested.nested_tensor(
             [torch.tensor([1, 2], dtype=torch.int16), torch.tensor([3], dtype=torch.int16)]
         )

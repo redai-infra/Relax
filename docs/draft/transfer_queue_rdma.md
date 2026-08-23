@@ -64,7 +64,7 @@ MooncakeStore/host-RDMA → SimpleStorage
 
 `(pending handshake)` 表示配置校验已通过但能力尚未确认；只有最后一行出现才说明每个存活节点都完成了真实 attach/setup，storage manager 是 MooncakeStore，且 Mooncake client 的配置请求为 `protocol=rdma`。
 
-注意这条断言的强度：它核对的是 client 的**配置意图和 setup 结果**，不是 negotiated transport，也不能单独证明数据包没有经过 TCP。线路级证明（IB counter 增长、非 RDMA 数据接口 counter 不增长）由 benchmark 的 `--require-wire-proof` 提供，见下方验收章节。
+注意这条断言的强度：它核对的是 client 的**配置意图和 setup 结果**，不是 negotiated transport，也不能单独证明数据包没有经过 TCP。线路级证明由 benchmark 的强制 counter gate 提供：RDMA 档要求 IB receive counter 增长且大于 TCP counter，SimpleStorage/TCP 档要求 TCP receive counter 增长且不小于 IB counter。
 
 发生回退时会看到：
 
@@ -156,48 +156,33 @@ Mock/本机测试和真实双节点 RDMA 测试必须分别报告，前者不能
 | 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性；`multimodal_train_inputs` 以生产容器（`list[dict]` / NonTensorStack，存储层非张量路径）全链路逐叶子 SHA-256 一致 | `tests/utils/test_tq_dataplane_behavior.py` 通过（含 `TestRealMultimodalFullLink`） |
 | 真实 Mooncake | TCP/RDMA direct-client：混合 dtype 稠密张量逐字节一致；`list[dict]` 非张量 msgpack 慢路径逐叶子一致（每协议独立 spawn 子进程，规避 0.3.10 会话内协议切换问题） | `TestMooncakeByteExact` 的 TCP/RDMA 各两档均通过，不得 skip |
 | 真实多模态载荷 | 真实数据集图像走完整生产预处理链（`build_messages` → `apply_chat_template` → `process_vision_info` → HF processor → `remap_mm_train_inputs`）生成 fixture；上述两级多模态用例检测到 fixture 后自动升级为真实载荷档 | fixture 存在时以 `[real]` 档通过；无 fixture 环境回退 `[synthetic]`（生产同构状，CI 兜底）；交付报告须注明真实档在何处跑过 |
-| 真实双节点 | 同一拓扑的 SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic、production-shaped multimodal、real-multimodal 三种 profile；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的逐字段 SHA-256 全部 PASS；`--require-wire-proof` 证明 RDMA 档 IB counter 增长且 TCP 档网络 counter 增长；CSV 留档并报告均值、median、stddev |
+| 真实双节点 | 同一 driver/consumer pair 下各 backend 的原生数据布局；SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic、production-shaped multimodal 两种 profile；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的 dtype、shape 与 raw-byte SHA-256 全部 PASS；强制 counter gate 证明对应线路；逐协议、逐轮 CSV 留档并报告均值、median、stddev |
 | 真实回退（`auto` + 某节点 RDMA 不可用） | 静态探测删除后，`auto` 会真的创建 Mooncake owner 与 named controller，再在 handshake 阶段失败并拆除，因此这条路径必须实测 | 逐条确认：① 日志显示 Mooncake owner `tq.init` **成功**、随后 handshake 阶段失败（否则实际只测到 owner 初始化失败，覆盖不到拆除）；② 最终存在且仅存在一个预期的 SimpleStorage `TransferQueueController`；③ 该 controller 的 stored config 确认为 SimpleStorage；④ SimpleStorage 的 put/get 正常工作；⑤ 旧 Mooncake owner actor 与其 client 均已消失；⑥ Mooncake segment 已从 master 卸载——若测的是强杀/超时路径，需等过 `client_ttl`（默认 30 s）再检查 |
 
-真实多模态 fixture 生成（需要本地数据集 parquet 与 Qwen-VL 模型目录；产物写入 `tests/fixtures/`，已 gitignore，不入库）：
+真实模型/数据 fixture 及其生成流程属于外部 PR 验收附件，不再由生产仓库维护。可选的本机 dataplane 测试仍可通过 `RELAX_MM_FIXTURE` 指向已验证的外部 fixture；唯一保留的跨节点 benchmark 只接受显式的 `synthetic` 和 `multimodal` profile，不会在缺失 fixture 时替换 profile。
 
-```bash
-PYTHONPATH=. python scripts/benchmarks/make_multimodal_fixture.py \
-  --dataset <path>/<multimodal-dataset>.parquet \
-  --model <path>/<qwen-vl-model-dir> \
-  --num-prompts 6 --n-samples-per-prompt 2 \
-  --output tests/fixtures/tq_multimodal_fixture.pt \
-  --manifest-json tests/fixtures/tq_multimodal_fixture.manifest.json
-```
-
-生成时自动做 processor 双跑字节一致性校验（以真实数据验证 F4 组共享假设）；fixture 载入时按叶子清单自校验，损坏即报错。测试与 bench 通过 `RELAX_MM_FIXTURE`（或默认路径 `tests/fixtures/tq_multimodal_fixture.pt`）发现 fixture。逐叶子指纹的规范实现在 `relax/utils/payload_digest.py`（哈希原始存储字节，对 NaN 也成立，严格强于 `torch.equal`）。
-
-双节点验收命令（master 与 Ray 集群需由部署侧预先准备）：
+双节点验收命令（master 与 Ray 集群需由部署侧预先准备；每个 protocol 必须启动一个全新的 Python 进程并使用独立 CSV）：
 
 ```bash
 PYTHONPATH=. python -u scripts/benchmarks/tq_cross_node_bench.py \
+  --protocol rdma \
   --master <master-host>:50051 \
-  --nodeb-ip <consumer-node-ip> \
+  --consumer-node-id <consumer-ray-node-id> \
   --device <rdma-device> \
-  --payload-profiles synthetic multimodal real-multimodal \
+  --tcp-device <network-interface> \
+  --payload-profiles synthetic multimodal \
   --payload-mib 256 1024 2048 4096 \
-  --repeats 5 --require-wire-proof \
-  --csv tq_cross_node_acceptance.csv
+  --repeats 5 \
+  --csv c2-rdma.csv
 ```
 
-`real-multimodal` profile 按目标档位循环平铺 fixture 样本，`multimodal_train_inputs` 列以 NonTensorStack 走存储层非张量路径（SimpleStorage pickle / Mooncake msgpack），字节校验用行多重集指纹（采样器可重排行序；张量行按 dtype+字节比较以兼容后端间标量行 `()` 与 `[1]` 的表示差异，dict 叶子仍全形状校验）。
+用同样方式分别以 `--protocol simple` 和 `--protocol tcp` 运行 C0/C1，但这两档必须删除 `--device`；`--tcp-device` 三档都必须显式指定，因为它选择的是 consumer 节点上的验收 counter。C2 只汇总 `--device` 指定 HCA 的所有端口，不能用其他 HCA 的后台流量充当证据。C1/C2 除要求目标线路流量不低于非目标线路外，还分别要求 TCP/RDMA 接收量至少达到 raw payload 的 20%/80%；C0 因 SimpleStorage unit 可能被放在 consumer 本地，不使用 payload-volume 门槛，只确认观测到 TCP 且没有被 RDMA 流量主导。
+
+C1 仅是 benchmark 对照，脚本会在 producer 和 consumer 进程内固定启用 Mooncake TCP connection pool，不形成生产配置面。C0 的 SimpleStorage units 使用上游原生 placement，因此三档共享的是固定 driver/consumer pair，而不是完全相同的 storage topology。每轮 byte-exact 或 wire-proof 失败都会立即终止，失败轮仍会先写入并 flush 到 CSV。
 
 若验收环境没有两个 RDMA 节点，交付结论必须写成“真机验收未执行”，不能用 mock 通过推导真机已经通过。
 
-### 参考吞吐区间
-
-2 节点 × 8 GPU、mooncake 0.3.10.post2 上按上述命令完成过一次全矩阵验收（36/36 测量点逐字节 PASS、wire-proof 全部成立），量级供容量规划参考：
-
-- get 均值：C2 RDMA 2.1~4.6 GB/s（real-multimodal 最高 8.4），C1 TCP（守卫后）0.8~1.1 GB/s，C0 SimpleStorage 1.2~3.2 GB/s；C2 相对 C1 增益 2.1×~8.4×，全档位满足 ≥20% 门槛
-- put 均值：C2 4.1~12.9 GB/s，C1/C0 1.4~2.6 GB/s——写侧收益显著大于读侧，与“已知限制”第一条一致
-- 大档位（4G）下 C2 吞吐明显上扬：大批量摊薄了每 key 的 MR 注册开销
-
-逐档明细、逐轮分布与原始 CSV 属于交付验收材料，随验收报告存档，不在本文档维护。
+完整矩阵结果、依赖版本、逐轮分布与原始 CSV 属于对应 commit 的外部 PR 验收材料，不在本文档维护易过期的历史性能数字。
 
 ## 排障表
 

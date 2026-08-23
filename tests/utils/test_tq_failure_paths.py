@@ -1339,7 +1339,7 @@ class TestMooncakeByteExact:
         assert status == "ok", f"{status}: {detail}"
 
     @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
-    def test_multimodal_list_dict_slow_path_roundtrip_is_byte_exact(self, protocol):
+    def test_multimodal_list_dict_slow_path_roundtrip_is_byte_exact(self, protocol, record_property):
         """The container production actually ships: one dict per sample.
 
         ``multimodal_train_inputs`` reaches MooncakeStore as non-tensor values
@@ -1355,4 +1355,5 @@ class TestMooncakeByteExact:
         across protocols) and a wedged engine cannot hang the suite.
         """
         status, detail = _run_isolated_roundtrip(_mm_slow_path_worker, protocol, timeout=240)
+        record_property("multimodal_roundtrip", detail)
         assert status == "ok", f"{status}: {detail}"
