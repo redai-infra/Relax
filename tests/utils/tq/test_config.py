@@ -157,50 +157,32 @@ class TestMasterEndpoint:
 class TestBackendConfigDicts:
     """The dicts handed to ``tq.init``."""
 
-    def test_simple_storage_config(self):
-        cfg = build_simple_storage_config(total_storage_size=1000, num_data_storage_units=2)
+    @pytest.mark.parametrize("total_storage_size", [1000, None], ids=["bounded", "unlimited"])
+    def test_simple_storage_config(self, total_storage_size):
+        cfg = build_simple_storage_config(total_storage_size=total_storage_size, num_data_storage_units=2)
         assert cfg == {
             "storage_backend": "SimpleStorage",
-            "SimpleStorage": {"total_storage_size": 1000, "num_data_storage_units": 2},
+            "SimpleStorage": {"total_storage_size": total_storage_size, "num_data_storage_units": 2},
         }
 
-    def test_simple_storage_config_allows_unlimited_capacity(self):
-        cfg = build_simple_storage_config(total_storage_size=None, num_data_storage_units=2)
-        assert cfg["SimpleStorage"]["total_storage_size"] is None
-
-    def test_storage_backend_key_selects_the_manager(self):
-        """``tq.init`` reads ``backend.storage_backend``; omitting it silently
-        keeps SimpleStorage."""
-        assert build_mooncake_config(master_address=_MASTER)["storage_backend"] == "MooncakeStore"
-        assert (
-            build_simple_storage_config(total_storage_size=1, num_data_storage_units=1)["storage_backend"]
-            == "SimpleStorage"
-        )
-
-    def test_mooncake_defaults_to_host_rdma(self):
-        """Production never names a protocol: the default is the only one it
-        ships."""
-        mc = build_mooncake_config(master_address=_MASTER, device="rdma0")["MooncakeStore"]
-        assert mc["protocol"] == "rdma"
-        assert mc["device_name"] == "rdma0"
-        assert mc["hard_pin"] is True  # no silent eviction
-        assert mc["auto_init"] is False  # external master
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_protocol", "expected_device"),
+        [
+            ({}, "rdma", ""),
+            ({"device": "rdma0"}, "rdma", "rdma0"),
+            ({"protocol": "tcp"}, "tcp", ""),
+        ],
+        ids=["production-default", "explicit-device", "benchmark-tcp"],
+    )
+    def test_mooncake_config_contract(self, kwargs, expected_protocol, expected_device):
+        cfg = build_mooncake_config(master_address=_MASTER, **kwargs)
+        assert cfg["storage_backend"] == "MooncakeStore"
+        mc = cfg["MooncakeStore"]
+        assert mc["protocol"] == expected_protocol
+        assert mc["device_name"] == expected_device
+        assert mc["hard_pin"] is True
+        assert mc["auto_init"] is False
         assert mc["master_server_address"] == _MASTER
-
-    def test_empty_device_is_left_to_mooncake(self):
-        mc = build_mooncake_config(master_address=_MASTER)["MooncakeStore"]
-        assert mc["device_name"] == ""
-
-    def test_tcp_is_reachable_only_by_explicit_request(self):
-        """Mooncake/TCP survives as benchmark C1, never as a production
-        default."""
-        mc = build_mooncake_config(master_address=_MASTER, protocol="tcp")["MooncakeStore"]
-        assert mc["protocol"] == "tcp"
-
-    def test_mooncake_config_pins_host_rdma(self):
-        """This phase ships host RDMA only: ``use_gdr`` is always False and no
-        GDR staging buffer is configured."""
-        mc = build_mooncake_config(master_address=_MASTER)["MooncakeStore"]
         assert mc["use_gdr"] is False
         assert "gdr_staging_buffer_mb" not in mc
 
@@ -228,41 +210,30 @@ class TestCorrectnessContract:
         not _REAL_TQ_STORAGE,
         reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
     )
-    def test_installed_tq_satisfies_loss_prevention_contract(self):
-        validate_mooncake_runtime_contract()
-
-    @pytest.mark.skipif(
-        not _REAL_TQ_STORAGE,
-        reason="needs real TransferQueue storage submodules; CPU CI uses a single-file transfer_queue stub",
-    )
-    def test_contract_defaults_mooncake_memcpy_off(self, monkeypatch):
-        # mooncake 0.3.10 memcpy fast path silently truncates TCP transfers;
-        # the correctness guards must force it off when the operator is silent.
-        monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    @pytest.mark.parametrize("override", [None, "0"], ids=["default", "explicit-disable"])
+    def test_contract_accepts_safe_memcpy_settings(self, monkeypatch, override):
+        if override is None:
+            monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+        else:
+            monkeypatch.setenv("MC_STORE_MEMCPY", override)
         validate_mooncake_runtime_contract()
         assert os.environ["MC_STORE_MEMCPY"] == "0"
 
-    def test_contract_rejects_explicit_memcpy_enable(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("override", "private_marker"),
+        [("1", None), ("1\nprivate deployment detail", "private deployment detail")],
+        ids=["enable", "untrusted-value"],
+    )
+    def test_contract_rejects_unsafe_memcpy_settings(self, monkeypatch, override, private_marker):
         # mooncake 0.3.10's memcpy path is confirmed to corrupt data, so the
         # guard fails closed instead of honouring an operator override.  The
         # rejection happens before any transfer_queue import, so this test runs
         # on CPU CI too.
-        monkeypatch.setenv("MC_STORE_MEMCPY", "1")
-        with pytest.raises(RuntimeError, match="MC_STORE_MEMCPY"):
-            validate_mooncake_runtime_contract()
-
-    def test_contract_rejection_does_not_echo_memcpy_override(self, monkeypatch):
-        private_detail = "1\nprivate deployment detail"
-        monkeypatch.setenv("MC_STORE_MEMCPY", private_detail)
+        monkeypatch.setenv("MC_STORE_MEMCPY", override)
         with pytest.raises(RuntimeError, match="MC_STORE_MEMCPY") as excinfo:
             validate_mooncake_runtime_contract()
-        assert private_detail not in str(excinfo.value)
-
-    def test_contract_accepts_explicit_memcpy_disable(self, monkeypatch):
-        monkeypatch.setenv("MC_STORE_MEMCPY", "0")
-        if _REAL_TQ_STORAGE:
-            validate_mooncake_runtime_contract()
-            assert os.environ["MC_STORE_MEMCPY"] == "0"
+        if private_marker is not None:
+            assert private_marker not in str(excinfo.value)
 
     @pytest.mark.skipif(
         not _REAL_TQ_STORAGE,
@@ -294,22 +265,45 @@ class TestSegmentCapacity:
     def test_text_only_passes(self):
         assert validate_segment_capacity(_make_args(multimodal_keys=None)) is None
 
-    def test_multimodal_large_batch_fails(self):
-        args = _make_args(
-            multimodal_keys=["pixel_values"], rollout_batch_size=256, n_samples_per_prompt=8, max_staleness=1
-        )
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            (
+                {
+                    "multimodal_keys": ["pixel_values"],
+                    "rollout_batch_size": 256,
+                    "n_samples_per_prompt": 8,
+                    "max_staleness": 1,
+                },
+                "insufficient",
+            ),
+            (
+                {
+                    "multimodal_keys": ["pixel_values"],
+                    "rollout_batch_size": 32,
+                    "n_samples_per_prompt": 1,
+                    "max_staleness": 1,
+                },
+                "RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB",
+            ),
+            (
+                {
+                    "multimodal_keys": ["pixel_values"],
+                    "rollout_batch_size": 16,
+                    "partial_rollout": True,
+                    "use_dynamic_global_batch_size": True,
+                    "over_sampling_batch_size": 64,
+                },
+                "effective_batch=64",
+            ),
+        ],
+        ids=["large-batch", "staleness", "dynamic-oversampling"],
+    )
+    def test_insufficient_capacity_is_rejected(self, overrides, message):
+        args = _make_args(**overrides)
         err = validate_segment_capacity(args)
         assert err is not None
-        assert "insufficient" in err.lower()
-
-    def test_multimodal_staleness_no_longer_passes(self):
-        # Review (Codex P1): 32 in-flight samples x ~77 MiB x (staleness+1)=2
-        # needs ~4.9 GiB and previously passed the 8 MiB/sample guess.
-        args = _make_args(
-            multimodal_keys=["pixel_values"], rollout_batch_size=32, n_samples_per_prompt=1, max_staleness=1
-        )
-        err = validate_segment_capacity(args)
-        assert err is not None and "RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB" in err
+        assert message.lower() in err.lower()
 
     def test_env_override_raises_the_ceiling(self, monkeypatch):
         args = _make_args(
@@ -355,33 +349,18 @@ class TestPayloadEstimate:
         with pytest.raises(RuntimeError, match="seq_length"):
             estimate_payload_bytes(_make_args(seq_length=None))
 
-    def test_capacity_batch_uses_dynamic_partial_rollout_oversampling(self):
+    @pytest.mark.parametrize(
+        ("partial_rollout", "expected_batch"),
+        [(True, 64), (False, 16)],
+        ids=["dynamic-partial", "nominal"],
+    )
+    def test_capacity_batch_resolution(self, partial_rollout, expected_batch):
         args = _make_args(
             rollout_batch_size=16,
-            partial_rollout=True,
+            partial_rollout=partial_rollout,
             use_dynamic_global_batch_size=True,
             over_sampling_batch_size=64,
         )
-        assert resolve_tq_capacity_batch_size(args) == 64
-        assert estimate_payload_bytes(args) == 64 * 8192 * 32
-
-    def test_capacity_batch_uses_nominal_rollout_without_dynamic_partial_rollout(self):
-        args = _make_args(
-            rollout_batch_size=16,
-            partial_rollout=False,
-            use_dynamic_global_batch_size=True,
-            over_sampling_batch_size=64,
-        )
-        assert resolve_tq_capacity_batch_size(args) == 16
-
-    def test_dynamic_partial_rollout_capacity_rejects_oversampling_peak(self):
-        args = _make_args(
-            multimodal_keys=["pixel_values"],
-            rollout_batch_size=16,
-            partial_rollout=True,
-            use_dynamic_global_batch_size=True,
-            over_sampling_batch_size=64,
-        )
-        err = validate_segment_capacity(args)
-        assert err is not None
-        assert "effective_batch=64" in err
+        assert resolve_tq_capacity_batch_size(args) == expected_batch
+        if partial_rollout:
+            assert estimate_payload_bytes(args) == expected_batch * 8192 * 32

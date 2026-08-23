@@ -133,18 +133,9 @@ Mooncake 配置固定 `hard_pin=true`，不会为了腾空间静默驱逐已经�
 - `NOTIFY_DATA_UPDATE_ACK` 必须检查 positive ACK，controller 拒绝更新时 producer 不得按成功返回；
 - 合入修复后更新 Relax 的明确 commit pin，并以稳定的 version/capability marker 校验，而不是仅凭 method name 或源码文本推断能力。
 
-在上述上游 PR 与新 pin 落地前，这个正确性门槛仍是明确的合入 blocker；本 PR 不通过 monkey patch 改写 TransferQueue。Relax 侧继续保留失败 store 的“写失败、production 状态不更新”契约测试，以及隔离 master 的物理容量溢出故障注入。
+在上述上游 PR 与新 pin 落地前，这个正确性门槛仍是明确的合入 blocker；本 PR 不通过 monkey patch 改写 TransferQueue。Relax 侧继续保留容量预检、SimpleStorage backpressure，以及失败 store 的“写失败、production 状态不更新”契约测试。真实 Mooncake 的容量与传输验收统一由跨节点 benchmark 承担，不再在 pytest 中维护第二套 direct-client harness。
 
 正确性守卫强制 `MC_STORE_MEMCPY=0` 且 **fail-closed**：mooncake 0.3.10 在 TCP-only 环境会自动启用 memcpy 快拷贝路径，该路径存在已确认的静默截断缺陷（现象与处置见排障表）；RDMA 会话本就自动禁用 memcpy，不受影响。由于缺陷在当前 pin 上已实证，显式导出 `MC_STORE_MEMCPY=1` 会在启动时被直接拒绝，待 pin 升级到修复版本后再按版本重新放开。
-
-真机容量故障注入会故意创建 64 MiB segment 并写入 96 MiB，仅允许在独立、可丢弃的 master 上运行：
-
-```bash
-MC_MASTER_ADDRESS=<isolated-master>:50051 \
-RELAX_RUN_REAL_MOONCAKE_CAPACITY_TEST=1 \
-pytest -q tests/utils/test_tq_failure_paths.py \
-  -k real_mooncake_capacity_overflow
-```
 
 ## 验收分层
 
@@ -153,13 +144,12 @@ Mock/本机测试和真实双节点 RDMA 测试必须分别报告，前者不能
 | 层级 | 验证内容 | 通过标准 |
 |---|---|---|
 | CI/mock | 模式校验、master 端点格式、容量预检、owner 超时与终止确认、controller 清理、attach 握手的 manager/config 契约与拆除顺序、auto/required、有限重试、写失败不发布状态 | `tests/utils/tq/test_config.py`、`tests/core/test_controller_tq_backend.py` 与 `tests/utils/test_tq_failure_paths.py` 全部通过；真机项允许明确 skip |
-| 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性；`multimodal_train_inputs` 以生产容器（`list[dict]` / NonTensorStack，存储层非张量路径）全链路逐叶子 SHA-256 一致 | `tests/utils/test_tq_dataplane_behavior.py` 通过（含 `TestRealMultimodalFullLink`） |
-| 真实 Mooncake | TCP/RDMA direct-client：混合 dtype 稠密张量逐字节一致；`list[dict]` 非张量 msgpack 慢路径逐叶子一致（每协议独立 spawn 子进程，规避 0.3.10 会话内协议切换问题） | `TestMooncakeByteExact` 的 TCP/RDMA 各两档均通过，不得 skip |
+| 本机 TQ | SimpleStorage 全链路 put/get、容量 backpressure、空读、清理、字节一致性；`multimodal_train_inputs` 以生产容器（`list[dict]` / NonTensorStack，存储层非张量路径）全链路逐叶子 SHA-256 一致 | `tests/utils/test_tq_dataplane_behavior.py` 通过（含 `TestMultimodalFullLink`） |
 | 真实多模态载荷 | 真实数据集图像走完整生产预处理链（`build_messages` → `apply_chat_template` → `process_vision_info` → HF processor → `remap_mm_train_inputs`）生成 fixture；上述两级多模态用例检测到 fixture 后自动升级为真实载荷档 | fixture 存在时以 `[real]` 档通过；无 fixture 环境回退 `[synthetic]`（生产同构状，CI 兜底）；交付报告须注明真实档在何处跑过 |
 | 真实双节点 | 同一 driver/consumer pair 下各 backend 的原生数据布局；SimpleStorage、Mooncake/TCP、Mooncake/RDMA；synthetic、production-shaped multimodal 两种 profile；256/1024/2048/4096 MiB；每档 warmup + 至少 5 轮 | 每次 get 的 dtype、shape 与 raw-byte SHA-256 全部 PASS；强制 counter gate 证明对应线路；逐协议、逐轮 CSV 留档并报告均值、median、stddev |
 | 真实回退（`auto` + 某节点 RDMA 不可用） | 静态探测删除后，`auto` 会真的创建 Mooncake owner 与 named controller，再在 handshake 阶段失败并拆除，因此这条路径必须实测 | 逐条确认：① 日志显示 Mooncake owner `tq.init` **成功**、随后 handshake 阶段失败（否则实际只测到 owner 初始化失败，覆盖不到拆除）；② 最终存在且仅存在一个预期的 SimpleStorage `TransferQueueController`；③ 该 controller 的 stored config 确认为 SimpleStorage；④ SimpleStorage 的 put/get 正常工作；⑤ 旧 Mooncake owner actor 与其 client 均已消失；⑥ Mooncake segment 已从 master 卸载——若测的是强杀/超时路径，需等过 `client_ttl`（默认 30 s）再检查 |
 
-真实模型/数据 fixture 及其生成流程属于外部 PR 验收附件，不再由生产仓库维护。可选的本机 dataplane 测试仍可通过 `RELAX_MM_FIXTURE` 指向已验证的外部 fixture；唯一保留的跨节点 benchmark 只接受显式的 `synthetic` 和 `multimodal` profile，不会在缺失 fixture 时替换 profile。
+真实模型/数据 fixture 及其生成流程属于外部 PR 验收附件，不再由仓库测试代码加载或维护。本机 dataplane 测试使用确定性的 production-shaped synthetic payload；唯一保留的跨节点 benchmark 只接受显式的 `synthetic` 和 `multimodal` profile，不会在缺失外部 fixture 时替换验收口径。
 
 双节点验收命令（master 与 Ray 集群需由部署侧预先准备；每个 protocol 必须启动一个全新的 Python 进程并使用独立 CSV）：
 

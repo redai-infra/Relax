@@ -1,33 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""TransferQueue data-plane behavior + byte-exact consistency tests.
+"""Real local SimpleStorage data-plane contracts.
 
-These are **integration tests**: they spin up a real TransferQueue over
-SimpleStorage (ZMQ/TCP) inside a local Ray cluster and exercise the full
-put -> get round-trip plus six storage-behavior contracts.  They do NOT need
-GPU or RDMA — SimpleStorage runs as Ray actors with in-process ZMQ servers,
-so they are single-node and CI-runnable wherever a Ray cluster can start.
-
-Behaviors verified (mapped to the RFC's six required behaviors):
-
-  1. connection  -- tq.init + get_client yield a usable client (put/get).
-  2. byte-exact  -- every put tensor returns byte-identical via NestedTensor
-                    .values(), including a realistic multimodal column count.
-  3. backpressure-- a single put exceeding capacity raises RuntimeError
-                    ("Storage capacity exceeded") rather than silently dropping.
-  4. empty-get   -- get on an empty partition returns size==0 + empty TensorDict
-                    without hanging (the consumer-side "no data yet" contract).
-  5. retry       -- re-putting the same partition overwrites; get returns latest.
-  6. cleanup     -- clear_partition empties data; close+reinit yields a fresh,
-                    isolated controller (exercises the F10 anti-hang path).
-  7. multimodal  -- ``multimodal_train_inputs`` as ``list[dict]`` (the
-                    production NonTensorStack container, storage's non-tensor
-                    slow path) survives the full link byte-exactly; runs on the
-                    REAL Qwen-VL fixture when present, production-structured
-                    synthetic otherwise (see tests/utils/mm_payload_fixtures.py).
-
-A true cross-node disconnect (consumer node death mid-get) is NOT covered here
--- it requires multi-node GPU hardware and is skipped per project rules.
+Covers connection, dense/multimodal byte identity, backpressure, empty get,
+repeat put, and clear/reinit.  Cross-node transport and disconnect behavior
+belong to the retained C0/C1/C2 benchmark.
 """
 
 from __future__ import annotations
@@ -40,20 +17,10 @@ import torch
 
 
 def _has_real_submodule(dotted: str) -> bool:
-    """True only if a REAL transfer_queue package is installed.
-
-    CI installs a single-file ``transfer_queue`` stub whose ``__getattr__``
-    returns a dummy for any attribute, so ``find_spec("transfer_queue")`` is
-    True on CI even though no real submodule exists. Probing a real submodule
-    (``transfer_queue.storage``) returns None for the stub, so these
-    integration tests skip on CPU CI and run only where real TransferQueue +
-    Ray are installed.
-    """
+    """Distinguish the real package from CI's single-file TQ stub."""
     try:
         return importlib.util.find_spec(dotted) is not None
     except (ImportError, ValueError, TypeError):
-        # CI's single-file transfer_queue stub returns a dummy for ``__path__``,
-        # so find_spec on a submodule raises TypeError instead of returning None.
         return False
 
 
@@ -70,11 +37,6 @@ pytestmark = pytest.mark.skipif(
 
 _TQ_ACTOR = "TransferQueueController"
 _TQ_NS = "transfer_queue"
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _wait_controller_gone(timeout: float = 20.0) -> bool:
@@ -106,24 +68,14 @@ def _force_kill_controller() -> None:
 
 
 def _flat_values(t):
-    """Flatten a dense tensor or a NestedTensor to a 1-D comparable view.
-
-    TransferQueue returns per-sample data as ``NestedTensor`` (shape ``(N,
-    j0)``); ``.values()`` is the row-major concatenated storage, which is what
-    byte-exact comparison must use.  Dense inputs flatten identically.
-    """
+    """Flatten a dense tensor or NestedTensor to its comparable storage."""
     if type(t).__name__ == "NestedTensor":
         return t.values().reshape(-1)
     return t.reshape(-1)
 
 
 def _row_value(column, row_position: int):
-    """Extract one sample's value from a returned TensorDict column.
-
-    Handles the three container types TQ can hand back: jagged ``NestedTensor``
-    (variable-length tensor fields), ``NonTensorStack`` (list[dict] fields),
-    and plain dense tensors.
-    """
+    """Extract one row from a dense, nested, or non-tensor column."""
     if isinstance(column, torch.Tensor) and column.is_nested:
         return column.unbind()[row_position]
     return column[row_position]
@@ -140,16 +92,29 @@ def _payload(n: int, fields: list[str], cols: int, dtype: str = "float32", seed:
     return TensorDict(data, batch_size=[n])
 
 
+def _multimodal_payload(num_samples: int) -> dict:
+    """Deterministic Qwen3-VL-shaped payload for the non-tensor TQ path."""
+    grids = ((1, 58, 64), (1, 34, 64), (1, 64, 64), (1, 26, 40))
+    generator = torch.Generator().manual_seed(20260813)
+    multimodal = []
+    tokens = []
+    for index in range(num_samples):
+        t, h, w = grids[index % len(grids)]
+        multimodal.append(
+            {
+                "pixel_values": torch.randn(t * h * w, 1536, generator=generator),
+                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.int64),
+            }
+        )
+        tokens.append(torch.randint(0, 151_000, (512 + 173 * index,), generator=generator).tolist())
+    return {"tokens": tokens, "multimodal_train_inputs": multimodal}
+
+
 def _round_trip(client, payload, partition: str, fields: list[str], n: int):
     """put -> get_data and return the retrieved TensorDict."""
     client.put(payload, partition_id=partition)
     meta = client.get_meta(data_fields=fields, batch_size=n, partition_id=partition, mode="fetch", task_name=partition)
     return client.get_data(meta)
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -166,12 +131,7 @@ def _ray_cluster():
 
 @pytest.fixture
 def tq_factory(_ray_cluster):
-    """Yield ``reinit(capacity, units=1) -> client``; tears down after each
-    test.
-
-    Each call closes the prior TQ, waits for the controller to leave the GCS
-    (F10-safe), and starts a fresh controller with the requested capacity.
-    """
+    """Yield an F10-safe ``reinit(capacity, units) -> client`` factory."""
     import transfer_queue as tq
     from omegaconf import OmegaConf
     from transfer_queue import GRPOGroupNSampler
@@ -201,54 +161,32 @@ def tq_factory(_ray_cluster):
 
     yield _reinit
 
-    # Final teardown: close + ensure controller gone so the next test/module
-    # starts clean.
     tq.close()
     _wait_controller_gone()
     _force_kill_controller()
     _wait_controller_gone()
 
 
-# ---------------------------------------------------------------------------
-# Behavior + byte-exact tests
-# ---------------------------------------------------------------------------
-
-
 class TestTqDataPlaneBehavior:
-    def test_connection_establishment(self, tq_factory):
-        """tq.init + get_client produce a client that can put and get."""
+    @pytest.mark.parametrize(
+        ("fields", "columns", "samples", "seed"),
+        [
+            (["a", "b"], 8, 4, 0),
+            (["img", "txt", "mask"], 16, 8, 42),
+            (["pixel_values"], 1176, 4, 7),
+        ],
+        ids=["connection", "multi-field", "multimodal-width"],
+    )
+    def test_dense_round_trip_is_byte_exact(self, tq_factory, fields, columns, samples, seed):
         client = tq_factory()
-        payload = _payload(n=4, fields=["a", "b"], cols=8)
-        got = _round_trip(client, payload, "conn", ["a", "b"], 4)
-        assert "a" in got.keys() and "b" in got.keys()
-
-    def test_byte_exact_consistency(self, tq_factory):
-        """Every put tensor returns byte-identical (NestedTensor .values())."""
-        client = tq_factory()
-        fields = ["img", "txt", "mask"]
-        payload = _payload(n=8, fields=fields, cols=16, seed=42)
-        got = _round_trip(client, payload, "be", fields, 8)
-        for k in fields:
-            gv, av = _flat_values(got[k]), _flat_values(payload[k])
-            assert gv.numel() == av.numel(), f"{k}: numel {gv.numel()} != {av.numel()}"
+        payload = _payload(n=samples, fields=fields, cols=columns, seed=seed)
+        got = _round_trip(client, payload, "dense", fields, samples)
+        assert set(fields) <= set(got.keys())
+        for field in fields:
+            gv, av = _flat_values(got[field]), _flat_values(payload[field])
+            assert gv.numel() == av.numel()
             assert gv.dtype == av.dtype
-            # Elementwise identity is the byte-exact contract.
-            assert torch.equal(gv, av), f"{k}: not byte-exact"
-
-    def test_byte_exact_multimodal_column_count(self, tq_factory):
-        """Realistic multimodal hidden dim (1176, Qwen3-VL) survives round-
-        trip.
-
-        Uses a bounded token count to keep the test fast; the point is that a
-        production column count round-trips byte-exactly through NestedTensor.
-        """
-        client = tq_factory()
-        fields = ["pixel_values"]
-        payload = _payload(n=4, fields=fields, cols=1176, seed=7)
-        got = _round_trip(client, payload, "mm", fields, 4)
-        gv, av = _flat_values(got["pixel_values"]), _flat_values(payload["pixel_values"])
-        assert gv.numel() == av.numel()
-        assert torch.equal(gv, av)
+            assert torch.equal(gv, av), f"{field}: not byte-exact"
 
     def test_backpressure_raises_on_capacity_overflow(self, tq_factory):
         """A single put exceeding capacity raises rather than silently
@@ -313,31 +251,16 @@ class TestTqDataPlaneBehavior:
         assert getattr(meta3, "size", None) == 0
 
 
-class TestRealMultimodalFullLink:
-    """Byte-exactness for the production multimodal container, full link.
-
-    Production ships ``multimodal_train_inputs`` as one dict per sample
-    (``relax/utils/utils.py::dict_to_tensordict`` keeps the raw list ->
-    tensordict ``NonTensorStack``).  That column takes the storage backends'
-    *non-tensor* path (SimpleStorage: pickled objects; MooncakeStore: msgpack
-    pack/unpack), which none of the dense-tensor tests above touch.
-
-    Payload source is reported in every assertion: ``real`` (an external
-    fixture built from actual dataset images through the production Qwen-VL
-    processor chain) or ``synthetic`` (production-structured fallback,
-    CI-safe).
-    """
+class TestMultimodalFullLink:
+    """Production NonTensorStack container survives the full link exactly."""
 
     def test_multimodal_list_dict_full_link_byte_exact(self, tq_factory, record_property):
-        """Real assembly (dict_to_tensordict) -> tq put/get -> leaf-level
-        SHA-256 equality for every sample, aligned by sample_id (the sampler
-        may reorder rows)."""
         from relax.utils.utils import dict_to_tensordict
-        from tests.utils.mm_payload_fixtures import mm_train_data
         from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
 
         num_samples = 4
-        train_data, source = mm_train_data(num_samples)
+        train_data = _multimodal_payload(num_samples)
+        source = "synthetic"
         record_property("multimodal_payload_source", source)
         train_data = dict(train_data)
         train_data["sample_id"] = list(range(num_samples))

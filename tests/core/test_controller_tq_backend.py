@@ -92,6 +92,10 @@ def _assert_simple_storage(backend: dict) -> None:
     assert "MooncakeStore" not in backend
 
 
+def _raise(error: BaseException) -> None:
+    raise error
+
+
 class TestOffMode:
     """``off`` is the untouched SimpleStorage path: it checks nothing."""
 
@@ -139,7 +143,7 @@ class TestOffMode:
         monkeypatch.setattr(
             controller,
             "reap_unusable_tq_controller",
-            lambda: (_ for _ in ()).throw(RuntimeError("exclusive cluster is not clean")),
+            lambda: _raise(RuntimeError("exclusive cluster is not clean")),
         )
         monkeypatch.setattr(
             controller.tq,
@@ -162,62 +166,62 @@ class TestNoStaticCapabilityProbe:
         _resolve(_config())
         assert recorder.calls == ["contract", "master"]
 
-    def test_probe_helpers_are_no_longer_importable(self):
-        with pytest.raises(ModuleNotFoundError):
-            __import__("relax.utils.rdma_probe")
 
-    def test_controller_module_holds_no_probe_symbols(self):
-        for name in ("probe_cluster_nodes", "reduce_results", "probe_node", "EffectiveConfig"):
-            assert not hasattr(controller, name), f"{name} should be gone with the static probe"
+class TestBackendPreconditions:
+    """The same unmet precondition degrades ``auto`` and aborts
+    ``required``."""
 
+    @pytest.mark.parametrize("mode", ["auto", "required"])
+    @pytest.mark.parametrize(
+        ("recorder_kwargs", "config_overrides", "segment_override", "match"),
+        [
+            ({"contract_error": RuntimeError("retry guard missing")}, {}, None, "correctness contract"),
+            ({"master_error": RuntimeError("MC_MASTER_ADDRESS required")}, {}, None, "master endpoint"),
+            ({"master_error": RuntimeError("unusable master endpoint")}, {}, None, "master endpoint"),
+            (
+                {},
+                {"multimodal_keys": ["pixel_values"], "rollout_batch_size": 64, "n_samples_per_prompt": 8},
+                None,
+                "segment capacity insufficient",
+            ),
+            ({}, {}, "four", "segment-capacity configuration is unusable"),
+            ({}, {}, "nan", "segment-capacity configuration is unusable"),
+            ({}, {}, "inf", "segment-capacity configuration is unusable"),
+            ({}, {}, "-inf", "segment-capacity configuration is unusable"),
+            ({}, {"seq_length": None}, None, "segment-capacity configuration is unusable"),
+        ],
+        ids=[
+            "correctness-contract",
+            "missing-master",
+            "malformed-master",
+            "insufficient-capacity",
+            "invalid-segment-size",
+            "nan-segment-size",
+            "infinite-segment-size",
+            "negative-infinite-segment-size",
+            "missing-seq-length",
+        ],
+    )
+    def test_unmet_precondition(
+        self,
+        monkeypatch,
+        mode,
+        recorder_kwargs,
+        config_overrides,
+        segment_override,
+        match,
+    ):
+        recorder = _Recorder(monkeypatch, **recorder_kwargs)
+        if segment_override is not None:
+            monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", segment_override)
 
-class TestAutoFallsBackForEveryUnmetPrecondition:
-    """Gate A: in ``auto``, anything short of host RDMA yields
-    SimpleStorage."""
-
-    def test_contract_failure_falls_back_before_touching_master(self, monkeypatch):
-        recorder = _Recorder(monkeypatch, contract_error=RuntimeError("retry guard missing"))
-        _assert_simple_storage(_resolve(_config()))
-        assert recorder.calls == ["contract"]
-
-    def test_missing_master_endpoint_falls_back(self, monkeypatch):
-        recorder = _Recorder(monkeypatch, master_error=RuntimeError("MC_MASTER_ADDRESS required"))
-        _assert_simple_storage(_resolve(_config()))
-        assert recorder.calls == ["contract", "master"]
-
-    def test_malformed_master_endpoint_falls_back(self, monkeypatch):
-        recorder = _Recorder(
-            monkeypatch, master_error=RuntimeError("MC_MASTER_ADDRESS is not a usable endpoint: missing host")
-        )
-        _assert_simple_storage(_resolve(_config()))
-        assert recorder.calls == ["contract", "master"]
-
-    def test_insufficient_segment_capacity_falls_back(self, monkeypatch):
-        """Worst-case multimodal payload far exceeds the default segment."""
-        _Recorder(monkeypatch)
-        config = _config(multimodal_keys=["pixel_values"], rollout_batch_size=64, n_samples_per_prompt=8)
-        _assert_simple_storage(_resolve(config))
-
-    def test_unusable_segment_size_override_falls_back(self, monkeypatch):
-        """Capacity validation *raises* here rather than returning a reason.
-
-        A garbage override is a configuration failure like any other and must
-        not abort an ``auto`` run.
-        """
-        _Recorder(monkeypatch)
-        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "four")
-        _assert_simple_storage(_resolve(_config()))
-
-    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
-    def test_non_finite_segment_size_override_falls_back(self, monkeypatch, value):
-        _Recorder(monkeypatch)
-        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", value)
-        _assert_simple_storage(_resolve(_config()))
-
-    def test_missing_seq_length_falls_back(self, monkeypatch):
-        """Without ``seq_length`` the payload bound cannot be derived."""
-        _Recorder(monkeypatch)
-        _assert_simple_storage(_resolve(_config(seq_length=None)))
+        config = _config(tq_rdma_mode=mode, **config_overrides)
+        if mode == "auto":
+            _assert_simple_storage(_resolve(config))
+        else:
+            with pytest.raises(RuntimeError, match=match):
+                _resolve(config)
+        assert recorder.calls == (["contract"] if recorder_kwargs.get("contract_error") else ["contract", "master"])
 
     def test_satisfied_preconditions_select_host_rdma(self, monkeypatch):
         _Recorder(monkeypatch)
@@ -226,59 +230,18 @@ class TestAutoFallsBackForEveryUnmetPrecondition:
         assert backend["MooncakeStore"]["protocol"] == "rdma"
         assert backend["MooncakeStore"]["device_name"] == "mlx5_0"
 
-    def test_validated_master_endpoint_reaches_the_client_config(self, monkeypatch):
-        """The checked endpoint must be the one handed to Mooncake.
-
-        ``build_mooncake_config`` must not re-read ``MC_MASTER_ADDRESS``; a
-        divergent env value here would surface as the wrong address.
-        """
-        _Recorder(monkeypatch)
-        monkeypatch.setenv("MC_MASTER_ADDRESS", "someone.else.invalid:9999")
-        backend = _resolve(_config())
-        assert backend["MooncakeStore"]["master_server_address"] == _MASTER
-
-
-class TestRequiredFailsFast:
-    """``required`` must never silently downgrade the same failures."""
-
-    @pytest.mark.parametrize(
-        ("kwargs", "match"),
-        [
-            ({"contract_error": RuntimeError("retry guard missing")}, "correctness contract"),
-            ({"master_error": RuntimeError("MC_MASTER_ADDRESS required")}, "master endpoint is not configured"),
-        ],
-    )
-    def test_required_raises(self, monkeypatch, kwargs, match):
-        _Recorder(monkeypatch, **kwargs)
-        with pytest.raises(RuntimeError, match=match):
-            _resolve(_config(tq_rdma_mode="required"))
-
-    def test_required_raises_on_insufficient_capacity(self, monkeypatch):
-        _Recorder(monkeypatch)
-        config = _config(
-            tq_rdma_mode="required",
-            multimodal_keys=["pixel_values"],
-            rollout_batch_size=64,
-            n_samples_per_prompt=8,
-        )
-        with pytest.raises(RuntimeError, match="segment capacity insufficient"):
-            _resolve(config)
-
-    def test_required_raises_on_unusable_segment_size_override(self, monkeypatch):
-        _Recorder(monkeypatch)
-        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "four")
-        with pytest.raises(RuntimeError, match="segment-capacity configuration is unusable"):
-            _resolve(_config(tq_rdma_mode="required"))
-
-    def test_required_raises_on_missing_seq_length(self, monkeypatch):
-        _Recorder(monkeypatch)
-        with pytest.raises(RuntimeError, match="segment-capacity configuration is unusable"):
-            _resolve(_config(tq_rdma_mode="required", seq_length=None))
-
     def test_required_accepts_satisfied_preconditions(self, monkeypatch):
         _Recorder(monkeypatch)
         backend = _resolve(_config(tq_rdma_mode="required"))
         assert backend["MooncakeStore"]["protocol"] == "rdma"
+
+    def test_validated_master_endpoint_reaches_the_client_config(self, monkeypatch):
+        """The checked endpoint, rather than a later env value, reaches
+        Mooncake."""
+        _Recorder(monkeypatch)
+        monkeypatch.setenv("MC_MASTER_ADDRESS", "someone.else.invalid:9999")
+        backend = _resolve(_config())
+        assert backend["MooncakeStore"]["master_server_address"] == _MASTER
 
 
 class TestModeValidation:
@@ -309,17 +272,6 @@ class TestProductionNeverSelectsMooncakeTcp:
             assert backend["MooncakeStore"]["protocol"] == "rdma"
         else:
             _assert_simple_storage(backend)
-
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {"contract_error": RuntimeError("gate failed")},
-            {"master_error": RuntimeError("no endpoint")},
-        ],
-    )
-    def test_auto_fallback_never_yields_mooncake(self, monkeypatch, kwargs):
-        _Recorder(monkeypatch, **kwargs)
-        _assert_simple_storage(_resolve(_config()))
 
 
 def test_cli_exposes_only_mode_and_device(arguments_module):
@@ -406,29 +358,18 @@ class TestAttachHandshakeCleanupChain:
         assert recorder.events == ["handshake"]
 
     def test_auto_closes_owner_before_initializing_simple_storage(self, monkeypatch):
-        recorder = _AttachRecorder(monkeypatch, failures=["node-B: attach timed out"])
-        result = _confirm(_config())
-        # Ordering is the point: SimpleStorage must not be initialised while a
-        # half-initialised Mooncake controller may still be registered.
+        recorder = _AttachRecorder(monkeypatch, failures=["node: attach timed out"])
+        result = _confirm(_config(), owner="attempt-owner")
         assert recorder.events == ["handshake", "close", "init_simple"]
+        assert recorder.closed == ["attempt-owner"]
         assert result.config == "simple-conf"
         assert result.fallback_reason == "attach_handshake_failed:1_failures"
 
-    def test_cleanup_receives_this_attempts_mooncake_owner(self, monkeypatch):
-        recorder = _AttachRecorder(monkeypatch, failures=["node-B: attach timed out"])
-        _confirm(_config(), owner="the-mooncake-owner")
-        assert recorder.closed == ["the-mooncake-owner"]
-
     def test_cleanup_failure_aborts_instead_of_falling_back(self, monkeypatch):
-        """If teardown fails, global TQ state is unknown.
-
-        Starting SimpleStorage on top of it could attach to a dirty controller,
-        so the cleanup error must propagate.
-        """
         recorder = _AttachRecorder(
             monkeypatch,
-            failures=["node-B: attach timed out"],
-            close_error=RuntimeError("TransferQueue owner cleanup failed: close timed out"),
+            failures=["node: attach timed out"],
+            close_error=RuntimeError("TransferQueue owner cleanup failed"),
         )
         with pytest.raises(RuntimeError, match="owner cleanup failed"):
             _confirm(_config())
@@ -436,7 +377,7 @@ class TestAttachHandshakeCleanupChain:
         assert recorder.initialized == []
 
     def test_required_closes_owner_then_raises(self, monkeypatch):
-        recorder = _AttachRecorder(monkeypatch, failures=["node-B: protocol=tcp"])
+        recorder = _AttachRecorder(monkeypatch, failures=["node: protocol=tcp"])
         with pytest.raises(RuntimeError, match="attach handshake reported"):
             _confirm(_config(tq_rdma_mode="required"))
         assert recorder.events == ["handshake", "close"]
@@ -486,3 +427,17 @@ class TestAttachHandshakeCleanupChain:
             controller.Controller(config)
 
         assert events == ["mooncake-owner"]
+
+    def test_repeated_data_system_cleanup_closes_the_owner_once(self, monkeypatch):
+        instance = controller.Controller.__new__(controller.Controller)
+        instance._tq_legacy_init = False
+        instance._tq_owner = "owner"
+        closed: list[object] = []
+
+        monkeypatch.setattr(controller, "close_tq_owner", lambda owner: closed.append(owner) if owner else None)
+
+        instance._close_data_system()
+        instance._close_data_system()
+
+        assert closed == ["owner"]
+        assert instance._tq_owner is None

@@ -12,6 +12,25 @@ import torch
 from scripts.benchmarks import tq_cross_node_bench
 
 
+def _argv(protocol: str, *extra: str) -> list[str]:
+    return [
+        "bench",
+        "--protocol",
+        protocol,
+        "--consumer-node-id",
+        "node",
+        "--tcp-device",
+        "eth0",
+        "--csv",
+        "x",
+        *extra,
+    ]
+
+
+def _raise(error: BaseException) -> None:
+    raise error
+
+
 def test_simple_config_builds_without_mooncake_runtime(monkeypatch):
     import transfer_queue
 
@@ -90,37 +109,9 @@ def test_read_counters_scopes_rdma_to_selected_hca(tmp_path):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["bench", "--protocol", "rdma", "--consumer-node-id", "node", "--tcp-device", "eth0", "--csv", "x"],
-        [
-            "bench",
-            "--protocol",
-            "tcp",
-            "--consumer-node-id",
-            "node",
-            "--master",
-            "master.example:50051",
-            "--device",
-            "rdma0",
-            "--tcp-device",
-            "eth0",
-            "--csv",
-            "x",
-        ],
-        [
-            "bench",
-            "--protocol",
-            "rdma",
-            "--consumer-node-id",
-            "node",
-            "--master",
-            "master.example:50051",
-            "--device",
-            "../rdma0",
-            "--tcp-device",
-            "eth0",
-            "--csv",
-            "x",
-        ],
+        _argv("rdma"),
+        _argv("tcp", "--master", "master.example:50051", "--device", "rdma0"),
+        _argv("rdma", "--master", "master.example:50051", "--device", "../rdma0"),
     ],
 )
 def test_cli_rejects_ambiguous_or_unsafe_counter_configuration(monkeypatch, argv):
@@ -129,40 +120,33 @@ def test_cli_rejects_ambiguous_or_unsafe_counter_configuration(monkeypatch, argv
         tq_cross_node_bench.parse_args()
 
 
-class _RemoteCall:
-    def __init__(self, result):
-        self.result = result
-
-    def remote(self):
-        return self.result
-
-
-def test_teardown_keeps_cleanup_order_when_consumer_shutdown_fails(monkeypatch):
+@pytest.fixture
+def teardown_events(monkeypatch):
     events: list[str] = []
-    consumer = SimpleNamespace(shutdown=_RemoteCall("shutdown-ref"))
-    monkeypatch.setattr(
-        tq_cross_node_bench.ray,
-        "get",
-        lambda _ref, timeout: (_ for _ in ()).throw(RuntimeError("consumer shutdown failed")),
-    )
     monkeypatch.setattr(tq_cross_node_bench.ray, "kill", lambda *_args, **_kwargs: events.append("consumer-killed"))
     monkeypatch.setattr(tq_cross_node_bench, "close_tq_unmount_and_wait", lambda: events.append("owner-closed"))
     monkeypatch.setattr(tq_cross_node_bench.ray, "shutdown", lambda: events.append("ray-shutdown"))
+    return events
+
+
+def test_teardown_keeps_cleanup_order_when_consumer_shutdown_fails(monkeypatch, teardown_events):
+    consumer = SimpleNamespace(shutdown=SimpleNamespace(remote=lambda: "shutdown-ref"))
+    monkeypatch.setattr(
+        tq_cross_node_bench.ray,
+        "get",
+        lambda _ref, timeout: _raise(RuntimeError("consumer shutdown failed")),
+    )
 
     with pytest.raises(RuntimeError, match="consumer shutdown failed"):
         tq_cross_node_bench._teardown_benchmark(consumer, owner_attempted=True)
 
-    assert events == ["consumer-killed", "owner-closed", "ray-shutdown"]
+    assert teardown_events == ["consumer-killed", "owner-closed", "ray-shutdown"]
 
 
-def test_teardown_dirty_cluster_does_not_close_unowned_controller(monkeypatch):
-    events: list[str] = []
-    monkeypatch.setattr(tq_cross_node_bench, "close_tq_unmount_and_wait", lambda: events.append("owner-closed"))
-    monkeypatch.setattr(tq_cross_node_bench.ray, "shutdown", lambda: events.append("ray-shutdown"))
-
+def test_teardown_dirty_cluster_does_not_close_unowned_controller(teardown_events):
     tq_cross_node_bench._teardown_benchmark(None, owner_attempted=False)
 
-    assert events == ["ray-shutdown"]
+    assert teardown_events == ["ray-shutdown"]
 
 
 def test_clean_cluster_guard_never_kills_a_healthy_existing_controller(monkeypatch):
@@ -177,19 +161,17 @@ def test_clean_cluster_guard_never_kills_a_healthy_existing_controller(monkeypat
     assert killed == []
 
 
-def test_teardown_shutdowns_ray_when_owner_cleanup_fails(monkeypatch):
-    events: list[str] = []
+def test_teardown_shutdowns_ray_when_owner_cleanup_fails(monkeypatch, teardown_events):
     monkeypatch.setattr(
         tq_cross_node_bench,
         "close_tq_unmount_and_wait",
-        lambda: (_ for _ in ()).throw(RuntimeError("owner cleanup failed")),
+        lambda: _raise(RuntimeError("owner cleanup failed")),
     )
-    monkeypatch.setattr(tq_cross_node_bench.ray, "shutdown", lambda: events.append("ray-shutdown"))
 
     with pytest.raises(RuntimeError, match="owner cleanup failed"):
         tq_cross_node_bench._teardown_benchmark(None, owner_attempted=True)
 
-    assert events == ["ray-shutdown"]
+    assert teardown_events == ["ray-shutdown"]
 
 
 def test_production_controller_cleanup_timeout_fails_closed(monkeypatch):

@@ -121,7 +121,13 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
 
-    def init_and_wait(self, args, role, with_ref=False, with_opd_teacher=False):
+    def init_and_wait(
+        self,
+        args: Any,
+        role: str,
+        with_ref: bool = False,
+        with_opd_teacher: bool = False,
+    ) -> list[Any]:
         """Initialize every train actor, destroying the group on any failure.
 
         ``MegatronTrainRayActor.init`` attaches the process-global

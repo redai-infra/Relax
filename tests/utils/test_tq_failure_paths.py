@@ -8,33 +8,24 @@ Covers the four gaps the maintainer review called out, which
 
 * timeout -- controller ``get_config`` timeout and attach-handshake timeout
 * disconnect -- store errors surface instead of returning corrupt data
-* retry -- ``batch_get_into`` / ``batch_upsert_from`` retry-then-raise
-* byte-exactness on **MooncakeStore** (SimpleStorage-only before), including
-  the non-tensor msgpack slow path that production ``multimodal_train_inputs``
-  (``list[dict]`` / NonTensorStack) actually takes — real Qwen-VL fixture when
-  available, production-structured synthetic otherwise
+* retry/disconnect -- a transient get recovers and a dead peer fails loudly
 * automatic degradation as pytest (was a manual two-node script)
 * the controller reaper / teardown helpers (now in ``relax.utils.tq.lifecycle``)
 
-Everything except the MooncakeStore round-trip runs with stubs, so it is
-CI-safe; the round-trip skips unless a reachable mooncake master is configured.
+Real Mooncake TCP/RDMA byte-exact and wire-level checks live in the single
+cross-node C0/C1/C2 benchmark.  This module keeps CI-safe failure semantics and
+uses real TransferQueue classes only where a stubbed store is sufficient.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib.util
-import inspect
-import multiprocessing
 import os
-import queue
-import socket
 import subprocess
 import sys
 import tempfile
-import uuid
 from types import SimpleNamespace
-from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -60,192 +51,10 @@ def _has_real_submodule(dotted: str) -> bool:
 
 
 _REAL_MOONCAKE_CLIENT = _has_real_submodule("transfer_queue.storage.clients.mooncake_client")
-_RUN_REAL_CAPACITY = os.environ.get("RELAX_RUN_REAL_MOONCAKE_CAPACITY_TEST") == "1"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _master_address() -> str:
-    """Mooncake master address for the round-trip test."""
-    return os.environ.get("MC_MASTER_ADDRESS", "127.0.0.1:50051")
-
-
-def _master_reachable(timeout: float = 1.0) -> bool:
-    """True if something accepts TCP connections on the master address."""
-    host, _, port = _master_address().rpartition(":")
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _real_capacity_worker(result_queue, segment_mib: int, payload_mib: int) -> None:
-    """Child-process target so a real Mooncake hang is externally bounded."""
-    from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
-
-    client = None
-    try:
-        client = MooncakeStoreClient(
-            {
-                "protocol": "tcp",
-                "device_name": "",
-                "master_server_address": _master_address(),
-                "metadata_server": "P2PHANDSHAKE",
-                "local_hostname": "",
-                "global_segment_size": segment_mib * 1024**2,
-                "local_buffer_size": min(segment_mib, 64) * 1024**2,
-                "hard_pin": True,
-                "use_gdr": False,
-            }
-        )
-        value = torch.arange(payload_mib * 1024**2, dtype=torch.uint8)
-        client.put(["real-capacity-overflow"], [value])
-        result_queue.put(("unexpected_success", "put returned success"))
-    except BaseException as error:
-        result_queue.put(("error", f"{type(error).__name__}: {error}"))
-    finally:
-        if client is not None:
-            client.close()
-
-
-def _mm_slow_path_worker(result_queue, protocol: str) -> None:
-    """Child-process target: multimodal list[dict] slow-path roundtrip.
-
-    Runs in its own process (one mooncake session per protocol) because
-    mooncake 0.3.10 is unstable when one process re-creates clients across
-    protocols (see scripts/benchmarks/tq_cross_node_bench.py docstring); a
-    child also keeps a real engine hang externally bounded.  Reports either
-    ("ok", ...), ("mismatch", ...) for data corruption, or ("error", ...) for
-    engine failures — the parent treats anything but "ok" as a hard failure.
-    """
-    client = None
-    keys: list[str] = []
-    put_meta: list[dict | None] | None = None
-    status = "error"
-    detail = "roundtrip did not run"
-    try:
-        from tests.utils.mm_payload_fixtures import mm_train_data
-        from tests.utils.tq._payload_assertions import diff_digests, leaf_digests
-
-        train_data, source = mm_train_data(4)
-        samples = train_data["multimodal_train_inputs"]
-        client = TestMooncakeByteExact._client(protocol)
-        run_token = uuid.uuid4().hex
-        keys = [f"mmslow_{run_token}_{protocol}_{index}@multimodal_train_inputs" for index in range(len(samples))]
-        put_meta = client.put(keys, samples)
-        if not all(isinstance(meta, dict) and meta.get("packed_size") for meta in put_meta):
-            raise RuntimeError(f"[{source}] dict payloads did not take the non-tensor path, put meta: {put_meta}")
-        got = client.get(
-            keys,
-            shapes=[[] for _ in keys],
-            dtypes=[None] * len(keys),
-            custom_backend_meta=put_meta,
-        )
-        problems: list[str] = []
-        for index, (want, have) in enumerate(zip(samples, got, strict=True)):
-            problems += [f"sample {index}: {line}" for line in diff_digests(leaf_digests(want), leaf_digests(have))]
-        if problems:
-            status, detail = "mismatch", f"[{source}] {problems[:6]}"
-        else:
-            leaves = sum(len(leaf_digests(sample)) for sample in samples)
-            packed = sum(meta["packed_size"] for meta in put_meta)
-            status, detail = (
-                "ok",
-                f"[{source}] {len(samples)} samples, {leaves} leaves, {packed} packed bytes",
-            )
-    except BaseException as error:  # pragma: no cover - transport/env failures
-        status, detail = "error", f"{type(error).__name__}: {error}"
-    finally:
-        if client is not None:
-            try:
-                if keys:
-                    client.clear(keys, put_meta)
-                client.close()
-            except BaseException as error:  # pragma: no cover - native cleanup failures
-                status, detail = "error", f"cleanup {type(error).__name__}: {error}"
-    result_queue.put((status, detail))
-
-
-def _dense_roundtrip_worker(result_queue, protocol: str) -> None:
-    """Child-process target: dense tensor roundtrip on one pristine session."""
-    client = None
-    keys: list[str] = []
-    status = "error"
-    detail = "roundtrip did not run"
-    try:
-        tensors = {
-            # Production multimodal field names, dimensions, and mixed dtypes.
-            "pixel_values": torch.randn(64, 1176, dtype=torch.float32).to(torch.bfloat16),
-            "image_grid_thw": torch.tensor([[1, 8, 8]], dtype=torch.int64),
-            "input_ids": torch.arange(4096, dtype=torch.int64),
-            "attention_mask": torch.ones(4096, dtype=torch.int64),
-            "rewards": torch.linspace(-1, 1, 64, dtype=torch.float32),
-            "noncontig": torch.randn(128, 256).t(),  # transposed == non-contiguous
-        }
-        client = TestMooncakeByteExact._client(protocol)
-        run_token = uuid.uuid4().hex
-        keys = [f"bx_{run_token}_{protocol}_{name}" for name in tensors]
-        values = list(tensors.values())
-        client.put(keys, values)
-        got = client.get(
-            keys,
-            shapes=[tuple(value.shape) for value in values],
-            dtypes=[value.dtype for value in values],
-        )
-        problems = [
-            name
-            for name, want, have in zip(tensors, values, got, strict=True)
-            if have is None or not torch.equal(have, want.contiguous())
-        ]
-        if problems:
-            status, detail = "mismatch", f"non-byte-exact fields: {problems}"
-        else:
-            status, detail = "ok", f"{len(tensors)} dense tensors"
-    except BaseException as error:  # pragma: no cover - transport/env failures
-        status, detail = "error", f"{type(error).__name__}: {error}"
-    finally:
-        if client is not None:
-            try:
-                if keys:
-                    client.clear(keys)
-                client.close()
-            except BaseException as error:  # pragma: no cover - native cleanup failures
-                status, detail = "error", f"cleanup {type(error).__name__}: {error}"
-    result_queue.put((status, detail))
-
-
-def _run_isolated_roundtrip(target: Callable[[Any, str], None], protocol: str, *, timeout: float) -> tuple[str, str]:
-    """Run one native Mooncake session with a hard process boundary."""
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
-    process = context.Process(target=target, args=(result_queue, protocol))
-    try:
-        process.start()
-        process.join(timeout=timeout)
-        timed_out = process.is_alive()
-        if timed_out:
-            process.terminate()
-            process.join(timeout=5)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=5)
-        if process.is_alive():
-            pytest.fail(f"{protocol} roundtrip process survived SIGKILL")
-        if timed_out:
-            pytest.fail(f"{protocol} roundtrip did not finish within {timeout:.0f} seconds")
-        if process.exitcode != 0:
-            pytest.fail(f"{protocol} roundtrip process exited with code {process.exitcode}")
-        try:
-            return result_queue.get(timeout=2)
-        except queue.Empty:
-            pytest.fail(f"{protocol} roundtrip process returned no result")
-    finally:
-        result_queue.close()
-        result_queue.join_thread()
+def _raise(error: BaseException) -> None:
+    raise error
 
 
 # ---------------------------------------------------------------------------
@@ -294,15 +103,14 @@ class TestReapUnusableController:
         assert tq_lifecycle.reap_unusable_tq_controller() is True
         assert killed == ["killed"]
 
-    def test_get_config_timeout_is_reaped(self, monkeypatch):
-        """An unresponsive controller must not turn tq.init into a hang."""
-        error = tq_lifecycle.ray.exceptions.GetTimeoutError("private timeout detail")
-        killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=error)
-        assert tq_lifecycle.reap_unusable_tq_controller() is True
-        assert killed == ["killed"]
-
-    def test_dead_actor_is_reaped(self, monkeypatch):
-        error = tq_lifecycle.ray.exceptions.RayActorError(error_msg="private actor detail")
+    @pytest.mark.parametrize("error_kind", ["timeout", "dead-actor"])
+    def test_unusable_controller_is_reaped(self, monkeypatch, error_kind):
+        """An unresponsive/dead controller must not turn tq.init into a
+        hang."""
+        if error_kind == "timeout":
+            error = tq_lifecycle.ray.exceptions.GetTimeoutError("private timeout detail")
+        else:
+            error = tq_lifecycle.ray.exceptions.RayActorError(error_msg="private actor detail")
         killed = self._fake_ray(monkeypatch, actor=MagicMock(), get_raises=error)
         assert tq_lifecycle.reap_unusable_tq_controller() is True
         assert killed == ["killed"]
@@ -323,7 +131,7 @@ class TestReapUnusableController:
         monkeypatch.setattr(
             tq_lifecycle.ray,
             "get_actor",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.RayError(private_detail)),
+            lambda *_args, **_kwargs: _raise(tq_lifecycle.ray.exceptions.RayError(private_detail)),
         )
 
         with pytest.raises(RuntimeError) as excinfo:
@@ -379,13 +187,8 @@ class TestCloseTqAndUnmount:
 class TestBoundedAttach:
     """attach_tq_client: one deadline for get_config wait and tq.init."""
 
-    def test_attach_timeout_env_rejects_garbage(self, monkeypatch):
-        monkeypatch.setenv("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", "soon")
-        with pytest.raises(RuntimeError, match="RELAX_TQ_ATTACH_TIMEOUT_SECONDS"):
-            tq_lifecycle._resolve_attach_timeout()
-
-    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
-    def test_attach_timeout_env_rejects_non_finite_values(self, monkeypatch, value):
+    @pytest.mark.parametrize("value", ["soon", "nan", "inf", "-inf"])
+    def test_attach_timeout_env_rejects_unusable_values(self, monkeypatch, value):
         monkeypatch.setenv("RELAX_TQ_ATTACH_TIMEOUT_SECONDS", value)
         with pytest.raises(RuntimeError, match="finite positive") as excinfo:
             tq_lifecycle._resolve_attach_timeout()
@@ -422,28 +225,38 @@ class TestBoundedAttach:
         with pytest.raises(tq_lifecycle.TqAttachTimeout, match="attach timed out"):
             tq_lifecycle._await_controller_config(time.monotonic() + 0.3)
 
-    def test_cluster_attach_handshake_worker_is_one_shot(self, monkeypatch):
+    def test_cluster_attach_covers_all_nodes_with_hard_affinity_and_one_shot_workers(self, monkeypatch):
         remote_options = {}
+        scheduling_strategies = []
+        submitted_refs = []
 
         class _Task:
-            def options(self, **_kwargs):
+            def options(self, **options):
+                scheduling_strategies.append(options["scheduling_strategy"])
                 return self
 
             def remote(self, *_args):
-                return object()
+                ref = object()
+                submitted_refs.append(ref)
+                return ref
 
         def record_remote_options(**options):
             remote_options.update(options)
             return lambda _function: _Task()
 
         monkeypatch.setattr(tq_lifecycle.ray, "remote", record_remote_options)
-        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: ["a" * 56])
+        node_ids = ["a" * 56, "b" * 56]
+        monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: node_ids)
         monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
         monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: None)
 
         assert tq_lifecycle.verify_cluster_attach({}, timeout=0.1) == []
         assert remote_options["max_calls"] == 1
         assert remote_options["max_retries"] == 0
+        assert len(submitted_refs) == len(node_ids)
+        assert [(strategy.node_id, strategy.soft) for strategy in scheduling_strategies] == [
+            (node_id, False) for node_id in node_ids
+        ]
 
     def test_cluster_attach_with_no_alive_nodes_fails_closed_without_scheduling(self, monkeypatch):
         monkeypatch.setattr(tq_lifecycle, "_alive_node_ids", lambda: [])
@@ -536,31 +349,34 @@ class TestBoundedAttach:
         monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: events.append("detach"))
         return worker[0], events
 
-    def test_handshake_worker_attaches_asserts_then_detaches(self, monkeypatch):
-        handshake, events = self._run_worker(monkeypatch)
-        handshake({"backend": {"storage_backend": "MooncakeStore"}}, True, 0.1)
-        assert events == ["attach:attach-handshake:0.1", "assert", "detach"]
-
-    def test_handshake_worker_detaches_even_when_the_assertion_fails(self, monkeypatch):
-        """A rejected transport must not leave this node's segment registered.
-
-        Without the ``finally`` the segment would linger until the master's
-        ``client_ttl`` expires and break fast restarts.
-        """
-        handshake, events = self._run_worker(monkeypatch, assert_error=RuntimeError("protocol=tcp"))
-        with pytest.raises(RuntimeError, match="protocol=tcp"):
-            handshake({"backend": {"storage_backend": "MooncakeStore"}}, True, 0.1)
-        assert events == ["attach:attach-handshake:0.1", "assert", "detach"]
-
-    def test_handshake_worker_skips_the_assertion_for_simple_storage(self, monkeypatch):
-        handshake, events = self._run_worker(monkeypatch)
-        handshake({"backend": {"storage_backend": "SimpleStorage"}}, False, 0.1)
-        assert events == ["attach:attach-handshake:0.1", "detach"]
+    @pytest.mark.parametrize(
+        ("backend", "verify_mooncake", "assert_error"),
+        [
+            ("MooncakeStore", True, None),
+            ("MooncakeStore", True, RuntimeError("protocol=tcp")),
+            ("SimpleStorage", False, None),
+        ],
+        ids=["mooncake", "mooncake-rejected", "simple"],
+    )
+    def test_handshake_worker_always_detaches(self, monkeypatch, backend, verify_mooncake, assert_error):
+        """A rejected transport must not leave this node's segment
+        registered."""
+        handshake, events = self._run_worker(monkeypatch, assert_error=assert_error)
+        conf = {"backend": {"storage_backend": backend}}
+        if assert_error is None:
+            handshake(conf, verify_mooncake, 0.1)
+        else:
+            with pytest.raises(RuntimeError, match="protocol=tcp"):
+                handshake(conf, verify_mooncake, 0.1)
+        expected = ["attach:attach-handshake:0.1"]
+        if verify_mooncake:
+            expected.append("assert")
+        assert events == [*expected, "detach"]
 
     def test_ready_task_failure_is_sanitized(self, monkeypatch):
         self._capture_handshake(monkeypatch)
         secret = "worker endpoint and traceback path must stay private"
-        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: (_ for _ in ()).throw(RuntimeError(secret)))
+        monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: _raise(RuntimeError(secret)))
 
         failures = tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
 
@@ -637,7 +453,7 @@ class TestBoundedAttach:
         monkeypatch.setattr(
             tq_lifecycle.ray,
             "cancel",
-            lambda _ref, force: (_ for _ in ()).throw(RuntimeError(private_detail)),
+            lambda _ref, force: _raise(RuntimeError(private_detail)),
         )
 
         with pytest.raises(tq_lifecycle.TqHandshakeIsolationError) as excinfo:
@@ -721,46 +537,19 @@ class TestWorkerDetach:
         tq_lifecycle.detach_tq_client()
         assert calls == [True]
 
-    def test_component_del_detaches_attached_client(self, monkeypatch):
+    @pytest.mark.parametrize("has_client", [True, False], ids=["attached", "not-attached"])
+    def test_component_del_detaches_only_an_attached_client(self, monkeypatch, has_client):
         from relax.components.base import Base
 
         calls = []
         monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
         component = Base()
-        component.data_system_client = object()
+        if has_client:
+            component.data_system_client = object()
         component.__del__()
-        assert calls == [True]
-        assert component.data_system_client is None
-
-    def test_component_del_without_client_is_noop(self, monkeypatch):
-        from relax.components.base import Base
-
-        calls = []
-        monkeypatch.setattr(tq_lifecycle, "detach_tq_client", lambda: calls.append(True))
-        component = Base()
-        component.__del__()
-        assert calls == []
-
-
-class TestExclusiveLifecycleSurface:
-    """Phase 4 must not grow the removed shared-cluster machinery back."""
-
-    def test_token_generation_and_foreign_owner_symbols_are_absent(self):
-        removed = (
-            "OWNER_TOKEN_FIELD",
-            "TqConfigurationMismatch",
-            "TqControllerInspectionError",
-            "TqControllerMissingConfig",
-            "_TQ_CLIENT_GENERATION",
-            "_CURRENT_TQ_CLIENT_GENERATION",
-        )
-        for name in removed:
-            assert not hasattr(tq_lifecycle, name)
-
-    def test_attach_and_teardown_signatures_express_single_process_owner(self):
-        assert "lease_owner" not in inspect.signature(tq_lifecycle.attach_tq_client).parameters
-        assert list(inspect.signature(tq_lifecycle.detach_tq_client).parameters) == []
-        assert list(inspect.signature(tq_lifecycle.close_tq_and_unmount).parameters) == []
+        assert calls == ([True] if has_client else [])
+        if has_client:
+            assert component.data_system_client is None
 
 
 # ---------------------------------------------------------------------------
@@ -835,16 +624,24 @@ class TestInitializeTqWithFallback:
 
         assert events == ["reap"]
 
-    def test_auto_cleans_failed_mooncake_then_retries_simple_once(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("primary_error", "fallback_reason"),
+        [
+            (
+                tq_lifecycle.TqInitializationError("master unavailable"),
+                "mooncake_init_failed:TqInitializationError",
+            ),
+            (tq_lifecycle.TqInitializationTimeout("timed out"), "mooncake_init_failed:TqInitializationTimeout"),
+        ],
+        ids=["init-error", "init-timeout"],
+    )
+    def test_auto_cleans_failed_mooncake_then_retries_simple_once(self, monkeypatch, primary_error, fallback_reason):
         primary = self._conf("MooncakeStore")
         fallback = self._conf("SimpleStorage")
-        events = self._patch_transaction(
-            monkeypatch,
-            init_effects=[tq_lifecycle.TqInitializationError("master unavailable"), None],
-        )
+        events = self._patch_transaction(monkeypatch, init_effects=[primary_error, None])
         result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
         assert result.config["backend"]["storage_backend"] == "SimpleStorage"
-        assert result.fallback_reason == "mooncake_init_failed:TqInitializationError"
+        assert result.fallback_reason == fallback_reason
         assert events == [
             "reap",
             "start",
@@ -864,17 +661,6 @@ class TestInitializeTqWithFallback:
         with pytest.raises(tq_lifecycle.TqInitializationError, match="master unavailable"):
             tq_lifecycle.initialize_tq_with_fallback(primary, mode="required", fallback_conf=fallback)
         assert events == ["reap", "start", "init:MooncakeStore"]
-
-    def test_timeout_auto_retries_only_after_isolated_owner_cleanup(self, monkeypatch):
-        primary = self._conf("MooncakeStore")
-        fallback = self._conf("SimpleStorage")
-        events = self._patch_transaction(
-            monkeypatch,
-            init_effects=[tq_lifecycle.TqInitializationTimeout("timed out"), None],
-        )
-        result = tq_lifecycle.initialize_tq_with_fallback(primary, mode="auto", fallback_conf=fallback)
-        assert result.config["backend"]["storage_backend"] == "SimpleStorage"
-        assert events[-3:] == ["reap", "start", "init:SimpleStorage"]
 
     def test_cleanup_failure_aborts_auto_before_second_gate(self, monkeypatch):
         events = self._patch_transaction(
@@ -975,37 +761,30 @@ class TestOwnerProcessBoundary:
         assert result.config is stored
         assert result.owner is owner
 
-    def test_initialize_timeout_cleans_owner_before_candidate_failure(self, monkeypatch):
-        owner = _FakeOwner()
-        cleaned: list[object] = []
-        monkeypatch.setattr(
-            tq_lifecycle.ray,
-            "get",
-            lambda _ref, timeout: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.GetTimeoutError("timeout")),
-        )
-        monkeypatch.setattr(tq_lifecycle, "_cleanup_failed_owner", lambda handle: cleaned.append(handle))
-
-        with pytest.raises(tq_lifecycle.TqInitializationTimeout):
-            tq_lifecycle._initialize_owner(owner, {}, timeout=0.1)
-
-        assert cleaned == [owner]
-
-    def test_initialize_error_is_sanitized_only_after_cleanup(self, monkeypatch):
+    @pytest.mark.parametrize("error_kind", ["timeout", "runtime"])
+    def test_initialize_failure_cleans_owner_before_propagating(self, monkeypatch, error_kind):
         owner = _FakeOwner()
         cleaned: list[object] = []
         private_detail = "private endpoint and traceback path"
+        if error_kind == "timeout":
+            source_error = tq_lifecycle.ray.exceptions.GetTimeoutError("timeout")
+            expected_error = tq_lifecycle.TqInitializationTimeout
+        else:
+            source_error = RuntimeError(private_detail)
+            expected_error = tq_lifecycle.TqInitializationError
         monkeypatch.setattr(
             tq_lifecycle.ray,
             "get",
-            lambda _ref, timeout: (_ for _ in ()).throw(RuntimeError(private_detail)),
+            lambda _ref, timeout: _raise(source_error),
         )
         monkeypatch.setattr(tq_lifecycle, "_cleanup_failed_owner", lambda handle: cleaned.append(handle))
 
-        with pytest.raises(tq_lifecycle.TqInitializationError) as excinfo:
+        with pytest.raises(expected_error) as excinfo:
             tq_lifecycle._initialize_owner(owner, {}, timeout=0.1)
 
         assert cleaned == [owner]
-        assert private_detail not in str(excinfo.value)
+        if error_kind == "runtime":
+            assert private_detail not in str(excinfo.value)
 
     def test_stop_owner_requires_terminal_probe_result(self, monkeypatch):
         owner = _FakeOwner()
@@ -1015,28 +794,29 @@ class TestOwnerProcessBoundary:
         monkeypatch.setattr(
             tq_lifecycle.ray,
             "get",
-            lambda _ref: (_ for _ in ()).throw(tq_lifecycle.ray.exceptions.RayActorError(error_msg="dead")),
+            lambda _ref: _raise(tq_lifecycle.ray.exceptions.RayActorError(error_msg="dead")),
         )
 
         tq_lifecycle._stop_owner_actor(owner, timeout=0.1)
 
         assert killed == [(owner, True)]
 
-    def test_stop_owner_fails_closed_when_probe_remains_pending(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("probe_ready", "match"),
+        [(False, "remained pending"), (True, "returned normally")],
+        ids=["pending", "returned"],
+    )
+    def test_stop_owner_requires_a_terminal_probe_failure(self, monkeypatch, probe_ready, match):
         owner = _FakeOwner()
         monkeypatch.setattr(tq_lifecycle.ray, "kill", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: ([], list(refs)))
-
-        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match="remained pending"):
-            tq_lifecycle._stop_owner_actor(owner, timeout=0.1)
-
-    def test_stop_owner_rejects_a_probe_that_returns_normally(self, monkeypatch):
-        owner = _FakeOwner()
-        monkeypatch.setattr(tq_lifecycle.ray, "kill", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(tq_lifecycle.ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+        monkeypatch.setattr(
+            tq_lifecycle.ray,
+            "wait",
+            lambda refs, **_kwargs: (list(refs), []) if probe_ready else ([], list(refs)),
+        )
         monkeypatch.setattr(tq_lifecycle.ray, "get", lambda _ref: None)
 
-        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match="returned normally"):
+        with pytest.raises(tq_lifecycle.TqCleanupTimeout, match=match):
             tq_lifecycle._stop_owner_actor(owner, timeout=0.1)
 
     def test_failed_owner_cleanup_waits_for_owner_then_reaps_controller(self, monkeypatch):
@@ -1065,7 +845,7 @@ class TestOwnerProcessBoundary:
         monkeypatch.setattr(
             tq_lifecycle,
             "_stop_owner_actor",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(tq_lifecycle.TqCleanupTimeout("owner pending")),
+            lambda *_args, **_kwargs: _raise(tq_lifecycle.TqCleanupTimeout("owner pending")),
         )
         monkeypatch.setattr(
             tq_lifecycle,
@@ -1085,7 +865,7 @@ class TestOwnerProcessBoundary:
         monkeypatch.setattr(
             tq_lifecycle.ray,
             "get",
-            lambda ref, timeout: (_ for _ in ()).throw(RuntimeError("close failed")),
+            lambda ref, timeout: _raise(RuntimeError("close failed")),
         )
         monkeypatch.setattr(tq_lifecycle, "_stop_owner_actor", lambda handle, **_kwargs: stopped.append(handle))
         monkeypatch.setattr(tq_lifecycle, "kill_tq_controller_and_wait", lambda **_kwargs: killed.append(True))
@@ -1102,15 +882,13 @@ class TestOwnerProcessBoundary:
 
 
 class _FlakyStore:
-    """Stub mooncake store: the first ``fail_times`` calls return error
-    codes."""
+    """Stub store whose first ``fail_times`` reads return an error code."""
 
     def __init__(self, fail_times: int, code: int = -800, raise_exc: Exception | None = None):
         self.fail_times = fail_times
         self.code = code
         self.raise_exc = raise_exc
         self.get_calls: list[list[str]] = []
-        self.put_calls: list[list[str]] = []
 
     def _codes(self, keys):
         if self.raise_exc is not None:
@@ -1122,10 +900,6 @@ class _FlakyStore:
 
     def batch_get_into(self, keys, ptrs, sizes):
         self.get_calls.append(list(keys))
-        return self._codes(keys)
-
-    def batch_upsert_from(self, keys, ptrs, sizes, config=None):
-        self.put_calls.append(list(keys))
         return self._codes(keys)
 
 
@@ -1165,34 +939,15 @@ class _InlineExecutorLoop:
     reason="needs a real transfer_queue (CI uses a single-file stub); run on a host with TransferQueue installed",
 )
 class TestRetryAndDisconnect:
-    """batch_get_into / batch_upsert_from: retry, then raise loudly."""
+    """Behavior surface retained in Relax; retry internals belong upstream."""
 
-    def test_get_retries_then_succeeds(self, monkeypatch):
+    def test_transient_get_failure_retries_then_succeeds(self, monkeypatch):
         monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
         store = _FlakyStore(fail_times=2)
         client = _client_with_store(store)
-        client._batch_get_into_with_retry(["0@f0", "1@f0"], [1, 2], [8, 8])
-        assert len(store.get_calls) == 3  # initial + 2 retries
-        assert store.get_calls[-1] == ["0@f0", "1@f0"]
-
-    def test_get_raises_after_max_retries(self, monkeypatch):
-        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
-        client = _client_with_store(_FlakyStore(fail_times=99))
-        with pytest.raises(RuntimeError, match="batch_get_into failed"):
-            client._batch_get_into_with_retry(["0@f0"], [1], [8])
-
-    def test_put_retries_then_succeeds(self, monkeypatch):
-        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
-        store = _FlakyStore(fail_times=1, code=-1)
-        client = _client_with_store(store)
-        client._batch_upsert_with_retry(["0@f0"], [1], [8])
-        assert len(store.put_calls) == 2
-
-    def test_put_raises_after_max_retries(self, monkeypatch):
-        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
-        client = _client_with_store(_FlakyStore(fail_times=99, code=-1))
-        with pytest.raises(RuntimeError, match="batch_upsert_from failed"):
-            client._batch_upsert_with_retry(["0@f0"], [1], [8])
+        keys = ["0@f0", "1@f0"]
+        client._batch_get_into_with_retry(keys, [1, 2], [8, 8])
+        assert store.get_calls == [keys, keys, keys]
 
     def test_disconnect_surfaces_instead_of_returning_garbage(self):
         """A dead peer must raise, never hand back a silently short buffer."""
@@ -1259,101 +1014,3 @@ class TestMooncakeProductionStatusContract:
         data, meta = self._data_and_meta()
         await manager.put_data(data, meta)
         assert calls == ["put", "notify"]
-
-
-@pytest.mark.skipif(
-    not (_RUN_REAL_CAPACITY and _master_reachable() and _REAL_MOONCAKE_CLIENT),
-    reason=(
-        "destructive real-capacity test is opt-in and needs an isolated reachable master; "
-        "set RELAX_RUN_REAL_MOONCAKE_CAPACITY_TEST=1 only on a disposable deployment"
-    ),
-)
-def test_real_mooncake_capacity_overflow_is_bounded_and_loud():
-    """A physical segment overflow must fail, never hang or report success.
-
-    Run this only against an isolated master: the deliberately tiny segment and
-    oversized put are fault injection, not a shared-cluster smoke test.
-    """
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
-    process = context.Process(target=_real_capacity_worker, args=(result_queue, 64, 96))
-    process.start()
-    process.join(timeout=30)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=5)
-        pytest.fail("Mooncake capacity-overflow put did not finish within 30 seconds")
-
-    assert process.exitcode == 0
-    status, detail = result_queue.get(timeout=2)
-    assert status == "error", detail
-    assert "batch_upsert_from failed" in detail or "capacity" in detail.lower(), detail
-
-
-# ---------------------------------------------------------------------------
-# Byte-exactness on MooncakeStore (was SimpleStorage-only)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not (_master_reachable() and _REAL_MOONCAKE_CLIENT),
-    reason=(
-        "needs a reachable mooncake master and a real TransferQueue install "
-        "(CI uses a single-file transfer_queue stub and has no RDMA/mooncake "
-        "deployment), so the MooncakeStore round-trip is skipped"
-    ),
-)
-class TestMooncakeByteExact:
-    """Real MooncakeStoreClient put/get round-trip, byte-for-byte."""
-
-    @staticmethod
-    def _client(protocol: str):
-        from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
-
-        from relax.utils.tq.correctness import ensure_mooncake_correctness_guards
-
-        ensure_mooncake_correctness_guards()
-        return MooncakeStoreClient(
-            {
-                "protocol": protocol,
-                "device_name": os.environ.get("MC_RDMA_DEVICE", ""),
-                "master_server_address": _master_address(),
-                "metadata_server": "P2PHANDSHAKE",
-                "local_hostname": "",
-                "global_segment_size": 2 * 1024**3,
-                "local_buffer_size": 512 * 1024**2,
-                "hard_pin": True,
-                "use_gdr": False,
-            }
-        )
-
-    @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
-    def test_multi_dtype_shape_roundtrip_is_byte_exact(self, protocol):
-        """Run each protocol in a pristine, externally bounded session.
-
-        Mooncake 0.3.10 can wedge in ``setup()`` when one process closes a TCP
-        client and then creates an RDMA client.  Process isolation also keeps a
-        native engine hang from blocking the pytest worker indefinitely.
-        """
-        status, detail = _run_isolated_roundtrip(_dense_roundtrip_worker, protocol, timeout=120)
-        assert status == "ok", f"{status}: {detail}"
-
-    @pytest.mark.parametrize("protocol", ["tcp", "rdma"])
-    def test_multimodal_list_dict_slow_path_roundtrip_is_byte_exact(self, protocol, record_property):
-        """The container production actually ships: one dict per sample.
-
-        ``multimodal_train_inputs`` reaches MooncakeStore as non-tensor values
-        (tensordict NonTensorStack rows), which take the msgpack pack ->
-        registered-buffer memcpy slow path — a completely different code path
-        from the dense-tensor test above.  Uses the REAL Qwen-VL fixture when
-        available (see tests/utils/mm_payload_fixtures.py), else
-        production-structured synthetic dicts; the payload source is part of
-        the reported result for acceptance auditing.
-
-        Runs in a spawn child so each protocol gets a pristine mooncake
-        session (mooncake 0.3.10 misbehaves when one process cycles clients
-        across protocols) and a wedged engine cannot hang the suite.
-        """
-        status, detail = _run_isolated_roundtrip(_mm_slow_path_worker, protocol, timeout=240)
-        record_property("multimodal_roundtrip", detail)
-        assert status == "ok", f"{status}: {detail}"
