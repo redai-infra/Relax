@@ -8,6 +8,7 @@ mismatched call order would all show up here rather than only on a GPU cluster.
 """
 
 import os
+import sys
 
 import pytest
 
@@ -85,6 +86,67 @@ def _run(rank, world_size, port, mode, out):
             # Each shard is constant on its own but the batch is not.
             values = torch.tensor([0.7, 0.7] if rank == 0 else [1.4, 1.4], dtype=torch.float32)
             out[rank] = [is_collapsed(values, process_group=group)]
+        elif mode == "loss_entry_point":
+            # The whole chain the review asked for: the production Megatron
+            # entry point -> the registry -> `advantage_gdpo` -> the DP
+            # reduction, with a real gloo group rather than a stub. The other
+            # cases here call `whiten_scalar` directly and the single-process
+            # wiring test stubs `mpu`, so neither of them covers the two
+            # together -- which is where a missing `process_group=` or a
+            # dropped `mini_batch_sizes=` would hide.
+            import importlib
+            from argparse import Namespace
+            from types import ModuleType, SimpleNamespace
+
+            try:
+                import megatron  # noqa: F401
+            except ModuleNotFoundError:
+                megatron = ModuleType("megatron")
+                megatron_core = ModuleType("megatron.core")
+                megatron_core.mpu = SimpleNamespace()
+                megatron.core = megatron_core
+                sys.modules["megatron"] = megatron
+                sys.modules["megatron.core"] = megatron_core
+
+            from relax.backends.megatron import cp_utils
+
+            loss_module = importlib.import_module("relax.backends.megatron.loss")
+            fake_mpu = SimpleNamespace(
+                is_pipeline_last_stage=lambda: True,
+                get_context_parallel_world_size=lambda: 1,
+                get_data_parallel_group=lambda: group,
+            )
+            loss_module.mpu = fake_mpu
+            cp_utils.mpu = fake_mpu
+
+            args = Namespace(
+                advantage_estimator="gdpo",
+                use_rollout_logprobs=False,
+                qkv_format="thd",
+                is_vl_model=False,
+                uses_unsplit_forward=False,
+                kl_coef=0.0,
+                kl_loss_type="k2",
+                gamma=1.0,
+                use_opd=False,
+                normalize_advantages=False,
+                dynamic_context_parallel=False,
+            )
+            # Rank 1 carries twice rank 0's amplitude, so a shard-local
+            # statistic and a shared one give different answers.
+            rewards = [1.0, 3.0] if rank == 0 else [2.0, 6.0]
+            rollout_data = {
+                "log_probs": [torch.zeros(2), torch.zeros(2)],
+                "ref_log_probs": None,
+                "rewards": rewards,
+                "values": None,
+                "response_lengths": [2, 2],
+                "loss_masks": [torch.ones(2), torch.ones(2)],
+                "total_lengths": [2, 2],
+                "rollout_mini_local_sample_counts": [2],
+            }
+            loss_module.compute_advantages_and_returns(args, rollout_data)
+            out[rank] = [chunk[0].item() for chunk in rollout_data["advantages"]]
         elif mode == "non_finite_on_one_rank":
             # Only rank 1's shard is bad. A local `isfinite` raise here strands
             # rank 0 inside `is_collapsed`'s all-reduce, which is the deadlock
@@ -254,3 +316,26 @@ def test_a_non_finite_shard_fails_both_ranks_instead_of_hanging_one():
     for rank in (0, 1):
         assert isinstance(out[rank], str), f"rank {rank} returned {out[rank]!r} instead of refusing"
         assert "non-finite advantage" in out[rank], rank
+
+
+def test_the_megatron_entry_point_reaches_gdpo_with_a_shared_statistic():
+    """`loss.compute_advantages_and_returns` -> registry -> gdpo, over gloo.
+
+    The review asked for exactly this chain, and neither existing test had it:
+    `test_gdpo_loss_wiring.py` walks the chain with a stubbed `mpu` in one
+    process, and the cases above use a real group but call `whiten_scalar`
+    directly. A `process_group=` dropped from the call in `loss.py` passes both
+    of them and fails here, because each rank would then whiten its own shard.
+
+    Rank 1's rewards are twice rank 0's. Shared statistics keep that ratio
+    visible in the advantages; per-shard whitening flattens both ranks onto the
+    same pair of values.
+    """
+    out = _spawn("loss_entry_point")
+
+    rank0, rank1 = out[0], out[1]
+    assert rank0 != pytest.approx(rank1), "both ranks whitened their own shard"
+    everything = torch.tensor([1.0, 3.0, 2.0, 6.0])
+    expected = (everything - everything.mean()) / (everything.std() + 1e-4)
+    for got, want in zip(rank0 + rank1, expected.tolist(), strict=True):
+        assert abs(got - want) < 1e-4, (rank0, rank1, expected.tolist())
