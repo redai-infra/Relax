@@ -11,7 +11,8 @@ relax/algorithms/
 ├── spec.py        AlgorithmSpec definition + the ALGORITHM_SPECS registry
 ├── rewards.py     reward normalization strategies + REWARD_NORMALIZERS
 ├── advantages.py  advantage estimators + ADVANTAGE_FNS
-└── policy.py      policy loss adapters + POLICY_LOSS_FNS
+├── policy.py      policy loss adapters + POLICY_LOSS_FNS
+└── numerics.py    shared numeric constants and degeneracy guards
 ```
 
 Three hard constraints:

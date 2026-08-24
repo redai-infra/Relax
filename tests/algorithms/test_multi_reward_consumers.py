@@ -31,6 +31,7 @@ from relax.algorithms.rewards import (  # noqa: E402
     group_carries_reward_signal,
     metrics_group_verdict,
     normalize_gdpo_decoupled,
+    observed_reward_signal,
     zero_std_group_label,
 )
 
@@ -357,17 +358,34 @@ def test_a_reward_dict_holding_a_none_is_not_a_scored_sample():
 
 
 def test_a_reward_missing_the_key_entirely_has_no_label_either():
-    """KeyError is outside what `observed_reward_signal` catches.
+    """The label side of the missing-key case.
 
-    So it is not covered by the "metrics observe, they do not enforce" split
-    that protects the verdict: an eval reward model with a different schema
-    (EvalConfig.rm_type) would take the metrics down here, past the point that
-    guards them.
+    An eval reward model with a different schema (EvalConfig.rm_type) produces
+    a dict without `--reward-key`; there is no number to report for it.
     """
     args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
     group = [_S(0, {"other": 1.0}), _S(0, {"other": 2.0})]
 
     assert zero_std_group_label(args, group) is None
+
+
+def test_a_reward_missing_the_key_is_unreadable_rather_than_fatal_for_metrics():
+    """The verdict side of it, which used to escape the observation guard.
+
+    `get_reward_components` raises ValueError for a missing key, but the
+    single-reward branch reads `Sample.get_reward_value`, a bare subscript that
+    raises KeyError. That went straight through the `(TypeError, ValueError)`
+    handler and took the metrics path down -- past the point whose whole job is
+    to keep a reporting stage from deciding whether the run continues.
+    """
+    args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
+    group = [_S(0, {"other": 1.0}), _S(0, {"other": 2.0})]
+
+    with pytest.raises(KeyError):
+        group_carries_reward_signal(args, group)
+
+    assert observed_reward_signal(args, group) is None
+    assert metrics_group_verdict(args, group) is None
 
 
 def test_the_two_metrics_copies_both_delegate_the_decision():

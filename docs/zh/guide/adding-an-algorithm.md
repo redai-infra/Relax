@@ -9,7 +9,8 @@ relax/algorithms/
 ├── spec.py        AlgorithmSpec 定义 + ALGORITHM_SPECS 注册表
 ├── rewards.py     reward 归一化策略 + REWARD_NORMALIZERS
 ├── advantages.py  advantage 估计器 + ADVANTAGE_FNS
-└── policy.py      policy loss 适配器 + POLICY_LOSS_FNS
+├── policy.py      policy loss 适配器 + POLICY_LOSS_FNS
+└── numerics.py    共享的数值常量与退化判定
 ```
 
 三条硬约束：

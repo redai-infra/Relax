@@ -279,12 +279,10 @@ def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     **Its replacement, a relative "is this rounding?" ratio**, lasted one round
     longer and was worse, because it was wrong in kind rather than in
     calibration. ``magnitude`` scales with the *difference* between the weights
-    while ``sum_k |w_k| max|z_k|`` scales with their *magnitude*, so the ratio
-    measured the weight configuration and not the data: at ``G = 2`` it reduces
-    exactly to ``|w1 - w2| / (|w1| + |w2|)``, independent of every reward value
-    in the group. Measured on real inputs it was inverted in both directions at
-    once -- it discarded a group whose final advantage was 0.43 and kept one
-    whose 1.08 was pure rounding.
+    while ``sum_k |w_k| max|z_k|`` scales with their *magnitude*. Measured on
+    real inputs it was inverted in both directions at once -- it discarded a
+    group whose final advantage was 0.43 and kept one whose 1.08 was pure
+    rounding.
 
     That is not fixable by moving the threshold. For ``G >= 3`` the centred
     subspace is at least two-dimensional, so ``z_2 = -z_1 + delta * u`` with
@@ -292,12 +290,11 @@ def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     signal with an arbitrarily small ratio. No universal threshold separates
     "the components nearly cancel" from "the arithmetic nearly cancelled".
 
-    (An earlier version of this paragraph added that at ``G = 2`` the ratio
-    reduces to ``|w1 - w2| / (|w1| + |w2|)`` "independent of every reward value
-    in the group". That holds only when the two standardised columns come out
-    as exact opposites. Two columns that move *together* give a ratio of 1 for
-    same-signed weights -- fully data-dependent. The G >= 3 construction above
-    is what actually settles it.)
+    ``G = 2`` does not settle it either way: the ratio reduces to
+    ``|w1 - w2| / (|w1| + |w2|)``, independent of the data, *only* when the two
+    standardised columns come out as exact opposites. Columns that move
+    together give 1 for same-signed weights, which is fully data-dependent. The
+    ``G >= 3`` construction above is what actually settles it.
 
     **What is left unsolved, stated plainly rather than argued away.** Two
     components summing to a constant do not cancel exactly, and the remainder
@@ -319,12 +316,10 @@ def combine_group(group: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     ``1e13``      1.2                        5.2e-3
     ============  =========================  ===================================
 
-    Read the second column carefully, because an earlier version of this
-    docstring quoted only its ``1e9`` entry and called it "around 1e-7" as if
-    it were the general case. Sharing a whitening unit with healthy groups
-    divides the remainder by *their* standard deviation -- a constant factor of
-    a few hundred here. It does not slow the growth with ``C``, and at
-    ``C = 1e13`` a mixed unit still delivers 5e-3.
+    The second column is not a bound. Sharing a whitening unit with healthy
+    groups divides the remainder by *their* standard deviation -- a constant
+    factor of a few hundred here. It does not slow the growth with ``C``, and
+    at ``C = 1e13`` a mixed unit still delivers 5e-3.
 
     "Whitening unit" is also not "the rollout". :func:`~relax.algorithms.
     advantages._whiten_by_segment` whitens each *training batch* separately, so
@@ -532,8 +527,11 @@ def group_carries_reward_signal(args: Any, samples: list[Any]) -> bool:
     #
     # The consequence is deliberate and it has a cost. A group whose components
     # sum to a constant survives this test on its rounding remainder and is
-    # trained on; in a mixed batch that remainder reaches the optimizer around
-    # 1e-7, and it wastes the group. That is the price of not guessing.
+    # trained on, and it wastes the group. How much reaches the optimizer grows
+    # with the magnitude the components are centred on -- see the table in
+    # `combine_group`; it is 3.1e-7 for C = 1e9 in a mixed training batch but
+    # 5.2e-3 at C = 1e13, and a degenerate group that lands in a batch of its
+    # own gets no division at all. That is the price of not guessing.
     combined = combine_group(components, weights).float()
     return bool(combined.amin() != combined.amax())
 
@@ -566,7 +564,17 @@ def observed_reward_signal(args: Any, samples: list[Any]) -> bool | None:
     """
     try:
         return group_carries_reward_signal(args, samples)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, KeyError, IndexError) as exc:
+        # KeyError/IndexError are not hypothetical. `get_reward_components`
+        # raises ValueError for a missing key, but the single-reward branch
+        # goes through `Sample.get_reward_value`, which is a bare subscript
+        # (`relax/utils/types.py:171`): a `--reward-key` absent from the reward
+        # dict raises KeyError straight through this handler and takes the
+        # metrics path down -- the exact failure this function exists to
+        # prevent. Narrowing `get_reward_value` to ValueError would be the
+        # tidier fix, but that accessor is shared with the filters and the
+        # rollout metrics, so changing what it raises is a contract change for
+        # callers that are not in scope here.
         logger.warning(
             "zero-std metrics: skipping a group whose reward could not be read (%s). "
             "For a training rollout the reward stage will raise on this; for eval it may just "
