@@ -3200,7 +3200,24 @@ def apply_custom_config_overrides(args) -> None:
     # `rollout * n`, and the validator instead saw the value derived from 4.
     # `enforce_consistency=False` because the stale value is, by construction,
     # the one derived before the merge -- comparing against it is the bug.
+    #
+    # A YAML file that *names* `global_batch_size` is a different case: that is
+    # not a stale value left over from an earlier derivation, it is the override
+    # this function exists to apply. Re-deriving over it wrote the YAML's value
+    # and then replaced it in the next statement, so the run used neither the
+    # configured number nor an error -- the one outcome the override contract
+    # rules out. Derive first so the comparison has something to name, then
+    # refuse the conflict rather than picking a winner.
+    yaml_global_batch_size = data.get("global_batch_size")
     derive_global_batch_size(args, enforce_consistency=False)
+    if yaml_global_batch_size is not None and args.global_batch_size != yaml_global_batch_size:
+        raise ValueError(
+            f"--custom-config-path sets global_batch_size to {yaml_global_batch_size}, but "
+            f"num_steps_per_rollout {args.num_steps_per_rollout} over rollout_batch_size "
+            f"{args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} derives "
+            f"{args.global_batch_size}. Remove one of the two from the YAML -- whichever you drop, "
+            f"the other is what the run would otherwise have used without saying so."
+        )
     validate_batch_shape(args)
     if args.use_critic != use_critic_before_override:
         # Role composition and the offload flags were derived from the pre-override

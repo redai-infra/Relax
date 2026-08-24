@@ -314,3 +314,59 @@ def test_spec_with_an_unregistered_implementation_is_rejected_at_startup(argumen
 def test_other_estimators_are_unaffected_by_fully_async(arguments_module, estimator):
     args = _args(estimator, fully_async=True, reward_key=None)
     arguments_module.validate_algorithm_args(args)
+
+
+# ---------------- a YAML global_batch_size must not be derived over ----------------
+
+
+def _batch_args(tmp_path, body, **overrides):
+    """Args shaped for the batch-size derivation, already validated once."""
+    base = _overridable_args(tmp_path, body, **overrides)
+    base.rollout_batch_size = 32
+    base.n_samples_per_prompt = 4
+    base.num_steps_per_rollout = 4
+    base.global_batch_size = 32  # 32 * 4 // 4, i.e. what the pre-merge derivation wrote
+    base.micro_batch_size = 1
+    base.use_dynamic_batch_size = False
+    for key, value in overrides.items():
+        setattr(base, key, value)
+    return base
+
+
+def test_yaml_global_batch_size_conflicting_with_the_derivation_is_refused(arguments_module, tmp_path):
+    """The override used to be written and then silently replaced.
+
+    `apply_custom_config_overrides` merges the YAML, then re-derives
+    `global_batch_size` from `num_steps_per_rollout`. With the derivation
+    unconditional, a YAML that names `global_batch_size` had its value assigned
+    by the merge loop and overwritten one statement later -- so the run used
+    neither the configured number nor an error, which is the single outcome the
+    "YAML key overrides the argument" contract does not allow.
+    """
+    args = _batch_args(tmp_path, "global_batch_size: 999\n")
+
+    with pytest.raises(ValueError, match="sets global_batch_size to 999"):
+        arguments_module.apply_custom_config_overrides(args)
+
+
+def test_yaml_global_batch_size_agreeing_with_the_derivation_survives(arguments_module, tmp_path):
+    """Naming the value the derivation would reach anyway is not a conflict."""
+    args = _batch_args(tmp_path, "global_batch_size: 32\n")
+
+    arguments_module.apply_custom_config_overrides(args)
+
+    assert args.global_batch_size == 32
+
+
+def test_yaml_that_only_moves_a_derivation_input_still_re_derives(arguments_module, tmp_path):
+    """The behaviour the `enforce_consistency=False` call was added for.
+
+    Switching `num_steps_per_rollout` from 4 to 1 has to produce
+    `rollout * n`; the pre-merge value of 32 is stale by construction and must
+    not be compared against.
+    """
+    args = _batch_args(tmp_path, "num_steps_per_rollout: 1\n")
+
+    arguments_module.apply_custom_config_overrides(args)
+
+    assert args.global_batch_size == 128  # 32 * 4 // 1
