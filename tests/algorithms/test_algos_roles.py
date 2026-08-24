@@ -177,7 +177,7 @@ def _args_for(name, **overrides):
 
 
 def test_a_second_critic_algorithm_gets_the_critic_rollout_fields(monkeypatch):
-    """`values` must reach the advantages consumer without naming the algorithm.
+    """`values` must reach the advantages consumer, unprompted by any name.
 
     This is the failure the registry was supposed to make impossible: argparse
     and `ALGOS` accept a second value-based estimator, and then the value

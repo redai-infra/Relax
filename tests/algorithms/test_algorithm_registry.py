@@ -170,7 +170,7 @@ def test_every_spec_declares_a_kl_level_the_loss_knows_how_to_read():
 def test_an_unsupported_enum_value_is_refused_when_the_spec_is_built(field, bad):
     """These two fields are compared for equality, so a typo picks a formula.
 
-    `loss.py` asks `advantage_normalization == "token_global"` and
+    `loss.py` asks for `advantage_normalization == "token_global"`, and for
     `kl_level == "sequence"`; every other string takes the else branch. Unlike
     `advantage_fn`, which blows up with a KeyError the first time it is looked
     up, a misspelled value here starts training successfully and quietly uses
@@ -193,7 +193,7 @@ def test_an_unsupported_enum_value_is_refused_when_the_spec_is_built(field, bad)
 
 
 def test_the_supported_values_are_the_ones_the_shipped_specs_use():
-    """Guards against the allow-list drifting away from the registry it guards."""
+    """The allow-list must not drift from the registry it guards."""
     from relax.algorithms.spec import ADVANTAGE_NORMALIZATIONS, ALGORITHM_SPECS, KL_LEVELS
 
     assert {s.kl_level for s in ALGORITHM_SPECS.values()} <= KL_LEVELS

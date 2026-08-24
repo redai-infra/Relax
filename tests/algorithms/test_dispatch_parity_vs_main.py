@@ -534,7 +534,7 @@ def test_rloo_advantage_adapter_is_the_grpo_broadcast():
 
 
 def _gae_inputs():
-    """Fresh tensors per call: `advantage_gae` mutates `kl` in place (`k *= ...`)."""
+    """Fresh tensors per call: `advantage_gae` mutates `kl` in place."""
     kl = [torch.tensor([0.1, 0.2, 0.3]), torch.tensor([0.4, 0.5])]
     values = [torch.tensor([0.5, 0.25, 0.125]), torch.tensor([1.0, 2.0])]
     return dict(
@@ -595,7 +595,7 @@ def test_gae_adapter_matches_mains_numbers(cp_disabled, kl_coef, gamma, lambd):
 
 
 def test_gae_terminal_reward_lands_on_the_last_token(cp_disabled):
-    """`k[-1] += reward` is the whole reward signal; dropping it trains on KL alone."""
+    """The terminal reward is the whole signal; without it, only KL trains."""
     from relax.algorithms.advantages import compute_advantages_and_returns
 
     args = _args("ppo", kl_coef=0.0, gamma=1.0, lambd=1.0)
