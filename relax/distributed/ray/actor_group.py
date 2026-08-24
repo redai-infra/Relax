@@ -137,10 +137,14 @@ class RayTrainGroup:
         safely, so all actor processes are force-killed and confirmed terminal
         before the initialization error is propagated.
         """
-        refs = self.async_init(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
-        pending = list(refs)
-        results: dict[Any, Any] = {}
         try:
+            # Submission itself can fail after one or more actor calls were
+            # already queued.  Keep it inside the same cleanup boundary as
+            # asynchronous task failures so no partially initialized group is
+            # left reusable.
+            refs = self.async_init(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            pending = list(refs)
+            results: dict[Any, Any] = {}
             # ``ray.get(refs)`` may wait for every ref before surfacing one
             # failure. A rank blocked in native initialization would then
             # prevent cleanup forever, so consume whichever ref finishes first.

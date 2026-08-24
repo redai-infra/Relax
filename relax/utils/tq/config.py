@@ -109,8 +109,8 @@ def resolve_mooncake_master_address() -> str:
     if not address:
         raise RuntimeError(
             "MooncakeStore requires MC_MASTER_ADDRESS=<host:port> of the externally "
-            "managed mooncake master on every node; Relax never assumes a loopback "
-            "endpoint."
+            "managed mooncake master in the driver environment; Relax never assumes "
+            "a loopback endpoint."
         )
     try:
         _split_host_port(address)
@@ -269,11 +269,18 @@ def build_mooncake_config(
 
 
 # Worst-case payload factors used by the segment-capacity pre-check.
-# Vision: a ViT-style processor (Qwen-VL family: patch 14x14, spatial merge
-# 2x2) maps one schedulable token to at most (14*2)^2 = 784 pixels, and
-# ``pixel_values`` is float32 RGB, so vision bytes <= seq_length * 784 * 12.
-_PIXELS_PER_VISION_TOKEN = 28 * 28
-_BYTES_PER_PIXEL_VALUE = 3 * 4
+#
+# The largest image/video tensor layout among the currently supported
+# multimodal processors is Qwen3-VL's 16x16 spatial patch, temporal patch 2,
+# RGB input, spatial merge 2x2, stored as float32.  One schedulable vision
+# token can therefore retain four flattened patch rows:
+#
+#   16 * 16 * 2 * 3 * 4 rows/token * 4 bytes/value = 24,576 bytes/token
+#
+# Keep this as one explicit bound instead of loading model config during
+# Controller startup.  If a supported processor gains a wider transported
+# feature row, this bound and its regression test must be updated together.
+_MULTIMODAL_BYTES_PER_TOKEN = 16 * 16 * 2 * 3 * (2 * 2) * 4
 # Text: token ids, logprobs, masks and rewards; 32 B/token rounds them up.
 _TEXT_BYTES_PER_TOKEN = 32
 
@@ -299,11 +306,11 @@ def estimate_payload_bytes(args: Any) -> int:
     """Worst-case per-step payload upper bound in bytes.
 
     Derived from the token budget instead of a fixed per-sample constant: the
-    processor cannot emit more vision tokens than ``--seq-length`` allows, so
-    the pixel payload of one sample is bounded by
-    ``seq_length * _PIXELS_PER_VISION_TOKEN * _BYTES_PER_PIXEL_VALUE``
-    (e.g. 77 MiB at seq_length=8192) rather than the old 8 MiB guess that
-    passed configurations which later failed puts mid-training.
+    processor cannot emit more multimodal tokens than ``--seq-length`` allows,
+    so the transported tensor payload of one sample is bounded by
+    ``seq_length * _MULTIMODAL_BYTES_PER_TOKEN`` (192 MiB at
+    ``seq_length=8192``) rather than a fixed per-sample guess that can pass
+    configurations which later fail puts mid-training.
     """
     n_samples = args.n_samples_per_prompt
     capacity_batch = resolve_tq_capacity_batch_size(args)
@@ -315,7 +322,7 @@ def estimate_payload_bytes(args: Any) -> int:
         )
     per_sample = seq_length * _TEXT_BYTES_PER_TOKEN
     if getattr(args, "multimodal_keys", None) is not None:
-        per_sample += seq_length * _PIXELS_PER_VISION_TOKEN * _BYTES_PER_PIXEL_VALUE
+        per_sample += seq_length * _MULTIMODAL_BYTES_PER_TOKEN
     return capacity_batch * n_samples * per_sample
 
 

@@ -8,9 +8,9 @@ strict production-status ACK must be fixed in upstream TransferQueue and then
 consumed through an updated, capability-marked pin; method-name checks alone do
 not prove those semantics.
 
-The pinned mooncake 0.3.10 additionally corrupts TCP-protocol transfers
-through its auto-enabled memcpy fast path, so that path is force-disabled
-here and an explicit enable is rejected (see :func:`_enforce_safe_memcpy`).
+Mooncake 0.3.10.post2 was observed corrupting TCP-protocol transfers through
+its auto-enabled memcpy fast path, so that path is force-disabled here and an
+explicit enable is rejected (see :func:`_enforce_safe_memcpy`).
 """
 
 from __future__ import annotations
@@ -21,24 +21,24 @@ import os
 def _enforce_safe_memcpy() -> None:
     """Force-disable mooncake's memcpy fast path; reject attempts to enable it.
 
-    mooncake 0.3.10 auto-enables ``MC_STORE_MEMCPY`` in TCP-only environments
-    (``transfer_task.cpp`` "auto-detected: TCP-only environment, memcpy
-    enabled") and that path silently truncates cross-node gets: roughly half of
-    fresh-session first transfers returned rows whose tails were zero bytes
-    from a 64 KiB-aligned offset onward while every batch code reported success
-    (two-node forensic probes, 2026-08; 12/12 sessions clean with
+    mooncake 0.3.10.post2 auto-enables ``MC_STORE_MEMCPY`` in TCP-only
+    environments (``transfer_task.cpp`` "auto-detected: TCP-only environment,
+    memcpy enabled") and that path silently truncates cross-node gets: roughly
+    half of fresh-session first transfers returned rows whose tails were zero
+    bytes from a 64 KiB-aligned offset onward while every batch code reported
+    success (two-node forensic probes, 2026-08; 12/12 sessions clean with
     ``MC_STORE_MEMCPY=0`` vs ~50% corrupt without).  The same code path
     SIGSEGVs on single-node loopback.  Because the corruption is confirmed on
-    the pinned mooncake build, this guard fails closed: an explicit
-    ``MC_STORE_MEMCPY=1`` is rejected at startup instead of honoured.  Re-gate
-    on the mooncake version once the pin moves to a release with the fix.
+    that build, this guard fails closed: an explicit ``MC_STORE_MEMCPY=1`` is
+    rejected at startup instead of honoured.  Re-gate this behavior only when a
+    reliable fixed-build capability is available.
     """
     override = os.environ.get("MC_STORE_MEMCPY", "").strip()
     if override not in ("", "0"):
         raise RuntimeError(
-            "MC_STORE_MEMCPY explicitly enables an unsafe value: the pinned mooncake 0.3.10 "
+            "MC_STORE_MEMCPY explicitly enables an unsafe value: the mooncake 0.3.10.post2 "
             "memcpy fast path silently truncates TCP transfers and can SIGSEGV. "
-            "Unset MC_STORE_MEMCPY; Relax forces it to 0 on this version."
+            "Unset MC_STORE_MEMCPY; Relax forces it to 0 until a fixed-build capability is available."
         )
     os.environ["MC_STORE_MEMCPY"] = "0"
 

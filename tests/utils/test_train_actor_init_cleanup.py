@@ -51,6 +51,23 @@ def test_successful_initialization_preserves_actor_group(monkeypatch):
     assert group._actor_handlers == [actor]
 
 
+def test_synchronous_submission_failure_cleans_partially_initialized_group(monkeypatch):
+    actor = _FakeActor()
+    group = _group(actor)
+    cleanup_calls = []
+
+    def fail_submission(*_args, **_kwargs):
+        raise RuntimeError("actor initialization submission failed")
+
+    monkeypatch.setattr(group, "async_init", fail_submission)
+    monkeypatch.setattr(group, "_terminate_failed_init", lambda: cleanup_calls.append(True))
+
+    with pytest.raises(RuntimeError, match="submission failed"):
+        group.init_and_wait(object(), "actor")
+
+    assert cleanup_calls == [True]
+
+
 def test_first_rank_failure_kills_and_confirms_every_actor(monkeypatch):
     actors = [_FakeActor("probe-0"), _FakeActor("probe-1")]
     group = _group(*actors)

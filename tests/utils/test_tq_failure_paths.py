@@ -166,6 +166,22 @@ class TestCloseTqAndUnmount:
         # Order matters: tq.close() still needs the store alive for remove_all().
         assert calls == ["tq.close", "store.close"]
 
+    def test_segment_is_unmounted_even_when_tq_close_fails(self, monkeypatch):
+        store_client = MagicMock()
+        calls = self._fake_tq(monkeypatch, store_client=store_client)
+
+        def close_failure():
+            calls.append("tq.close")
+            raise RuntimeError("close failed")
+
+        tq_lifecycle.tq.close.side_effect = close_failure
+        store_client.close.side_effect = lambda: calls.append("store.close")
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            tq_lifecycle.close_tq_and_unmount()
+
+        assert calls == ["tq.close", "store.close"]
+
     def test_simple_storage_teardown_is_noop_beyond_close(self, monkeypatch):
         calls = self._fake_tq(monkeypatch, store_client=None)
         tq_lifecycle.close_tq_and_unmount()
@@ -380,7 +396,8 @@ class TestBoundedAttach:
 
         failures = tq_lifecycle.verify_cluster_attach({}, timeout=0.1)
 
-        assert failures[0].endswith("handshake task failed (RuntimeError)")
+        assert failures == ["node#1: handshake task failed (RuntimeError)"]
+        assert "a" * 56 not in failures[0]
         assert secret not in failures[0]
 
     def test_partial_scheduling_failure_cancels_submitted_workers(self, monkeypatch):

@@ -245,8 +245,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Fully async pipeline num of iters every global batch.",
             )
             # ── RDMA transport (MooncakeStore backend) ──────────────────────────
-            # Default values are equivalent to current main behavior (SimpleStorage,
-            # no RDMA). These expose *intent* only; Mooncake internals (endpoint,
+            # The default selects the existing SimpleStorage data path. These
+            # expose *intent* only; Mooncake internals (endpoint,
             # buffer, segment, timeout, master strategy) are handled via internal
             # defaults / deployment environment, not CLI flags.
             parser.add_argument(
@@ -255,7 +255,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="off",
                 help=(
                     "TransferQueue data-plane transport. 'off' (default) uses "
-                    "SimpleStorage/ZMQ and is equivalent to current behavior. "
+                    "SimpleStorage/ZMQ with bounded worker attach and cleanup. "
                     "'auto' attempts MooncakeStore over host RDMA and falls back "
                     "to SimpleStorage when it is unavailable (with a WARNING). "
                     "'required' fails fast instead of falling back."

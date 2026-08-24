@@ -309,7 +309,7 @@ class TestSegmentCapacity:
         args = _make_args(
             multimodal_keys=["pixel_values"], rollout_batch_size=32, n_samples_per_prompt=1, max_staleness=1
         )
-        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "8")
+        monkeypatch.setenv("RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB", "16")
         assert validate_segment_capacity(args) is None
 
     @pytest.mark.parametrize("value", ["four", "-1", "nan", "inf", "-inf"])
@@ -338,12 +338,12 @@ class TestPayloadEstimate:
         assert estimate_payload_bytes(_make_args(multimodal_keys=None)) == 32 * 1 * 8192 * 32
 
     def test_multimodal_is_token_budget_bound(self):
-        # One sample may not exceed seq_length vision tokens; at 784 pixels per
-        # token and 12 B per pixel that is ~77 MiB for seq_length=8192.
+        # Qwen3-VL transports four 1536-float32 patch rows per schedulable
+        # vision token, or 24,576 bytes/token: ~192 MiB at seq_length=8192.
         args = _make_args(multimodal_keys=["pixel_values"], rollout_batch_size=1, n_samples_per_prompt=1)
         per_sample = estimate_payload_bytes(args)
-        assert per_sample == 8192 * (32 + 784 * 12)
-        assert 70 * 1024**2 < per_sample < 80 * 1024**2
+        assert per_sample == 8192 * (32 + 24_576)
+        assert 192 * 1024**2 < per_sample < 193 * 1024**2
 
     def test_requires_seq_length(self):
         with pytest.raises(RuntimeError, match="seq_length"):

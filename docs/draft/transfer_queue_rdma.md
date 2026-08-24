@@ -6,7 +6,7 @@ Relax 默认使用 TransferQueue SimpleStorage。首期 RDMA 支持只接入 Moo
 
 | 参数 | 语义 |
 |---|---|
-| `--tq-rdma-mode=off` | 默认值；保持原有 SimpleStorage 路径，不执行 Mooncake 检查或 attach |
+| `--tq-rdma-mode=off` | 默认值；保持 SimpleStorage 数据路径，不执行 Mooncake 检查或集群 handshake；worker 的 TQ attach 仍有 60 秒边界 |
 | `--tq-rdma-mode=auto` | 尝试 host-RDMA；任一检查或节点 attach 失败时，完成清理后统一回退 SimpleStorage |
 | `--tq-rdma-mode=required` | 要求 host-RDMA；不可用时完成清理并终止启动，不允许降级 |
 | `--tq-rdma-device=<device>` | 指定 RDMA 设备；空值由 Mooncake 原生逻辑选择，多 HCA 环境建议显式指定 |
@@ -17,17 +17,17 @@ Relax 固定 Mooncake `use_gdr=false`。GDR 若有实际需求，应由独立 PR
 
 首期只支持**单任务独占 Ray 集群**：同一个 Ray cluster 在初始化和运行期间只能有一个 Relax job，不支持 concurrent initializer、多 job admission 或复用其他作业的 TransferQueue controller。
 
-Mooncake master 由部署环境管理，Relax 不启动、重启或停止它。所有节点必须设置同一个外部 endpoint：
+Mooncake master 由部署环境管理，Relax 不启动、重启或停止它。driver 必须设置外部 endpoint：
 
 ```bash
 export MC_MASTER_ADDRESS=master.example:50051
 ```
 
-Relax 只检查 `host:port` 格式；DNS、路由、防火墙和 master 健康状态由真实初始化与 attach 验证。
+driver 将该 endpoint 写入 job-level TQ config，owner 和 worker attach 复用已存储配置，因此 worker 节点不要求重复设置该环境变量；但所有节点都必须能访问同一个 endpoint。Relax 只检查 `host:port` 格式；DNS、路由、防火墙和 master 健康状态由真实初始化与 attach 验证。
 
 ## 启动、回退与清理
 
-`off` 直接初始化 SimpleStorage。`auto` 和 `required` 按以下顺序执行：
+`off` 直接初始化 SimpleStorage，不创建 owner actor 或执行 Mooncake handshake；各 worker 仍通过有界 helper attach 到 SimpleStorage，以避免旧版无界等待。启动时还会回收不可用的半初始化 controller，并因首期独占集群约束拒绝复用健康的既有 controller。`auto` 和 `required` 按以下顺序执行：
 
 1. 校验 mode、TransferQueue/Mooncake correctness contract、master 格式和 segment 容量。
 2. 在独立 owner actor 中有界执行 Mooncake `tq.init`。
@@ -51,7 +51,7 @@ global segment 可按部署容量调整：
 export RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB=8
 ```
 
-启动前容量预检采用保守上界：文本按 `seq_length × 32 B`，多模态另加 `seq_length × 784 × 12 B`，再乘 rollout batch、`n_samples_per_prompt` 和 `max_staleness + 1`。容量不足时 `auto` 回退 SimpleStorage，`required` 失败。增大 segment 时必须同步规划每个节点的瞬时内存与 `memlock` 足迹。
+启动前容量预检采用保守上界：文本按 `seq_length × 32 B`；多模态按当前支持的最大 transported tensor layout（16×16 spatial patch、temporal patch 2、RGB、2×2 spatial merge、float32）另加 `seq_length × 24,576 B`。因此 8,192 token 的单样本多模态 tensor 上界约 192 MiB。最终再乘 rollout batch、`n_samples_per_prompt` 和 `max_staleness + 1`。容量不足时 `auto` 回退 SimpleStorage，`required` 失败。增大 segment 时必须同步规划每个节点的瞬时内存与 `memlock` 足迹。
 
 异常退出时 client segment 可能继续注册到 master，直到 Mooncake `client_ttl`（默认 30 秒）到期。
 
@@ -64,7 +64,7 @@ export RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB=8
 
 这些修复应在 TransferQueue 上游实现；Relax 不使用 monkey patch 替代依赖修复。
 
-当前固定的 Mooncake 0.3.10 在 TCP memcpy 路径存在已确认的静默截断风险。Relax 强制 `MC_STORE_MEMCPY=0`，显式设置不安全值会拒绝启动；升级到已修复版本后再重新评估该 gate。
+测试确认 `mooncake-transfer-engine==0.3.10.post2` 的 TCP memcpy 路径存在静默截断风险。Relax 当前会统一强制 `MC_STORE_MEMCPY=0`，显式设置不安全值会拒绝启动；只有在能够可靠识别已修复 build 后，才重新评估是否允许 memcpy 路径。
 
 每次验收必须记录 Relax commit SHA、TransferQueue commit 和 Mooncake 版本，不能只记录分支名。
 
@@ -102,7 +102,7 @@ python -u scripts/benchmarks/tq_cross_node_bench.py \
 | 现象 | 检查与处理 |
 |---|---|
 | correctness contract 不满足 | 核对各节点 TransferQueue/Mooncake 版本和 capability marker；不要绕过 gate |
-| master 缺失、格式错误或不可达 | 检查所有节点的 `MC_MASTER_ADDRESS`、DNS、路由、防火墙和 master 服务 |
+| master 缺失、格式错误或不可达 | 检查 driver 的 `MC_MASTER_ADDRESS`，并检查所有节点到该 endpoint 的 DNS、路由、防火墙和 master 服务 |
 | segment capacity insufficient | 减少 batch、采样数或 staleness，或增大 `RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB` 并重新核算资源 |
 | attach handshake 失败 | 在失败节点检查 HCA port、GID、内存、`memlock` 和到 master 的连接；CPU-only head 也必须满足 attach 条件 |
 | manager/protocol 不符 | 清理前一个作业；首期要求单任务独占且不会接管健康的旧 controller |

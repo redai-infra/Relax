@@ -438,7 +438,7 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
     expects_mooncake = uses_mooncake(conf)
 
     refs: list[Any] = []
-    id_by_ref: dict[Any, str] = {}
+    node_number_by_ref: dict[Any, int] = {}
     try:
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -459,11 +459,14 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
                 # segment; without the detach it lingers until client_ttl.
                 detach_tq_client()
 
-        for node_id in node_ids:
+        for node_number, node_id in enumerate(node_ids, start=1):
             strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
             ref = _handshake.options(scheduling_strategy=strategy).remote(conf, expects_mooncake, timeout)
             refs.append(ref)
-            id_by_ref[ref] = node_id
+            # Keep the raw Ray NodeID only in the scheduling strategy.  Failure
+            # summaries may reach public CI/PR logs, so identify nodes by a
+            # stable per-handshake ordinal instead.
+            node_number_by_ref[ref] = node_number
     except Exception as error:
         if refs and not _cancel_handshake_tasks(refs):
             raise TqHandshakeIsolationError(
@@ -487,11 +490,11 @@ def verify_cluster_attach(conf: Any, *, timeout: float | None = None) -> list[st
         try:
             ray.get(ref)
         except Exception as error:
-            failures.append(f"node {id_by_ref[ref][:12]}: handshake task failed ({safe_exception_kind(error)})")
+            failures.append(f"node#{node_number_by_ref[ref]}: handshake task failed ({safe_exception_kind(error)})")
     if pending and not _cancel_handshake_tasks(pending):
         raise TqHandshakeIsolationError("timed-out TQ handshake workers could not be confirmed stopped")
     for ref in pending:
-        failures.append(f"node {id_by_ref[ref][:12]}: handshake did not return within {wait_bound:.0f}s")
+        failures.append(f"node#{node_number_by_ref[ref]}: handshake did not return within {wait_bound:.0f}s")
     return failures
 
 
@@ -512,14 +515,18 @@ def close_tq_and_unmount() -> None:
     except (AssertionError, AttributeError):
         pass  # TQ not initialised in this process, or no KV client.
 
-    tq.close()
-
-    if store_client is not None and hasattr(store_client, "close"):
-        try:
-            store_client.close()
-            logger.info("[dataplane] Unmounted MooncakeStore segment on teardown.")
-        except Exception as e:  # pragma: no cover - best-effort cleanup
-            logger.warning(f"[dataplane] Failed to unmount MooncakeStore segment ({safe_exception_kind(e)}).")
+    try:
+        tq.close()
+    finally:
+        # ``tq.close`` may fail while removing queued data.  Segment teardown
+        # is still mandatory; otherwise the failed owner leaves registered and
+        # locked memory behind until the Mooncake TTL expires.
+        if store_client is not None and hasattr(store_client, "close"):
+            try:
+                store_client.close()
+                logger.info("[dataplane] Unmounted MooncakeStore segment on teardown.")
+            except Exception as e:  # pragma: no cover - best-effort cleanup
+                logger.warning(f"[dataplane] Failed to unmount MooncakeStore segment ({safe_exception_kind(e)}).")
 
 
 @ray.remote(num_cpus=0)

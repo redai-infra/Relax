@@ -382,10 +382,11 @@ class Controller:
         """
 
         def _close_owned_attempt() -> None:
-            try:
-                close_tq_owner(init_result.owner)
-            finally:
-                self._tq_owner = None
+            # Retain the handle if teardown fails.  The constructor's outer
+            # cleanup boundary can then retry instead of losing the only
+            # reference to possibly live process-global TQ state.
+            close_tq_owner(init_result.owner)
+            self._tq_owner = None
 
         try:
             failures = verify_cluster_attach(init_result.config)
@@ -512,8 +513,11 @@ class Controller:
         # 5. One startup line stating what was requested and what will run. The
         #    effective transport is only confirmed once the cluster-wide attach
         #    handshake passes.
-        logger.info(f"[dataplane] requested: rdma_mode={mode} device={device or 'auto'}")
-        logger.info(f"[dataplane] backend=MooncakeStore protocol=rdma device={device or 'auto'} (pending handshake)")
+        device_selection = "explicit" if device else "auto"
+        logger.info(f"[dataplane] requested: rdma_mode={mode} device_selection={device_selection}")
+        logger.info(
+            f"[dataplane] backend=MooncakeStore protocol=rdma device_selection={device_selection} (pending handshake)"
+        )
         return backend_dict
 
     def _close_data_system(self) -> None:

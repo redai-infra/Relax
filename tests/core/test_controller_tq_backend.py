@@ -225,10 +225,16 @@ class TestBackendPreconditions:
 
     def test_satisfied_preconditions_select_host_rdma(self, monkeypatch):
         _Recorder(monkeypatch)
-        backend = _resolve(_config(tq_rdma_device="mlx5_0"))
+        private_device = "private-device-name"
+        messages: list[str] = []
+        monkeypatch.setattr(controller.logger, "info", lambda message: messages.append(message))
+
+        backend = _resolve(_config(tq_rdma_device=private_device))
         assert backend["storage_backend"] == "MooncakeStore"
         assert backend["MooncakeStore"]["protocol"] == "rdma"
-        assert backend["MooncakeStore"]["device_name"] == "mlx5_0"
+        assert backend["MooncakeStore"]["device_name"] == private_device
+        assert any("device_selection=explicit" in message for message in messages)
+        assert all(private_device not in message for message in messages)
 
     def test_required_accepts_satisfied_preconditions(self, monkeypatch):
         _Recorder(monkeypatch)
@@ -371,10 +377,17 @@ class TestAttachHandshakeCleanupChain:
             failures=["node: attach timed out"],
             close_error=RuntimeError("TransferQueue owner cleanup failed"),
         )
+        owner = object()
+        instance = controller.Controller.__new__(controller.Controller)
+        instance.config = _config()
+        instance._tq_owner = owner
+        init_result = controller.TqInitResult(config="mooncake-conf", owner=owner)
+
         with pytest.raises(RuntimeError, match="owner cleanup failed"):
-            _confirm(_config())
+            instance._confirm_mooncake_attach(init_result, "simple-conf")
         assert recorder.events == ["handshake", "close"]
         assert recorder.initialized == []
+        assert instance._tq_owner is owner
 
     def test_required_closes_owner_then_raises(self, monkeypatch):
         recorder = _AttachRecorder(monkeypatch, failures=["node: protocol=tcp"])
