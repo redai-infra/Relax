@@ -522,3 +522,122 @@ def test_rloo_advantage_adapter_is_the_grpo_broadcast():
 
     for left, right in zip(got, want, strict=True):
         assert torch.equal(left, right)
+
+
+# ---------------- GAE: the adapter main's two call sites disagreed on ----------------
+#
+# `advantage_gae` had only a co_names check, and it is the adapter with the most
+# to get wrong: it shapes the reward in place before delegating, and it carries
+# `padded_total_lengths`, which one of main's two call sites passed and the
+# other did not. A dropped or reordered argument here does not raise -- it reads
+# the wrong token positions and trains on them.
+
+
+def _gae_inputs():
+    """Fresh tensors per call: `advantage_gae` mutates `kl` in place (`k *= ...`)."""
+    kl = [torch.tensor([0.1, 0.2, 0.3]), torch.tensor([0.4, 0.5])]
+    values = [torch.tensor([0.5, 0.25, 0.125]), torch.tensor([1.0, 2.0])]
+    return dict(
+        rewards=[1.5, -2.0],
+        kl=kl,
+        values=values,
+        response_lengths=[3, 2],
+        total_lengths=[3, 2],
+    )
+
+
+def _main_gae(kl_coef, gamma, lambd, *, padded_total_lengths=None):
+    """main's PPO branch, transcribed, not regenerated.
+
+    components/advantages.py:181-193 and the megatron duplicate at
+    loss.py:585-602. The only difference between the two is that the megatron
+    one forwards `padded_total_lengths`; both shape the reward identically.
+    """
+    inputs = _gae_inputs()
+    old_rewards, kl = inputs["rewards"], inputs["kl"]
+    rewards = []
+    for reward, k in zip(old_rewards, kl, strict=False):
+        k *= -kl_coef
+        cp_rank = 0  # the fixture pins mpu.get_context_parallel_rank() to 0
+        if cp_rank == 0:
+            k[-1] += reward
+        rewards.append(k)
+    return ppo_utils.get_advantages_and_returns_batch(
+        inputs["total_lengths"],
+        inputs["response_lengths"],
+        inputs["values"],
+        rewards,
+        gamma,
+        lambd,
+        padded_total_lengths=padded_total_lengths,
+    )
+
+
+@pytest.mark.parametrize(
+    "kl_coef,gamma,lambd",
+    [
+        (0.0, 1.0, 1.0),  # the degenerate case the co_names check implied was enough
+        (0.05, 0.99, 0.95),  # non-zero kl_coef and real discounting
+    ],
+)
+def test_gae_adapter_matches_mains_numbers(cp_disabled, kl_coef, gamma, lambd):
+    """Every element, not just the kernel's name in the bytecode."""
+    from relax.algorithms.advantages import compute_advantages_and_returns
+
+    args = _args("ppo", kl_coef=kl_coef, gamma=gamma, lambd=lambd)
+    got_adv, got_ret = compute_advantages_and_returns(args, **_gae_inputs())
+    want_adv, want_ret = _main_gae(kl_coef, gamma, lambd)
+
+    for got, want, label in ((got_adv, want_adv, "advantages"), (got_ret, want_ret, "returns")):
+        assert len(got) == len(want), label
+        for left, right in zip(got, want, strict=True):
+            torch.testing.assert_close(left, right, rtol=0, atol=0, msg=label)
+
+
+def test_gae_terminal_reward_lands_on_the_last_token(cp_disabled):
+    """`k[-1] += reward` is the whole reward signal; dropping it trains on KL alone."""
+    from relax.algorithms.advantages import compute_advantages_and_returns
+
+    args = _args("ppo", kl_coef=0.0, gamma=1.0, lambd=1.0)
+    with_reward, _ = compute_advantages_and_returns(args, **_gae_inputs())
+
+    zeroed = _gae_inputs()
+    zeroed["rewards"] = [0.0, 0.0]
+    without_reward, _ = compute_advantages_and_returns(args, **zeroed)
+
+    assert not torch.equal(with_reward[0], without_reward[0]), "the terminal reward changed nothing"
+
+
+def test_gae_adapter_forwards_padded_total_lengths_to_the_kernel(cp_disabled, monkeypatch):
+    """The argument the two call sites disagreed on must survive the adapter.
+
+    Scope, stated because it is easy to over-read: `padded_total_lengths` is
+    only *consumed* when `cp_size > 1` (ppo_utils.py, the `all_gather_with_cp`
+    branch), and this file runs at cp_size 1. So this pins that the adapter
+    hands the value through unchanged and in the right keyword -- the "dropped
+    or reordered argument" failure -- not that the padded slicing itself is
+    correct. That needs a real context-parallel group and is not covered here.
+    """
+    from relax.algorithms import advantages as advantages_module
+
+    seen = {}
+
+    def spy(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return ([torch.zeros(3)], [torch.zeros(3)])
+
+    monkeypatch.setattr(advantages_module, "get_advantages_and_returns_batch", spy)
+
+    padded = [8, 8]
+    advantages_module.compute_advantages_and_returns(
+        _args("ppo", kl_coef=0.0, gamma=1.0, lambd=1.0),
+        **_gae_inputs(),
+        padded_total_lengths=padded,
+    )
+
+    assert seen["kwargs"].get("padded_total_lengths") == padded
+    # main's positional order: total_lengths, response_lengths, values, rewards, gamma, lambd
+    assert seen["args"][0] == [3, 2]
+    assert seen["args"][1] == [3, 2]
+    assert seen["args"][4] == 1.0 and seen["args"][5] == 1.0
