@@ -19,6 +19,16 @@ makes the registry testable on a CPU-only runner.
 from dataclasses import dataclass
 
 
+# The two enum-like fields below are consumed by equality checks in
+# `relax/backends/megatron/loss.py` -- `advantage_normalization == "token_global"`
+# at 659 and 819, `kl_level == "sequence"` at 919. Anything that is not the
+# awaited string takes the *other* branch, so a typo in a registry entry does
+# not fail, it silently selects a different formula. These sets are what
+# `__post_init__` checks against.
+KL_LEVELS = frozenset({"token", "sequence"})
+ADVANTAGE_NORMALIZATIONS = frozenset({"whiten", "token_global"})
+
+
 @dataclass(frozen=True)
 class AlgorithmSpec:
     """Everything the training pipeline needs to know about one algorithm."""
@@ -120,6 +130,29 @@ class AlgorithmSpec:
     or an advantage that needs batch-level statistics the async deployment
     only sees a slice of). Those get their own field; do not fold them here.
     """
+
+    def __post_init__(self) -> None:
+        """Reject an unsupported enum value while the registry is being built.
+
+        ``ALGORITHM_SPECS`` is a module-level literal, so this runs at import:
+        a typo cannot reach a worker, let alone a training step. The
+        implementation identifiers are already resolved eagerly for the same
+        reason (``_assert_spec_implementations_resolve`` in ``arguments.py``);
+        these two fields were the ones left unchecked, and they are the ones
+        whose failure is silent rather than loud -- a bad ``advantage_fn``
+        raises a KeyError, a bad ``kl_level`` just trains with token-level KL
+        and never says so.
+        """
+        for field, value, allowed in (
+            ("kl_level", self.kl_level, KL_LEVELS),
+            ("advantage_normalization", self.advantage_normalization, ADVANTAGE_NORMALIZATIONS),
+        ):
+            if value not in allowed:
+                raise ValueError(
+                    f"AlgorithmSpec({self.name!r}) has {field}={value!r}, which no call site matches; "
+                    f"the run would silently take the default branch instead. "
+                    f"Expected one of {sorted(allowed)}."
+                )
 
     @property
     def is_group_normalized(self) -> bool:

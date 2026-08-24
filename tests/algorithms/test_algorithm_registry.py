@@ -153,3 +153,48 @@ def test_every_spec_declares_a_kl_level_the_loss_knows_how_to_read():
     """
     for name in list_algorithm_names():
         assert get_algorithm(name).kl_level in ("token", "sequence"), name
+
+
+# ---------------- enum-like fields must fail loudly, not silently ----------------
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("kl_level", "Sequence"),  # right word, wrong case
+        ("kl_level", "seq"),
+        ("advantage_normalization", "token-global"),  # hyphen instead of underscore
+        ("advantage_normalization", "none"),
+    ],
+)
+def test_an_unsupported_enum_value_is_refused_when_the_spec_is_built(field, bad):
+    """These two fields are compared for equality, so a typo picks a formula.
+
+    `loss.py` asks `advantage_normalization == "token_global"` and
+    `kl_level == "sequence"`; every other string takes the else branch. Unlike
+    `advantage_fn`, which blows up with a KeyError the first time it is looked
+    up, a misspelled value here starts training successfully and quietly uses
+    the wrong KL level or the wrong advantage normalisation. The registry is a
+    module-level literal, so validating in `__post_init__` moves that from a
+    silent wrong-maths run to an import-time error.
+    """
+    from relax.algorithms.spec import AlgorithmSpec
+
+    kwargs = dict(
+        name="probe",
+        reward_normalizer="none",
+        advantage_fn="grpo_broadcast",
+        policy_loss_fn="ppo_clip",
+    )
+    kwargs[field] = bad
+
+    with pytest.raises(ValueError, match=field):
+        AlgorithmSpec(**kwargs)
+
+
+def test_the_supported_values_are_the_ones_the_shipped_specs_use():
+    """Guards against the allow-list drifting away from the registry it guards."""
+    from relax.algorithms.spec import ADVANTAGE_NORMALIZATIONS, ALGORITHM_SPECS, KL_LEVELS
+
+    assert {s.kl_level for s in ALGORITHM_SPECS.values()} <= KL_LEVELS
+    assert {s.advantage_normalization for s in ALGORITHM_SPECS.values()} <= ADVANTAGE_NORMALIZATIONS
