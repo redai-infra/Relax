@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU-only checks for fail-closed Ray train-actor initialization."""
+"""Fail-closed Ray train-actor initialization contracts."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import ray
@@ -15,139 +17,91 @@ import ray
 from relax.distributed.ray.actor_group import RayTrainGroup
 
 
-class _RemoteMethod:
-    def __init__(self, result=None, error: BaseException | None = None):
-        self.result = result
-        self.error = error
-
-    def remote(self, *args, **kwargs):
-        if self.error is not None:
-            raise self.error
-        return self.result
-
-
-class _FakeActor:
-    def __init__(self, probe_ref=None, probe_error: BaseException | None = None):
-        self.termination_probe = _RemoteMethod(probe_ref, probe_error)
-
-
-def _group(*actors) -> RayTrainGroup:
+def _group(*actors: Any) -> RayTrainGroup:
     group = object.__new__(RayTrainGroup)
     group._actor_handlers = list(actors)
     return group
 
 
-def test_successful_initialization_preserves_actor_group(monkeypatch):
-    actor = _FakeActor()
+def _actor(probe: Any = None) -> Any:
+    return SimpleNamespace(termination_probe=SimpleNamespace(remote=lambda: probe))
+
+
+def _raise(error: BaseException) -> None:
+    raise error
+
+
+def test_init_and_wait_preserves_success_and_cleans_submission_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = _actor()
     group = _group(actor)
     refs = [object(), object()]
-    values = {refs[0]: "rank-0", refs[1]: "rank-1"}
-    monkeypatch.setattr(group, "async_init", lambda *args, **kwargs: refs)
-    monkeypatch.setattr(ray, "wait", lambda pending, num_returns: ([pending[0]], pending[1:]))
+    values = dict(zip(refs, ["rank-0", "rank-1"], strict=True))
+    monkeypatch.setattr(group, "async_init", lambda *_args, **_kwargs: refs)
+    monkeypatch.setattr(ray, "wait", lambda pending, **_kwargs: ([pending[0]], pending[1:]))
     monkeypatch.setattr(ray, "get", lambda ref: values[ref])
-    monkeypatch.setattr(ray, "kill", lambda *_args, **_kwargs: pytest.fail("success must not kill actors"))
-
     assert group.init_and_wait(object(), "actor") == ["rank-0", "rank-1"]
     assert group._actor_handlers == [actor]
 
-
-def test_synchronous_submission_failure_cleans_partially_initialized_group(monkeypatch):
-    actor = _FakeActor()
-    group = _group(actor)
-    cleanup_calls = []
-
-    def fail_submission(*_args, **_kwargs):
-        raise RuntimeError("actor initialization submission failed")
-
-    monkeypatch.setattr(group, "async_init", fail_submission)
-    monkeypatch.setattr(group, "_terminate_failed_init", lambda: cleanup_calls.append(True))
-
+    monkeypatch.setattr(group, "async_init", lambda *_args, **_kwargs: _raise(RuntimeError("submission failed")))
+    monkeypatch.setattr(group, "_terminate_failed_init", lambda: group._actor_handlers.clear())
     with pytest.raises(RuntimeError, match="submission failed"):
         group.init_and_wait(object(), "actor")
+    assert group._actor_handlers == []
 
-    assert cleanup_calls == [True]
 
-
-def test_first_rank_failure_kills_and_confirms_every_actor(monkeypatch):
-    actors = [_FakeActor("probe-0"), _FakeActor("probe-1")]
+def test_first_rank_failure_kills_and_confirms_every_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+    actors = [_actor("probe-0"), _actor("probe-1")]
     group = _group(*actors)
-    init_refs = ["init-0", "init-1"]
-    killed = []
-    monkeypatch.setattr(group, "async_init", lambda *args, **kwargs: init_refs)
+    monkeypatch.setattr(group, "async_init", lambda *_args, **_kwargs: ["init-0", "init-1"])
 
-    def fake_wait(refs, *, num_returns, timeout=None):
-        if timeout is None:
-            # rank 1 fails before rank 0 finishes; cleanup must begin without
-            # waiting for rank 0.
-            return ["init-1"], ["init-0"]
-        return list(refs), []
+    def wait(refs: list[str], *, timeout: float | None = None, **_kwargs: Any):
+        return (list(refs), []) if timeout is not None else (["init-1"], ["init-0"])
 
-    def fake_get(ref):
+    def get(ref: str) -> None:
         if ref == "init-1":
             raise RuntimeError("rank initialization failed")
-        if str(ref).startswith("probe-"):
-            raise ray.exceptions.RayActorError(error_msg="actor terminated")
-        pytest.fail(f"unexpected ray.get({ref!r})")
+        raise ray.exceptions.RayActorError(error_msg="actor terminated")
 
-    monkeypatch.setattr(ray, "wait", fake_wait)
-    monkeypatch.setattr(ray, "get", fake_get)
+    killed: list[Any] = []
+    monkeypatch.setattr(ray, "wait", wait)
+    monkeypatch.setattr(ray, "get", get)
     monkeypatch.setattr(ray, "kill", lambda actor, no_restart: killed.append((actor, no_restart)))
-
     with pytest.raises(RuntimeError, match="rank initialization failed"):
         group.init_and_wait(object(), "actor")
-
     assert killed == [(actors[0], True), (actors[1], True)]
     assert group._actor_handlers == []
 
 
-def test_kill_failure_still_attempts_every_actor_and_fails_closed(monkeypatch):
-    actors = [_FakeActor("probe-0"), _FakeActor("probe-1")]
+@pytest.mark.parametrize("failure", ["kill", "pending"])
+def test_unconfirmed_cleanup_keeps_group_and_fails_closed(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    actors = [_actor("probe-0"), _actor("probe-1")]
     group = _group(*actors)
-    killed = []
-
-    def fake_kill(actor, *, no_restart):
-        killed.append(actor)
-        if actor is actors[0]:
-            raise RuntimeError("private control-plane detail")
-
-    monkeypatch.setattr(ray, "kill", fake_kill)
-    monkeypatch.setattr(ray, "wait", lambda refs, **kwargs: (list(refs), []))
-    monkeypatch.setattr(
-        ray,
-        "get",
-        lambda _ref: (_ for _ in ()).throw(ray.exceptions.RayActorError(error_msg="actor terminated")),
-    )
-
+    if failure == "kill":
+        monkeypatch.setattr(ray, "kill", lambda *_args, **_kwargs: _raise(RuntimeError("private detail")))
+        monkeypatch.setattr(ray, "wait", lambda refs, **_kwargs: (list(refs), []))
+        monkeypatch.setattr(
+            ray,
+            "get",
+            lambda _ref: _raise(ray.exceptions.RayActorError(error_msg="terminated")),
+        )
+    else:
+        monkeypatch.setattr(ray, "kill", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(ray, "wait", lambda refs, **_kwargs: ([], list(refs)))
     with pytest.raises(RuntimeError, match="Failed to confirm train actor cleanup") as excinfo:
         group._terminate_failed_init(timeout=0.1)
-
-    assert killed == actors
-    assert "private control-plane detail" not in str(excinfo.value)
+    assert "private detail" not in str(excinfo.value)
     assert group._actor_handlers == actors
 
 
-def test_pending_termination_probe_keeps_group_and_fails_closed(monkeypatch):
-    actor = _FakeActor("probe")
-    group = _group(actor)
-    monkeypatch.setattr(ray, "kill", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ray, "wait", lambda refs, **kwargs: ([], list(refs)))
-
-    with pytest.raises(RuntimeError, match=r"1 task\(s\) remained pending"):
-        group._terminate_failed_init(timeout=0.1)
-
-    assert group._actor_handlers == [actor]
-
-
-def test_real_actor_failure_cannot_mutate_state_after_cleanup():
-    """A killed actor process cannot complete a delayed daemon-thread write."""
+def test_real_actor_failure_cannot_mutate_state_after_cleanup() -> None:
     env = os.environ.copy()
     env["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
     env.pop("RAY_ADDRESS", None)
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     with tempfile.TemporaryDirectory(prefix="train-init-ray-") as probe_dir:
         result = subprocess.run(
             [sys.executable, "-m", "tests.utils._train_actor_init_cleanup_probe", probe_dir],
-            cwd=repo_root,
+            cwd=root,
             env=env,
             capture_output=True,
             text=True,

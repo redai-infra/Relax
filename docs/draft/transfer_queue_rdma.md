@@ -78,7 +78,7 @@ export RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB=8
 | C1 | Mooncake/TCP | benchmark 对照，不是生产配置或 fallback |
 | C2 | Mooncake/host-RDMA | 生产 RDMA candidate |
 
-每个 protocol 必须使用全新 Python 进程和独立 CSV。示例仅展示 C2；C0/C1 使用 `--protocol simple` / `tcp`，并删除 `--device`：
+每个 protocol 必须使用全新 Python 进程和独立 CSV。示例仅展示 C2；C1 改用 `--protocol tcp` 并删除 `--device`/`--rdma-port`，C0 改用 `--protocol simple` 并额外删除 `--master`：
 
 ```bash
 python -u scripts/benchmarks/tq_cross_node_bench.py \
@@ -86,6 +86,7 @@ python -u scripts/benchmarks/tq_cross_node_bench.py \
   --master master.example:50051 \
   --consumer-node-id <consumer-node-id> \
   --device <rdma-device> \
+  --rdma-port 1 \
   --tcp-device <network-interface> \
   --payload-profiles synthetic multimodal \
   --payload-mib 256 1024 2048 4096 \
@@ -93,7 +94,11 @@ python -u scripts/benchmarks/tq_cross_node_bench.py \
   --csv c2-rdma.csv
 ```
 
-所有档位都必须 byte-exact。C2 要求 IB receive counter 增长、至少覆盖 raw payload 的 80%，且不被 TCP 流量主导；C1 要求 TCP receive counter 至少覆盖 20%，且不被 RDMA 流量主导。C0 只要求观测到 TCP 且不被 RDMA 主导，因为 SimpleStorage unit 可能位于 consumer 本地。
+所有档位都必须 byte-exact。C2 只读取明确指定的 HCA/port，要求一次完整 `put → get` round 的 idle-adjusted IB receive bytes 至少覆盖 raw payload 的 80%；完整 round 可以覆盖对象随机落在 producer、consumer 或 owner segment 的情况。C1 要求 idle-adjusted TCP receive bytes 至少覆盖 20%，C0 只要求观测到跨节点 TCP，因为 SimpleStorage unit 可能位于 consumer 本地。端口级 counter 不是 per-flow 指标，正式验收必须使用静默或独占的数据端口；CSV 同时记录 raw delta、紧邻 round 的 idle rate 和扣除后的 proof bytes，不能在共享端口有显著背景流量时宣称 wire proof。
+
+C1 会在 driver 及其 Ray worker runtime 中设置 `MC_TCP_ENABLE_CONNECTION_POOL=1`，这是当前 Mooncake/TCP correctness baseline 的组成部分，必须随结果一并记录。benchmark 通过一次性 owner lifecycle 有界初始化 TQ，producer/consumer 均有界 attach；任一失败都非零退出，不执行 backend fallback。
+
+CSV 使用 exclusive-create，不覆盖既有文件。每个 warmup/测量 round 都先落盘再执行 byte-exact/wire gate，失败行包含稳定的 `error_kind`；每轮无论成功失败都清理 partition。每行还记录 Relax SHA、安装的 TransferQueue VCS commit 和 Mooncake package version，且 Relax tracked worktree 不干净时拒绝作为正式验收运行。
 
 真实多模态 fixture、原始 CSV、版本信息和性能分布属于 PR 验收附件，不在仓库文档维护生成教程或易过期的性能数字。没有双节点 RDMA 环境时必须明确记录“真机验收未执行”，不能用 mock 结果替代。
 
