@@ -7,6 +7,7 @@ real: a shard-local implementation, a missing collective on an empty shard, or a
 mismatched call order would all show up here rather than only on a GPU cluster.
 """
 
+import datetime
 import os
 import sys
 
@@ -61,7 +62,13 @@ _SEGMENT_MODES = {
 def _run(rank, world_size, port, mode, out):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    # Bounded so a rank-divergence regression fails instead of hanging. These
+    # cases exist because one rank raising while the other proceeds strands the
+    # second inside a collective; at gloo's 30-minute default that regression
+    # shows up as a stalled CI job, which reads as infrastructure flake and gets
+    # retried rather than investigated. Every collective here is sub-millisecond,
+    # so 60s is pure headroom.
+    dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=60))
     try:
         from relax.algorithms.advantages import whiten_scalar
         from relax.algorithms.numerics import distributed_mean_std, is_collapsed
