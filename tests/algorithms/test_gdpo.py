@@ -16,7 +16,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from relax.algorithms import get_algorithm  # noqa: E402
+from relax.algorithms import get_algorithm, numerics  # noqa: E402
 from relax.algorithms.advantages import _whiten_by_segment, whiten_scalar  # noqa: E402
 from relax.algorithms.numerics import GDPO_EPS  # noqa: E402
 from relax.algorithms.rewards import (  # noqa: E402
@@ -604,6 +604,60 @@ def test_batch_std_matches_torch_std_on_ordinary_input():
         mean, std = distributed_mean_std(values)
         torch.testing.assert_close(mean, values.mean(), rtol=1e-6, atol=0)
         torch.testing.assert_close(std, values.std(), rtol=1e-6, atol=0)
+
+
+def test_float64_statistics_that_overflow_raise_instead_of_zeroing_the_batch():
+    """The one guard in `whiten_scalar` that nothing else covers.
+
+    Whitening promotes its input to float64, so a float32 caller can never
+    reach this: the largest float32 squared is 1.2e77 against float64's 1.8e308.
+    A float64 caller near its own maximum can -- the squares overflow inside the
+    reduction and the standard deviation comes back `inf`. Left unchecked that
+    divides the whole batch by infinity and returns all zeros, which is
+    indistinguishable from "every sample scored the same".
+
+    Deleting the check leaves every other test in the suite green, which is why
+    this one exists.
+    """
+    values = torch.tensor([1e300, -1e300, 5e299, -2e299], dtype=torch.float64)
+
+    # not caught earlier: the batch is not collapsed, and every input is finite
+    assert values.min() != values.max()
+    assert torch.isfinite(values).all()
+
+    with pytest.raises(ValueError, match="overflowed computing"):
+        whiten_scalar(values)
+
+
+def test_the_flag_crossing_the_wire_is_never_a_bool_tensor(monkeypatch):
+    """`any_rank_has_non_finite` must not hand a bool tensor to a collective.
+
+    The cast to a numeric dtype looks like dead weight -- MAX over 0/1 is the
+    same answer in bool, uint8, int32 or float32 -- and removing it leaves the
+    whole suite green. A two-process NCCL run on the production image (torch
+    2.11, NCCL 2.28.9) agrees: bool reduces correctly there too, at both scalar
+    and `[1]` shape. So this is not guarding a reproduced failure.
+
+    It guards the part of the matrix nothing here can run.
+    `relax/utils/device.py` picks the backend from the accelerator, so an NPU
+    job reduces this flag over hccl and an XPU job over xccl, and a vendor
+    dtype table that lacks an entry throws rather than degrades. The cast is
+    free; finding out on an Ascend cluster is not.
+
+    The assertion is deliberately "not bool" rather than "== float32": float32
+    is what the pre-rewrite code sent and there is no reason to churn it, but
+    int32 -- what every other flag in this repo uses -- must stay a legal
+    future choice. Pinning the exact dtype would only copy the implementation
+    into a test.
+    """
+    sent = []
+    monkeypatch.setattr(numerics.dist, "all_reduce", lambda tensor, **_: sent.append(tensor))
+
+    values = torch.tensor([1.0, float("inf")])
+    assert numerics.any_rank_has_non_finite(values, process_group=object()) is True
+
+    assert len(sent) == 1, "the collective is what makes this a cross-rank answer"
+    assert sent[0].dtype is not torch.bool
 
 
 # ---------------- what step 3's boundary actually is ----------------

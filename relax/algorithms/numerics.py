@@ -81,12 +81,38 @@ def any_rank_has_non_finite(values: torch.Tensor, *, process_group: dist.Process
     One MAX all-reduce of a 0/1 flag, so every rank gets the same answer and
     the caller can raise on all of them together. Without a group the reduction
     is skipped and the answer is simply the local one.
+
+    The flag is built and reduced entirely on device. An earlier version read
+    it back with ``bool(...)`` to construct the tensor, which cost a
+    device-to-host sync *before* the collective and another host-to-device copy
+    to rebuild it -- and this runs on every training batch of GDPO's step 3.
+    The single ``.item()`` at the end is the only sync, and it is unavoidable
+    while the function returns a Python ``bool``.
+
+    The flag is cast off ``bool`` on purpose, though not because bool is known
+    to break. MAX over a 0/1 flag gives the same answer in any of these dtypes,
+    and bool measurably survives both backends we can run: gloo in CI, and
+    NCCL 2.28.9 under torch 2.11 on two H100s, where bool, uint8, int32, int64
+    and float32 all reduce correctly at both scalar and ``[1]`` shape.
+
+    What we cannot run is the rest of the matrix. ``relax/utils/device.py``
+    picks the backend from the accelerator, so an NPU job reduces this flag
+    over hccl and an XPU job over xccl, and neither vendor's dtype table is
+    something this repo can check. A dtype table is a lookup; a missing entry
+    throws rather than degrades, and it would throw on the first batch of
+    GDPO's step 3. A numeric flag costs nothing and takes the question off the
+    table -- that is the whole argument for the cast, and it is precaution
+    rather than a fix for any failure observed so far.
+
+    float32 specifically is just what the pre-rewrite code sent; this was a
+    latency fix and had no business changing the wire format. ``int32`` would
+    be equally safe and would match every other flag in this repo
+    (megatron/actor.py, megatron/collective_utils.py,
+    megatron/conditional_branch_sync.py, all of which also send shape ``[1]``
+    rather than a scalar) -- that alignment is worth doing, but as its own
+    change, not as a side effect of this one.
     """
-    bad = torch.tensor(
-        float(not bool(torch.isfinite(values).all())),
-        dtype=torch.float32,
-        device=values.device,
-    )
+    bad = (~torch.isfinite(values)).any().to(dtype=torch.float32)
     if process_group is not None:
         dist.all_reduce(bad, op=dist.ReduceOp.MAX, group=process_group)
     return bool(bad.item())

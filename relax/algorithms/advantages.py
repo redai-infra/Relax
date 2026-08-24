@@ -114,7 +114,11 @@ def whiten_scalar(values: torch.Tensor, *, process_group: dist.ProcessGroup | No
         return torch.zeros_like(values)
     work = values.double()
     mean, std = distributed_mean_std(work, process_group=process_group)
-    if not (torch.isfinite(mean) and torch.isfinite(std)):
+    # Stacked rather than `isfinite(mean) and isfinite(std)`: Python's `and`
+    # calls `__bool__` on the first tensor and, when it is true, on the second,
+    # so the readable spelling costs one or two device-to-host syncs per
+    # training batch. One stack, one reduction, one read.
+    if not torch.isfinite(torch.stack((mean, std))).all():
         # Unreachable from float32 -- the largest float32 squared is 1.2e77
         # against float64's 1.8e308 -- but reachable from a float64 caller near
         # its own maximum, where the squares overflow inside the reduction.
