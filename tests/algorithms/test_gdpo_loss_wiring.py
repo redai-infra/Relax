@@ -33,8 +33,32 @@ torch = pytest.importorskip("torch")
 from relax.algorithms.advantages import whiten_scalar  # noqa: E402
 
 
+# The `mpu` surface this file's call path touches, answered as a one-process
+# run would. Kept as data so the import-time fake and the per-test patch cannot
+# drift apart -- they are the same answers reaching the same call sites.
+_SINGLE_PROCESS_ANSWERS = {
+    "is_pipeline_last_stage": lambda *_a, **_k: True,
+    "get_data_parallel_group": lambda *_a, **_k: None,
+    "get_context_parallel_rank": lambda *_a, **_k: 0,
+    "get_context_parallel_world_size": lambda *_a, **_k: 1,
+}
+
+
+def _single_process_mpu():
+    mpu = ModuleType("megatron.core.mpu")
+    for name, answer in _SINGLE_PROCESS_ANSWERS.items():
+        setattr(mpu, name, answer)
+    return mpu
+
+
 def _load_loss_module():
-    """Import the production loss module with a single-process `mpu`."""
+    """Import the production loss module, with or without Megatron installed.
+
+    Only the import needs the fake package, and only when Megatron is absent.
+    Which `mpu` the module ends up bound to is decided per test by
+    `single_process_mpu` below -- doing it here instead is what made this file
+    pass on CI and fail in the project image.
+    """
     try:
         import megatron.core  # noqa: F401
     except ModuleNotFoundError:
@@ -44,11 +68,7 @@ def _load_loss_module():
 
     megatron = ModuleType("megatron")
     core = ModuleType("megatron.core")
-    mpu = ModuleType("megatron.core.mpu")
-    mpu.is_pipeline_last_stage = lambda *_a, **_k: True
-    mpu.get_data_parallel_group = lambda *_a, **_k: None
-    mpu.get_context_parallel_rank = lambda *_a, **_k: 0
-    mpu.get_context_parallel_world_size = lambda *_a, **_k: 1
+    mpu = _single_process_mpu()
     core.mpu = mpu
     sys.modules.update({"megatron": megatron, "megatron.core": core, "megatron.core.mpu": mpu})
     try:
@@ -59,6 +79,33 @@ def _load_loss_module():
 
 
 loss_module = _load_loss_module()
+
+
+@pytest.fixture(autouse=True)
+def single_process_mpu(monkeypatch):
+    """Bind the loss module to a one-process `mpu`, installed or not.
+
+    This file exists to run the real `loss.compute_advantages_and_returns`, and
+    that function asks `mpu` which pipeline stage it is on. With Megatron
+    absent the import-time fake answered; with Megatron present -- which is how
+    `docker/Dockerfile` builds the project image, adding MCore to PYTHONPATH --
+    the real `mpu` answered instead, and it cannot: no test here initialises a
+    pipeline group, so all four cases died on `pipeline_model parallel group is
+    not initialized`. GitHub's CPU runner has no MCore and so only ever
+    exercised the other branch, which is why the suite looked green while
+    `pytest -q tests/algorithms` in the image reported `4 failed, 805 passed`.
+
+    Patching the functions *on* the `mpu` object, rather than rebinding
+    `loss_module.mpu`, is what makes this cover the whole call path. `loss.py`
+    is not the only module that does `from megatron.core import mpu`:
+    `cp_utils.maybe_padded_total_lengths` holds its own reference and is
+    reached from `compute_advantages_and_returns`, so rebinding one name left
+    the other one talking to the uninitialised real thing. Every holder shares
+    one module object, so patching its attributes reaches all of them at once.
+    `monkeypatch` puts the originals back after each test.
+    """
+    for name, answer in _SINGLE_PROCESS_ANSWERS.items():
+        monkeypatch.setattr(loss_module.mpu, name, answer, raising=False)
 
 
 def _args(estimator="gdpo", **overrides):
