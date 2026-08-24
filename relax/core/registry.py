@@ -11,7 +11,7 @@ except ImportError:
             return self.value
 
 
-from relax.algorithms import ALGORITHM_SPECS
+from relax.algorithms import ALGORITHM_SPECS, algorithm_needs_critic
 from relax.components.actor import Actor
 from relax.components.actor_fwd import ActorFwd
 from relax.components.advantages import Advantages
@@ -91,8 +91,9 @@ def _rl_roles(*, needs_critic: bool) -> dict:
     service-registration time, because both sides read the same dict.
 
     This decides which class a role maps to, *not* which roles the controller
-    walks -- that is ``process_role``'s job and it is deliberately left
-    untouched.  ``controller.py`` iterates ``list(process_role(config))`` and
+    walks -- that is ``process_role``'s job, which reads the same
+    ``needs_critic`` through ``algorithm_needs_critic``.  ``controller.py``
+    iterates ``list(process_role(config))`` and
     skips any role missing from this dict, so an algorithm without a critic
     simply never matches the ``critic`` member the role sets already carry.
     """
@@ -125,7 +126,7 @@ def process_role(config):
         return ROLES_TRAIN_ONLY
     if getattr(config, "loss_type", None) == "sft":
         return ROLES_SFT_ONLY
-    if getattr(config, "advantage_estimator", None) == "ppo":
+    if algorithm_needs_critic(config):
         if config.fully_async:
             if getattr(config, "true_on_policy_mode", False):
                 return ROLES_PPO_FULLY_ASYNC_ON_POLICY

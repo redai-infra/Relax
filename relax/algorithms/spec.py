@@ -221,6 +221,31 @@ def get_algorithm(name: str) -> AlgorithmSpec:
         raise KeyError(f"Unknown advantage estimator {name!r}. Available: {available}") from None
 
 
+def algorithm_needs_critic(config) -> bool:
+    """Whether the configured algorithm runs a critic, read from the registry.
+
+    The training pipeline asks this in five places -- role topology, the
+    critic's placement group, the device hand-off of the critic's ``values``,
+    the critic consumer's rollout fields, and the critic's own wait loop -- and
+    each of them used to compare ``advantage_estimator`` against ``"ppo"``.
+    That worked while PPO was the only value-based estimator, and silently
+    stopped working the moment the registry could accept a second one:
+    ``--advantage-estimator`` and ``ALGOS`` would take it, then none of the
+    value plumbing would switch on.
+
+    ``args.use_critic`` carries the same answer, but only after
+    ``validate_algorithm_args`` has run; ``process_role`` and the controller's
+    placement logic read a config that may not have been through it yet. This
+    reads the spec directly so the answer does not depend on call order.
+
+    Unknown or missing estimators answer False rather than raising: SFT and the
+    debug-only role paths reach these call sites with no estimator at all, and
+    an unknown name is rejected by argument parsing long before this matters.
+    """
+    spec = ALGORITHM_SPECS.get(getattr(config, "advantage_estimator", None))
+    return spec is not None and spec.needs_critic
+
+
 def list_algorithm_names() -> list[str]:
     """All registered algorithm names, in definition order."""
     return list(ALGORITHM_SPECS)

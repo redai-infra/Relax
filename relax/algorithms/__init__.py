@@ -9,7 +9,19 @@ heavy import here would pull the whole training stack into ``--help`` and into
 the CPU-only test runner.
 """
 
-from relax.algorithms.spec import ALGORITHM_SPECS, AlgorithmSpec, get_algorithm, list_algorithm_names
+from relax.algorithms.spec import (
+    ALGORITHM_SPECS,
+    AlgorithmSpec,
+    algorithm_needs_critic,
+    get_algorithm,
+    list_algorithm_names,
+)
 
 
-__all__ = ["ALGORITHM_SPECS", "AlgorithmSpec", "get_algorithm", "list_algorithm_names"]
+__all__ = [
+    "ALGORITHM_SPECS",
+    "AlgorithmSpec",
+    "algorithm_needs_critic",
+    "get_algorithm",
+    "list_algorithm_names",
+]

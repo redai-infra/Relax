@@ -133,3 +133,98 @@ def test_each_algorithm_gets_an_independent_role_dict():
     names = list_algorithm_names()
     for left, right in zip(names, names[1:], strict=False):
         assert ALGOS[left] is not ALGOS[right], f"{left} and {right} share one dict object"
+
+
+# ---------------- a second critic algorithm must need no new name checks ----------------
+
+
+def _register_second_critic_algorithm(monkeypatch):
+    """Add a value-based estimator to the registry for the duration of a test.
+
+    Returns its name. Uses PPO's own spec so the only thing under test is
+    whether the pipeline keys off `needs_critic` or off the literal `"ppo"`.
+    """
+    import dataclasses
+
+    from relax.algorithms import ALGORITHM_SPECS
+    from relax.algorithms import spec as spec_module
+
+    name = "ppo_second"
+    clone = dataclasses.replace(ALGORITHM_SPECS["ppo"], name=name)
+    monkeypatch.setitem(spec_module.ALGORITHM_SPECS, name, clone)
+    assert ALGORITHM_SPECS[name].needs_critic is True
+    return name
+
+
+def _args_for(name, **overrides):
+    from argparse import Namespace
+
+    base = dict(
+        advantage_estimator=name,
+        multimodal_keys=None,
+        kl_coef=0.0,
+        fully_async=False,
+        hybrid=False,
+        use_opd=False,
+        use_rollout_logprobs=False,
+        true_on_policy_mode=False,
+        debug_rollout_only=False,
+        debug_train_only=False,
+        loss_type=None,
+    )
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def test_a_second_critic_algorithm_gets_the_critic_rollout_fields(monkeypatch):
+    """`values` must reach the advantages consumer without naming the algorithm.
+
+    This is the failure the registry was supposed to make impossible: argparse
+    and `ALGOS` accept a second value-based estimator, and then the value
+    plumbing silently does not switch on because it compares against `"ppo"`.
+    """
+    from relax.utils.training.data_fields import build_data_fields
+
+    name = _register_second_critic_algorithm(monkeypatch)
+
+    ppo_fields = build_data_fields(_args_for("ppo"), consumer="advantages")
+    new_fields = build_data_fields(_args_for(name), consumer="advantages")
+    assert new_fields == ppo_fields, "a second critic algorithm sees different fields than PPO"
+    assert "values" in new_fields
+
+    # and the critic consumer's own set, which is the base set rather than the actor's
+    assert build_data_fields(_args_for(name), consumer="critic") == build_data_fields(
+        _args_for("ppo"), consumer="critic"
+    )
+
+
+def test_a_second_critic_algorithm_is_told_it_needs_a_critic_resource(monkeypatch):
+    """Startup validation is keyed on the capability, not on the name."""
+    import pytest as _pytest
+
+    from relax.utils.training.ppo_utils import validate_ppo_config
+
+    name = _register_second_critic_algorithm(monkeypatch)
+
+    with _pytest.raises(ValueError, match="requires a 'critic' entry"):
+        validate_ppo_config(_args_for(name, resource={"actor": "a"}))
+
+    # a non-critic estimator is still waved through
+    validate_ppo_config(_args_for("grpo", resource={"actor": "a"}))
+
+
+@requires_megatron
+def test_a_second_critic_algorithm_walks_the_critic_role_topology(monkeypatch):
+    """`process_role` decides which roles the controller walks at all."""
+    from relax.core.registry import process_role
+
+    name = _register_second_critic_algorithm(monkeypatch)
+
+    # identity, not membership: every role set carries a `critic` member and
+    # `ALGOS` is what filters it out, so comparing member names would pass even
+    # if the second algorithm fell through to the non-critic topology.
+    assert process_role(_args_for(name)) is process_role(_args_for("ppo"))
+    assert process_role(_args_for(name)) is not process_role(_args_for("grpo"))
+
+    # and the fully-async split follows too, rather than only the colocate one
+    assert process_role(_args_for(name, fully_async=True)) is process_role(_args_for("ppo", fully_async=True))
