@@ -329,7 +329,38 @@ def test_tensor_to_python_values_jagged_tensor(monkeypatch):
     ]
 
 
-def test_tensor_to_python_values_mixed_nested_rows(monkeypatch):
+def test_tensor_to_python_values_singleton_nested_rows(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.nested.nested_tensor(
+        [
+            torch.tensor([512]),
+            torch.tensor([135]),
+        ],
+        layout=torch.jagged,
+    )
+
+    assert stream_module._tensor_to_python_values(value) == [512, 135]
+
+
+def test_tensor_to_python_values_uniform_nested_rows(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.nested.nested_tensor(
+        [
+            torch.tensor([1, 2]),
+            torch.tensor([3, 4]),
+        ],
+        layout=torch.jagged,
+    )
+
+    assert stream_module._tensor_to_python_values(value) == [
+        [1, 2],
+        [3, 4],
+    ]
+
+
+def test_tensor_to_python_values_mixed_ragged_rows(monkeypatch):
     stream_module = _load_stream_module(monkeypatch)
 
     value = torch.nested.nested_tensor(
@@ -341,6 +372,6 @@ def test_tensor_to_python_values_mixed_nested_rows(monkeypatch):
     )
 
     assert stream_module._tensor_to_python_values(value) == [
-        1,
+        [1],
         [2, 3],
     ]

@@ -615,7 +615,20 @@ def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
     if not value.is_nested:
         return value.tolist()
 
-    return [sample.item() if sample.numel() == 1 else sample.tolist() for sample in value.unbind()]
+    rows = value.unbind(0)
+
+    try:
+        dense = torch.stack(rows)
+    except RuntimeError:
+        # Preserve row boundaries for truly ragged values.
+        return [row.tolist() for row in rows]
+
+    # TransferQueue may reconstruct scalar fields as singleton rows when
+    # the per-sample shape () is reported as (1,).
+    if dense.ndim == 2 and dense.shape[1] == 1:
+        return dense.squeeze(-1).tolist()
+
+    return dense.tolist()
 
 
 def get_data_from_transfer_queue(
