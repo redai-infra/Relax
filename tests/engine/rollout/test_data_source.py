@@ -190,5 +190,73 @@ class TestDataSourceIntegration:
                     os.unlink(path)
 
 
+class TestRolloutDataSourceWithBufferReconcile:
+    """Tests for the add-sequence watermark / pop_recently_added /
+    return_samples trio that RolloutDataSourceWithBuffer exposes so a cross-
+    step prefetch can reconcile its (already snapshotted) batch against
+    partial/oversample groups that land in the buffer after the snapshot was
+    taken."""
+
+    @pytest.fixture
+    def data_source(self):
+        from relax.engine.rollout.data_source import RolloutDataSourceWithBuffer
+
+        args = MagicMock()
+        args.rollout_global_dataset = False
+        args.buffer_filter_path = None
+        args.n_samples_per_prompt = 1
+        return RolloutDataSourceWithBuffer(args)
+
+    @staticmethod
+    def _group(tag: str):
+        from relax.utils.types import Sample
+
+        return [Sample(prompt=tag)]
+
+    def test_data_source_watermark_starts_at_zero(self, data_source):
+        _, watermark = data_source.get_samples_and_watermark(0)
+        assert watermark == 0
+
+    def test_data_source_pop_recently_added_empty_when_nothing_added_since(self, data_source):
+        _, watermark = data_source.get_samples_and_watermark(0)
+        assert data_source.pop_recently_added(watermark, max_count=5) == []
+
+    def test_data_source_pop_recently_added_returns_groups_added_after_watermark(self, data_source):
+        _, watermark = data_source.get_samples_and_watermark(0)
+        data_source.add_samples([self._group("partial")])
+
+        popped = data_source.pop_recently_added(watermark, max_count=5)
+
+        assert [g[0].prompt for g in popped] == ["partial"]
+        # Consumed from the buffer, not just copied.
+        assert data_source.get_buffer_length() == 0
+
+    def test_data_source_pop_recently_added_ignores_groups_added_before_watermark(self, data_source):
+        data_source.add_samples([self._group("old")])
+        _, watermark = data_source.get_samples_and_watermark(0)
+
+        assert data_source.pop_recently_added(watermark, max_count=5) == []
+        # The pre-existing group must stay untouched in the buffer.
+        assert data_source.get_buffer_length() == 1
+
+    def test_data_source_pop_recently_added_respects_max_count(self, data_source):
+        _, watermark = data_source.get_samples_and_watermark(0)
+        data_source.add_samples([self._group("a"), self._group("b"), self._group("c")])
+
+        popped = data_source.pop_recently_added(watermark, max_count=2)
+
+        assert len(popped) == 2
+        assert data_source.get_buffer_length() == 1
+
+    def test_data_source_return_samples_does_not_advance_watermark(self, data_source):
+        _, watermark = data_source.get_samples_and_watermark(0)
+        data_source.return_samples([self._group("displaced_fresh")])
+
+        # A group put back via return_samples (not add_samples) must not be
+        # mistaken for a newly produced partial/oversample group.
+        assert data_source.pop_recently_added(watermark, max_count=5) == []
+        assert data_source.get_buffer_length() == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

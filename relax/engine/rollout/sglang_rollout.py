@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import concurrent.futures
 import contextvars
 import copy
 import inspect
@@ -8,7 +9,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
-from time import monotonic
+from time import monotonic, thread_time
 from typing import Any
 
 import numpy as np
@@ -25,7 +26,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
-from relax.utils.async_utils import run
+from relax.utils.async_utils import get_async_loop, run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
@@ -174,20 +175,52 @@ class GenerateState(metaclass=SingletonMeta):
         )  # tasks that should not be aborted (abort_count >= partial_rollout_max_aborted_count)
         self.aborted = False
         self.evaluating = getattr(self, "evaluating", 0)  # preserve eval state across resets
-        # Pre-fetched data ObjectRef for cross-step overlap.
-        # Persisted across reset() calls so the ref submitted at the end of
-        # step N is consumed at the beginning of step N+1.
-        if not hasattr(self, "prefetched_samples_ref"):
-            self.prefetched_samples_ref: ray.ObjectRef | None = None
+        # Pre-fetched (and, when --dedup-multimodal-preprocess is on, pre-encoded)
+        # data for cross-step overlap: a concurrent.futures.Future scheduled on the
+        # persistent async-loop thread (see async_utils.get_async_loop) at the end of
+        # step N, so both the data_buffer.get_samples fetch and the per-group dedup
+        # image-processor call run while step N's actor training is in flight, not
+        # after step N+1 starts. Persisted across reset() calls so the future
+        # submitted at the end of step N is consumed at the beginning of step N+1.
+        # Resolves to (samples, watermark) — watermark lets the consumer reconcile
+        # against partial/oversample groups added to the buffer after the snapshot
+        # (see _prefetch_and_preprocess_next_step and pop_recently_added).
+        if not hasattr(self, "prefetched_samples_future"):
+            self.prefetched_samples_future: concurrent.futures.Future | None = None
         # How many groups the previous step left short of its transfer-queue target
         # (rollout_batch_size - committed_current). The next step backfills exactly this
-        # many into rollout_id-1. Persisted across reset() like prefetched_samples_ref;
+        # many into rollout_id-1. Persisted across reset() like prefetched_samples_future;
         # 0 before the first step / when the previous step met its target. fully_async only.
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
+        # Step N's own tail transfer_tasks (data_system_client.async_put calls still
+        # in flight when step N returns) — deferred here instead of awaited before
+        # returning, so step N+1's generate() call isn't gated on them. Drained at the
+        # top of the next generate_rollout_async call (see there), by which point they
+        # have almost always already finished on the persistent async-loop thread
+        # (async_utils.get_async_loop), overlapped with the staleness-wait loop and
+        # Ray dispatch overhead between steps in components/rollout.py's _async_run.
+        # Persisted across reset() like prefetched_samples_future — must survive from
+        # step N's reset() into step N+1's drain.
+        if not hasattr(self, "pending_transfer_tasks"):
+            self.pending_transfer_tasks: list[asyncio.Task] = []
+        # Tracks this step's own dedup-encoding phase (see _dedup_encode_group),
+        # so the cross-step prefetch can fire as soon as it's done rather than
+        # waiting for the whole step (generation + reward scoring + transfer)
+        # to finish. Reset every step (unlike prefetched_samples_future above):
+        # submit_generate_tasks() increments per group submitted and clears the
+        # event; generate_and_rm_group()'s finally-block decrements and sets the
+        # event once it reaches 0. Starts set (no pending dedup work at reset).
+        self.pending_dedup_groups = 0
+        self.all_done_event = asyncio.Event()
+        self.all_done_event.set()
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
+        if samples:
+            if self.pending_dedup_groups == 0:
+                self.all_done_event.clear()
+            self.pending_dedup_groups += len(samples)
         for group in samples:
             task = asyncio.create_task(
                 generate_and_rm_group(
@@ -208,11 +241,20 @@ class GenerateState(metaclass=SingletonMeta):
 
 async def _run_image_processor(
     state: GenerateState, args: Namespace, prompt: str | list[dict[str, str]], multimodal_inputs: dict
-) -> tuple[list[int], dict | None, float]:
+) -> tuple[list[int], dict | None, float, float | None]:
     """Run HF processor and return (prompt_ids, mm_train_inputs,
-    elapsed_seconds)."""
+    elapsed_seconds, cpu_seconds).
+
+    cpu_seconds is the calling worker thread's own `time.thread_time()` delta —
+    actual on-CPU compute for this call, excluding time spent waiting for a
+    free thread-pool worker or blocked on the GIL. Only measurable on the
+    ThreadPoolExecutor path (same-process worker thread); the
+    ProcessPoolExecutor path (--mm-processor-pool-size) runs in a separate
+    process and isn't instrumented here, so cpu_seconds is None there.
+    """
     t_start = monotonic()
     loop = asyncio.get_running_loop()
+    cpu_seconds: float | None = None
 
     if state.processor_pool is not None:
         mm_inputs_ipc = prepare_mm_inputs_for_ipc(multimodal_inputs)
@@ -235,6 +277,7 @@ async def _run_image_processor(
         )
 
         def _run_processor():
+            t_cpu_start = thread_time()
             adapted = adapt_processor_kwargs(
                 state.processor,
                 multimodal_inputs,
@@ -256,11 +299,13 @@ async def _run_image_processor(
             } or None
             train_inputs = remap_mm_train_inputs(state.processor, train_inputs)
             prompt_ids = expand_kimi_k25_placeholders(state.processor, prompt_ids, train_inputs)
-            return prompt_ids, train_inputs
+            return prompt_ids, train_inputs, thread_time() - t_cpu_start
 
-        processor_prompt_ids, mm_train_inputs = await loop.run_in_executor(state.encode_executor, _run_processor)
+        processor_prompt_ids, mm_train_inputs, cpu_seconds = await loop.run_in_executor(
+            state.encode_executor, _run_processor
+        )
 
-    return processor_prompt_ids, mm_train_inputs, monotonic() - t_start
+    return processor_prompt_ids, mm_train_inputs, monotonic() - t_start, cpu_seconds
 
 
 async def _encode_multimodal_inputs(multimodal_inputs: dict) -> tuple[dict[str, list], float]:
@@ -313,6 +358,8 @@ async def generate(
     tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
     _t_image_processor: float | None = None
+    _t_image_processor_cpu: float | None = None
+    _image_processor_is_real_call: bool | None = None
     # K2.x ships a multimodal AutoProcessor even for text-only fine-tunes; the
     # data loader always populates multimodal_inputs with empty-list placeholders
     # in that case, so check for actual media content before routing through the
@@ -322,9 +369,27 @@ async def generate(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
     if state.processor and _has_media:
-        processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
-            state, args, sample.prompt, sample.multimodal_inputs
-        )
+        pre_encoded = getattr(sample, "_pre_encoded_image", None)
+        if pre_encoded is not None:
+            processor_prompt_ids, sample.multimodal_train_inputs = pre_encoded
+            _t_image_processor = getattr(sample, "_pre_encoded_image_elapsed", 0.0)
+            _t_image_processor_cpu = getattr(sample, "_pre_encoded_image_cpu_elapsed", None)
+            _image_processor_is_real_call = getattr(sample, "_pre_encoded_image_is_real_call", False)
+            del sample._pre_encoded_image
+            if hasattr(sample, "_pre_encoded_image_elapsed"):
+                del sample._pre_encoded_image_elapsed
+            if hasattr(sample, "_pre_encoded_image_cpu_elapsed"):
+                del sample._pre_encoded_image_cpu_elapsed
+            if hasattr(sample, "_pre_encoded_image_is_real_call"):
+                del sample._pre_encoded_image_is_real_call
+        else:
+            (
+                processor_prompt_ids,
+                sample.multimodal_train_inputs,
+                _t_image_processor,
+                _t_image_processor_cpu,
+            ) = await _run_image_processor(state, args, sample.prompt, sample.multimodal_inputs)
+            _image_processor_is_real_call = True
     else:
         processor_prompt_ids = tokenizer_prompt_ids
 
@@ -486,6 +551,9 @@ async def generate(
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
     if _t_image_processor is not None:
         _timing["image_processor"] = _t_image_processor
+        _timing["image_processor_real_call"] = 1.0 if _image_processor_is_real_call else 0.0
+        if _t_image_processor_cpu is not None:
+            _timing["image_processor_cpu"] = _t_image_processor_cpu
     if _t_mm_encode is not None:
         _timing["mm_encode"] = _t_mm_encode
     sample.metadata["_timing"] = _timing
@@ -620,18 +688,166 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     timing_data = _collect_timing_from_samples(all_samples)
     metrics: dict[str, float] = {}
 
-    for phase in ("image_processor", "mm_encode", "generate", "post_generate"):
+    for phase in ("image_processor", "image_processor_cpu", "mm_encode", "generate", "post_generate"):
         values = timing_data.get(phase, [])
         if not values:
             continue
         metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
         metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
 
+    # Anchor: image_processor_real_call marks which samples triggered an actual
+    # HF-processor invocation vs. reused a dedup'd group result (see generate_and_rm_group).
+    # total_real/calls-real/calls-deduped let dedup-multimodal-preprocess on/off runs be
+    # compared on true processor wall-clock spent, instead of image_processor_time/mean
+    # being inflated by len(group) copies of the same elapsed value when dedup is on.
+    image_processor_values = timing_data.get("image_processor", [])
+    real_call_flags = timing_data.get("image_processor_real_call", [])
+    if image_processor_values and real_call_flags:
+        real_times = [t for t, is_real in zip(image_processor_values, real_call_flags, strict=True) if is_real]
+        metrics["perf_detail/rollout/image_processor_time/total_real"] = sum(real_times)
+        metrics["perf_detail/rollout/image_processor_calls/real"] = float(len(real_times))
+        metrics["perf_detail/rollout/image_processor_calls/deduped"] = float(len(real_call_flags) - len(real_times))
+
+    # image_processor_cpu is time.thread_time() (actual on-CPU compute, excludes
+    # thread-pool queue wait and GIL-contention wait) — only populated on the
+    # ThreadPoolExecutor path, see _run_image_processor. total_real here is the
+    # true CPU-time analogue of image_processor_time/total_real above.
+    image_processor_cpu_values = timing_data.get("image_processor_cpu", [])
+    if image_processor_cpu_values and real_call_flags and len(image_processor_cpu_values) == len(real_call_flags):
+        real_cpu_times = [t for t, is_real in zip(image_processor_cpu_values, real_call_flags, strict=True) if is_real]
+        metrics["perf_detail/rollout/image_processor_cpu_time/total_real"] = sum(real_cpu_times)
+
     if get_samples_times:
         metrics["perf_detail/rollout/get_samples_time/total"] = sum(get_samples_times)
         metrics["perf_detail/rollout/get_samples_time/mean"] = sum(get_samples_times) / len(get_samples_times)
 
     return metrics
+
+
+async def _dedup_encode_group(args: Namespace, group: list[Sample]) -> None:
+    """Group-level multimodal encoding de-duplication: when samples in the same
+    group share the same multimodal_inputs object (e.g. after shallow-copy in
+    data_source), encode once and attach the result to every sample so that
+    generate() picks up the pre-encoded data instead of re-encoding per sample.
+
+    Idempotent — a no-op if this group was already encoded (e.g. by the cross-
+    step prefetch task in _prefetch_and_preprocess_next_step), so
+    generate_and_rm_group can call it unconditionally without redoing work.
+    """
+    if hasattr(group[0], "_pre_encoded_mm"):
+        return
+
+    state = GenerateState(args)
+    first_mm = getattr(group[0], "multimodal_inputs", None)
+    if first_mm is None or not all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+        return
+
+    encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
+
+    pre_train_inputs = None
+    t_img = t_img_cpu = None
+    if (
+        getattr(args, "dedup_multimodal_preprocess", False)
+        and state.processor
+        and any(first_mm.get(k) for k in ("images", "videos", "audio"))
+    ):
+        pre_prompt_ids, mm_train_inputs, t_img, t_img_cpu = await _run_image_processor(
+            state, args, group[0].prompt, first_mm
+        )
+        pre_train_inputs = (pre_prompt_ids, mm_train_inputs)
+
+    for idx, sample in enumerate(group):
+        sample._pre_encoded_mm = encoded_mm
+        sample._pre_encoded_mm_elapsed = t_enc
+        if pre_train_inputs is not None:
+            sample._pre_encoded_image = pre_train_inputs
+            sample._pre_encoded_image_elapsed = t_img
+            if t_img_cpu is not None:
+                sample._pre_encoded_image_cpu_elapsed = t_img_cpu
+            # Anchor: only the first sample "owns" the real HF-processor call for
+            # this group; the rest reuse its output. Lets perf_detail metrics count
+            # actual processor invocations instead of len(group) copies of one value,
+            # so dedup-multimodal-preprocess on/off runs can be compared apples-to-apples.
+            sample._pre_encoded_image_is_real_call = idx == 0
+
+
+async def _prefetch_and_preprocess_next_step(
+    args: Namespace, data_buffer: Any, num_samples: int
+) -> tuple[list[list[Sample]], int]:
+    """Fetch the next step's raw samples and, when --dedup-multimodal-
+    preprocess is on, run the per-group dedup encoding for them too — both
+    scheduled on the persistent async-loop thread (see
+    async_utils.get_async_loop) so they run concurrently with the current
+    step's actor training instead of blocking the start of the next rollout
+    step.
+
+    Grouping (which samples share a prompt) is fixed the moment
+    data_buffer.get_samples returns — it depends only on dataset order/shuffle
+    and --n-samples-per-prompt, never on the previous step's training result —
+    so encoding here ahead of time is safe. Over-sampling surplus groups that
+    end up unused this step are carried back to the buffer for a later step
+    (see generate_rollout_async), not discarded, so eagerly encoding them isn't
+    wasted work even when they go unused immediately.
+
+    Returns the add-sequence watermark alongside the samples (see
+    RolloutDataSourceWithBuffer.get_samples_and_watermark) — this snapshot is
+    taken before this step's own partial/oversample groups exist, so the
+    caller must reconcile against it (via pop_recently_added) before actually
+    submitting these samples, rather than assuming the snapshot is still
+    current by then.
+    """
+    loop = asyncio.get_running_loop()
+    ref = data_buffer.get_samples_and_watermark.remote(num_samples)
+    samples, watermark = await loop.run_in_executor(None, ray.get, ref)
+    await asyncio.gather(*(_dedup_encode_group(args, group) for group in samples))
+    return samples, watermark
+
+
+async def _fire_prefetch(args: Namespace, data_buffer: Any, state: "GenerateState") -> None:
+    """Background waiter: submits the cross-step prefetch as soon as THIS
+    step's own dedup-encoding work is done, instead of waiting for the whole
+    step (generation + reward scoring + data transfer) to finish.
+
+    Rationale: within a group, dedup-encoding (CPU-bound, uses
+    state.encode_executor/processor_pool) always completes before that
+    group's generation requests are even sent (see generate_and_rm_group) —
+    the remaining, much longer part of the step is spent awaiting SGLang HTTP
+    responses, which doesn't hold the GIL. So the true CPU-idle window this
+    step offers starts right after its own dedup work finishes, not only
+    after the entire step completes. Firing here gives the next step's
+    prefetch the longest possible head start without contending with this
+    step's own encode_executor/processor_pool usage (which is already done
+    by the time this fires).
+
+    state.all_done_event is set from GenerateState.reset() (no pending
+    work) and re-armed per step by submit_generate_tasks/generate_and_rm_group
+    (see those for the counting protocol); it can only fire once per step
+    since reset() replaces it with a fresh Event.
+    """
+    await state.all_done_event.wait()
+    state.prefetched_samples_future = asyncio.run_coroutine_threadsafe(
+        _prefetch_and_preprocess_next_step(args, data_buffer, args.over_sampling_batch_size),
+        get_async_loop().loop,
+    )
+    logger.info("Pre-submitted data fetch(+preprocess) for next step (this step's own dedup work just finished)")
+
+
+def _mark_group_done(state: "GenerateState", evaluation: bool) -> None:
+    """Mirrors submit_generate_tasks' increment.
+
+    Only training-rollout submissions (evaluation=False) increment the counter,
+    so only those decrement it here. Must be called exactly once per group,
+    right when that group's dedup-relevant work settles (success, exception, or
+    the aborted early-return) — NOT after generation, or all_done_event would
+    only ever fire once the whole step is done, defeating the point of firing
+    the cross-step prefetch early (see _fire_prefetch).
+    """
+    if evaluation:
+        return
+    state.pending_dedup_groups -= 1
+    if state.pending_dedup_groups <= 0:
+        state.pending_dedup_groups = 0
+        state.all_done_event.set()
 
 
 async def generate_and_rm_group(
@@ -641,6 +857,7 @@ async def generate_and_rm_group(
 
     # eval requests should not be affected by abort state; only skip for training rollout
     if state.aborted and not evaluation:
+        _mark_group_done(state, evaluation)
         return group
 
     # Generate a unique session_id for each sample in the group
@@ -648,16 +865,13 @@ async def generate_and_rm_group(
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
-    # Group-level multimodal encoding de-duplication: when samples in the same
-    # group share the same multimodal_inputs object (e.g. after shallow-copy in
-    # data_source), encode once and attach the result to every sample so that
-    # generate() picks up the pre-encoded data instead of re-encoding per sample.
-    first_mm = getattr(group[0], "multimodal_inputs", None)
-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
-        encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
-        for sample in group:
-            sample._pre_encoded_mm = encoded_mm
-            sample._pre_encoded_mm_elapsed = t_enc
+    try:
+        await _dedup_encode_group(args, group)
+    finally:
+        # Marked here — right after the dedup phase settles — rather than at
+        # the end of the function, so it fires before the (much longer)
+        # generation phase below even starts, not after it finishes too.
+        _mark_group_done(state, evaluation)
 
     tasks = []
     for idx, sample in enumerate(group):
@@ -783,6 +997,51 @@ async def generate_rollout_async(
 
     state = GenerateState(args)
 
+    # Drain the previous step's deferred tail transfer (see the end of this
+    # function and pending_transfer_tasks in GenerateState.reset()) before this
+    # step does anything that depends on it. Not on the critical path in
+    # practice: those tasks have been running on the persistent async-loop
+    # thread since the previous step returned, through this step's own Ray
+    # dispatch and (in components/rollout.py's _async_run) the staleness-wait
+    # loop, so they are almost always already done by the time we get here.
+    # Awaiting (rather than dropping) also ensures a failed transfer still
+    # raises -- one step later than before, attributed to this step instead of
+    # the one that actually failed, which is the accepted trade-off for not
+    # gating step N+1's generation on step N's transfer tail.
+    if state.pending_transfer_tasks:
+        await asyncio.gather(*state.pending_transfer_tasks)
+        state.pending_transfer_tasks = []
+
+    # Cross-step prefetch: fire as soon as THIS step's own dedup-encoding work
+    # is done (see _fire_prefetch), not only after the whole
+    # step finishes. Same gating as before: skip for pure fully-async
+    # (continuous TransferQueue streaming has no per-step "gap" to speak of)
+    # and LoRA adapter mode (prefetched generation would almost always be
+    # aborted by the next step's pause_generation and pollute the rollout).
+    # --disable-early-prefetch opts back into the old end-of-step trigger (see
+    # generate_rollout below) for A/B benchmarking the timing change alone.
+    #
+    # The waiter task is NOT created here, even though this looks like the
+    # natural spot: state.all_done_event is left .set() by the PREVIOUS
+    # step's reset() (see GenerateState.reset) as a "no pending work" default,
+    # and doesn't get cleared until THIS step's own first submit_generate_tasks
+    # call runs (below). Between here and that first call there are several
+    # awaits (start_sglang_profile, the initial get_samples fetch) that could
+    # let a task created here run immediately, see the event still in its
+    # stale "set" state from last step, and fire the next step's prefetch
+    # before this step has submitted a single one of its own generate
+    # requests — stealing encode_executor/processor_pool capacity from this
+    # step's own dispatch and delaying it. Creating the task right after the
+    # first submit_generate_tasks call instead guarantees the event has
+    # already been cleared (synchronously, no await in between) by the time
+    # the task can possibly run.
+    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+    _pure_fully_async = args.fully_async and not args.hybrid
+    _should_fire_early_prefetch = (
+        not _pure_fully_async and not _lora_adapter_mode and not getattr(args, "disable_early_prefetch", False)
+    )
+    _early_prefetch_task_created = False
+
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
 
@@ -800,6 +1059,16 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
+
+    # Whether a step N+1 call is expected to follow this one. If not, there is no
+    # next step to hide the tail transfer behind, so it must be awaited before
+    # returning (see the deferred-transfer-tail block at the end of this
+    # function) instead of being handed off to a drain that will never run.
+    # fully_async keeps the old always-await behavior unconditionally: it
+    # already streams transfers continuously during generation (no per-step
+    # gap to speak of, same reasoning as the early-prefetch skip above), and
+    # its final call is is_final_backfill rather than num_rollout - 1.
+    _is_last_rollout_step = args.fully_async or rollout_id >= args.num_rollout - 1
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -866,17 +1135,42 @@ async def generate_rollout_async(
         while state.remaining_batch_size < submit_target:
             _t_get_samples = monotonic()
 
-            if state.prefetched_samples_ref is not None:
-                ref = state.prefetched_samples_ref
-                state.prefetched_samples_ref = None
-                logger.info(f"Rollout step {rollout_id}: using pre-fetched data from previous step")
+            if state.prefetched_samples_future is not None:
+                future = state.prefetched_samples_future
+                state.prefetched_samples_future = None
+                logger.info(f"Rollout step {rollout_id}: using pre-fetched(+preprocessed) data from previous step")
+                samples, watermark = await asyncio.wrap_future(future)
+                # The snapshot behind `samples` was taken before the previous step's own
+                # partial/oversample groups were written back (see
+                # _prefetch_and_preprocess_next_step's docstring) — reconcile against the
+                # buffer now, swapping an equal number of those (already-encoded, still
+                # perfectly usable) prefetched groups back out for whichever partial/
+                # oversample groups landed after the snapshot, so those groups don't sit an
+                # extra step waiting in the buffer just because they missed the snapshot.
+                swap_ref = data_source.pop_recently_added.remote(watermark, len(samples))
+                swapped_in = await loop.run_in_executor(None, ray.get, swap_ref)
+                if swapped_in:
+                    displaced = samples[-len(swapped_in) :]
+                    samples = samples[: -len(swapped_in)] + swapped_in
+                    data_source.return_samples.remote(displaced)
+                    logger.info(
+                        f"Rollout step {rollout_id}: reconciled {len(swapped_in)} partial/oversample "
+                        "group(s) into the pre-fetched batch"
+                    )
             else:
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
-
-            samples = await loop.run_in_executor(None, ray.get, ref)
+                samples = await loop.run_in_executor(None, ray.get, ref)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
+            # See the comment above this function's _should_fire_early_prefetch
+            # setup: only safe to create this task once this step's own first
+            # submit_generate_tasks call has synchronously cleared
+            # all_done_event, so the waiter can't observe a stale
+            # "set" state left over from the previous step's reset().
+            if _should_fire_early_prefetch and not _early_prefetch_task_created:
+                asyncio.create_task(_fire_prefetch(args, data_source, state))
+                _early_prefetch_task_created = True
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
         done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -1035,10 +1329,18 @@ async def generate_rollout_async(
                 f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
             )
 
-    logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
-    # Wait for all transfer tasks to complete
+    # Deferred transfer tail: on all but the last step, hand the still-running
+    # transfer_tasks off to the next step's drain (top of this function)
+    # instead of blocking this step's return on them, so step N+1's generate()
+    # call isn't gated behind step N's own scoring+transfer. The last step has
+    # no next-step drain to catch them, so it falls back to awaiting here.
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        if _is_last_rollout_step:
+            logger.info(f"Last rollout step. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
+            await asyncio.gather(*transfer_tasks)
+        else:
+            logger.info(f"Deferring {len(transfer_tasks)} transfer tasks to next step's drain.")
+            state.pending_transfer_tasks.extend(transfer_tasks)
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
@@ -1327,12 +1629,26 @@ def generate_rollout(
     output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
-    # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a
-    # prefetched generation is almost always aborted by the next step's pause_generation and its
-    # truncated samples would pollute the next rollout. Other modes keep the optimization.
-    _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
-    if not args.fully_async and not _lora_adapter_mode:
-        state = GenerateState(args)
-        state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
-        logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")
+    # Cross-step prefetch is fired from inside generate_rollout_async as soon as
+    # this step's own encoding work finishes (see
+    # _fire_prefetch), instead of unconditionally here after the
+    # whole step (generation + reward scoring + transfer) completes — that gave
+    # the prefetch a much shorter, often-zero head start under --max-staleness > 0,
+    # where the next step starts almost immediately after this one ends.
+    #
+    # --disable-early-prefetch opts back into that old end-of-step trigger, for
+    # A/B benchmarking the timing change alone (isolated from
+    # --dedup-multimodal-preprocess's own call-count-reduction effect).
+    if getattr(args, "disable_early_prefetch", False):
+        _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
+        _pure_fully_async = args.fully_async and not args.hybrid
+        if not _pure_fully_async and not _lora_adapter_mode:
+            state = GenerateState(args)
+            state.prefetched_samples_future = asyncio.run_coroutine_threadsafe(
+                _prefetch_and_preprocess_next_step(args, data_buffer, args.over_sampling_batch_size),
+                get_async_loop().loop,
+            )
+            logger.info(
+                f"Rollout step {rollout_id}: pre-submitted data fetch(+preprocess) for next step (late, end-of-step)"
+            )
     return output

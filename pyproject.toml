@@ -23,6 +23,7 @@ known-third-party = [
     "ray",
     "sglang",
     "torch",
+    "transfer_queue",
     "transformers",
     "trl"
 ]

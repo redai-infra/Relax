@@ -541,6 +541,20 @@ def get_batch(
                     multimodal_data[key] = torch.cat(tensor_list, dim=0)
                 multimodal_num_items[key] = [t.size(0) for t in tensor_list]
 
+        # Pin so the H2D copy in move_tensors_to_device (called once per microbatch in
+        # forward_step, right before this data feeds the model) can go non_blocking instead
+        # of forcing the GPU to wait on a synchronous pageable-memory copy of pixel tensors.
+        # Off by default (--pin-multimodal-h2d-copy); move_tensors_to_device's non_blocking=True
+        # is a silent no-op on unpinned tensors, so leaving this off reproduces the prior
+        # synchronous-copy behavior exactly.
+        if getattr(get_args(), "pin_multimodal_h2d_copy", False):
+            multimodal_data = {
+                key: tensor.pin_memory()
+                if isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
+                else tensor
+                for key, tensor in multimodal_data.items()
+            }
+
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
@@ -1218,13 +1232,17 @@ def move_tensors_to_device(data, device):
     """Recursively move tensors in a (nested) dict/list to the specified
     device.
 
-    Non-tensor values are left unchanged.
+    Non-tensor values are left unchanged. non_blocking is safe to set
+    unconditionally: it only takes effect for tensors already in pinned
+    memory (e.g. multimodal_train_inputs, see the pin_memory() call above)
+    and is a silent no-op (still a synchronous copy) for regular pageable
+    tensors such as tokens/loss_masks.
     """
     if isinstance(data, dict):
         return {k: move_tensors_to_device(v, device) for k, v in data.items()}
     elif isinstance(data, list):
         return [move_tensors_to_device(v, device) for v in data]
     elif isinstance(data, torch.Tensor):
-        return data.to(device)
+        return data.to(device, non_blocking=True)
     else:
         return data  # e.g., int, str, None, etc.

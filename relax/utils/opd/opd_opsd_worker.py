@@ -79,7 +79,7 @@ class OpsdWorker:
         teacher_prompt_for_tokenize = teacher_prompt if teacher_prompt is not None else sample.prompt
 
         if state.processor is not None and teacher_has_media:
-            teacher_prompt_ids, teacher_mm_train_inputs, _ = await _run_image_processor(
+            teacher_prompt_ids, teacher_mm_train_inputs, _, _ = await _run_image_processor(
                 state, args, teacher_prompt_for_tokenize, teacher_mm
             )
             if teacher_mm_train_inputs:

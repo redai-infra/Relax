@@ -303,6 +303,12 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
     def __init__(self, args):
         super().__init__(args)
         self.buffer = []
+        # Bumped once per add_samples() call; each added group is tagged with the
+        # resulting value (see add_samples). Lets a cross-step prefetch that
+        # snapshotted this counter via get_samples_and_watermark() later tell,
+        # via pop_recently_added(), which buffer entries were added *after* its
+        # snapshot — see that method's docstring for why this matters.
+        self._buffer_add_seq = 0
         if self.args.buffer_filter_path is None:
             self.buffer_filter = pop_first
         else:
@@ -320,6 +326,13 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         samples += super().get_samples(num_samples=num_samples)
         return samples
 
+    def get_samples_and_watermark(self, num_samples: int) -> tuple[list[list[Sample]], int]:
+        """Same as get_samples, plus the add-sequence watermark at the moment
+        of the call, for a later pop_recently_added() call to reconcile against
+        (see that method)."""
+        watermark = self._buffer_add_seq
+        return self.get_samples(num_samples), watermark
+
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:
         if len(self.buffer) == 0 or num_samples == 0:
             return []
@@ -333,12 +346,56 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             return
         assert isinstance(samples, list), f"samples must be a list, got {type(samples)}"
         assert isinstance(samples[0], list), f"the elements of samples must be list, got {type(samples[0])}"
+        self._buffer_add_seq += 1
         for i in range(0, len(samples)):
             assert len(samples[i]) == self.args.n_samples_per_prompt, (
                 f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             )
             group = samples[i]  # type: ignore
+            group[0]._buffer_add_seq = self._buffer_add_seq
             self.buffer.append(group)
+
+    def pop_recently_added(self, watermark: int, max_count: int) -> list[list[Sample]]:
+        """Pop up to max_count groups added via add_samples() strictly after
+        `watermark` (a value previously returned by get_samples_and_watermark).
+
+        Exists for the cross-step rollout prefetch: it snapshots a batch (and,
+        under --dedup-multimodal-preprocess, pre-encodes it) well before this
+        step's own partial/oversample groups are collected and written back
+        via add_samples() — so that snapshot can never contain them. Once
+        those groups do land, the caller uses this method to swap an equal
+        number of the (still perfectly usable, already-encoded) prefetched
+        groups back out via return_samples(), instead of leaving the new
+        groups to wait a full extra step in the buffer.
+
+        Returns [] (cheaply, without scanning) once watermark has caught up
+        to the current counter, i.e. nothing has been added since the
+        snapshot.
+        """
+        if max_count <= 0 or watermark >= self._buffer_add_seq:
+            return []
+        picked = []
+        remaining = []
+        for group in self.buffer:
+            if len(picked) < max_count and getattr(group[0], "_buffer_add_seq", 0) > watermark:
+                picked.append(group)
+            else:
+                remaining.append(group)
+        self.buffer = remaining
+        return picked
+
+    def return_samples(self, samples: list[list[Sample]]):
+        """Put groups displaced by a pop_recently_added() swap back into the
+        buffer, without bumping _buffer_add_seq — so they aren't mistaken for
+        newly produced partial/oversample groups by a later
+        pop_recently_added() call.
+
+        Use add_samples() instead for groups that actually are newly produced
+        partial/oversample output.
+        """
+        if not samples:
+            return
+        self.buffer.extend(samples)
 
     # TODO remove
     def update_metadata(self, metadata: dict):

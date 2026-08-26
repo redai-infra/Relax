@@ -17,7 +17,7 @@ import asyncio
 import logging
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
@@ -83,6 +83,7 @@ class DeviceDirectBackend(CommBackend):
         coordinator_url=None,
         lock: Any = None,
         timeout_seconds: int = 300,
+        weights_getter: Optional[Callable[[], Mapping[str, torch.Tensor]]] = None,
     ) -> None:
         """Initialize DeviceDirectBackend.
 
@@ -96,6 +97,11 @@ class DeviceDirectBackend(CommBackend):
             coordinator_url: URL of the coordinator service
             lock: Remote lock for coordinating weight updates
             timeout_seconds: Operation timeout (default 300)
+            weights_getter: Optional override for the weight source used by
+                ``update_weights_for_rollout``. Defaults to reading the live
+                model directly via ``named_params_and_buffers``; callers that
+                need to push a decoupled snapshot (e.g. hybrid mode's
+                TensorBackuper tag) pass this instead.
         """
         super().__init__(backend_type, role_info)
         self.args = args
@@ -107,6 +113,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
+        self._weights_getter = weights_getter
         self.device = next(model[0].parameters()).device if model else device_utils.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
@@ -149,6 +156,53 @@ class DeviceDirectBackend(CommBackend):
         self._lora_sync = LoraAdapterSync(args, model) if self._lora_adapter_mode else None
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
+
+    def _named_params_and_buffers(
+        self, name_filter: Callable[[str], bool] | None = None
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Weight source for ``update_weights_for_rollout``.
+
+        Defaults to reading the live model directly; ``weights_getter``
+        overrides this with a decoupled snapshot (e.g. hybrid mode's
+        TensorBackuper tag) when the caller cannot safely read live params at
+        push time. That snapshot is host-pinned by default (or already device-
+        resident when the backuper was populated with ``on_device=True``, e.g.
+        via ``--hybrid-weights-backuper-on-gpu``); all_gather_param and the
+        NCCL/GLOO broadcast below require device tensors either way, so the
+        host case is coerced here (mirrors UpdateWeightFromTensor's equivalent
+        H2D copy for its CUDA-IPC push) — the device-resident case just skips
+        this branch. ``tensor.to(device)`` returns a brand-new Tensor object,
+        which drops the tensor_model_parallel/partition_dim/etc. attributes
+        TensorBackuper attached to the snapshot — copy them onto the device
+        copy too, same as Megatron's own copy_tensor_model_parallel_attributes
+        does after any such reallocation.
+
+        Yields lazily and applies ``name_filter`` (when given) before the
+        H2D copy above, so a caller that only wants the non-expert (or only
+        the expert) subset never pays to move the other half of a CPU
+        snapshot onto the device just to discard it — update_weights_for_rollout
+        calls this once per subset, and materializing the whole snapshot on
+        device for a call that only keeps half of it would transiently double
+        the GPU memory the push needs.
+        """
+        if self._weights_getter is not None:
+            from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+            for name, tensor in self._weights_getter().items():
+                if name_filter is not None and not name_filter(name):
+                    continue
+                if tensor.device != self.device:
+                    moved = tensor.to(self.device)
+                    copy_tensor_model_parallel_attributes(moved, tensor)
+                    if hasattr(tensor, "parallel_mode"):
+                        moved.parallel_mode = tensor.parallel_mode
+                    tensor = moved
+                yield name, tensor
+            return
+        for name, tensor in named_params_and_buffers(self.args, self.model):
+            if name_filter is not None and not name_filter(name):
+                continue
+            yield name, tensor
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -594,9 +648,7 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." in name:
-                continue
+        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." not in n):
             buffer_size = self._update_weight_from_distributed(
                 name,
                 param,
@@ -619,9 +671,7 @@ class DeviceDirectBackend(CommBackend):
 
         buffer_size = 0
         named_tensors = []
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." not in name:
-                continue
+        for name, param in self._named_params_and_buffers(name_filter=lambda n: ".experts." in n):
             buffer_size = self._update_expert_weight_from_distributed(
                 name, param, named_tensors, buffer_size, rollout_only, actor_fwd_only, pbar=pbar
             )

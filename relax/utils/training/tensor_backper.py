@@ -12,6 +12,26 @@ _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 _PIN_MEMORY = device_utils.use_pinned_host_memory()
 
+# Megatron attaches these as plain Python attributes on live nn.Parameter
+# objects (not part of the tensor's storage), so torch.empty_like() alone
+# drops them. Consumers that TP-gather from a backed-up snapshot instead of
+# the live model (e.g. DCS's all_gather_param) need them preserved.
+_MEGATRON_TP_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride", "parallel_mode")
+
+
+def _attach_tp_attrs(snapshot: torch.Tensor, param: torch.Tensor, backfill_defaults) -> None:
+    for attr in _MEGATRON_TP_ATTRS:
+        if hasattr(param, attr):
+            setattr(snapshot, attr, getattr(param, attr))
+    # Some params (e.g. this model's word_embeddings under bridge mode) aren't
+    # explicitly marked at model-construction time and only get backfilled
+    # with Megatron's own "not parallel" defaults later (see
+    # set_defaults_if_not_set_tensor_model_parallel_attributes callers) —
+    # apply the same backfill here so downstream TP-gather (e.g. DCS's
+    # all_gather_param) can rely on the attributes always being present, same
+    # contract Megatron itself guarantees for the live model.
+    backfill_defaults(snapshot)
+
 
 class TensorBackuper(ABC):
     @staticmethod
@@ -34,7 +54,7 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def backup(self, tag: str):
+    def backup(self, tag: str, *, on_device: bool = False):
         raise NotImplementedError
 
     def copy(self, *, src_tag: str, dst_tag: str):
@@ -58,11 +78,47 @@ class _TensorBackuperNormal(TensorBackuper):
         return self._backups[tag]
 
     @torch.no_grad()
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
+        """Snapshot the source tensors into ``tag``.
+
+        By default the snapshot lives on host-pinned memory. Passing
+        ``on_device=True`` keeps it on the source tensor's own device instead
+        (a D2D copy, avoiding the D2H/H2D PCIe round trip), at the cost of
+        holding a full extra device-resident copy of every tensor in ``tag``
+        for as long as the tag exists.
+        """
+        from megatron.core.tensor_parallel import set_defaults_if_not_set_tensor_model_parallel_attributes
+
         backup_dict = self._backups[tag]
+        missing = [(name, param) for name, param in self._source_getter() if name not in backup_dict]
+        if on_device and missing:
+            # One cudaMalloc per parameter (hundreds for a real model) leaves the
+            # CUDA caching allocator holding hundreds of small, permanently
+            # non-reusable segments, fragmenting the segment table that later
+            # dynamic-batch forward passes search when allocating activations.
+            # Allocate one contiguous buffer per dtype instead, and give every
+            # parameter a shape/stride view into it; each view is still a
+            # distinct Tensor object so it can carry its own TP attributes.
+            by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = defaultdict(list)
+            for name, param in missing:
+                by_dtype[param.dtype].append((name, param))
+            for dtype, entries in by_dtype.items():
+                device = entries[0][1].device
+                flat_buffer = torch.empty(sum(p.numel() for _, p in entries), dtype=dtype, device=device)
+                offset = 0
+                for name, param in entries:
+                    numel = param.numel()
+                    snapshot = flat_buffer[offset : offset + numel].view(param.shape)
+                    offset += numel
+                    _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
+                    backup_dict[name] = snapshot
+        else:
+            for name, param in missing:
+                snapshot = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
+                _attach_tp_attrs(snapshot, param, set_defaults_if_not_set_tensor_model_parallel_attributes)
+                backup_dict[name] = snapshot
+
         for name, param in self._source_getter():
-            if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=_PIN_MEMORY)
             backup_dict[name].copy_(param.detach(), non_blocking=_NON_BLOCKING)
         device_utils.synchronize()
 
@@ -97,7 +153,7 @@ class _TensorBackuperNoop(TensorBackuper):
         assert _compute_hash_dict(ans) == self._backup_hash_dict
         return ans
 
-    def backup(self, tag: str) -> None:
+    def backup(self, tag: str, *, on_device: bool = False) -> None:
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
         device_utils.synchronize()

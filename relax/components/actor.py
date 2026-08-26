@@ -109,8 +109,14 @@ class Actor(Base):
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
 
-        # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
-        # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
+        # Call update_weights when weight_updater exists: sync colocate mode, or
+        # hybrid mode with --hybrid-weight-sync-backend=cuda_ipc (the default —
+        # hybrid otherwise forces fully_async=True). With backend=dcs, hybrid has
+        # no weight_updater (it's replaced by the DCS checkpoint_engine_client),
+        # so push through that client instead — without this, a resumed actor's
+        # checkpoint weights never reach SGLang until the first real train step,
+        # and rollout_id 0 silently generates against --hf-checkpoint's stale
+        # weights in the meantime.
         # SFT: skip the init-time weight sync. SFT only sync weights to SGLang
         # right before periodic predict (gated in `train_actor`); between
         # predicts SGLang stays fully offloaded. Sync-at-init would leave
@@ -118,8 +124,13 @@ class Actor(Base):
         # the first predict-step `onload_weights` to crash on a non-idempotent
         # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
         # fires on the first real `update_weights` instead.
-        if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
-            self.actor_model.update_weights()
+        hybrid_uses_cuda_ipc = self.config.hybrid and self.config.hybrid_weight_sync_backend == "cuda_ipc"
+        hybrid_uses_dcs = self.config.hybrid and self.config.hybrid_weight_sync_backend == "dcs"
+        if not is_sft_mode(self.config):
+            if not self.config.fully_async or hybrid_uses_cuda_ipc:
+                self.actor_model.update_weights()
+            elif hybrid_uses_dcs:
+                self.actor_model.update_weights_fully_async(0, rollout_only=True, actor_fwd_only=False)
 
     def set_barriers(
         self,

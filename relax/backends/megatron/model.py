@@ -29,7 +29,7 @@ from megatron.training.training import get_model
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
-from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.data.stream_dataloader import StreamingIteratorBase
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
@@ -1145,7 +1145,7 @@ def train_one_step(
         getattr(args, "use_dynamic_batch_size", False)
         and getattr(args, "fully_async", False)
         and mpu.get_virtual_pipeline_model_parallel_world_size() is None
-        and isinstance(data_iterator[0], StreamingTQIterator)
+        and isinstance(data_iterator[0], StreamingIteratorBase)
     )
     if use_streaming:
         pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -1379,7 +1379,7 @@ def train(
 
     num_steps_per_rollout = len(num_microbatches)
     use_step_iterators = (
-        not is_data_iterator and len(data_iterator) > 1 and isinstance(data_iterator[0], StreamingTQIterator)
+        not is_data_iterator and len(data_iterator) > 1 and isinstance(data_iterator[0], StreamingIteratorBase)
     )
     if use_step_iterators and len(data_iterator) != num_steps_per_rollout:
         raise ValueError(
