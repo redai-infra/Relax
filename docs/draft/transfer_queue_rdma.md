@@ -57,10 +57,11 @@ export RELAX_TQ_GLOBAL_SEGMENT_SIZE_GB=8
 
 ## Correctness 与依赖 gate
 
-当前 Relax pin 为 TransferQueue `58054a33834aadbcf76aacd6b1e32e25c030f2c9`。现有检查只能确认 retry API 和部分源码顺序，不能证明完整 fail-closed 语义。启用 Mooncake/RDMA 前，上游 TransferQueue PR 必须提供并固定到明确版本或 capability marker，至少保证：
+当前 Relax pin 为 TransferQueue `6c7a587292910af0827f027de99e005e1900310e`，并要求 `MOONCAKE_CORRECTNESS_CONTRACT_VERSION >= 1`。Contract version 1 保证：
 
-- `batch_upsert_from` 和 `batch_get_into` 的每次 retry 都校验返回结果与请求 key 等长；
-- `NOTIFY_DATA_UPDATE_ACK` 必须验证 positive ACK，controller 拒绝时 producer 不能按成功结束。
+- `batch_upsert_from` 和 `batch_get_into` 的每次 batch/retry 都校验返回结果与请求 key 等长；
+- `batch_remove` 的非幂等失败向调用方传播；
+- `NOTIFY_DATA_UPDATE_ACK` 验证 positive ACK，controller 拒绝时 producer 不会按成功结束。
 
 这些修复应在 TransferQueue 上游实现；Relax 不使用 monkey patch 替代依赖修复。
 

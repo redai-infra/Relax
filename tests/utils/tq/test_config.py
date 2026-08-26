@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
+import sys
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -26,16 +27,6 @@ from relax.utils.tq.config import (
 
 
 _MASTER = "master.example:50051"
-
-
-def _has_real_tq_storage() -> bool:
-    try:
-        return importlib.util.find_spec("transfer_queue.storage.clients.mooncake_client") is not None
-    except (ImportError, TypeError, ValueError):
-        return False
-
-
-_REAL_TQ_STORAGE = _has_real_tq_storage()
 
 
 def _args(**overrides: Any) -> argparse.Namespace:
@@ -143,8 +134,13 @@ def test_mooncake_builder_rejects_invalid_direct_inputs(kwargs: dict[str, Any], 
 
 
 @pytest.mark.parametrize("override", [None, "0"], ids=["default", "explicit-disable"])
-@pytest.mark.skipif(not _REAL_TQ_STORAGE, reason="requires real TransferQueue storage submodules")
-def test_runtime_contract_accepts_safe_memcpy(monkeypatch: pytest.MonkeyPatch, override: str | None) -> None:
+@pytest.mark.parametrize("contract_version", [1, 2], ids=["required", "forward-compatible"])
+def test_runtime_contract_accepts_safe_memcpy(
+    monkeypatch: pytest.MonkeyPatch, override: str | None, contract_version: int
+) -> None:
+    tq_stub = ModuleType("transfer_queue")
+    tq_stub.MOONCAKE_CORRECTNESS_CONTRACT_VERSION = contract_version
+    monkeypatch.setitem(sys.modules, "transfer_queue", tq_stub)
     if override is None:
         monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
     else:
@@ -167,12 +163,16 @@ def test_runtime_contract_rejects_unsafe_memcpy_without_echo(
         assert private_marker not in str(excinfo.value)
 
 
-@pytest.mark.skipif(not _REAL_TQ_STORAGE, reason="requires real TransferQueue storage submodules")
-def test_runtime_contract_fails_closed_when_source_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    from relax.utils.tq import config as config_module
-
-    monkeypatch.setattr(config_module.inspect, "getsource", lambda _obj: (_ for _ in ()).throw(OSError()))
-    with pytest.raises(RuntimeError, match="Cannot verify TransferQueue put/notify ordering"):
+@pytest.mark.parametrize("contract_version", [None, 0, "1", True], ids=["missing", "old", "string", "bool"])
+def test_runtime_contract_rejects_missing_or_invalid_marker(
+    monkeypatch: pytest.MonkeyPatch, contract_version: int | str | bool | None
+) -> None:
+    monkeypatch.setenv("MC_STORE_MEMCPY", "0")
+    tq_stub = ModuleType("transfer_queue")
+    if contract_version is not None:
+        tq_stub.MOONCAKE_CORRECTNESS_CONTRACT_VERSION = contract_version
+    monkeypatch.setitem(sys.modules, "transfer_queue", tq_stub)
+    with pytest.raises(RuntimeError, match="required Mooncake correctness contract"):
         validate_mooncake_runtime_contract()
 
 

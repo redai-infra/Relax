@@ -21,7 +21,7 @@ except ImportError as e:
     raise ImportError(
         "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
         '    pip install "transferqueue @ git+https://github.com/redai-infra/'
-        'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
+        'TransferQueue.git@6c7a587292910af0827f027de99e005e1900310e" --no-deps\n'
         "or use the latest image."
     ) from e
 

@@ -15,7 +15,6 @@ internal defaults or the deployment environment, per maintainer guidance.
 
 from __future__ import annotations
 
-import inspect
 import math
 import os
 from typing import Any
@@ -146,28 +145,11 @@ def resolve_global_segment_size() -> int:
 def validate_mooncake_runtime_contract() -> None:
     """Validate the Relax-side portion of the Mooncake safety contract.
 
-    The environment guard and available read-only capability checks run before
-    every Mooncake client is created or attached.  Retry result-length and
-    positive-ACK correctness must be supplied by the pinned upstream
-    TransferQueue revision; this function does not monkey-patch that package.
+    The environment guard and versioned correctness-contract check run before
+    every Mooncake client is created or attached. This function does not
+    monkey-patch TransferQueue.
     """
     ensure_mooncake_correctness_guards()
-
-    from transfer_queue.storage.managers.base import KVStorageManager
-
-    try:
-        put_source = inspect.getsource(KVStorageManager.put_data)
-    except (OSError, TypeError):
-        # No retrievable source (compiled/stripped install): the ordering
-        # contract cannot be proven, so fail like any other unmet gate instead
-        # of escaping this RuntimeError-only boundary.
-        raise RuntimeError("Cannot verify TransferQueue put/notify ordering because source is unavailable") from None
-    storage_call = put_source.find("self.storage_client.put")
-    ready_notify = put_source.find("self.notify_data_update")
-    if storage_call < 0 or ready_notify < 0 or storage_call > ready_notify:
-        raise RuntimeError(
-            "Installed TransferQueue does not guarantee storage success before production-status notification"
-        )
 
 
 # ---------------------------------------------------------------------------

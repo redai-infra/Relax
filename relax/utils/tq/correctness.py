@@ -3,10 +3,9 @@
 """Mooncake safety guards and raw-byte payload correctness helpers.
 
 Relax validates the capabilities and environment it can inspect without
-modifying TransferQueue at runtime.  Per-retry result-length validation and a
-strict production-status ACK must be fixed in upstream TransferQueue and then
-consumed through an updated, capability-marked pin; method-name checks alone do
-not prove those semantics.
+modifying TransferQueue at runtime.  The pinned TransferQueue advertises a
+versioned correctness contract for batch/retry result counts, remove failure
+propagation, and fail-closed production-status ACKs.
 
 Mooncake 0.3.10.post2 was observed corrupting TCP-protocol transfers through
 its auto-enabled memcpy fast path, so that path is force-disabled here and an
@@ -23,6 +22,7 @@ from typing import Any
 
 
 LeafDigest = tuple[str, str, str]
+_REQUIRED_TQ_MOONCAKE_CONTRACT_VERSION = 1
 
 
 def _enforce_safe_memcpy() -> None:
@@ -54,19 +54,20 @@ def ensure_mooncake_correctness_guards() -> None:
     """Validate that the installed stack can run MooncakeStore safely.
 
     Enforces the memcpy environment contract and checks that the pinned
-    TransferQueue ships the Mooncake retry APIs Relax's data plane relies on.
-    It does not modify TransferQueue code or objects at runtime.
+    TransferQueue advertises the Mooncake correctness contract Relax's data
+    plane relies on. It does not modify TransferQueue at runtime.
     """
     _enforce_safe_memcpy()
     try:
-        from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
+        import transfer_queue as tq
     except ImportError as error:
-        raise RuntimeError("Installed TransferQueue has no MooncakeStore support") from error
+        raise RuntimeError(
+            "Installed TransferQueue does not satisfy the required Mooncake correctness contract"
+        ) from error
 
-    required_methods = ("_batch_upsert_with_retry", "_batch_get_into_with_retry")
-    missing = [name for name in required_methods if not callable(getattr(MooncakeStoreClient, name, None))]
-    if missing:
-        raise RuntimeError("Installed TransferQueue lacks required Mooncake retry APIs: " + ", ".join(missing))
+    actual = getattr(tq, "MOONCAKE_CORRECTNESS_CONTRACT_VERSION", 0)
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual < _REQUIRED_TQ_MOONCAKE_CONTRACT_VERSION:
+        raise RuntimeError("Installed TransferQueue does not satisfy the required Mooncake correctness contract")
 
 
 def _tensor_digest(value: Any) -> LeafDigest:
