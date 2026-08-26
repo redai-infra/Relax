@@ -178,6 +178,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
+    args.eval_prompt_data = "/fake/eval.jsonl"
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -194,7 +195,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     with pytest.raises(RuntimeError, match="source produced 0 valid samples"):
-        await sft._maybe_produce_eval()
+        await sft._maybe_produce_eval(completed_steps=1)
 
     fake_client.async_put.assert_not_awaited()
 
