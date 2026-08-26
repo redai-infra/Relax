@@ -69,10 +69,13 @@ def _post_train_eval_expected(args, rollout_id: int, data_source) -> bool:
     if not getattr(args, "rollout_global_dataset", False):
         return False
 
-    import ray
+    if hasattr(args, "num_rollout_per_epoch"):
+        num_rollout_per_epoch = args.num_rollout_per_epoch
+    else:
+        import ray
 
-    num_rollout_per_epoch = ray.get(data_source.lengths.remote()) // args.rollout_batch_size
-    return step % num_rollout_per_epoch == 0
+        num_rollout_per_epoch = ray.get(data_source.lengths.remote()) // args.rollout_batch_size
+    return num_rollout_per_epoch is not None and num_rollout_per_epoch > 0 and step % num_rollout_per_epoch == 0
 
 
 def _resident_async_loop_main(loop: asyncio.AbstractEventLoop) -> None:
