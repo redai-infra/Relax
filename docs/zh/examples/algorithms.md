@@ -2,7 +2,7 @@
 
 Relax 支持多种策略梯度算法，均通过 `--advantage-estimator` 参数选择。本文档覆盖 PPO 与主要 GRPO-family 算法（OPD 在线策略蒸馏请参阅[单独文档](./on-policy-distillation.md)）。
 
-GRPO、RLOO、CISPO、GSPO 与 SAPO 使用相同的 Actor/Rollout 服务拓扑；其中 RLOO 仅支持同步模式，并要求固定批量不变量。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
+GRPO、Dr.GRPO、RLOO、CISPO、GSPO 与 SAPO 使用相同的 Actor/Rollout 服务拓扑；其中 RLOO 仅支持同步模式，并要求固定批量不变量。PPO 还需要 Critic 模型与 Advantages 服务，因此应从 [PPO 训练配置](../guide/ppo-training.md)开始，而不是只替换 `GRPO_ARGS`。
 
 REINFORCE++ 与 REINFORCE++-baseline 同样复用 GRPO 服务拓扑，但 return、全局归一化和 KL 契约由算法单独定义。启用任一 estimator 前，请先阅读 [REINFORCE++ 训练文档](../guide/reinforce-plus-plus.md)。
 
@@ -111,6 +111,50 @@ bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
 ```
 
 设置 `ADVANTAGE_ESTIMATOR=grpo` 可在相同 recipe 与 seed 下运行对照臂。该 recipe 会把清洗后的 GSM8K 写入可写的 artifact cache（可用 `RLOO_DATA_CACHE_DIR` 覆盖），并在问题后追加最终答案须使用 `\boxed{...}` 的指令，以匹配 `math` reward parser 的输入契约。
+
+---
+
+## Dr.GRPO
+
+Dr.GRPO（Group Relative Policy Optimization Done Right）从 GRPO 中移除了 response length normalization 和组内 reward 标准差归一化。Relax 使用组内中心化 reward，并用固定预算 `N * B` 对 Actor token-loss sum 进行 reduction，其中 `N` 是 optimizer window 的全局 response 数，`B` 是 `--rollout-max-response-len`。
+
+当前实现采用 fail-closed 边界，仅支持 dense 模型与 `--loss-type policy_loss`；MoE 模型、SFT 和 custom loss 会在参数校验阶段被拒绝。
+
+参考论文：[Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783)。
+
+### 算法原理
+
+$$
+A_i = r_i - \frac{1}{G}\sum_{j=1}^{G} r_j,
+\qquad
+\mathcal{L}_{\mathrm{Dr.GRPO}} = \frac{S_{\mathrm{actor}}}{N B}
+$$
+
+Relax 通过给组合后的 Actor loss 乘以 $T/(N B)$，再复用 Megatron 对 CP 兼容的 $1/T$ normalization，实现固定分母。
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--advantage-estimator dr_grpo` | — | 启用 Dr.GRPO |
+| `--loss-type policy_loss` | `policy_loss` | 必须使用；其他 loss type 会被拒绝 |
+| `--num-experts` | `None` | 必须保持未设置；当前不支持 MoE |
+| `--rollout-max-response-len` | `None` | 固定 response budget `B`，必须设置 |
+| `--normalize-advantages` | 关闭 | 会被拒绝；它与 Dr.GRPO 去掉 advantage 方差归一化的设计矛盾 |
+| `--calculate-per-token-loss` | 关闭 | Dr.GRPO 会自动启用，CP 场景下也强制要求 |
+
+### 快速开始
+
+```bash
+DR_GRPO_ARGS=(
+   --advantage-estimator dr_grpo
+   --rollout-max-response-len 8192
+   --eps-clip 0.2
+   --eps-clip-high 0.28
+)
+```
+
+实现细节、CP 行为、使用方法和故障排除详见 [Dr.GRPO 训练](../guide/dr-grpo-training.md)。
 
 ---
 
@@ -282,6 +326,7 @@ SAPO_ARGS=(
 | **GRPO** | 组相对奖励 | PPO-Clip（硬裁剪） | 可选 KL loss |
 | **REINFORCE++** | Token KL-to-go return + 全局 token 归一化 | PPO-Clip（硬裁剪） | shaped reward 中的 k1 KL |
 | **REINFORCE++-baseline** | Inclusive group mean + 全局 token 归一化 | PPO-Clip（硬裁剪） | 独立 k2 KL loss |
+| **Dr.GRPO** | 不除组内 std 的中心化 reward | 使用固定 `N * B` 分母的 PPO-Clip | 可选 explicit KL loss |
 | **CISPO** | 组相对奖励 | Stop-gradient 系数 | 推荐 KL loss |
 | **GSPO** | 组相对奖励 | PPO-Clip + 序列级 KL | 序列级 ratio |
 | **SAPO** | 组相对奖励 | Sigmoid 门控 | 温度控制 |
@@ -289,6 +334,7 @@ SAPO_ARGS=(
 
 ## 下一步
 
+- [Dr.GRPO 训练](../guide/dr-grpo-training.md)
 - [PPO 训练](../guide/ppo-training.md)
 - [REINFORCE++ 训练](../guide/reinforce-plus-plus.md)
 - [快速开始](../guide/quick-start.md)

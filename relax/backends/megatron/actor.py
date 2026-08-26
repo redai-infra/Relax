@@ -83,6 +83,7 @@ from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    bind_optimizer_window_metadata,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     get_data_iterator,
@@ -91,7 +92,12 @@ from .data import (
     log_rollout_data,
 )
 from .initialize import init, is_megatron_main_rank
-from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from .loss import (
+    compute_advantages_and_returns,
+    get_log_probs_and_entropy,
+    get_values,
+    prepare_policy_optimizer_window_metadata,
+)
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
@@ -885,6 +891,15 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
+            bind_optimizer_window_metadata(
+                data_iterator,
+                num_microbatches,
+                prepare_policy_optimizer_window_metadata(
+                    self.args,
+                    rollout_data,
+                    rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY],
+                ),
+            )
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
@@ -1356,6 +1371,15 @@ class MegatronTrainRayActor(TrainRayActor):
 
             # ── Phase 3: Train on the full merged batch ──
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            bind_optimizer_window_metadata(
+                data_iterator,
+                num_microbatches,
+                prepare_policy_optimizer_window_metadata(
+                    self.args,
+                    rollout_data,
+                    rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY],
+                ),
+            )
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):

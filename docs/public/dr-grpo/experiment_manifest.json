@@ -1,0 +1,145 @@
+{
+  "schema_version": 3,
+  "status": "published",
+  "experiment": "Qwen3.5-4B GSM8K paired GRPO vs Dr.GRPO",
+  "budget": {
+    "declared_optimizer_steps_per_run": 200,
+    "executed_optimizer_steps": {
+      "grpo": 200,
+      "dr_grpo": 200
+    },
+    "reported_range": "optimizer step 0..199",
+    "post_hoc_truncation": false,
+    "responses_per_run": 3200
+  },
+  "source": {
+    "execution_base_commit": "62022e01ce4cbe48b4720bcf20335af2415e41ec",
+    "execution_tracked_patch_sha256": "e0f560236024420b51e03124b03b7041c9c0936f5d431de81c4fc770191b1f03",
+    "execution_worktree_archive_sha256": "30ab4f7524e378bba6350d0b67641090485c5b904fc375eb8e51ba726fb876e7",
+    "reproduction_commit": "96693f0f89fcbe56487184627398c2bb00f1dd3e",
+    "note": "The formal jobs used the recorded base, exact tracked patch, and execution-time untracked tools. The published sanitized source snapshot reconstructs that checkout without unrelated local worktree files.",
+    "reproduction_equivalence": "Production training files, the paired recipe, dataset converter, backend tests, and argument tests are byte-identical to the reproduction commit; execution-time and final post-processing tools are published separately with distinct hashes."
+  },
+  "environment": {
+    "hardware": "4 x NVIDIA H20",
+    "image": "ghcr.io/redai-infra/relaxrl@sha256:d6ee9f015f1a92987931ed5f7229e6cfb6f089bba9fa8e6bc1ea289c2503a7af",
+    "image_id": "sha256:64bb6b4e8bdb38bf5812dc0beb8e0e9a7474cb5ad7172e395fc2a216be9c03d2",
+    "python": "3.12.3",
+    "torch": "2.11.0+cu129",
+    "cuda": "12.9",
+    "nccl": "2.28.9",
+    "ray": "2.57.0",
+    "sglang": "0.5.15.post1",
+    "transformers": "5.12.1",
+    "transformer_engine": "2.14.1"
+  },
+  "model": {
+    "repo": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "precision": "BF16",
+    "update": "full parameter update"
+  },
+  "dataset": {
+    "source_repo": "openai/gsm8k",
+    "source_revision": "740312add88f781978c0658806c59bc2815b9866",
+    "config": "main",
+    "split": "train",
+    "source_file": "main/train-00000-of-00001.parquet",
+    "source_rows": 7473,
+    "source_sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+    "shuffle_seed": 42,
+    "output_rows": 256,
+    "output_sha256": "8f8580875e50e5da2828ad586f97ee20e55f3ac1dfd7a6f019103ddad1a0f9d1",
+    "converter": "scripts/testing/convert_gsm8k_for_dr_grpo_e2e.py"
+  },
+  "parallelism": {
+    "tensor_model_parallel_size": 2,
+    "pipeline_model_parallel_size": 1,
+    "context_parallel_size": 1,
+    "data_parallel_size": 2
+  },
+  "training": {
+    "global_batch_size": 16,
+    "rollout_batch_size": 4,
+    "n_samples_per_prompt": 4,
+    "rollout_max_response_len": 4096,
+    "optimizer": "adam",
+    "lr": "1e-6",
+    "lr_decay_style": "constant",
+    "weight_decay": 0.1,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.98,
+    "eps_clip": 0.2,
+    "eps_clip_high": 0.28,
+    "kl_coef": 0.0,
+    "use_kl_loss": true,
+    "kl_loss_coef": 0.0,
+    "entropy_coef": 0.0
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20
+  },
+  "seeds": {
+    "train": 1234,
+    "rollout": 42,
+    "dataset_shuffle": 42
+  },
+  "accepted_runs": {
+    "grpo": {
+      "ray_job_id": "raysubmit_vDTubmtM8eQTGNZV",
+      "status": "succeeded",
+      "submitted": "2026-08-25T14:23:47+08:00",
+      "completed": "2026-08-25T16:19:52+08:00",
+      "rollout_files": 200,
+      "per_rank_train_dumps": 800,
+      "accuracy": 0.915625,
+      "exact_loss_mask_tokens": 3930695
+    },
+    "dr_grpo": {
+      "ray_job_id": "raysubmit_KVkiXL6tGMyyjUeq",
+      "status": "succeeded",
+      "submitted": "2026-08-25T18:46:39+08:00",
+      "completed": "2026-08-25T21:31:05+08:00",
+      "rollout_files": 200,
+      "per_rank_train_dumps": 800,
+      "accuracy": 0.92875,
+      "exact_loss_mask_tokens": 3275766
+    }
+  },
+  "metric_semantics": {
+    "summary_window": "all means optimizer steps 0..199; last20 means steps 180..199",
+    "accuracy": "sum(correct) / sum(correct + incorrect) across all responses",
+    "length": "pooled sum(per-step mean length * per-step class count) / sum(class count)",
+    "loss_mask_tokens": "exact integer sum of final training loss_masks reconstructed from all per-rank dumps after verifying and removing TP replicas",
+    "reference_kl": "strict sum(KL) / exact loss-mask T; unavailable when T is zero",
+    "grad_norm": "reported Relax train/grad_norm"
+  },
+  "artifacts": {
+    "generator": "scripts/testing/summarize_dr_grpo_qwen35_gsm8k.py",
+    "training_metrics_long_csv_sha256": "4ff3d7ec6d0909fa67066ae3f10fbccc7bd44305909dc8c156f06da2d0e08387",
+    "training_summary_json_sha256": "c24b9881df4fa6a9d6184c0a392d7a7bc648eb699aff5730e356bf0daf45f813",
+    "tables_md_sha256": "7eca96d1555efc918e1e26dcdea5a70f45bba3cc28ba2a00aeca8a186f1deb70",
+    "training_curves_svg_sha256": "7ee87e88a6a7aaad5dbdcb4f28ecc7b78e72f147d5fdf67dd74fb2f9cadbd770",
+    "incorrect_length_svg_sha256": "8fc5097e811c559de3189d720f14770a00a66176f2ffc1f62cec84f1c0e0d8c1"
+  },
+  "public_evidence": {
+    "release_url": "https://github.com/idvzchusvol/Relax/releases/tag/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3",
+    "main_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-evidence-v3.tar.zst",
+    "main_archive_sha256": "e9e212f9b826a28cda463cdab6a96e61ca8b42d45ad0855060ba877a673b75db",
+    "formal_run_source_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-formal-run-source-v3.tar.zst",
+    "formal_run_source_archive_sha256": "9ea4a1c5da317e640b41a48c7c637ee2f4c88ad018c5b260a1de4e574a257e28",
+    "loss_mask_source_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-loss-mask-source-dumps.tar.zst",
+    "loss_mask_source_archive_sha256": "521c554bb11b2c5891e72e103eb669286dbf7b1531903f7b258773deeaae28f3",
+    "supersedes_release_url": "https://github.com/idvzchusvol/Relax/releases/tag/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v2",
+    "correction": "The v2 main archive accidentally packaged a different tracked patch than the one named by its metadata. Experiment outputs were unaffected; v3 publishes the actual formal-run patch and a sanitized reconstructed source snapshot.",
+    "note": "All three archives were downloaded from the published immutable prerelease and verified against the listed SHA256 digests. The main archive excludes this outer manifest to avoid self-reference."
+  },
+  "excluded": [
+    "model weights",
+    "source dataset parquet",
+    "checkpoints",
+    "failed preflight and retry runs"
+  ]
+}
