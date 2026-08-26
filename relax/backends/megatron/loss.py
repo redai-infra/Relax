@@ -43,6 +43,7 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .mixture_lora_modules import get_microbatch_objective_scale
 
 
 def get_responses(
@@ -1421,34 +1422,25 @@ def loss_function(
     is_dummy = batch.get("__is_dummy__", False)
     explicit_loss_scale = batch.get("__loss_scale__", None)
 
-    # Rescale the loss for Megatron's gradient accumulation. The non-per-token
-    # branch folds in the DP(+CP) world size (cancelled by DDP's 1/dp_cp grad
-    # scaling); the per-token branch does NO CP scaling (normalization is the
-    # all-reduced CP-local token count in finalize_model_grads).
+    # This is the final scale after Megatron's schedule divides non-per-token
+    # losses by num_microbatches. Routed aux losses use the same helper before
+    # they are attached to intermediate activations.
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
+    microbatch_objective_scale = get_microbatch_objective_scale(
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        is_dummy=is_dummy,
+        explicit_loss_scale=explicit_loss_scale,
+        num_microbatches=num_microbatches,
+        global_batch_size=global_batch_size,
+        data_parallel_world_size_with_cp=mpu.get_data_parallel_world_size(with_context_parallel=True),
+    )
     if not args.calculate_per_token_loss:
-        if is_dummy:
-            # Zero-out gradient contribution but keep the autograd graph
-            # connected so PP/CP backward collectives still complete.
-            loss = 0.0 * loss
-        elif explicit_loss_scale is not None:
-            loss = loss * explicit_loss_scale
-        else:
-            loss = (
-                loss
-                * num_microbatches
-                / global_batch_size
-                * mpu.get_data_parallel_world_size(with_context_parallel=True)
-            )
-    else:
-        if is_dummy:
-            loss = 0.0 * loss
-        # Non-dummy per-token path: do NOT scale by cp_size. `loss` is the
-        # CP-local token-sum; finalize_model_grads normalizes the summed gradient
-        # by the all-reduced CP-local `num_tokens`. A `* cp_size` here would weight
-        # each sample by its CP degree — wrong when CP differs across micro-batches
-        # (dynamic CP). Under static CP the removed factor exactly cancels the old
-        # full-count denominator, leaving the final loss/grad unchanged.
+        loss = loss * microbatch_objective_scale * num_microbatches
+    elif is_dummy:
+        # Keep the graph connected so PP/CP backward collectives still complete.
+        loss = 0.0 * loss
+    # The non-dummy per-token path is normalized by the all-reduced CP-local
+    # token count in finalize_model_grads, so it needs no scale here.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
     log_values = torch.tensor(

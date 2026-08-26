@@ -14,7 +14,6 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
-from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
@@ -25,11 +24,14 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    is_mixture_lora_enabled,
 )
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .lora_adapter_sync import LoraAdapterSync
+from .mixture_lora_sync import MixtureLoraSync
+from .synchronized_send import run_synchronized_phase, send_chunks_pipelined
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -39,6 +41,26 @@ from .update_weight_from_distributed import (
 
 
 logger = get_logger(__name__)
+_CURRENT_WEIGHT_VERSION = object()
+
+
+def iter_mixture_weight_updates(base_chunks, mixture_chunks, *, include_base: bool, weight_version: int):
+    """Yield base first and attach the version only to the final routed
+    chunk."""
+
+    if include_base:
+        for chunk in base_chunks:
+            yield chunk, None
+
+    iterator = iter(mixture_chunks)
+    try:
+        pending = next(iterator)
+    except StopIteration as error:
+        raise ValueError("Mixture-of-LoRA weight sync produced no routed tensors") from error
+    for chunk in iterator:
+        yield pending, None
+        pending = chunk
+    yield pending, weight_version
 
 
 class UpdateWeightFromTensor:
@@ -73,10 +95,12 @@ class UpdateWeightFromTensor:
         self.lora_enabled = is_lora_enabled(args)
         self.lora_merge_mode = is_lora_merge_mode(args) if self.lora_enabled else False
         self.lora_adapter_mode = is_lora_adapter_mode(args) if self.lora_enabled else False
+        self.mixture_lora_enabled = is_mixture_lora_enabled(args)
 
         # Adapter-mode incremental-sync state (base-once + adapter-delta protocol) lives in the
         # shared LoraAdapterSync helper; the backend keeps only its in-memory transport below.
         self._lora_sync = LoraAdapterSync(args, model) if self.lora_adapter_mode else None
+        self._mixture_lora_sync = MixtureLoraSync(args, model) if self.mixture_lora_enabled else None
 
         self._hf_weight_iterator = HfWeightIteratorBase.create(
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
@@ -130,6 +154,9 @@ class UpdateWeightFromTensor:
             colocate_engine_nums += 1
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
+
+        if self.mixture_lora_enabled and self.use_distribute:
+            raise ValueError("Mixture-of-LoRA weight sync currently requires colocated rollout engines")
 
         if self.use_distribute:
             self.rollout_engines = rollout_engines[:colocate_engine_nums]
@@ -191,6 +218,9 @@ class UpdateWeightFromTensor:
         if self.lora_enabled and self.lora_adapter_mode:
             self._update_weights_adapter_mode()
             return
+        if self.mixture_lora_enabled:
+            self._update_weights_mixture_lora()
+            return
 
         self.weight_version += 1
 
@@ -233,27 +263,14 @@ class UpdateWeightFromTensor:
 
         # Pipeline: when chunk N's IPC refs are in-flight on the engine,
         # chunk N+1's HF conversion + serialize + gather can proceed in
-        # parallel.  We defer ``ray.get`` to the *next* iteration so the
-        # two stages overlap.
-        prev_refs: list[ObjectRef] = []
-        prev_long_lived_tensors = None
+        # parallel.  The shared primitive defers each ``ray.get`` to the
+        # *next* iteration and synchronizes its failures across ranks.
         with export_ctx:
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-                # Wait for the *previous* chunk's IPC to finish before
-                # releasing its GPU tensors.
-                if prev_refs:
-                    ray.get(prev_refs)
-                del prev_long_lived_tensors
-                prev_refs = refs
-                prev_long_lived_tensors = long_lived_tensors
-                # Backend-specific per-chunk synchronization is handled in device
-                # utils so this path stays hardware-agnostic.
-                device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-            # Drain the last chunk.
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
+            send_chunks_pipelined(
+                self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights),
+                self._send_hf_params,
+                description="base weight chunk transfer",
+            )
 
         # All ranks must finish sending before rank 0 triggers Marlin repack,
         # otherwise engines in slower gather groups may still be processing
@@ -270,6 +287,105 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _update_weights_mixture_lora(self) -> None:
+        """Sync the frozen base once and all routed parameters every step."""
+
+        next_weight_version = self.weight_version + 1
+        include_base = not self._mixture_lora_sync.base_sync_done
+        all_engines = list(self.rollout_engines)
+        rank = dist.get_rank()
+        quantization_restored = False
+
+        def pause_and_flush() -> None:
+            nonlocal quantization_restored
+            if rank != 0:
+                return
+            ray.get([engine.pause_generation.remote() for engine in all_engines])
+            ray.get([engine.flush_cache.remote() for engine in all_engines])
+            if (
+                include_base
+                and self.quantization_config
+                and self.quantization_config["quant_method"] in ["compressed-tensors"]
+            ):
+                post_process_weights(
+                    restore_weights_before_load=True,
+                    post_process_quantization=False,
+                    rollout_engines=all_engines,
+                )
+                quantization_restored = True
+
+        def send_weights() -> None:
+            local_weights = self.weights_getter()
+            base_chunks = self._hf_weight_iterator.get_hf_weight_chunks(local_weights)
+            mixture_chunks = self._mixture_lora_sync.get_weight_chunks(local_weights)
+            updates = iter_mixture_weight_updates(
+                base_chunks,
+                mixture_chunks,
+                include_base=include_base,
+                weight_version=next_weight_version,
+            )
+            self._send_weight_update_stream(updates)
+
+        def resume_generation(*, finish_quantization: bool) -> None:
+            if rank != 0:
+                return
+            if (
+                finish_quantization
+                and quantization_restored
+                and include_base
+                and self.quantization_config
+                and self.quantization_config["quant_method"] in ["compressed-tensors"]
+            ):
+                post_process_weights(
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                    rollout_engines=all_engines,
+                )
+            ray.get([engine.continue_generation.remote() for engine in all_engines])
+
+        for phase_name, operation in (("pause and flush", pause_and_flush), ("send weights", send_weights)):
+            local_error, phase_failed = run_synchronized_phase(
+                operation, description=f"Mixture-of-LoRA weight update phase {phase_name!r}"
+            )
+            if not phase_failed:
+                continue
+
+            logger.error(
+                "Mixture-of-LoRA weight update failed during %s; rollout generation remains paused "
+                "until the engines are restarted or fully resynchronized",
+                phase_name,
+            )
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(f"Mixture-of-LoRA weight update phase {phase_name!r} failed on another rank")
+
+        local_error, phase_failed = run_synchronized_phase(
+            lambda: resume_generation(finish_quantization=True),
+            description="Mixture-of-LoRA weight update phase 'resume generation'",
+        )
+        if phase_failed:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("Mixture-of-LoRA weight update phase 'resume generation' failed on another rank")
+
+        self.weight_version = next_weight_version
+        self._mixture_lora_sync.base_sync_done = True
+
+    def _send_weight_update_stream(self, updates) -> None:
+        """Pipeline conversion collectives with the preceding IPC request.
+
+        ``updates`` yields ``(named_tensors, weight_version)``; the versioned
+        final chunk makes the whole update visible, so every preceding chunk is
+        confirmed on every rank before it is sent.
+        """
+
+        send_chunks_pipelined(
+            updates,
+            lambda update: self._send_hf_params(update[0], weight_version=update[1]),
+            description="Mixture-of-LoRA weight chunk transfer",
+            confirm_before=lambda update: update[1] is not None,
+        )
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -337,18 +453,11 @@ class UpdateWeightFromTensor:
         # 1) Send BASE weights only. In adapter mode the HF iterator pulls adapter params OUT of
         #    the conversion buckets (collect_adapters=True) without merging, so only base weights
         #    flow through SGLang's base-model load_weights (which has no notion of lora_A/lora_B).
-        prev_refs: list[ObjectRef] = []
-        prev_long_lived_tensors = None
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
-            prev_refs = refs
-            prev_long_lived_tensors = long_lived_tensors
-        if prev_refs:
-            ray.get(prev_refs)
-        del prev_long_lived_tensors
+        send_chunks_pipelined(
+            self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights),
+            self._send_hf_params,
+            description="adapter-mode base weight chunk transfer",
+        )
 
         dist.barrier(group=get_gloo_group())
 
@@ -476,8 +585,14 @@ class UpdateWeightFromTensor:
         finally:
             set_sharing_strategy(prev_strategy)
 
-    def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
+    def _send_hf_params(
+        self,
+        hf_named_tensors,
+        *,
+        weight_version: int | None | object = _CURRENT_WEIGHT_VERSION,
+    ) -> tuple[list[ObjectRef], Any]:
         all_refs = []
+        resolved_weight_version = self.weight_version if weight_version is _CURRENT_WEIGHT_VERSION else weight_version
 
         long_lived_tensors = None
         if self._ipc_engine is not None:
@@ -486,7 +601,8 @@ class UpdateWeightFromTensor:
                 ipc_engine=self._ipc_engine,
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
-                weight_version=self.weight_version,
+                weight_version=resolved_weight_version,
+                use_host_tensors=(self.mixture_lora_enabled and getattr(self.args, "sglang_pp_size", 1) > 1),
             )
             all_refs.extend(refs_colocated)
 
@@ -494,7 +610,7 @@ class UpdateWeightFromTensor:
             refs_distributed = update_weights_from_distributed(
                 self._group_name,
                 self._model_update_groups,
-                self.weight_version,
+                resolved_weight_version,
                 self.distributed_rollout_engines,
                 hf_named_tensors,
             )
@@ -510,7 +626,8 @@ def _send_to_colocated_engine(
     ipc_engine,
     ipc_gather_src,
     ipc_gather_group,
-    weight_version,
+    weight_version: int | None,
+    use_host_tensors: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -526,7 +643,10 @@ def _send_to_colocated_engine(
     # devices. Synchronous copy: this runs on the weight-update path (not the
     # rollout/train hot path) and FlattenedTensorBucket may flatten on a
     # different stream — correctness over a few µs.
-    cur_device = make_current_torch_device()
+    # SGLang indexes serialized buckets by TP rank. Pipeline stages therefore
+    # share one entry when TP=1, so device IPC handles would point every stage
+    # at the first stage's GPU. Host tensors are safe for all PP stages to read.
+    cur_device = torch.device("cpu") if use_host_tensors else make_current_torch_device()
     hf_named_tensors = [
         (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
     ]
@@ -552,7 +672,12 @@ def _send_to_colocated_engine(
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        serialized_tensors.append(
+            _serialize_flattened_tensor_data(
+                flattened_tensor_data,
+                use_file_system_sharing=use_host_tensors,
+            )
+        )
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -581,16 +706,36 @@ def _send_to_colocated_engine(
                 if empty_serialized_tensor is None:
                     empty_tensor_data = _empty_flattened_tensor_data(cur_device)
                     long_live_tensors.append(empty_tensor_data)
-                    empty_serialized_tensor = MultiprocessingSerializer.serialize(empty_tensor_data, output_str=True)
+                    empty_serialized_tensor = _serialize_flattened_tensor_data(
+                        empty_tensor_data,
+                        use_file_system_sharing=use_host_tensors,
+                    )
                 serialized_tensors_for_bucket.append(empty_serialized_tensor)
             kwargs = {
                 "serialized_named_tensors": serialized_tensors_for_bucket,
                 "load_format": "flattened_bucket",
-                "weight_version": str(weight_version),
+                "weight_version": None if weight_version is None else str(weight_version),
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     return refs, long_live_tensors
+
+
+def _serialize_flattened_tensor_data(flattened_tensor_data, *, use_file_system_sharing: bool):
+    if not use_file_system_sharing:
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+
+    # CPU storage serialized with the default file-descriptor strategy is tied
+    # to the producer process's multiprocessing auth key. SGLang PP workers run
+    # in separate processes, so use named shared-memory files for this path.
+    from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
+
+    previous_strategy = get_sharing_strategy()
+    try:
+        set_sharing_strategy("file_system")
+        return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+    finally:
+        set_sharing_strategy(previous_strategy)
 
 
 def _empty_flattened_tensor_data(device):

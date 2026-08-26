@@ -251,6 +251,50 @@ def test_hf_load_context_restores_value_head_on_error(monkeypatch):
     assert not hasattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
 
 
+def test_model_provider_uses_mixture_lora_for_multiple_experts(monkeypatch):
+    module, _ = _load_model_provider(monkeypatch)
+    model = object()
+    config = object()
+    calls = []
+    mixture_module = types.ModuleType("relax.backends.megatron.mixture_lora_modules")
+
+    def build_mixture_lora_peft(received_config, dropout, vp_stage=None):
+        calls.append((received_config, dropout, vp_stage))
+        return lambda received_model, training: received_model
+
+    mixture_module.build_mixture_lora_peft = build_mixture_lora_peft
+    mixture_module.ensure_mixture_lora_recompute_inputs_grad = lambda model: None
+    mixture_module.install_mixture_lora_checkpoint_context = lambda: None
+    monkeypatch.setitem(sys.modules, "relax.backends.megatron.mixture_lora_modules", mixture_module)
+    monkeypatch.setattr(module, "build_mixture_lora_config", lambda args: config)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: pytest.fail("single LoRA factory was called"))
+    monkeypatch.setattr(module, "validate_and_count_mixture_lora_parameters", lambda model: (100, 20, 4, 124))
+    args = SimpleNamespace(lora_rank=16, lora_num_experts=4, lora_dropout=0.1)
+
+    provider = module.wrap_model_provider_with_lora(lambda **kwargs: model, args)
+
+    assert provider() is model
+    assert calls == [(config, 0.1, None)]
+
+
+def test_model_provider_keeps_single_expert_on_existing_lora_path(monkeypatch):
+    module, _ = _load_model_provider(monkeypatch)
+    model = object()
+    calls = []
+
+    def build_lora_peft(args):
+        calls.append(args.lora_num_experts)
+        return lambda received_model, training: received_model
+
+    monkeypatch.setattr(module, "build_lora_peft", build_lora_peft)
+    args = SimpleNamespace(lora_rank=16, lora_num_experts=1)
+
+    provider = module.wrap_model_provider_with_lora(lambda **kwargs: model, args)
+
+    assert provider() is model
+    assert calls == [1]
+
+
 def test_critic_value_head_validation_accepts_ddp_and_optimizer_ownership(monkeypatch):
     class _FakeBridgeModel(torch.nn.Module):
         def __init__(self):

@@ -7,11 +7,18 @@ from typing import Tuple
 
 import torch
 
+from relax.utils.mixture_lora_common import MixtureLoraConfig
+
 
 # Fixed name under which the trained policy LoRA adapter is registered on the rollout
 # engines in adapter mode. Generation requests must pass ``lora_path=LORA_ADAPTER_NAME``
 # for the adapter to take effect (see sglang_rollout.generate and _push_lora_adapter).
 LORA_ADAPTER_NAME = "relax_policy_lora"
+_MIXTURE_LORA_EXPERT_SUFFIXES = (
+    "mixture_lora.experts.lora_A",
+    "mixture_lora.experts.lora_B",
+)
+_MIXTURE_LORA_ROUTER_SUFFIX = "mixture_lora.router.weight"
 
 
 def count_adapter_parameters(model) -> Tuple[int, int, float]:
@@ -42,6 +49,52 @@ def count_adapter_parameters(model) -> Tuple[int, int, float]:
     percentage = 100 * adapter_params / total_params if total_params > 0 else 0
 
     return adapter_params, total_params, percentage
+
+
+def validate_and_count_mixture_lora_parameters(model) -> tuple[int, int, int, int]:
+    """Validate trainable parameters and return base/expert/router/total
+    counts."""
+
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    if not isinstance(unwrapped, list):
+        unwrapped = [unwrapped]
+
+    base_params = 0
+    expert_params = 0
+    router_params = 0
+    total_params = 0
+    frozen_mixture_params = []
+    unexpected_trainable_params = []
+
+    for chunk in unwrapped:
+        for name, param in chunk.named_parameters():
+            param_count = param.numel()
+            total_params += param_count
+            if is_mixture_lora_expert_param(name):
+                expert_params += param_count
+                if not param.requires_grad:
+                    frozen_mixture_params.append(name)
+            elif is_mixture_lora_router_param(name):
+                router_params += param_count
+                if not param.requires_grad:
+                    frozen_mixture_params.append(name)
+            else:
+                base_params += param_count
+                if param.requires_grad:
+                    unexpected_trainable_params.append(name)
+
+    if expert_params == 0 or router_params == 0:
+        raise RuntimeError("Mixture-of-LoRA injection produced no expert or router parameters")
+    if frozen_mixture_params:
+        names = ", ".join(frozen_mixture_params[:5])
+        raise RuntimeError(f"Mixture-of-LoRA parameters must remain trainable: {names}")
+    if unexpected_trainable_params:
+        names = ", ".join(unexpected_trainable_params[:5])
+        raise RuntimeError(f"Base parameters must be frozen during Mixture-of-LoRA training: {names}")
+
+    return base_params, expert_params, router_params, total_params
 
 
 # Fused Megatron module name -> the HF-style projections it expands to. Megatron is the
@@ -104,7 +157,35 @@ def is_lora_adapter_param(name: str) -> bool:
     - Megatron-Bridge: ``...adapter.linear_in.weight`` / ``...adapter.linear_out.weight``
     - Standard PEFT:   ``...lora_A.weight`` / ``...lora_B.weight``
     """
-    return ".lora_A." in name or ".lora_B." in name or ".adapter.linear_in." in name or ".adapter.linear_out." in name
+    return (
+        ".lora_A." in name
+        or ".lora_B." in name
+        or ".adapter.linear_in." in name
+        or ".adapter.linear_out." in name
+        or is_mixture_lora_param(name)
+    )
+
+
+def is_mixture_lora_param(name: str) -> bool:
+    """Return whether ``name`` identifies an expert or router parameter."""
+
+    return is_mixture_lora_expert_param(name) or is_mixture_lora_router_param(name)
+
+
+def is_mixture_lora_expert_param(name: str) -> bool:
+    """Return whether ``name`` identifies a Mixture LoRA A or B tensor."""
+
+    return _has_parameter_suffix(name, _MIXTURE_LORA_EXPERT_SUFFIXES)
+
+
+def is_mixture_lora_router_param(name: str) -> bool:
+    """Return whether ``name`` identifies a Mixture LoRA router tensor."""
+
+    return _has_parameter_suffix(name, (_MIXTURE_LORA_ROUTER_SUFFIX,))
+
+
+def _has_parameter_suffix(name: str, suffixes: tuple[str, ...]) -> bool:
+    return any(name == suffix or name.endswith(f".{suffix}") for suffix in suffixes)
 
 
 def build_hf_peft_config_dict(
@@ -185,6 +266,26 @@ def write_hf_peft_adapter(
 def is_lora_enabled(args) -> bool:
     """Check if LoRA is enabled in training arguments."""
     return hasattr(args, "lora_rank") and args.lora_rank > 0
+
+
+def is_mixture_lora_enabled(args) -> bool:
+    """Return whether training uses more than one routed LoRA expert."""
+    return is_lora_enabled(args) and getattr(args, "lora_num_experts", 1) > 1
+
+
+def build_mixture_lora_config(args) -> MixtureLoraConfig | None:
+    """Build the shared Mixture-of-LoRA config from validated arguments."""
+    if not is_mixture_lora_enabled(args):
+        return None
+    return MixtureLoraConfig(
+        num_experts=args.lora_num_experts,
+        rank=args.lora_rank,
+        top_k=args.lora_router_top_k,
+        temperature=args.lora_router_temperature,
+        aux_loss_coef=args.lora_router_aux_loss_coef,
+        alpha=args.lora_alpha,
+        target_modules=tuple(args.lora_target_modules),
+    )
 
 
 def is_lora_merge_mode(args) -> bool:
@@ -300,12 +401,18 @@ def build_lora_peft(args):
 __all__ = [
     "LORA_ADAPTER_NAME",
     "count_adapter_parameters",
+    "validate_and_count_mixture_lora_parameters",
     "convert_megatron_to_hf_target_modules",
     "MEGATRON_TO_HF_MODULES",
     "write_hf_peft_adapter",
     "extract_lora_delta",
     "is_lora_enabled",
+    "is_mixture_lora_param",
+    "is_mixture_lora_expert_param",
+    "is_mixture_lora_router_param",
+    "is_mixture_lora_enabled",
     "is_lora_merge_mode",
     "is_lora_adapter_mode",
+    "build_mixture_lora_config",
     "build_lora_peft",
 ]

@@ -209,6 +209,7 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- LoRA -------------
     RELAX_LORA_LIVE_DIR = EnvProperty("RELAX_LORA_LIVE_DIR", str, None)
+    RELAX_MIXTURE_LORA_CONFIG = EnvProperty("RELAX_MIXTURE_LORA_CONFIG", str, None)
 
     # ------------- Extra Modules -------------
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")

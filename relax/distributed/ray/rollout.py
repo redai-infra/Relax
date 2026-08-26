@@ -534,6 +534,7 @@ class EngineGroup:
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 register_sigterm_handler=self.is_scaled_out,
+                enable_mixture_lora_external_model=True,
             )
 
             rollout_engines.append((global_rank, rollout_engine))

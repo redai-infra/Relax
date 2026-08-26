@@ -32,7 +32,13 @@ from relax.utils.async_utils import run
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.megatron_peft_utils import (
+    build_mixture_lora_config,
+    convert_megatron_to_hf_target_modules,
+    is_lora_enabled,
+    is_mixture_lora_enabled,
+)
+from relax.utils.mixture_lora_common import configure_mixture_lora_external_model
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
 from relax.utils.s3_model_loader import (
     get_s3_model_cached_path,
@@ -230,6 +236,20 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
+def _configure_external_model_environment(external_pkg: str, *, text_only: bool) -> str | None:
+    os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_pkg
+    if text_only:
+        os.environ.pop("SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE", None)
+        os.environ.pop("SGLANG_EXTERNAL_MM_MODEL_ARCH", None)
+        return None
+
+    os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = external_pkg
+    arch = _resolve_external_model_arch(external_pkg)
+    if arch:
+        os.environ["SGLANG_EXTERNAL_MM_MODEL_ARCH"] = arch
+    return arch
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
@@ -332,6 +352,7 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        enable_mixture_lora_external_model: bool = False,
     ):
         self.args = args
         self.rank = rank
@@ -339,6 +360,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self.enable_mixture_lora_external_model = enable_mixture_lora_external_model
         self._evicted = threading.Event()
         self._is_weight_updating: bool = False
         self._router_worker_id: str | None = None
@@ -557,14 +579,18 @@ class SGLangEngine(RayActor):
         # Must be set before launch_server_process() spawns child process
         # (multiprocessing start_method='spawn'), because the child inherits
         # the parent's os.environ at spawn time.
-        external_pkg = getattr(self.args, "sglang_external_model_package", None)
+        mixture_lora_config = build_mixture_lora_config(self.args) if self.enable_mixture_lora_external_model else None
+        external_pkg = configure_mixture_lora_external_model(
+            mixture_lora_config,
+            getattr(self.args, "sglang_external_model_package", None),
+        )
         if external_pkg:
-            os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = external_pkg
-            os.environ["SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE"] = external_pkg
-            arch = _resolve_external_model_arch(external_pkg)
-            if arch:
-                os.environ["SGLANG_EXTERNAL_MM_MODEL_ARCH"] = arch
-            logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg}, SGLANG_EXTERNAL_MM_MODEL_ARCH={arch}")
+            is_mixture_lora = mixture_lora_config is not None
+            arch = _configure_external_model_environment(external_pkg, text_only=is_mixture_lora)
+            if not is_mixture_lora:
+                logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg}, SGLANG_EXTERNAL_MM_MODEL_ARCH={arch}")
+            else:
+                logger.info(f"Set SGLANG_EXTERNAL_MODEL_PACKAGE={external_pkg} for Mixture-of-LoRA")
 
         # Warm the OS page cache for this engine's HF checkpoint before the SGLang
         # subprocess mmaps the safetensors. Applies uniformly to rollout / genrm /
@@ -1448,6 +1474,11 @@ def _compute_server_args(
         # Mandatory: base is synced once, so it must survive colocate sleep/wake. Without CPU
         # backup, release_memory_occupation drops the GPU pages and base becomes garbage after
         # the first wake (other modes re-push full base every step and never notice).
+        kwargs["enable_weights_cpu_backup"] = True
+
+    # Mixture sync also sends the frozen base only once. Keep its CPU copy alive
+    # while colocate sleep releases the GPU weight pages between rollout phases.
+    if is_mixture_lora_enabled(args):
         kwargs["enable_weights_cpu_backup"] = True
 
     if worker_type == "prefill":

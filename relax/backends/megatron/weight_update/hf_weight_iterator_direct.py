@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group
+from relax.utils.megatron_peft_utils import is_mixture_lora_param
 from relax.utils.types import ParamInfo
 
 from ..sglang import monkey_patch_torch_reductions
@@ -152,6 +153,8 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
+        if is_mixture_lora_param(name):
+            continue
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,

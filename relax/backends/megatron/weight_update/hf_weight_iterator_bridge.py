@@ -17,6 +17,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    is_mixture_lora_param,
 )
 from relax.utils.types import ParamInfo
 
@@ -109,29 +110,32 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             yield from results
             del all_converted, results
 
-        # --- Non-expert weights: original path ---
+        # --- Non-expert weights ---
         for bucket_infos in self._non_expert_buckets:
-            t_b0 = time.monotonic()
-            params = _load_and_broadcast(
+            params = _load_to_gpu(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
             )
-            t_b1 = time.monotonic()
-            t_bcast_total += t_b1 - t_b0
-
+            all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
                 t_g0 = time.monotonic()
                 gathered = all_gather_param(self.args, info.name, param)
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
-
-                converted = self._bridge_converter.convert(info.name, gathered)
-                t_convert_total += time.monotonic() - t_g1
-
-                param_count += len(converted)
-                yield from converted
-                del gathered, converted
-
+                if rank == info.src_rank:
+                    t_c0 = time.monotonic()
+                    all_converted.append(self._bridge_converter.convert(info.name, gathered))
+                    t_convert_total += time.monotonic() - t_c0
+                else:
+                    all_converted.append(None)
+                del gathered
             del params
+
+            t_b0 = time.monotonic()
+            results = _broadcast_converted_bucket(bucket_infos, all_converted, device)
+            t_bcast_total += time.monotonic() - t_b0
+            param_count += len(results)
+            yield from results
+            del all_converted, results
 
         if rank == 0:
             logger.info(
@@ -243,6 +247,8 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
     vanilla_key_map = {}
     adapter_map: dict[str, dict[str, str]] = {}
     for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
+        if is_mixture_lora_param(g_name):
+            continue
         if collect_adapters and is_lora_adapter_param(g_name):
             # LoRA adapter param: keep it out of the conversion buckets (no standalone
             # bridge mapping) and record its vanilla key for load-time merging.
@@ -285,9 +291,9 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
                 else:
                     local_infos[name] = info
 
-    # Exchange across EP so every rank has all expert indices.
-    # Only expert params need src_rank update — non-expert params are
-    # replicated across EP and already have the correct PP-local src_rank.
+    # Exchange across EP so every rank has all expert indices. Replicated
+    # non-expert params also need one canonical source: the converted-tensor
+    # broadcast protocol requires at most one owner for each parameter slot.
     if ep_size > 1:
         ep_infos_list: list[None | tuple[int, dict]] = [None] * ep_size
         dist.all_gather_object(
@@ -299,7 +305,7 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
             for name, info in infos.items():
                 if name not in local_infos:
                     local_infos[name] = dataclasses.replace(info, src_rank=src_rank)
-                elif ".experts." in name and info.src_rank < local_infos[name].src_rank:
+                elif info.src_rank < local_infos[name].src_rank:
                     local_infos[name] = dataclasses.replace(local_infos[name], src_rank=info.src_rank)
 
     # Sort deterministically and split expert / non-expert.

@@ -3,6 +3,7 @@ import dataclasses
 from contextlib import contextmanager
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import is_mixture_lora_param
 
 
 logger = get_logger(__name__)
@@ -57,8 +58,40 @@ def _patch_progress_tracking_show_elapsed():
 _patch_progress_tracking_show_elapsed()
 
 
+_bridge_mixture_filter_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "relax_bridge_mixture_filter_active", default=False
+)
+_bridge_mixture_filter_patched = False
+
+
+def _ensure_bridge_mixture_filter_patched():
+    """Teach Bridge base conversion to treat routed parameters as adapters."""
+
+    global _bridge_mixture_filter_patched
+    if _bridge_mixture_filter_patched:
+        return
+
+    try:
+        from megatron.bridge.models.conversion.peft_bridge import MegatronPeftBridge
+    except ImportError:
+        logger.warning("Megatron-Bridge PEFT helpers are unavailable; skipping the Mixture-of-LoRA parameter filter.")
+        return
+
+    original = MegatronPeftBridge._is_adapter_param_name
+
+    def _is_adapter_param_name(self, param_name: str) -> bool:
+        return original(self, param_name) or (
+            _bridge_mixture_filter_active.get() and is_mixture_lora_param(param_name)
+        )
+
+    MegatronPeftBridge._is_adapter_param_name = _is_adapter_param_name
+    _bridge_mixture_filter_patched = True
+
+
 @contextmanager
 def patch_megatron_model(model):
+    _ensure_bridge_mixture_filter_patched()
+    mixture_filter_token = _bridge_mixture_filter_active.set(True)
     unwrapped_model = unwrap_model(model)[0]
     model_config = unwrapped_model.config
     attribute_was_added = False
@@ -69,6 +102,7 @@ def patch_megatron_model(model):
     try:
         yield
     finally:
+        _bridge_mixture_filter_active.reset(mixture_filter_token)
         if attribute_was_added:
             delattr(model_config, "share_embeddings_and_output_weights")
 
