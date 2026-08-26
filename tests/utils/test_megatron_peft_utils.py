@@ -14,7 +14,9 @@ notice when broken:
 - Base<->adapter param-name prefix round-trip in the fast bridge path
 """
 
+import base64
 import json
+import pickle
 import sys
 import types
 from argparse import Namespace
@@ -29,6 +31,7 @@ from relax.utils.megatron_peft_utils import (
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
+    serialize_adapter_tensors,
     write_hf_peft_adapter,
 )
 
@@ -242,3 +245,46 @@ class TestBridgeParamPrefixes:
         base = "decoder.layers.0.mlp.experts.linear_fc1"
         # Grouped experts carry a trailing weight index (weight3) that must be stripped.
         assert _base_param_prefix(f"{base}.to_wrap.weight3") == base
+
+
+class TestSerializeAdapterTensors:
+    """The adapter payload must carry its bytes, not a reference to them.
+
+    Sharing the tensors through host memory instead puts a handle in the
+    pickle, and that handle is only resolvable while the producer holds the
+    storage, which no longer holds once the payload reaches the engine workers.
+    """
+
+    @staticmethod
+    def _adapter():
+        # Large enough that a handle-only payload is unmistakably smaller.
+        return {
+            "layers.0.self_attn.q_proj.lora_A.weight": torch.randn(256, 256),
+            "layers.0.self_attn.q_proj.lora_B.weight": torch.randn(256, 256),
+        }
+
+    def test_round_trips_through_plain_unpickling(self):
+        """SGLang deserializes with base64 + unpickle and nothing else."""
+        tensors = self._adapter()
+
+        restored = pickle.loads(base64.b64decode(serialize_adapter_tensors(tensors), validate=True))
+
+        assert restored.keys() == tensors.keys()
+        for name, tensor in tensors.items():
+            assert torch.equal(restored[name], tensor)
+
+    def test_payload_is_at_least_as_large_as_the_tensors(self):
+        """A payload holding a handle is orders of magnitude smaller."""
+        tensors = self._adapter()
+        nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+
+        payload = base64.b64decode(serialize_adapter_tensors(tensors), validate=True)
+
+        assert len(payload) >= nbytes
+
+    def test_payload_holds_no_shared_memory_handle(self):
+        """A shared storage serializes as a /torch_<pid> handle, not as
+        bytes."""
+        payload = base64.b64decode(serialize_adapter_tensors(self._adapter()), validate=True)
+
+        assert b"/torch_" not in payload
