@@ -46,7 +46,7 @@ from relax.utils.training.ppo_utils import (
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import loss_function, normalize_reduced_loss_metrics
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 
@@ -943,6 +943,48 @@ def forward_only(
     return rollout_data
 
 
+def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
+    """Return True when the whole step has zero effective loss tokens.
+
+    An empty or fully-masked global batch connects a zero loss through
+    ``0 * logits.sum()``, so gradients are exactly zero. Running the optimizer
+    anyway would still move parameters through Adam momentum / weight decay and
+    advance the LR scheduler, despite there being no training signal. This
+    computes the globally reduced token count on the last pipeline stage and
+    broadcasts the decision to every rank so they agree on skipping the
+    optimizer and scheduler updates.
+    """
+    signal = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        # Sum the per-microbatch CP-local token counts, then reduce over DP+CP so
+        # every last-stage TP rank observes the same global count (mirrors the
+        # metric all-reduce below, which also uses the DP+CP group).
+        num_tokens_local = sum(x["values"][0] for x in losses_reduced)  # type: ignore[index]
+        torch.distributed.all_reduce(
+            num_tokens_local,
+            group=mpu.get_data_parallel_group(with_context_parallel=True),
+        )
+        signal[0] = 1 if num_tokens_local.item() == 0 else 0
+        if pp_size > 1:
+            # Non-last stages did not join the all-reduce; propagate the
+            # decision across the pipeline group so every rank agrees.
+            torch.distributed.broadcast(
+                signal,
+                src=pp_size - 1,
+                group=mpu.get_pipeline_model_parallel_group(),
+            )
+    elif pp_size > 1:
+        # Non-last stages must enter the broadcast so the collective completes;
+        # they keep the sentinel value overwritten by the last-stage decision.
+        torch.distributed.broadcast(
+            signal,
+            src=pp_size - 1,
+            group=mpu.get_pipeline_model_parallel_group(),
+        )
+    return bool(signal.item())
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -1190,33 +1232,47 @@ def train_one_step(
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
     valid_step = True
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
-        # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
-        # Detect overflow via the documented (False, None, None) return signature.
-        found_inf_flag = not update_successful and grad_norm is None and num_zeros_in_grad is None
-        if found_inf_flag:
-            valid_step = False
-            current_scale = optimizer.get_loss_scale().item()
-            logger.warning(
-                "Inf found in gradients (step_id=%d, loss_scale=%s), skipping parameter "
-                "update (dynamic loss scaling will reduce scale)",
-                step_id,
-                current_scale,
-            )
-        else:
-            if isinstance(grad_norm, torch.Tensor):
-                valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
-            else:
-                valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
-
-    if valid_step:
-        # Update learning rate.
-        assert update_successful
-        opt_param_scheduler.step(increment=args.global_batch_size)
+    if _is_global_zero_token_step(losses_reduced):
+        # No effective loss tokens anywhere in the global batch. Gradients are
+        # exactly zero (the loss is zero-connected), so skip both the parameter
+        # and LR scheduler updates; momentum / weight decay must not move the
+        # model on a no-signal step. Every rank agrees because the decision is
+        # reduced over DP+CP and broadcast across the pipeline.
+        logger.warning(
+            "Training step %d has zero effective loss tokens globally; skipping optimizer and LR scheduler updates.",
+            step_id,
+        )
+        update_successful = True
+        grad_norm = 0.0
+        num_zeros_in_grad = None
     else:
-        grad_norm = float("nan")
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+        if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+            # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
+            # Detect overflow via the documented (False, None, None) return signature.
+            found_inf_flag = not update_successful and grad_norm is None and num_zeros_in_grad is None
+            if found_inf_flag:
+                valid_step = False
+                current_scale = optimizer.get_loss_scale().item()
+                logger.warning(
+                    "Inf found in gradients (step_id=%d, loss_scale=%s), skipping parameter "
+                    "update (dynamic loss scaling will reduce scale)",
+                    step_id,
+                    current_scale,
+                )
+            else:
+                if isinstance(grad_norm, torch.Tensor):
+                    valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+                else:
+                    valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+
+        if valid_step:
+            # Update learning rate.
+            assert update_successful
+            opt_param_scheduler.step(increment=args.global_batch_size)
+        else:
+            grad_norm = float("nan")
 
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
@@ -1246,16 +1302,17 @@ def train_one_step(
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
-        loss_reduced = {}
         values = values.tolist()
         num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:], strict=False):
-            # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
-            # token count (per-token) or sample count, so each token/sample is
-            # already counted once. A `* cp_size` here would over-weight metrics by
-            # CP degree under dynamic CP (and is a no-op under static CP, where the
-            # count previously carried the cancelling cp factor).
-            loss_reduced[key] = value / num_samples_or_tokens
+        if num_samples_or_tokens == 0:
+            logger.warning(
+                "Training step %d has zero effective loss tokens; reporting zero loss metrics for this no-signal step.",
+                step_id,
+            )
+        # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
+        # token count (per-token) or sample count, so each token/sample is already
+        # counted once. A `* cp_size` here would over-weight metrics by CP degree.
+        loss_reduced = normalize_reduced_loss_metrics(keys, values)
         return loss_reduced, grad_norm
     return {}, grad_norm
 
