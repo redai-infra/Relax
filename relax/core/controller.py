@@ -30,6 +30,7 @@ from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
     shutdown_agentic_chat_api_services,
 )
+from relax.algorithms import algorithm_needs_critic
 from relax.core.optional_roles import register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
@@ -104,7 +105,7 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
     matches the actor's; otherwise critic runs on its own placement group.
     """
     roles = list(ACTOR_ROLLOUT_PG_ROLES)
-    if getattr(config, "advantage_estimator", None) != "ppo":
+    if not algorithm_needs_critic(config):
         return roles
     resource = getattr(config, "resource", None) or {}
     if resource.get("critic") == resource.get("actor"):

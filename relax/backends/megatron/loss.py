@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from relax.algorithms import get_algorithm
+from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
+from relax.algorithms.policy import compute_policy_loss_for
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -21,17 +24,9 @@ from relax.utils.opd.opd_utils import (
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
-    compute_cispo_loss,
     compute_gspo_kl,
     compute_log_probs,
     compute_opsm_mask,
-    compute_policy_loss,
-    compute_rloo_loss,
-    compute_sapo_loss,
-    get_advantages_and_returns_batch,
-    get_grpo_returns,
-    get_reinforce_plus_plus_baseline_advantages,
-    get_reinforce_plus_plus_returns,
 )
 from relax.utils.types import RolloutBatch
 
@@ -525,10 +520,12 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
-    `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
-    and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
-    True, advantages are whitened across the data-parallel group using masked
+    `rollout_data`, computes KL divergences, then dispatches to the estimator
+    named by `relax.algorithms.spec.ALGORITHM_SPECS[...].advantage_fn`. The
+    supported methods are whatever that registry holds -- deliberately not
+    listed here, because keeping algorithm names in prose is the duplication
+    the registry exists to remove. When `args.normalize_advantages` is True,
+    advantages are whitened across the data-parallel group using masked
     statistics.
 
     Early returns if both `log_probs` and `values` are None (intermediate
@@ -576,56 +573,21 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_grpo_returns(rewards, kl)
-        # TODO: is the copy necessary?
-        advantages = [r for r in returns]  # noqa: C416
-
-    elif args.advantage_estimator == "ppo":
-        old_rewards = rewards
-        rewards = []
-        kl_coef = -args.kl_coef
-        cp_rank = mpu.get_context_parallel_rank()
-        for reward, k in zip(old_rewards, kl, strict=False):
-            k *= kl_coef
-            if cp_rank == 0:
-                k[-1] += reward
-            rewards.append(k)
-        advantages, returns = get_advantages_and_returns_batch(
-            total_lengths,
-            response_lengths,
-            values,
-            rewards,
-            args.gamma,
-            args.lambd,
-            padded_total_lengths=padded_total_lengths,
-        )
-
-    elif args.advantage_estimator == "reinforce_plus_plus":
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_reinforce_plus_plus_returns(
-            rewards=rewards,
-            kl=kl,
-            loss_masks=loss_masks,
-            response_lengths=response_lengths,
-            total_lengths=total_lengths,
-            kl_coef=args.kl_coef,
-            gamma=args.gamma,
-        )
-        advantages = [r for r in returns]  # noqa: C416
-
-    elif args.advantage_estimator == "reinforce_plus_plus_baseline":
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        advantages = get_reinforce_plus_plus_baseline_advantages(
-            rewards=rewards,
-            kl=kl,
-            loss_masks=loss_masks,
-        )
-        returns = advantages
-
-    else:
-        raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+    advantages, returns = compute_advantages_and_returns_impl(
+        args,
+        rewards=rewards,
+        kl=kl,
+        loss_masks=loss_masks,
+        response_lengths=response_lengths,
+        total_lengths=total_lengths,
+        values=values,
+        # Only this path can compute it: `maybe_padded_total_lengths` reads
+        # args.qkv_format plus the VL / unsplit-forward flags, which the
+        # Advantages deployment does not have. GAE needs it to slice CP shards
+        # at the padded offsets; omitting it does not raise, it reads the wrong
+        # token positions.
+        padded_total_lengths=padded_total_lengths,
+    )
 
     # Optional pure OPD mode: remove all non-OPD reward contribution.
     # This keeps only the OPD KL term injected below.
@@ -688,14 +650,17 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         assert all_advs.size() == all_masks.size(), (
             f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
         )
-        is_reinforce_plus_plus = args.advantage_estimator in {
-            "reinforce_plus_plus",
-            "reinforce_plus_plus_baseline",
-        }
-        if is_reinforce_plus_plus or all_masks.numel() > 0:
+        # Which normalisation to apply is declared by the algorithm registry.
+        # This used to be a set of estimator names maintained here and a second
+        # identical set in `policy_loss_function` below, which is exactly the
+        # kind of pair that drifts: the two have to stay in step because
+        # token-global normalisation is only correct together with the
+        # mask-safe reducer.
+        is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
+        if is_token_global or all_masks.numel() > 0:
             dp_group = mpu.get_data_parallel_group()
 
-            if is_reinforce_plus_plus:
+            if is_token_global:
                 whitened_advs_flat, raw_mean, raw_variance, valid_count = distributed_masked_normalize(
                     all_advs,
                     all_masks,
@@ -848,12 +813,12 @@ def policy_loss_function(
     else:
         advantages = batch["advantages"]
 
-    is_reinforce_plus_plus = args.advantage_estimator in {
-        "reinforce_plus_plus",
-        "reinforce_plus_plus_baseline",
-    }
+    # Same registry field as `compute_advantages_and_returns` reads: the
+    # mask-safe reducer is the other half of token-global normalisation, not an
+    # independent choice.
+    is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
 
-    if is_reinforce_plus_plus:
+    if is_token_global:
         sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
 
     true_on_policy = getattr(args, "true_on_policy_mode", False)
@@ -891,7 +856,8 @@ def policy_loss_function(
         old_log_probs = [lp.detach() for lp in log_probs]
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    algorithm = get_algorithm(args.advantage_estimator)
+    need_full_log_probs = args.use_opsm or algorithm.needs_full_log_probs
 
     full_log_probs = None
     full_old_log_probs = None
@@ -950,7 +916,7 @@ def policy_loss_function(
         )
 
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
-    if args.advantage_estimator == "gspo":
+    if algorithm.kl_level == "sequence":
         ppo_kl = compute_gspo_kl(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
@@ -965,27 +931,7 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    if args.advantage_estimator == "sapo":
-        tau_pos = getattr(args, "sapo_tau_pos", 1.0)
-        tau_neg = getattr(args, "sapo_tau_neg", 1.05)
-        pg_loss, pg_clipfrac = compute_sapo_loss(
-            ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg
-        )
-    elif args.advantage_estimator == "cispo":
-        pg_loss, pg_clipfrac = compute_cispo_loss(
-            log_probs=log_probs,
-            ppo_kl=ppo_kl,
-            advantages=advantages,
-            eps_clip=args.eps_clip,
-            eps_clip_high=args.eps_clip_high,
-        )
-    elif args.advantage_estimator == "rloo":
-        pg_loss, pg_clipfrac = compute_rloo_loss(
-            log_probs=log_probs,
-            advantages=advantages,
-        )
-    else:
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    pg_loss, pg_clipfrac = compute_policy_loss_for(args, log_probs=log_probs, ppo_kl=ppo_kl, advantages=advantages)
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1040,7 +986,7 @@ def policy_loss_function(
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         )
-        if is_reinforce_plus_plus:
+        if is_token_global:
             sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
                 sum_of_sample_mean, modified_response_masks
             )
@@ -1053,7 +999,7 @@ def policy_loss_function(
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
-        if is_reinforce_plus_plus:
+        if is_token_global:
             pg_loss_reducer = _get_reinforce_plus_plus_mask_safe_reducer(pg_loss_reducer, pg_loss_masks)
     else:
         pg_loss_reducer = sum_of_sample_mean
