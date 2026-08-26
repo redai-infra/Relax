@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import warnings
 from typing import Any
@@ -73,6 +74,52 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
     return parsed
+
+
+def _is_megatron_checkpoint_source(path: Any) -> bool:
+    """Return whether ``path`` is a non-empty native Megatron checkpoint.
+
+    Megatron accepts either a checkpoint root with its latest-iteration
+    sentinel or a direct ``iter_0000000`` directory. Keep this lightweight
+    validation-time predicate aligned with the backend loader so a direct
+    iteration path is never silently downgraded to a HuggingFace cold start.
+    """
+    if path is None or not os.path.isdir(path):
+        return False
+    try:
+        with os.scandir(path) as entries:
+            if next(entries, None) is None:
+                return False
+    except OSError:
+        return False
+    return os.path.isfile(os.path.join(path, "latest_checkpointed_iteration.txt")) or bool(
+        re.fullmatch(r"iter_\d{7}", os.path.basename(os.path.normpath(path)))
+    )
+
+
+def _configure_megatron_checkpoint_loading(args: argparse.Namespace) -> None:
+    """Preserve native checkpoints and configure cold loads consistently."""
+    is_megatron_checkpoint = _is_megatron_checkpoint_source(args.load)
+    if args.megatron_to_hf_mode == "bridge":
+        if is_megatron_checkpoint:
+            # Native checkpoints are loaded directly by Megatron rather than
+            # through the HuggingFace bridge.
+            return
+        if args.load is None:
+            args.load = args.ref_load or args.hf_checkpoint
+        # A HuggingFace/cold load starts the rollout service at zero.
+        args.start_rollout_id = 0
+        return
+
+    if is_megatron_checkpoint:
+        return
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    args.load = args.ref_load
+    if args.ref_ckpt_step is not None:
+        args.ckpt_step = args.ref_ckpt_step
+    args.start_rollout_id = 0
 
 
 def reset_arg(parser, name, **kwargs):
@@ -1735,12 +1782,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "p3o",
                     "rloo",
                 ],
                 default="grpo",
                 help=(
                     "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
                     "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
+                    "'p3o' uses ESS-adaptive policy optimization; "
                     "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
             )
@@ -1835,6 +1884,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to use the rollout logprobs when calculating the importance sampling ratios. "
                     "If not set, we will use the logprobs from the actor model."
                 ),
+            )
+            parser.add_argument(
+                "--p3o-ess-scope",
+                choices=["micro-batch", "step"],
+                default="micro-batch",
+                help=(
+                    "P3O ESS scope: paper-compatible but topology-dependent micro-batch (default), "
+                    "or optimizer step for a partition-invariant adaptive cap."
+                ),
+            )
+            parser.add_argument(
+                "--p3o-kl-mode",
+                choices=["proxy", "proxy_safe"],
+                default="proxy",
+                help="P3O behavior-KL implementation: proxy or proxy_safe.",
+            )
+            parser.add_argument(
+                "--clip-low",
+                type=float,
+                default=0.2,
+                help="Lower ratio margin used only for P3O clip-fraction monitoring.",
+            )
+            parser.add_argument(
+                "--clip-high",
+                type=float,
+                default=0.2,
+                help="Upper ratio margin used only for P3O clip-fraction monitoring.",
             )
             # Off-Policy Correction using Importance Sampling: https://fengyao.notion.site/off-policy-rl
             parser.add_argument(
@@ -2874,6 +2950,117 @@ def _validate_agentic_rollout_args(args) -> None:
         raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
 
 
+def _validate_p3o_args(args: argparse.Namespace) -> None:
+    """Reject P3O configurations whose ESS scope or replay would be wrong.
+
+    These are hard errors, not warnings. Every condition below silently changes
+    the objective (not just performance), and the failure mode is a plausible
+    loss curve that does not implement P3O.
+    """
+    # These are raises rather than asserts on purpose: `python -O` strips
+    # asserts, and every condition here silently changes the objective rather
+    # than crashing, so a stripped check would let a non-P3O run masquerade as
+    # one for its entire duration.
+    scope = getattr(args, "p3o_ess_scope", "micro-batch")
+    if scope not in {"micro-batch", "step"}:
+        raise ValueError(f"--p3o-ess-scope must be micro-batch or step, got {scope!r}.")
+    kl_mode = getattr(args, "p3o_kl_mode", "proxy")
+    if kl_mode not in {"proxy", "proxy_safe"}:
+        raise ValueError(f"--p3o-kl-mode must be proxy or proxy_safe, got {kl_mode!r}.")
+    clip_low = getattr(args, "clip_low", 0.2)
+    clip_high = getattr(args, "clip_high", 0.2)
+    if clip_low < 0.0 or clip_high < 0.0:
+        raise ValueError(f"--clip-low/--clip-high must be non-negative, got {clip_low}, {clip_high}.")
+
+    context_parallel_size = getattr(args, "context_parallel_size", 1)
+    if context_parallel_size > 1:
+        if getattr(args, "qkv_format", "thd") != "thd":
+            raise ValueError("P3O context parallelism requires THD full-sequence attention.")
+        if getattr(args, "tensor_model_parallel_size", 1) != 1:
+            raise ValueError("P3O strict full-sequence attention currently requires --tensor-model-parallel-size 1.")
+        if getattr(args, "is_vl_model", False):
+            raise ValueError("P3O strict full-sequence context parallelism currently supports text-only THD models.")
+        if getattr(args, "allgather_cp", False):
+            raise ValueError("P3O strict full-sequence attention requires standard zig-zag THD context parallelism.")
+
+    if not args.use_rollout_logprobs:
+        raise ValueError(
+            "P3O requires the rollout sampling distribution as its behavior policy. "
+            "Add --use-rollout-logprobs; without it there is no importance ratio to correct."
+        )
+    if not args.calculate_per_token_loss:
+        raise ValueError(
+            "P3O requires --calculate-per-token-loss. Per-sample-mean normalization "
+            "reintroduces a per-micro-batch denominator, so the loss would depend on "
+            "how the optimizer step is split into micro-batches."
+        )
+    rollout_top_p = getattr(args, "rollout_top_p", 1.0)
+    rollout_top_k = getattr(args, "rollout_top_k", -1)
+    if rollout_top_p != 1.0 or rollout_top_k != -1:
+        raise ValueError(
+            "P3O requires behavior log-probs from the untruncated rollout distribution. "
+            "Use --rollout-top-p 1.0 and --rollout-top-k -1; truncated sampling changes the behavior policy "
+            "unless its exact normalized log-probs are explicitly supported."
+        )
+    if args.use_tis:
+        raise ValueError(
+            "P3O and TIS (--use-tis) are mutually exclusive: both correct the same "
+            "rollout/training mismatch, and stacking them double-corrects the ratio."
+        )
+    if getattr(args, "use_critic", False):
+        raise ValueError(
+            "P3O does not use a critic; it is a score-function estimator over group-relative "
+            "advantages. Drop --use-critic."
+        )
+
+    incompatible_flags = {
+        "get_mismatch_metrics": "--get-mismatch-metrics",
+        "use_opsm": "--use-opsm",
+        "enable_mtp_training": "--enable-mtp-training",
+        "use_routing_replay": "--use-routing-replay",
+        "use_rollout_routing_replay": "--use-rollout-routing-replay",
+        "overlap_moe_expert_parallel_comm": "--overlap-moe-expert-parallel-comm",
+    }
+    for attr, flag in incompatible_flags.items():
+        if getattr(args, attr, False):
+            raise ValueError(f"P3O does not support {flag} in the replayed two-pass optimizer step.")
+    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        raise ValueError("P3O requires token-sum normalization and does not support a custom PG-loss reducer.")
+
+    if scope == "micro-batch" and getattr(args, "recompute_loss_function", False):
+        raise ValueError(
+            "P3O micro-batch ESS reduces statistics inside the loss callback, which checkpoint replay would execute "
+            "again during backward. Disable --recompute-loss-function or use --p3o-ess-scope step."
+        )
+
+    if scope == "step":
+        # The ESS pre-pass replays the same micro-batch window under no_grad. Ops
+        # that mutate state on a forward would make the two passes disagree.
+        if getattr(args, "fp8", None) is not None:
+            raise ValueError(
+                "P3O's ESS pre-pass runs a second forward over the same window, which would "
+                "advance FP8 amax history and make the training forward non-reproducible. "
+                "Disable FP8 or use --p3o-ess-scope micro-batch."
+            )
+        dropout = max(
+            getattr(args, "attention_dropout", 0.0) or 0.0,
+            getattr(args, "hidden_dropout", 0.0) or 0.0,
+            (getattr(args, "lora_dropout", 0.0) or 0.0) if getattr(args, "lora_rank", 0) > 0 else 0.0,
+        )
+        if dropout > 0.0:
+            raise ValueError(
+                f"P3O step scope requires deterministic replay, but dropout is enabled (max rate {dropout}). "
+                "Set attention, hidden, and LoRA dropout rates to 0.0 or use --p3o-ess-scope micro-batch."
+            )
+
+        if getattr(args, "fully_async", False):
+            raise ValueError(
+                "P3O's optimizer-step ESS scope requires the whole micro-batch window to be "
+                "available before the training pass. Fully-async mode streams micro-batches; "
+                "use --p3o-ess-scope micro-batch instead."
+            )
+
+
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
     """Validate the frozen Task 29 REINFORCE++ algorithm contracts."""
     if is_sft:
@@ -3077,32 +3264,7 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
-            args.start_rollout_id = 0
-    else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+    _configure_megatron_checkpoint_loading(args)
 
     if args.eval_interval is not None:
         if args.loss_type == "sft":
@@ -3665,3 +3827,10 @@ def slime_validate_args(args):
     if args.genrm_model_path:
         args.genrm_engine_config = args.genrm_engine_config or {}
         args.genrm_sampling_config = args.genrm_sampling_config or {}
+
+    # Validate the final effective values. Several execution flags are derived
+    # above (hybrid and routing replay), and custom YAML is applied near the end;
+    # validating earlier would let those paths silently bypass P3O's replay
+    # contract.
+    if args.advantage_estimator == "p3o":
+        _validate_p3o_args(args)

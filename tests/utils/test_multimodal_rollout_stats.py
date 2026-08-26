@@ -41,6 +41,8 @@ def test_rollout_summary_record_includes_token_and_agent_stats():
         response="world",
         tokens=list(range(12)),
         response_length=5,
+        rollout_log_probs=[-0.5, -0.4, -0.3, -0.2, -0.1],
+        rollout_log_probs_mask=[True, True, False, True, True],
         reward=1.0,
         multimodal_inputs={"images": ["image.png"]},
         multimodal_train_inputs={"image_grid_thw": [[1, 8, 8]]},
@@ -51,6 +53,9 @@ def test_rollout_summary_record_includes_token_and_agent_stats():
 
     assert record["prompt_token_count"] == 7
     assert record["response_token_count"] == 5
+    assert record["response_token_ids"] == [7, 8, 9, 10, 11]
+    assert record["response_rollout_log_probs"] == [-0.5, -0.4, -0.3, -0.2, -0.1]
+    assert record["response_rollout_log_probs_mask"] == [True, True, False, True, True]
     assert record["total_token_count"] == 12
     assert record["prompt_length"] == 7
     assert record["image_count"] == 1

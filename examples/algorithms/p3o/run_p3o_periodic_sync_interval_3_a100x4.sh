@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+export P3O_ALGORITHM=p3o
+export P3O_ENABLE_TEMPERATURE_OVERRIDE=0
+export P3O_UPDATE_WEIGHTS_INTERVAL="${P3O_UPDATE_WEIGHTS_INTERVAL:-3}"
+source "${SCRIPT_DIR}/common_a100x4.sh"
+P3O_run

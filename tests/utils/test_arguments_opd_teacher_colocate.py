@@ -194,6 +194,14 @@ def test_opd_sampled_token_loss_is_accepted(arguments_module):
     arguments_module.slime_validate_args(args)
 
 
+def test_p3o_with_opd_is_rejected_before_training(arguments_module):
+    args = _opd_args()
+    args.advantage_estimator = "p3o"
+
+    with pytest.raises(ValueError, match="P3O and OPD are mutually exclusive"):
+        arguments_module.slime_validate_args(args)
+
+
 def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments_module):
     args = _opd_args()
     args.colocate = True

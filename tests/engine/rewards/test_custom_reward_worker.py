@@ -90,8 +90,8 @@ def _kill_workers(executor: RewardExecutor | None) -> None:
         return
     for worker in executor._workers:
         try:
-            ray.kill(worker)
-        except Exception:
+            ray.get(worker.__ray_terminate__.remote())
+        except ray.exceptions.RayError:
             # A worker may already be dead after an expected failure. Teardown
             # must still clear the remaining actor handles.
             pass

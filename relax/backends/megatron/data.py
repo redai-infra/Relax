@@ -168,6 +168,99 @@ def concat_rollout_batches(rollout_batches: Sequence[RolloutBatch]) -> RolloutBa
     return merged
 
 
+def _cpu_detached_rollout_value(value: Any) -> Any:
+    """Copy one rollout value into a Gloo-serializable CPU form."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, list):
+        return [_cpu_detached_rollout_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_detached_rollout_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _cpu_detached_rollout_value(item) for key, item in value.items()}
+    return deepcopy(value)
+
+
+def _merge_p3o_strict_dp_rollout_batches(
+    rollout_batches: Sequence[RolloutBatch],
+    *,
+    is_anchor: bool,
+) -> RolloutBatch:
+    """Build one global strict-P3O batch and keep loss on one DP replica.
+
+    Every DP replica executes the same globally ordered micro-batches so the
+    schedule and any CP collectives remain aligned. Only DP rank zero keeps the
+    real loss mask; other replicas contribute an exact zero to the existing
+    DP×CP gradient reduction.
+    """
+    local_step_counts = []
+    for batch in rollout_batches:
+        counts = batch.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
+        local_sample_count = len(batch.get("total_lengths", []))
+        if not isinstance(counts, list) or len(counts) != 1 or counts[0] != local_sample_count:
+            raise RuntimeError(
+                "P3O strict DP canonicalization currently requires exactly one rollout mini per optimizer step; "
+                f"got counts={counts}, local_sample_count={local_sample_count}"
+            )
+        local_step_counts.append(counts[0])
+
+    merged = concat_rollout_batches(rollout_batches)
+    global_sample_count = len(merged.get("total_lengths", []))
+    if global_sample_count <= 0:
+        raise ValueError("P3O strict DP canonicalization requires at least one global sample")
+    merged[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = [sum(local_step_counts)]
+    if not is_anchor:
+        loss_masks = merged.get("loss_masks")
+        if not isinstance(loss_masks, list) or len(loss_masks) != global_sample_count:
+            raise ValueError("P3O strict DP canonicalization requires one loss mask per sample")
+        merged["loss_masks"] = [
+            torch.zeros_like(mask) if isinstance(mask, torch.Tensor) else [0 for _ in mask] for mask in loss_masks
+        ]
+    return merged
+
+
+def canonicalize_p3o_strict_dp_rollout(args: Namespace, rollout_data: RolloutBatch) -> bool:
+    """Canonicalize strict-P3O training onto DP rank zero.
+
+    Rank-local CUDA backward is deterministic but not invariant across physical
+    DP rank mappings. Gather the final training batch within each fixed-CP data
+    parallel group, preserve global sample order, and execute real loss only on
+    DP rank zero. Existing summed DP×CP gradient and token-count reductions then
+    propagate exactly one canonical gradient to every optimizer shard.
+
+    Returns ``True`` when the rollout was replaced and its iterator must be
+    rebuilt, otherwise ``False``.
+    """
+    if getattr(args, "advantage_estimator", None) != "p3o":
+        return False
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    if dp_size <= 1:
+        return False
+    if not getattr(args, "deterministic_mode", False) or not getattr(args, "batch_invariant_mode", False):
+        raise RuntimeError("P3O strict DP canonicalization requires deterministic and batch-invariant modes")
+    if getattr(args, "use_routing_replay", False):
+        raise RuntimeError("P3O strict DP canonicalization does not support routing replay")
+
+    dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
+    dp_gloo_group = mpu.get_data_parallel_group_gloo(with_context_parallel=False)
+    gathered: list[RolloutBatch | None] = [None for _ in range(dp_size)]
+    dist.all_gather_object(
+        gathered,
+        _cpu_detached_rollout_value(rollout_data),
+        group=dp_gloo_group,
+    )
+    if any(batch is None for batch in gathered):
+        raise RuntimeError("P3O strict DP canonicalization did not receive every DP rollout shard")
+    canonical = _merge_p3o_strict_dp_rollout_batches(
+        [batch for batch in gathered if batch is not None],
+        is_anchor=dp_rank == 0,
+    )
+    canonical = move_tensors_to_device(canonical, device_utils.make_current_torch_device())
+    rollout_data.clear()
+    rollout_data.update(canonical)
+    return True
+
+
 PAD_RULES = {
     # shape like [1, 128, 1036]
     "input_features": dict(
@@ -248,6 +341,46 @@ def pad_and_flatten(
 
     num_items = [t.size(0) for t in padded_list]
     return torch.cat(padded_list, dim=0), num_items
+
+
+def build_rl_forward_kwargs(args: Namespace, batch: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Build policy-forward inputs shared by training and the P3O stats pass.
+
+    The returned flag identifies layouts that require unsplit tokens, so
+    callers can select the matching dynamic-CP process group around their own
+    forward. Keeping that process-group mutation outside this pure helper
+    preserves each caller's distinct lifetime while keeping the model inputs
+    identical.
+    """
+    is_vl_model = bool(getattr(args, "is_vl_model", False))
+    multimodal_inputs = batch.get("multimodal_train_inputs")
+    needs_unsplit = is_vl_model or multimodal_inputs is not None or getattr(args, "uses_unsplit_forward", False)
+    use_unsplit = needs_unsplit and "unsplit_tokens" in batch
+
+    forward_kwargs = {
+        "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
+        "position_ids": None,
+        "attention_mask": None,
+        "labels": None,
+        "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
+        "loss_mask": batch["full_loss_masks"],
+    }
+
+    # THD VL+CP uses the bridge-specific attention mask and packed layout. The
+    # external RL loss consumes full_loss_masks, so GPTModel must not compute an
+    # internal loss for this bridge path.
+    if needs_unsplit and "vlm_packed_seq_params" in batch:
+        forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
+        forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
+        forward_kwargs["loss_mask"] = None
+
+    # Text-only batches for a VL checkpoint deliberately carry no multimodal
+    # kwargs. Custom multimodal data with is_vl_model=False follows the same
+    # gate in both the stats and gradient passes.
+    if is_vl_model and multimodal_inputs:
+        forward_kwargs.update(multimodal_inputs)
+
+    return forward_kwargs, needs_unsplit
 
 
 def get_batch(
@@ -401,6 +534,7 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
+            cu_seqlens_cpu = cu_seqlens_list
             cu_seqlens = torch.tensor(
                 cu_seqlens_list, dtype=torch.int, device=device_utils.make_current_torch_device()
             )
@@ -424,6 +558,7 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
+            cu_seqlens_cpu = [value * cp_size for value in cu_seqlens]
             cu_seqlens = (
                 torch.tensor(cu_seqlens, dtype=torch.int).to(device_utils.make_current_torch_device()) * cp_size
             )
@@ -439,6 +574,13 @@ def get_batch(
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group
+        if getattr(get_args(), "advantage_estimator", None) == "p3o":
+            # P3O's strict CP path reconstructs the CP1 TransformerLayer shape
+            # without changing this existing token layout. Keep the host
+            # boundaries so every layer avoids a device-to-host synchronization.
+            packed_seq_params._relax_total_lengths = list(batch["total_lengths"])
+            packed_seq_params._relax_attention_pad_multiple = pad_size
+            packed_seq_params._relax_cu_seqlens_cpu = cu_seqlens_cpu
 
         tokens = tokens.unsqueeze(0)
     else:
@@ -701,6 +843,24 @@ class DataIterator:
         """Reset internal offset to the start and return self."""
         self.offset = 0
         return self
+
+    def snapshot_position(self) -> int:
+        """Return the current offset so it can be restored later.
+
+        ``reset()`` rewinds to the start of the whole rollout, which is wrong
+        for replaying a single optimizer window that begins mid-rollout. P3O's
+        ESS pre-pass consumes the window once and must hand the iterator back
+        exactly where it found it.
+        """
+        return self.offset
+
+    def restore_position(self, position: int) -> None:
+        """Restore an offset previously returned by :meth:`snapshot_position`.
+
+        Works for both the fixed micro-batch-size and the explicit
+        ``micro_batch_indices`` schedule, including non-zero start offsets.
+        """
+        self.offset = position
 
 
 def get_data_iterator(

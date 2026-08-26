@@ -196,6 +196,7 @@ def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: s
     total_length = len(sample.tokens) if sample.tokens else 0
     response_length = sample.response_length
     prompt_length = max(total_length - response_length, 0)
+    response_token_ids = list(sample.tokens[prompt_length:]) if sample.tokens else []
     multimodal_stats = get_sample_multimodal_stats(sample)
     metadata = sample.metadata or {}
     record = {
@@ -209,6 +210,7 @@ def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: s
         "total_length": total_length,
         "prompt_token_count": prompt_length,
         "response_token_count": response_length,
+        "response_token_ids": response_token_ids,
         "total_token_count": total_length,
         "image_count": multimodal_stats["image_count"],
         "image_token_count": multimodal_stats["image_token_count"],
@@ -217,6 +219,10 @@ def _sample_to_summary_record(sample, rollout_id: int, idx: int, dataset_name: s
         "status": sample.status.value if hasattr(sample.status, "value") else str(sample.status),
         "group_index": sample.group_index,
     }
+    if sample.rollout_log_probs is not None:
+        record["response_rollout_log_probs"] = list(sample.rollout_log_probs)
+    if sample.rollout_log_probs_mask is not None:
+        record["response_rollout_log_probs_mask"] = list(sample.rollout_log_probs_mask)
     if sample.label is not None:
         record["label"] = sample.label
     if sample.multimodal_inputs is not None:

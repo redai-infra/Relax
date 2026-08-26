@@ -225,15 +225,7 @@ class RewardExecutor:
         async with self._worker_init_lock:
             if self._workers:
                 return
-            self._workers = await asyncio.to_thread(
-                lambda: [
-                    RewardWorker.options(
-                        name=f"reward_worker_{i}",
-                        get_if_exists=True,
-                    ).remote()
-                    for i in range(self._num_workers)
-                ]
-            )
+            self._workers = await asyncio.to_thread(lambda: [RewardWorker.remote() for _ in range(self._num_workers)])
             logger.info(
                 "RewardExecutor: created %d RewardWorker actors (max_concurrency=%d)",
                 self._num_workers,

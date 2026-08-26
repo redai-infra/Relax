@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import contextlib
+import copy
 import dataclasses
 import gc
 import math
@@ -9,7 +11,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 
 import torch
@@ -45,12 +47,289 @@ from relax.utils.training.ppo_utils import (
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import DataIterator, get_batch
+from .data import DataIterator, build_rl_forward_kwargs, get_batch
 from .loss import loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .rollout_policy_lag import build_rollout_policy_age_metrics
 
 
 logger = get_logger(__name__)
+
+
+P3O_CP_ATTENTION_OOM_ERROR = (
+    "P3O strict mode refuses context-parallel size greater than one after full-sequence TransformerLayer OOM"
+)
+
+
+class _P3OSingletonCPGroup:
+    """Non-collective CP=1 view used by Megatron's THD RoPE path."""
+
+    @staticmethod
+    def size() -> int:
+        return 1
+
+    @staticmethod
+    def rank() -> int:
+        return 0
+
+
+_P3O_SINGLETON_CP_GROUP = _P3OSingletonCPGroup()
+
+
+def _resolve_p3o_attention_cp(attention: torch.nn.Module, packed_seq_params: object) -> tuple[int, object, int]:
+    """Resolve the effective CP group for one packed attention forward."""
+    local_cp_size = getattr(packed_seq_params, "local_cp_size", None)
+    if local_cp_size is not None:
+        cp_group = getattr(packed_seq_params, "cp_group", None)
+        if cp_group is None:
+            raise RuntimeError("P3O full-sequence attention requires packed_seq_params.cp_group for dynamic CP")
+        cp_size = int(local_cp_size)
+    else:
+        cp_group = attention.pg_collection.cp
+        cp_size = int(cp_group.size())
+    cp_rank = int(cp_group.rank()) if cp_size > 1 else 0
+    return cp_size, cp_group, cp_rank
+
+
+def _p3o_cp_gather_full(
+    hidden_states: torch.Tensor,
+    cu_seqlens: list[int],
+    cp_size: int,
+    cp_group: object,
+) -> torch.Tensor:
+    """Gather THD hidden-state shards before the shape-sensitive QKV GEMM."""
+    from .cp_utils import gdn_cp_gather_full
+
+    return gdn_cp_gather_full(hidden_states, cu_seqlens, cp_size, cp_group)
+
+
+def _p3o_cp_slice(
+    full_output: torch.Tensor,
+    cu_seqlens: list[int],
+    cp_size: int,
+    cp_rank: int,
+    cp_group: object,
+) -> torch.Tensor:
+    """Return the current rank's THD zig-zag shard from full attention
+    output."""
+    from .cp_utils import p3o_cp_replicated_slice
+
+    return p3o_cp_replicated_slice(full_output, cu_seqlens, cp_size, cp_rank, cp_group)
+
+
+def _canonicalize_p3o_attention_input(
+    full_hidden_states: torch.Tensor,
+    source_cu_seqlens: list[int],
+    total_lengths: list[int],
+    pad_multiple: int,
+) -> tuple[torch.Tensor, list[int]]:
+    """Remove CP-only padding and reproduce the CP1 packed sequence shape."""
+    if pad_multiple <= 0:
+        raise ValueError(f"P3O attention pad multiple must be positive, got {pad_multiple}")
+    if not total_lengths:
+        raise ValueError("P3O full-sequence attention requires at least one packed sequence")
+    if len(source_cu_seqlens) not in {len(total_lengths) + 1, len(total_lengths) + 2}:
+        raise ValueError(
+            f"P3O attention metadata mismatch: cu_seqlens={len(source_cu_seqlens)}, total_lengths={len(total_lengths)}"
+        )
+    if (
+        source_cu_seqlens[0] != 0
+        or any(end < start for start, end in zip(source_cu_seqlens[:-1], source_cu_seqlens[1:], strict=True))
+        or source_cu_seqlens[-1] != full_hidden_states.shape[0]
+    ):
+        raise ValueError(
+            "P3O attention cu_seqlens must be monotonic and span the reconstructed tensor: "
+            f"cu_seqlens={source_cu_seqlens}, tokens={full_hidden_states.shape[0]}"
+        )
+
+    pieces: list[torch.Tensor] = []
+    canonical_cu_seqlens = [0]
+    for index, total_length in enumerate(total_lengths):
+        source_start = source_cu_seqlens[index]
+        source_end = source_cu_seqlens[index + 1]
+        if total_length < 0 or source_end - source_start < total_length:
+            raise ValueError(
+                "P3O attention source segment is shorter than its real sequence: "
+                f"index={index}, source_length={source_end - source_start}, total_length={total_length}"
+            )
+        pieces.append(full_hidden_states[source_start : source_start + total_length])
+        canonical_cu_seqlens.append(canonical_cu_seqlens[-1] + total_length)
+
+    canonical_padding = (-canonical_cu_seqlens[-1]) % pad_multiple
+    if canonical_padding:
+        trailing_start = source_cu_seqlens[len(total_lengths)]
+        trailing_end = source_cu_seqlens[-1]
+        available_padding = min(trailing_end - trailing_start, canonical_padding)
+        if available_padding:
+            pieces.append(full_hidden_states[trailing_start : trailing_start + available_padding])
+        missing_padding = canonical_padding - available_padding
+        if missing_padding:
+            pieces.append(full_hidden_states.new_zeros((missing_padding, *full_hidden_states.shape[1:])))
+        canonical_cu_seqlens.append(canonical_cu_seqlens[-1] + canonical_padding)
+
+    return torch.cat(pieces, dim=0), canonical_cu_seqlens
+
+
+def _restore_p3o_attention_output_layout(
+    canonical_output: torch.Tensor,
+    source_cu_seqlens: list[int],
+    total_lengths: list[int],
+) -> torch.Tensor:
+    """Map real-token outputs back into the original CP-padded THD layout."""
+    if canonical_output.shape[0] < sum(total_lengths):
+        raise ValueError(
+            "P3O canonical attention output is shorter than the real-token total: "
+            f"output={canonical_output.shape[0]}, total={sum(total_lengths)}"
+        )
+    output = canonical_output.new_zeros((source_cu_seqlens[-1], *canonical_output.shape[1:]))
+    canonical_start = 0
+    for index, total_length in enumerate(total_lengths):
+        source_start = source_cu_seqlens[index]
+        output[source_start : source_start + total_length] = canonical_output[
+            canonical_start : canonical_start + total_length
+        ]
+        canonical_start += total_length
+    return output
+
+
+def _build_p3o_full_sequence_layer_forward(layer: torch.nn.Module) -> Callable:
+    """Wrap one TransformerLayer with P3O's strict CP-equivalent path."""
+    original_forward = layer.forward
+
+    @wraps(original_forward)
+    def full_sequence_forward(
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        rotary_pos_emb: object | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        inference_context: object | None = None,
+        packed_seq_params: object | None = None,
+        sequence_len_offset: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        *,
+        inference_params: object | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, object | None]:
+        if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+            raise RuntimeError("P3O full-sequence layers require THD packed_seq_params when CP>1")
+
+        attention = getattr(layer, "self_attention", None)
+        if attention is None:
+            raise RuntimeError("P3O full-sequence layer requires a self_attention module")
+        cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
+        if cp_size == 1:
+            return original_forward(
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                rotary_pos_cos_sin,
+                attention_bias,
+                inference_context,
+                packed_seq_params,
+                sequence_len_offset,
+                padding_mask,
+                inference_params=inference_params,
+                **kwargs,
+            )
+        if padding_mask is not None:
+            raise RuntimeError("P3O strict full-sequence layers do not support a CP-local padding_mask")
+
+        cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu", None)
+        if cu_seqlens_cpu is None:
+            cu_seqlens_cpu = packed_seq_params.cu_seqlens_q.tolist()
+            packed_seq_params._relax_cu_seqlens_cpu = cu_seqlens_cpu
+
+        original_cp_group = attention.pg_collection.cp
+        try:
+            full_hidden_states = _p3o_cp_gather_full(hidden_states, cu_seqlens_cpu, cp_size, cp_group)
+            total_lengths = getattr(packed_seq_params, "_relax_total_lengths", None)
+            pad_multiple = getattr(packed_seq_params, "_relax_attention_pad_multiple", None)
+            if total_lengths is None or pad_multiple is None:
+                raise RuntimeError("P3O full-sequence attention requires Relax packed-length metadata")
+            canonical_hidden_states, canonical_cu_seqlens = _canonicalize_p3o_attention_input(
+                full_hidden_states,
+                cu_seqlens_cpu,
+                total_lengths,
+                pad_multiple,
+            )
+            full_packed_seq_params = copy.copy(packed_seq_params)
+            full_packed_seq_params.local_cp_size = 1
+            full_packed_seq_params.cp_group = _P3O_SINGLETON_CP_GROUP
+            canonical_cu_seqlens_tensor = packed_seq_params.cu_seqlens_q.new_tensor(canonical_cu_seqlens)
+            full_packed_seq_params.cu_seqlens_q = canonical_cu_seqlens_tensor
+            full_packed_seq_params.cu_seqlens_kv = canonical_cu_seqlens_tensor
+            full_packed_seq_params.max_seqlen_q = max(
+                end - start for start, end in zip(canonical_cu_seqlens[:-1], canonical_cu_seqlens[1:], strict=True)
+            )
+            full_packed_seq_params.max_seqlen_kv = full_packed_seq_params.max_seqlen_q
+            if hasattr(full_packed_seq_params, "cu_seqlens_q_padded"):
+                full_packed_seq_params.cu_seqlens_q_padded = None
+                full_packed_seq_params.cu_seqlens_kv_padded = None
+            full_output, full_context = original_forward(
+                canonical_hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                rotary_pos_cos_sin,
+                attention_bias,
+                inference_context,
+                full_packed_seq_params,
+                sequence_len_offset,
+                padding_mask,
+                inference_params=inference_params,
+                **kwargs,
+            )
+            source_layout_output = _restore_p3o_attention_output_layout(
+                full_output,
+                cu_seqlens_cpu,
+                total_lengths,
+            )
+            return _p3o_cp_slice(
+                source_layout_output,
+                cu_seqlens_cpu,
+                cp_size,
+                cp_rank,
+                cp_group,
+            ), full_context
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
+        finally:
+            attention.pg_collection.cp = original_cp_group
+
+    return full_sequence_forward
+
+
+def _install_p3o_full_sequence_attention(args: Namespace, model: torch.nn.Module) -> int:
+    """Install strict full-sequence attention for P3O whenever configured CP is
+    greater than one."""
+    if getattr(args, "advantage_estimator", None) != "p3o" or getattr(args, "context_parallel_size", 1) <= 1:
+        return 0
+
+    installed = 0
+    for module in model.modules():
+        if type(module).__name__ != "TransformerLayer" or getattr(
+            module, "_relax_p3o_full_sequence_layer_installed", False
+        ):
+            continue
+        attention = getattr(module, "self_attention", None)
+        if attention is None or not hasattr(attention, "pg_collection") or not hasattr(attention.pg_collection, "cp"):
+            raise RuntimeError("P3O full-sequence layer requires SelfAttention.pg_collection.cp")
+        module.forward = _build_p3o_full_sequence_layer_forward(module)
+        module._relax_p3o_full_sequence_layer_installed = True
+        installed += 1
+    return installed
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -81,6 +360,247 @@ def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         if module is None:
             return None
     return None
+
+
+def _find_p3o_post_process_modules(
+    model: torch.nn.Module,
+) -> tuple[torch.nn.Module, torch.nn.Module] | None:
+    """Find the final normalization and LM head on the last pipeline stage."""
+    module = unwrap_model(model)
+    for _ in range(4):
+        output_layer = getattr(module, "output_layer", None)
+        decoder = getattr(module, "decoder", None)
+        final_layernorm = getattr(decoder, "final_layernorm", None)
+        if output_layer is not None and not isinstance(output_layer, torch.nn.Identity):
+            if final_layernorm is None:
+                raise RuntimeError("P3O strict CP post-processing requires decoder.final_layernorm")
+            return final_layernorm, output_layer
+        module = getattr(module, "module", None) or getattr(module, "language_model", None)
+        if module is None:
+            return None
+    return None
+
+
+def _find_p3o_embedding(model: torch.nn.Module) -> torch.nn.Module | None:
+    """Find the token embedding on the first pipeline stage."""
+    module = unwrap_model(model)
+    for _ in range(4):
+        embedding = getattr(module, "embedding", None)
+        if embedding is not None and not isinstance(embedding, torch.nn.Identity):
+            return embedding
+        module = getattr(module, "module", None) or getattr(module, "language_model", None)
+        if module is None:
+            return None
+    return None
+
+
+def _build_p3o_full_sequence_embedding_forward(
+    module: torch.nn.Module,
+    packed_seq_params: object,
+    cp_size: int,
+    cp_group: object,
+    cp_rank: int,
+) -> Callable:
+    """Run the embedding weight-gradient accumulation in canonical CP1
+    order."""
+    original_forward = module.forward
+    cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu")
+    total_lengths = getattr(packed_seq_params, "_relax_total_lengths")
+    pad_multiple = getattr(packed_seq_params, "_relax_attention_pad_multiple")
+
+    def canonicalize_batch_first(value: torch.Tensor | None) -> torch.Tensor | None:
+        if value is None:
+            return None
+        if value.ndim < 2 or value.shape[0] != 1:
+            raise RuntimeError(
+                f"P3O strict CP embedding requires batch-first singleton inputs, got shape={tuple(value.shape)}"
+            )
+        full_value = _p3o_cp_gather_full(value.transpose(0, 1).contiguous(), cu_seqlens_cpu, cp_size, cp_group)
+        canonical_value, _ = _canonicalize_p3o_attention_input(
+            full_value,
+            cu_seqlens_cpu,
+            total_lengths,
+            pad_multiple,
+        )
+        return canonical_value.transpose(0, 1).contiguous()
+
+    @wraps(original_forward)
+    def full_sequence_forward(
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        tokentype_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        try:
+            canonical_input_ids = canonicalize_batch_first(input_ids)
+            if canonical_input_ids is None:
+                raise RuntimeError("P3O strict CP embedding requires input_ids")
+            canonical_output = original_forward(
+                canonical_input_ids,
+                canonicalize_batch_first(position_ids),
+                canonicalize_batch_first(tokentype_ids),
+            )
+            from .cp_utils import gdn_cp_slice, p3o_cp_canonical_full
+
+            canonical_output = p3o_cp_canonical_full(canonical_output, cp_group)
+            source_layout_output = _restore_p3o_attention_output_layout(
+                canonical_output,
+                cu_seqlens_cpu,
+                total_lengths,
+            )
+            return gdn_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank)
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
+
+    return full_sequence_forward
+
+
+@contextmanager
+def _p3o_full_sequence_embedding(
+    args: Namespace,
+    model: torch.nn.Module,
+    packed_seq_params: object | None,
+) -> Iterator[None]:
+    """Canonicalize token-embedding forward/backward under strict CP."""
+    if getattr(args, "advantage_estimator", None) != "p3o" or getattr(args, "context_parallel_size", 1) <= 1:
+        yield
+        return
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        raise RuntimeError("P3O strict CP embedding requires THD packed_seq_params")
+    embedding = _find_p3o_embedding(model)
+    if embedding is None:
+        yield
+        return
+    attention = next((candidate for candidate in model.modules() if type(candidate).__name__ == "SelfAttention"), None)
+    if attention is None:
+        raise RuntimeError("P3O strict CP embedding requires a SelfAttention module")
+    cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
+    if cp_size == 1:
+        yield
+        return
+
+    original_forward = embedding.forward
+    try:
+        embedding.forward = _build_p3o_full_sequence_embedding_forward(
+            embedding,
+            packed_seq_params,
+            cp_size,
+            cp_group,
+            cp_rank,
+        )
+        yield
+    finally:
+        try:
+            del embedding.forward
+        except AttributeError:
+            embedding.forward = original_forward
+
+
+def _build_p3o_full_sequence_post_process_forward(
+    module: torch.nn.Module,
+    packed_seq_params: object,
+    cp_size: int,
+    cp_group: object,
+    cp_rank: int,
+    *,
+    stash_full_logits: bool,
+) -> Callable:
+    """Make one token-wise post-process module use the canonical CP1 shape."""
+    original_forward = module.forward
+    cu_seqlens_cpu = getattr(packed_seq_params, "_relax_cu_seqlens_cpu")
+    total_lengths = getattr(packed_seq_params, "_relax_total_lengths")
+    pad_multiple = getattr(packed_seq_params, "_relax_attention_pad_multiple")
+
+    @wraps(original_forward)
+    def full_sequence_forward(hidden_states: torch.Tensor, *args: object, **kwargs: object):
+        try:
+            full_hidden_states = _p3o_cp_gather_full(hidden_states, cu_seqlens_cpu, cp_size, cp_group)
+            canonical_hidden_states, _ = _canonicalize_p3o_attention_input(
+                full_hidden_states,
+                cu_seqlens_cpu,
+                total_lengths,
+                pad_multiple,
+            )
+            sequence_parallel = getattr(module, "sequence_parallel", None)
+            if sequence_parallel is not None:
+                module.sequence_parallel = False
+            try:
+                result = original_forward(canonical_hidden_states, *args, **kwargs)
+            finally:
+                if sequence_parallel is not None:
+                    module.sequence_parallel = sequence_parallel
+
+            output = result[0] if isinstance(result, tuple) else result
+            from .cp_utils import gdn_cp_slice, p3o_cp_canonical_full
+
+            canonical_output = p3o_cp_canonical_full(output, cp_group)
+            if stash_full_logits:
+                # GPTModel's public policy-logit contract is FP32.  Stashing
+                # inside the raw LM head happens before that outer contract is
+                # applied, so make the canonical full view match the tensor
+                # consumed by the ordinary CP1 loss path.
+                packed_seq_params._relax_p3o_canonical_full_logits = (
+                    canonical_output.transpose(0, 1).float().contiguous()
+                )
+            source_layout_output = _restore_p3o_attention_output_layout(
+                canonical_output,
+                cu_seqlens_cpu,
+                total_lengths,
+            )
+            local_output = gdn_cp_slice(source_layout_output, cu_seqlens_cpu, cp_size, cp_rank)
+            if isinstance(result, tuple):
+                return (local_output, *result[1:])
+            return local_output
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(P3O_CP_ATTENTION_OOM_ERROR) from exc
+
+    return full_sequence_forward
+
+
+@contextmanager
+def _p3o_full_sequence_post_process(
+    args: Namespace,
+    model: torch.nn.Module,
+    packed_seq_params: object | None,
+) -> Iterator[None]:
+    """Canonicalize final RMSNorm and LM-head forward/backward under strict
+    CP."""
+    if getattr(args, "advantage_estimator", None) != "p3o" or getattr(args, "context_parallel_size", 1) <= 1:
+        yield
+        return
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        raise RuntimeError("P3O strict CP post-processing requires THD packed_seq_params")
+    modules = _find_p3o_post_process_modules(model)
+    if modules is None:
+        yield
+        return
+    attention = next((module for module in model.modules() if type(module).__name__ == "SelfAttention"), None)
+    if attention is None:
+        raise RuntimeError("P3O strict CP post-processing requires a SelfAttention module")
+    cp_size, cp_group, cp_rank = _resolve_p3o_attention_cp(attention, packed_seq_params)
+    if cp_size == 1:
+        yield
+        return
+
+    originals: list[tuple[torch.nn.Module, Callable]] = []
+    try:
+        for module_index, module in enumerate(modules):
+            original_forward = module.forward
+            module.forward = _build_p3o_full_sequence_post_process_forward(
+                module,
+                packed_seq_params,
+                cp_size,
+                cp_group,
+                cp_rank,
+                stash_full_logits=module_index == 1,
+            )
+            originals.append((module, original_forward))
+        yield
+    finally:
+        for module, original_forward in originals:
+            try:
+                del module.forward
+            except AttributeError:
+                module.forward = original_forward
 
 
 @contextmanager
@@ -169,6 +689,108 @@ def _bypass_output_layer(
             del output_layer.forward
         except AttributeError:
             output_layer.forward = original_forward
+
+
+@contextmanager
+def _preserved_dynamic_cp_group(args: Namespace, model: Sequence[torch.nn.Module]) -> Iterator[None]:
+    """Restore the static context-parallel group after dynamic-CP forwards."""
+    if not getattr(args, "dynamic_context_parallel", False):
+        yield
+        return
+
+    inner = model[0]
+    while hasattr(inner, "module"):
+        inner = inner.module
+    original_cp_group = inner.pg_collection.cp
+    try:
+        yield
+    finally:
+        inner.pg_collection.cp = original_cp_group
+
+
+P3O_NO_VALID_TOKENS_ERROR = (
+    "P3O: optimizer step has no valid response tokens globally; refusing optimizer and scheduler advancement."
+)
+
+
+def _require_p3o_global_valid_tokens(
+    num_tokens: torch.Tensor | int | None,
+    device: torch.device,
+) -> None:
+    """Fail a P3O step before gradient normalization can divide by zero.
+
+    The pipeline schedule supplies its exact CP-local token total to
+    ``finalize_model_grads_func`` after all micro-batches. Reduce it over DP x
+    CP on the pipeline-last stage, then publish the result to all pipeline
+    stages so every rank takes the same failure path. The single host read is
+    intentionally at this optimizer-step boundary rather than in the per-micro-
+    batch loss hot path.
+    """
+    valid_token_count = torch.zeros((), dtype=torch.float64, device=device)
+    is_pipeline_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=True)
+    if is_pipeline_last_stage and num_tokens is not None:
+        if isinstance(num_tokens, torch.Tensor):
+            local_num_tokens = num_tokens.detach().to(device=device, dtype=torch.float64)
+        else:
+            local_num_tokens = torch.tensor(num_tokens, device=device, dtype=torch.float64)
+        if local_num_tokens.numel() != 1:
+            raise ValueError(f"P3O valid-token count must be scalar, got shape {tuple(local_num_tokens.shape)}")
+        valid_token_count += local_num_tokens.reshape(())
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if distributed and is_pipeline_last_stage:
+        torch.distributed.all_reduce(
+            valid_token_count,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=True),
+        )
+
+    if distributed and mpu.get_pipeline_model_parallel_world_size() > 1:
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        torch.distributed.broadcast(
+            valid_token_count,
+            group=pp_group,
+            group_src=torch.distributed.get_world_size(group=pp_group) - 1,
+        )
+
+    if valid_token_count.item() <= 0.0:
+        raise RuntimeError(P3O_NO_VALID_TOKENS_ERROR)
+
+
+@contextmanager
+def _p3o_valid_token_finalizer(args: Namespace, model: Sequence[torch.nn.Module]) -> Iterator[None]:
+    """Install P3O's zero-token guard immediately before gradient
+    finalization."""
+    if getattr(args, "advantage_estimator", None) != "p3o":
+        yield
+        return
+
+    config = get_model_config(model[0])
+    original_finalize_model_grads = config.finalize_model_grads_func
+    if original_finalize_model_grads is None:
+        raise RuntimeError("P3O requires Megatron's gradient finalizer to be configured before training")
+    device = next(model[0].parameters()).device
+
+    def finalize_with_p3o_token_guard(
+        finalizer_model: Sequence[torch.nn.Module],
+        num_tokens: torch.Tensor | int | None = None,
+        **kwargs: object,
+    ) -> None:
+        _require_p3o_global_valid_tokens(num_tokens, device)
+        original_finalize_model_grads(finalizer_model, num_tokens, **kwargs)
+
+    config.finalize_model_grads_func = finalize_with_p3o_token_guard
+    try:
+        yield
+    finally:
+        config.finalize_model_grads_func = original_finalize_model_grads
+
+
+def _require_p3o_step_context_tokens(step_context: object) -> None:
+    """Reject a globally empty P3O step before its training schedule starts."""
+    valid_token_count = getattr(step_context, "valid_token_count")
+    if valid_token_count.item() <= 0.0:
+        raise RuntimeError(P3O_NO_VALID_TOKENS_ERROR)
 
 
 def _should_use_sft_chunked(args: Namespace) -> bool:
@@ -320,6 +942,13 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+
+    if getattr(args, "advantage_estimator", None) == "p3o" and getattr(args, "context_parallel_size", 1) > 1:
+        installed_full_sequence_layers = sum(
+            _install_p3o_full_sequence_attention(args, model_chunk) for model_chunk in model
+        )
+        if installed_full_sequence_layers == 0:
+            raise RuntimeError("P3O context parallelism requires at least one supported TransformerLayer")
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
@@ -1062,35 +1691,8 @@ def train_one_step(
                 loss_mask=batch["full_loss_masks"],
             )
         else:
-            has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
-            needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
-            use_unsplit = needs_unsplit and "unsplit_tokens" in batch
-
-            forward_kwargs = {
-                "input_ids": batch["unsplit_tokens"] if use_unsplit else batch["tokens"],
-                "position_ids": None,
-                "attention_mask": None,
-                "labels": None,
-                "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
-                "loss_mask": batch["full_loss_masks"],
-            }
-
-            # thd VL+CP: bridge needs per-sample attention_mask + matching thd
-            # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
-            # because labels=None means GPTModel won't run internal loss;
-            # Relax's loss is computed externally from full_loss_masks.
-            if needs_unsplit and "vlm_packed_seq_params" in batch:
-                forward_kwargs["attention_mask"] = batch["unsplit_attention_mask"]
-                forward_kwargs["packed_seq_params"] = batch["vlm_packed_seq_params"]
-                forward_kwargs["loss_mask"] = None
-
+            forward_kwargs, needs_unsplit = build_rl_forward_kwargs(args, batch)
             _attach_mtp_forward_kwargs(args, batch, forward_kwargs)
-
-            # VL model with text-only batch has is_vl_model=True but no
-            # multimodal_train_inputs in batch — no kwargs to splice in.
-            mm_inputs = batch.get("multimodal_train_inputs")
-            if is_vl_model and mm_inputs:
-                forward_kwargs.update(mm_inputs)
 
             # Dynamic CP: point pg_collection.cp at this mb's dynamic CP sub-group for
             # the VL bridge forward. Set every mb (incl. size 1) to avoid a stale group
@@ -1115,7 +1717,9 @@ def train_one_step(
                 ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
-                output_tensor = model(**forward_kwargs)
+                with _p3o_full_sequence_embedding(args, model, batch.get("packed_seq_params")):
+                    with _p3o_full_sequence_post_process(args, model, batch.get("packed_seq_params")):
+                        output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -1125,15 +1729,6 @@ def train_one_step(
         # routes to sft_loss_function_chunked when both --sft-chunked-logits
         # and lm_head_forward are set.
         return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
-
-    # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
-    # save the original static CP group here and restore after forward+backward.
-    _dcp_orig_cp_group = None
-    if getattr(args, "dynamic_context_parallel", False):
-        inner = model[0]
-        while hasattr(inner, "module"):
-            inner = inner.module
-        _dcp_orig_cp_group = inner.pg_collection.cp
 
     # Forward pass.
     use_streaming = (
@@ -1158,19 +1753,42 @@ def train_one_step(
             forward_backward_func = streaming_forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-    )
 
-    if _dcp_orig_cp_group is not None:
-        inner.pg_collection.cp = _dcp_orig_cp_group
+    # Dynamic CP mutates the model's CP process group inside each forward.
+    # Protect both P3O passes so failures cannot leak a per-micro-batch group.
+    with _preserved_dynamic_cp_group(args, model):
+        # Optional step scope freezes one adaptive cap before gradients are
+        # produced. Micro-batch scope computes its cap inside the loss callback.
+        p3o_context_manager = contextlib.nullcontext()
+        if (
+            getattr(args, "advantage_estimator", None) == "p3o"
+            and getattr(args, "p3o_ess_scope", "micro-batch") == "step"
+        ):
+            from relax.backends.megatron.p3o_step import (
+                compute_p3o_step_context,
+                p3o_step_context_published,
+            )
+
+            p3o_step_context = compute_p3o_step_context(
+                args=args,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+            )
+            _require_p3o_step_context_tokens(p3o_step_context)
+            p3o_context_manager = p3o_step_context_published(args, p3o_step_context)
+
+        with _p3o_valid_token_finalizer(args, model), p3o_context_manager:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+            )
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
@@ -1457,6 +2075,18 @@ def train(
                 log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
                     num_per_epoch * num_steps_per_rollout
                 )
+
+            # P3O observability: track rollout policy age
+            if getattr(args, "advantage_estimator", None) == "p3o" and args.update_weights_interval > 1:
+                snapshot_rollout = getattr(args, "rollout_policy_snapshot_rollout", 0)
+                current_rollout = rollout_id
+                log_dict.update(
+                    build_rollout_policy_age_metrics(
+                        current_rollout_id=current_rollout,
+                        rollout_policy_snapshot_rollout=snapshot_rollout,
+                    )
+                )
+
             tracking_utils.log(args, log_dict, step_key="train/step")
             tracking_utils.flush_metrics(args, accumulated_step_id)
 

@@ -212,6 +212,8 @@ def get_model_provider_func(
         # Override provider attributes with matching args values
         bridge_keys = [
             "attention_backend",
+            "deterministic_mode",
+            "batch_invariant_mode",
             "tensor_model_parallel_size",
             "sequence_parallel",
             "pipeline_model_parallel_size",
@@ -313,6 +315,13 @@ def get_model_provider_func(
             provider.fp16 = False
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
+        else:
+            # The HF checkpoint may advertise a reduced-precision dtype.  When
+            # both Megatron precision flags are disabled, make the requested
+            # FP32 mode explicit instead of inheriting that checkpoint hint.
+            provider.fp16 = False
+            provider.bf16 = False
+            provider.params_dtype = torch.float32
 
         provider.finalize()
 

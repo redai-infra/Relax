@@ -130,7 +130,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
-    if exist and _is_megatron_checkpoint(load_path):
+    if is_megatron_checkpoint_resume(load_path):
         _alias_renamed_transfer_queue_enum()
         try:
             return _load_checkpoint_megatron(
@@ -194,6 +194,14 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
     return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
         re.fullmatch(r"iter_\d{7}", Path(path).name)
     )
+
+
+def is_megatron_checkpoint_resume(path: str | Path | None) -> bool:
+    """Return whether ``path`` is a non-empty native Megatron resume source."""
+    if path is None:
+        return False
+    candidate = Path(path)
+    return candidate.is_dir() and _is_dir_nonempty(candidate) and _is_megatron_checkpoint(candidate)
 
 
 def _is_hf_checkpoint(path: str | Path) -> bool:

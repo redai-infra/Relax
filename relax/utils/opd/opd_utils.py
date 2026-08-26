@@ -680,9 +680,27 @@ def add_opd_arguments(parser: Any) -> Any:
     return parser
 
 
+def validate_p3o_opd_compatibility(args: Namespace) -> None:
+    """Reject the unsupported hybrid of P3O and on-policy distillation.
+
+    P3O owns its behavior-policy correction, adaptive cap, and trust-region
+    loss. OPD can independently modify rollout payloads, advantages, or add a
+    teacher loss, so composing the two would optimize an objective that neither
+    implementation defines.
+    """
+    if getattr(args, "advantage_estimator", None) == "p3o" and getattr(args, "use_opd", False):
+        raise ValueError(
+            "P3O and OPD are mutually exclusive: --advantage-estimator p3o uses an independent "
+            "policy-loss dispatch, while --use-opd changes teacher data, advantages, or loss terms. "
+            "Disable --use-opd or select a non-P3O advantage estimator."
+        )
+
+
 def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> None:
     if is_sft:
         return
+
+    validate_p3o_opd_compatibility(args)
 
     if not getattr(args, "use_opd", False):
         return

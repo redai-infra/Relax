@@ -277,11 +277,46 @@ SAPO_ARGS=(
 
 ---
 
+## P3O
+
+P3O corrects rollout-policy mismatch with selected-token behavior
+log-probabilities. It computes an effective sample size
+(ESS) from the importance ratios and uses the detached ESS value as a one-sided
+adaptive cap for the policy update.
+
+P3O is mutually exclusive with `--use-opd`: combining its objective with an OPD
+teacher loss or OPD advantage replacement would create an unvalidated hybrid.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--advantage-estimator p3o` | — | Enable P3O |
+| `--use-rollout-logprobs` | required | Use rollout behavior log-probabilities for importance ratios |
+| `--calculate-per-token-loss` | required | Preserve P3O's token-sum normalization |
+| `--p3o-ess-scope` | `micro-batch` | Compute the adaptive cap per micro-batch; `step` is available for replay validation |
+| `--p3o-kl-mode` | `proxy` | Behavior-KL approximation: `proxy` or `proxy_safe` |
+| `--clip-low`, `--clip-high` | `0.2` | P3O clip-fraction monitoring margins |
+
+The full-vocabulary `exact` KL calculation is a pure verification helper, not a
+production CLI mode: rollout records contain selected-token behavior
+log-probabilities rather than full behavior logits.
+
+### Recipes
+
+The A100×4 recipes pair P3O and GRPO with identical on-policy, periodic-sync,
+and temperature-mismatch scenarios. Start with
+`examples/algorithms/p3o/README.md`; use
+`examples/algorithms/p3o/run_p3o_smoke.sh` for a one-rollout smoke check.
+
+---
+
 ## Algorithm Comparison
 
 | Algorithm | Advantage Computation | Policy Loss | KL Constraint |
 |-----------|----------------------|-------------|---------------|
 | **PPO** | Critic values + GAE | PPO-Clip (hard clip) | Disabled in the current synchronous topology |
+| **P3O** | Rollout behavior log-probabilities + ESS | Detached one-sided adaptive cap | Sampled-token behavior-KL proxy |
 | **GRPO** | Group-relative reward | PPO-Clip (hard clip) | Optional KL loss |
 | **REINFORCE++** | Token KL-to-go return + global token normalization | PPO-Clip (hard clip) | k1 KL in shaped reward |
 | **REINFORCE++-baseline** | Inclusive group mean + global token normalization | PPO-Clip (hard clip) | Separate k2 KL loss |
@@ -295,5 +330,6 @@ SAPO_ARGS=(
 - [PPO Training](../guide/ppo-training.md)
 - [REINFORCE++ Training](../guide/reinforce-plus-plus.md)
 - [Quick Start](../guide/quick-start.md)
+- `examples/algorithms/p3o/README.md`
 - [On-Policy Distillation](./on-policy-distillation.md)
 - [Generative Reward Model](./generative-reward-model.md)

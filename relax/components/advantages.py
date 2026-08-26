@@ -18,6 +18,7 @@ from relax.utils.opd.opd_utils import (
     consume_opd_advantage_data,
 )
 from relax.utils.training.ppo_utils import (
+    GRPO_STYLE_ADVANTAGE_ESTIMATORS,
     compute_approx_kl,
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -173,7 +174,9 @@ class Advantages(Base):
                 for i in range(len(log_probs))
             ]
 
-        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
+        if self.config.advantage_estimator in GRPO_STYLE_ADVANTAGE_ESTIMATORS:
+            # P3O shares GRPO's group-relative advantage; the two differ only in
+            # how the policy-gradient coefficient is formed at loss time.
             rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
             returns = get_grpo_returns(rewards, kl)
             advantages = list(returns)  # make a copy
