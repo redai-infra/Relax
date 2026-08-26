@@ -51,6 +51,34 @@ class TestConvertMegatronToHfTargetModules:
         """Unknown / already-HF names are passed through unchanged."""
         assert convert_megatron_to_hf_target_modules(["q_proj", "custom_mod"]) == ["q_proj", "custom_mod"]
 
+    def test_convert_megatron_to_hf_expands_path_patterns(self):
+        """A Bridge path pattern contributes its trailing module name.
+
+        ``scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-lora-mtp-8xgpu.sh`` scopes
+        LoRA this way to keep the MTP layers frozen; without the reduction the glob
+        reached adapter_config.json verbatim.
+        """
+        result = convert_megatron_to_hf_target_modules(
+            ["*decoder.layers.*.linear_qkv", "*decoder.layers.*.linear_proj"]
+        )
+        assert result == ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+    def test_convert_megatron_to_hf_dedups_pattern_and_bare_name(self):
+        """A pattern and the bare name it ends with collapse to one entry."""
+        result = convert_megatron_to_hf_target_modules(["*decoder.layers.*.linear_proj", "linear_proj"])
+        assert result == ["o_proj"]
+
+    def test_convert_megatron_to_hf_accepts_exact_paths(self):
+        """A fully qualified module path works like a pattern."""
+        result = convert_megatron_to_hf_target_modules(["decoder.layers.0.self_attention.linear_qkv"])
+        assert result == ["q_proj", "k_proj", "v_proj"]
+
+    def test_convert_megatron_to_hf_rejects_trailing_wildcard(self):
+        """A glob in the trailing segment has no HF equivalent and must not be
+        written into adapter_config.json."""
+        with pytest.raises(ValueError, match="trailing segment"):
+            convert_megatron_to_hf_target_modules(["*decoder.layers.*.linear_*"])
+
     def test_convert_megatron_to_hf_empty(self):
         assert convert_megatron_to_hf_target_modules([]) == []
 
