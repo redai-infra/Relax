@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 import numpy as np
 import ray
-import transfer_queue as tq
 import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
@@ -52,6 +51,7 @@ from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.tq_lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -813,8 +813,12 @@ class RolloutManager(ReloadableMixin):
 
         self.data_source = data_source
 
-        tq.init(self.args.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.args.tq_config,
+            requested_gdr=getattr(self.args, "tq_use_gdr", False),
+            role="rollout_worker",
+            lease_owner=self,
+        )
 
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
@@ -917,6 +921,13 @@ class RolloutManager(ReloadableMixin):
         for monitor in self._health_monitors:
             monitor.stop()
         self._shutdown_all_engines()
+        # Deregister this worker's Mooncake segment before the actor dies so a
+        # fast restart does not hit stale endpoints until client_ttl expires.
+        generation = getattr(self, "_tq_client_generation", None)
+        if generation is not None:
+            detach_tq_client(generation)
+        self._tq_client_generation = None
+        self.data_system_client = None
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.

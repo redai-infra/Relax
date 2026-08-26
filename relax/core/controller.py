@@ -47,7 +47,22 @@ from relax.utils.opd.opd_utils import (
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
+from relax.utils.rdma_probe import probe_cluster_nodes, reduce_results, validate_config
 from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
+from relax.utils.tq_config import (
+    build_backend_config,
+    resolve_mooncake_master_address,
+    resolve_tq_capacity_batch_size,
+    validate_mooncake_runtime_contract,
+)
+from relax.utils.tq_lifecycle import (
+    TqInitResult,
+    close_tq_owner,
+    initialize_tq_with_fallback,
+    reap_unusable_tq_controller,
+    uses_mooncake,
+    verify_cluster_attach,
+)
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
 
@@ -131,6 +146,8 @@ class Controller:
             self._pending_task_refs_lock = threading.Lock()
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
+        self._tq_owner = None
+        self._tq_legacy_init = False
 
         # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
         # is launched (RL is resolved later in placement_group.py).
@@ -138,42 +155,55 @@ class Controller:
 
         # Initialize data management system
         self._initialize_data_system()
-        self.dcs, self.config.coordinator_url = create_dcs_deployment()
-
-        self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
-        if self._metrics_service_enabled:
-            self._deploy_metrics_service()
-
-        if self.config.use_agentic_rollout and not self.config.debug_train_only:
-            deploy_agentic_chat_api_services(
-                config=self.config,
-                runtime_env=self.runtime_env,
-            )
-        self._autoscaler_config = None
         try:
-            self.register_all_serve()
-        except Exception as e:
-            self._report_error_to_metrics_service(e)
+            self.dcs, self.config.coordinator_url = create_dcs_deployment()
+
+            self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
+            if self._metrics_service_enabled:
+                self._deploy_metrics_service()
+
+            if self.config.use_agentic_rollout and not self.config.debug_train_only:
+                deploy_agentic_chat_api_services(
+                    config=self.config,
+                    runtime_env=self.runtime_env,
+                )
+            self._autoscaler_config = None
+            try:
+                self.register_all_serve()
+            except Exception as e:
+                self._report_error_to_metrics_service(e)
+                raise
+
+            autoscaler_config_path = getattr(config, "autoscaler_config", None)
+            if autoscaler_config_path:
+                from relax.utils.autoscaler.config import AutoscalerConfig
+                from relax.utils.utils import get_serve_url
+
+                rollout_service_url = get_serve_url("/rollout")
+                self._autoscaler_config = AutoscalerConfig.from_yaml(autoscaler_config_path, rollout_service_url)
+                self._deploy_autoscaler_service()
+
+            # Start health management with service restart callback
+            if self._health_check_enabled:
+                self._health_manager.start(
+                    on_unhealthy=self._on_service_unhealthy,
+                    on_fatal=self._on_service_fatal,
+                )
+                logger.info("Global health check system enabled")
+            else:
+                logger.info("Global health check system disabled (use --use-health-check to enable)")
+        except Exception:
+            # Past this point a failed construction means Controller() never
+            # returns: train.main() cannot install its signal/atexit cleanup,
+            # so the TQ owner (and any TransferQueueController it owns) would
+            # be orphaned and the next launch would attach with owner=None,
+            # making its shutdown a no-op. Close what this job created.
+            logger.error("Controller construction failed after TQ initialization; closing TQ owner.")
+            try:
+                self._close_data_system()
+            except Exception as cleanup_error:  # pragma: no cover - best effort
+                logger.warning(f"TQ owner cleanup during failed construction failed: {cleanup_error}")
             raise
-
-        autoscaler_config_path = getattr(config, "autoscaler_config", None)
-        if autoscaler_config_path:
-            from relax.utils.autoscaler.config import AutoscalerConfig
-            from relax.utils.utils import get_serve_url
-
-            rollout_service_url = get_serve_url("/rollout")
-            self._autoscaler_config = AutoscalerConfig.from_yaml(autoscaler_config_path, rollout_service_url)
-            self._deploy_autoscaler_service()
-
-        # Start health management with service restart callback
-        if self._health_check_enabled:
-            self._health_manager.start(
-                on_unhealthy=self._on_service_unhealthy,
-                on_fatal=self._on_service_fatal,
-            )
-            logger.info("Global health check system enabled")
-        else:
-            logger.info("Global health check system disabled (use --use-health-check to enable)")
 
     def _cleanup_s3_model_weights_after_init(self) -> None:
         """Remove policy weight shards after every startup consumer is
@@ -242,11 +272,7 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        batch_size_for_capacity = (
-            self.config.over_sampling_batch_size
-            if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
-            else self.config.rollout_batch_size
-        )
+        batch_size_for_capacity = resolve_tq_capacity_batch_size(self.config)
         total_storage_size = (
             batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
         )
@@ -271,23 +297,229 @@ class Controller:
         else:
             sampler = GRPOGroupNSampler(n_samples_per_prompt=self.config.n_samples_per_prompt)
 
+        controller_config = {
+            "sampler": sampler,
+            "polling_mode": self.config.polling_mode,
+        }
+        backend_config = self._resolve_tq_backend(total_storage_size)
         tq_config = OmegaConf.create(
             {
-                "controller": {
-                    "sampler": sampler,
-                    "polling_mode": self.config.polling_mode,
-                },
-                "backend": {
-                    "SimpleStorage": {
-                        "total_storage_size": total_storage_size,
-                        "num_data_storage_units": self.config.num_data_storage_units,
-                    },
-                },
+                "controller": controller_config,
+                "backend": backend_config,
             },
             flags={"allow_objects": True},
         )
-        tq_config = tq.init(conf=tq_config) or tq_config
-        self.config.tq_config = tq_config
+
+        if getattr(self.config, "tq_storage_backend", "simple") == "simple":
+            # Preserve the upstream SimpleStorage ownership model: the first
+            # tq.init runs inside Controller and no _TransferQueueOwner actor
+            # is created.  Lifecycle hardening still applies: the F10 reaper
+            # removes a provably half-initialised controller, worker attaches
+            # use a 60-second default deadline, and constructor failure closes
+            # any legacy tq.init completed by this process.
+            reap_unusable_tq_controller()
+            self._tq_owner = None
+            self._tq_legacy_init = True
+            self.config.tq_config = tq.init(conf=tq_config) or tq_config
+            logger.info("[dataplane] backend=SimpleStorage (default in-process init, no owner actor)")
+            return
+
+        fallback_config = None
+        if backend_config.get("storage_backend") == "MooncakeStore":
+            from relax.utils.tq_config import build_simple_storage_config
+
+            fallback_config = OmegaConf.create(
+                {
+                    "controller": controller_config,
+                    "backend": build_simple_storage_config(
+                        total_storage_size=total_storage_size,
+                        num_data_storage_units=self.config.num_data_storage_units,
+                    ),
+                },
+                flags={"allow_objects": True},
+            )
+
+        init_result = initialize_tq_with_fallback(
+            tq_config,
+            mode=getattr(self.config, "tq_rdma_mode", "off"),
+            fallback_conf=fallback_config,
+        )
+        if uses_mooncake(init_result.config):
+            init_result = self._confirm_mooncake_attach(init_result, fallback_config)
+        self._tq_owner = init_result.owner
+        self.config.tq_config = init_result.config
+        if init_result.fallback_reason:
+            logger.warning(f"[dataplane] effective backend=SimpleStorage fallback={init_result.fallback_reason}")
+        logger.info(f"[dataplane] controller ownership={'owner' if init_result.owns_controller else 'attached'}")
+
+    def _confirm_mooncake_attach(self, init_result: TqInitResult, fallback_config) -> TqInitResult:
+        """Bounded attach handshake on every alive node before the job-level
+        Mooncake config is confirmed.
+
+        The RDMA probe cannot cover this: TQ clients live in Ray Serve replicas
+        and 0-CPU actors with no placement binding, so they may land on nodes
+        the GPU-only probe never saw, and a worker-side ``tq.init`` has no
+        timeout of its own.  The handshake attaches (bounded) from every alive
+        node and reports failures back here, so ``auto`` degrades the whole job
+        to one backend instead of hanging or failing a single replica mid-
+        deployment.
+        """
+        failures = verify_cluster_attach(init_result.config)
+        if not failures:
+            logger.info("[dataplane] Mooncake attach handshake passed on all alive nodes.")
+            return init_result
+
+        detail = "; ".join(failures)
+        mode = getattr(self.config, "tq_rdma_mode", "off")
+        if mode != "auto" or not init_result.owns_controller or fallback_config is None:
+            # off/required must fail loudly, and a job that merely attached to
+            # a foreign controller must never tear it down or replace its
+            # backend unilaterally.
+            if init_result.owns_controller:
+                close_tq_owner(init_result.owner)
+            raise RuntimeError(
+                f"Mooncake attach handshake failed on {len(failures)} node(s) (--tq-rdma-mode={mode}): {detail}"
+            )
+
+        logger.warning(
+            f"[dataplane] Mooncake attach handshake failed on {len(failures)} node(s) ({detail}); "
+            "closing Mooncake state and converging the whole job to SimpleStorage."
+        )
+        close_tq_owner(init_result.owner)
+        fallback_result = initialize_tq_with_fallback(fallback_config, mode="auto")
+        return TqInitResult(
+            config=fallback_result.config,
+            owner=fallback_result.owner,
+            fallback_reason=f"attach_handshake_failed:{len(failures)}_nodes",
+        )
+
+    def _resolve_tq_backend(self, total_storage_size: int) -> dict:
+        """Resolve the TransferQueue ``backend`` config dict.
+
+        ``--tq-storage-backend=simple`` retains the previous storage and
+        ownership semantics while sharing the bounded worker-attach and
+        failure-cleanup hardening.  When MooncakeStore is requested, this runs
+        the RDMA capability probe *before* ``tq.init``, applies graded
+        degradation, and emits the startup log line.
+        """
+        # 1. Validate flag combinations (structural, before any probe).
+        #    getattr defaults keep old checkpoints / non-argparse configs safe.
+        errors = validate_config(self.config)
+        if errors:
+            raise ValueError("Invalid TransferQueue RDMA configuration:\n  " + "\n  ".join(errors))
+
+        backend = getattr(self.config, "tq_storage_backend", "simple")
+        mode = getattr(self.config, "tq_rdma_mode", "off")
+
+        # 2. SimpleStorage short-circuit (default, zero behavior change).
+        #    ``mooncake + off`` is MooncakeStore/TCP, not SimpleStorage.
+        if backend == "simple":
+            from relax.utils.tq_config import build_simple_storage_config
+
+            return build_simple_storage_config(
+                total_storage_size=total_storage_size,
+                num_data_storage_units=self.config.num_data_storage_units,
+            )
+
+        # 3. MooncakeStore path: probe → reduce → effective config.
+        #    The driver fans the probe out to every alive GPU node via Ray
+        #    (probe_cluster_nodes), then AND-reduces to a single job-level
+        #    effective config so all data-plane workers converge identically.
+        device = getattr(self.config, "tq_rdma_device", "")
+        try:
+            validate_mooncake_runtime_contract()
+        except RuntimeError as e:
+            if mode != "auto":
+                raise RuntimeError(
+                    f"--tq-rdma-mode={mode} but the installed TransferQueue "
+                    f"does not satisfy the Mooncake correctness contract: {e}"
+                ) from e
+            from relax.utils.tq_config import build_simple_storage_config
+
+            logger.warning(
+                "[dataplane] Installed TransferQueue does not satisfy the Mooncake "
+                f"correctness contract; auto fallback to SimpleStorage: {e}"
+            )
+            return build_simple_storage_config(
+                total_storage_size=total_storage_size,
+                num_data_storage_units=self.config.num_data_storage_units,
+            )
+        master_address = resolve_mooncake_master_address()
+        probe_results = probe_cluster_nodes(device, master_address, probe_rdma=mode != "off")
+
+        effective = reduce_results(
+            probe_results,
+            requested_backend=backend,
+            requested_device=device,
+            use_gdr=getattr(self.config, "tq_use_gdr", False),
+            rdma_mode=mode,
+        )
+
+        # 4. Only auto mode may degrade. ``off`` explicitly requests
+        #    Mooncake/TCP, while ``required`` explicitly requires RDMA.
+        if mode != "auto" and effective.fallback_reason:
+            detail = "\n".join(r.summary() for r in probe_results)
+            raise RuntimeError(
+                f"--tq-rdma-mode={mode} but the requested Mooncake path is unavailable: "
+                f"{effective.fallback_reason}.\n"
+                f"Probe details:\n{detail}"
+            )
+
+        # 5. Build backend dict (may fall back to SimpleStorage on capacity error).
+        backend_dict, cap_error = build_backend_config(self.config, effective, total_storage_size=total_storage_size)
+        actual_backend = "MooncakeStore" if "MooncakeStore" in backend_dict else "SimpleStorage"
+
+        # 6. Capacity fallback is also auto-only. Explicit Mooncake/TCP and
+        #    required-RDMA requests fail instead of silently changing backend.
+        if mode != "auto" and cap_error:
+            raise RuntimeError(f"--tq-rdma-mode={mode} but segment capacity insufficient: {cap_error}")
+
+        # 7. GDR is EXPERIMENTAL in this phase: --tq-rdma-mode=required only
+        #    covers the *transport* (MooncakeStore + RDMA), not GDR.  The probe
+        #    cannot decide GDR eligibility -- it runs as a separate Ray task
+        #    where torch.cuda.is_initialized() is always False -- so the real
+        #    check happens per worker in the runtime client
+        #    (mooncake_client.py:87), which silently falls back to host RDMA.
+        use_gdr = getattr(self.config, "tq_use_gdr", False)
+        if use_gdr and (effective.protocol != "rdma" or actual_backend != "MooncakeStore"):
+            logger.warning(
+                "[dataplane] --tq-use-gdr requested but the effective path is not RDMA "
+                f"(protocol={effective.protocol}, backend={actual_backend}); GDR inactive."
+            )
+        elif use_gdr:
+            logger.warning(
+                "[dataplane] --tq-use-gdr is EXPERIMENTAL: eligibility is not probed, and "
+                "workers without an initialised CUDA context fall back to host RDMA silently. "
+                "--tq-rdma-mode=required does NOT fail fast on unavailable GDR."
+            )
+
+        # 8. Log requested vs effective so the startup log alone explains the
+        #    decision, plus one summary block per probed node.
+        logger.info(
+            f"[dataplane] requested: backend={backend} rdma_mode={mode} device={device or 'auto'} gdr={use_gdr}"
+        )
+        for result in probe_results:
+            logger.info(f"[dataplane] probe result:\n{result.summary()}")
+        if cap_error:
+            logger.warning(f"[dataplane] MooncakeStore capacity fallback to SimpleStorage: {cap_error}")
+            logger.info("[dataplane] backend=SimpleStorage protocol=tcp (capacity fallback)")
+        else:
+            logger.info(effective.log_line())
+        return backend_dict
+
+    def _close_data_system(self) -> None:
+        """Tear down the data system.
+
+        Default in-process path keeps upstream's plain ``tq.close()``;
+        owner-mediated runs delegate to
+        :func:`relax.utils.tq_lifecycle.close_tq_owner`.
+        """
+        if self._tq_legacy_init:
+            self._tq_legacy_init = False
+            tq.close()
+            return
+        close_tq_owner(self._tq_owner)
+        self._tq_owner = None
 
     def _deploy_metrics_service(self):
         """Deploy the MetricsService as a lightweight Ray Serve deployment.
@@ -806,6 +1038,11 @@ class Controller:
 
         self._shutdown_agentic_rollout_services()
 
+        try:
+            self._close_data_system()
+        except Exception as e:
+            logger.warning(f"Failed to tear down data system during controller shutdown: {e}")
+
         logger.info("Controller shutdown complete.")
 
     def add_serve(self, role: str) -> None:
@@ -1006,7 +1243,7 @@ class Controller:
 
         # --- 1.7 Tear down data system (storage units + controller) ---
         try:
-            tq.close()
+            self._close_data_system()
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to tear down data system: {e}")
 
