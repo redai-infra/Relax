@@ -134,6 +134,27 @@ def build_hf_peft_config_dict(
     }
 
 
+# PEFT wraps the base model as ``base_model.model``, so every key in a standard
+# ``adapter_model.safetensors`` carries that prefix. Bridge's adapter export yields bare
+# HF parameter names, which PEFT then cannot match: ``PeftModel.from_pretrained`` reports
+# the keys as missing (a warning, not an error) and leaves every ``lora_B`` at zero, i.e.
+# it silently loads an adapter that does nothing.
+PEFT_STATE_DICT_PREFIX = "base_model.model."
+
+
+def to_peft_state_dict(adapter_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Return ``adapter_weights`` keyed the way standard PEFT writes them.
+
+    Idempotent: keys that already carry the prefix are left alone, so callers that
+    hand over an exporter's output and callers that hand over an existing PEFT state
+    dict both get the same result.
+    """
+    return {
+        name if name.startswith(PEFT_STATE_DICT_PREFIX) else PEFT_STATE_DICT_PREFIX + name: tensor
+        for name, tensor in adapter_weights.items()
+    }
+
+
 def write_hf_peft_adapter(
     merged: dict[str, torch.Tensor],
     adapter_dir,
@@ -147,10 +168,12 @@ def write_hf_peft_adapter(
 
     Produces ``adapter_config.json`` + ``adapter_model.safetensors`` — the on-disk
     format used by the checkpoint save, which Megatron-Bridge's ``load_peft_adapter``
-    can read back.
+    can read back. Keys are normalized to PEFT's ``base_model.model.`` layout so the
+    directory also loads with ``peft.PeftModel.from_pretrained``.
 
     Args:
-        merged: Full (TP-gathered, PP-merged) adapter tensors keyed by HF name.
+        merged: Full (TP-gathered, PP-merged) adapter tensors keyed by HF name, with
+            or without the PEFT prefix (see ``to_peft_state_dict``).
         adapter_dir: Target directory (created if missing).
         lora_rank/lora_alpha/target_modules/lora_dropout: PEFT config written to
             ``adapter_config.json`` (HF-style target module names).
@@ -177,7 +200,7 @@ def write_hf_peft_adapter(
         json.dump(config_dict, f)
 
     # safetensors requires contiguous CPU tensors.
-    state = {name: t.contiguous() for name, t in merged.items()}
+    state = {name: t.contiguous() for name, t in to_peft_state_dict(merged).items()}
     save_file(state, str(adapter_dir / "adapter_model.safetensors"))
     return str(adapter_dir)
 
@@ -302,6 +325,8 @@ __all__ = [
     "count_adapter_parameters",
     "convert_megatron_to_hf_target_modules",
     "MEGATRON_TO_HF_MODULES",
+    "PEFT_STATE_DICT_PREFIX",
+    "to_peft_state_dict",
     "write_hf_peft_adapter",
     "extract_lora_delta",
     "is_lora_enabled",
