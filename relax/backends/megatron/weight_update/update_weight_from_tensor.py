@@ -16,6 +16,7 @@ from ray.actor import ActorHandle
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
+from relax.utils.cross_version_kv import cross_version_kv_enabled, cross_version_kv_pause_mode
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -194,14 +195,24 @@ class UpdateWeightFromTensor:
 
         self.weight_version += 1
 
-        # Pause/flush must cover both IPC and distributed-broadcast engines,
-        # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
+        # Pause must cover both IPC and distributed-broadcast engines so no
+        # request observes a partially loaded parameter set.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
+        pause_mode = cross_version_kv_pause_mode(self.args, self.weight_version)
+        preserve_kv = cross_version_kv_enabled(self.args) and pause_mode == "in_place"
 
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in all_engines])
-            ray.get([engine.flush_cache.remote() for engine in all_engines])
+            logger.info(
+                "Cross-version KV publication: weight_version=%s mode=%s preserve_kv=%s max_gap=%s",
+                self.weight_version,
+                pause_mode,
+                preserve_kv,
+                getattr(self.args, "cross_version_kv_max_gap", 0),
+            )
+            ray.get([engine.pause_generation.remote(mode=pause_mode) for engine in all_engines])
+            if not preserve_kv:
+                ray.get([engine.flush_cache.remote() for engine in all_engines])
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
                     restore_weights_before_load=True,
@@ -268,7 +279,7 @@ class UpdateWeightFromTensor:
                     post_process_quantization=True,
                     rollout_engines=all_engines,
                 )
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            ray.get([engine.continue_generation.remote(torch_empty_cache=not preserve_kv) for engine in all_engines])
         dist.barrier(group=get_gloo_group())
 
     def _update_weights_adapter_mode(self) -> None:

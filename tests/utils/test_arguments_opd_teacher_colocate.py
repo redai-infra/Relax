@@ -1,41 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import argparse
-import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
-
-@pytest.fixture()
-def arguments_module(monkeypatch):
-    router_pkg = ModuleType("sglang_router")
-    launch_router = ModuleType("sglang_router.launch_router")
-    launch_router.RouterArgs = object
-    monkeypatch.setitem(sys.modules, "sglang_router", router_pkg)
-    monkeypatch.setitem(sys.modules, "sglang_router.launch_router", launch_router)
-
-    sglang_arguments = ModuleType("relax.backends.sglang.arguments")
-    sglang_arguments.sglang_parse_args = lambda: None
-    sglang_arguments.validate_args = lambda args: args
-    monkeypatch.setitem(sys.modules, "relax.backends.sglang.arguments", sglang_arguments)
-
-    device = ModuleType("relax.utils.device")
-    device.get_dist_backend = lambda: "gloo"
-    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
-
-    eval_config = ModuleType("relax.utils.training.eval_config")
-    eval_config.EvalDatasetConfig = dict
-    eval_config.build_eval_dataset_configs = lambda args, datasets_config, defaults: []
-    eval_config.build_named_prompt_data_configs = lambda values: []
-    eval_config.ensure_dataset_list = lambda values: values or []
-    monkeypatch.setitem(sys.modules, "relax.utils.training.eval_config", eval_config)
-
-    sys.modules.pop("relax.utils.arguments", None)
-    module = importlib.import_module("relax.utils.arguments")
-    yield module
-    sys.modules.pop("relax.utils.arguments", None)
+from tests.utils.test_arguments_helpers import _arguments_module  # noqa: F401
 
 
 @pytest.mark.parametrize(
@@ -56,6 +26,18 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+def test_hybrid_gpu_snapshot_aliases_share_one_destination(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    canonical = parser.parse_args(["--hybrid-weights-backuper-on-gpu"])
+    maintainer_spelling = parser.parse_args(["--hybrid-weights-backup-on-gpu"])
+
+    assert canonical.hybrid_weights_backuper_on_gpu is True
+    assert maintainer_spelling.hybrid_weights_backuper_on_gpu is True
+
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
@@ -63,7 +45,11 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
         (["--sft-invalid-multimodal-strategy", "skip"], "skip"),
     ],
 )
-def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected):
+def test_sft_invalid_multimodal_strategy_option(
+    arguments_module,
+    argv,
+    expected,
+):
     arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
     parser = argparse.ArgumentParser()
     arguments_module.get_slime_extra_args_provider()(parser)
@@ -203,6 +189,50 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     assert args.rollout_num_gpus == 4
 
 
+def test_hybrid_dcs_weight_sync_requires_hybrid(arguments_module):
+    args = _opd_args()
+    args.hybrid_dcs_weight_sync = True
+
+    with pytest.raises(ValueError, match="requires --hybrid"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_hybrid_dcs_with_cross_version_kv_requires_slime_router(arguments_module):
+    args = _opd_args()
+    args.hybrid = True
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    args.use_slime_router = False
+
+    with pytest.raises(ValueError, match="requires --use-slime-router"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_hybrid_dcs_with_cross_version_kv_accepts_default_router(
+    arguments_module,
+):
+    args = _opd_args()
+    args.hybrid = True
+    args.hybrid_dcs_weight_sync = True
+    args.enable_cross_version_kv_continuation = True
+    args.use_slime_router = True
+    args.partial_rollout = True
+    args.targeted_retirement_timeout_seconds = 15.0
+    args.offload_train = False
+    args.offload_rollout = False
+    args.pipeline_model_parallel_size = 1
+    args.expert_model_parallel_size = 1
+    args.hybrid_weights_backuper_on_gpu = False
+    args.update_weights_interval = 1
+    args.cross_version_kv_max_gap = 2
+    args.max_staleness = 2
+    args.use_tis = True
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.use_slime_router is True
+
+
 def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"
@@ -221,3 +251,15 @@ def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     assert args.dynamic_context_parallel is True
     assert args.eval_interval == 10
     assert args.eval_size == 0.1
+
+
+def test_zero_kl_normalization_precedes_reference_checkpoint_validation(arguments_module):
+    args = _opd_args()
+    args.use_opd = False
+    args.use_kl_loss = True
+    args.kl_loss_coef = 0.0
+    args.ref_load = None
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.use_kl_loss is False

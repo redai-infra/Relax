@@ -26,6 +26,12 @@ from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
+from relax.utils.cross_version_kv import (
+    cross_version_kv_enabled,
+    cross_version_kv_group_generation_indices,
+    cross_version_kv_group_ready_for_finalize,
+    plan_dp_aligned_extra_groups,
+)
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
     async_encode_audio_for_rollout_engine,
@@ -51,6 +57,9 @@ from relax.utils.utils import CURRENT_ROLLOUT_BATCH, compute_dp_size, transfer_b
 __all__ = ["generate_rollout"]
 
 logger = get_logger(__name__)
+
+_GROUP_RM_FINALIZED_KEY = "_cross_version_kv_group_rm_finalized"
+_GROUP_OPD_FINALIZED_KEY = "_cross_version_kv_group_opd_finalized"
 
 
 # Misuse guard for the per-request permit contract. Set while the session-level
@@ -185,6 +194,17 @@ class GenerateState(metaclass=SingletonMeta):
         # 0 before the first step / when the previous step met its target. fully_async only.
         if not hasattr(self, "last_step_current_deficit"):
             self.last_step_current_deficit = 0
+        # Experimental cross-version KV continuation keeps the original
+        # asyncio tasks alive across physical rollout calls. The next call
+        # takes ownership and assigns the first deficit groups to old debt.
+        if not hasattr(self, "cross_version_kv_tasks"):
+            self.cross_version_kv_tasks: list[asyncio.Task[Any]] = []
+        if not hasattr(self, "cross_version_kv_task_groups"):
+            self.cross_version_kv_task_groups: dict[asyncio.Task[Any], list[Sample]] = {}
+        if not hasattr(self, "cross_version_kv_task_started_at"):
+            self.cross_version_kv_task_started_at: dict[asyncio.Task[Any], float] = {}
+        if not hasattr(self, "cross_version_kv_protected_tasks"):
+            self.cross_version_kv_protected_tasks: set[asyncio.Task[Any]] = set()
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         max_aborted_count = getattr(self.args, "partial_rollout_max_aborted_count", None)
@@ -382,6 +402,21 @@ async def generate(
         if not sample.rollout_tokens:
             sample.rollout_tokens = tokenizer_prompt_ids
 
+    targeted_publication = bool(
+        getattr(args, "hybrid_dcs_weight_sync", False) and getattr(args, "enable_cross_version_kv_continuation", False)
+    )
+    request_rid = None
+    if targeted_publication:
+        if sample.session_id is None:
+            raise RuntimeError("targeted publication requires a sample session_id")
+        request_rid = f"relax:{sample.session_id}:attempt:{sample.abort_count}"
+    if request_rid is not None:
+        payload["rid"] = str(request_rid)
+    if targeted_publication:
+        if sample.group_index is None:
+            raise RuntimeError("targeted publication requires a group_index")
+        payload["extra_key"] = f"relax-kv-group:{sample.group_index}:epoch:{sample.abort_count}"
+
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
@@ -481,6 +516,8 @@ async def generate(
         )
 
     sample.update_from_meta_info(args, output["meta_info"])
+    if targeted_publication and sample.status == Sample.Status.ABORTED:
+        sample.metadata["targeted_retirement_aborted"] = True
     _t_post_generate = monotonic() - _t_post_generate_start
 
     _timing: dict[str, float] = {"generate": _t_generate, "post_generate": _t_post_generate}
@@ -499,6 +536,7 @@ async def _dispatch_generate(
     sample: Sample,
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    dispatch_started_event: asyncio.Event | None = None,
 ) -> Sample | list[Sample]:
     """Resolve the generate function and run it under the correct permit scope.
 
@@ -535,8 +573,12 @@ async def _dispatch_generate(
 
     try:
         if manages_permit:
+            if dispatch_started_event is not None:
+                dispatch_started_event.set()
             return await _run()
         async with state.semaphore:
+            if dispatch_started_event is not None:
+                dispatch_started_event.set()
             token = _holding_session_lock.set(True)
             try:
                 return await _run()
@@ -552,6 +594,7 @@ async def generate_and_rm(
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    dispatch_started_event: asyncio.Event | None = None,
 ) -> Sample | list[Sample]:
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
@@ -562,13 +605,22 @@ async def generate_and_rm(
         assert sample.response is not None
         if not args.group_rm:
             assert sample.reward is not None
+        if dispatch_started_event is not None:
+            dispatch_started_event.set()
         return sample
 
     state = GenerateState(args)
 
     # Resolve the generate function and run it under the right permit scope
     # (session-level lock by default; per-request permits for opt-in functions).
-    sample = await _dispatch_generate(state, args, sample, sampling_params, evaluation=evaluation)
+    sample = await _dispatch_generate(
+        state,
+        args,
+        sample,
+        sampling_params,
+        evaluation=evaluation,
+        dispatch_started_event=dispatch_started_event,
+    )
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -635,16 +687,34 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
 
 
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    submitted_event: asyncio.Event | None = None,
 ) -> list[Sample]:
     state = GenerateState(args)
 
     # eval requests should not be affected by abort state; only skip for training rollout
     if state.aborted and not evaluation:
+        if submitted_event is not None:
+            submitted_event.set()
         return group
 
-    # Generate a unique session_id for each sample in the group
-    for sample in group:
+    generation_indices = (
+        cross_version_kv_group_generation_indices(group) if cross_version_kv_enabled(args) else list(range(len(group)))
+    )
+    generation_index_set = set(generation_indices)
+    for group_index, sample in enumerate(group):
+        if group_index in generation_index_set:
+            continue
+        assert sample.response is not None
+        if not args.group_rm:
+            assert sample.reward is not None
+    generation_samples = [group[index] for index in generation_indices]
+
+    # Generate a unique session_id only for samples that will enter generation.
+    for sample in generation_samples:
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
@@ -652,38 +722,101 @@ async def generate_and_rm_group(
     # group share the same multimodal_inputs object (e.g. after shallow-copy in
     # data_source), encode once and attach the result to every sample so that
     # generate() picks up the pre-encoded data instead of re-encoding per sample.
-    first_mm = getattr(group[0], "multimodal_inputs", None)
-    if first_mm is not None and all(getattr(s, "multimodal_inputs", None) is first_mm for s in group[1:]):
+    first_mm = getattr(generation_samples[0], "multimodal_inputs", None) if generation_samples else None
+    if first_mm is not None and all(
+        getattr(sample, "multimodal_inputs", None) is first_mm for sample in generation_samples[1:]
+    ):
         encoded_mm, t_enc = await _encode_multimodal_inputs(first_mm)
-        for sample in group:
+        for sample in generation_samples:
             sample._pre_encoded_mm = encoded_mm
             sample._pre_encoded_mm_elapsed = t_enc
 
     tasks = []
-    for idx, sample in enumerate(group):
+    dispatch_started_events = [asyncio.Event() for _ in generation_samples] if submitted_event is not None else None
+    for task_index, (group_index, sample) in enumerate(zip(generation_indices, generation_samples, strict=True)):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
+            seed = state.group_sampling_seeds[group_index]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        dispatch_started_event = dispatch_started_events[task_index] if dispatch_started_events else None
+        task = asyncio.create_task(
+            generate_and_rm(
+                args,
+                sample,
+                current_sampling_params,
+                evaluation=evaluation,
+                dispatch_started_event=dispatch_started_event,
+            )
         )
+        if dispatch_started_event is not None:
+            task.add_done_callback(lambda _task, event=dispatch_started_event: event.set())
+        tasks.append(task)
 
-    group = await asyncio.gather(*tasks)
+    if dispatch_started_events is not None:
+        await asyncio.gather(*(event.wait() for event in dispatch_started_events))
+        submitted_event.set()
 
-    # eval should still compute group reward even if abort was triggered by a concurrent rollout
-    if (not state.aborted or evaluation) and args.group_rm:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+    generated_samples = await asyncio.gather(*tasks)
+    result_group = list(group)
+    for group_index, generated_sample in zip(generation_indices, generated_samples, strict=True):
+        result_group[group_index] = generated_sample
+    group = result_group
+
+    # A backend-side strict pause can abort only part of a group without
+    # toggling state.aborted. Defer group reward and OPD prefill until every
+    # member is terminal so a cross-version retry can reuse completed siblings.
+    group_ready = evaluation or not cross_version_kv_enabled(args) or cross_version_kv_group_ready_for_finalize(group)
+    if (not state.aborted or evaluation) and args.group_rm and group_ready:
+        # A fully completed oversampling surplus group is returned to the data
+        # source and can enter this function again in the next physical
+        # rollout. Its requests are already terminal, but group RM must also be
+        # idempotent: an external or stochastic RM must not run twice and
+        # overwrite the reward selected by the first rollout.
+        group_rm_finalized = (
+            cross_version_kv_enabled(args)
+            and not evaluation
+            and all(
+                sample.reward is not None and sample.metadata.get(_GROUP_RM_FINALIZED_KEY, False) for sample in group
+            )
+        )
+        if not group_rm_finalized:
+            rewards = await batched_async_rm(args, group)
+            for sample, reward in zip(group, rewards, strict=False):
+                sample.reward = reward
+            if cross_version_kv_enabled(args) and not evaluation:
+                for sample in group:
+                    sample.metadata[_GROUP_RM_FINALIZED_KEY] = True
 
         if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+            opd_finalized = cross_version_kv_enabled(args) and all(
+                sample.metadata.get(_GROUP_OPD_FINALIZED_KEY, False) for sample in group
+            )
+            if not opd_finalized:
+                await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+                if cross_version_kv_enabled(args):
+                    for sample in group:
+                        sample.metadata[_GROUP_OPD_FINALIZED_KEY] = True
 
     return group
 
 
-async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], list[list[Sample]]]:
+async def abort(
+    args: Namespace,
+    rollout_id: int,
+    *,
+    retry_interval_seconds: float | None = None,
+    timeout_seconds: float | None = None,
+    protected_timeout_seconds: float | None = None,
+) -> tuple[list[list[Sample]], list[list[Sample]]]:
+    if retry_interval_seconds is not None and retry_interval_seconds <= 0:
+        raise ValueError("retry_interval_seconds must be positive")
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    if timeout_seconds is not None and retry_interval_seconds is None:
+        raise ValueError("timeout_seconds requires retry_interval_seconds")
+    if protected_timeout_seconds is not None and protected_timeout_seconds <= 0:
+        raise ValueError("protected_timeout_seconds must be positive")
+
     aborted_samples = []
     completed_protected_samples = []
 
@@ -701,6 +834,8 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             await asyncio.sleep(0.5)
         logger.info(f"Eval completed. Proceeding with abort for rollout {rollout_id}.")
 
+    protected_drain_started_at = monotonic()
+
     # Step 1: Wait for protected tasks (abort_count >= partial_rollout_max_aborted_count) to finish naturally.
     if state.protected_pendings:
         logger.info(
@@ -708,9 +843,24 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             f"(abort_count >= partial_rollout_max_aborted_count) to complete before aborting others."
         )
         while state.protected_pendings:
+            wait_timeout = None
+            if protected_timeout_seconds is not None:
+                wait_timeout = protected_timeout_seconds - (monotonic() - protected_drain_started_at)
+                if wait_timeout <= 0:
+                    raise RuntimeError(
+                        f"Protected abort drain timed out for rollout_id={rollout_id}: "
+                        f"protected_groups={len(state.protected_pendings)}"
+                    )
             done, state.protected_pendings = await asyncio.wait(
-                state.protected_pendings, return_when=asyncio.FIRST_COMPLETED
+                state.protected_pendings,
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                raise RuntimeError(
+                    f"Protected abort drain timed out for rollout_id={rollout_id}: "
+                    f"protected_groups={len(state.protected_pendings)}"
+                )
             for task in done:
                 group = task.result()
                 completed_protected_samples.append(group)
@@ -728,20 +878,55 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
         urls = [worker["url"] for worker in response["workers"]]
 
     urls = router_worker_base_urls(urls)
-    logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, BaseException):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+
+    abort_started_at = monotonic()
+    abort_attempt = 0
+
+    async def send_abort_all() -> None:
+        nonlocal abort_attempt
+        abort_attempt += 1
+        logger.info(
+            "Abort request for %s attempt=%s pending_groups=%s",
+            urls,
+            abort_attempt,
+            len(state.pendings),
+        )
+        abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+        abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+        for url, result in zip(urls, abort_results, strict=False):
+            if isinstance(result, BaseException):
+                logger.warning(f"Failed to abort worker at {url}: {result}")
+
+    await send_abort_all()
 
     # make sure all the pending tasks are finished
     count = 0
+    next_abort_at = monotonic() + retry_interval_seconds if retry_interval_seconds is not None else None
     while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        done = {task for task in state.pendings if task.done()}
+        if done:
+            state.pendings -= done
+        else:
+            wait_timeout = None
+            if next_abort_at is not None:
+                wait_timeout = max(next_abort_at - monotonic(), 0.0)
+            if timeout_seconds is not None:
+                remaining_timeout = timeout_seconds - (monotonic() - abort_started_at)
+                if remaining_timeout <= 0:
+                    raise RuntimeError(
+                        f"Abort drain timed out for rollout_id={rollout_id}: "
+                        f"pending_groups={len(state.pendings)} attempts={abort_attempt}"
+                    )
+                wait_timeout = min(wait_timeout, remaining_timeout) if wait_timeout is not None else remaining_timeout
+
+            done, state.pendings = await asyncio.wait(
+                state.pendings,
+                timeout=wait_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
         if not args.partial_rollout:
-            continue
+            done = set()
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
@@ -754,8 +939,18 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
             aborted_samples.append(group)
             count += len(group)
 
+        now = monotonic()
+        if state.pendings and next_abort_at is not None and now >= next_abort_at:
+            await send_abort_all()
+            next_abort_at = monotonic() + retry_interval_seconds
+
     if args.partial_rollout:
-        logger.info(f"Collected {count} partial samples into the data buffer")
+        logger.info(
+            "Collected %s partial samples into the data buffer abort_attempts=%s abort_drain_seconds=%.6f",
+            count,
+            abort_attempt,
+            monotonic() - abort_started_at,
+        )
 
     return aborted_samples, completed_protected_samples
 
@@ -888,7 +1083,8 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                    f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
                 )
                 do_print = False
 
@@ -1046,7 +1242,8 @@ async def generate_rollout_async(
 
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+        f"label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
 
     rollout_time = timer.end("rollout")
@@ -1103,8 +1300,11 @@ async def generate_rollout_async(
             ]
             # Trim so total groups in TQ is divisible by dp_size (required by SeqlenBalancedSampler)
             dp_size = compute_dp_size(args)
-            max_total = len(data) + len(extra_completed)
-            max_extra = max_total - (max_total % dp_size) - len(data)
+            max_extra = plan_dp_aligned_extra_groups(
+                current_groups=len(data),
+                available_extra_groups=len(extra_completed),
+                dp_size=dp_size,
+            )
             accepted = extra_completed[:max_extra]
             surplus = extra_completed[max_extra:]
             aborted_samples.extend(surplus)
@@ -1147,7 +1347,6 @@ EVAL_PROMPT_DATASET = {}
 
 
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
-
     state = GenerateState(args)
     # Increment evaluating counter so that abort() knows to wait for eval to finish.
     # This prevents abort_all from killing in-flight eval requests on SGLang workers.
@@ -1324,7 +1523,14 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
+    if cross_version_kv_enabled(args):
+        from relax.engine.rollout.cross_version_kv_rollout import generate_rollout_async_with_kv_continuation
+
+        output, aborted_samples = run(
+            generate_rollout_async_with_kv_continuation(args, rollout_id, data_buffer, data_system_client)
+        )
+    else:
+        output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_buffer, data_system_client))
     if aborted_samples:
         ray.get(data_buffer.add_samples.remote(aborted_samples))
     # LoRA adapter mode disables next-step prefetch: the per-step adapter update is ~1s, so a

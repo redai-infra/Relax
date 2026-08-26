@@ -119,7 +119,10 @@ class Actor(Base):
         # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
         # fires on the first real `update_weights` instead.
         if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
-            self.actor_model.update_weights()
+            # The initial publication represents the checkpoint state before
+            # ``self.step`` starts. Preserve that provenance so a resumed run
+            # does not reset Router KV epochs to actor step zero.
+            self.actor_model.update_weights(rollout_id=self.step - 1)
 
     def set_barriers(
         self,

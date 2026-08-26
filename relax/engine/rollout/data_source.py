@@ -95,6 +95,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
             use_audio_in_video=args.use_audio_in_video,
             seed=args.rollout_seed,
+            shuffle=getattr(args, "rollout_shuffle", True),
             buffer_size=buffer_size,
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_max_cached=prefetch_max_cached,
@@ -199,21 +200,28 @@ class RolloutDataSource(DataSource):
                 # Use streaming dataset's get_batch method
                 prompt_samples, crossed_epoch = self.dataset.get_batch(num_samples)
                 if crossed_epoch:
-                    self.epoch_id += 1
-                    logger.info(f"Epoch boundary crossed, now at epoch {self.epoch_id}")
+                    previous_epoch_id = self.epoch_id
+                    self.epoch_id = self.dataset.get_state()["epoch_id"]
+                    logger.info(
+                        f"Crossed {self.epoch_id - previous_epoch_id} epoch boundaries, now at epoch {self.epoch_id}"
+                    )
             else:
-                # Original logic for traditional Dataset
-                if self.sample_offset + num_samples <= len(self.dataset):
-                    prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
-                    self.sample_offset += num_samples
-                else:
-                    prompt_samples = self.dataset.samples[self.sample_offset :]
-                    num_samples -= len(prompt_samples)
-                    self.epoch_id += 1
-                    if self.args.rollout_shuffle:
-                        self.dataset.shuffle(self.epoch_id)
-                    prompt_samples += self.dataset.samples[:num_samples]
-                    self.sample_offset = num_samples
+                dataset_size = len(self.dataset)
+                if dataset_size == 0:
+                    raise ValueError("Cannot draw rollout samples from an empty dataset")
+                prompt_samples = []
+                remaining = num_samples
+                while remaining > 0:
+                    if self.sample_offset >= dataset_size:
+                        self.sample_offset = 0
+                        self.epoch_id += 1
+                        if self.args.rollout_shuffle:
+                            self.dataset.shuffle(self.epoch_id)
+
+                    take = min(remaining, dataset_size - self.sample_offset)
+                    prompt_samples.extend(self.dataset.samples[self.sample_offset : self.sample_offset + take])
+                    self.sample_offset += take
+                    remaining -= take
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
 

@@ -357,7 +357,7 @@ class IndexManager:
     Tracks current position within the epoch.
     """
 
-    def __init__(self, total_size: int, seed: int = 42):
+    def __init__(self, total_size: int, seed: int = 42, shuffle_enabled: bool = True):
         """Initialize the index manager.
 
         Args:
@@ -366,6 +366,7 @@ class IndexManager:
         """
         self.total_size = total_size
         self.seed = seed
+        self.shuffle_enabled = shuffle_enabled
         self.current_epoch = -1
         self.indices: Optional[list[int]] = None
         self.position = 0
@@ -381,7 +382,8 @@ class IndexManager:
 
         random.seed(self.seed + epoch_id)
         self.indices = list(range(self.total_size))
-        random.shuffle(self.indices)
+        if self.shuffle_enabled:
+            random.shuffle(self.indices)
         self.current_epoch = epoch_id
         self.position = 0
 
@@ -721,6 +723,7 @@ class StreamingDataset(BaseDataset):
         metadata_key: str = "metadata",
         system_prompt: Optional[str] = None,
         seed: int = 42,
+        shuffle: bool = True,
         apply_chat_template: bool = False,
         apply_chat_template_kwargs: Optional[dict] = None,
         use_audio_in_video: bool = False,
@@ -747,6 +750,7 @@ class StreamingDataset(BaseDataset):
             metadata_key: Key for metadata in data
             system_prompt: System prompt key
             seed: Random seed for shuffling
+            shuffle: Whether to shuffle indices at each epoch
             apply_chat_template: Whether to apply chat template
             apply_chat_template_kwargs: Additional kwargs for chat template
             use_audio_in_video: Whether to extract audio from video files for multimodal processing
@@ -788,7 +792,7 @@ class StreamingDataset(BaseDataset):
         else:
             self.reader = CompositeStreamingReader(paths, row_slice)
         self.buffer = SampleBuffer(max_size=buffer_size)
-        self.index_manager = IndexManager(len(self.reader), seed=seed)
+        self.index_manager = IndexManager(len(self.reader), seed=seed, shuffle_enabled=shuffle)
 
         self._filter_count = 0
         self._total_processed = 0
@@ -969,7 +973,9 @@ class StreamingDataset(BaseDataset):
 
         while len(samples) < n and attempts < max_attempts:
             need = n - len(samples)
-            fetch_size = min(need * 2, 100)
+            # Never advance the index cursor past samples this call can
+            # return. Filtered samples are replenished by the next loop.
+            fetch_size = min(need, 100)
 
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed

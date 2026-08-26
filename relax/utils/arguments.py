@@ -13,6 +13,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
+from relax.utils.cross_version_kv import validate_cross_version_kv_args
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import (
@@ -176,6 +177,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(TensorBackuper + _switch_model), so the actor handles ref / actor_fwd / advantages "
                     "internally on its own GPUs while rollout runs on a separate GPU placement group. "
                     "Mutually exclusive with passing --fully-async and --colocate together."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-dcs-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Hybrid mode only: push Actor weights to Rollout through the synchronous DCS "
+                    "collective path instead of the default CUDA-IPC UpdateWeightFromTensor path. "
+                    "Default off. With cross-version KV continuation this requires the SlimeRouter "
+                    "request-version ledger and targeted retirement protocol."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-weights-backuper-on-gpu",
+                "--hybrid-weights-backup-on-gpu",
+                dest="hybrid_weights_backuper_on_gpu",
+                action="store_true",
+                default=False,
+                help=(
+                    "Hybrid DCS mode only: keep the Actor snapshot used for weight sync on its "
+                    "source GPU instead of host-pinned memory. This removes the snapshot D2H/H2D "
+                    "round trip at the cost of one extra TP-sharded model copy on Actor GPUs."
                 ),
             )
             parser.add_argument(
@@ -947,6 +971,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Interval for updating the weights",
+            )
+            parser.add_argument(
+                "--enable-cross-version-kv-continuation",
+                action="store_true",
+                help=(
+                    "Keep in-flight SGLang requests and their KV cache across adjacent "
+                    "weight publications. This experimental Hybrid-async path periodically "
+                    "falls back to abort+flush to bound the KV/weight version gap."
+                ),
+            )
+            parser.add_argument(
+                "--cross-version-kv-max-gap",
+                type=int,
+                default=2,
+                help="Maximum number of weight publications that an in-flight KV cache may span.",
+            )
+            parser.add_argument(
+                "--targeted-retirement-timeout-seconds",
+                type=float,
+                default=15.0,
+                help=(
+                    "Maximum time to wait for request-level retirement before an in-place "
+                    "DCS weight publication. Used only when Hybrid DCS and cross-version KV "
+                    "continuation are enabled together."
+                ),
             )
             parser.add_argument(
                 "--keep-old-actor",
@@ -2963,6 +3012,88 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _normalize_zero_kl_loss_args(args) -> bool:
+    """Disable a KL-loss path that is multiplied by exactly zero."""
+    if not getattr(args, "use_kl_loss", False) or getattr(args, "kl_loss_coef", 0.0) != 0.0:
+        return False
+
+    args.use_kl_loss = False
+    return True
+
+
+def _drop_unused_reference_resource(args) -> bool:
+    resource = getattr(args, "resource", None)
+    reference_needed = getattr(args, "kl_coef", 0.0) != 0.0 or getattr(args, "use_kl_loss", False)
+    if reference_needed or not resource or "reference" not in resource:
+        return False
+
+    del resource["reference"]
+    return True
+
+
+def _validate_hybrid_weight_publication_args(args) -> None:
+    """Require a valid behavior-policy reference when Hybrid skips
+    publications."""
+    update_weights_interval = int(getattr(args, "update_weights_interval", 1))
+    if update_weights_interval < 1:
+        raise ValueError("--update-weights-interval must be >= 1.")
+    if not getattr(args, "hybrid", False) or update_weights_interval <= 1:
+        return
+
+    if getattr(args, "use_tis", False):
+        return
+
+    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    if not true_on_policy and getattr(args, "use_rollout_logprobs", False):
+        return
+
+    if not true_on_policy and getattr(args, "max_staleness", 0) == 0 and getattr(args, "keep_old_actor", False):
+        return
+
+    if true_on_policy:
+        valid_options = "--use-tis"
+    elif getattr(args, "max_staleness", 0) > 0:
+        valid_options = "--use-tis or --use-rollout-logprobs"
+    else:
+        valid_options = "--use-tis, --keep-old-actor, or --use-rollout-logprobs"
+    raise ValueError(
+        "--hybrid with --update-weights-interval > 1 reuses previously published Rollout weights, so "
+        f"old log-probs require correction. Enable {valid_options}, or set --update-weights-interval 1."
+    )
+
+
+def _resolve_checkpoint_load_args(args) -> None:
+    has_megatron_load = (
+        args.load is not None
+        and os.path.exists(args.load)
+        and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+    )
+
+    if args.megatron_to_hf_mode == "bridge":
+        if not has_megatron_load:
+            if args.load is None:
+                args.load = args.ref_load or args.hf_checkpoint
+            # If is a HF checkpoint, set start_rollout_id to 0 here.
+            args.start_rollout_id = 0
+        return
+
+    if has_megatron_load:
+        return
+
+    args.no_load_optim = True
+    args.no_load_rng = True
+    args.finetune = True
+    if args.ref_load is None:
+        raise ValueError(
+            "--megatron-to-hf-mode raw requires an existing Megatron checkpoint from "
+            "--load or --ref-load; raw mode cannot initialize training weights from --hf-checkpoint."
+        )
+    args.load = args.ref_load
+    if args.ref_ckpt_step is not None:
+        args.ckpt_step = args.ref_ckpt_step
+    args.start_rollout_id = 0
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -3050,6 +3181,14 @@ def slime_validate_args(args):
     validate_save_hf_fp8_args(args)
     validate_save_hf_post_hook_args(args)
 
+    if _normalize_zero_kl_loss_args(args):
+        logger.info(
+            "Auto-disabling --use-kl-loss because --kl-loss-coef is exactly 0. "
+            "The reference forward cannot affect the training objective."
+        )
+    if _drop_unused_reference_resource(args):
+        logger.info("Removing unused 'reference' resource because no KL objective requires ref_log_probs.")
+
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
             "The options 'partial_rollout' and 'use_rollout_routing_replay' cannot be enabled simultaneously. "
@@ -3077,32 +3216,7 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
-            args.start_rollout_id = 0
-    else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+    _resolve_checkpoint_load_args(args)
 
     if args.eval_interval is not None:
         if args.loss_type == "sft":
@@ -3191,6 +3305,8 @@ def slime_validate_args(args):
                     f"== global_batch_size ({args.global_batch_size}). actor_fwd will be skipped."
                 )
             args.true_on_policy_mode = True
+
+        _validate_hybrid_weight_publication_args(args)
 
         # Validate --resource has the producer roles the trainer will fetch from
         # TransferQueue in fully-async mode. Without these, train_async would poll
@@ -3377,6 +3493,32 @@ def slime_validate_args(args):
             "--fully-async and --colocate cannot be combined directly. "
             "Use --hybrid instead, which is the supported public flag for hybrid training mode."
         )
+
+    if getattr(args, "hybrid_dcs_weight_sync", False):
+        if not args.hybrid:
+            raise ValueError("--hybrid-dcs-weight-sync requires --hybrid.")
+        if getattr(args, "enable_cross_version_kv_continuation", False):
+            if not getattr(args, "use_slime_router", False):
+                raise ValueError("Hybrid DCS with cross-version KV requires --use-slime-router.")
+            if float(getattr(args, "targeted_retirement_timeout_seconds", 0.0)) <= 0:
+                raise ValueError("--targeted-retirement-timeout-seconds must be positive.")
+        if getattr(args, "offload_train", False) or getattr(args, "offload_rollout", False):
+            raise ValueError("--hybrid-dcs-weight-sync does not yet support train or rollout offload.")
+        if getattr(args, "pipeline_model_parallel_size", 1) != 1:
+            raise ValueError("--hybrid-dcs-weight-sync currently requires --pipeline-model-parallel-size 1.")
+        if getattr(args, "expert_model_parallel_size", 1) != 1:
+            raise ValueError("--hybrid-dcs-weight-sync currently requires --expert-model-parallel-size 1.")
+    if getattr(args, "hybrid_weights_backuper_on_gpu", False):
+        if not getattr(args, "hybrid_dcs_weight_sync", False):
+            raise ValueError("--hybrid-weights-backuper-on-gpu requires --hybrid-dcs-weight-sync.")
+        if not getattr(args, "enable_weights_backuper", True):
+            raise ValueError("--hybrid-weights-backuper-on-gpu requires the weights backuper to remain enabled.")
+
+    _validate_hybrid_weight_publication_args(args)
+
+    # Cross-version KV continuation depends on Hybrid's normalized execution
+    # flags, so validate only after --hybrid has enabled fully_async+colocate.
+    validate_cross_version_kv_args(args)
 
     assert not (args.debug_rollout_only and args.debug_train_only), (
         "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."

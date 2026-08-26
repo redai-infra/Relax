@@ -128,6 +128,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     args = get_args()
     load_path = args.load
 
+    if load_path is None:
+        raise ValueError(
+            "No checkpoint load path is configured. Set --load or --ref-load for raw mode, "
+            "or use --megatron-to-hf-mode bridge to initialize from --hf-checkpoint."
+        )
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
     if exist and _is_megatron_checkpoint(load_path):

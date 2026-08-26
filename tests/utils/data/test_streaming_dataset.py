@@ -416,6 +416,64 @@ class TestStreamingDataset:
         assert len(samples) == 5
         assert all(s is not None for s in samples)
 
+    def test_small_dataset_batches_preserve_contiguous_cursor(self, mock_tokenizer, monkeypatch):
+        from relax.utils.data.streaming_dataset import StreamingDataset
+
+        data = [{"text": prompt} for prompt in ("a", "b", "c")]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            for item in data:
+                f.write(json.dumps(item) + "\n")
+            filepath = f.name
+
+        try:
+            monkeypatch.setattr("random.shuffle", lambda seq: None)
+            dataset = StreamingDataset(
+                path=filepath,
+                tokenizer=mock_tokenizer,
+                processor=None,
+                max_length=None,
+                prompt_key="text",
+                prefetch_max_cached=0,
+            )
+
+            first, _ = dataset.get_batch(8)
+            first_state = dataset.index_manager.get_state()
+            second, _ = dataset.get_batch(8)
+            second_state = dataset.index_manager.get_state()
+
+            assert [sample.prompt for sample in first] == ["a", "b", "c", "a", "b", "c", "a", "b"]
+            assert first_state == {"epoch_id": 2, "position": 2}
+            assert [sample.prompt for sample in second] == ["c", "a", "b", "c", "a", "b", "c", "a"]
+            assert second_state == {"epoch_id": 5, "position": 1}
+        finally:
+            os.unlink(filepath)
+
+    def test_shuffle_false_preserves_source_order_across_epochs(self, mock_tokenizer):
+        from relax.utils.data.streaming_dataset import StreamingDataset
+
+        data = [{"text": prompt} for prompt in ("a", "b", "c")]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            for item in data:
+                f.write(json.dumps(item) + "\n")
+            filepath = f.name
+
+        try:
+            dataset = StreamingDataset(
+                path=filepath,
+                tokenizer=mock_tokenizer,
+                processor=None,
+                max_length=None,
+                prompt_key="text",
+                shuffle=False,
+                prefetch_max_cached=0,
+            )
+
+            samples, _ = dataset.get_batch(8)
+
+            assert [sample.prompt for sample in samples] == ["a", "b", "c", "a", "b", "c", "a", "b"]
+        finally:
+            os.unlink(filepath)
+
     def test_shuffle_epoch(self, jsonl_file, mock_tokenizer):
         """Test that shuffle produces different order."""
         from relax.utils.data.streaming_dataset import StreamingDataset

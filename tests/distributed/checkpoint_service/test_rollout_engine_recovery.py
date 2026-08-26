@@ -14,6 +14,7 @@ now only raise when *no* healthy engine is left, prune the unhealthy ones, and
 invalidate the cached topology signature so the group is rebuilt cleanly.
 """
 
+from types import SimpleNamespace
 from typing import Callable, Set
 
 import pytest
@@ -132,3 +133,56 @@ def test_topology_signature_distinguishes_pruned_from_full():
     sig_full = DeviceDirectBackend._rollout_topology_signature_of(full)
     sig_pruned = DeviceDirectBackend._rollout_topology_signature_of(pruned)
     assert sig_full != sig_pruned
+
+
+def test_successful_group_build_records_signature_and_reuses_group(monkeypatch):
+    backend = object.__new__(DeviceDirectBackend)
+    backend.role_info = {"rank": 0}
+    backend.args = SimpleNamespace(rollout_num_gpus_per_engine=1)
+    backend.backend_type = "nccl"
+    backend.rollout_engines = {}
+    backend.rollout_topology = {}
+    backend._rollout_topology_signature = None
+    backend._model_update_groups = None
+
+    created = []
+
+    def _create(topology):
+        created.append(dict(topology))
+        backend.rollout_engines = {int(rank): object() for rank in topology}
+
+    backend._create_rollout_engines = _create  # type: ignore[method-assign]
+    backend._update_rollout_engines = lambda: None  # type: ignore[method-assign]
+    backend._cleanup_rollout_engines = lambda: None  # type: ignore[method-assign]
+    backend._healthcheck_rollout_engines = lambda: set()  # type: ignore[method-assign]
+    backend._batch_request = lambda *_args, **_kwargs: []  # type: ignore[method-assign]
+    backend._find_free_port_in_range = lambda *_args: 11000  # type: ignore[method-assign]
+
+    monkeypatch.setattr(device_direct.mpu, "get_data_parallel_rank", lambda **_kwargs: 0)
+    monkeypatch.setattr(device_direct.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(device_direct.mpu, "get_pipeline_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(device_direct.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr(device_direct.ray, "get", lambda value, **_kwargs: value)
+    process_group = object()
+    monkeypatch.setattr(device_direct, "init_process_group", lambda **_kwargs: process_group)
+
+    topology = {
+        "nodes": {
+            "rollout": {
+                "0": {"ip": "host-a", "port": 100, "metadata": {"num_gpus_per_engine": 1}},
+                "1": {"ip": "host-b", "port": 200, "metadata": {"num_gpus_per_engine": 1}},
+            }
+        }
+    }
+
+    first = backend.init_process_group_for_rollout(topology)
+    expected_signature = backend._rollout_topology_signature_of(topology["nodes"]["rollout"])
+    assert first["group_reused"] is False
+    assert backend._rollout_topology_signature == expected_signature
+    assert len(created) == 1
+
+    second = backend.init_process_group_for_rollout(topology)
+    assert second["group_reused"] is True
+    assert second["group_world_size"] == 3
+    assert second["rollout_receiver_count"] == 2
+    assert len(created) == 1
