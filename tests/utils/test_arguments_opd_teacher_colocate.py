@@ -73,6 +73,226 @@ def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected
     assert args.sft_invalid_multimodal_strategy == expected
 
 
+def test_hybrid_pipeline_options_default_off(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args([])
+
+    assert args.hybrid_pipeline_forward is False
+    assert args.hybrid_pipeline_overlap is True
+    assert args.hybrid_pipeline_trace_dir is None
+    assert args.hybrid_pipeline_fetch_timeout_s == 600.0
+
+    args = parser.parse_args(["--hybrid-pipeline-forward", "--no-hybrid-pipeline-overlap"])
+    assert args.hybrid_pipeline_forward is True
+    assert args.hybrid_pipeline_overlap is False
+
+
+def _hybrid_pipeline_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        hybrid=True,
+        hybrid_pipeline_forward=True,
+        hybrid_pipeline_overlap=True,
+        hybrid_pipeline_trace_dir="/tmp/trace",
+        hybrid_pipeline_fetch_timeout_s=600.0,
+        use_dynamic_batch_size=True,
+        multimodal_keys={"image": "image"},
+        advantage_estimator="grpo",
+        compute_advantages_and_returns=True,
+        enable_weights_backuper=True,
+        kl_coef=0.0,
+        use_kl_loss=False,
+        use_opd=False,
+        keep_old_actor=False,
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        get_mismatch_metrics=False,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+        use_agentic_rollout=False,
+        partial_rollout=False,
+        use_dynamic_global_batch_size=False,
+        use_critic=False,
+        per_rank_fetch=False,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        offload_train=False,
+        offload_rollout=False,
+        num_iters_per_train_update=2,
+        rollout_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+    )
+
+
+def test_hybrid_pipeline_supported_configuration_is_accepted(arguments_module):
+    arguments_module._validate_hybrid_pipeline_args(_hybrid_pipeline_args())
+
+
+def test_hybrid_pipeline_overlap_control_requires_chunk_forward(arguments_module):
+    args = _hybrid_pipeline_args()
+    args.hybrid_pipeline_forward = False
+    args.hybrid_pipeline_overlap = False
+
+    with pytest.raises(ValueError, match="requires --hybrid-pipeline-forward"):
+        arguments_module._validate_hybrid_pipeline_args(args)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("hybrid", False, "only supported with --hybrid"),
+        ("use_dynamic_batch_size", False, "missing --use-dynamic-batch-size"),
+        ("multimodal_keys", None, "missing --multimodal-keys"),
+        ("enable_weights_backuper", False, "--disable-weights-backuper"),
+        ("kl_coef", 0.1, "--kl-coef"),
+        ("use_opd", True, "--use-opd"),
+        ("true_on_policy_mode", True, "--true-on-policy-mode"),
+        ("use_rollout_routing_replay", True, "--use-rollout-routing-replay"),
+        ("use_agentic_rollout", True, "--use-agentic-rollout"),
+        ("partial_rollout", True, "--partial-rollout"),
+        ("attention_dropout", 0.1, "--attention-dropout"),
+        ("tensor_model_parallel_size", 1, "--tensor-model-parallel-size"),
+        ("pipeline_model_parallel_size", 2, "--pipeline-model-parallel-size"),
+        ("context_parallel_size", 1, "--context-parallel-size"),
+        ("expert_model_parallel_size", 2, "--expert-model-parallel-size"),
+        ("expert_tensor_parallel_size", 2, "--expert-tensor-parallel-size"),
+        ("offload_train", True, "--offload-train"),
+        ("offload_rollout", True, "--offload-rollout"),
+        ("num_iters_per_train_update", 1, "must be >= 2"),
+        ("global_batch_size", 128, "exactly one optimizer mini per rollout"),
+    ],
+)
+def test_hybrid_pipeline_rejects_unsupported_configuration(
+    arguments_module,
+    field,
+    value,
+    error,
+):
+    args = _hybrid_pipeline_args()
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match=error):
+        arguments_module._validate_hybrid_pipeline_args(args)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_hybrid_pipeline_timeout_must_be_positive_and_finite(arguments_module, timeout):
+    args = _hybrid_pipeline_args()
+    args.hybrid_pipeline_fetch_timeout_s = timeout
+
+    with pytest.raises(ValueError, match="finite value greater than 0"):
+        arguments_module._validate_hybrid_pipeline_args(args)
+
+
+def _install_transfer_queue_contract(monkeypatch, *, global_indexes=True, custom_meta=True):
+    transfer_queue = ModuleType("transfer_queue")
+
+    class BatchMeta:
+        __slots__ = ("global_indexes",) if global_indexes else ("partition_ids",)
+
+    if custom_meta:
+
+        class TransferQueueClient:
+            async def async_put(self, data, partition_id=None, custom_meta=None, is_last=False):
+                return None
+
+    else:
+
+        class TransferQueueClient:
+            async def async_put(self, data, partition_id=None, is_last=False):
+                return None
+
+    transfer_queue.BatchMeta = BatchMeta
+    transfer_queue.TransferQueueClient = TransferQueueClient
+    monkeypatch.setitem(sys.modules, "transfer_queue", transfer_queue)
+
+
+def test_hybrid_pipeline_transfer_queue_contract_is_checked_before_runtime(
+    arguments_module,
+    monkeypatch,
+):
+    _install_transfer_queue_contract(monkeypatch)
+    monkeypatch.setattr("importlib.metadata.version", lambda _package: "0.1.10.dev0")
+
+    arguments_module.check_hybrid_pipeline_transfer_queue_contract()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"global_indexes": False}, "global_indexes"),
+        ({"custom_meta": False}, "custom_meta"),
+    ],
+)
+def test_hybrid_pipeline_transfer_queue_contract_fails_fast(
+    arguments_module,
+    monkeypatch,
+    kwargs,
+    error,
+):
+    _install_transfer_queue_contract(monkeypatch, **kwargs)
+    monkeypatch.setattr("importlib.metadata.version", lambda _package: "0.1.10.dev0")
+
+    with pytest.raises(RuntimeError, match=error):
+        arguments_module.check_hybrid_pipeline_transfer_queue_contract()
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (
+            SimpleNamespace(
+                hybrid_pipeline_forward=False,
+                hybrid_pipeline_trace_dir="/tmp/timeline",
+                fully_async=True,
+            ),
+            "hybrid",
+        ),
+        (
+            SimpleNamespace(
+                hybrid_pipeline_forward=False,
+                hybrid_pipeline_trace_dir=None,
+                fully_async=True,
+            ),
+            "version",
+        ),
+        (
+            SimpleNamespace(
+                hybrid_pipeline_forward=False,
+                hybrid_pipeline_trace_dir=None,
+                fully_async=False,
+            ),
+            None,
+        ),
+    ],
+)
+def test_transfer_queue_runtime_selects_trace_contract_before_side_effects(
+    arguments_module,
+    monkeypatch,
+    args,
+    expected,
+):
+    calls = []
+    monkeypatch.setattr(
+        arguments_module,
+        "check_hybrid_pipeline_transfer_queue_contract",
+        lambda: calls.append("hybrid"),
+    )
+    monkeypatch.setattr(arguments_module, "check_transfer_queue_version", lambda: calls.append("version"))
+
+    arguments_module.check_transfer_queue_runtime(args)
+
+    assert calls == ([] if expected is None else [expected])
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",

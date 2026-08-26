@@ -6,6 +6,7 @@ import random
 import socket
 import time
 from argparse import Namespace
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, List
 
@@ -64,6 +65,12 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.hybrid_forward_pipeline import (
+    canonicalize_hybrid_microbatch_schedule,
+    execute_hybrid_forward_mini,
+    fetch_exact_chunk_with_timeout,
+)
+from relax.utils.training.hybrid_pipeline_trace import emit_hybrid_pipeline_event
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -79,11 +86,19 @@ from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
-from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
+from .cp_utils import (
+    all_gather_with_cp,
+    get_logits_and_tokens_offset_with_cp,
+    maybe_padded_total_lengths,
+    slice_with_cp,
+)
 from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
+    RolloutMiniBatchPlan,
+    build_hybrid_forward_chunk_plan,
     build_rollout_minibatch_plan,
+    canonicalize_rollout_chunks,
     concat_rollout_batches,
     get_data_iterator,
     log_perf_data,
@@ -131,14 +146,12 @@ def _slice_rollout_batch(rollout_data: dict, start: int, end: int) -> dict:
             return value
         if isinstance(value, (list, tuple)) and len(value) == num_samples:
             return value[start:end]
-        ndim = getattr(value, "ndim", None)
-        size = getattr(value, "size", None)
-        if ndim and ndim > 0 and callable(size):
-            try:
-                if int(size(0)) == num_samples:
-                    return value[start:end]
-            except (TypeError, ValueError, IndexError):
-                pass
+        shape = getattr(value, "shape", None)
+        try:
+            if shape is not None and len(shape) > 0 and int(shape[0]) == num_samples:
+                return value[start:end]
+        except (TypeError, ValueError, IndexError):
+            pass
         return value
 
     return {k: _slice(v) for k, v in rollout_data.items()}
@@ -248,6 +261,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # internally via _switch_model and pushes weights to rollout via
         # UpdateWeightFromTensor instead of DCS.
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
+        self._hybrid_pipeline_chunk_plan = None
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
@@ -274,6 +288,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Create rollout_actor as a copy of current actor
                 if args.update_weights_interval == 1:
                     self.weights_backuper.backup("rollout_actor")
+
+            if getattr(self.args, "hybrid_pipeline_forward", False):
+                dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+                rollout_plan = build_rollout_minibatch_plan(self.args, dp_size)
+                self._hybrid_pipeline_chunk_plan = self._validate_hybrid_pipeline_runtime(
+                    rollout_plan,
+                    dp_size,
+                )
 
             update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
             # Push-side repack is decided by the HF config: an FP8 release auto-routes
@@ -1078,13 +1100,31 @@ class MegatronTrainRayActor(TrainRayActor):
         self.recv_weight_fully_async(rollout_id)
         log_perf_data_fwd(self.args, rollout_id)
 
-    def _hybrid_forward_subbatch(self, sub_batch: RolloutBatch) -> None:
+    def _hybrid_forward_subbatch(
+        self,
+        sub_batch: RolloutBatch,
+        *,
+        rollout_id: int,
+        chunk_index: int,
+        global_indexes: list[int] | None = None,
+        reuse_train_forward_log_probs: bool = False,
+    ) -> None:
         """Run the ref/teacher/actor forward passes for a single hybrid sub-
         batch in place.
 
         Shared by the streaming and debug_train_only paths so both compute
         identical log-probs before advantages are merged.
         """
+        needs_ref_forward = "ref" in self.weights_backuper.backup_tags
+        needs_teacher_forward = "teacher" in self.weights_backuper.backup_tags
+        needs_actor_forward = not reuse_train_forward_log_probs and (
+            not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
+        )
+        if not self.args.compute_advantages_and_returns or not (
+            needs_ref_forward or needs_teacher_forward or needs_actor_forward
+        ):
+            return
+
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
         # Separate iterator with larger token budget for ref/teacher log-probs (fallthrough mode).
         if self.args.use_dynamic_batch_size and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu:
@@ -1102,7 +1142,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.compute_advantages_and_returns:
             # Ref forward
-            if "ref" in self.weights_backuper.backup_tags:
+            if needs_ref_forward:
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                 self._switch_model("ref")
@@ -1111,7 +1151,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
 
             # Teacher forward for Megatron-based OPD
-            if "teacher" in self.weights_backuper.backup_tags:
+            if needs_teacher_forward:
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                 self._switch_model("teacher")
@@ -1120,40 +1160,366 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
 
             # Actor forward
-            self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-            if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+            if needs_actor_forward:
+                target_tag = "old_actor" if self.args.keep_old_actor else "actor"
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "actor_restore_start",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    chunk_index=chunk_index,
+                    batch=sub_batch,
+                    global_indexes=global_indexes,
+                    details={"target_tag": target_tag},
+                )
+                self._switch_model(target_tag)
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "actor_restore_end",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    chunk_index=chunk_index,
+                    batch=sub_batch,
+                    global_indexes=global_indexes,
+                    details={"target_tag": target_tag},
+                )
                 if self.args.use_routing_replay:
                     if self.args.use_rollout_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                     else:
                         os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "actor_forward_start",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    chunk_index=chunk_index,
+                    batch=sub_batch,
+                    global_indexes=global_indexes,
+                )
                 sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "actor_forward_end",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    chunk_index=chunk_index,
+                    batch=sub_batch,
+                    global_indexes=global_indexes,
+                )
                 if self.args.use_rollout_routing_replay:
                     RoutingReplay.clear_all_forward()
 
+    def _should_reuse_hybrid_train_forward_log_probs(self, plan: RolloutMiniBatchPlan) -> bool:
+        """Return whether Hybrid can skip its dedicated old-policy forward."""
+        if not getattr(self.args, "true_on_policy_mode", False):
+            return False
+        if plan.num_rollout_minis != 1:
+            raise ValueError(
+                "--true-on-policy-mode in hybrid requires exactly one optimizer mini per rollout partition, "
+                f"got {plan.num_rollout_minis}."
+            )
+        if getattr(self.args, "keep_old_actor", False):
+            raise ValueError("--true-on-policy-mode in hybrid does not support --keep-old-actor.")
+        if getattr(self.args, "use_rollout_logprobs", False):
+            raise ValueError("--true-on-policy-mode and --use-rollout-logprobs select different old-policy sources.")
+        if getattr(self.args, "max_staleness", 0) > 0 and not getattr(self.args, "use_tis", False):
+            raise ValueError(
+                "--true-on-policy-mode in stale hybrid training requires --use-tis and aligned rollout log-probs."
+            )
+        if getattr(self.args, "custom_megatron_before_log_prob_hook_path", None):
+            raise ValueError(
+                "--true-on-policy-mode in hybrid does not support a custom before-log-prob hook because "
+                "the train forward does not execute that hook."
+            )
+
+        dropout_fields = ("attention_dropout", "hidden_dropout", "lora_dropout")
+        nonzero_dropout = {
+            name: float(getattr(self.args, name, 0.0) or 0.0)
+            for name in dropout_fields
+            if float(getattr(self.args, name, 0.0) or 0.0) != 0.0
+        }
+        if nonzero_dropout:
+            raise ValueError(
+                "--true-on-policy-mode in hybrid requires deterministic forwards; "
+                f"non-zero dropout: {nonzero_dropout}."
+            )
+
+        incompatible_features = []
+        if self.args.kl_coef != 0:
+            incompatible_features.append("reward KL")
+        if getattr(self.args, "use_kl_loss", False):
+            incompatible_features.append("KL loss")
+        if getattr(self.args, "use_opd", False):
+            incompatible_features.append("OPD")
+        if getattr(self.args, "use_routing_replay", False) or getattr(self.args, "use_rollout_routing_replay", False):
+            incompatible_features.append("routing replay")
+        if incompatible_features:
+            raise ValueError(
+                "--true-on-policy-mode Hybrid fast path does not support: " + ", ".join(incompatible_features)
+            )
+        return True
+
+    def _validate_hybrid_rollout_log_probs(self, rollout_data: RolloutBatch) -> None:
+        """Validate rollout log-probs in their current context-parallel
+        layout."""
+        rollout_log_probs = rollout_data.get("rollout_log_probs")
+        total_lengths = rollout_data.get("total_lengths")
+        response_lengths = rollout_data.get("response_lengths")
+        if (
+            rollout_log_probs is None
+            or total_lengths is None
+            or response_lengths is None
+            or len(rollout_log_probs) != len(response_lengths)
+            or len(total_lengths) != len(response_lengths)
+        ):
+            raise RuntimeError(
+                "Hybrid train-forward log-prob reuse requires one rollout_log_probs entry per response."
+            )
+
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size == 1 or getattr(self.args, "dynamic_context_parallel", False):
+            expected_lengths = response_lengths
+        else:
+            max_seq_lens = rollout_data.get("max_seq_lens")
+            padded_total_lengths = maybe_padded_total_lengths(
+                total_lengths,
+                self.args.qkv_format,
+                getattr(self.args, "is_vl_model", False)
+                or rollout_data.get("multimodal_train_inputs") is not None
+                or getattr(self.args, "uses_unsplit_forward", False),
+            )
+            expected_lengths = []
+            for index, (total_length, response_length) in enumerate(zip(total_lengths, response_lengths, strict=True)):
+                _, _, logits_offsets, _ = get_logits_and_tokens_offset_with_cp(
+                    total_length,
+                    response_length,
+                    self.args.qkv_format,
+                    max_seq_lens[index] if max_seq_lens is not None else None,
+                    padded_total_length=(padded_total_lengths[index] if padded_total_lengths is not None else None),
+                )
+                expected_lengths.append(sum(end - start for start, end in logits_offsets))
+
+        mismatches = [
+            (index, None if log_probs is None else len(log_probs), expected_length)
+            for index, (log_probs, expected_length) in enumerate(zip(rollout_log_probs, expected_lengths, strict=True))
+            if log_probs is None or len(log_probs) != expected_length
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "Hybrid train-forward log-prob reuse requires CP-aligned rollout_log_probs; "
+                f"first mismatches (index, actual, expected): {mismatches[:3]}."
+            )
+
+    def _validate_hybrid_pipeline_runtime(self, rollout_plan, dp_size: int):
+        if dp_size != 1:
+            raise RuntimeError(f"--hybrid-pipeline-forward currently requires DP=1, detected DP={dp_size}")
+        if rollout_plan.num_rollout_minis != 1:
+            raise RuntimeError(
+                "--hybrid-pipeline-forward currently requires exactly one optimizer mini per rollout, "
+                f"detected {rollout_plan.num_rollout_minis}"
+            )
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+        if pp_size != 1 or vpp_size != 1:
+            raise RuntimeError(
+                f"--hybrid-pipeline-forward currently requires PP=1 and VPP=1, detected PP={pp_size}, VPP={vpp_size}"
+            )
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        etp_size = int(getattr(self.args, "expert_tensor_parallel_size", 1) or 1)
+        if (tp_size, cp_size, ep_size, etp_size) != (2, 2, 1, 1):
+            raise RuntimeError(
+                "--hybrid-pipeline-forward currently requires TP=2, CP=2, EP=1, and ETP=1, "
+                f"detected TP={tp_size}, CP={cp_size}, EP={ep_size}, ETP={etp_size}"
+            )
+        if self.args.offload_train or self.args.offload_rollout:
+            raise RuntimeError(
+                "--hybrid-pipeline-forward requires offload_train=False and offload_rollout=False, "
+                f"detected offload_train={self.args.offload_train}, "
+                f"offload_rollout={self.args.offload_rollout}"
+            )
+        backup_tags = set(self.weights_backuper.backup_tags)
+        if backup_tags != {"actor"}:
+            raise RuntimeError(
+                f"--hybrid-pipeline-forward requires actor-only TensorBackuper tags, detected {sorted(backup_tags)}"
+            )
+        if not self.args.compute_advantages_and_returns:
+            raise RuntimeError("--hybrid-pipeline-forward requires compute_advantages_and_returns=True")
+        if not self.args.use_dynamic_batch_size:
+            raise RuntimeError("--hybrid-pipeline-forward requires use_dynamic_batch_size=True")
+        return build_hybrid_forward_chunk_plan(self.args, rollout_plan, dp_size)
+
+    def _restore_hybrid_pipeline_actor(
+        self,
+        *,
+        rollout_id: int,
+        chunk_index: int,
+        sample_count: int,
+    ) -> None:
+        emit_hybrid_pipeline_event(
+            self.args,
+            "actor_restore_start",
+            rollout_id=rollout_id,
+            role="actor",
+            chunk_index=chunk_index,
+            sample_count=sample_count,
+            details={"target_tag": "actor"},
+        )
+        self._switch_model("actor")
+        emit_hybrid_pipeline_event(
+            self.args,
+            "actor_restore_end",
+            rollout_id=rollout_id,
+            role="actor",
+            chunk_index=chunk_index,
+            sample_count=sample_count,
+            details={"target_tag": "actor"},
+        )
+        if self._active_model_tag != "actor":
+            raise RuntimeError(
+                "--hybrid-pipeline-forward actor restore completed with unexpected active tag "
+                f"{self._active_model_tag!r}"
+            )
+
+    def _hybrid_actor_forward_without_switch(
+        self,
+        sub_batch: RolloutBatch,
+        *,
+        rollout_id: int,
+        chunk_index: int,
+        global_indexes: list[int],
+    ) -> list[list[int]]:
+        if self._active_model_tag != "actor":
+            raise RuntimeError(
+                "--hybrid-pipeline-forward requires the actor model to remain active before "
+                f"chunk forward, detected {self._active_model_tag!r}"
+            )
+
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, sub_batch)
+        if len(data_iterator) != 1 or len(num_microbatches) != 1:
+            raise RuntimeError(
+                "--hybrid-pipeline-forward expected one PP/VPP iterator and one optimizer step "
+                f"per chunk, got iterators={len(data_iterator)}, steps={num_microbatches}"
+            )
+        microbatch_indices = data_iterator[0].micro_batch_indices
+        if microbatch_indices is None:
+            raise RuntimeError("--hybrid-pipeline-forward requires an explicit dynamic microbatch schedule")
+        forward_schedule = [list(indices) for indices in microbatch_indices]
+        flattened_schedule = [index for indices in forward_schedule for index in indices]
+        if len(forward_schedule) != num_microbatches[0] or sorted(flattened_schedule) != list(
+            range(len(sub_batch["total_lengths"]))
+        ):
+            raise RuntimeError(
+                "--hybrid-pipeline-forward produced an invalid chunk microbatch schedule: "
+                f"chunk_index={chunk_index}, microbatches={len(forward_schedule)}, "
+                f"expected_microbatches={num_microbatches[0]}, samples={len(flattened_schedule)}"
+            )
+        emit_hybrid_pipeline_event(
+            self.args,
+            "actor_forward_start",
+            rollout_id=rollout_id,
+            role="actor",
+            chunk_index=chunk_index,
+            batch=sub_batch,
+            global_indexes=global_indexes,
+        )
+        sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
+        emit_hybrid_pipeline_event(
+            self.args,
+            "actor_forward_end",
+            rollout_id=rollout_id,
+            role="actor",
+            chunk_index=chunk_index,
+            batch=sub_batch,
+            global_indexes=global_indexes,
+        )
+        if self._active_model_tag != "actor":
+            raise RuntimeError(
+                f"--hybrid-pipeline-forward actor tag changed during chunk forward: {self._active_model_tag!r}"
+            )
+        return forward_schedule
+
+    def _fetch_hybrid_pipeline_chunk(
+        self,
+        *,
+        rollout_id: int,
+        data_fields: list[str],
+        expected_samples: int,
+        batch_index: int,
+        mini_index: int,
+    ) -> tuple[RolloutBatch, list[int]]:
+        emit_hybrid_pipeline_event(
+            self.args,
+            "chunk_fetch_start",
+            rollout_id=rollout_id,
+            role="actor",
+            chunk_index=batch_index,
+            sample_count=expected_samples,
+            details={
+                "batch_index": batch_index,
+                "mini_index": mini_index,
+                "expected_samples": expected_samples,
+            },
+        )
+
+        def fetch_once():
+            with timer("train_get_data"):
+                return self._get_data_from_transfer_queue(
+                    "train",
+                    rollout_id,
+                    data_fields,
+                    expected_samples,
+                    batch_index,
+                )
+
+        error_context = (
+            "--hybrid-pipeline-forward TransferQueue chunk failure: "
+            f"rollout_id={rollout_id}, mini_index={mini_index}, chunk_index={batch_index}"
+        )
+        sub_batch, batch_meta, elapsed = fetch_exact_chunk_with_timeout(
+            fetch_once=fetch_once,
+            expected_samples=expected_samples,
+            timeout_s=self.args.hybrid_pipeline_fetch_timeout_s,
+            error_context=error_context,
+        )
+        actual_samples = len(sub_batch["total_lengths"])
+        global_indexes = list(getattr(batch_meta, "global_indexes", []))
+        if len(global_indexes) != actual_samples:
+            raise RuntimeError(
+                "--hybrid-pipeline-forward received invalid BatchMeta.global_indexes: "
+                f"rollout_id={rollout_id}, mini_index={mini_index}, "
+                f"chunk_index={batch_index}, samples={actual_samples}, "
+                f"indexes={len(global_indexes)}"
+            )
+        emit_hybrid_pipeline_event(
+            self.args,
+            "chunk_fetch_end",
+            rollout_id=rollout_id,
+            role="actor",
+            chunk_index=batch_index,
+            batch=sub_batch,
+            global_indexes=global_indexes,
+            details={
+                "batch_index": batch_index,
+                "mini_index": mini_index,
+                "expected_samples": expected_samples,
+                "elapsed_s": elapsed,
+            },
+        )
+        return sub_batch, global_indexes
+
     @staticmethod
     def _split_rollout_batch(rollout_data: RolloutBatch, num_chunks: int) -> List[RolloutBatch]:
-        """Split a merged rollout batch (dict of per-sample lists) into at most
-        ``num_chunks`` roughly equal sub-batches along the sample dimension.
-
-        Keys whose value is not a per-sample list are copied into every chunk
-        unchanged. Used by the debug_train_only path to feed the collected-
-        sub-batch forward loop (one global batch per chunk).
-        """
+        """Split a debug rollout into roughly equal per-sample chunks."""
         num_samples = len(rollout_data["tokens"])
         num_chunks = max(1, min(num_chunks, num_samples))
         chunk_size = (num_samples + num_chunks - 1) // num_chunks
-        chunks: List[RolloutBatch] = []
-        for start in range(0, num_samples, chunk_size):
-            end = min(start + chunk_size, num_samples)
-            chunk: RolloutBatch = {}
-            for key, value in rollout_data.items():
-                if isinstance(value, list) and len(value) == num_samples:
-                    chunk[key] = value[start:end]
-                else:
-                    chunk[key] = value
-            chunks.append(chunk)
-        return chunks
+        return [
+            _slice_rollout_batch(rollout_data, start, min(start + chunk_size, num_samples))
+            for start in range(0, num_samples, chunk_size)
+        ]
 
     def _use_streaming_fwd(self) -> bool:
         """Whether ref / actor_fwd forward should stream via token-budget
@@ -1243,9 +1609,61 @@ class MegatronTrainRayActor(TrainRayActor):
         plan = build_rollout_minibatch_plan(self.args, dp_size)
         batch_size = plan.mini_local_sample_request
 
+        pipeline_enabled = bool(getattr(self.args, "hybrid_pipeline_forward", False))
+        reuse_train_forward_log_probs = self._should_reuse_hybrid_train_forward_log_probs(plan)
+        if reuse_train_forward_log_probs:
+            logger.info(
+                "train_hybrid(%s) reuses detached log-probs from the deterministic train forward; "
+                "skipping the redundant actor log-prob forward",
+                rollout_id,
+            )
+        trace_enabled = bool(getattr(self.args, "hybrid_pipeline_trace_dir", None))
+        chunk_plan = self._hybrid_pipeline_chunk_plan if pipeline_enabled else None
+        if pipeline_enabled and chunk_plan is None:
+            raise RuntimeError(
+                "--hybrid-pipeline-forward was enabled without an initialized chunk plan; "
+                "the actor startup compatibility checks did not complete."
+            )
+
+        def phase1_timer():
+            return timer("hybrid_phase1") if trace_enabled else nullcontext()
+
+        data_fields = [
+            "tokens",
+            "total_lengths",
+            "response_lengths",
+            "loss_masks",
+            "rollout_log_probs",
+            "rewards",
+            "raw_reward",
+        ]
+        if trace_enabled:
+            data_fields.append("truncated")
+        data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
+        if self.args.multimodal_keys is not None:
+            data_fields.append("multimodal_train_inputs")
+        if self.args.use_opd and self.args.opd_type == "sglang":
+            data_fields.append("teacher_log_probs")
+
         # ── Phase 1: Collect sub-batches and compute ref/actor forward in small chunks ──
         collected_batches: list[RolloutBatch] = []
+        collected_global_indexes: list[int] = []
         rollout_mini_local_sample_counts: list[int] = []
+        pipeline_chunk_schedules: list[tuple[list[int], list[list[int]]]] = []
+
+        def forward_pipeline_chunk(
+            sub_batch: RolloutBatch,
+            tq_batch_index: int,
+            global_indexes: list[int],
+        ) -> None:
+            forward_schedule = self._hybrid_actor_forward_without_switch(
+                sub_batch,
+                rollout_id=rollout_id,
+                chunk_index=tq_batch_index,
+                global_indexes=global_indexes,
+            )
+            pipeline_chunk_schedules.append((list(global_indexes), forward_schedule))
+
         if self.args.debug_train_only:
             # Bypass the transfer queue and load the offline debug rollout dump
             # directly (mirrors `train`'s debug_train_only path). The dump holds
@@ -1256,72 +1674,183 @@ class MegatronTrainRayActor(TrainRayActor):
             full_batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
             debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, debug_data)
-            for sub_batch in self._split_rollout_batch(debug_data, plan.num_rollout_minis):
-                if len(sub_batch["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"debug rollout mini batch local size mismatch for train_hybrid({rollout_id}): "
-                        f"expected {batch_size}, got {len(sub_batch['total_lengths'])}."
-                    )
-                self._hybrid_forward_subbatch(sub_batch)
-                collected_batches.append(sub_batch)
-                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
-        else:
-            batch_index = 0
-            # Surface stuck-loop conditions: when the partition can never reach the
-            # requested batch_size (e.g. rollout dropped samples without refilling),
-            # `get_meta` keeps returning size=0 while `all_consumed` stays False,
-            # producing a silent infinite spin. Warn periodically so the failure mode
-            # is visible in logs instead of presenting as a totally silent hang.
-            loop_start = time.monotonic()
-            last_progress = loop_start
-            last_warn = loop_start
-            while batch_index < plan.num_rollout_minis and not self.all_consumed("train", rollout_id):
-                data_fields = [
-                    "tokens",
-                    "total_lengths",
-                    "response_lengths",
-                    "loss_masks",
-                    "rollout_log_probs",
-                    "rewards",
-                    "raw_reward",
-                ]
-                data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
-                if self.args.multimodal_keys is not None:
-                    data_fields.append("multimodal_train_inputs")
-                if self.args.use_opd and self.args.opd_type == "sglang":
-                    data_fields.append("teacher_log_probs")
-                with timer("train_get_data"):
-                    sub_batch, batch_meta = self._get_data_from_transfer_queue(
-                        "train", rollout_id, data_fields, batch_size, batch_index
-                    )
-                if sub_batch is None:
-                    now = time.monotonic()
-                    stalled = now - last_progress
-                    if now - last_warn >= 60.0 and stalled >= 60.0:
-                        logger.warning(
-                            f"train_hybrid({rollout_id}) batch_index={batch_index} stalled for {stalled:.0f}s: "
-                            f"partition train_{rollout_id} has no data of size={batch_size} available but "
-                            f"all_consumed=False. Likely the rollout under-filled this partition."
-                        )
-                        last_warn = now
-                    # Throttle the spin so the controller is not hammered with metadata
-                    # polls while we wait for upstream data.
-                    time.sleep(0.1)
-                    continue
-                last_progress = time.monotonic()
-                last_warn = last_progress
-                batch_index += 1
+            if pipeline_enabled:
+                for mini_index in range(plan.num_rollout_minis):
 
-                # Forward passes on this sub-batch (small memory footprint)
-                if len(sub_batch["total_lengths"]) != batch_size:
-                    raise RuntimeError(
-                        f"rollout mini batch local size mismatch for train_hybrid({rollout_id}), "
-                        f"batch_index={batch_index - 1}: expected {batch_size}, "
-                        f"got {len(sub_batch['total_lengths'])}."
+                    def fetch_debug_chunk(tq_batch_index):
+                        start = tq_batch_index * chunk_plan.chunk_local_samples
+                        end = start + chunk_plan.chunk_local_samples
+                        return _slice_rollout_batch(debug_data, start, end), list(range(start, end))
+
+                    with phase1_timer():
+                        mini_chunks = execute_hybrid_forward_mini(
+                            chunks_per_mini=chunk_plan.chunks_per_mini,
+                            batch_index_for_chunk=lambda chunk_index: chunk_plan.transfer_queue_batch_index(
+                                mini_index, chunk_index
+                            ),
+                            restore_actor=lambda tq_batch_index: self._restore_hybrid_pipeline_actor(
+                                rollout_id=rollout_id,
+                                chunk_index=tq_batch_index,
+                                sample_count=batch_size,
+                            ),
+                            fetch_chunk=fetch_debug_chunk,
+                            forward_chunk=forward_pipeline_chunk,
+                            overlap_producer=bool(getattr(self.args, "hybrid_pipeline_overlap", True)),
+                        )
+                    mini_batch, canonical_indexes = canonicalize_rollout_chunks(
+                        mini_chunks,
+                        expected_sample_count=batch_size,
                     )
-                self._hybrid_forward_subbatch(sub_batch)
-                collected_batches.append(sub_batch)
-                rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
+                    collected_batches.append(mini_batch)
+                    collected_global_indexes.extend(canonical_indexes)
+                    rollout_mini_local_sample_counts.append(batch_size)
+            else:
+                debug_batches = self._split_rollout_batch(debug_data, plan.num_rollout_minis)
+                for mini_index, sub_batch in enumerate(debug_batches):
+                    if len(sub_batch["total_lengths"]) != batch_size:
+                        raise RuntimeError(
+                            f"debug rollout mini batch local size mismatch for train_hybrid({rollout_id}): "
+                            f"expected {batch_size}, got {len(sub_batch['total_lengths'])}."
+                        )
+                    start = mini_index * batch_size
+                    global_indexes = list(range(start, start + batch_size))
+                    with phase1_timer():
+                        self._hybrid_forward_subbatch(
+                            sub_batch,
+                            rollout_id=rollout_id,
+                            chunk_index=mini_index,
+                            global_indexes=global_indexes,
+                            reuse_train_forward_log_probs=reuse_train_forward_log_probs,
+                        )
+                    collected_batches.append(sub_batch)
+                    collected_global_indexes.extend(global_indexes)
+                    rollout_mini_local_sample_counts.append(len(sub_batch["total_lengths"]))
+        else:
+            if pipeline_enabled:
+                seen_global_indexes: set[int] = set()
+                for mini_index in range(plan.num_rollout_minis):
+
+                    def fetch_pipeline_chunk(tq_batch_index):
+                        sub_batch, global_indexes = self._fetch_hybrid_pipeline_chunk(
+                            rollout_id=rollout_id,
+                            data_fields=data_fields,
+                            expected_samples=chunk_plan.chunk_local_samples,
+                            batch_index=tq_batch_index,
+                            mini_index=mini_index,
+                        )
+                        overlap = seen_global_indexes.intersection(global_indexes)
+                        if overlap:
+                            raise RuntimeError(
+                                "--hybrid-pipeline-forward received duplicate global indexes "
+                                f"across optimizer minis: {sorted(overlap)}"
+                            )
+                        seen_global_indexes.update(global_indexes)
+                        return sub_batch, global_indexes
+
+                    with phase1_timer():
+                        mini_chunks = execute_hybrid_forward_mini(
+                            chunks_per_mini=chunk_plan.chunks_per_mini,
+                            batch_index_for_chunk=lambda chunk_index: chunk_plan.transfer_queue_batch_index(
+                                mini_index, chunk_index
+                            ),
+                            restore_actor=lambda tq_batch_index: self._restore_hybrid_pipeline_actor(
+                                rollout_id=rollout_id,
+                                chunk_index=tq_batch_index,
+                                sample_count=batch_size,
+                            ),
+                            fetch_chunk=fetch_pipeline_chunk,
+                            forward_chunk=forward_pipeline_chunk,
+                            overlap_producer=bool(getattr(self.args, "hybrid_pipeline_overlap", True)),
+                        )
+
+                    mini_batch, canonical_indexes = canonicalize_rollout_chunks(
+                        mini_chunks,
+                        expected_sample_count=batch_size,
+                    )
+                    collected_batches.append(mini_batch)
+                    collected_global_indexes.extend(canonical_indexes)
+                    rollout_mini_local_sample_counts.append(batch_size)
+            else:
+                # Preserve the baseline sample-count request and unbounded retry
+                # behavior when the optimization switch is disabled.
+                for mini_index in range(plan.num_rollout_minis):
+                    loop_start = time.monotonic()
+                    last_progress = loop_start
+                    last_warn = loop_start
+                    emit_hybrid_pipeline_event(
+                        self.args,
+                        "chunk_fetch_start",
+                        rollout_id=rollout_id,
+                        role="actor",
+                        chunk_index=mini_index,
+                        sample_count=batch_size,
+                        details={
+                            "batch_index": mini_index,
+                            "mini_index": mini_index,
+                            "expected_samples": batch_size,
+                        },
+                    )
+                    with phase1_timer():
+                        while True:
+                            if self.all_consumed("train", rollout_id):
+                                raise RuntimeError(
+                                    f"TransferQueue was consumed before train_hybrid({rollout_id}) "
+                                    f"received rollout mini {mini_index}."
+                                )
+                            with timer("train_get_data"):
+                                sub_batch, batch_meta = self._get_data_from_transfer_queue(
+                                    "train",
+                                    rollout_id,
+                                    data_fields,
+                                    batch_size,
+                                    mini_index,
+                                )
+                            if sub_batch is not None:
+                                break
+                            now = time.monotonic()
+                            stalled = now - last_progress
+                            if now - last_warn >= 60.0 and stalled >= 60.0:
+                                logger.warning(
+                                    f"train_hybrid({rollout_id}) batch_index={mini_index} "
+                                    f"stalled for {stalled:.0f}s: partition train_{rollout_id} "
+                                    f"has no data of size={batch_size} available but "
+                                    "all_consumed=False. Likely the rollout under-filled this partition."
+                                )
+                                last_warn = now
+                            time.sleep(0.1)
+
+                        actual_samples = len(sub_batch["total_lengths"])
+                        if actual_samples != batch_size:
+                            raise RuntimeError(
+                                f"rollout mini batch local size mismatch for train_hybrid({rollout_id}), "
+                                f"batch_index={mini_index}: expected {batch_size}, got {actual_samples}."
+                            )
+                        global_indexes = list(getattr(batch_meta, "global_indexes", []))
+                        emit_hybrid_pipeline_event(
+                            self.args,
+                            "chunk_fetch_end",
+                            rollout_id=rollout_id,
+                            role="actor",
+                            chunk_index=mini_index,
+                            batch=sub_batch,
+                            global_indexes=global_indexes,
+                            details={
+                                "batch_index": mini_index,
+                                "mini_index": mini_index,
+                                "expected_samples": batch_size,
+                                "elapsed_s": time.monotonic() - loop_start,
+                            },
+                        )
+                        self._hybrid_forward_subbatch(
+                            sub_batch,
+                            rollout_id=rollout_id,
+                            chunk_index=mini_index,
+                            global_indexes=global_indexes,
+                            reuse_train_forward_log_probs=reuse_train_forward_log_probs,
+                        )
+                    collected_batches.append(sub_batch)
+                    collected_global_indexes.extend(global_indexes)
+                    rollout_mini_local_sample_counts.append(actual_samples)
 
         if len(collected_batches) != plan.num_rollout_minis:
             raise RuntimeError(
@@ -1333,21 +1862,47 @@ class MegatronTrainRayActor(TrainRayActor):
             self._switch_model("actor")
 
         # ── Phase 2: Merge sub-batches and compute advantages with correct global normalization ──
-        # Merge all sub-batch dicts: each value is a list, so we concatenate them.
-        rollout_data: RolloutBatch = {}
-        for sb in collected_batches:
-            for key, value in sb.items():
-                if key not in rollout_data:
-                    rollout_data[key] = []
-                if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
-                    rollout_data[key].extend(value)
-                else:
-                    rollout_data[key].append(value)
+        if pipeline_enabled:
+            rollout_data = concat_rollout_batches(collected_batches)
+            pipeline_train_microbatch_indices = canonicalize_hybrid_microbatch_schedule(
+                pipeline_chunk_schedules,
+                collected_global_indexes,
+            )
+        else:
+            # Keep the flag-off merge path byte-for-byte compatible with the
+            # pre-optimization implementation.
+            rollout_data: RolloutBatch = {}
+            for sb in collected_batches:
+                for key, value in sb.items():
+                    if key not in rollout_data:
+                        rollout_data[key] = []
+                    if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
+                        rollout_data[key].extend(value)
+                    else:
+                        rollout_data[key].append(value)
         rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
+        if reuse_train_forward_log_probs:
+            self._validate_hybrid_rollout_log_probs(rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "advantages_start",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    batch=rollout_data,
+                    global_indexes=collected_global_indexes,
+                )
                 compute_advantages_and_returns(self.args, rollout_data)
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "advantages_end",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    batch=rollout_data,
+                    global_indexes=collected_global_indexes,
+                )
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
@@ -1355,10 +1910,29 @@ class MegatronTrainRayActor(TrainRayActor):
             log_rollout_data(rollout_id, self.args, rollout_data)
 
             # ── Phase 3: Train on the full merged batch ──
-            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+            if pipeline_enabled:
+                data_iterator = [
+                    DataIterator(
+                        rollout_data,
+                        micro_batch_indices=pipeline_train_microbatch_indices,
+                        max_tokens_per_gpu=self.args.max_tokens_per_gpu,
+                    )
+                ]
+                num_microbatches = [len(pipeline_train_microbatch_indices)]
+            else:
+                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "optimizer_start",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    batch=rollout_data,
+                    global_indexes=collected_global_indexes,
+                    details={"scope": "actor_train"},
+                )
                 train(
                     rollout_id,
                     self.model,
@@ -1366,6 +1940,15 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.opt_param_scheduler,
                     data_iterator,
                     num_microbatches,
+                )
+                emit_hybrid_pipeline_event(
+                    self.args,
+                    "optimizer_end",
+                    rollout_id=rollout_id,
+                    role="actor",
+                    batch=rollout_data,
+                    global_indexes=collected_global_indexes,
+                    details={"scope": "actor_train"},
                 )
 
             self.prof.step(rollout_id=rollout_id)
@@ -1398,6 +1981,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
+        if trace_enabled:
+            response_token_counts = [
+                int(mask.sum().item()) if isinstance(mask, torch.Tensor) else int(sum(mask))
+                for mask in rollout_data["loss_masks"]
+            ]
+            all_response_token_counts = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_response_token_counts,
+                response_token_counts,
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            Timer().response_lens = sum(all_response_token_counts, [])
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
             images_seqlens = _extract_images_seqlens(mm_inputs)

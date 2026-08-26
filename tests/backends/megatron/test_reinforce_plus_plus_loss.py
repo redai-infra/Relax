@@ -15,6 +15,21 @@ compute_approx_kl = torch.compiler.disable(_compiled_compute_approx_kl)
 compute_policy_loss = torch.compiler.disable(_compiled_compute_policy_loss)
 
 
+def _load_loss_module(monkeypatch):
+    try:
+        import megatron  # noqa: F401
+    except ModuleNotFoundError:
+        megatron = ModuleType("megatron")
+        megatron_core = ModuleType("megatron.core")
+        megatron_core.mpu = SimpleNamespace()
+        megatron.core = megatron_core
+        monkeypatch.setitem(sys.modules, "megatron", megatron)
+        monkeypatch.setitem(sys.modules, "megatron.core", megatron_core)
+    if "ray" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "ray", ModuleType("ray"))
+    return importlib.import_module("relax.backends.megatron.loss")
+
+
 def _response_mean(values: torch.Tensor, response_lengths: list[int], masks: list[torch.Tensor]) -> torch.Tensor:
     chunks = values.split(response_lengths)
     per_response = [(chunk * mask).sum() / mask.sum() for chunk, mask in zip(chunks, masks, strict=True)]
@@ -81,18 +96,39 @@ def test_nonfinite_masked_tokens_are_scoped_to_reinforce_plus_plus(monkeypatch):
     assert torch.isnan(response_mean(values))
     assert torch.isnan(token_sum(values))
 
-    try:
-        import megatron  # noqa: F401
-    except ModuleNotFoundError:
-        megatron = ModuleType("megatron")
-        megatron_core = ModuleType("megatron.core")
-        megatron_core.mpu = SimpleNamespace()
-        megatron.core = megatron_core
-        monkeypatch.setitem(sys.modules, "megatron", megatron)
-        monkeypatch.setitem(sys.modules, "megatron.core", megatron_core)
-    loss_module = importlib.import_module("relax.backends.megatron.loss")
+    loss_module = _load_loss_module(monkeypatch)
 
     safe_response_mean = loss_module._get_reinforce_plus_plus_mask_safe_reducer(response_mean, masks)
     safe_token_sum = loss_module._get_reinforce_plus_plus_mask_safe_reducer(token_sum, masks)
     torch.testing.assert_close(safe_response_mean(values), torch.tensor(4.5), atol=0, rtol=0)
     torch.testing.assert_close(safe_token_sum(values), torch.tensor(8.0), atol=0, rtol=0)
+
+
+def test_true_on_policy_advantages_use_rollout_log_probs_as_zero_kl_shape(monkeypatch):
+    loss_module = _load_loss_module(monkeypatch)
+    args = SimpleNamespace(
+        advantage_estimator="grpo",
+        is_vl_model=False,
+        kl_coef=0.0,
+        normalize_advantages=False,
+        qkv_format="thd",
+        true_on_policy_mode=True,
+        use_opd=False,
+        use_rollout_logprobs=False,
+        uses_unsplit_forward=False,
+    )
+    rollout_data = {
+        "loss_masks": [torch.ones(2), torch.ones(1)],
+        "response_lengths": [2, 1],
+        "rewards": [1.5, -0.5],
+        "rollout_log_probs": [torch.tensor([-0.2, -0.4]), torch.tensor([-0.1])],
+        "total_lengths": [2, 1],
+    }
+    monkeypatch.setattr(cp_utils, "mpu", SimpleNamespace(get_context_parallel_world_size=lambda: 1))
+    monkeypatch.setattr(loss_module.mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+
+    loss_module.compute_advantages_and_returns(args, rollout_data)
+
+    assert "log_probs" not in rollout_data
+    assert torch.equal(rollout_data["advantages"][0], torch.tensor([1.5, 1.5]))
+    assert torch.equal(rollout_data["advantages"][1], torch.tensor([-0.5]))

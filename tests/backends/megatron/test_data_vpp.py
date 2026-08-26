@@ -15,6 +15,7 @@ def _load_data_module(monkeypatch):
     training = types.ModuleType("megatron.training")
     global_vars = types.ModuleType("megatron.training.global_vars")
     tracking_utils = types.ModuleType("relax.utils.tracking_utils")
+    ray = types.ModuleType("ray")
 
     class _PackedSeqParams:
         pass
@@ -31,6 +32,7 @@ def _load_data_module(monkeypatch):
         "megatron.training": training,
         "megatron.training.global_vars": global_vars,
         "relax.utils.tracking_utils": tracking_utils,
+        "ray": ray,
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -94,6 +96,81 @@ def test_rollout_minibatch_plan_rejects_non_divisible_prompt_groups(monkeypatch)
         data_module.build_rollout_minibatch_plan(args, dp_size=2)
 
 
+def test_hybrid_forward_chunk_plan_matches_producer_granularity(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=2,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=1)
+
+    chunk_plan = data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=1)
+
+    assert chunk_plan.chunks_per_mini == 2
+    assert chunk_plan.chunk_global_samples == 128
+    assert chunk_plan.chunk_local_samples == 128
+    assert [
+        chunk_plan.transfer_queue_batch_index(mini_index, chunk_index)
+        for mini_index in range(3)
+        for chunk_index in range(chunk_plan.chunks_per_mini)
+    ] == [0, 1, 2, 3, 4, 5]
+
+
+def test_hybrid_forward_chunk_plan_supports_four_prompt_aligned_stages(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=32,
+        n_samples_per_prompt=8,
+        global_batch_size=256,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=4,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=1)
+
+    chunk_plan = data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=1)
+
+    assert chunk_plan.chunks_per_mini == 4
+    assert chunk_plan.chunk_global_samples == 64
+    assert chunk_plan.chunk_local_samples == 64
+    assert [
+        chunk_plan.transfer_queue_batch_index(mini_index, chunk_index)
+        for mini_index in range(2)
+        for chunk_index in range(chunk_plan.chunks_per_mini)
+    ] == list(range(8))
+
+
+@pytest.mark.parametrize(
+    ("num_iters", "global_batch_size", "n_samples_per_prompt", "error"),
+    [
+        (1, 256, 8, "num_iters_per_train_update >= 2"),
+        (3, 256, 8, "mini_global_samples must be divisible"),
+        (4, 24, 8, "must preserve complete prompt groups"),
+    ],
+)
+def test_hybrid_forward_chunk_plan_rejects_unsafe_boundaries(
+    monkeypatch,
+    num_iters,
+    global_batch_size,
+    n_samples_per_prompt,
+    error,
+):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(
+        rollout_batch_size=global_batch_size // n_samples_per_prompt,
+        n_samples_per_prompt=n_samples_per_prompt,
+        global_batch_size=global_batch_size,
+        num_steps_per_rollout=None,
+        num_iters_per_train_update=num_iters,
+    )
+    rollout_plan = data_module.build_rollout_minibatch_plan(args, dp_size=1)
+
+    with pytest.raises(ValueError, match=error):
+        data_module.build_hybrid_forward_chunk_plan(args, rollout_plan, dp_size=1)
+
+
 def test_concat_rollout_batches_preserves_order_and_scalar_metadata(monkeypatch):
     data_module = _load_data_module(monkeypatch)
 
@@ -118,6 +195,117 @@ def test_concat_rollout_batches_preserves_order_and_scalar_metadata(monkeypatch)
     assert merged["total_lengths"] == [1, 2, 3]
     assert torch.equal(merged["scores"], torch.tensor([[1], [2], [3]]))
     assert merged["weight_version"] == 7
+
+
+@pytest.mark.parametrize(
+    ("second_batch", "error"),
+    [
+        (
+            {"tokens": ["c"], "total_lengths": [3]},
+            "schema mismatch",
+        ),
+        (
+            {
+                "tokens": ["c", "unexpected"],
+                "total_lengths": [3],
+                "weight_version": 7,
+            },
+            "Per-sample rollout field",
+        ),
+    ],
+)
+def test_concat_rollout_batches_rejects_incomplete_chunks(monkeypatch, second_batch, error):
+    data_module = _load_data_module(monkeypatch)
+
+    with pytest.raises(ValueError, match=error):
+        data_module.concat_rollout_batches(
+            [
+                {
+                    "tokens": ["a", "b"],
+                    "total_lengths": [1, 2],
+                    "weight_version": 7,
+                },
+                second_batch,
+            ]
+        )
+
+
+def test_canonicalize_rollout_chunks_reorders_every_sample_field(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    chunks = [
+        (
+            {
+                "tokens": ["token-12", "token-10"],
+                "total_lengths": [12, 10],
+                "multimodal_train_inputs": [{"image": "12"}, {"image": "10"}],
+                "scores": torch.tensor([[12], [10]]),
+                "array": data_module.np.array([[12], [10]]),
+                "weight_version": 7,
+            },
+            [12, 10],
+        ),
+        (
+            {
+                "tokens": ["token-13", "token-11"],
+                "total_lengths": [13, 11],
+                "multimodal_train_inputs": [{"image": "13"}, {"image": "11"}],
+                "scores": torch.tensor([[13], [11]]),
+                "array": data_module.np.array([[13], [11]]),
+                "weight_version": 7,
+            },
+            [13, 11],
+        ),
+    ]
+
+    merged, global_indexes = data_module.canonicalize_rollout_chunks(chunks, expected_sample_count=4)
+
+    assert global_indexes == [10, 11, 12, 13]
+    assert merged["tokens"] == ["token-10", "token-11", "token-12", "token-13"]
+    assert merged["total_lengths"] == [10, 11, 12, 13]
+    assert merged["multimodal_train_inputs"] == [
+        {"image": "10"},
+        {"image": "11"},
+        {"image": "12"},
+        {"image": "13"},
+    ]
+    assert torch.equal(merged["scores"], torch.tensor([[10], [11], [12], [13]]))
+    assert merged["array"].tolist() == [[10], [11], [12], [13]]
+    assert merged["weight_version"] == 7
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected_count", "error"),
+    [
+        (
+            [
+                ({"total_lengths": [1, 1]}, [10, 11]),
+                ({"total_lengths": [1, 1]}, [11, 12]),
+            ],
+            4,
+            "contain duplicates",
+        ),
+        (
+            [({"total_lengths": [1, 1]}, [10])],
+            2,
+            "length mismatch",
+        ),
+        (
+            [({"total_lengths": [1]}, [10])],
+            2,
+            "sample count mismatch",
+        ),
+    ],
+)
+def test_canonicalize_rollout_chunks_rejects_invalid_metadata(
+    monkeypatch,
+    chunks,
+    expected_count,
+    error,
+):
+    data_module = _load_data_module(monkeypatch)
+
+    with pytest.raises((ValueError, TypeError), match=error):
+        data_module.canonicalize_rollout_chunks(chunks, expected_count)
 
 
 def test_get_data_iterator_uses_rollout_mini_boundaries_with_balance_data(monkeypatch):

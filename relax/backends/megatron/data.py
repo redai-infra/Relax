@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from collections import Counter
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -50,6 +51,20 @@ class RolloutMiniBatchPlan:
     fixed_n_samples_per_prompt: int | None
     mini_global_samples: int | None
     mini_local_sample_request: int | None
+
+
+@dataclass(frozen=True)
+class HybridForwardChunkPlan:
+    chunks_per_mini: int
+    chunk_global_samples: int
+    chunk_local_samples: int
+
+    def transfer_queue_batch_index(self, mini_index: int, chunk_index: int) -> int:
+        if mini_index < 0:
+            raise ValueError(f"mini_index must be non-negative, got {mini_index}")
+        if not 0 <= chunk_index < self.chunks_per_mini:
+            raise ValueError(f"chunk_index must be in [0, {self.chunks_per_mini}), got {chunk_index}")
+        return mini_index * self.chunks_per_mini + chunk_index
 
 
 def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBatchPlan:
@@ -119,9 +134,63 @@ def build_rollout_minibatch_plan(args: Namespace, dp_size: int) -> RolloutMiniBa
     )
 
 
+def build_hybrid_forward_chunk_plan(
+    args: Namespace,
+    rollout_plan: RolloutMiniBatchPlan,
+    dp_size: int,
+) -> HybridForwardChunkPlan:
+    """Split one optimizer mini into fixed actor sample-count chunks."""
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+
+    chunks_per_mini = int(args.num_iters_per_train_update)
+    if chunks_per_mini < 2:
+        raise ValueError(f"hybrid pipeline forward requires num_iters_per_train_update >= 2, got {chunks_per_mini}")
+
+    mini_global_samples = rollout_plan.mini_global_samples
+    mini_local_samples = rollout_plan.mini_local_sample_request
+    n_samples_per_prompt = rollout_plan.fixed_n_samples_per_prompt
+    if mini_global_samples is None or mini_local_samples is None or n_samples_per_prompt is None:
+        raise ValueError("hybrid pipeline forward requires a fixed-size rollout mini plan")
+    if mini_global_samples % chunks_per_mini != 0:
+        raise ValueError(
+            "mini_global_samples must be divisible by num_iters_per_train_update, "
+            f"got mini_global_samples={mini_global_samples}, chunks={chunks_per_mini}"
+        )
+
+    chunk_global_samples = mini_global_samples // chunks_per_mini
+    if chunk_global_samples % dp_size != 0:
+        raise ValueError(
+            "chunk_global_samples must be divisible by data parallel size, "
+            f"got chunk_global_samples={chunk_global_samples}, dp_size={dp_size}"
+        )
+    if chunk_global_samples % n_samples_per_prompt != 0:
+        raise ValueError(
+            "hybrid pipeline forward chunks must preserve complete prompt groups, "
+            f"got chunk_global_samples={chunk_global_samples}, "
+            f"n_samples_per_prompt={n_samples_per_prompt}"
+        )
+
+    chunk_local_samples = chunk_global_samples // dp_size
+    if chunk_local_samples * chunks_per_mini != mini_local_samples:
+        raise ValueError(
+            "hybrid pipeline chunk plan does not reconstruct the optimizer mini, "
+            f"chunk_local_samples={chunk_local_samples}, chunks={chunks_per_mini}, "
+            f"mini_local_samples={mini_local_samples}"
+        )
+
+    return HybridForwardChunkPlan(
+        chunks_per_mini=chunks_per_mini,
+        chunk_global_samples=chunk_global_samples,
+        chunk_local_samples=chunk_local_samples,
+    )
+
+
 def _same_scalar_value(lhs: Any, rhs: Any) -> bool:
     if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
         return torch.equal(lhs, rhs)
+    if isinstance(lhs, np.ndarray) and isinstance(rhs, np.ndarray):
+        return np.array_equal(lhs, rhs)
     return lhs == rhs
 
 
@@ -130,24 +199,37 @@ def concat_rollout_batches(rollout_batches: Sequence[RolloutBatch]) -> RolloutBa
     if not rollout_batches:
         raise ValueError("rollout_batches must not be empty")
 
+    expected_keys = set(rollout_batches[0])
     merged: RolloutBatch = {}
     tensor_batches: dict[str, list[torch.Tensor]] = {}
+    array_batches: dict[str, list[np.ndarray]] = {}
     scalar_values: dict[str, Any] = {}
 
-    for batch in rollout_batches:
+    for batch_index, batch in enumerate(rollout_batches):
         if batch is None:
             raise ValueError("rollout_batches must not contain None")
+        if set(batch) != expected_keys:
+            missing = sorted(expected_keys - set(batch))
+            extra = sorted(set(batch) - expected_keys)
+            raise ValueError(f"rollout batch {batch_index} schema mismatch: missing={missing}, extra={extra}")
         batch_size = len(batch.get("total_lengths", []))
         if batch_size <= 0:
             raise ValueError("rollout mini batch must contain at least one sample")
 
         for key, value in batch.items():
             if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
+                if len(value) != batch_size:
+                    raise ValueError(
+                        f"Per-sample rollout field {key!r} in batch {batch_index} has "
+                        f"length={len(value)}, expected={batch_size}"
+                    )
                 if key not in merged:
                     merged[key] = []
                 merged[key].extend(value)
             elif isinstance(value, torch.Tensor) and value.ndim > 0 and value.size(0) == batch_size:
                 tensor_batches.setdefault(key, []).append(value)
+            elif isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == batch_size:
+                array_batches.setdefault(key, []).append(value)
             else:
                 if key in scalar_values:
                     if not _same_scalar_value(scalar_values[key], value):
@@ -160,12 +242,66 @@ def concat_rollout_batches(rollout_batches: Sequence[RolloutBatch]) -> RolloutBa
             raise ValueError(f"Rollout field {key!r} appears as both list-like and tensor-like")
         merged[key] = torch.cat(tensors, dim=0)
 
+    for key, arrays in array_batches.items():
+        if key in merged or key in tensor_batches:
+            raise ValueError(f"Rollout field {key!r} has inconsistent batched types")
+        merged[key] = np.concatenate(arrays, axis=0)
+
     for key, value in scalar_values.items():
         if key in merged:
             raise ValueError(f"Rollout field {key!r} appears as both scalar and batched data")
         merged[key] = value
 
     return merged
+
+
+def canonicalize_rollout_chunks(
+    chunks_with_global_indexes: Sequence[tuple[RolloutBatch, Sequence[int]]],
+    expected_sample_count: int,
+) -> tuple[RolloutBatch, list[int]]:
+    """Merge chunks and restore deterministic TransferQueue global-index
+    order."""
+    if expected_sample_count <= 0:
+        raise ValueError(f"expected_sample_count must be positive, got {expected_sample_count}")
+    if not chunks_with_global_indexes:
+        raise ValueError("chunks_with_global_indexes must not be empty")
+
+    chunks: list[RolloutBatch] = []
+    global_indexes: list[int] = []
+    for chunk_index, (chunk, indexes) in enumerate(chunks_with_global_indexes):
+        batch_size = len(chunk.get("total_lengths", []))
+        normalized_indexes = list(indexes)
+        if len(normalized_indexes) != batch_size:
+            raise ValueError(
+                f"chunk {chunk_index} BatchMeta.global_indexes length mismatch: "
+                f"indexes={len(normalized_indexes)}, samples={batch_size}"
+            )
+        if not all(type(index) is int for index in normalized_indexes):
+            raise TypeError(f"chunk {chunk_index} BatchMeta.global_indexes must contain only int values")
+        chunks.append(chunk)
+        global_indexes.extend(normalized_indexes)
+
+    if len(global_indexes) != expected_sample_count:
+        raise ValueError(
+            f"hybrid pipeline sample count mismatch: expected={expected_sample_count}, actual={len(global_indexes)}"
+        )
+    if len(set(global_indexes)) != len(global_indexes):
+        duplicates = sorted(index for index, count in Counter(global_indexes).items() if count > 1)
+        raise ValueError(f"hybrid pipeline BatchMeta.global_indexes contain duplicates: {duplicates}")
+
+    merged = concat_rollout_batches(chunks)
+    permutation = sorted(range(len(global_indexes)), key=global_indexes.__getitem__)
+    canonical_indexes = [global_indexes[index] for index in permutation]
+
+    for key, value in list(merged.items()):
+        if isinstance(value, list) and len(value) == expected_sample_count:
+            merged[key] = [value[index] for index in permutation]
+        elif isinstance(value, torch.Tensor) and value.ndim > 0 and value.size(0) == expected_sample_count:
+            merged[key] = value[permutation]
+        elif isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == expected_sample_count:
+            merged[key] = value[permutation]
+
+    return merged, canonical_indexes
 
 
 PAD_RULES = {

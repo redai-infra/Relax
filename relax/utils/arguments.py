@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -73,6 +74,54 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
     return parsed
+
+
+def check_hybrid_pipeline_transfer_queue_contract() -> None:
+    """Validate the TransferQueue API needed by chunked Hybrid forwarding
+    before any rollout can write data."""
+    import inspect
+
+    check_transfer_queue_version()
+    try:
+        from transfer_queue import BatchMeta, TransferQueueClient
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "transferqueue does not expose BatchMeta and TransferQueueClient required by "
+            "Hybrid pipeline forwarding/tracing. Upgrade with:\n"
+            f"    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        ) from exc
+
+    slots = set(getattr(BatchMeta, "__slots__", ()))
+    annotations = set(getattr(BatchMeta, "__annotations__", {}))
+    if "global_indexes" not in slots | annotations and not hasattr(BatchMeta, "global_indexes"):
+        raise RuntimeError(
+            "transferqueue BatchMeta does not expose global_indexes required by "
+            "Hybrid pipeline forwarding/tracing. Upgrade with:\n"
+            f"    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        )
+
+    try:
+        async_put_parameters = inspect.signature(TransferQueueClient.async_put).parameters
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RuntimeError(
+            "transferqueue TransferQueueClient.async_put cannot be inspected for "
+            "Hybrid pipeline forwarding/tracing compatibility."
+        ) from exc
+    missing = sorted({"custom_meta", "is_last"} - set(async_put_parameters))
+    if missing:
+        raise RuntimeError(
+            "transferqueue TransferQueueClient.async_put is missing parameters "
+            f"{missing} required by Hybrid pipeline forwarding/tracing. Upgrade with:\n"
+            f"    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        )
+
+
+def check_transfer_queue_runtime(args) -> None:
+    """Select the startup contract required by the resolved execution mode."""
+    if getattr(args, "hybrid_pipeline_forward", False) or getattr(args, "hybrid_pipeline_trace_dir", None):
+        check_hybrid_pipeline_transfer_queue_contract()
+    elif getattr(args, "fully_async", False):
+        check_transfer_queue_version()
 
 
 def reset_arg(parser, name, **kwargs):
@@ -176,6 +225,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(TensorBackuper + _switch_model), so the actor handles ref / actor_fwd / advantages "
                     "internally on its own GPUs while rollout runs on a separate GPU placement group. "
                     "Mutually exclusive with passing --fully-async and --colocate together."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-pipeline-forward",
+                action="store_true",
+                default=False,
+                help=(
+                    "In the supported Hybrid actor-only topology, split one optimizer mini "
+                    "into num-iters-per-train-update fixed sample-count actor chunks and "
+                    "overlap actor log-prob forward with later rollout production. "
+                    "Default: disabled."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-pipeline-overlap",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "When Hybrid pipeline forwarding is enabled, forward each chunk immediately "
+                    "instead of waiting until all chunks have been fetched. Disable only to run a "
+                    "schedule-matched no-overlap performance control. Default: enabled."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-pipeline-trace-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Write per-process JSONL events for Hybrid producer puts, actor fetch, "
+                    "restore, forward, advantages, and optimizer phases. No sample content is written."
+                ),
+            )
+            parser.add_argument(
+                "--hybrid-pipeline-fetch-timeout-s",
+                type=float,
+                default=600.0,
+                help=(
+                    "Maximum seconds the Hybrid pipeline path waits for one exact "
+                    "TransferQueue chunk before failing with rollout/mini/chunk context."
                 ),
             )
             parser.add_argument(
@@ -2735,10 +2823,10 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     if not args.debug_train_only:
         sglang_validate_args(args)
 
-    # Only fully-async mode relies on the newer TransferQueue (e.g.
-    # StreamingTokenBudgetSampler), so gate the version requirement on it.
-    if getattr(args, "fully_async", False):
-        check_transfer_queue_version()
+    # Chunked Hybrid forwarding additionally depends on BatchMeta global
+    # indexes and the atomic custom-meta async_put contract. Validate that
+    # API before Ray workers or rollout producers can create side effects.
+    check_transfer_queue_runtime(args)
 
     return args
 
@@ -2961,6 +3049,95 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     args.use_kl_loss = False
     args.kl_coef = 0.0
     return True
+
+
+def _validate_hybrid_pipeline_args(args) -> None:
+    enabled = bool(getattr(args, "hybrid_pipeline_forward", False))
+    overlap_enabled = bool(getattr(args, "hybrid_pipeline_overlap", True))
+    trace_enabled = bool(getattr(args, "hybrid_pipeline_trace_dir", None))
+    if (enabled or trace_enabled or not overlap_enabled) and not getattr(args, "hybrid", False):
+        raise ValueError(
+            "--hybrid-pipeline-forward, its overlap control, and --hybrid-pipeline-trace-dir "
+            "are only supported with --hybrid."
+        )
+    if not enabled:
+        if not overlap_enabled:
+            raise ValueError("--no-hybrid-pipeline-overlap requires --hybrid-pipeline-forward.")
+        return
+
+    timeout = getattr(args, "hybrid_pipeline_fetch_timeout_s", 600.0)
+    if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("--hybrid-pipeline-fetch-timeout-s must be a finite value greater than 0.")
+
+    conflicts = []
+
+    def reject(condition: bool, option: str) -> None:
+        if condition:
+            conflicts.append(option)
+
+    reject(not getattr(args, "use_dynamic_batch_size", False), "missing --use-dynamic-batch-size")
+    reject(getattr(args, "multimodal_keys", None) is None, "missing --multimodal-keys")
+    reject(getattr(args, "advantage_estimator", None) != "grpo", "--advantage-estimator must be grpo")
+    reject(not getattr(args, "compute_advantages_and_returns", False), "advantages must be computed in actor")
+    reject(not getattr(args, "enable_weights_backuper", True), "--disable-weights-backuper")
+    reject(getattr(args, "kl_coef", 0.0) != 0, "--kl-coef")
+    reject(getattr(args, "use_kl_loss", False), "--use-kl-loss")
+    reject(getattr(args, "use_opd", False), "--use-opd")
+    reject(getattr(args, "keep_old_actor", False), "--keep-old-actor")
+    reject(getattr(args, "true_on_policy_mode", False), "--true-on-policy-mode")
+    reject(getattr(args, "use_rollout_logprobs", False), "--use-rollout-logprobs")
+    reject(getattr(args, "get_mismatch_metrics", False), "--get-mismatch-metrics")
+    reject(getattr(args, "use_routing_replay", False), "--use-routing-replay")
+    reject(getattr(args, "use_rollout_routing_replay", False), "--use-rollout-routing-replay")
+    reject(getattr(args, "use_agentic_rollout", False), "--use-agentic-rollout")
+    reject(getattr(args, "partial_rollout", False), "--partial-rollout")
+    reject(getattr(args, "use_dynamic_global_batch_size", False), "--use-dynamic-global-batch-size")
+    reject(getattr(args, "use_critic", False), "--advantage-estimator ppo / critic")
+    reject(getattr(args, "per_rank_fetch", False), "--per-rank-fetch")
+    reject(float(getattr(args, "attention_dropout", 0.0) or 0.0) != 0.0, "--attention-dropout")
+    reject(float(getattr(args, "hidden_dropout", 0.0) or 0.0) != 0.0, "--hidden-dropout")
+    reject(
+        int(getattr(args, "pipeline_model_parallel_size", 1) or 1) != 1,
+        "--pipeline-model-parallel-size",
+    )
+    reject(
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1) != 2,
+        "--tensor-model-parallel-size must be 2",
+    )
+    reject(
+        int(getattr(args, "context_parallel_size", 1) or 1) != 2,
+        "--context-parallel-size must be 2",
+    )
+    reject(
+        int(getattr(args, "expert_model_parallel_size", 1) or 1) != 1,
+        "--expert-model-parallel-size must be 1",
+    )
+    reject(
+        int(getattr(args, "expert_tensor_parallel_size", 1) or 1) != 1,
+        "--expert-tensor-parallel-size must be 1",
+    )
+    reject(bool(getattr(args, "offload_train", False)), "--offload-train")
+    reject(bool(getattr(args, "offload_rollout", False)), "--offload-rollout")
+    reject(
+        int(getattr(args, "num_iters_per_train_update", 0) or 0) < 2,
+        "--num-iters-per-train-update must be >= 2",
+    )
+    rollout_batch_size = int(getattr(args, "rollout_batch_size", 0) or 0)
+    n_samples_per_prompt = int(getattr(args, "n_samples_per_prompt", 0) or 0)
+    global_batch_size = int(getattr(args, "global_batch_size", 0) or 0)
+    reject(
+        rollout_batch_size * n_samples_per_prompt != global_batch_size,
+        "rollout_batch_size * n_samples_per_prompt must equal global_batch_size "
+        "(exactly one optimizer mini per rollout)",
+    )
+
+    if conflicts:
+        raise ValueError(
+            "--hybrid-pipeline-forward currently supports only actor-only multimodal "
+            "Hybrid GRPO with dynamic batching, zero dropout, TP2/PP1/CP2/EP1/ETP1, "
+            "offload disabled, and the normal TensorBackuper. "
+            f"Conflicting configuration: {', '.join(conflicts)}."
+        )
 
 
 def slime_validate_args(args):
@@ -3499,6 +3676,8 @@ def slime_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    _validate_hybrid_pipeline_args(args)
 
     if args.advantage_estimator == "rloo":
         if args.n_samples_per_prompt < 2:

@@ -542,13 +542,18 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             "total_lengths"). Modified in-place to add "advantages" and
             "returns" keys, each mapping to lists of tensors per sample.
     """
-    log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs" if args.use_rollout_logprobs else "log_probs")
-    ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
+    log_probs: list[torch.Tensor] | None = rollout_data.get(
+        "rollout_log_probs" if args.use_rollout_logprobs else "log_probs"
+    )
+    ref_log_probs: list[torch.Tensor] | None = rollout_data.get("ref_log_probs")
     rewards: list[float] = rollout_data.get("rewards")
     values: None | list[torch.Tensor] = rollout_data.get("values")
     response_lengths: list[int] = rollout_data.get("response_lengths")
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
     total_lengths: list[int] = rollout_data.get("total_lengths")
+    rollout_log_probs: list[torch.Tensor] | None = (
+        rollout_data.get("rollout_log_probs") if getattr(args, "true_on_policy_mode", False) else None
+    )
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
     padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
         total_lengths,
@@ -562,11 +567,25 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     if not mpu.is_pipeline_last_stage():
         return
 
-    if args.kl_coef == 0 or not log_probs:
+    if args.kl_coef == 0:
         # when kl_coef is 0, we won't compute ref_log_prob
-        xs = log_probs if log_probs is not None else values
+        xs = log_probs or values or rollout_log_probs
+        if not xs:
+            raise RuntimeError(
+                "Advantage computation on the pipeline last stage requires log_probs, values, or "
+                "true-on-policy rollout_log_probs."
+            )
         kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
     else:
+        if not log_probs:
+            raise RuntimeError("Reward KL requires actor log_probs; rollout_log_probs cannot replace them.")
+        if not ref_log_probs:
+            raise RuntimeError("Reward KL requires ref_log_probs.")
+        if len(log_probs) != len(ref_log_probs):
+            raise RuntimeError(
+                "Reward KL requires one ref_log_probs entry per actor log_probs entry, "
+                f"got {len(ref_log_probs)} and {len(log_probs)}."
+            )
         kl = [
             compute_approx_kl(
                 log_probs[i],

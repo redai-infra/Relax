@@ -1,0 +1,332 @@
+{
+  "campaigns": [
+    "CURVE60-BR-e2be8cd-20260821-1120-GPU01247",
+    "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247"
+  ],
+  "benchmark_commit": "e2be8cd158609cc2dfae72b7ba92df72cacb3091",
+  "seeds": [
+    20260820,
+    20260821
+  ],
+  "steps": 60,
+  "warmup_steps": [
+    0,
+    9
+  ],
+  "steady_windows": [
+    [
+      10,
+      59
+    ]
+  ],
+  "validation": "passed",
+  "excluded_attempts": [
+    {
+      "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-S60-GPU01247-seed20260820-attempt1",
+      "reason": "exclusive GPU lease interruption",
+      "exit_status": 137
+    }
+  ],
+  "conditions": {
+    "B": {
+      "controls": {
+        "processor_pool": 0,
+        "reuse_train_forward_logprobs": 0,
+        "pipeline_forward": 0,
+        "pipeline_overlap": 0
+      },
+      "steady_metrics": {
+        "step_token_per_s": {
+          "coefficient_of_variation": 0.1256053284801138,
+          "count": 2,
+          "max": 1241.8265281264164,
+          "mean": 1103.2521761452872,
+          "median": 1103.2521761452872,
+          "min": 964.6778241641581,
+          "population_stddev": 138.57435198112915
+        },
+        "step_time_s_mean": 179.61954551696778,
+        "raw_reward_mean": 0.448046875,
+        "grad_norm_max": 4.891648769378662
+      },
+      "runs": [
+        {
+          "seed": 20260820,
+          "run_id": "CURVE60-BR-e2be8cd-20260821-1120-GPU01247-B60-GPU01247-seed20260820-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 964.6778241641581,
+          "step_time_s_mean": 203.61846618652345,
+          "raw_reward_mean": 0.44359375,
+          "grad_norm_max": 4.891648769378662,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        },
+        {
+          "seed": 20260821,
+          "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-B60-GPU01247-seed20260821-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1241.8265281264164,
+          "step_time_s_mean": 155.6206248474121,
+          "raw_reward_mean": 0.4525,
+          "grad_norm_max": 2.9024391174316406,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        }
+      ]
+    },
+    "P": {
+      "controls": {
+        "processor_pool": 8,
+        "reuse_train_forward_logprobs": 0,
+        "pipeline_forward": 0,
+        "pipeline_overlap": 0
+      },
+      "steady_metrics": {
+        "step_token_per_s": {
+          "coefficient_of_variation": 0.023115961177071986,
+          "count": 2,
+          "max": 1184.6903442610908,
+          "mean": 1157.9238221424393,
+          "median": 1157.9238221424393,
+          "min": 1131.157300023788,
+          "population_stddev": 26.766522118651437
+        },
+        "step_time_s_mean": 170.52157882690432,
+        "raw_reward_mean": 0.43999999999999995,
+        "grad_norm_max": 3.112680196762085
+      },
+      "runs": [
+        {
+          "seed": 20260820,
+          "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-P60-GPU01247-seed20260820-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1184.6903442610908,
+          "step_time_s_mean": 164.4360321044922,
+          "raw_reward_mean": 0.44265625,
+          "grad_norm_max": 3.112680196762085,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        },
+        {
+          "seed": 20260821,
+          "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-P60-GPU01247-seed20260821-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1131.157300023788,
+          "step_time_s_mean": 176.6071255493164,
+          "raw_reward_mean": 0.43734375,
+          "grad_norm_max": 2.016056776046753,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        }
+      ]
+    },
+    "P+R": {
+      "controls": {
+        "processor_pool": 8,
+        "reuse_train_forward_logprobs": 1,
+        "pipeline_forward": 0,
+        "pipeline_overlap": 0
+      },
+      "steady_metrics": {
+        "step_token_per_s": {
+          "coefficient_of_variation": 0.030795013931243814,
+          "count": 2,
+          "max": 1568.914914904609,
+          "mean": 1522.0435622026193,
+          "median": 1522.0435622026193,
+          "min": 1475.1722095006298,
+          "population_stddev": 46.87135270198962
+        },
+        "step_time_s_mean": 129.2131224822998,
+        "raw_reward_mean": 0.44253906249999997,
+        "grad_norm_max": 6.170009136199951
+      },
+      "runs": [
+        {
+          "seed": 20260820,
+          "run_id": "CURVE60-BR-e2be8cd-20260821-1120-GPU01247-R60-GPU01247-seed20260820-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1475.1722095006298,
+          "step_time_s_mean": 131.71488632202147,
+          "raw_reward_mean": 0.438046875,
+          "grad_norm_max": 3.0623481273651123,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        },
+        {
+          "seed": 20260821,
+          "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-R60-GPU01247-seed20260821-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1568.914914904609,
+          "step_time_s_mean": 126.71135864257812,
+          "raw_reward_mean": 0.44703125,
+          "grad_norm_max": 6.170009136199951,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        }
+      ]
+    },
+    "P+S": {
+      "controls": {
+        "processor_pool": 8,
+        "reuse_train_forward_logprobs": 0,
+        "pipeline_forward": 1,
+        "pipeline_overlap": 1
+      },
+      "steady_metrics": {
+        "step_token_per_s": {
+          "coefficient_of_variation": 0.07522858803167884,
+          "count": 2,
+          "max": 1321.500041543845,
+          "mean": 1229.0410209079287,
+          "median": 1229.0410209079287,
+          "min": 1136.582000272012,
+          "population_stddev": 92.45902063591654
+        },
+        "step_time_s_mean": 162.82377471923826,
+        "raw_reward_mean": 0.44148437500000004,
+        "grad_norm_max": 1.9913811683654785
+      },
+      "runs": [
+        {
+          "seed": 20260820,
+          "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-S60-GPU01247-seed20260820-attempt2",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1136.582000272012,
+          "step_time_s_mean": 177.27848846435546,
+          "raw_reward_mean": 0.4284375,
+          "grad_norm_max": 1.9913811683654785,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        },
+        {
+          "seed": 20260821,
+          "run_id": "CURVE60-FULL2-e2be8cd-20260821-192422-GPU01247-S60-GPU01247-seed20260821-attempt1",
+          "optimizer_update_count": 60,
+          "measured_optimizer_step_count": 50,
+          "step_token_per_s": 1321.500041543845,
+          "step_time_s_mean": 148.36906097412108,
+          "raw_reward_mean": 0.45453125,
+          "grad_norm_max": 1.5016627311706543,
+          "training_exit_status": 0,
+          "validation_exit_status": 0,
+          "exit_status": 0,
+          "validation": "passed"
+        }
+      ]
+    }
+  },
+  "comparisons": {
+    "P+R_vs_B": {
+      "paired_seed_count": 2,
+      "step_token_per_s_geomean_improvement": 0.38995084789983947,
+      "step_time_geomean_reduction": 0.274256681417563,
+      "step_resp_token_per_s_geomean_improvement": 0.40315687235696074,
+      "paired_runs": [
+        {
+          "seed": 20260820,
+          "step_token_per_s_improvement": 0.5291864004221181,
+          "step_time_reduction": 0.3531289730796574
+        },
+        {
+          "seed": 20260821,
+          "step_token_per_s_improvement": 0.26339297749717216,
+          "step_time_reduction": 0.18576757568721924
+        }
+      ]
+    },
+    "P+R_vs_P": {
+      "paired_seed_count": 2,
+      "step_token_per_s_geomean_improvement": 0.31418689230404895,
+      "step_time_geomean_reduction": 0.24190680331120762,
+      "step_resp_token_per_s_geomean_improvement": 0.31151950019550556,
+      "paired_runs": [
+        {
+          "seed": 20260820,
+          "step_token_per_s_improvement": 0.24519644871480484,
+          "step_time_reduction": 0.19899012013180795
+        },
+        {
+          "seed": 20260821,
+          "step_token_per_s_improvement": 0.38699976994500696,
+          "step_time_reduction": 0.28252408701825127
+        }
+      ]
+    },
+    "P+S_vs_B": {
+      "paired_seed_count": 2,
+      "step_token_per_s_geomean_improvement": 0.11972754899894267,
+      "step_time_geomean_reduction": 0.08891785444121869,
+      "step_resp_token_per_s_geomean_improvement": 0.14149397323287194,
+      "paired_runs": [
+        {
+          "seed": 20260820,
+          "step_token_per_s_improvement": 0.17819853613490055,
+          "step_time_reduction": 0.1293594741944447
+        },
+        {
+          "seed": 20260821,
+          "step_token_per_s_improvement": 0.06415832776389041,
+          "step_time_reduction": 0.046597704387842276
+        }
+      ]
+    },
+    "P+S_vs_P": {
+      "paired_seed_count": 2,
+      "step_token_per_s_geomean_improvement": 0.058693025058818016,
+      "step_time_geomean_reduction": 0.04830653140310592,
+      "step_resp_token_per_s_geomean_improvement": 0.06694528227325702,
+      "paired_runs": [
+        {
+          "seed": 20260820,
+          "step_token_per_s_improvement": -0.040608370129904814,
+          "step_time_reduction": -0.07810001369835051
+        },
+        {
+          "seed": 20260821,
+          "step_token_per_s_improvement": 0.16827256608435825,
+          "step_time_reduction": 0.15989198899740897
+        }
+      ]
+    },
+    "P_vs_B": {
+      "paired_seed_count": 2,
+      "step_token_per_s_geomean_improvement": 0.05765082275547595,
+      "step_time_geomean_reduction": 0.04267269281356634,
+      "step_resp_token_per_s_geomean_improvement": 0.06987114728206101,
+      "paired_runs": [
+        {
+          "seed": 20260820,
+          "step_token_per_s_improvement": 0.2280683919396218,
+          "step_time_reduction": 0.1924306513837425
+        },
+        {
+          "seed": 20260821,
+          "step_token_per_s_improvement": -0.08911810594801728,
+          "step_time_reduction": -0.13485680784588694
+        }
+      ]
+    }
+  }
+}
