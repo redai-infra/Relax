@@ -1,0 +1,414 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Consumers upstream of the advantage stage must ask the algorithm's question.
+
+The dynamic-sampling filter and the zero-std metrics both decide whether a
+prompt group "carries signal". They answered that with the single
+``--reward-key`` scalar, which is the right question only for an algorithm that
+consumes that scalar.
+
+For a multi-reward algorithm the right question is narrower than "did any
+component vary" and wider than "did the scalar vary": it is whether the
+*combined* advantage GDPO will actually produce is non-zero. The three differ.
+A zero weight mutes a varying component; two components whose standardised
+values are exact opposites cancel; and a group can be flat in the scalar while
+alive in the components. Only the combined value predicts whether the group
+contributes a gradient, so that is what these consumers compute.
+
+The tests below deliberately include the case that motivated all of this and
+turned out to be wrong -- equal sums under equal weights cancel to zero -- so
+that the mistake cannot be reintroduced as a "fix".
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+
+torch = pytest.importorskip("torch")
+
+from relax.algorithms.rewards import (  # noqa: E402
+    group_carries_reward_signal,
+    metrics_group_verdict,
+    normalize_gdpo_decoupled,
+    observed_reward_signal,
+    zero_std_group_label,
+)
+
+
+def _combined(args, group):
+    """The scalar GDPO steps 1+2 actually hand to the advantage stage."""
+    return normalize_gdpo_decoupled(args, group, [0.0] * len(group))
+
+
+class _S:
+    """Minimal stand-in for Sample with the same reward contract."""
+
+    def __init__(self, group_index, reward):
+        self.group_index = group_index
+        self.reward = reward
+
+    def get_reward_value(self, args):
+        return self.reward if not args.reward_key else self.reward[args.reward_key]
+
+    def get_reward_components(self, keys):
+        # Mirrors Sample.get_reward_components, including the error type: a
+        # double that raises KeyError where the real one raises ValueError
+        # cannot exercise any caller that distinguishes them.
+        if not isinstance(self.reward, dict):
+            raise ValueError(f"Sample.reward must be a dict to read components {keys}")
+        for key in keys:
+            if key not in self.reward:
+                raise ValueError(f"Reward key {key!r} missing from sample reward")
+        return [self.reward[key] for key in keys]
+
+
+def _gdpo_args(n=4):
+    return SimpleNamespace(
+        advantage_estimator="gdpo",
+        n_samples_per_prompt=n,
+        reward_key="score",
+        gdpo_reward_keys=["correctness", "format"],
+        gdpo_reward_weights=None,
+    )
+
+
+def _grpo_args():
+    return SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=4, reward_key="score")
+
+
+def _group(correctness, fmt):
+    """One prompt group; `score` is the summed scalar --reward-key selects."""
+    return [_S(0, {"correctness": c, "format": f, "score": c + f}) for c, f in zip(correctness, fmt, strict=True)]
+
+
+# ---------------- the case the whole feature exists for ----------------
+
+
+def test_group_flat_in_one_component_still_carries_signal():
+    """`correctness` constant, `format` varying: one live component is enough.
+
+    The scalar happens to vary here too, so this case alone does not separate
+    the two tests -- it pins the weaker property that a partially collapsed
+    group is not treated as dead. The case that does separate them is below.
+    """
+    group = _group(correctness=[1.0, 1.0, 1.0, 1.0], fmt=[0.0, 0.5, 1.0, 0.5])
+    assert group_carries_reward_signal(_gdpo_args(), group) is True
+
+
+def test_equal_sums_cancel_exactly_under_equal_weights():
+    """Equal sums do NOT survive GDPO under equal weights. Pinning the maths.
+
+    This was written the other way round first, and the mistake is worth a
+    test of its own: if the components sum to a constant then ``r2 = C - r1``,
+    so ``std(r2) == std(r1)`` and ``z2 == -z1``. Equal weights cancel them to
+    exactly zero -- the same answer GRPO gives. Nothing about GDPO rescues
+    this group, and a filter that claims otherwise keeps a group that then
+    contributes no gradient.
+    """
+    group = _group(correctness=[1.0, 0.0, 1.0, 0.0], fmt=[0.0, 1.0, 0.0, 1.0])
+    scalars = {s.get_reward_value(_gdpo_args()) for s in group}
+    assert scalars == {1.0}, "precondition: the summed scalar really is constant"
+
+    combined = _combined(_gdpo_args(), group)
+    assert combined == [0.0, 0.0, 0.0, 0.0], combined
+    assert group_carries_reward_signal(_gdpo_args(), group) is False
+
+
+def test_unequal_weights_break_the_cancellation():
+    """The tie is broken by weights, not by the standardisation itself."""
+    args = _gdpo_args()
+    args.gdpo_reward_weights = [2.0, 1.0]
+    group = _group(correctness=[1.0, 0.0, 1.0, 0.0], fmt=[0.0, 1.0, 0.0, 1.0])
+
+    assert any(v != 0.0 for v in _combined(args, group))
+    assert group_carries_reward_signal(args, group) is True
+
+
+def test_scale_disparity_is_what_separates_gdpo_from_grpo():
+    """The real motivation: components whose spreads differ by orders of
+    magnitude.
+
+    `correctness` in {0,1} against a `format` reward in the hundreds, ranked
+    the opposite way. GRPO standardises the *sum*, so the large-spread
+    component decides the direction and even reverses the sign for the correct
+    samples. GDPO gives each component unit variance first, so both get a say.
+    """
+    args = _gdpo_args()
+    group = _group(correctness=[1.0, 1.0, 0.0, 0.0], fmt=[0.0, 100.0, 200.0, 300.0])
+
+    summed = torch.tensor([s.get_reward_value(args) for s in group])
+    grpo = (summed - summed.mean()) / (summed.std() + 1e-6)
+    gdpo = torch.tensor(_combined(args, group))
+
+    # GRPO ranks the two correct samples *lowest*, dragged there by `format`.
+    assert grpo[0] < grpo[2] and grpo[1] < grpo[3]
+    # GDPO does not: correctness pulls them back up, and the signs disagree.
+    assert not torch.equal(grpo.sign(), gdpo.sign())
+
+
+def test_group_flat_in_every_component_is_dead():
+    """GDPO does not invent signal: all components constant means no signal."""
+    group = _group(correctness=[1.0, 1.0, 1.0, 1.0], fmt=[0.5, 0.5, 0.5, 0.5])
+    assert group_carries_reward_signal(_gdpo_args(), group) is False
+
+
+# ---------------- single-reward algorithms keep their old answer ----------------
+
+
+def test_single_reward_algorithm_reads_only_the_reward_key():
+    varying = _group(correctness=[1.0, 0.0, 1.0, 0.0], fmt=[0.0, 1.0, 0.0, 1.0])
+    # Components vary, but the scalar GRPO consumes does not.
+    assert group_carries_reward_signal(_grpo_args(), varying) is False
+
+    real = _group(correctness=[1.0, 0.0, 1.0, 0.0], fmt=[1.0, 0.0, 1.0, 0.0])
+    assert group_carries_reward_signal(_grpo_args(), real) is True
+
+
+def test_empty_group_carries_nothing():
+    assert group_carries_reward_signal(_gdpo_args(), []) is False
+    assert group_carries_reward_signal(_grpo_args(), []) is False
+
+
+# ---------------- the built-in filter is wired to the same question ----------------
+
+
+def test_builtin_filter_keeps_a_group_only_one_component_varies_in():
+    """`correctness` flat, `format` varying: one live component is enough."""
+    from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
+
+    group = _group(correctness=[1.0, 1.0, 1.0, 1.0], fmt=[0.0, 0.5, 1.0, 0.5])
+    assert check_reward_nonzero_std(_gdpo_args(), group).keep is True
+
+
+def test_builtin_filter_agrees_with_the_advantage_it_will_produce():
+    """The filter's verdict must match what the reward stage actually outputs.
+
+    Cheaper proxies ("did any raw component vary?") disagree with the real
+    answer whenever a weight mutes a component or two standardised components
+    cancel -- and disagreeing means keeping groups with no gradient.
+    """
+    from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
+
+    muted = _gdpo_args()
+    muted.gdpo_reward_weights = [0.0, 1.0]
+    cases = [
+        (_gdpo_args(), _group([1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0])),  # cancels
+        (_gdpo_args(), _group([1.0, 1.0, 0.0, 0.0], [0.0, 100.0, 200.0, 300.0])),  # real signal
+        (_gdpo_args(), _group([1.0, 1.0, 1.0, 1.0], [0.5, 0.5, 0.5, 0.5])),  # fully flat
+        (muted, _group([1.0, 0.0, 1.0, 0.0], [2.0, 2.0, 2.0, 2.0])),  # only muted one varies
+    ]
+    for args, group in cases:
+        verdict = check_reward_nonzero_std(args, group).keep
+        actually_moves = any(v != 0.0 for v in _combined(args, group))
+        assert verdict is actually_moves, (verdict, _combined(args, group))
+
+
+def test_builtin_filter_drops_a_fully_flat_group():
+    from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
+
+    group = _group(correctness=[1.0, 1.0, 1.0, 1.0], fmt=[0.5, 0.5, 0.5, 0.5])
+    out = check_reward_nonzero_std(_gdpo_args(), group)
+    assert out.keep is False
+    assert out.reason.startswith("zero_std_")
+
+
+def test_builtin_filter_is_unchanged_for_single_reward_algorithms():
+    from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
+
+    flat = _group(correctness=[1.0, 1.0, 1.0, 1.0], fmt=[0.0, 0.0, 0.0, 0.0])
+    assert check_reward_nonzero_std(_grpo_args(), flat).keep is False
+
+    varied = _group(correctness=[1.0, 0.0, 1.0, 0.0], fmt=[1.0, 0.0, 1.0, 0.0])
+    assert check_reward_nonzero_std(_grpo_args(), varied).keep is True
+
+
+def test_the_drop_label_survives_a_reward_without_the_scalar_key():
+    """The label line used to take the rollout down instead of labelling.
+
+    A multi-reward run only needs `--gdpo-reward-keys` in each reward dict; the
+    signal test above reads nothing else. But the label was built from
+    `samples[0].get_reward_value(args)`, which reads `--reward-key`, and only
+    on the drop path -- so a group that was flat *and* carried no scalar key
+    raised `KeyError` out of the rollout loop. `zero_std_group_label` already
+    refused exactly this input on the metrics side; the filter now uses it too.
+
+    It gets its own reason rather than joining `zero_std_*`. Swallowing it into
+    the flat-group bucket trades a loud crash for a silent one: a reward schema
+    that always omits the scalar would drop every such group and resample
+    forever, and the only signal would be a zero-std count that looks like
+    ordinary prompt flatness.
+    """
+    from relax.engine.filters.dynamic_sampling_filters import check_reward_nonzero_std
+
+    class _NoScalar:
+        group_index = 0
+        reward = {"correctness": 1.0, "format": 2.0}
+
+        def get_reward_value(self, args):
+            return self.reward[args.reward_key]
+
+        def get_reward_components(self, keys):
+            return [self.reward[key] for key in keys]
+
+    out = check_reward_nonzero_std(_gdpo_args(), [_NoScalar(), _NoScalar(), _NoScalar(), _NoScalar()])
+    assert out.keep is False
+    assert out.reason == "unreadable_reward", (
+        "a reward missing a key the run requires must not be filed as 'this group was flat' -- "
+        "a schema that always omits it would drop and resample forever behind a zero-std metric"
+    )
+
+
+# ---------------- the zero-std metrics (metrics_group_verdict) ----------------
+#
+# There are two copies of `_compute_zero_std_metrics`, and only the agentic one
+# is importable without `sglang`. Both now delegate the whole decision to
+# `metrics_group_verdict`, so testing it here covers the copy that cannot be
+# imported. That indirection is the point: the copies drifted apart once and
+# the drift was invisible precisely because neither had a test.
+
+
+def _scalar_args():
+    """GRPO reading the bare reward, not a dict key -- the common single-reward
+    setup."""
+    return SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=4, reward_key=None)
+
+
+def test_metrics_verdict_tolerates_an_unscored_sample():
+    """`reward=None` reaches the metrics under --group-rm when a rollout
+    aborts.
+
+    The scalar path builds a float32 tensor from these; a None in it is a
+    TypeError, raised from a logging helper on the rollout's way out. Before
+    the shared helper the distributed copy did exactly that.
+    """
+    group = [_S(0, None), _S(0, 1.0), _S(0, 1.0)]
+    assert metrics_group_verdict(_scalar_args(), group) is True
+
+
+def test_metrics_verdict_is_unknown_when_nothing_was_scored():
+    assert metrics_group_verdict(_scalar_args(), [_S(0, None), _S(0, None)]) is None
+
+
+def test_metrics_verdict_still_reads_variation():
+    assert metrics_group_verdict(_scalar_args(), [_S(0, 0.0), _S(0, 1.0)]) is False
+
+
+def test_metrics_verdict_is_unknown_when_the_reward_schema_does_not_fit():
+    """Eval may run a different reward model than training
+    (EvalConfig.rm_type).
+
+    Its rewards need not carry --gdpo-reward-keys, and nothing in eval consumes
+    them. The strict question has no correct answer here, so the observer must
+    not be the thing that enforces the training contract -- it took eval down.
+    """
+    args = SimpleNamespace(
+        advantage_estimator="gdpo",
+        gdpo_reward_keys=["a", "b"],
+        gdpo_reward_weights=None,
+        reward_key="score",
+        n_samples_per_prompt=2,
+    )
+    group = [_S(0, {"score": 1.0, "a": 1.0}), _S(0, {"score": 2.0, "a": 2.0})]
+
+    assert metrics_group_verdict(args, group) is None
+    # ...while the stage that actually consumes the components still refuses it.
+    with pytest.raises(ValueError, match="missing from sample reward"):
+        group_carries_reward_signal(args, group)
+
+
+def test_the_label_comes_off_a_scored_sample_not_the_first_one():
+    """The counted group's label must not be read off `group[0]`.
+
+    A flat group can begin with an unscored sample: under --group-rm the whole
+    group is scored in one shot that an abort skips, and the verdict above
+    deliberately tolerates that rather than taking the rollout down. The label
+    then has to skip it too -- `get_reward_value` is None there and
+    `round(None, 1)` raises the same TypeError the verdict removed, one line
+    further down.
+    """
+    group = [_S(0, None), _S(0, 0.5), _S(0, 0.5)]
+
+    assert metrics_group_verdict(_scalar_args(), group) is True  # counted...
+    assert zero_std_group_label(_scalar_args(), group) == "0.5"  # ...and filed under a real reward
+
+
+def test_a_group_with_nothing_scored_has_no_label():
+    """`None`, so the caller drops it rather than inventing a reward for it.
+
+    The distributed copy counts unanswerable groups (`is not False`), so it
+    reaches the label for a group where every reward is None. There is no
+    number to report for one, and asking for it anyway is what crashed.
+    """
+    assert zero_std_group_label(_scalar_args(), [_S(0, None), _S(0, None)]) is None
+
+
+def test_a_reward_dict_holding_a_none_is_not_a_scored_sample():
+    """`reward is not None` does not mean the *value* is not None.
+
+    A partially failed reward function returns the dict with a None inside it.
+    The dict passes a test on `sample.reward`, and the None then reaches
+    `round(None, 1)` -- the same TypeError, one predicate later.
+    """
+    args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
+
+    assert zero_std_group_label(args, [_S(0, {"score": None}), _S(0, {"score": None})]) is None
+    # ...and a readable sample later in the group is still found
+    assert zero_std_group_label(args, [_S(0, {"score": None}), _S(0, {"score": 0.5})]) == "0.5"
+
+
+def test_a_reward_missing_the_key_entirely_has_no_label_either():
+    """The label side of the missing-key case.
+
+    An eval reward model with a different schema (EvalConfig.rm_type) produces
+    a dict without `--reward-key`; there is no number to report for it.
+    """
+    args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
+    group = [_S(0, {"other": 1.0}), _S(0, {"other": 2.0})]
+
+    assert zero_std_group_label(args, group) is None
+
+
+def test_a_reward_missing_the_key_is_unreadable_rather_than_fatal_for_metrics():
+    """The verdict side of it, which used to escape the observation guard.
+
+    `get_reward_components` raises ValueError for a missing key, but the
+    single-reward branch reads `Sample.get_reward_value`, a bare subscript that
+    raises KeyError. That went straight through the `(TypeError, ValueError)`
+    handler and took the metrics path down -- past the point whose whole job is
+    to keep a reporting stage from deciding whether the run continues.
+    """
+    args = SimpleNamespace(advantage_estimator="grpo", n_samples_per_prompt=2, reward_key="score")
+    group = [_S(0, {"other": 1.0}), _S(0, {"other": 2.0})]
+
+    with pytest.raises(KeyError):
+        group_carries_reward_signal(args, group)
+
+    assert observed_reward_signal(args, group) is None
+    assert metrics_group_verdict(args, group) is None
+
+
+def test_the_two_metrics_copies_both_delegate_the_decision():
+    """Neither copy may re-derive "is this group flat", nor its label, for
+    itself.
+
+    A source check because `relax/distributed/ray/rollout.py` imports `sglang`
+    and cannot be loaded here. It is weak -- it cannot tell whether either is
+    *used* correctly -- so it is paired with the behavioural tests above rather
+    than standing in for them.
+
+    The label is checked because splitting the verdict out and leaving the
+    label behind is exactly how these copies drifted the second time: both
+    delegated the verdict while one read the label off `group[0]` and the other
+    off the first scored sample.
+    """
+    import pathlib
+
+    import relax
+
+    root = pathlib.Path(relax.__file__).parent
+    for path in ("agentic/rollout.py", "distributed/ray/rollout.py"):
+        src = (root / path).read_text()
+        assert "metrics_group_verdict" in src, path
+        assert "zero_std_group_label" in src, f"{path} must not build the count label itself"
+        assert "group_carries_reward_signal" not in src, f"{path} must not ask the strict question"

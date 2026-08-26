@@ -19,6 +19,8 @@ from relax.agentic.pipeline.runtime import (
     get_agentic_runtime_resources,
 )
 from relax.agentic.profile import TRACE_KEY
+from relax.algorithms import get_algorithm
+from relax.algorithms.rewards import metrics_group_verdict, zero_std_group_label
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -1293,19 +1295,30 @@ def _dict_add_prefix(d, prefix):
 
 
 def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, float]:
-    if args.advantage_estimator == "ppo":
+    if get_algorithm(args.advantage_estimator).needs_critic:
         return {}
 
     all_sample_groups = group_by(all_samples, lambda sample: sample.group_index)
-    reward_groups = [
-        [sample.get_reward_value(args) for sample in group if sample.reward is not None]
-        for group in all_sample_groups.values()
-    ]
-    interesting_rewards = [
-        str(round(rewards[0], 1))
-        for rewards in reward_groups
-        if rewards and all(rewards[0] == reward for reward in rewards)
-    ]
+    interesting_rewards = []
+    for group in all_sample_groups.values():
+        # Counted as flat only when it carries no signal *for this algorithm*:
+        # for a multi-reward one that means the weighted combination cancels,
+        # not that the --reward-key scalar happens to be flat.
+        #
+        # `is not True`, so a group that is unscored or unreadable is skipped
+        # rather than counted -- which is what this metric did before, since it
+        # dropped `reward is None` samples and then required a non-empty list.
+        # The distributed copy counts them instead; see `metrics_group_verdict`.
+        if metrics_group_verdict(args, group) is not True:
+            continue
+        # A `True` verdict already implies a scored sample, so the label is
+        # never None here. It goes through the shared helper anyway: this line
+        # and its opposite number in the distributed copy are the half of this
+        # metric `metrics_group_verdict` did not cover, and they had already
+        # drifted -- that copy read the label off `group[0]`, scored or not.
+        label = zero_std_group_label(args, group)
+        if label is not None:
+            interesting_rewards.append(label)
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 
 

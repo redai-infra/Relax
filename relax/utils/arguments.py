@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -10,6 +11,7 @@ from typing import Any
 import yaml
 from sglang_router.launch_router import RouterArgs
 
+from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
@@ -1727,19 +1729,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--advantage-estimator",
                 type=str,
-                choices=[
-                    "grpo",
-                    "gspo",
-                    "reinforce_plus_plus",
-                    "reinforce_plus_plus_baseline",
-                    "ppo",
-                    "sapo",
-                    "cispo",
-                    "rloo",
-                ],
+                choices=list_algorithm_names(),
                 default="grpo",
                 help=(
-                    "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
+                    "Advantage estimator to use. The choices come from the algorithm registry in "
+                    "relax/algorithms/spec.py. Note: on-policy distillation (OPD) is orthogonal "
                     "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
                     "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
@@ -1755,6 +1749,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1.05,
                 help="Temperature for negative advantages in SAPO (default: 1.05)",
+            )
+            parser.add_argument(
+                "--gdpo-reward-keys",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "Names of the reward components GDPO standardizes independently, e.g. "
+                    "`--gdpo-reward-keys correctness format`. The reward function must return a dict "
+                    "containing every key. At least two keys are required."
+                ),
+            )
+            parser.add_argument(
+                "--gdpo-reward-weights",
+                type=float,
+                nargs="+",
+                default=None,
+                help=(
+                    "Per-component weights for GDPO, matching --gdpo-reward-keys in length. "
+                    "Defaults to 1.0 each. The weights multiply the *normalized* advantages, "
+                    "not the raw rewards, so they express relative importance rather than units."
+                ),
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -2963,6 +2979,371 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _assert_spec_implementations_resolve(spec) -> None:
+    """Check that every implementation the spec names is actually registered.
+
+    Imports the implementation tables lazily: they pull in torch, and this
+    module is imported for `--help`.
+    """
+    from relax.algorithms.advantages import ADVANTAGE_FNS
+    from relax.algorithms.policy import POLICY_LOSS_FNS
+    from relax.algorithms.rewards import REWARD_NORMALIZERS
+
+    for field, key, table in (
+        ("reward_normalizer", spec.reward_normalizer, REWARD_NORMALIZERS),
+        ("advantage_fn", spec.advantage_fn, ADVANTAGE_FNS),
+        ("policy_loss_fn", spec.policy_loss_fn, POLICY_LOSS_FNS),
+    ):
+        if key not in table:
+            raise ValueError(
+                f"Algorithm {spec.name!r} declares {field}={key!r}, which is not registered. "
+                f"Available: {sorted(table)}."
+            )
+
+    # Not a lookup key, so the loop above cannot cover it, but it has the same
+    # failure mode and a worse consequence: a typo does not raise, it silently
+    # selects the default branch in `relax/backends/megatron/loss.py` and
+    # changes the training maths.
+    valid_normalizations = {"whiten", "token_global"}
+    if spec.advantage_normalization not in valid_normalizations:
+        raise ValueError(
+            f"Algorithm {spec.name!r} declares advantage_normalization="
+            f"{spec.advantage_normalization!r}, which is not a known mode. "
+            f"Available: {sorted(valid_normalizations)}."
+        )
+
+
+def validate_algorithm_args(args) -> None:
+    """Apply the constraints the algorithm registry declares for this run.
+
+    These rules used to be `if args.advantage_estimator == "..."` checks
+    scattered across this file, which meant a new algorithm could silently miss
+    one. They now come from AlgorithmSpec fields, so declaring the algorithm is
+    enough. Also sets ``args.use_critic``, the only role switch derived from
+    the algorithm.
+
+    Runs *after* ``_validate_reinforce_plus_plus_args`` on purpose: that
+    function owns the frozen Task 29 wording for the REINFORCE++ variants, and
+    checking the same conditions here first would replace its messages.
+    """
+    spec = get_algorithm(args.advantage_estimator)
+
+    # The spec references its implementations by name, so a typo in the registry
+    # would otherwise surface as a KeyError deep inside a worker on the first
+    # batch. Resolve them here, while the error can still name the culprit.
+    _assert_spec_implementations_resolve(spec)
+
+    args.use_critic = spec.needs_critic
+
+    if spec.requires_normalize_advantages and not args.normalize_advantages:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator requires advantage normalization. "
+            "Please add `--normalize-advantages` to your command."
+        )
+    if spec.forbids_normalize_advantages and args.normalize_advantages:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator is incompatible with --normalize-advantages: it "
+            "has already settled the scale of its advantages, and the token-level pass would apply a "
+            "second normalization on top -- whitening twice for gdpo, and for rloo re-introducing the "
+            "standard-deviation division the leave-one-out baseline deliberately omits (which also "
+            "makes the result depend on the DP partition). Please remove --normalize-advantages."
+        )
+    if spec.requires_rewards_normalization and not args.rewards_normalization:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator requires rewards normalization to be enabled: its "
+            "group-reward normalization stage is exactly what --disable-rewards-normalization skips. "
+            "Please remove --disable-rewards-normalization."
+        )
+    if not spec.allows_reward_post_process_hooks:
+        # Both hooks return from post_process_rewards before the registry's
+        # normalizer runs, so either one silently skips this algorithm's reward
+        # stage while the run still reports itself as that algorithm.
+        for option, value in (
+            ("--custom-reward-post-process-path", args.custom_reward_post_process_path),
+            ("--agentic-custom-advantage-path", getattr(args, "agentic_custom_advantage_path", None)),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"`{option}` short-circuits reward post-processing, which would silently skip "
+                    f"{spec.name!r}'s reward normalization while the run still reports itself as "
+                    f"{spec.name!r}. Please drop one of the two."
+                )
+    if args.n_samples_per_prompt < spec.min_group_size:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator requires --n-samples-per-prompt >= "
+            f"{spec.min_group_size} (got {args.n_samples_per_prompt}); its reward stage is undefined "
+            "for a smaller group."
+        )
+    # `--hybrid` also ends up with fully_async set, but only later in validation and
+    # only as an implementation detail: it uses the colocate role set, so advantages
+    # are computed in the Megatron worker rather than the Advantages deployment.
+    # Reading both raw flags here is what distinguishes the two.
+    if not spec.supports_fully_async and args.fully_async and not args.hybrid:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator is not supported under --fully-async. "
+            "Its advantages depend on batch-level statistics, but that mode computes them in a "
+            "single-replica service that sees one `global_batch_size / num_iters_per_train_update` "
+            "slice at a time — with a slice of one sample the advantages come out all zero and the "
+            "run trains on no signal without failing. Use --colocate or --hybrid."
+        )
+
+    if spec.requires_global_token_loss and not args.calculate_per_token_loss:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator requires --calculate-per-token-loss so policy loss "
+            "is normalized by the global number of valid response tokens. The per-sample token-mean "
+            "reducer would reweight unequal-length responses by 1 / response_length."
+        )
+
+    if spec.requires_on_policy_updates:
+        # `supports_fully_async` above is about *where* advantages get computed;
+        # this is about the objective having no ratio correction at all, which
+        # rules out `--hybrid` as well even though hybrid keeps the colocate
+        # role set. Two fields, two reasons -- see AlgorithmSpec.
+        if args.fully_async or getattr(args, "hybrid", False):
+            raise ValueError(
+                f"The {spec.name!r} advantage estimator only supports synchronous (colocate) training. "
+                "Please remove --fully-async / --hybrid."
+            )
+        if args.max_staleness != 0:
+            raise ValueError(
+                f"The {spec.name!r} advantage estimator requires --max-staleness 0: its unclipped "
+                "objective has no importance-ratio correction for stale rollout data."
+            )
+        if args.partial_rollout or args.use_dynamic_global_batch_size:
+            raise ValueError(
+                f"The {spec.name!r} advantage estimator is incompatible with --partial-rollout / "
+                "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
+                "at runtime, breaking the one-update-per-rollout guarantee."
+            )
+
+    if spec.uses_reward_components:
+        _validate_multi_reward_args(args, spec)
+
+
+def _validate_multi_reward_args(args, spec) -> None:
+    """Check the reward-component configuration for multi-reward algorithms."""
+    keys = args.gdpo_reward_keys or []
+    if len(keys) < 2:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator needs at least two reward keys; "
+            f"pass e.g. `--gdpo-reward-keys correctness format`. Got {keys}."
+        )
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"`--gdpo-reward-keys` contains duplicates: {duplicates}.")
+
+    weights = args.gdpo_reward_weights
+    if weights is not None and len(weights) != len(keys):
+        raise ValueError(
+            f"`--gdpo-reward-weights` has {len(weights)} entries but `--gdpo-reward-keys` has {len(keys)}."
+        )
+
+    # The same two conditions the reward stage rejects, asked here instead of at
+    # the first rollout. `type=float` accepts "nan" and "inf" from the command
+    # line, and 1e-50 is a perfectly good Python float that flushes to zero once
+    # it reaches float32. Neither depends on any rollout data, so waiting until
+    # one exists only means the cluster is up and the checkpoint is loaded
+    # before the typo is reported. The reward-stage checks stay: they also cover
+    # weights that arrive from a config override after this point.
+    if weights is not None:
+        import torch
+
+        unusable = [w for w in weights if not math.isfinite(w)]
+        if unusable:
+            raise ValueError(f"`--gdpo-reward-weights` contains non-finite values: {unusable}.")
+        survives_cast = torch.tensor(weights, dtype=torch.float32)
+        if not bool(survives_cast.abs().sum() > 0):
+            raise ValueError(
+                f"`--gdpo-reward-weights` {weights} are all zero in float32; the combined advantage "
+                "would be identically 0 and the run would train on no signal."
+            )
+
+    # Components arrive as a dict; without --reward-key the raw_reward column
+    # would hold dicts, which the TransferQueue conversion cannot represent.
+    if not args.reward_key:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator needs `--reward-key` to select the scalar reward "
+            "used for metrics and for the raw_reward column."
+        )
+
+    filter_path = args.dynamic_sampling_filter_path
+    if filter_path and not filter_path.endswith("check_reward_nonzero_std"):
+        # The built-in filter reads `group_carries_reward_signal`, so it judges a
+        # group by every component and needs no warning. A custom one is opaque
+        # from here: if it reduces the group to the single --reward-key scalar,
+        # it drops exactly the groups this estimator exists to keep. A warning
+        # rather than an error, because a custom filter may well be
+        # component-aware and we cannot tell.
+        logger.warning(
+            "%r combines multiple reward components, but --dynamic-sampling-filter-path points at a "
+            "custom filter (%s). If it judges a group by the single --reward-key scalar (%r), groups "
+            "carrying signal only in the other components will be dropped before training sees them. "
+            "relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std handles this correctly.",
+            spec.name,
+            filter_path,
+            args.reward_key,
+        )
+
+
+def validate_reward_side_kl(args, is_sft: bool) -> None:
+    """Reject ``--kl-coef`` for estimators that have nowhere to put it.
+
+    Separate from :func:`validate_algorithm_args`, and called much earlier,
+    because of what runs in between: a nonzero ``--kl-coef`` makes validation
+    require ``--ref-load`` to exist on disk. Checking this later would report a
+    missing reference checkpoint for a run whose real problem is that the
+    estimator would have ignored the coefficient anyway.
+    """
+    if is_sft:
+        return
+    spec = get_algorithm(args.advantage_estimator)
+    if not spec.forbids_reward_side_kl or args.kl_coef == 0:
+        return
+
+    # `_validate_reinforce_plus_plus_args` is the frozen Task 29 contract and
+    # owns the wording for its two estimators, but it runs later than this
+    # point. Give it the first word here rather than pre-empting it -- and only
+    # on a path that is about to raise anyway, so no other error's precedence
+    # changes.
+    _validate_reinforce_plus_plus_args(args, is_sft)
+
+    raise ValueError(
+        f"--advantage-estimator {spec.name} does not support nonzero --kl-coef: reward-side KL "
+        "shaping is not implemented for the completion-level signal it trains on. Set --kl-coef 0; "
+        "for a supported direct KL penalty, provide --ref-load and use --use-kl-loss with "
+        "--kl-loss-coef."
+    )
+
+
+def validate_update_schedule(args) -> None:
+    """Reject repeated optimizer updates on one rollout.
+
+    Called before ``--num-steps-per-rollout`` is folded into
+    ``global_batch_size``: afterwards the two are consistent by construction
+    and a mismatch surfaces as an assertion about batch arithmetic rather than
+    as the reason the schedule is wrong.
+    """
+    spec = get_algorithm(args.advantage_estimator)
+    if spec.requires_on_policy_updates and args.num_steps_per_rollout not in (None, 1):
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires --num-steps-per-rollout 1 "
+            "(the unclipped objective has no ratio correction, so repeated updates on the same "
+            "rollout would be off-policy)."
+        )
+
+
+def derive_global_batch_size(args, *, enforce_consistency: bool = True) -> None:
+    """Fold ``--num-steps-per-rollout`` into ``global_batch_size``.
+
+    A function rather than three inline lines because
+    :func:`validate_batch_shape` reads the value it writes, and both have to
+    run again after ``--custom-config-path`` merges. Leaving the derivation
+    inline is what made re-running the validator alone *reject a legitimate
+    config*: a YAML file that switches from ``num_steps_per_rollout: 4`` to
+    ``1`` should get a global batch of ``rollout * n``, but the validator saw
+    the stale value derived from 4 and refused it.
+    """
+    if getattr(args, "num_steps_per_rollout", None) is None:
+        return
+    global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
+    if enforce_consistency and args.global_batch_size is not None:
+        assert args.global_batch_size == global_batch_size, (
+            f"global_batch_size {args.global_batch_size} is not equal to "
+            f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
+            f"// num_steps_per_rollout {args.num_steps_per_rollout}"
+        )
+    args.global_batch_size = global_batch_size
+
+
+def validate_batch_shape(args) -> None:
+    """Require the rollout to fill exactly one optimizer step.
+
+    Called after ``global_batch_size`` has taken its final value -- checking
+    earlier would compare against a number validation is still deriving.
+    """
+    spec = get_algorithm(args.advantage_estimator)
+    if spec.requires_on_policy_updates and args.rollout_batch_size * args.n_samples_per_prompt != (
+        args.global_batch_size
+    ):
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires exactly one optimizer update per rollout "
+            "(the unclipped objective has no ratio correction, so a second update on the "
+            "same rollout is off-policy without correction). This means "
+            "rollout_batch_size * n_samples_per_prompt must equal global_batch_size, "
+            f"got {args.rollout_batch_size} * {args.n_samples_per_prompt} = "
+            f"{args.rollout_batch_size * args.n_samples_per_prompt} != "
+            f"{args.global_batch_size}."
+        )
+
+
+def apply_custom_config_overrides(args) -> None:
+    """Merge ``--custom-config-path`` YAML into ``args`` and re-check the
+    result.
+
+    The merge happens late in validation so that a YAML file can override
+    derived values, which means every algorithm check that already ran was made
+    against a config we may no longer be training with. Re-running them here is
+    what stops a YAML file from quietly switching on a flag the algorithm
+    forbids.
+    """
+    if not args.custom_config_path:
+        return
+
+    use_critic_before_override = getattr(args, "use_critic", False)
+    with open(args.custom_config_path) as f:
+        data = yaml.safe_load(f) or {}
+    for k, v in data.items():
+        if hasattr(args, k):
+            logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
+        setattr(args, k, v)
+
+    if args.loss_type in ("sft", "sft_loss", "sft-loss"):
+        return
+
+    # Every *algorithm* validator, and the one derivation they read. Be precise
+    # about the scope: this function does not close every hole, it closes the
+    # algorithm-shaped ones.
+    #
+    # What it covers: `validate_reward_side_kl`, `validate_update_schedule` and
+    # `validate_batch_shape` were split out of `validate_algorithm_args`
+    # because argument validation has a derivation order. Re-running only the
+    # spec-driven validator would leave a YAML file free to select rloo and
+    # then set `--kl-coef`, `--num-steps-per-rollout 4`, or a
+    # `global_batch_size` that breaks the one-update guarantee, with nothing
+    # objecting. `_validate_reinforce_plus_plus_args` is re-run too, because
+    # the frozen function owns a constraint the spec deliberately does not
+    # restate.
+    #
+    # What it does NOT cover, and a YAML file can still move: the `--ref-load`
+    # existence check, the `kl_coef`/`kl_loss_coef` exclusion assert,
+    # `_normalize_sync_ppo_kl_args`, the fully-async resource checks, the
+    # `rollout_batch_size` derivation, and the over-sampling assert. All of
+    # them run before the merge and none is an algorithm validator. Closing
+    # that class properly means merging the YAML *before* validation rather
+    # than bolting re-runs on after it, which is a larger change than this one.
+    _validate_reinforce_plus_plus_args(args, is_sft=False)
+    validate_algorithm_args(args)
+    validate_reward_side_kl(args, is_sft=False)
+    validate_update_schedule(args)
+    # The derivation, then the validator that reads what it writes. Re-running
+    # the validator alone rejected a legitimate config: a YAML switching
+    # `num_steps_per_rollout` from 4 to 1 should get a global batch of
+    # `rollout * n`, and the validator instead saw the value derived from 4.
+    # `enforce_consistency=False` because the stale value is, by construction,
+    # the one derived before the merge -- comparing against it is the bug.
+    derive_global_batch_size(args, enforce_consistency=False)
+    validate_batch_shape(args)
+    if args.use_critic != use_critic_before_override:
+        # Role composition and the offload flags were derived from the pre-override
+        # value earlier in validation, so accepting the new one here would leave the
+        # run half-configured rather than either fully critic or fully critic-free.
+        raise ValueError(
+            f"--custom-config-path changed the algorithm to {args.advantage_estimator!r}, which needs a different "
+            f"critic setup than the one already derived. Pass --advantage-estimator on the command line instead "
+            f"of overriding it from YAML."
+        )
+
+
 def slime_validate_args(args):
     # Backward compatibility: old scripts may pass --enable-gloo-process-groups
     if not hasattr(args, "use_gloo_process_groups"):
@@ -3057,13 +3438,7 @@ def slime_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
-    if not is_sft and args.advantage_estimator == "rloo" and args.kl_coef != 0:
-        raise ValueError(
-            "--advantage-estimator rloo does not support nonzero --kl-coef: reward-side KL shaping "
-            "is not implemented for the completion-level leave-one-out signal. Set --kl-coef 0; "
-            "for a supported direct KL penalty, provide --ref-load and use --use-kl-loss with "
-            "--kl-loss-coef."
-        )
+    validate_reward_side_kl(args, is_sft)
 
     if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
         if not os.path.exists(args.ref_load):
@@ -3148,10 +3523,14 @@ def slime_validate_args(args):
             raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
         if args.n_samples_per_prompt <= 0:
             raise ValueError("--n-samples-per-prompt must be positive when deriving --rollout-batch-size.")
-        if args.advantage_estimator == "rloo" and args.global_batch_size % args.n_samples_per_prompt != 0:
+        # An estimator that must consume exactly one rollout per update cannot
+        # absorb the remainder this floor division would drop.
+        if get_algorithm(args.advantage_estimator).requires_on_policy_updates and (
+            args.global_batch_size % args.n_samples_per_prompt != 0
+        ):
             raise ValueError(
-                "--global-batch-size must be divisible by --n-samples-per-prompt for RLOO when "
-                "--rollout-batch-size is omitted, got "
+                f"--global-batch-size must be divisible by --n-samples-per-prompt for "
+                f"{args.advantage_estimator} when --rollout-batch-size is omitted, got "
                 f"{args.global_batch_size} % {args.n_samples_per_prompt} != 0."
             )
         args.rollout_batch_size = args.global_batch_size // args.n_samples_per_prompt
@@ -3161,11 +3540,8 @@ def slime_validate_args(args):
         )
 
     if not is_sft:
-        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
-            assert args.normalize_advantages, (
-                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
-                "require advantage normalization. Please add `--normalize-advantages` to your command."
-            )
+        validate_algorithm_args(args)
+
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
@@ -3316,7 +3692,9 @@ def slime_validate_args(args):
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    # `use_critic` is set by validate_algorithm_args for RL runs; SFT never has one.
+    if is_sft:
+        args.use_critic = False
     # Synchronous PPO has no producer for
     # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
     # gated on `advantage_estimator != "ppo"`, and the sync role set does not
@@ -3483,75 +3861,13 @@ def slime_validate_args(args):
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
-    if args.advantage_estimator == "rloo" and args.num_steps_per_rollout not in (None, 1):
-        raise ValueError(
-            "--advantage-estimator rloo requires --num-steps-per-rollout 1 "
-            "(the unclipped objective has no ratio correction, so repeated updates on the same "
-            "rollout would be off-policy)."
-        )
+    if not is_sft:
+        validate_update_schedule(args)
 
-    if args.num_steps_per_rollout is not None:
-        global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
-        if args.global_batch_size is not None:
-            assert args.global_batch_size == global_batch_size, (
-                f"global_batch_size {args.global_batch_size} is not equal to "
-                f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
-                f"// num_steps_per_rollout {args.num_steps_per_rollout}"
-            )
-        args.global_batch_size = global_batch_size
+    derive_global_batch_size(args)
 
-    if args.advantage_estimator == "rloo":
-        if args.n_samples_per_prompt < 2:
-            raise ValueError(
-                "--advantage-estimator rloo requires --n-samples-per-prompt >= 2 "
-                "(the leave-one-out baseline divides by G-1; G=1 is undefined)."
-            )
-        if args.fully_async or getattr(args, "hybrid", False):
-            raise ValueError(
-                "--advantage-estimator rloo only supports synchronous (colocate) training. "
-                "Please remove --fully-async / --hybrid."
-            )
-        if not args.calculate_per_token_loss:
-            raise ValueError(
-                "--advantage-estimator rloo requires --calculate-per-token-loss so policy loss is "
-                "normalized by the global number of valid response tokens. The per-sample token-mean "
-                "reducer would reweight unequal-length responses by 1 / response_length."
-            )
-        if args.max_staleness != 0:
-            raise ValueError(
-                "--advantage-estimator rloo requires --max-staleness 0: the unclipped objective has no "
-                "importance-ratio correction for stale rollout data."
-            )
-        if not args.rewards_normalization:
-            raise ValueError(
-                "--advantage-estimator rloo requires rewards normalization to be enabled "
-                "(the leave-one-out baseline is computed inside the group-reward path that "
-                "--disable-rewards-normalization skips). Please remove --disable-rewards-normalization."
-            )
-        if args.normalize_advantages:
-            raise ValueError(
-                "--advantage-estimator rloo is incompatible with --normalize-advantages: "
-                "the latter re-whitens advantages after DP sharding "
-                "(distributed_masked_whiten in loss.py), which re-introduces the std "
-                "normalization RLOO removes and makes the result depend on the DP partition. "
-                "Please remove --normalize-advantages."
-            )
-        if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
-            raise ValueError(
-                "--advantage-estimator rloo requires exactly one optimizer update per rollout "
-                "(the unclipped objective has no ratio correction, so a second update on the "
-                "same rollout is off-policy without correction). This means "
-                "rollout_batch_size * n_samples_per_prompt must equal global_batch_size, "
-                f"got {args.rollout_batch_size} * {args.n_samples_per_prompt} = "
-                f"{args.rollout_batch_size * args.n_samples_per_prompt} != "
-                f"{args.global_batch_size}."
-            )
-        if args.partial_rollout or args.use_dynamic_global_batch_size:
-            raise ValueError(
-                "--advantage-estimator rloo is incompatible with --partial-rollout / "
-                "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
-                "at runtime, breaking the one-update-per-rollout guarantee."
-            )
+    if not is_sft:
+        validate_batch_shape(args)
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
@@ -3625,13 +3941,7 @@ def slime_validate_args(args):
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
 
-    if args.custom_config_path:
-        with open(args.custom_config_path) as f:
-            data = yaml.safe_load(f) or {}
-        for k, v in data.items():
-            if hasattr(args, k):
-                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
-            setattr(args, k, v)
+    apply_custom_config_overrides(args)
 
     if args.eval_max_context_len is None:
         logger.info(
