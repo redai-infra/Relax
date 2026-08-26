@@ -2952,6 +2952,10 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
 def _validate_dr_grpo_args(args) -> None:
     """Validate Dr.GRPO's fixed-budget optimization contract."""
 
+    if getattr(args, "loss_type", None) != "policy_loss":
+        raise ValueError("Dr.GRPO requires --loss-type policy_loss; SFT and custom losses are not supported.")
+    if getattr(args, "num_experts", None):
+        raise ValueError("Dr.GRPO currently supports dense models only; MoE models are not supported.")
     if type(args.rollout_max_response_len) is not int or args.rollout_max_response_len <= 0:
         raise ValueError("--rollout-max-response-len must be a positive integer for Dr.GRPO.")
     if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):

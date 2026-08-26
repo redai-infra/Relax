@@ -129,7 +129,13 @@ def test_dr_grpo_advantages_service_does_not_add_reward_side_kl_to_returns(monke
 
 
 def test_dr_grpo_uses_response_tokens_for_gradient_normalizer(monkeypatch):
-    monkeypatch.setattr(loss_module, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(3.0))
+    exact_count_modes = []
+
+    def get_num_tokens(*_args, **kwargs):
+        exact_count_modes.append(kwargs["use_exact_loss_mask_count"])
+        return torch.tensor(3.0)
+
+    monkeypatch.setattr(loss_module, "get_cp_local_num_tokens", get_num_tokens)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(
         loss_module,
@@ -142,6 +148,7 @@ def test_dr_grpo_uses_response_tokens_for_gradient_normalizer(monkeypatch):
         lambda *_args, **_kwargs: (torch.tensor(6.0), {"loss": torch.tensor(6.0)}),
     )
     args = Namespace(
+        advantage_estimator="dr_grpo",
         loss_type="policy_loss",
         recompute_loss_function=False,
         qkv_format="thd",
@@ -163,10 +170,17 @@ def test_dr_grpo_uses_response_tokens_for_gradient_normalizer(monkeypatch):
     assert torch.isclose(normalizer, torch.tensor(3.0))
     assert torch.isclose(logging["values"][0], torch.tensor(3.0))
     assert torch.isclose(logging["values"][1], torch.tensor(1.8))
+    assert exact_count_modes == [True]
 
 
 def test_non_dr_grpo_per_token_loss_ignores_streaming_loss_scale(monkeypatch):
-    monkeypatch.setattr(loss_module, "get_cp_local_num_tokens", lambda *args, **kwargs: torch.tensor(3.0))
+    exact_count_modes = []
+
+    def get_num_tokens(*_args, **kwargs):
+        exact_count_modes.append(kwargs["use_exact_loss_mask_count"])
+        return torch.tensor(3.0)
+
+    monkeypatch.setattr(loss_module, "get_cp_local_num_tokens", get_num_tokens)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(
         loss_module,
@@ -199,6 +213,7 @@ def test_non_dr_grpo_per_token_loss_ignores_streaming_loss_scale(monkeypatch):
     assert torch.isclose(loss, torch.tensor(6.0))
     assert torch.isclose(normalizer, torch.tensor(3.0))
     assert torch.isclose(logging["values"][1], torch.tensor(6.0))
+    assert exact_count_modes == [False]
 
 
 def _distributed_dr_grpo_metadata_worker(rank: int, world_size: int, port: int, topology: str) -> None:
@@ -322,6 +337,7 @@ def test_dr_grpo_cp_padding_preserves_token_count_and_reduction() -> None:
                 padded_total_lengths=padded_total_lengths,
                 dynamic_cp_size=2,
                 dynamic_cp_rank=cp_rank,
+                use_exact_loss_mask_count=True,
             )
 
         assert torch.isclose(total_tokens, expected_tokens)
@@ -332,8 +348,8 @@ def test_dr_grpo_cp_padding_preserves_token_count_and_reduction() -> None:
 
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
-def test_get_cp_local_num_tokens_counts_fully_masked_response_as_zero(cp_size: int) -> None:
-    """Every CP degree counts real unmasked tokens, with no per-sample clamp.
+def test_dr_grpo_token_count_counts_fully_masked_response_as_zero(cp_size: int) -> None:
+    """Dr.GRPO counts real unmasked tokens at every CP degree.
 
     A filtered sample stays in the batch with an all-zero loss_mask. Clamping
     its count to 1 at CP=1 made that branch report one more token than CP>1 for
@@ -350,6 +366,7 @@ def test_get_cp_local_num_tokens_counts_fully_masked_response_as_zero(cp_size: i
             loss_masks,
             dynamic_cp_size=cp_size,
             dynamic_cp_rank=cp_rank,
+            use_exact_loss_mask_count=True,
         )
         for cp_rank in range(cp_size)
     )
@@ -358,22 +375,73 @@ def test_get_cp_local_num_tokens_counts_fully_masked_response_as_zero(cp_size: i
 
 
 @pytest.mark.parametrize("cp_size", [1, 2])
-def test_get_cp_local_num_tokens_is_zero_when_every_response_is_masked(cp_size: int) -> None:
-    """A fully-filtered window yields a zero denominator, not a clamped one.
+def test_dr_grpo_token_count_is_zero_when_every_response_is_masked(cp_size: int) -> None:
+    """A fully-filtered Dr.GRPO window yields a zero denominator.
 
-    Callers must guard their own division; ``finalize_model_grads`` already
-    skips its ``1 / num_tokens`` scaling when the count is not positive.
+    Callers must guard their own division; ``finalize_model_grads`` uses a safe
+    denominator and may omit scaling or apply identity scaling.
     """
     loss_masks = [torch.zeros(8, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)]
 
     total = sum(
         cp_utils_module.get_cp_local_num_tokens(
-            [16, 8], [8, 4], loss_masks, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
+            [16, 8],
+            [8, 4],
+            loss_masks,
+            dynamic_cp_size=cp_size,
+            dynamic_cp_rank=cp_rank,
+            use_exact_loss_mask_count=True,
         )
         for cp_rank in range(cp_size)
     )
 
     assert float(total) == 0.0, f"cp_size={cp_size}"
+
+
+def test_non_dr_cp1_token_count_preserves_legacy_floor_for_mixed_masks() -> None:
+    loss_masks = [torch.ones(8), torch.zeros(4)]
+
+    total = cp_utils_module.get_cp_local_num_tokens(
+        [16, 8],
+        [8, 4],
+        loss_masks,
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    reducer = cp_utils_module.get_sum_of_sample_mean(
+        [16, 8],
+        [8, 4],
+        loss_masks,
+        calculate_per_token_loss=True,
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+
+    assert float(total) == 9.0
+    assert float(reducer(torch.ones(12))) == 8.0
+
+
+def test_non_dr_cp1_token_count_preserves_legacy_floor_for_all_zero_masks() -> None:
+    loss_masks = [torch.zeros(8), torch.zeros(4)]
+
+    total = cp_utils_module.get_cp_local_num_tokens(
+        [16, 8],
+        [8, 4],
+        loss_masks,
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+    reducer = cp_utils_module.get_sum_of_sample_mean(
+        [16, 8],
+        [8, 4],
+        loss_masks,
+        calculate_per_token_loss=True,
+        dynamic_cp_size=1,
+        dynamic_cp_rank=0,
+    )
+
+    assert float(total) == 2.0
+    assert float(reducer(torch.ones(12))) == 0.0
 
 
 def test_dr_grpo_flags_fully_masked_window_and_leaves_others_alone(monkeypatch) -> None:
@@ -535,6 +603,50 @@ def test_dr_grpo_metadata_moves_cpu_mask_stats_to_current_device(monkeypatch):
 
     assert reduced_devices == [torch.device("meta")]
     assert metadata[0]["__dr_grpo_window_scale__"].device == torch.device("meta")
+
+
+def test_dr_grpo_metadata_all_reduces_large_counts_as_int64(monkeypatch) -> None:
+    response_budget = 2**24 + 20
+    global_response_tokens = 2**24 + 11
+    reductions = []
+
+    class SyntheticLossMask:
+        def __init__(self, count: int) -> None:
+            self.count = count
+
+        def sum(self, dtype=None) -> torch.Tensor:
+            return torch.tensor(self.count, dtype=dtype)
+
+    def prepare(local_counts: list[int], remote_samples: int, remote_tokens: int) -> torch.Tensor:
+        def all_reduce(stats: torch.Tensor, *, group) -> None:
+            reductions.append((stats.clone(), group))
+            stats.add_(torch.tensor([[remote_samples, remote_tokens]], dtype=torch.int64))
+
+        monkeypatch.setattr(loss_module.dist, "all_reduce", all_reduce)
+        metadata = loss_module.prepare_policy_optimizer_window_metadata(
+            Namespace(advantage_estimator="dr_grpo", rollout_max_response_len=response_budget),
+            {"loss_masks": [SyntheticLossMask(count) for count in local_counts]},
+            [len(local_counts)],
+        )
+        return metadata[0]["__dr_grpo_window_scale__"]
+
+    monkeypatch.setattr(
+        loss_module.mpu,
+        "get_data_parallel_group",
+        lambda with_context_parallel=True: "dp_cp" if with_context_parallel else "dp_no_cp",
+    )
+    split_scale = prepare([2**24 + 1], remote_samples=1, remote_tokens=10)
+    local_scale = prepare([2**24, 11], remote_samples=0, remote_tokens=0)
+    expected_scale = torch.tensor(global_response_tokens, dtype=torch.float32) / torch.tensor(
+        2 * response_budget, dtype=torch.float32
+    )
+
+    assert all(stats.dtype == torch.int64 for stats, _group in reductions)
+    assert reductions[0][0].tolist() == [[1, 2**24 + 1]]
+    assert reductions[1][0].tolist() == [[2, global_response_tokens]]
+    assert [group for _stats, group in reductions] == ["dp_no_cp", "dp_no_cp"]
+    assert torch.equal(split_scale, expected_scale)
+    assert torch.equal(local_scale, expected_scale)
 
 
 def test_dr_grpo_metadata_rejects_zero_response_budget():
@@ -1465,9 +1577,9 @@ def test_megatron_finalizer_reaches_dr_grpo_fixed_denominator(tmp_path) -> None:
 def test_megatron_finalizer_leaves_gradients_alone_for_empty_window(tmp_path) -> None:
     """A fully masked window reaches the finalizer with ``T == 0``.
 
-    Megatron guards the division itself, so the window must come back unscaled
-    rather than raising or producing inf/NaN. ``train_one_step`` then skips the
-    optimizer, see
+    Megatron uses a safe denominator, so it may omit scaling or apply identity
+    scaling. In either case the gradient must remain unchanged and finite.
+    ``train_one_step`` then skips the optimizer, see
     :func:`test_train_one_step_skips_optimizer_and_scheduler_for_empty_window`.
     """
     import json
@@ -1482,6 +1594,5 @@ def test_megatron_finalizer_leaves_gradients_alone_for_empty_window(tmp_path) ->
     with open(result_path) as handle:
         recorded = json.load(handle)
 
-    assert recorded["scalings"] == []
     assert recorded["gradient"][0] == pytest.approx(float(FROZEN_DR_GRPO_GRADIENT_TOTAL), abs=1e-12)
     assert math.isfinite(recorded["gradient"][0])

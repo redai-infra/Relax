@@ -118,6 +118,8 @@ bash examples/algorithms/run-qwen3-0.6B-1xgpu-rloo.sh
 
 Dr.GRPO（Group Relative Policy Optimization Done Right）从 GRPO 中移除了 response length normalization 和组内 reward 标准差归一化。Relax 使用组内中心化 reward，并用固定预算 `N * B` 对 Actor token-loss sum 进行 reduction，其中 `N` 是 optimizer window 的全局 response 数，`B` 是 `--rollout-max-response-len`。
 
+当前实现采用 fail-closed 边界，仅支持 dense 模型与 `--loss-type policy_loss`；MoE 模型、SFT 和 custom loss 会在参数校验阶段被拒绝。
+
 参考论文：[Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783)。
 
 ### 算法原理
@@ -135,6 +137,8 @@ Relax 通过给组合后的 Actor loss 乘以 $T/(N B)$，再复用 Megatron 对
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--advantage-estimator dr_grpo` | — | 启用 Dr.GRPO |
+| `--loss-type policy_loss` | `policy_loss` | 必须使用；其他 loss type 会被拒绝 |
+| `--num-experts` | `None` | 必须保持未设置；当前不支持 MoE |
 | `--rollout-max-response-len` | `None` | 固定 response budget `B`，必须设置 |
 | `--normalize-advantages` | 关闭 | 会被拒绝；它与 Dr.GRPO 去掉 advantage 方差归一化的设计矛盾 |
 | `--calculate-per-token-loss` | 关闭 | Dr.GRPO 会自动启用，CP 场景下也强制要求 |

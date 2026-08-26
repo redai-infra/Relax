@@ -174,6 +174,7 @@ def get_cp_local_num_tokens(
     padded_total_lengths: list[int] | None = None,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
+    use_exact_loss_mask_count: bool = False,
 ) -> torch.Tensor:
     """Count loss-contributing tokens held by THIS CP rank.
 
@@ -193,7 +194,9 @@ def get_cp_local_num_tokens(
     """
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
-        return sum([loss_mask.sum() for loss_mask in loss_masks])
+        if use_exact_loss_mask_count:
+            return sum([loss_mask.sum() for loss_mask in loss_masks])
+        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
 
     # cp_size > 1: mirror the chunk slicing done in get_sum_of_sample_mean so the
     # counted tokens exactly match the ones sum_of_token contributes on this rank.

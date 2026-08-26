@@ -2,6 +2,8 @@
 
 Relax supports Dr.GRPO (Group Relative Policy Optimization Done Right) for closed-window dense-model training in synchronous colocate and hybrid modes with the Megatron backend.
 
+For the reproducible Qwen3.5-4B GSM8K comparison, see the [Dr.GRPO 200-Step Training Report](./dr-grpo-training-report.md).
+
 ## Overview
 
 Dr.GRPO removes two normalization terms that can bias vanilla GRPO: division of each response by its own length and division of group-relative rewards by the group standard deviation. The algorithm was introduced in [Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783).
@@ -32,6 +34,10 @@ This fixed budget prevents short responses from receiving a larger per-token wei
 
 ::: warning Advantage normalization is rejected
 `--normalize-advantages` is rejected for Dr.GRPO. Removing the advantage variance normalization is the core of Dr.GRPO, and the flag re-applies a global whitening step that contradicts it. Startup fails with a validation error if the flag is set.
+:::
+
+::: warning Supported model and loss
+Dr.GRPO currently supports dense models with `--loss-type policy_loss` only. Startup rejects MoE models and SFT or custom losses because their auxiliary losses and normalization contracts are not covered by the current implementation.
 :::
 
 ## Relax Implementation
@@ -108,6 +114,8 @@ Adjust the GPU counts, model configuration, data paths, and token budget for you
 | Parameter | Default | Dr.GRPO behavior |
 |---|---|---|
 | `--advantage-estimator dr_grpo` | `grpo` | Select Dr.GRPO and its fixed-budget reduction |
+| `--loss-type policy_loss` | `policy_loss` | Required; SFT and custom losses are rejected |
+| `--num-experts` | `None` | Must remain unset; MoE models are not currently supported |
 | `--rollout-max-response-len` | `None` | Defines `B`; set it to the generation response-token budget |
 | `--n-samples-per-prompt` | `1` | Number of responses in each reward-centering group |
 | `--global-batch-size` | `None` | Number of responses in one optimizer step for the usual fixed-size schedule |
@@ -143,8 +151,13 @@ Check that `--rollout-max-response-len` matches the intended response budget and
 
 Use synchronous colocate or hybrid mode. Pure fully-async streaming does not yet prepare the closed-window `(N, T)` metadata required by the fixed denominator.
 
+### MoE or a non-policy loss is rejected
+
+Use a dense model with `--loss-type policy_loss`. MoE auxiliary losses and router expert-bias updates require an empty-window contract that is not implemented for Dr.GRPO, while SFT and custom losses do not satisfy its policy-objective contract.
+
 ## Next Steps
 
+- [Dr.GRPO 200-Step Training Report](./dr-grpo-training-report.md) — Reproduce the paired GRPO/Dr.GRPO experiment
 - [Algorithm Reference](../examples/algorithms.md) — Compare Dr.GRPO with other policy-gradient algorithms
 - [Configuration](./configuration.md) — Review rollout, batch, and parallelism parameters
 - [PPO Training](./ppo-training.md) — Use the Actor-Critic training path

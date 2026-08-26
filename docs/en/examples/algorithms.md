@@ -121,6 +121,8 @@ Set `ADVANTAGE_ESTIMATOR=grpo` to run a control arm with the same recipe and see
 
 Dr.GRPO (Group Relative Policy Optimization Done Right) removes response-length normalization and group reward standard-deviation normalization from GRPO. Relax uses the group-centered reward and reduces the Actor token-loss sum by the fixed budget `N * B`, where `N` is the global response count in the optimizer window and `B` is `--rollout-max-response-len`.
 
+The current implementation is fail-closed to dense models with `--loss-type policy_loss`; MoE models, SFT, and custom losses are rejected during argument validation.
+
 Reference: [Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783).
 
 ### How It Works
@@ -138,6 +140,8 @@ Relax implements the fixed denominator by scaling the combined Actor loss with $
 | Parameter | Default | Description |
 |---|---|---|
 | `--advantage-estimator dr_grpo` | — | Enable Dr.GRPO |
+| `--loss-type policy_loss` | `policy_loss` | Required; other loss types are rejected |
+| `--num-experts` | `None` | Must remain unset; MoE is not currently supported |
 | `--rollout-max-response-len` | `None` | Fixed response budget `B`; it must be set |
 | `--normalize-advantages` | off | Rejected; it contradicts Dr.GRPO's removal of advantage variance normalization |
 | `--calculate-per-token-loss` | off | Automatically enabled by Dr.GRPO and required for CP |

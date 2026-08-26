@@ -1,0 +1,32 @@
+{
+  "kl_note": "train/kl_loss is Relax's logged algorithm-normalized reference-KL component; train/reference_kl reconstructs sum(KL)/T using exact loss masks and the applicable training denominator; it is unavailable when T=0.",
+  "loss_mask_tokens_source": "sum(loss_masks) from every actor-rank --save-debug-train-data dump, divided by TP*PP*CP replicas",
+  "runs": {
+    "grpo": {
+      "algorithm": "GRPO",
+      "steps": 200,
+      "correct_count": 2930,
+      "incorrect_count": 270,
+      "accuracy": 0.915625,
+      "mean_raw_reward": 0.83125,
+      "loss_mask_tokens": 3930695,
+      "fully_masked_responses": 0,
+      "zero_token_windows": 0,
+      "mean_grad_norm": 0.44663846597075463,
+      "max_grad_norm": 8.78978157043457
+    },
+    "dr_grpo": {
+      "algorithm": "Dr.GRPO",
+      "steps": 200,
+      "correct_count": 2972,
+      "incorrect_count": 228,
+      "accuracy": 0.92875,
+      "mean_raw_reward": 0.8575,
+      "loss_mask_tokens": 3275766,
+      "fully_masked_responses": 0,
+      "zero_token_windows": 0,
+      "mean_grad_norm": 0.10321016080677509,
+      "max_grad_norm": 2.0178613662719727
+    }
+  }
+}

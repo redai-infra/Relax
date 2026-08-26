@@ -2,6 +2,8 @@
 
 Relax 支持在 Megatron 后端的同步 colocate 和 hybrid 模式中，使用 Dr.GRPO（Group Relative Policy Optimization Done Right）进行 closed-window dense 模型训练。
 
+可复现的 Qwen3.5-4B GSM8K 对照实验见 [Dr.GRPO 200-Step 训练报告](./dr-grpo-training-report.md)。
+
 ## 概述
 
 Dr.GRPO 移除了 vanilla GRPO 中可能引入偏差的两个归一化项：按每条 response 自身长度归一化，以及按组内 reward 标准差归一化。该算法来自论文 [Understanding R1-Zero-Like Training: A Critical Perspective](https://arxiv.org/abs/2503.20783)。
@@ -32,6 +34,10 @@ $$
 
 ::: warning 拒绝 advantage normalization
 Dr.GRPO 会拒绝 `--normalize-advantages`。去掉 advantage 的方差归一化正是 Dr.GRPO 的核心，而该选项会重新叠加一层全局 whitening，与之矛盾。设置该选项会在启动阶段报校验错误。
+:::
+
+::: warning 支持的模型与 loss
+Dr.GRPO 当前仅支持 dense 模型与 `--loss-type policy_loss`。启动阶段会拒绝 MoE 模型以及 SFT 或 custom loss，因为当前实现尚未覆盖它们的辅助 loss 与 normalization contract。
 :::
 
 ## Relax 实现
@@ -108,6 +114,8 @@ PERF_ARGS=(
 | 参数 | 默认值 | Dr.GRPO 行为 |
 |---|---|---|
 | `--advantage-estimator dr_grpo` | `grpo` | 选择 Dr.GRPO 及其固定预算 reduction |
+| `--loss-type policy_loss` | `policy_loss` | 必须使用；SFT 和 custom loss 会被拒绝 |
+| `--num-experts` | `None` | 必须保持未设置；当前不支持 MoE 模型 |
 | `--rollout-max-response-len` | `None` | 定义 `B`；应设置为生成时的 response token budget |
 | `--n-samples-per-prompt` | `1` | 每个 reward centering group 中的 response 数 |
 | `--global-batch-size` | `None` | 常规固定 batch schedule 下，每个 optimizer step 的 response 数 |
@@ -143,8 +151,13 @@ PERF_ARGS=(
 
 请使用同步 colocate 或 hybrid 模式。纯 fully-async streaming 尚未准备 fixed denominator 所需的 closed-window `(N, T)` metadata。
 
+### MoE 或非 policy loss 被拒绝
+
+请使用 dense 模型与 `--loss-type policy_loss`。MoE auxiliary loss 和 router expert-bias update 需要当前 Dr.GRPO 尚未实现的 empty-window contract，而 SFT 和 custom loss 不符合其 policy objective contract。
+
 ## 下一步
 
+- [Dr.GRPO 200-Step 训练报告](./dr-grpo-training-report.md) — 复现 GRPO/Dr.GRPO 配对实验
 - [算法参考](../examples/algorithms.md) — 对比 Dr.GRPO 与其他 policy-gradient 算法
 - [配置说明](./configuration.md) — 查看 rollout、batch 和并行参数
 - [PPO 训练](./ppo-training.md) — 使用 Actor-Critic 训练路径

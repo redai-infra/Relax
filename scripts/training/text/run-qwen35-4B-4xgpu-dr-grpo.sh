@@ -5,9 +5,18 @@
 # Qwen3.5-4B 4xGPU colocate (sync) Dr.GRPO training script.
 #
 # Usage:
+#   hf download openai/gsm8k main/train-00000-of-00001.parquet \
+#     --repo-type dataset \
+#     --revision 740312add88f781978c0658806c59bc2815b9866 \
+#     --local-dir /path/to/gsm8k-pinned
+#   python scripts/testing/convert_gsm8k_for_dr_grpo_e2e.py \
+#     --input /path/to/gsm8k-pinned/main/train-00000-of-00001.parquet \
+#     --output /path/to/gsm8k-train-shuffle42-first256.jsonl
 #   MODEL_PATH=/path/to/Qwen3.5-4B \
-#   PROMPT_SET=/path/to/gsm8k-test.jsonl \
+#   PROMPT_SET=/path/to/gsm8k-train-shuffle42-first256.jsonl \
 #   OUTPUT_DIR=/path/to/output \
+#   TRAIN_DATA_DIR=/path/to/output/train_data \
+#   NUM_ROLLOUT=200 \
 #     bash scripts/training/text/run-qwen35-4B-4xgpu-dr-grpo.sh
 
 set -ex
@@ -35,6 +44,18 @@ MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-4096}"
 RUN_ID="${RUN_ID:-qwen35-4b-${ADVANTAGE_ESTIMATOR}-cp${CONTEXT_PARALLEL_SIZE}}"
 LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/log}"
 ROLLOUT_RESULT_DIR="${ROLLOUT_RESULT_DIR:-${OUTPUT_DIR}/rollout_result}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
+export TENSORBOARD_DIR
+
+RUNTIME_ENV_JSON=$(python3 -c '
+import json
+import os
+
+runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+runtime_env.setdefault("env_vars", {})["TENSORBOARD_DIR"] = os.environ["TENSORBOARD_DIR"]
+print(json.dumps(runtime_env))
+')
+export RUNTIME_ENV_JSON
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_PATH}"
@@ -122,8 +143,11 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
 )
+if [ -n "${TRAIN_DATA_DIR:-}" ]; then
+   MISC_ARGS+=(--save-debug-train-data "${TRAIN_DATA_DIR}/{rollout_id}_{rank}.pt")
+fi
 
-mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
+mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}" "${TENSORBOARD_DIR}"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

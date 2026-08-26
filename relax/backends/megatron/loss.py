@@ -749,10 +749,10 @@ def prepare_policy_optimizer_window_metadata(
             window_masks = rollout_data["loss_masks"][start:end]
             if window_masks:
                 local_response_tokens = torch.stack(
-                    [mask.sum().to(device=stats_device, dtype=torch.float32) for mask in window_masks]
+                    [mask.sum(dtype=torch.int64).to(device=stats_device) for mask in window_masks]
                 ).sum()
             else:
-                local_response_tokens = torch.zeros((), device=stats_device, dtype=torch.float32)
+                local_response_tokens = torch.zeros((), device=stats_device, dtype=torch.int64)
             step_stats.append(
                 torch.stack(
                     [
@@ -765,9 +765,9 @@ def prepare_policy_optimizer_window_metadata(
 
         stats = torch.stack(step_stats)
         dist.all_reduce(stats, group=mpu.get_data_parallel_group(with_context_parallel=False))
-        step_denominators = (stats[:, 0] * args.rollout_max_response_len).clamp_min(1.0)
-        step_loss_scales = stats[:, 1] / step_denominators
-        step_window_empty = stats[:, 1] <= 0
+        step_denominators = (stats[:, 0] * args.rollout_max_response_len).clamp_min(1)
+        step_loss_scales = stats[:, 1].to(torch.float32) / step_denominators.to(torch.float32)
+        step_window_empty = stats[:, 1] == 0
         return [
             {"__dr_grpo_window_scale__": scale, "__optimizer_window_empty__": window_empty}
             for scale, window_empty in zip(step_loss_scales, step_window_empty, strict=True)
@@ -1406,6 +1406,9 @@ def loss_function(
     # normalizer is correct even when CP differs across micro-batches (dynamic CP).
     # Under static CP it equals the old full-sample count distributed across ranks,
     # so the final loss/grad/metric are unchanged after all-reduce.
+    use_exact_loss_mask_count = False
+    if getattr(args, "advantage_estimator", None) == "dr_grpo":
+        use_exact_loss_mask_count = True
     num_tokens = get_cp_local_num_tokens(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -1415,6 +1418,7 @@ def loss_function(
         batch.get("padded_total_lengths", None),
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        use_exact_loss_mask_count=use_exact_loss_mask_count,
     )
     num_samples = len(batch["response_lengths"])
 

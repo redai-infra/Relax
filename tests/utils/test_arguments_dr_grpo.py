@@ -43,6 +43,8 @@ def _args(**overrides) -> SimpleNamespace:
         rollout_max_response_len=1024,
         fully_async=False,
         hybrid=False,
+        loss_type="policy_loss",
+        num_experts=None,
         rewards_normalization=True,
         kl_coef=0.0,
         normalize_advantages=False,
@@ -79,8 +81,32 @@ def test_dr_grpo_validates_async_execution_mode(arguments_module, hybrid, should
     ],
 )
 def test_dr_grpo_rejects_incompatible_semantics(arguments_module, overrides, error):
+    args = _args(**overrides)
+
     with pytest.raises(ValueError, match=error):
-        arguments_module._validate_dr_grpo_args(_args(**overrides))
+        arguments_module._validate_dr_grpo_args(args)
+
+    assert args.calculate_per_token_loss is False
+
+
+@pytest.mark.parametrize("loss_type", ["sft", "custom_loss"])
+def test_dr_grpo_rejects_non_policy_loss(arguments_module, loss_type):
+    args = _args(loss_type=loss_type)
+
+    with pytest.raises(ValueError, match="requires --loss-type policy_loss"):
+        arguments_module._validate_dr_grpo_args(args)
+
+    assert args.calculate_per_token_loss is False
+
+
+@pytest.mark.parametrize("num_experts", [1, 8])
+def test_dr_grpo_rejects_moe_models(arguments_module, num_experts):
+    args = _args(num_experts=num_experts)
+
+    with pytest.raises(ValueError, match="dense models only"):
+        arguments_module._validate_dr_grpo_args(args)
+
+    assert args.calculate_per_token_loss is False
 
 
 def test_valid_dr_grpo_enables_per_token_loss(arguments_module):
