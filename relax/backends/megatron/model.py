@@ -1024,6 +1024,8 @@ def train_one_step(
                     "loss_masks",
                     "log_probs",
                     "ref_log_probs",
+                    "preference_branch_pair_ids",
+                    "preference_is_chosen",
                     "values",
                     "advantages",
                     "returns",
