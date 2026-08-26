@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "status": "release_candidate",
+  "schema_version": 3,
+  "status": "published",
   "experiment": "Qwen3.5-4B GSM8K paired GRPO vs Dr.GRPO",
   "budget": {
     "declared_optimizer_steps_per_run": 200,
@@ -16,8 +16,9 @@
     "execution_base_commit": "62022e01ce4cbe48b4720bcf20335af2415e41ec",
     "execution_tracked_patch_sha256": "e0f560236024420b51e03124b03b7041c9c0936f5d431de81c4fc770191b1f03",
     "execution_worktree_archive_sha256": "30ab4f7524e378bba6350d0b67641090485c5b904fc375eb8e51ba726fb876e7",
-    "reproduction_commit": null,
-    "note": "The formal jobs used the recorded base plus frozen worktree snapshot. Set reproduction_commit to the final clean PR commit before publication."
+    "reproduction_commit": "96693f0f89fcbe56487184627398c2bb00f1dd3e",
+    "note": "The formal jobs used the recorded base, exact tracked patch, and execution-time untracked tools. The published sanitized source snapshot reconstructs that checkout without unrelated local worktree files.",
+    "reproduction_equivalence": "Production training files, the paired recipe, dataset converter, backend tests, and argument tests are byte-identical to the reproduction commit; execution-time and final post-processing tools are published separately with distinct hashes."
   },
   "environment": {
     "hardware": "4 x NVIDIA H20",
@@ -124,12 +125,16 @@
     "incorrect_length_svg_sha256": "8fc5097e811c559de3189d720f14770a00a66176f2ffc1f62cec84f1c0e0d8c1"
   },
   "public_evidence": {
-    "release_url": null,
-    "main_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-evidence-v2.tar.zst",
-    "main_archive_sha256": "7510d747a3f3371e52a84f19315fde5f7cc54c9438c5d30970fab4dec465c96c",
+    "release_url": "https://github.com/idvzchusvol/Relax/releases/tag/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3",
+    "main_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-evidence-v3.tar.zst",
+    "main_archive_sha256": "e9e212f9b826a28cda463cdab6a96e61ca8b42d45ad0855060ba877a673b75db",
+    "formal_run_source_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-formal-run-source-v3.tar.zst",
+    "formal_run_source_archive_sha256": "9ea4a1c5da317e640b41a48c7c637ee2f4c88ad018c5b260a1de4e574a257e28",
     "loss_mask_source_archive": "relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-loss-mask-source-dumps.tar.zst",
     "loss_mask_source_archive_sha256": "521c554bb11b2c5891e72e103eb669286dbf7b1531903f7b258773deeaae28f3",
-    "note": "Populate release_url after uploading the locally verified archives. The main archive excludes this outer manifest to avoid self-reference."
+    "supersedes_release_url": "https://github.com/idvzchusvol/Relax/releases/tag/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v2",
+    "correction": "The v2 main archive accidentally packaged a different tracked patch than the one named by its metadata. Experiment outputs were unaffected; v3 publishes the actual formal-run patch and a sanitized reconstructed source snapshot.",
+    "note": "All three archives were downloaded from the published immutable prerelease and verified against the listed SHA256 digests. The main archive excludes this outer manifest to avoid self-reference."
   },
   "excluded": [
     "model weights",

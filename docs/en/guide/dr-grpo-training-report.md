@@ -12,13 +12,21 @@ This report records the equal-budget Qwen3.5-4B GSM8K comparison used to validat
 - Execution source base: `62022e01ce4cbe48b4720bcf20335af2415e41ec`
 - Execution patch SHA256: `e0f560236024420b51e03124b03b7041c9c0936f5d431de81c4fc770191b1f03`
 - Frozen execution worktree SHA256: `30ab4f7524e378bba6350d0b67641090485c5b904fc375eb8e51ba726fb876e7`
+- Clean reproduction-code commit: `96693f0f89fcbe56487184627398c2bb00f1dd3e`
 - Container image: `ghcr.io/redai-infra/relaxrl@sha256:d6ee9f015f1a92987931ed5f7229e6cfb6f089bba9fa8e6bc1ea289c2503a7af`
 
-::: warning Evidence release candidate
-The sanitized evidence archives are built and SHA256-verified locally. Their public GitHub Release URL and the final clean reproduction commit must be added before the PR evidence update is considered complete. The experiment source is currently identified by the base commit plus the archived patch and worktree hashes above.
+::: tip Published evidence
+The sanitized evidence is published in the immutable, versioned
+[GitHub prerelease](https://github.com/idvzchusvol/Relax/releases/tag/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3).
+The formal jobs used the recorded base plus the exact tracked patch and execution-time untracked tools. The
+published source snapshot reconstructs that checkout without unrelated local worktree files. Its equivalence
+manifest verifies that the production training files, exact recipe, dataset converter, backend tests, and
+argument tests are byte-identical to the clean reproduction-code commit.
 :::
 
-The prepared path-free main archive SHA256 is `7510d747a3f3371e52a84f19315fde5f7cc54c9438c5d30970fab4dec465c96c`. The separate 1,600-dump loss-mask source archive SHA256 is `521c554bb11b2c5891e72e103eb669286dbf7b1531903f7b258773deeaae28f3`.
+The [path-free main evidence archive](https://github.com/idvzchusvol/Relax/releases/download/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3/relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-evidence-v3.tar.zst) SHA256 is `e9e212f9b826a28cda463cdab6a96e61ca8b42d45ad0855060ba877a673b75db`. The [formal-run source snapshot](https://github.com/idvzchusvol/Relax/releases/download/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3/relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-formal-run-source-v3.tar.zst) SHA256 is `9ea4a1c5da317e640b41a48c7c637ee2f4c88ad018c5b260a1de4e574a257e28`. The separate [1,600-dump loss-mask source archive](https://github.com/idvzchusvol/Relax/releases/download/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3/relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-loss-mask-source-dumps.tar.zst) SHA256 is `521c554bb11b2c5891e72e103eb669286dbf7b1531903f7b258773deeaae28f3`.
+
+v3 publishes the actual `e0f560...` formal-run patch, both generations of post-processing tools under distinct hashes, and the independently verifiable source snapshot.
 
 The repository publishes the lightweight, path-free results used below:
 
@@ -168,14 +176,6 @@ The accuracy is pooled over all 3,200 responses in each run. Length means are po
 The exact token-pooled policy-reference KL was `0.31151` for GRPO and `0.16972` for Dr.GRPO over all 200 steps. The inference/training probability mismatch remained small: mean `train/train_rollout_prob_abs_diff` was `0.003474` for GRPO and `0.003470` for Dr.GRPO.
 
 Both jobs completed successfully without OOM, NCCL failure, NaN/Inf metrics, or a training traceback. Each run retained checkpoints at iterations 49, 99, 149, and 199. Checkpoints are operational recovery artifacts and are excluded from the public evidence bundle.
-
-## Limitations
-
-1. There is one stochastic run per algorithm. Differences in reward, accuracy, length, KL, or gradient norm are descriptive for this pair and do not establish statistical superiority.
-2. Training uses a fixed 256-prompt subset of GSM8K train, not the test split or a complete benchmark evaluation.
-3. `kl_loss_coef=0`, so reference KL is a diagnostic and does not contribute to the optimized objective.
-4. The run covers dense Qwen3.5-4B with CP1. Dr.GRPO currently rejects MoE models, non-policy losses, pure fully-async training, and `--normalize-advantages`.
-5. There were no fully masked responses or zero-token optimizer windows in these two formal runs; those boundaries are covered by focused regression tests instead.
 
 Within those limits, both algorithms completed the identical declared 200-step budget, the report uses exact training loss-mask counts, and the observed Dr.GRPO run had higher pooled accuracy and lower gradient norms than its GRPO control.
 

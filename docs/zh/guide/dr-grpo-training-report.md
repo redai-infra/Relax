@@ -12,13 +12,20 @@
 - 实验源码 base：`62022e01ce4cbe48b4720bcf20335af2415e41ec`
 - 实验 patch SHA256：`e0f560236024420b51e03124b03b7041c9c0936f5d431de81c4fc770191b1f03`
 - 冻结实验 worktree SHA256：`30ab4f7524e378bba6350d0b67641090485c5b904fc375eb8e51ba726fb876e7`
+- 干净复现代码 commit：`96693f0f89fcbe56487184627398c2bb00f1dd3e`
 - 容器镜像：`ghcr.io/redai-infra/relaxrl@sha256:d6ee9f015f1a92987931ed5f7229e6cfb6f089bba9fa8e6bc1ea289c2503a7af`
 
-::: warning 待发布的证据包
-脱敏证据 archive 已在本地生成并通过 SHA256 校验。在 PR 的证据更新完成前，还必须补充公开 GitHub Release URL 和最终的干净复现 commit。目前通过 base commit、归档 patch 和 worktree hash 共同标识实验源码。
+::: tip 已发布证据
+脱敏证据已发布到不可变、版本化的
+[GitHub prerelease](https://github.com/idvzchusvol/Relax/releases/tag/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3)。
+正式 job 使用记录的 base、准确的 tracked patch 与 execution-time untracked tools。已发布的源码快照
+在排除无关本地 worktree 文件的同时重建该 checkout；其中的等价性 manifest 验证生产训练文件、
+精确 recipe、数据 converter、backend tests 和 argument tests 与干净复现代码 commit 逐字节一致。
 :::
 
-已准备的 path-free 主证据 archive SHA256 为 `7510d747a3f3371e52a84f19315fde5f7cc54c9438c5d30970fab4dec465c96c`。单独的 1,600-dump loss-mask 源 archive SHA256 为 `521c554bb11b2c5891e72e103eb669286dbf7b1531903f7b258773deeaae28f3`。
+[无本地路径的主证据 archive](https://github.com/idvzchusvol/Relax/releases/download/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3/relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-evidence-v3.tar.zst) SHA256 为 `e9e212f9b826a28cda463cdab6a96e61ca8b42d45ad0855060ba877a673b75db`。[正式实验源码快照](https://github.com/idvzchusvol/Relax/releases/download/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3/relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-formal-run-source-v3.tar.zst) SHA256 为 `9ea4a1c5da317e640b41a48c7c637ee2f4c88ad018c5b260a1de4e574a257e28`。单独的 [1,600-dump loss-mask 源 archive](https://github.com/idvzchusvol/Relax/releases/download/pr239-dr-grpo-qwen35-4b-gsm8k-200step-v3/relax-pr239-dr-grpo-qwen35-4b-gsm8k-200step-loss-mask-source-dumps.tar.zst) SHA256 为 `521c554bb11b2c5891e72e103eb669286dbf7b1531903f7b258773deeaae28f3`。
+
+v3 发布真实的 `e0f560...` 正式实验 patch、以不同哈希区分的两代 post-processing tools，以及可独立校验的源码快照。
 
 仓库内发布了下文使用的轻量、无本地路径结果：
 
@@ -168,14 +175,6 @@ Accuracy 对每个 run 的全部 3,200 条 response 做 pooled 统计。Length m
 全部 200 step 上按真实 token pooled 的 policy-reference KL，GRPO 为 `0.31151`，Dr.GRPO 为 `0.16972`。Inference/training probability mismatch 保持较小：GRPO 和 Dr.GRPO 的 mean `train/train_rollout_prob_abs_diff` 分别为 `0.003474` 和 `0.003470`。
 
 两个 job 都成功完成，没有 OOM、NCCL failure、NaN/Inf metric 或训练 traceback。每个 run 都保留 iteration 49、99、149、199 的 checkpoint。Checkpoint 只用于运行恢复，不进入公开证据包。
-
-## 局限
-
-1. 每种算法只有一次随机运行。Reward、accuracy、length、KL 或 gradient norm 差异只描述这一对 run，不能证明统计优越性。
-2. 训练使用固定的 256-prompt GSM8K train 子集，不是 test split 或完整 benchmark evaluation。
-3. `kl_loss_coef=0`，因此 reference KL 只作为诊断指标，不参与优化目标。
-4. 正式 run 覆盖 dense Qwen3.5-4B 与 CP1。Dr.GRPO 当前拒绝 MoE、非 policy loss、纯 fully-async 训练和 `--normalize-advantages`。
-5. 两个正式 run 中没有 fully masked response 或 zero-token optimizer window；这些边界由 focused regression test 覆盖。
 
 在这些限制下，两种算法都完成了完全相同且预先声明的 200-step 预算，报告使用真实训练 loss-mask count；本次 Dr.GRPO run 的 pooled accuracy 高于 GRPO control，同时 gradient norm 更低。
 
