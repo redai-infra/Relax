@@ -1,4 +1,6 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Adapted from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ray/utils.py#L1
+import asyncio
 import os
 
 import ray
@@ -24,6 +26,56 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
     "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
 ]
+
+
+class TrainBatchRowCountTracker:
+    """Coordinate data-dependent train row counts across rollout steps.
+
+    A custom converter can produce a different number of rows per rollout.
+    Actor training may ask for step N before rollout generation for N has
+    finished, so counts must be keyed by rollout ID and waiters must be woken
+    on both success and failure.
+    """
+
+    def __init__(self, retained_rollouts: int = 2):
+        self._retained_rollouts = retained_rollouts
+        self._counts: dict[int, int] = {}
+        self._errors: dict[int, str] = {}
+        self._events: dict[int, asyncio.Event] = {}
+
+    def start(self, rollout_id: int) -> None:
+        """Reset one rollout without replacing an event held by a waiter."""
+        event = self._events.setdefault(rollout_id, asyncio.Event())
+        event.clear()
+        self._counts.pop(rollout_id, None)
+        self._errors.pop(rollout_id, None)
+        for stale_rollout_id in [key for key in self._events if key < rollout_id - self._retained_rollouts]:
+            self._events.pop(stale_rollout_id, None)
+            self._counts.pop(stale_rollout_id, None)
+            self._errors.pop(stale_rollout_id, None)
+
+    def complete(self, rollout_id: int, row_count: int) -> None:
+        """Publish a successful producer-side count and wake consumers."""
+        row_count = int(row_count)
+        if row_count <= 0:
+            raise ValueError(f"Expanded rollout produced an invalid train row count: {row_count}.")
+        self._counts[rollout_id] = row_count
+        self._events.setdefault(rollout_id, asyncio.Event()).set()
+
+    def fail(self, rollout_id: int, error: BaseException) -> None:
+        """Publish a generation/conversion failure so waiters cannot hang."""
+        self._errors[rollout_id] = f"{type(error).__name__}: {error}"
+        self._events.setdefault(rollout_id, asyncio.Event()).set()
+
+    async def wait(self, rollout_id: int) -> int:
+        """Wait for the exact count associated with ``rollout_id``."""
+        event = self._events.setdefault(rollout_id, asyncio.Event())
+        await event.wait()
+        if error := self._errors.get(rollout_id):
+            raise RuntimeError(f"Failed to determine train rows for rollout_id={rollout_id}: {error}")
+        if rollout_id not in self._counts:
+            raise RuntimeError(f"Train row count is unavailable for rollout_id={rollout_id}.")
+        return self._counts[rollout_id]
 
 
 def ray_noset_visible_devices(env_vars=os.environ):

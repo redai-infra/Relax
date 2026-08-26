@@ -1,0 +1,157 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Expand MemAgent trajectories into independent ReLax training samples."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from examples.mem_agent.contracts import require_strict_alignment
+from relax.utils.logging_utils import get_logger
+from relax.utils.types import Sample
+from relax.utils.utils import dict_to_tensordict, post_process_rewards
+
+
+logger = get_logger(__name__)
+
+
+def _get_turns(sample: Sample) -> list[dict[str, Any]]:
+    metadata = sample.train_metadata or {}
+    turns = metadata.get("mem_agent_turns", metadata.get("turns"))
+    if not isinstance(turns, list) or not turns:
+        raise ValueError(f"Sample index={sample.index} has no MemAgent turns.")
+    return turns
+
+
+def _validate_turn(args: Any, sample: Sample, turn: dict[str, Any]) -> None:
+    required = {"kind", "turn_index", "tokens", "response_length", "loss_mask", "rollout_log_probs", "finish_reason"}
+    missing = required.difference(turn)
+    if missing:
+        raise ValueError(f"Sample index={sample.index} turn is missing fields: {sorted(missing)}")
+    kind = turn["kind"]
+    if kind not in ("memory", "final"):
+        raise ValueError(f"Sample index={sample.index} has invalid turn kind={kind!r}.")
+    if turn["finish_reason"] not in (Sample.Status.COMPLETED.value, Sample.Status.TRUNCATED.value):
+        raise ValueError(f"Sample index={sample.index} has invalid finish_reason={turn['finish_reason']!r}.")
+    response_length = int(turn["response_length"])
+    if response_length <= 0 or len(turn["tokens"]) < response_length:
+        raise ValueError(f"Sample index={sample.index} has an invalid response_length.")
+    limit_name = "mem_agent_max_memory_tokens" if kind == "memory" else "mem_agent_max_final_tokens"
+    max_response_tokens = int(getattr(args, limit_name, 1024 if kind == "memory" else 256))
+    if response_length > max_response_tokens:
+        raise ValueError(
+            f"Sample index={sample.index} {kind} response_length={response_length} exceeds {max_response_tokens}."
+        )
+    if len(turn["loss_mask"]) != response_length:
+        raise ValueError(f"Sample index={sample.index} has a misaligned loss_mask.")
+    if len(turn["rollout_log_probs"]) != response_length:
+        raise ValueError(f"Sample index={sample.index} has misaligned rollout_log_probs.")
+
+
+def _validate_trajectory(args: Any, sample: Sample, turns: list[dict[str, Any]]) -> None:
+    """Require ordered memory turns followed by exactly one final turn."""
+    expected_indices = list(range(len(turns)))
+    actual_indices = [int(turn.get("turn_index", -1)) for turn in turns]
+    if actual_indices != expected_indices:
+        raise ValueError(
+            f"Sample index={sample.index} has non-contiguous turn indices: {actual_indices}, expected {expected_indices}."
+        )
+    kinds = [turn.get("kind") for turn in turns]
+    if kinds[-1] != "final" or any(kind != "memory" for kind in kinds[:-1]):
+        raise ValueError(f"Sample index={sample.index} must contain memory turns followed by exactly one final turn.")
+    for turn in turns:
+        _validate_turn(args, sample, turn)
+
+
+def convert_samples(args: Any, samples: list[Sample]):
+    """Normalize trajectory rewards first, then expand every saved turn."""
+    if not samples:
+        raise ValueError("MemAgent converter received an empty sample list.")
+    require_strict_alignment(args)
+    for sample in samples:
+        if sample.status in (Sample.Status.ABORTED, Sample.Status.FAILED):
+            raise ValueError(f"Cannot train from sample index={sample.index} with status={sample.status.value}.")
+
+    credit_assignment = getattr(args, "mem_agent_credit_assignment", "split")
+    if credit_assignment not in ("split", "share"):
+        raise ValueError("mem_agent_credit_assignment must be either 'split' or 'share'.")
+
+    # Every trajectory in one GRPO prompt group reads the same context, so it
+    # must have the same number of turns. Besides catching partial trajectories,
+    # this makes each expanded group n_samples_per_prompt * turn_count rows.
+    validated_turns: list[list[dict[str, Any]]] = []
+    turn_counts_by_group: dict[int, set[int]] = {}
+    for sample in samples:
+        if sample.group_index is None:
+            raise ValueError("MemAgent samples require group_index.")
+        turns = _get_turns(sample)
+        _validate_trajectory(args, sample, turns)
+        validated_turns.append(turns)
+        turn_counts_by_group.setdefault(sample.group_index, set()).add(len(turns))
+    inconsistent_groups = {
+        group_index: counts for group_index, counts in turn_counts_by_group.items() if len(counts) != 1
+    }
+    if inconsistent_groups:
+        raise ValueError(f"MemAgent prompt groups have inconsistent turn counts: {inconsistent_groups}")
+
+    # Normalize only after the full trajectory contract is known to be valid,
+    # while there is still exactly one row per trajectory. Expanding first
+    # would overweight long documents in the group statistics.
+    raw_rewards, advantages = post_process_rewards(args, samples)
+
+    train_data: dict[str, list[Any]] = {
+        "tokens": [],
+        "response_lengths": [],
+        "loss_masks": [],
+        "rollout_log_probs": [],
+        "rewards": [],
+        "raw_reward": [],
+        "truncated": [],
+        "sample_indices": [],
+        "trajectory_indices": [],
+        "turn_indices": [],
+        "total_lengths": [],
+    }
+
+    for trajectory_position, (sample, turns, raw_reward, advantage) in enumerate(
+        zip(samples, validated_turns, raw_rewards, advantages, strict=True)
+    ):
+        turn_credit = float(advantage) / len(turns) if credit_assignment == "split" else float(advantage)
+        # Expansion is lossless: every turn remains an independent row and no
+        # tail rows are trimmed merely to manufacture divisibility.
+        for fallback_turn_index, turn in enumerate(turns):
+            tokens = list(turn["tokens"])
+            response_length = int(turn["response_length"])
+            loss_mask = list(turn["loss_mask"])
+            if sample.remove_sample:
+                loss_mask = [0] * response_length
+            train_data["tokens"].append(tokens)
+            train_data["response_lengths"].append(response_length)
+            train_data["loss_masks"].append(loss_mask)
+            train_data["rollout_log_probs"].append(list(turn["rollout_log_probs"]))
+            train_data["rewards"].append(turn_credit)
+            train_data["raw_reward"].append(float(raw_reward))
+            train_data["truncated"].append(int(turn.get("finish_reason") == Sample.Status.TRUNCATED.value))
+            train_data["sample_indices"].append(sample.index)
+            train_data["trajectory_indices"].append(trajectory_position)
+            train_data["turn_indices"].append(int(turn.get("turn_index", fallback_turn_index)))
+            train_data["total_lengths"].append(len(tokens))
+
+    required_multiple = int(getattr(args, "mem_agent_train_rows_multiple", 1))
+    if required_multiple <= 0:
+        raise ValueError("mem_agent_train_rows_multiple must be positive.")
+    if len(train_data["tokens"]) % required_multiple:
+        raise ValueError(
+            f"Expanded MemAgent row count {len(train_data['tokens'])} is not divisible by "
+            f"mem_agent_train_rows_multiple={required_multiple}."
+        )
+
+    # One concise count line makes the GPU smoke invariant reviewable:
+    # saved turns and emitted train rows must be identical, with no tail trim.
+    logger.info(
+        f"Expanded MemAgent trajectories={len(samples)} saved_turns={sum(len(turns) for turns in validated_turns)} "
+        f"train_rows={len(train_data['tokens'])}"
+    )
+
+    if getattr(args, "debug_train_only", False):
+        return train_data
+    return dict_to_tensordict(train_data, len(train_data["tokens"]))

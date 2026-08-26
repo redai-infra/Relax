@@ -638,14 +638,28 @@ class MegatronTrainRayActor(TrainRayActor):
             if is_sft_mode(self.args):
                 batch_size = self.args.global_batch_size // dp_size
                 rollout_mini_local_sample_counts = None
+            elif getattr(self.args, "custom_train_expanded_batch", False):
+                batch_size = None
+                rollout_mini_local_sample_counts = None
             else:
                 plan = build_rollout_minibatch_plan(self.args, dp_size)
                 batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
                 rollout_mini_local_sample_counts = [
                     plan.mini_local_sample_request for _ in range(plan.num_rollout_minis)
                 ]
-            rollout_data = get_debug_data(self.args, rollout_id, batch_size, dp_rank=mpu.get_data_parallel_rank())
+            rollout_data = get_debug_data(
+                self.args,
+                rollout_id,
+                batch_size,
+                dp_rank=mpu.get_data_parallel_rank(),
+                dp_size=dp_size,
+            )
             post_process_rollout_data(self.args, rollout_data)
+            if getattr(self.args, "custom_train_expanded_batch", False):
+                # Debug dumps must preserve the same one-rollout boundary as
+                # online expanded batches; otherwise get_data_iterator may
+                # reinterpret turn rows as several fixed global batches.
+                rollout_mini_local_sample_counts = [len(rollout_data["total_lengths"])]
             if rollout_mini_local_sample_counts is not None:
                 if sum(rollout_mini_local_sample_counts) != len(rollout_data["total_lengths"]):
                     raise RuntimeError(
@@ -668,7 +682,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_rollout_minis = 1
             else:
                 dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-                if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
+                if getattr(self.args, "custom_train_expanded_batch", False):
+                    # The rollout-ID keyed getter waits until this exact
+                    # partition has been fully converted and transferred.
+                    expanded_rows = ray.get(self.rollout_manager.get_train_batch_row_count.remote(rollout_id))
+                    if expanded_rows % dp_size:
+                        raise RuntimeError(
+                            f"Expanded train row count {expanded_rows} must be divisible by dp_size={dp_size}."
+                        )
+                    batch_size = expanded_rows // dp_size
+                    num_rollout_minis = 1
+                    logger.info(
+                        f"Expanded train row contract rollout_id={rollout_id}: "
+                        f"transferred_global_rows={expanded_rows}, dp_size={dp_size}, local_rows={batch_size}"
+                    )
+                elif self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
                     dynamic_size = ray.get(self.rollout_manager.get_dynamic_global_batch_size.remote())
                     batch_size = dynamic_size // dp_size
                     num_rollout_minis = 1
@@ -721,6 +749,11 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"rollout mini batch local size mismatch for rollout_id={rollout_id}, "
                         f"batch_index={batch_index - 1}: expected {batch_size}, "
                         f"got {len(rollout_data['total_lengths'])}."
+                    )
+                if getattr(self.args, "custom_train_expanded_batch", False):
+                    logger.info(
+                        f"Consumed expanded train rows rollout_id={rollout_id}: "
+                        f"local_rows={len(rollout_data['total_lengths'])}, expected_local_rows={batch_size}"
                     )
                 rollout_mini_batches.append(rollout_data)
                 rollout_mini_batch_metas.append(batch_meta)
@@ -1263,7 +1296,13 @@ class MegatronTrainRayActor(TrainRayActor):
             # rollout mini windows.
             logger.info(f"start to get rollout_id: {rollout_id} data from debug rollout data for train_hybrid.")
             full_batch_size = plan.mini_local_sample_request * plan.num_rollout_minis
-            debug_data = get_debug_data(self.args, rollout_id, full_batch_size, dp_rank=mpu.get_data_parallel_rank())
+            debug_data = get_debug_data(
+                self.args,
+                rollout_id,
+                full_batch_size,
+                dp_rank=mpu.get_data_parallel_rank(),
+                dp_size=dp_size,
+            )
             post_process_rollout_data(self.args, debug_data)
             for sub_batch in self._split_rollout_batch(debug_data, plan.num_rollout_minis):
                 if len(sub_batch["total_lengths"]) != batch_size:

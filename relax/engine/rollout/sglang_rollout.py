@@ -822,6 +822,10 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
+    # Producer-side conversion is the source of truth for the number of train
+    # rows. MemAgent expands one trajectory into a variable number of turns, so
+    # the actor cannot derive this count from rollout_batch_size.
+    transferred_train_rows = 0
     batch_to_transfer = []
     aborted_samples = []
     # Completed groups beyond target_data_size (over-sampling surplus). Carried back to
@@ -1038,7 +1042,10 @@ async def generate_rollout_async(
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        transfer_results = await asyncio.gather(*transfer_tasks)
+        transferred_train_rows += sum(
+            row_count for destination_rollout_id, row_count in transfer_results if destination_rollout_id == rollout_id
+        )
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
@@ -1111,7 +1118,10 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                _, accepted_rows = await transfer_batch_to_data_system(
+                    args, accepted, len(accepted), rollout_id, data_system_client
+                )
+                transferred_train_rows += accepted_rows
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH
@@ -1140,7 +1150,14 @@ async def generate_rollout_async(
 
     state.reset()
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    train_row_count = None
+    if getattr(args, "custom_train_expanded_batch", False):
+        train_row_count = transferred_train_rows
+        # Retain the published metric key for external observers and return-shape
+        # compatibility. The structured field carries the control signal.
+        metrics["rollout/train_batch_row_count"] = transferred_train_rows
+    return RolloutFnTrainOutput(samples=data, metrics=metrics, train_row_count=train_row_count), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}

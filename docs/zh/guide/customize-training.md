@@ -207,6 +207,11 @@ generate.manages_inference_permit = True
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
 
+如果替换 `--rollout-function-path` 指向的更高层 rollout 函数，应返回
+`RolloutFnTrainOutput`。其中 `metrics` 只用于可观测性；若 rollout 开启
+`custom_train_expanded_batch`，且实际传输行数由 converter 动态展开决定，还必须把当前训练分区中
+实际写入的转换后行数填入 `train_row_count`。普通 1:1 rollout 应保持 `train_row_count=None`。
+
 ### 多轮 Rollout 的请求级并发调度
 
 默认情况下，`generate_and_rm` 会为整个自定义 `generate` 调用持有一把会话级并发锁（`GenerateState.semaphore`）——多轮 rollout 在环境/工具执行期间也一直占用名额，降低推理引擎利用率。
