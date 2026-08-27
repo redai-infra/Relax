@@ -2,6 +2,7 @@
 
 import importlib
 import logging
+import pickle
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -146,6 +147,72 @@ def _make_engine(sglang_engine_module):
     engine._router_worker_id = None
     engine._router_unregister_submitted = False
     return engine
+
+
+@pytest.mark.parametrize("routing_replay", [False, True])
+def test_scheduler_wrapper_applies_endpoint_patch_before_optional_routing_patch(
+    monkeypatch, sglang_engine_module, routing_replay
+):
+    events = []
+    endpoint_patch_module = ModuleType("relax.backends.sglang.deterministic_sampler_patch")
+    endpoint_patch_module.apply_deterministic_sampler_endpoint_patch = lambda: events.append("endpoint")
+    routing_patch_module = ModuleType("relax.backends.sglang.routing_replay_patch")
+    routing_patch_module.apply_patch = lambda: events.append("routing")
+    scheduler_module = ModuleType("sglang.srt.managers.scheduler")
+
+    def run_scheduler_process(*args, **kwargs):
+        events.append(("scheduler", args, kwargs))
+        return "finished"
+
+    scheduler_module.run_scheduler_process = run_scheduler_process
+    monkeypatch.setitem(sys.modules, endpoint_patch_module.__name__, endpoint_patch_module)
+    monkeypatch.setitem(sys.modules, routing_patch_module.__name__, routing_patch_module)
+    monkeypatch.setitem(sys.modules, scheduler_module.__name__, scheduler_module)
+    monkeypatch.setattr(
+        sglang_engine_module.Envs,
+        "RELAX_OPTIMIZE_ROUTING_REPLAY",
+        routing_replay,
+        raising=False,
+    )
+
+    assert sglang_engine_module._patched_run_scheduler_process("arg", key="value") == "finished"
+    expected = ["endpoint"]
+    if routing_replay:
+        expected.append("routing")
+    assert events[:-1] == expected
+    assert events[-1] == (("scheduler", ("arg",), {"key": "value"}))
+
+
+@pytest.mark.parametrize("routing_replay", [False, True])
+def test_launch_server_always_receives_picklable_scheduler_wrapper(monkeypatch, sglang_engine_module, routing_replay):
+    calls = []
+    http_server = ModuleType("sglang.srt.entrypoints.http_server")
+
+    def launch_server(server_args, **kwargs):
+        calls.append((server_args, kwargs))
+
+    http_server.launch_server = launch_server
+    monkeypatch.setitem(sys.modules, http_server.__name__, http_server)
+    monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PREEXPANDED_PATCH", False, raising=False)
+    monkeypatch.setattr(
+        sglang_engine_module.Envs,
+        "RELAX_OPTIMIZE_ROUTING_REPLAY",
+        routing_replay,
+        raising=False,
+    )
+    server_args = object()
+
+    sglang_engine_module._launch_server_with_patches(server_args)
+
+    assert calls == [
+        (
+            server_args,
+            {"run_scheduler_process_func": sglang_engine_module._patched_run_scheduler_process},
+        )
+    ]
+    assert pickle.loads(pickle.dumps(sglang_engine_module._patched_run_scheduler_process)).__name__ == (
+        "_patched_run_scheduler_process"
+    )
 
 
 def test_missing_load_format_choices_uses_legacy_remote(sglang_engine_module):
