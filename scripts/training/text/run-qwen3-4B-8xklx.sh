@@ -144,6 +144,7 @@ WANDB_ARGS=(
    # --wandb-mode ${WANDB_MODE:-offline}
    --disable-wandb-random-suffix
    --no-use-metrics-service
+   --no-use-tensorboard
 )
 
 MISC_ARGS=(

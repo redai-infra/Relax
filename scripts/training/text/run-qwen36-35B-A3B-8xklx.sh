@@ -166,6 +166,7 @@ WANDB_ARGS=(
    --wandb-key ${WANDB_API_KEY}
    --disable-wandb-random-suffix
    --no-use-metrics-service
+   --no-use-tensorboard
 )
 
 MISC_ARGS=(
