@@ -20,9 +20,8 @@ class OpsdWorker:
 
     @classmethod
     def from_args(cls, args) -> "OpsdWorker":
-        teacher_prompt_key = getattr(args, "opd_teacher_prompt_key", None)
         teacher_image_key = getattr(args, "opd_teacher_image_key", None)
-        return cls(is_opsd=teacher_prompt_key is not None or teacher_image_key is not None)
+        return cls(is_opsd=teacher_image_key is not None)
 
     async def build_teacher_inputs(self, args, sample: "Sample") -> None:
         """Pre-expand teacher inputs on the client (rollout) side.

@@ -1260,7 +1260,7 @@ def train_one_step(
             # already counted once. A `* cp_size` here would over-weight metrics by
             # CP degree under dynamic CP (and is a no-op under static CP, where the
             # count previously carried the cancelling cp factor).
-            loss_reduced[key] = value / num_samples_or_tokens
+            loss_reduced[key] = value / num_samples_or_tokens if num_samples_or_tokens != 0 else 0.0
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
     capture_hooks.end_step_for()

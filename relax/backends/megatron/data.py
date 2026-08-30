@@ -21,7 +21,7 @@ from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
-from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
+from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS, OPD_SAMPLE_MASK
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.flops_counter import FlopsCounter
@@ -291,6 +291,9 @@ def get_batch(
             batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
     else:
         batch, _ = next(data_iterator)
+
+    if getattr(get_args(), "use_opd", False):
+        _apply_opd_sample_mask(batch)
 
     use_dynamic_context_parallel = getattr(get_args(), "dynamic_context_parallel", False)
     if use_dynamic_context_parallel:
@@ -584,6 +587,28 @@ def get_batch(
 
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     return batch
+
+
+def _apply_opd_sample_mask(batch: dict) -> None:
+    """Fold the OPD sample mask into the per-sample response loss masks.
+
+    Inactive samples get an all-zero loss mask, so the standard loss reduction
+    (num_tokens / sum_of_sample_mean / CP slicing / metric counts) excludes
+    them from both the numerator and the denominator without any extra
+    plumbing.
+    """
+    sample_mask = batch.get(OPD_SAMPLE_MASK)
+    loss_masks = batch.get("loss_masks")
+    if sample_mask is None or loss_masks is None:
+        return
+    if len(sample_mask) != len(loss_masks):
+        raise ValueError(
+            f"{OPD_SAMPLE_MASK} must contain one scalar per sample: expected {len(loss_masks)}, got {len(sample_mask)}"
+        )
+    batch["loss_masks"] = [
+        torch.as_tensor(loss_mask, dtype=torch.float32) * float(mask)
+        for loss_mask, mask in zip(loss_masks, sample_mask, strict=True)
+    ]
 
 
 def gather_log_data(

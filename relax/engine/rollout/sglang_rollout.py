@@ -6,7 +6,7 @@ import copy
 import inspect
 import uuid
 from argparse import Namespace
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
 from time import monotonic
 from typing import Any
@@ -587,7 +587,7 @@ async def generate_and_rm(
             sample.reward = reward
 
         if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
+            await _record_feedback_and_prefill(state, samples, _encode_multimodal_inputs)
 
         return samples
     else:
@@ -598,7 +598,7 @@ async def generate_and_rm(
             sample.reward = await async_rm(args, sample)
 
         if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
+            await _record_feedback_and_prefill(state, [sample], _encode_multimodal_inputs)
 
     return sample
 
@@ -632,6 +632,21 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
         metrics["perf_detail/rollout/get_samples_time/mean"] = sum(get_samples_times) / len(get_samples_times)
 
     return metrics
+
+
+async def _record_feedback_and_prefill(
+    state: GenerateState,
+    group: list[Sample],
+    encode_multimodal_inputs: Callable[[dict], Awaitable[tuple[dict, float]]],
+) -> None:
+    """The shared OPD-family two-step: record env feedback, then build the
+    privileged teacher prompts, before the teacher prefill fetch."""
+    feedback = state.opd_manager.feedback
+    rewards = [sample.reward for sample in group]
+    for sample, reward in zip(group, rewards):
+        feedback.record_sample_feedback(sample, reward)
+    feedback.prepare_teacher_prompts(group, rewards)
+    await state.opd_manager.prefill(group, encode_multimodal_inputs)
 
 
 async def generate_and_rm_group(
@@ -678,7 +693,7 @@ async def generate_and_rm_group(
             sample.reward = reward
 
         if state.opd_manager and not evaluation:
-            await state.opd_manager.prefill(group, _encode_multimodal_inputs)
+            await _record_feedback_and_prefill(state, group, _encode_multimodal_inputs)
 
     return group
 

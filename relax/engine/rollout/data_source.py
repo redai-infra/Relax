@@ -67,6 +67,8 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
         teacher_mm_keys = {"image": _t_img}
         logger.info(f"OPSD: teacher_multimodal_keys = {teacher_mm_keys}")
 
+    teacher_prompt_key = (getattr(args, "opd_feedback_kwargs", None) or {}).get("teacher_prompt_key")
+
     if use_streaming:
         from relax.utils.data.streaming_dataset import StreamingDataset
 
@@ -101,7 +103,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             prefetch_num_workers=prefetch_num_workers,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
-            teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
+            teacher_prompt_key=teacher_prompt_key,
             teacher_multimodal_keys=teacher_mm_keys,
         )
     else:
@@ -123,7 +125,7 @@ def _create_dataset(args, tokenizer, processor, multimodal_config=None):
             seed=args.rollout_seed,
             multimodal_config=multimodal_config,
             custom_prompt_func=custom_prompt_func,
-            teacher_prompt_key=getattr(args, "opd_teacher_prompt_key", None),
+            teacher_prompt_key=teacher_prompt_key,
             teacher_multimodal_keys=teacher_mm_keys,
         )
 

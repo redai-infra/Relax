@@ -3,12 +3,14 @@
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from time import monotonic
 
 import aiohttp
 import numpy as np
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
+from relax.utils.opd.feedback import load_feedback
 from relax.utils.types import Sample
 
 
@@ -95,18 +97,21 @@ def _pick_teacher_url(args, sample=None) -> str:
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        self.feedback = load_feedback(
+            getattr(args, "opd_feedback_class", None), getattr(args, "opd_feedback_kwargs", None)
+        )
         self.topk_worker: opd_main_worker.TopkWorker | None = None
         self.sampled_worker: opd_main_worker.SampledTokenWorker | None = None  # 仅 student_sampled
         self.opsd_worker: opd_opsd_worker.OpsdWorker | None = None
+        opsd_worker = self.feedback.create_opsd_worker(args)
+        if opsd_worker.is_opsd:
+            self.opsd_worker = opsd_worker
 
         token_selection = args.opd_token_selection
         if token_selection != "student_sampled":
             self.topk_worker = opd_main_worker.TopkWorker.from_args(args)
         else:
             self.sampled_worker = opd_main_worker.SampledTokenWorker.from_args(args)
-
-        opsd_worker = opd_opsd_worker.OpsdWorker.from_args(args)
-        self.opsd_worker = opsd_worker if opsd_worker.is_opsd else None
 
     @property
     def is_topk(self) -> bool:
@@ -117,7 +122,7 @@ class OpdManager:
         return self.opsd_worker is not None
 
     def schema_opd_transfer_data(self) -> list[str]:
-        fields: list[str] = []
+        fields: list[str] = list(self.feedback.extra_transfer_schema())
         if self.topk_worker is not None:
             fields.extend(self.topk_worker.topk_transfer_fields())
         if self.sampled_worker is not None:
@@ -125,8 +130,9 @@ class OpdManager:
         return fields
 
     def produce_opd_transfer_data(self, samples: list[Sample], train_data: dict) -> None:
+        self.feedback.produce_extra_transfer(samples, train_data)
         if self.topk_worker is not None:
-            for field_name in opd_main_worker.TopkWorker.TRANSFER_FIELDS:
+            for field_name in self.topk_worker.topk_transfer_fields():
                 if not any(getattr(s, field_name, None) is not None for s in samples):
                     continue
                 flat: list = []
@@ -137,11 +143,6 @@ class OpdManager:
                     else:
                         flat.append(v.reshape(-1).tolist())
                 train_data[field_name] = flat
-            kl_field = opd_main_worker.TopkWorker.TRANSFER_K_LENGTHS
-            if self.topk_worker.spec.name == "union" and any(getattr(s, kl_field, None) is not None for s in samples):
-                train_data[kl_field] = [
-                    getattr(s, kl_field).tolist() if getattr(s, kl_field, None) is not None else [] for s in samples
-                ]
         elif self.sampled_worker is not None:
             train_data[opd_main_worker.SampledTokenWorker.TRANSFER_TEACHER_LOG_PROBS] = [
                 s.teacher_log_probs if s.teacher_log_probs is not None else [] for s in samples
@@ -161,7 +162,11 @@ class OpdManager:
         if val_b64 is None:
             return tokens, log_probs
         import numpy as np
-        import pybase64
+
+        try:
+            import pybase64
+        except ImportError:  # pragma: no cover - pybase64 is used in the runtime image
+            import base64 as pybase64
 
         val = np.frombuffer(pybase64.b64decode(val_b64), dtype=np.float32)
         idx_b64 = meta_info.get("output_token_logprobs_idx_b64")
@@ -197,18 +202,29 @@ class OpdManager:
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
         if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
+            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, sample) for sample in sample_list])
 
-        async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, fetch_results)
-
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
-                await asyncio.gather(
-                    *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
+        prefill_start = monotonic()
+        fetch_results: list[bool] = []
+        if sample_list:
+            async with _create_teacher_client_session(self.args) as session:
+                fetch_results = list(
+                    await asyncio.gather(*[self._teacher_prefill(sample, session) for sample in sample_list])
                 )
+                self._raise_if_all_failed(sample_list, fetch_results)
+
+                if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
+                    await asyncio.gather(
+                        *[self._student_prefill(sample, session, encode_multimodal_inputs) for sample in sample_list]
+                    )
 
         self._assemble_transfer(sample_list)
+        logger.info(
+            "OPD teacher prefill: requests=%d valid=%d elapsed=%.3fs",
+            len(sample_list),
+            sum(int(result is True) for result in fetch_results),
+            monotonic() - prefill_start,
+        )
 
     async def _post_logprob(
         self,
@@ -237,25 +253,23 @@ class OpdManager:
         return opd_main_worker.LogprobResponse(data)
 
     async def _teacher_prefill(self, sample: Sample, session: aiohttp.ClientSession) -> bool:
-        from relax.utils.opd.opd_utils import build_teacher_preexpanded_image_data
-
         response_length = int(sample.response_length or 0)
         if response_length <= 0:
             return True
 
-        # OPSD: expanded teacher_tokens + image_data；
         if self.opsd_worker is not None:
-            image_data = await build_teacher_preexpanded_image_data(sample)
+            image_data = self.opsd_worker.build_preexpanded_image_data(sample)
             teacher_input_ids = self.opsd_worker.teacher_input_ids(sample, response_length)
             prompt_length = self.opsd_worker.teacher_prompt_len(sample, response_length)
+            logprob_start_len = max(prompt_length - 1, 0)
         else:
             image_data = None
             teacher_input_ids = sample.rollout_tokens or sample.tokens
-            prompt_length = len(sample.tokens) - response_length
-        logprob_start_len = max(prompt_length - 1, 0)
+            logprob_start_len = max(len(sample.tokens) - response_length - 1, 0)
 
         mm_fields = {"image_data": image_data} if image_data is not None else None
         if self.topk_worker is not None:
+            self.feedback.check_student_topk_ids(sample, self.topk_worker.top_k)
             payload = self.topk_worker.build_teacher_payload(
                 input_ids=teacher_input_ids,
                 logprob_start_len=logprob_start_len,
@@ -361,6 +375,7 @@ class OpdManager:
                 teacher_at_student_lp=sample.teacher_at_student_topk_log_probs,
                 student_at_teacher_lp=sample.student_at_teacher_topk_log_probs,
             )
+            self.feedback.check_transfer_channels(sample, channels, self.topk_worker.top_k)
             sample.opd_topk_token_ids = channels.get(opd_main_worker.TopkWorker.TRANSFER_TOKEN_IDS)
             sample.opd_topk_student_log_probs = channels.get(opd_main_worker.TopkWorker.TRANSFER_STUDENT_LOG_PROBS)
             sample.opd_topk_teacher_log_probs = channels.get(opd_main_worker.TopkWorker.TRANSFER_TEACHER_LOG_PROBS)

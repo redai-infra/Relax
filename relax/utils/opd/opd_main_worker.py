@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import numpy as np
-import pybase64
+
+
+try:
+    import pybase64
+except ImportError:  # pragma: no cover - pybase64 is used in the runtime image
+    import base64 as pybase64
 
 
 @dataclass
@@ -39,17 +44,42 @@ class LogprobResponse:
         if top_k <= 0:
             return None
         val = self._b64_decode(self.meta.get(f"{prefix}_val_b64"), "float32")
-        n = val.size // top_k
-        if n <= 0:
+        if val.size:
+            n = val.size // top_k
+            if n <= 0:
+                return None
+            if response_length is None:
+                response_length = n
+            if response_length <= 0 or n < response_length:
+                return None
+            take = response_length * top_k
+            lps = val[-take:].reshape(response_length, top_k)
+            idx = self._b64_decode(self.meta.get(f"{prefix}_idx_b64"), "int32")
+            ids = idx[-take:].reshape(response_length, top_k) if idx.size >= take else None
+            return ids, lps
+
+        rows = self.meta.get(prefix)
+        if not isinstance(rows, list) or not rows:
             return None
         if response_length is None:
-            response_length = n
-        if response_length <= 0 or n < response_length:
+            response_length = len(rows)
+        if response_length <= 0 or len(rows) < response_length:
             return None
-        take = response_length * top_k
-        lps = val[-take:].reshape(response_length, top_k)
-        idx = self._b64_decode(self.meta.get(f"{prefix}_idx_b64"), "int32")
-        ids = idx[-take:].reshape(response_length, top_k) if idx.size >= take else None
+
+        selected_rows = rows[-response_length:]
+        if any(row is None or len(row) < top_k for row in selected_rows):
+            return None
+        try:
+            lps = np.asarray(
+                [[float(item[0]) for item in row[:top_k]] for row in selected_rows],
+                dtype=np.float32,
+            )
+            ids = np.asarray(
+                [[int(item[1]) for item in row[:top_k]] for row in selected_rows],
+                dtype=np.int32,
+            )
+        except (IndexError, TypeError, ValueError):
+            return None
         return ids, lps
 
     def base_logprobs_1d(self) -> np.ndarray | None:
@@ -101,7 +131,6 @@ class TopkWorker:
     TRANSFER_STUDENT_LOG_PROBS = "opd_topk_student_log_probs"
     # only union
     TRANSFER_K_LENGTHS = "opd_topk_ksz"
-    TRANSFER_FIELDS = (TRANSFER_TOKEN_IDS, TRANSFER_STUDENT_LOG_PROBS, TRANSFER_TEACHER_LOG_PROBS)
 
     def __init__(
         self,
@@ -120,7 +149,7 @@ class TopkWorker:
         self._teacher_prefill_tpl: dict = {}
         if self.spec.teacher_self_topk:
             self._teacher_prefill_tpl["top_logprobs_num"] = self.top_k
-        self._student_prefill_tpl: dict = {} if self.spec.student_at_teacher else {}
+        self._student_prefill_tpl: dict = {}
 
     @classmethod
     def from_args(cls, args) -> "TopkWorker":

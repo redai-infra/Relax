@@ -248,10 +248,12 @@ def dict_to_tensordict(
     if not data:
         return TensorDict({}, batch_size=0 if batch_size is None else batch_size, device=device)
 
-    def _nesting_depth(x):
-        if isinstance(x, list) and x:
-            return 1 + _nesting_depth(x[0])
-        return 0
+    def _nesting_depth(x, *, root: bool = True):
+        if not isinstance(x, list):
+            return 0
+        if not x:
+            return 0 if root else 1
+        return 1 + max(_nesting_depth(item, root=False) for item in x)
 
     def _scalar_dtype(sample) -> Optional[torch.dtype]:
         """Return an explicit dtype only for bool/float; None lets torch.tensor
@@ -267,8 +269,23 @@ def dict_to_tensordict(
         dtype = _scalar_dtype(lst[0])
         return torch.tensor(lst, dtype=dtype, device=device)
 
+    def _first_scalar(value):
+        if isinstance(value, list):
+            for item in value:
+                scalar = _first_scalar(item)
+                if scalar is not None:
+                    return scalar
+            return None
+        return value
+
     def _to_tensor_2d(lst):
-        dtype = _scalar_dtype(lst[0][0])
+        nonempty_row = next((row for row in lst if row), None)
+        if nonempty_row is None:
+            dtype = None
+        else:
+            dtype = _scalar_dtype(_first_scalar(nonempty_row))
+            if dtype is None:
+                dtype = torch.as_tensor(nonempty_row).dtype
         tensors = [torch.tensor(seq, dtype=dtype, device=device) for seq in lst]
         return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 

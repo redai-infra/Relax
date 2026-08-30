@@ -4,7 +4,7 @@
 
 import pytest
 
-from relax.utils.data.data_utils import build_messages, collect_message_multimodal_data
+from relax.utils.data.data_utils import build_messages, collect_message_multimodal_data, process_raw_sample
 
 
 @pytest.mark.parametrize(
@@ -75,3 +75,38 @@ def test_build_messages_uses_top_level_media_without_mutating_input():
     assert first_messages == second_messages
     assert first_messages[0]["content"][0] == {"type": "image", "image": "/data/image.png"}
     assert collect_message_multimodal_data(first_messages)["image"] == ["/data/image.png"]
+
+
+class _Tokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        return f"rendered:{messages[-1]['content']}"
+
+
+def test_process_raw_sample_surfaces_teacher_prompt_as_metadata():
+    sample = process_raw_sample(
+        {"text": "question", "teacher_text": "privileged question", "label": "answer"},
+        _Tokenizer(),
+        processor=None,
+        prompt_key="text",
+        label_key="label",
+        teacher_prompt_key="teacher_text",
+        apply_chat_template=True,
+    )
+
+    assert sample.teacher_prompt is None
+    assert sample.metadata["opd_teacher_prompt"] == "rendered:privileged question"
+
+
+def test_process_raw_sample_without_teacher_key_leaves_no_privilege_metadata():
+    sample = process_raw_sample(
+        {"text": "question", "label": "answer"},
+        _Tokenizer(),
+        processor=None,
+        prompt_key="text",
+        label_key="label",
+        teacher_prompt_key=None,
+        apply_chat_template=True,
+    )
+
+    assert sample.teacher_prompt is None
+    assert "opd_teacher_prompt" not in sample.metadata

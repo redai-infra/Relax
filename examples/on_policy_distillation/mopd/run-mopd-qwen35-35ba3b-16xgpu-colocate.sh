@@ -177,6 +177,7 @@ SGLANG_ARGS=(
    --sglang-max-running-requests 128
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup
+   --sglang-disable-cuda-graph
 )
 
 PARTIAL_ROLLOUT_ARGS=(

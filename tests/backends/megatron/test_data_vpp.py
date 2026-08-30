@@ -182,3 +182,57 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
     _, num_microbatches = data_module.get_data_iterator(args, object(), rollout_data)
 
     assert num_microbatches == [2, 2]
+
+
+def test_opd_sample_mask_gates_loss_masks_per_sample(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    batch = {
+        "loss_masks": [torch.ones(2), torch.ones(1), torch.ones(3), torch.ones(2)],
+        data_module.OPD_SAMPLE_MASK: [True, False, True, False],
+    }
+
+    data_module._apply_opd_sample_mask(batch)
+
+    assert torch.equal(batch["loss_masks"][0], torch.ones(2))
+    assert torch.equal(batch["loss_masks"][1], torch.zeros(1))
+    assert torch.equal(batch["loss_masks"][2], torch.ones(3))
+    assert torch.equal(batch["loss_masks"][3], torch.zeros(2))
+
+
+def test_opd_sample_mask_gates_loss_masks_after_microbatch_permutation(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    rollout_data = {
+        "total_lengths": [4, 3, 6, 5],
+        "loss_masks": [torch.ones(2), torch.ones(1), torch.ones(3), torch.ones(2)],
+        data_module.OPD_SAMPLE_MASK: [True, False, True, False],
+    }
+    iterator = data_module.DataIterator(rollout_data, micro_batch_indices=[[1], [0], [3], [2]])
+
+    for _ in range(4):
+        batch = iterator.get_next(["total_lengths", "loss_masks", data_module.OPD_SAMPLE_MASK])
+        data_module._apply_opd_sample_mask(batch)
+        for loss_mask, sample_mask in zip(batch["loss_masks"], batch[data_module.OPD_SAMPLE_MASK], strict=True):
+            assert torch.equal(
+                loss_mask, torch.zeros(loss_mask.numel()) if not sample_mask else torch.ones_like(loss_mask)
+            )
+
+
+def test_opd_sample_mask_leaves_ordinary_batch_untouched(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    batch = {"loss_masks": [torch.ones(2), torch.ones(1)]}
+
+    data_module._apply_opd_sample_mask(batch)
+
+    assert torch.equal(batch["loss_masks"][0], torch.ones(2))
+    assert torch.equal(batch["loss_masks"][1], torch.ones(1))
+
+
+def test_opd_sample_mask_rejects_length_mismatch(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    batch = {
+        "loss_masks": [torch.ones(2), torch.ones(1)],
+        data_module.OPD_SAMPLE_MASK: [True],
+    }
+
+    with pytest.raises(ValueError, match="one scalar per sample"):
+        data_module._apply_opd_sample_mask(batch)
