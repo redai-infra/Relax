@@ -47,9 +47,24 @@ def log_perf_data_raw(
         estimated_tflops, peak_tflops = flops_counter.estimate(
             batch_seqlens=seq_lens, delta_time=1.0, images_seqlens=images_seqlens, audio_seqlens=audio_seqlens
         )
+        actor_train_estimated_tflops = estimated_tflops
+        backward_skipped_seq_lens = getattr(timer_instance, "backward_skipped_seq_lens", None) or []
+        if backward_skipped_seq_lens:
+            backward_skipped_tflops, _ = flops_counter.estimate(
+                batch_seqlens=backward_skipped_seq_lens,
+                delta_time=1.0,
+            )
+            # The estimator models training as one forward plus two backward
+            # passes. Zero-advantage microbatches still run the full forward,
+            # so only the backward two-thirds should be removed.
+            actor_train_estimated_tflops -= 2 * backward_skipped_tflops / 3
+            backward_skipped_tokens = sum(backward_skipped_seq_lens)
+            log_dict["perf/actor_train_backward_skipped_tokens"] = backward_skipped_tokens
+            log_dict["perf/actor_train_backward_skipped_token_fraction"] = backward_skipped_tokens / sum(seq_lens)
         # estimated_tflops is total fwd+bwd TFLOPS at delta_time=1 => raw TFLOPS count
         # Normalize to per-GPU
         per_gpu_tflops = estimated_tflops / world_size
+        actor_train_per_gpu_tflops = actor_train_estimated_tflops / world_size
 
         if "perf/log_probs_time" in log_dict:
             # Forward only = fwd+bwd / 3
@@ -60,7 +75,7 @@ def log_perf_data_raw(
 
         if log_dict["perf/actor_train_time"] > 0:
             # Training includes fwd+bwd, use full 6N flops
-            log_dict["perf/actor_train_tflops"] = per_gpu_tflops / log_dict["perf/actor_train_time"]
+            log_dict["perf/actor_train_tflops"] = actor_train_per_gpu_tflops / log_dict["perf/actor_train_time"]
             log_dict["perf/actor_train_tok_per_s"] = sum(seq_lens) / log_dict["perf/actor_train_time"]
 
         # MFU = achieved_per_gpu_tflops / device_peak_tflops

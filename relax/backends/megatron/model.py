@@ -8,7 +8,7 @@ import string
 import uuid
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -37,7 +37,7 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
-from relax.utils.timer import timer
+from relax.utils.timer import Timer, timer
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
@@ -46,8 +46,8 @@ from relax.utils.training.ppo_utils import (
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import DataIterator, get_batch
-from .loss import loss_function
+from .data import _ZERO_EFFECTIVE_ADVANTAGE_KEY, DataIterator, get_batch
+from .loss import _SKIP_ZERO_ADVANTAGE_BACKWARD_KEY, loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 
@@ -1018,29 +1018,41 @@ def train_one_step(
             _opd_keys: list[str] = []
             if args.use_opd:
                 consume_opd_train_data(_opd_keys, args)
+            batch_keys = [
+                "tokens",
+                "multimodal_train_inputs",
+                "packed_seq_params",
+                "total_lengths",
+                "response_lengths",
+                "loss_masks",
+                "log_probs",
+                "ref_log_probs",
+                "values",
+                "advantages",
+                "returns",
+                "rollout_log_probs",
+                "max_seq_lens",
+                *_opd_keys,
+            ]
+            if getattr(args, "skip_zero_advantage_backward", False) and not return_schedule_plan:
+                batch_keys.append(_ZERO_EFFECTIVE_ADVANTAGE_KEY)
             batch = get_batch(
                 data_iterator,
-                [
-                    "tokens",
-                    "multimodal_train_inputs",
-                    "packed_seq_params",
-                    "total_lengths",
-                    "response_lengths",
-                    "loss_masks",
-                    "log_probs",
-                    "ref_log_probs",
-                    "values",
-                    "advantages",
-                    "returns",
-                    "rollout_log_probs",
-                    "max_seq_lens",
-                    *_opd_keys,
-                ],
+                batch_keys,
                 args.data_pad_size_multiplier,
                 args.qkv_format,
                 args.allgather_cp,
                 is_vl_model,
             )
+        skip_zero_advantage_backward = False
+        if getattr(args, "skip_zero_advantage_backward", False) and not return_schedule_plan:
+            zero_effective_advantages = batch.get(_ZERO_EFFECTIVE_ADVANTAGE_KEY)
+            if not isinstance(zero_effective_advantages, list) or not zero_effective_advantages:
+                raise RuntimeError("zero-advantage backward metadata is missing from the training micro-batch")
+            skip_zero_advantage_backward = all(zero_effective_advantages)
+        batch[_SKIP_ZERO_ADVANTAGE_BACKWARD_KEY] = skip_zero_advantage_backward
+        if skip_zero_advantage_backward:
+            Timer().backward_skipped_seq_lens.extend(batch["total_lengths"])
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1120,7 +1132,9 @@ def train_one_step(
                 ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
-                output_tensor = model(**forward_kwargs)
+                grad_context = torch.no_grad() if skip_zero_advantage_backward else nullcontext()
+                with grad_context:
+                    output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -1294,6 +1308,7 @@ def train(
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
     """
     args = get_args()
+    Timer().backward_skipped_seq_lens = []
     is_data_iterator = isinstance(data_iterator[0], DataIterator)
     if is_data_iterator:
         for iterator in data_iterator:

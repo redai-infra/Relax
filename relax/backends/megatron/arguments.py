@@ -126,6 +126,58 @@ def _validate_dynamic_context_parallel(args):
     args.max_seqlen_per_dp_cp_rank = args.max_tokens_per_gpu
 
 
+def _validate_skip_zero_advantage_backward(args) -> None:
+    if not getattr(args, "skip_zero_advantage_backward", False):
+        return
+
+    unsupported = []
+    if not getattr(args, "colocate", False) or getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        unsupported.append("synchronous colocate mode")
+    if getattr(args, "advantage_estimator", None) != "grpo":
+        unsupported.append("the GRPO advantage estimator")
+    if getattr(args, "use_critic", False):
+        unsupported.append("critic-free training")
+    if getattr(args, "critic_train_only", False):
+        unsupported.append("actor training")
+    if getattr(args, "loss_type", None) != "policy_loss":
+        unsupported.append("policy loss")
+    if getattr(args, "pipeline_model_parallel_size", 1) != 1:
+        unsupported.append("pipeline parallel size 1")
+    if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False):
+        unsupported.append("context parallel size 1")
+    if getattr(args, "expert_model_parallel_size", 1) != 1 or getattr(args, "num_experts", None) is not None:
+        unsupported.append("a dense model")
+    if getattr(args, "is_vl_model", False):
+        unsupported.append("a text model")
+    if getattr(args, "lora_rank", 0) > 0:
+        unsupported.append("non-LoRA training")
+    if getattr(args, "enable_mtp_training", False):
+        unsupported.append("MTP disabled")
+    if getattr(args, "overlap_grad_reduce", False):
+        unsupported.append("gradient-reduction overlap disabled")
+    if getattr(args, "entropy_coef", 0.0) != 0:
+        unsupported.append("zero entropy coefficient")
+    if getattr(args, "kl_loss_coef", 0.0) != 0:
+        unsupported.append("zero KL-loss coefficient")
+    if getattr(args, "use_kl_loss", False):
+        unsupported.append("KL loss disabled")
+    if getattr(args, "use_opd", False):
+        unsupported.append("OPD disabled")
+    if getattr(args, "custom_loss_function_path", None) is not None:
+        unsupported.append("the built-in policy loss")
+    if getattr(args, "custom_tis_function_path", None) is not None:
+        unsupported.append("the built-in TIS function")
+    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+        unsupported.append("the built-in policy-loss reducer")
+    if getattr(args, "custom_megatron_before_train_step_hook_path", None) is not None:
+        unsupported.append("no custom pre-train-step hook")
+    if getattr(args, "recompute_loss_function", False):
+        unsupported.append("loss-function recomputation disabled")
+
+    if unsupported:
+        raise ValueError("--skip-zero-advantage-backward currently requires " + ", ".join(unsupported) + ".")
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
@@ -172,6 +224,7 @@ def validate_args(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
+    _validate_skip_zero_advantage_backward(args)
     return args
 
 
@@ -215,6 +268,8 @@ def _hf_validate_args(args, hf_config):
     # RoPE kernel cannot handle this and produces numerically different results from the
     # unfused HF/SGLang implementation, causing training-inference log-prob mismatch.
     is_multimodal = hasattr(hf_config, "text_config") or hasattr(hf_config, "thinker_config")
+    if is_multimodal and getattr(args, "skip_zero_advantage_backward", False):
+        errors.append("--skip-zero-advantage-backward currently supports text-only models")
     if is_multimodal and getattr(args, "apply_rope_fusion", False):
         errors.append(
             "Multimodal models use multi-axis RoPE (list of tensors) which is incompatible "

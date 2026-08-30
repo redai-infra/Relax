@@ -46,6 +46,9 @@ from .cp_utils import (
 )
 
 
+_SKIP_ZERO_ADVANTAGE_BACKWARD_KEY = "__skip_zero_advantage_backward__"
+
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -1421,6 +1424,17 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    skip_zero_advantage_backward = bool(
+        getattr(args, "skip_zero_advantage_backward", False) and batch.get(_SKIP_ZERO_ADVANTAGE_BACKWARD_KEY, False)
+    )
+    if getattr(args, "skip_zero_advantage_backward", False):
+        metric_weight = num_tokens if args.calculate_per_token_loss else loss.new_tensor(num_samples)
+        log["zero_advantage_backward_fraction"] = metric_weight * float(skip_zero_advantage_backward)
+    if skip_zero_advantage_backward:
+        # Preserve the scalar loss and Megatron's backward schedule without retaining
+        # or traversing the model graph for this micro-batch.
+        loss = loss.detach().requires_grad_(True)
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding or all-masked). Without this, gradient doesn't flow through their attention

@@ -64,3 +64,34 @@ def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):
 
     assert logged_metrics["perf/device_peak_tflops"] == 100.0
     assert logged_metrics["perf/mfu/actor_train"] == 0.75
+
+
+def test_log_perf_data_raw_excludes_skipped_backward_flops(monkeypatch):
+    timer = FakeTimer()
+    timer.backward_skipped_seq_lens = [100]
+    flops_counter = Mock()
+    flops_counter.estimate.side_effect = [(300.0, 100.0), (90.0, 100.0)]
+    logged_metrics = {}
+
+    monkeypatch.setattr(train_metric_utils, "Timer", lambda: timer)
+    monkeypatch.setattr(
+        train_metric_utils.tracking_utils,
+        "log",
+        lambda _args, metrics, step_key: logged_metrics.update(metrics),
+    )
+
+    args = Namespace(wandb_always_use_train_step=False)
+    train_metric_utils.log_perf_data_raw(
+        rollout_id=3,
+        args=args,
+        is_primary_rank=True,
+        flops_counter=flops_counter,
+        world_size=2,
+    )
+
+    assert logged_metrics["perf/actor_train_tflops"] == 60.0
+    assert logged_metrics["perf/mfu/actor_train"] == 0.6
+    assert logged_metrics["perf/log_probs_tflops"] == 50.0
+    assert logged_metrics["perf/ref_log_probs_tflops"] == 50.0
+    assert logged_metrics["perf/actor_train_backward_skipped_tokens"] == 100
+    assert logged_metrics["perf/actor_train_backward_skipped_token_fraction"] == 1 / 3

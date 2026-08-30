@@ -90,6 +90,7 @@ from .data import (
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
+    prepare_zero_advantage_backward_metadata,
 )
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
@@ -182,6 +183,17 @@ class MegatronTrainRayActor(TrainRayActor):
         # reads model metadata or weights.
         # Leaf actor with private args, safe to remap in place.
         prepare_model_maybe_update_args(args)
+
+        if getattr(args, "skip_zero_advantage_backward", False):
+            # Re-check after model materialization so --skip-hf-validate and
+            # remote model sources cannot bypass the text-only boundary.
+            args.is_vl_model = any(
+                os.path.exists(os.path.join(args.hf_checkpoint, name))
+                for name in ("processor_config.json", "preprocessor_config.json")
+            )
+            from .arguments import _validate_skip_zero_advantage_backward
+
+            _validate_skip_zero_advantage_backward(args)
 
         self.genrm_manager = None
 
@@ -893,6 +905,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
+            if self.args.skip_zero_advantage_backward:
+                prepare_zero_advantage_backward_metadata(rollout_data)
+
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -930,12 +945,22 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         total_lengths = rollout_data["total_lengths"]
-        all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
-        dist.all_gather_object(
-            all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
-        )
-        all_total_lengths = sum(all_total_lengths, [])  # flatten
-        Timer().seq_lens = all_total_lengths
+        if getattr(self.args, "skip_zero_advantage_backward", False):
+            local_length_stats = (total_lengths, Timer().backward_skipped_seq_lens)
+            all_length_stats = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_length_stats,
+                local_length_stats,
+                group=mpu.get_data_parallel_group(with_context_parallel=False),
+            )
+            Timer().seq_lens = sum((stats[0] for stats in all_length_stats), [])
+            Timer().backward_skipped_seq_lens = sum((stats[1] for stats in all_length_stats), [])
+        else:
+            all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            dist.all_gather_object(
+                all_total_lengths, total_lengths, group=mpu.get_data_parallel_group(with_context_parallel=False)
+            )
+            Timer().seq_lens = sum(all_total_lengths, [])
         # Count supervised tokens (loss_mask==1) per sample. For SFT this is the
         # assistant-only tokens; for RL it's the response-only mask sum. Avoids
         # the SFT `response_length == total_length` convention (see data.py:296).
