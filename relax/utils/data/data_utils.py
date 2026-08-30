@@ -427,12 +427,16 @@ def process_raw_sample(
         build_messages_fn=build_messages,
     )
 
+    # The rendered teacher prompt is surfaced as raw metadata; OPSDFeedback owns
+    # the policy of assigning it to sample.teacher_prompt at rollout time.
+    if teacher_prompt_str is not None and isinstance(metadata, dict):
+        metadata["opd_teacher_prompt"] = teacher_prompt_str
+
     return Sample(
         prompt=output_prompt,
         label=data[label_key] if label_key is not None else None,
         metadata=metadata,
         multimodal_inputs=multimodal_inputs,
-        teacher_prompt=teacher_prompt_str,
         teacher_multimodal_inputs=teacher_multimodal_inputs,
     )
 

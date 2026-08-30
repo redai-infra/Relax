@@ -145,9 +145,14 @@ class RayTrainGroup:
         """Save actor model."""
         ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
 
-    def update_weights(self):
+    def update_weights(self, *, publish_sdpo_teacher_ema: bool = False):
         """Broadcast weights from rank 0 to all other ranks."""
-        ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+        ray.get(
+            [
+                actor.update_weights.remote(publish_sdpo_teacher_ema=publish_sdpo_teacher_ema)
+                for actor in self._actor_handlers
+            ]
+        )
 
     def update_weights_fully_async(self, rollout_id, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights in fully async mode (sends to rollout and

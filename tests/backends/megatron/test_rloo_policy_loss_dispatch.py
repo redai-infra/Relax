@@ -162,7 +162,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
 
     flat_mask = torch.cat(masks)
     expected_token_sum = -(advantages * log_probs * flat_mask).sum()
-    expected_num_tokens = flat_mask.sum()
+    expected_num_tokens = flat_mask.sum().to(torch.int)
     expected_final_loss = expected_token_sum / expected_num_tokens
     final_loss = token_sum_loss / normalizer
 

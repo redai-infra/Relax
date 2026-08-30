@@ -56,6 +56,7 @@ from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_onload_handle,
     consume_opd_train_data,
     has_managed_opd_teacher_manager,
+    is_sdpo_teacher_ema_enabled,
 )
 from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from relax.utils.replay import capture_hooks
@@ -249,6 +250,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # internally via _switch_model and pushes weights to rollout via
         # UpdateWeightFromTensor instead of DCS.
         use_tensor_backuper = not self.args.fully_async or self.args.hybrid
+        self._sdpo_teacher_ema_enabled = is_sdpo_teacher_ema_enabled(self.args)
+        self.actor_ema_weight_updater = None
+        self._sdpo_teacher_ema_engines_connected = False
         if use_tensor_backuper:
             self.weights_backuper = TensorBackuper.create(
                 source_getter=lambda: named_params_and_buffers(
@@ -261,6 +265,8 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             self._active_model_tag: str | None = "actor"
             self.weights_backuper.backup("actor")
+            if self._sdpo_teacher_ema_enabled:
+                self.weights_backuper.backup("actor_ema")
 
             if with_ref:
                 self.load_other_checkpoint("ref", args.ref_load)
@@ -302,6 +308,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 else self.args.model_name,
                 quantization_config=push_quant_config,
             )
+            if self._sdpo_teacher_ema_enabled:
+                if update_weight_cls is not UpdateWeightFromTensor:
+                    raise ValueError("SDPO EMA currently requires colocated tensor weight updates.")
+                self.actor_ema_weight_updater = update_weight_cls(
+                    self.args,
+                    self.model,
+                    weights_getter=lambda: self.weights_backuper.get("actor_ema"),
+                    model_name=type(self.hf_config).__name__.lower()
+                    if self.args.model_name is None
+                    else self.args.model_name,
+                    quantization_config=push_quant_config,
+                )
         else:
             is_pp_src_rank = (
                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -916,7 +934,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
-        self.weights_backuper.backup("actor")
+        self._snapshot_student_and_step_ema_teacher()
 
         # Update ref model if needed
         if (
@@ -978,7 +996,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.offload_train:
                 self.sleep()
             if has_rollout:
-                self.update_weights()
+                self.update_weights(publish_sdpo_teacher_ema=self._sdpo_teacher_ema_enabled)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
@@ -1298,8 +1316,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
                 if self.args.multimodal_keys is not None:
                     data_fields.append("multimodal_train_inputs")
-                if self.args.use_opd and self.args.opd_type == "sglang":
-                    data_fields.append("teacher_log_probs")
+                if self.args.use_opd:
+                    consume_opd_train_data(data_fields, self.args)
                 with timer("train_get_data"):
                     sub_batch, batch_meta = self._get_data_from_transfer_queue(
                         "train", rollout_id, data_fields, batch_size, batch_index
@@ -1388,7 +1406,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # Update CPU actor weight backup
-        self.weights_backuper.backup("actor")
+        self._snapshot_student_and_step_ema_teacher()
 
         # Update ref model if needed
         if (
@@ -1450,7 +1468,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._check_services_health()
 
         # Sync weights to rollout via UpdateWeightFromTensor (colocate mode)
-        self.update_weights()
+        self.update_weights(publish_sdpo_teacher_ema=self._sdpo_teacher_ema_enabled)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id, end_update_weight=True)
@@ -1618,8 +1636,50 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train and self._per_step_rollout:
             destroy_process_groups()
 
+    def _snapshot_student_and_step_ema_teacher(self) -> None:
+        self.weights_backuper.backup("actor")
+        if not getattr(self, "_sdpo_teacher_ema_enabled", False):
+            return
+        with timer("sdpo_teacher_ema_update"):
+            self.weights_backuper.ema(
+                source_tag="actor",
+                target_tag="actor_ema",
+                alpha=self.args.sdpo_teacher_ema_alpha,
+            )
+
+    def _publish_sdpo_teacher_ema(self) -> None:
+        if not getattr(self, "_sdpo_teacher_ema_enabled", False):
+            return
+        teacher_manager = getattr(self, "teacher_manager", None)
+        if teacher_manager is None:
+            if getattr(self.args, "debug_train_only", False):
+                return
+            raise RuntimeError("SDPO EMA requires a managed teacher manager on the actor.")
+        if isinstance(teacher_manager, list):
+            raise ValueError("SDPO EMA supports one managed teacher manager, not MOPD routes.")
+        if self.actor_ema_weight_updater is None:
+            raise RuntimeError("SDPO EMA weight updater was not initialized.")
+
+        if not self._sdpo_teacher_ema_engines_connected:
+            engines, engine_lock, engine_gpu_counts, engine_gpu_offsets = ray.get(
+                teacher_manager.get_weight_update_engines_and_lock.remote()
+            )
+            if not engines:
+                raise RuntimeError("SDPO EMA teacher manager returned no engines.")
+            self.actor_ema_weight_updater.connect_rollout_engines(
+                engines,
+                engine_lock,
+                engine_gpu_counts=engine_gpu_counts,
+                engine_gpu_offsets=engine_gpu_offsets,
+            )
+            dist.barrier(group=get_gloo_group())
+            self._sdpo_teacher_ema_engines_connected = True
+
+        with timer("sdpo_teacher_ema_publish"):
+            self.actor_ema_weight_updater.update_weights()
+
     @timer
-    def update_weights(self) -> None:
+    def update_weights(self, publish_sdpo_teacher_ema: bool = False) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
@@ -1674,6 +1734,9 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
+
+            if publish_sdpo_teacher_ema:
+                self._publish_sdpo_teacher_ema()
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)

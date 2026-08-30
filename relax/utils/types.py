@@ -43,6 +43,7 @@ class Sample:
     opd_topk_student_log_probs: list[np.ndarray] | None = None
     opd_topk_teacher_log_probs: list[np.ndarray] | None = None
     opd_topk_ksz: np.ndarray | None = None  # [only union]
+    opd_sample_mask: bool | None = None
 
     teacher_prompt: str | list[dict[str, str]] | None = None
     teacher_multimodal_inputs: dict[str, Any] | None = None
@@ -212,7 +213,7 @@ class ParamInfo:
 # A dict-based batch produced along the rollout -> training path
 # In Megatron backend, several fields are converted to torch.Tensor lists on GPU
 # before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
-RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
+RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[bool] | list[str]]
 
 SFTBatch = dict[str, list[torch.Tensor] | list[int] | list[str] | dict | None]
 """SFT 训练 batch 的 dict alias。

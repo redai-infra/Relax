@@ -16,7 +16,7 @@ from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrie
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import is_sft_mode, sft_partition_id, sft_task_name
 from relax.utils.async_utils import run
-from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
+from relax.utils.opd.opd_utils import is_sdpo_teacher_ema_enabled, set_managed_opd_teacher_on_train_group
 
 
 app = FastAPI()
@@ -119,7 +119,7 @@ class Actor(Base):
         # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
         # fires on the first real `update_weights` instead.
         if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
-            self.actor_model.update_weights()
+            self.actor_model.update_weights(publish_sdpo_teacher_ema=is_sdpo_teacher_ema_enabled(self.config))
 
     def set_barriers(
         self,

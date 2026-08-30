@@ -97,16 +97,16 @@ def _opd_args() -> SimpleNamespace:
         use_opd=True,
         opd_kl_coef=1.0,
         opd_loss_coef=0.0,
-        opd_teacher_prompt_key=None,
+        calculate_per_token_loss=True,
+        opd_feedback_class="relax.utils.opd.feedback.OPDFeedback",
+        opd_feedback_kwargs=None,
         opd_teacher_image_key=None,
         opd_teacher_video_key=None,
         opd_teacher_audio_key=None,
         multimodal_keys=None,
         opd_per_token_clip=None,
         opd_is_clip=None,
-        opd_mask_on_success=False,
         opd_only_reward=False,
-        opd_log_prob_dump_dir=None,
         opd_type="sglang",
         opd_teacher_load=None,
         teacher_hf_checkpoint="/teacher",
@@ -170,6 +170,7 @@ def _opd_args() -> SimpleNamespace:
         rollout_max_context_len=None,
         rollout_max_prompt_len=None,
         qkv_format="sbhd",
+        allgather_cp=False,
         train_backend="megatron",
         only_train_params_name_list=None,
         freeze_params_name_list=None,
@@ -192,6 +193,131 @@ def test_opd_sampled_token_loss_is_accepted(arguments_module):
     # student_sampled + loss mode is supported via the 1D reverse-KL path
     # (see compute_policy_opd_loss); validation must not reject it.
     arguments_module.slime_validate_args(args)
+
+
+def test_opd_jsd_help_describes_existing_alpha(arguments_module):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    help_text = next(action.help for action in parser._actions if action.dest == "opd_jsd_alpha")
+
+    assert "Mixture coefficient" in help_text
+
+
+def _configure_sdpo_ema(args):
+    args.group_rm = True
+    args.opd_feedback_class = "relax.utils.opd.sdpo.feedback.GoldenAnswerSDPOFeedback"
+    args.opd_token_selection = "student_topk"
+    args.opd_log_prob_top_k = 2
+    args.opd_kl_coef = 0.0
+    args.opd_loss_coef = 1.0
+    args.colocate = True
+    args.sdpo_teacher_update_mode = "ema"
+    args.sdpo_teacher_ema_alpha = 0.01
+    args.enable_weights_backuper = True
+    return args
+
+
+def test_sdpo_ema_accepts_managed_colocated_teacher(arguments_module):
+    args = _configure_sdpo_ema(_opd_args())
+
+    arguments_module.slime_validate_args(args)
+
+
+def test_sdpo_ema_does_not_require_loss_mode(arguments_module):
+    args = _configure_sdpo_ema(_opd_args())
+
+    arguments_module.slime_validate_args(args)
+
+
+def test_sdpo_ema_rejects_when_opd_is_disabled(arguments_module):
+    args = _configure_sdpo_ema(_opd_args())
+    args.use_opd = False
+
+    with pytest.raises(ValueError, match="requires --use-opd"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_sdpo_ema_rejects_external_teacher(arguments_module):
+    args = _configure_sdpo_ema(_opd_args())
+    args.teacher_hf_checkpoint = None
+    args.opd_teacher_url = "http://teacher/generate"
+
+    with pytest.raises(ValueError, match="managed single teacher"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_sdpo_ema_rejects_mopd_routes(arguments_module):
+    args = _configure_sdpo_ema(_opd_args())
+    args.opd_teacher_routes = '{"math":"/teacher"}'
+
+    with pytest.raises(ValueError, match="MOPD"):
+        arguments_module.slime_validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("fully_async", True, "fully asynchronous"),
+        ("hybrid", True, "hybrid"),
+        ("lora_rank", 8, "LoRA"),
+    ],
+)
+def test_sdpo_ema_rejects_unsupported_execution_modes(arguments_module, field_name, value, message):
+    args = _configure_sdpo_ema(_opd_args())
+    setattr(args, field_name, value)
+
+    with pytest.raises(ValueError, match=message):
+        arguments_module.slime_validate_args(args)
+
+
+def test_sdpo_ema_auto_enables_weights_backuper(arguments_module):
+    args = _configure_sdpo_ema(_opd_args())
+    args.enable_weights_backuper = False
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.enable_weights_backuper is True
+
+
+@pytest.mark.parametrize("alpha", [0.0, -0.1, 1.1])
+def test_sdpo_ema_rejects_invalid_alpha(arguments_module, alpha):
+    args = _configure_sdpo_ema(_opd_args())
+    args.sdpo_teacher_ema_alpha = alpha
+
+    with pytest.raises(ValueError, match="sdpo-teacher-ema-alpha"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_topk_opd_rejects_allgather_context_parallel(arguments_module):
+    args = _opd_args()
+    args.opd_token_selection = "student_topk"
+    args.opd_log_prob_top_k = 2
+    args.allgather_cp = True
+
+    with pytest.raises(ValueError, match="not compatible with --allgather-cp"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_topk_opd_rejects_context_parallelism(arguments_module):
+    args = _opd_args()
+    args.opd_token_selection = "student_topk"
+    args.opd_log_prob_top_k = 2
+    args.context_parallel_size = 2
+
+    with pytest.raises(ValueError, match="not compatible with context parallelism"):
+        arguments_module.slime_validate_args(args)
+
+
+def test_topk_opd_rejects_dynamic_context_parallel(arguments_module):
+    args = _opd_args()
+    args.opd_token_selection = "student_topk"
+    args.opd_log_prob_top_k = 2
+    args.dynamic_context_parallel = True
+
+    with pytest.raises(ValueError, match="not compatible with context parallelism"):
+        arguments_module.slime_validate_args(args)
 
 
 def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments_module):

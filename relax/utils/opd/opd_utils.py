@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 
 from relax.utils.logging_utils import get_logger
-from relax.utils.opd import opd_opsd_worker
 
 
 if TYPE_CHECKING:
@@ -20,6 +19,8 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+
+PREEXPANDED_RAW_FORMAT = "opd_preexpanded_raw"
 
 OPD_TOKEN_SELECTIONS = ("student_sampled", "student_topk", "teacher_topk", "union")
 OPD_KL_TYPES = ("reverse_kl", "forward_kl", "low_var_kl", "jsd")
@@ -34,6 +35,7 @@ OPD_ROLLOUT_LOG_SKIP_FIELDS = frozenset(
 )
 
 OPD_CP_FLOAT_FIELDS = ("teacher_log_probs",)
+OPD_SAMPLE_MASK = "opd_sample_mask"
 
 
 def iter_opd_cp_float_fields() -> tuple[str, ...]:
@@ -81,6 +83,24 @@ def is_managed_opd_teacher_colocate(args: Any) -> bool:
         and not getattr(args, "hybrid", False)
         and "actor" in args.resource
         and "rollout" in args.resource
+    )
+
+
+def is_sdpo_teacher_ema_enabled(args: Any) -> bool:
+    feedback_class = getattr(args, "opd_feedback_class", None)
+    is_sdpo = False
+    if feedback_class:
+        try:
+            from relax.utils.opd.feedback import load_feedback_class
+
+            is_sdpo = bool(getattr(load_feedback_class(feedback_class), "is_sdpo_feedback", False))
+        except (ImportError, TypeError, ValueError):
+            is_sdpo = False
+    return (
+        getattr(args, "use_opd", False)
+        and getattr(args, "sdpo_teacher_update_mode", "static") == "ema"
+        and getattr(args, "group_rm", False)
+        and is_sdpo
     )
 
 
@@ -489,6 +509,19 @@ def add_opd_arguments(parser: Any) -> Any:
         default=0.0,
         help=("On-policy distillation KL coefficient, Default 0.0."),
     )
+    parser.add_argument(
+        "--sdpo-teacher-update-mode",
+        type=str,
+        choices=("static", "ema"),
+        default="static",
+        help="SDPO teacher update mode. 'static' keeps the initial teacher; 'ema' updates it after each actor step.",
+    )
+    parser.add_argument(
+        "--sdpo-teacher-ema-alpha",
+        type=float,
+        default=0.01,
+        help="EMA mixing rate for the new actor weights in SDPO EMA mode. Must be in (0, 1].",
+    )
 
     parser.add_argument(
         "--opd-only-reward",
@@ -596,7 +629,11 @@ def add_opd_arguments(parser: Any) -> Any:
         "--opd-jsd-alpha",
         type=float,
         default=0.5,
-        help="Mixture coefficient for --opd-kl-type=jsd. 0.0 reduces to reverse_kl, 1.0 to forward_kl.",
+        help=(
+            "Mixture coefficient for --opd-kl-type=jsd. Ordinary OPD uses alpha=0 for "
+            "KL(student||teacher) and alpha=1 for KL(teacher||student); SDPO uses the same "
+            "endpoint convention."
+        ),
     )
     parser.add_argument(
         "--opd-norm-mode",
@@ -630,10 +667,24 @@ def add_opd_arguments(parser: Any) -> Any:
         help=("Which token set the OPD KL signal is computed on."),
     )
     parser.add_argument(
-        "--opd-teacher-prompt-key",
+        "--opd-feedback-class",
         type=str,
         default=None,
-        help=("Dataset field name that holds the teacher-side prompt for On-Policy Self-Distillation (OPSD). "),
+        help=(
+            "Fully qualified EnvironmentFeedback class binding an OPD-flavored algorithm "
+            "(OPSD / SDPO) to the shared rollout path. Defaults to "
+            "relax.utils.opd.feedback.OPDFeedback."
+        ),
+    )
+    parser.add_argument(
+        "--opd-feedback-kwargs",
+        type=json.loads,
+        default=None,
+        help=(
+            "JSON string of constructor parameters for --opd-feedback-class, e.g. "
+            '\'{"teacher_prompt_key": "teacher_prompt"}\' for OPSDFeedback or '
+            "'{\"success_reward_threshold\": 0.8}' for SDPOFeedback."
+        ),
     )
     parser.add_argument(
         "--opd-teacher-image-key",
@@ -682,10 +733,21 @@ def add_opd_arguments(parser: Any) -> Any:
 
 def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> None:
     if is_sft:
+        if getattr(args, "sdpo_teacher_update_mode", "static") == "ema":
+            raise ValueError("SDPO EMA is only available for on-policy RL training, not SFT.")
         return
 
+    if getattr(args, "sdpo_teacher_update_mode", "static") == "ema" and not getattr(args, "use_opd", False):
+        raise ValueError("--sdpo-teacher-update-mode=ema requires --use-opd.")
     if not getattr(args, "use_opd", False):
         return
+
+    from relax.utils.opd.feedback import load_feedback
+
+    load_feedback(
+        getattr(args, "opd_feedback_class", None),
+        getattr(args, "opd_feedback_kwargs", None),
+    ).validate_launch_args(args)
 
     # OPD is enabled here. Backfill the routing key so teacher routing AND the
     # per-source metrics (compute_mopd_metrics) get a consistent value even when
@@ -704,6 +766,62 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
     if token_selection != "student_sampled":
         if args.opd_log_prob_top_k <= 0:
             raise ValueError(f"--opd-token-selection={token_selection} requires --opd-log-prob-top-k > 0 ")
+        if getattr(args, "allgather_cp", False):
+            raise ValueError(
+                "OPD Top-K token selection is not compatible with --allgather-cp; "
+                "use the standard zig-zag context-parallel layout."
+            )
+        if getattr(args, "context_parallel_size", 1) > 1 or getattr(args, "dynamic_context_parallel", False):
+            raise ValueError(
+                "OPD Top-K token selection is not compatible with context parallelism; "
+                "use --context-parallel-size 1 without --dynamic-context-parallel, "
+                "or --opd-token-selection=student_sampled."
+            )
+
+    teacher_update_mode = getattr(args, "sdpo_teacher_update_mode", "static")
+    if teacher_update_mode not in ("static", "ema"):
+        raise ValueError(f"--sdpo-teacher-update-mode must be 'static' or 'ema', got {teacher_update_mode!r}.")
+    if teacher_update_mode == "ema":
+        try:
+            valid_ema_alpha = 0 < float(getattr(args, "sdpo_teacher_ema_alpha", 0.01)) <= 1
+        except (TypeError, ValueError):
+            valid_ema_alpha = False
+        if not valid_ema_alpha:
+            raise ValueError(
+                f"--sdpo-teacher-ema-alpha must be in (0, 1], got {getattr(args, 'sdpo_teacher_ema_alpha', None)}."
+            )
+        if not is_sdpo_teacher_ema_enabled(args):
+            raise ValueError("SDPO EMA requires --group-rm and an SDPO feedback class.")
+        if getattr(args, "teacher_hf_checkpoint", None) is None:
+            raise ValueError(
+                "--sdpo-teacher-update-mode=ema requires a managed single teacher via --teacher-hf-checkpoint."
+            )
+        if getattr(args, "opd_teacher_routes", None) is not None:
+            raise ValueError("SDPO EMA does not support --opd-teacher-routes/MOPD.")
+        if getattr(args, "opd_teacher_url", None) is not None:
+            raise ValueError("SDPO EMA does not support an external --opd-teacher-url teacher.")
+        if not getattr(args, "colocate", False):
+            raise ValueError("SDPO EMA currently requires --colocate with a managed teacher.")
+        if getattr(args, "hybrid", False):
+            raise ValueError("SDPO EMA does not support --hybrid mode.")
+        if getattr(args, "fully_async", False):
+            raise ValueError("SDPO EMA does not support fully asynchronous training.")
+        if getattr(args, "train_backend", "megatron") != "megatron":
+            raise ValueError("SDPO EMA currently requires the Megatron training backend.")
+        resource = getattr(args, "resource", None)
+        if not isinstance(resource, dict) or "teacher" not in resource:
+            raise ValueError("SDPO EMA requires a managed teacher resource entry.")
+        if not is_managed_opd_teacher_colocate(args):
+            raise ValueError(
+                "SDPO EMA requires a single Relax-managed colocated SGLang teacher with actor and rollout resources."
+            )
+        # SDPO EMA needs the multi-tag backuper (actor + actor_ema snapshots);
+        # force it on so users do not have to opt in explicitly.
+        args.enable_weights_backuper = True
+        from relax.utils.megatron_peft_utils import is_lora_enabled
+
+        if is_lora_enabled(args):
+            raise ValueError("SDPO EMA currently supports full-model training only; LoRA is not supported.")
 
     kl_type = args.opd_kl_type
     if token_selection == "student_sampled" and kl_type not in ("reverse_kl", "low_var_kl"):
@@ -725,14 +843,6 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
             "Use --opd-kl-coef=X --opd-loss-coef=0.0 for advantage mode, or "
             "--opd-kl-coef=0.0 --opd-loss-coef=X for loss mode."
         )
-
-    if getattr(args, "opd_teacher_prompt_key", None) is not None:
-        if args.opd_type != "sglang":
-            raise ValueError(
-                "--opd-teacher-prompt-key currently only supports --opd-type=sglang "
-                f"(got --opd-type={args.opd_type}). The megatron teacher path does not "
-                "yet rebuild a teacher-side data_iterator from teacher_tokens."
-            )
 
     if getattr(args, "opd_teacher_image_key", None) is not None:
         if args.opd_type != "sglang":
@@ -860,26 +970,6 @@ async def _encode_images_b64(raw_images: list, cache_key: str, mm_dict: dict | N
     return cached
 
 
-async def build_teacher_preexpanded_image_data(sample: "Sample") -> list | None:
-    """Build image_data for the teacher forward request (OPSD path).
-
-    Ships raw base64 images + teacher image_grid_thw via
-    format=opd_preexpanded_raw. Returns None when there are no images (text-
-    only path).
-    """
-    image_b64_list = getattr(sample, "teacher_image_b64_list", None)
-    image_grid_thw = getattr(sample, "teacher_image_grid_thw", None)
-    if not image_b64_list or image_grid_thw is None:
-        return None
-    return [
-        {
-            "format": opd_opsd_worker.PREEXPANDED_RAW_FORMAT,
-            "images_b64": list(image_b64_list),
-            "image_grid_thw": _to_jsonable(image_grid_thw),
-        }
-    ]
-
-
 async def build_student_preexpanded_image_data(sample: "Sample") -> list | None:
     """Build image_data for the student extra forward request (student-at-
     teacher-topk).
@@ -897,7 +987,7 @@ async def build_student_preexpanded_image_data(sample: "Sample") -> list | None:
     cached = await _encode_images_b64(raw_images, "_student_image_b64_cache", student_mm_in)
     return [
         {
-            "format": opd_opsd_worker.PREEXPANDED_RAW_FORMAT,
+            "format": PREEXPANDED_RAW_FORMAT,
             "images_b64": cached,
             "image_grid_thw": _to_jsonable(image_grid_thw),
         }
@@ -913,7 +1003,9 @@ def _get_opd_transfer_schema(args: Namespace) -> list[str]:
 def consume_opd_train_data(data_fields: list[str], args: Namespace) -> None:
     if not (getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"):
         return
-    data_fields.extend(_get_opd_transfer_schema(args))
+    for field_name in _get_opd_transfer_schema(args):
+        if field_name not in data_fields:
+            data_fields.append(field_name)
 
 
 def consume_opd_advantage_data(data_fields: list[str], args: Namespace) -> None:
@@ -1056,9 +1148,9 @@ def compute_log_probs_on_topk_token_ids(
     logsumexp = logits_max + exp_sum.log()  # [S, 1]
 
     # === Step 2: vocab-parallel gather of logits at topk_token_ids ===
-    from megatron.core import mpu
-
     if process_group is not None:
+        from megatron.core import mpu
+
         tp_world_size = mpu.get_tensor_model_parallel_world_size()
         tp_rank = mpu.get_tensor_model_parallel_rank()
     else:
@@ -1069,6 +1161,12 @@ def compute_log_probs_on_topk_token_ids(
     vocab_end = vocab_start + vocab_size_per_rank
 
     ids = topk_token_ids.to(device=logits.device, dtype=torch.long)  # [S, K]
+    global_vocab_size = vocab_size_per_rank * tp_world_size
+    if torch.any(ids >= global_vocab_size):
+        raise ValueError(
+            f"Top-K token ids must be below the global vocabulary size {global_vocab_size}; "
+            f"got max id {int(ids.max().detach().cpu())}."
+        )
     invalid = ids < 0
     safe_ids = ids.clamp(min=0)
     in_range = (safe_ids >= vocab_start) & (safe_ids < vocab_end)
@@ -1117,6 +1215,9 @@ def compute_opd_kl(
     positions are set to ``-inf`` after clamp (so ``logsumexp`` ignores them)
     and their contributions are zeroed before ``.sum(dim=-1)``. ``None`` (topk
     path with fixed K) skips all masking — behavior unchanged.
+
+    For ordinary OPD, JSD ``alpha=0`` and ``alpha=1`` are explicit endpoint
+    aliases for ``KL(student || teacher)`` and ``KL(teacher || student)``.
     """
     s = student_log_probs.float()
     t = teacher_log_probs.float()
@@ -1140,6 +1241,8 @@ def compute_opd_kl(
         if not (0.0 <= jsd_alpha <= 1.0):
             raise ValueError(f"jsd_alpha must be in [0, 1], got {jsd_alpha}")
 
+        distribution_mask = mask
+
         def _add_tail(lp: torch.Tensor) -> torch.Tensor:
             log_s = torch.logsumexp(lp, dim=-1, keepdim=True).clamp(max=-1e-7)
             tail = torch.log(-torch.expm1(log_s))
@@ -1158,16 +1261,16 @@ def compute_opd_kl(
             s_t = s
             t_t = t
 
-        K_orig = mask.size(-1) if mask is not None else s_t.size(-1)
+        K_orig = distribution_mask.size(-1) if distribution_mask is not None else s_t.size(-1)
         if jsd_alpha == 0.0:
             result = s_t.exp() * (s_t - t_t)
-            if mask is not None:
-                result = result[..., :K_orig].masked_fill(~mask, 0.0)
+            if distribution_mask is not None:
+                result = result[..., :K_orig].masked_fill(~distribution_mask, 0.0)
             return result.sum(dim=-1)
         if jsd_alpha == 1.0:
             result = t_t.exp() * (t_t - s_t)
-            if mask is not None:
-                result = result[..., :K_orig].masked_fill(~mask, 0.0)
+            if distribution_mask is not None:
+                result = result[..., :K_orig].masked_fill(~distribution_mask, 0.0)
             return result.sum(dim=-1)
 
         log_1ma = torch.log(torch.tensor(1.0 - jsd_alpha, device=s_t.device, dtype=s_t.dtype))
@@ -1176,9 +1279,9 @@ def compute_opd_kl(
 
         kl_student = s_t.exp() * (s_t - m_t)
         kl_teacher = t_t.exp() * (t_t - m_t)
-        if mask is not None:
-            kl_student = kl_student[..., :K_orig].masked_fill(~mask, 0.0)
-            kl_teacher = kl_teacher[..., :K_orig].masked_fill(~mask, 0.0)
+        if distribution_mask is not None:
+            kl_student = kl_student[..., :K_orig].masked_fill(~distribution_mask, 0.0)
+            kl_teacher = kl_teacher[..., :K_orig].masked_fill(~distribution_mask, 0.0)
         return (1.0 - jsd_alpha) * kl_student.sum(dim=-1) + jsd_alpha * kl_teacher.sum(dim=-1)
 
     raise ValueError(f"Unknown opd_kl_type: {kl_type}. Choose one of {OPD_KL_TYPES}.")
@@ -1197,6 +1300,12 @@ def compute_opd_kl_topk(
 
     ``mask``: optional bool ``[R, K]`` (union path only). ``None`` for fixed-K
     topk path — behavior unchanged.
+
+    This is the ordinary OPD convention: ``reverse_kl`` maps to the student
+    expectation and ``forward_kl`` maps to the teacher expectation. The JSD
+    boundary values are explicit endpoint aliases: ``jsd_alpha=0`` is
+    ``KL(student || teacher)`` and ``jsd_alpha=1`` is
+    ``KL(teacher || student)``. SDPO reuses these same OPD equations.
     """
     if kl_type in ("reverse_kl", "forward_kl", "jsd"):
         if kl_type == "reverse_kl":
@@ -1349,16 +1458,21 @@ def apply_opd_to_advantages(
         advantages[i] = adv - args.opd_kl_coef * kl_term.detach()
 
 
-def reduce_opd_loss(batch: RolloutBatch, values: torch.Tensor) -> torch.Tensor:
+def reduce_opd_loss(
+    batch: RolloutBatch,
+    values: torch.Tensor,
+    loss_masks: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    loss_masks = batch["loss_masks"] if loss_masks is None else loss_masks
     chunks = torch.split(values, batch["response_lengths"], dim=0)
     masked_chunks = []
-    for chunk, loss_mask in zip(chunks, batch["loss_masks"], strict=False):
+    for chunk, loss_mask in zip(chunks, loss_masks, strict=False):
         mask = loss_mask.to(device=chunk.device, dtype=chunk.dtype)
         masked = chunk * mask
         masked_chunks.append(masked)
 
     numerator = torch.cat(masked_chunks, dim=0).sum()
-    denominator = sum(mask.to(device=values.device, dtype=values.dtype).sum() for mask in batch["loss_masks"])
+    denominator = sum(mask.to(device=values.device, dtype=values.dtype).sum() for mask in loss_masks)
     return numerator / torch.clamp_min(denominator, 1)
 
 
@@ -1448,7 +1562,25 @@ def compute_policy_opd_loss(
         with torch.no_grad():
             reported_loss["opd_is_clip_frac"] = (ratio > clip).float().mean().clone().detach()
 
-    opd_loss = reduce_opd_loss(batch, opd_per_token_kl)
+    if batch.get(OPD_SAMPLE_MASK) is not None:
+        # The batch loss_masks are already gated by the sample mask (get_batch),
+        # so the standard sum-style reduction excludes inactive samples from both
+        # the numerator and the global num_tokens normalizer.
+        from relax.backends.megatron.cp_utils import get_sum_of_sample_mean
+
+        opd_loss = get_sum_of_sample_mean(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch["loss_masks"],
+            getattr(args, "calculate_per_token_loss", False),
+            args.qkv_format,
+            batch.get("max_seq_lens"),
+            batch.get("padded_total_lengths"),
+            dynamic_cp_size=batch.get("dynamic_cp_size"),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank"),
+        )(opd_per_token_kl)
+    else:
+        opd_loss = reduce_opd_loss(batch, opd_per_token_kl)
     return opd_loss_coef * opd_loss, reported_loss
 
 

@@ -194,7 +194,7 @@ def get_cp_local_num_tokens(
     """
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
-        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
+        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks]).to(torch.int)
 
     # cp_size > 1: mirror the chunk slicing done in get_sum_of_sample_mean so the
     # counted tokens exactly match the ones sum_of_token contributes on this rank.
@@ -221,8 +221,8 @@ def get_cp_local_num_tokens(
 
     if total is None:
         # No samples on this rank: mirror the empty-sum behaviour of cp_size == 1.
-        return sum([loss_mask.sum() for loss_mask in loss_masks])
-    return total
+        return sum([loss_mask.sum() for loss_mask in loss_masks]).to(torch.int)
+    return total.to(torch.int)
 
 
 def all_gather_with_cp(

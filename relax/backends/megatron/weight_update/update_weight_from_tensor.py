@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
@@ -176,7 +177,7 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self) -> None:
-        """version++, flush caches, process buckets with pipelining.
+        """Flush caches and process buckets with pipelining.
 
         Pipelining: overlap chunk N's IPC transfer with chunk N+1's HF
         conversion + serialization + Gloo gather.  At most two chunks'
@@ -192,44 +193,62 @@ class UpdateWeightFromTensor:
             self._update_weights_adapter_mode()
             return
 
-        self.weight_version += 1
+        candidate_weight_version = self.weight_version + 1
 
         # Pause/flush must cover both IPC and distributed-broadcast engines,
         # otherwise NCCL-path engines see torn reads and stale radix-KV cache.
         all_engines = list(self.rollout_engines) + list(self.distributed_rollout_engines)
 
         rank = dist.get_rank()
+        local_error: BaseException | None = None
         if rank == 0:
-            ray.get([engine.pause_generation.remote() for engine in all_engines])
-            ray.get([engine.flush_cache.remote() for engine in all_engines])
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
-                    rollout_engines=all_engines,
-                )
+            try:
+                ray.get([engine.pause_generation.remote() for engine in all_engines])
+                ray.get([engine.flush_cache.remote() for engine in all_engines])
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=True,
+                        post_process_quantization=False,
+                        rollout_engines=all_engines,
+                    )
+            except BaseException as exc:
+                local_error = exc
         dist.barrier(group=get_gloo_group())
+        if self._synchronize_update_error(local_error):
+            self._abort_weight_update(all_engines, local_error)
 
-        megatron_local_weights = self.weights_getter()
+        try:
+            megatron_local_weights = self.weights_getter()
+        except BaseException as exc:
+            local_error = exc
+            megatron_local_weights = None
+        if self._synchronize_update_error(local_error):
+            self._abort_weight_update(all_engines, local_error)
 
-        if self.lora_enabled and self.lora_merge_mode:
-            renamed = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
-            n_adapter_backup = sum(1 for k in renamed if is_lora_adapter_param(k))
-            logger.info(
-                "[lora-merge] merge branch active (weight_version=%d): %d/%d backup tensors are "
-                "LoRA adapters available for splicing",
-                self.weight_version,
-                n_adapter_backup,
-                len(renamed),
-            )
-            if n_adapter_backup == 0:
-                logger.error(
-                    "[lora-merge] NO adapter tensors in backup dict — merge would degrade to "
-                    "base-only. Check adapter naming / weights_getter output."
+        try:
+            if self.lora_enabled and self.lora_merge_mode:
+                renamed = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
+                n_adapter_backup = sum(1 for k in renamed if is_lora_adapter_param(k))
+                logger.info(
+                    "[lora-merge] merge branch active (weight_version=%d): %d/%d tensors are "
+                    "LoRA adapters available for splicing",
+                    self.weight_version,
+                    n_adapter_backup,
+                    len(renamed),
                 )
-            export_ctx = megatron_bridge_utils.splice_adapter_weights(renamed)
-        else:
+                if n_adapter_backup == 0:
+                    logger.error(
+                        "[lora-merge] NO adapter tensors in backup dict — merge would degrade to "
+                        "base-only. Check adapter naming / weights_getter output."
+                    )
+                export_ctx = megatron_bridge_utils.splice_adapter_weights(renamed)
+            else:
+                export_ctx = nullcontext()
+        except BaseException as exc:
+            local_error = exc
             export_ctx = nullcontext()
+        if self._synchronize_update_error(local_error):
+            self._abort_weight_update(all_engines, local_error)
 
         # Pipeline: when chunk N's IPC refs are in-flight on the engine,
         # chunk N+1's HF conversion + serialize + gather can proceed in
@@ -237,39 +256,120 @@ class UpdateWeightFromTensor:
         # two stages overlap.
         prev_refs: list[ObjectRef] = []
         prev_long_lived_tensors = None
-        with export_ctx:
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-                # Wait for the *previous* chunk's IPC to finish before
-                # releasing its GPU tensors.
-                if prev_refs:
-                    ray.get(prev_refs)
+        try:
+            with export_ctx:
+                for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                    current_refs: list[ObjectRef] = []
+                    current_long_lived_tensors = None
+                    local_error = None
+                    try:
+                        current_refs, current_long_lived_tensors = self._send_hf_params(
+                            hf_named_tensors, weight_version=candidate_weight_version
+                        )
+                    except BaseException as exc:
+                        local_error = exc
+
+                    # A sender owns only the engine for its rank.  Coordinate a
+                    # failed send before any rank enters the next per-chunk
+                    # barrier; otherwise a non-zero sender can leave all other
+                    # training ranks waiting in Gloo forever.
+                    if self._synchronize_update_error(local_error):
+                        for refs in (current_refs, prev_refs):
+                            drain_error = self._drain_weight_refs(refs)
+                            if local_error is None and drain_error is not None:
+                                local_error = drain_error
+                        del current_long_lived_tensors, prev_long_lived_tensors
+                        prev_refs = []
+                        break
+
+                    # Every rank which contributed a CPU/file-system shared
+                    # tensor must retain it until the gather-source rank has
+                    # confirmed that the engine consumed the previous chunk.
+                    # Only the gather source owns the Ray ref, so a local
+                    # ``ray.get(prev_refs)`` followed by immediate deletion on
+                    # other ranks could free their shared storage too early.
+                    local_error = self._drain_weight_refs(prev_refs)
+                    if self._synchronize_update_error(local_error):
+                        for refs in (current_refs,):
+                            drain_error = self._drain_weight_refs(refs)
+                            if local_error is None and drain_error is not None:
+                                local_error = drain_error
+                        del current_long_lived_tensors, prev_long_lived_tensors
+                        prev_refs = []
+                        break
+
+                    del prev_long_lived_tensors
+                    prev_refs = current_refs
+                    prev_long_lived_tensors = current_long_lived_tensors
+
+                    # Backend-specific per-chunk synchronization is handled in
+                    # device utils so this path stays hardware-agnostic.
+                    device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
+
+                # Drain the last chunk.  Errors are synchronized below so every
+                # rank reaches the cleanup path before rank 0 resumes serving.
+                drain_error = self._drain_weight_refs(prev_refs)
+                if local_error is None and drain_error is not None:
+                    local_error = drain_error
                 del prev_long_lived_tensors
-                prev_refs = refs
-                prev_long_lived_tensors = long_lived_tensors
-                # Backend-specific per-chunk synchronization is handled in device
-                # utils so this path stays hardware-agnostic.
-                device_utils.maybe_backend_barrier_on_weight_chunk(group=get_gloo_group())
-            # Drain the last chunk.
-            if prev_refs:
-                ray.get(prev_refs)
-            del prev_long_lived_tensors
+        except BaseException as exc:
+            if local_error is None:
+                local_error = exc
+
+        global_error = self._synchronize_update_error(local_error)
 
         # All ranks must finish sending before rank 0 triggers Marlin repack,
         # otherwise engines in slower gather groups may still be processing
         # weight chunks when their parameters get reshaped by post_process.
         dist.barrier(group=get_gloo_group())
+        if global_error:
+            self._abort_weight_update(all_engines, local_error)
 
         # int4/fp4 post_process
+        local_error = None
         if rank == 0:
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=all_engines,
-                )
-            ray.get([engine.continue_generation.remote() for engine in all_engines])
+            try:
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=False,
+                        post_process_quantization=True,
+                        rollout_engines=all_engines,
+                    )
+            except BaseException as exc:
+                local_error = exc
+        if self._synchronize_update_error(local_error):
+            self._abort_weight_update(all_engines, local_error)
+
+        local_error = None
+        if rank == 0:
+            try:
+                ray.get([engine.continue_generation.remote() for engine in all_engines])
+            except BaseException as exc:
+                local_error = exc
         dist.barrier(group=get_gloo_group())
+        if self._synchronize_update_error(local_error):
+            self._abort_weight_update(all_engines, local_error)
+        self.weight_version = candidate_weight_version
+
+    def _synchronize_update_error(self, local_error: BaseException | None) -> bool:
+        error_flag = torch.tensor([int(local_error is not None)], dtype=torch.int32)
+        dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        return bool(error_flag.item())
+
+    @staticmethod
+    def _drain_weight_refs(refs: Sequence[ObjectRef]) -> BaseException | None:
+        if not refs:
+            return None
+        try:
+            ray.get(refs)
+        except BaseException as exc:
+            return exc
+        return None
+
+    def _abort_weight_update(self, all_engines: Sequence[ActorHandle], local_error: BaseException | None) -> None:
+        del all_engines
+        error = local_error or RuntimeError("weight update failed on one or more ranks")
+        raise RuntimeError(f"Weight update failed before commit: {error}") from error
 
     def _update_weights_adapter_mode(self) -> None:
         """LoRA adapter mode: sync base once, then push only the adapter each
@@ -476,8 +576,11 @@ class UpdateWeightFromTensor:
         finally:
             set_sharing_strategy(prev_strategy)
 
-    def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
+    def _send_hf_params(self, hf_named_tensors, *, weight_version: int | None = None) -> tuple[list[ObjectRef], Any]:
         all_refs = []
+
+        if weight_version is None:
+            weight_version = self.weight_version
 
         long_lived_tensors = None
         if self._ipc_engine is not None:
@@ -486,7 +589,7 @@ class UpdateWeightFromTensor:
                 ipc_engine=self._ipc_engine,
                 ipc_gather_src=self._ipc_gather_src,
                 ipc_gather_group=self._ipc_gather_group,
-                weight_version=self.weight_version,
+                weight_version=weight_version,
             )
             all_refs.extend(refs_colocated)
 
@@ -494,7 +597,7 @@ class UpdateWeightFromTensor:
             refs_distributed = update_weights_from_distributed(
                 self._group_name,
                 self._model_update_groups,
-                self.weight_version,
+                weight_version,
                 self.distributed_rollout_engines,
                 hf_named_tensors,
             )
@@ -543,16 +646,33 @@ def _send_to_colocated_engine(
                 converted_named_tensors_by_dtypes[dtype] = []
             converted_named_tensors_by_dtypes[dtype].append((name, tensor))
 
+    use_cpu_serialization = os.environ.get("TMS_INIT_ENABLE") == "1"
     serialized_tensors = []
-    for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+    from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
+
+    previous_sharing_strategy = get_sharing_strategy()
+    if use_cpu_serialization:
+        # torch_memory_saver's allocator cannot export CUDA IPC handles.  Keep
+        # the same flattened-bucket protocol, but send a CPU copy through the
+        # file-system sharing backend; SGLang moves it to its inference device
+        # while reconstructing the bucket.
+        set_sharing_strategy("file_system")
+    try:
+        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            metadata = flattened_tensor_bucket.get_metadata()
+            flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+            if use_cpu_serialization:
+                flattened_tensor = flattened_tensor.cpu()
+            flattened_tensor_data = {
+                "flattened_tensor": flattened_tensor,
+                "metadata": metadata,
+            }
+            long_live_tensors.append(flattened_tensor_data)
+            serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+    finally:
+        if use_cpu_serialization:
+            set_sharing_strategy(previous_sharing_strategy)
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None

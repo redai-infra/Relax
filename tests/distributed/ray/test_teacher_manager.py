@@ -73,6 +73,34 @@ def test_teacher_gpu_index_starts_at_zero_for_dedicated_pg(monkeypatch):
     )
 
 
+def test_teacher_weight_update_offsets_use_actor_world_rank_slice(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    args = SimpleNamespace(rollout_num_gpus=4)
+
+    assert teacher_manager._teacher_gpu_offsets(
+        args=args,
+        num_replicas=2,
+        gpus_per_replica=2,
+        bundle_offset=3,
+    ) == [7, 9]
+
+
+@pytest.mark.parametrize(
+    ("num_replicas", "gpus_per_replica"),
+    [(0, 2), (2, 0)],
+)
+def test_teacher_weight_update_offsets_reject_invalid_layout(monkeypatch, num_replicas, gpus_per_replica):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    args = SimpleNamespace(rollout_num_gpus=4)
+
+    with pytest.raises(ValueError, match="must be positive"):
+        teacher_manager._teacher_gpu_offsets(
+            args=args,
+            num_replicas=num_replicas,
+            gpus_per_replica=gpus_per_replica,
+        )
+
+
 def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
     # RELAX_OPD_PREEXPANDED_PATCH is passed through from the driver env (default

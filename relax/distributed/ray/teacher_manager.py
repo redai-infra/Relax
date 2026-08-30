@@ -34,6 +34,14 @@ def _resolve_teacher_gpu_index(
     return int(args.rollout_num_gpus) + bundle_offset + replica * gpus_per_replica
 
 
+def _teacher_gpu_offsets(*, args, num_replicas: int, gpus_per_replica: int, bundle_offset: int = 0) -> list[int]:
+    if num_replicas < 1 or gpus_per_replica < 1:
+        raise ValueError(
+            f"num_replicas and gpus_per_replica must be positive, got {num_replicas}, {gpus_per_replica}."
+        )
+    return [int(args.rollout_num_gpus) + bundle_offset + replica * gpus_per_replica for replica in range(num_replicas)]
+
+
 def _build_teacher_engine_env(args) -> dict[str, str]:
     env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
         # OPD patches default off; enabled only when the corresponding env flag is
@@ -88,10 +96,28 @@ class TeacherManager:
         self._shared_pg = shared_pg
         self._bundle_offset = bundle_offset
         self._engines: list[tuple] = []
+        self._weight_sync_lock = None
         self._urls = self._start()
 
     def get_urls(self) -> list[str]:
         return list(self._urls)
+
+    def get_weight_update_engines_and_lock(self):
+        if not self._shared_pg:
+            raise RuntimeError("SDPO EMA weight updates require a colocated managed teacher.")
+        if self._weight_sync_lock is None:
+            from relax.distributed.ray.utils import Lock
+
+            self._weight_sync_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        engines = [engine for _pg, engine, _owns_pg in self._engines]
+        gpu_counts = [self.gpus_per_replica] * len(engines)
+        gpu_offsets = _teacher_gpu_offsets(
+            args=self.args,
+            num_replicas=len(engines),
+            gpus_per_replica=self.gpus_per_replica,
+            bundle_offset=self._bundle_offset,
+        )
+        return engines, self._weight_sync_lock, gpu_counts, gpu_offsets
 
     def _start(self) -> list[str]:
         """Create the teacher PG(s) + engine actor(s), wait until healthy, and
@@ -233,6 +259,11 @@ class TeacherManager:
                 except Exception as e:
                     logger.warning(f"[OPD teacher] remove placement group failed: {e}")
         self._engines = []
+        if self._weight_sync_lock is not None:
+            try:
+                ray.kill(self._weight_sync_lock)
+            except Exception as e:
+                logger.warning(f"[OPD teacher] weight sync lock cleanup failed: {e}")
         logger.info("[OPD teacher] shutdown complete.")
 
     def offload(self) -> None:

@@ -41,6 +41,10 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def ema(self, *, source_tag: str, target_tag: str, alpha: float) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def restore(self, tag: str):
         raise NotImplementedError
 
@@ -72,6 +76,25 @@ class _TensorBackuperNormal(TensorBackuper):
             self._backups[dst_tag][name].copy_(self._backups[src_tag][name])
 
     @torch.no_grad()
+    def ema(self, *, source_tag: str, target_tag: str, alpha: float) -> None:
+        if not 0 < alpha <= 1:
+            raise ValueError(f"EMA alpha must be in (0, 1], got {alpha}.")
+        source = self._backups[source_tag]
+        target = self._backups[target_tag]
+        if source.keys() != target.keys():
+            raise ValueError("EMA source and target snapshots must have identical keys.")
+        for name, source_tensor in source.items():
+            target_tensor = target[name]
+            if source_tensor.shape != target_tensor.shape or source_tensor.dtype != target_tensor.dtype:
+                raise ValueError(f"EMA snapshot mismatch for {name}.")
+            if alpha == 1:
+                target_tensor.copy_(source_tensor)
+            elif not (source_tensor.is_floating_point() or source_tensor.is_complex()):
+                target_tensor.copy_(source_tensor)
+            else:
+                target_tensor.mul_(1 - alpha).add_(source_tensor, alpha=alpha)
+
+    @torch.no_grad()
     def restore(self, tag: str) -> None:
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
@@ -101,6 +124,9 @@ class _TensorBackuperNoop(TensorBackuper):
         assert tag == self._single_tag
         self._backup_hash_dict = _compute_hash_dict(dict(self._source_getter()))
         device_utils.synchronize()
+
+    def ema(self, *, source_tag: str, target_tag: str, alpha: float) -> None:
+        raise RuntimeError("SDPO EMA requires --enable-weights-backuper.")
 
     def restore(self, tag: str) -> None:
         assert tag == self._single_tag
