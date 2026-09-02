@@ -5,6 +5,7 @@
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -23,6 +24,93 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+
+
+def test_restrict_training_size_excludes_held_out_tail_from_every_epoch(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+
+    dataset.restrict_training_size(8)
+    dataset.shuffle(0)
+    indices, crossed_epoch = dataset.index_manager.get_next_indices(24)
+
+    assert crossed_epoch is True
+    assert set(indices) == set(range(8))
+    assert all(index < 8 for index in indices)
+    assert len(dataset) == 10
+
+
+def test_restrict_training_indices_shuffles_only_physical_row_ids_and_resumes(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    train_indices = (0, 2, 5, 7, 9)
+
+    uninterrupted = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+    uninterrupted.restrict_training_indices(train_indices)
+    uninterrupted.shuffle(0)
+    uninterrupted.index_manager.get_next_indices(7)
+    expected, _ = uninterrupted.index_manager.get_next_indices(8)
+
+    resumed = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+    resumed.restrict_training_indices(train_indices)
+    resumed.shuffle(1, position=2)
+    actual, crossed_epoch = resumed.index_manager.get_next_indices(8)
+
+    assert actual == expected
+    assert crossed_epoch is True
+    assert set(actual).issubset(train_indices)
+
+
+def test_restrict_training_indices_prefetches_physical_row_ids(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    train_indices = (0, 2, 5, 7, 9)
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=7)
+    dataset._prefetch = MagicMock()
+
+    dataset.restrict_training_indices(train_indices)
+    dataset.shuffle(0)
+
+    prefetched_indices = dataset._prefetch.set_index_order.call_args.args[0]
+    assert set(prefetched_indices) == set(train_indices)
+    assert len(prefetched_indices) == len(train_indices)
+
+
+@pytest.mark.parametrize("indices", [(), (1, 1), (0, 10)])
+def test_restrict_training_indices_rejects_invalid_row_ids(tmp_path, indices):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0)
+
+    with pytest.raises(ValueError):
+        dataset.restrict_training_indices(indices)
+
+
+def test_get_batch_by_indices_preserves_requested_physical_order(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"Q{index}"},
+                    {"role": "assistant", "content": f"A{index}"},
+                ]
+            }
+            for index in range(6)
+        ],
+    )
+    dataset = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        prompt_key="messages",
+        prefetch_max_cached=0,
+    )
+
+    samples = dataset.get_batch_by_indices((4, 1, 5))
+
+    assert [sample.source_idx for sample in samples] == [4, 1, 5]
 
 
 class _FakeTokenizer:
@@ -130,6 +218,229 @@ def test_pack_samples_for_tq_marks_samples_as_sft(tmp_path: Path):
     assert batch["response_lengths"] == batch["total_lengths"]
     assert batch["response_lengths"][0] == len(batch["tokens"][0])
     assert sum(batch["loss_masks"][0]) == len("A")
+    ds.stop()
+
+
+def _make_classification_dataset(
+    path: Path,
+    *,
+    problem_type: str = "single_label_classification",
+    num_labels: int = 3,
+    capacity: int | None = None,
+) -> SFTStreamingDataset:
+    return SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=capacity,
+        prompt_key="messages",
+        label_key="label",
+        multimodal_keys=None,
+        seed=42,
+        prefetch_max_cached=0,
+        oversize_strategy="truncate_right",
+        task_type="seq_cls",
+        num_labels=num_labels,
+        problem_type=problem_type,
+        classification_sentinel_token_id=99,
+        require_response=False,
+    )
+
+
+def test_streaming_dataset_builds_single_label_classification_sample(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": 2}])
+    ds = _make_classification_dataset(path)
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+    batch = pack_samples_for_tq([sample])
+
+    assert sample.tokens[-1].item() == 99
+    assert sample.loss_mask.tolist() == [1]
+    assert sample.classification_label.item() == 2
+    assert batch["response_lengths"] == [1]
+    assert batch["classification_labels"] == [2]
+    ds.stop()
+
+
+def test_streaming_dataset_builds_multimodal_classification_sample(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Classify this image."},
+                            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+                        ],
+                    }
+                ],
+                "images": [],
+                "label": 2,
+            }
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=MagicMock(),
+        capacity=None,
+        prompt_key="messages",
+        label_key="label",
+        multimodal_keys={"image": "images"},
+        seed=42,
+        prefetch_max_cached=0,
+        task_type="seq_cls",
+        num_labels=3,
+        problem_type="single_label_classification",
+        classification_sentinel_token_id=99,
+        require_response=False,
+    )
+    mm_inputs = {
+        "pixel_values": torch.zeros(1, 3, 2, 2),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+    }
+
+    with (
+        patch("relax.engine.sft.dataset.streaming.render_to_text", return_value="rendered multimodal prompt"),
+        patch(
+            "relax.engine.sft.dataset.streaming.preprocess_multimodal",
+            return_value=([10, 11, 12], mm_inputs),
+        ),
+    ):
+        sample = ds.get_batch_in_order(0, 1)[0]
+    batch = pack_samples_for_tq([sample], force_multimodal_field=True)
+
+    assert sample.tokens.tolist() == [10, 11, 12, 99]
+    assert sample.loss_mask.tolist() == [1]
+    assert sample.classification_label.item() == 2
+    assert sample.multimodal_train_inputs is mm_inputs
+    assert batch["classification_labels"] == [2]
+    assert batch["multimodal_train_inputs"] == [mm_inputs]
+    ds.stop()
+
+
+def test_streaming_dataset_builds_dense_multi_label_targets(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": [0, 2]}])
+    ds = _make_classification_dataset(
+        path,
+        problem_type="multi_label_classification",
+        num_labels=4,
+    )
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+    batch = pack_samples_for_tq([sample], sample_weights=[1.0])
+
+    assert sample.classification_label.tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert batch["classification_labels"] == [[1.0, 0.0, 1.0, 0.0]]
+    assert batch["sample_weights"] == [1.0]
+    ds.stop()
+
+
+def test_streaming_dataset_truncates_prompt_but_preserves_classification_sentinel(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "long prompt"}], "label": 1}])
+    ds = _make_classification_dataset(path, capacity=5)
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+
+    assert sample.total_length == 5
+    assert sample.tokens[-1].item() == 99
+    assert sample.loss_mask.tolist() == [1]
+    ds.stop()
+
+
+@pytest.mark.parametrize(
+    ("label", "problem_type", "match"),
+    [
+        (True, "single_label_classification", "requires an integer label"),
+        (3, "single_label_classification", "expected 0 <= label < 3"),
+        ([0, 0], "multi_label_classification", "duplicate indices"),
+        ([3], "multi_label_classification", "expected 0 <= index < 3"),
+    ],
+)
+def test_streaming_dataset_rejects_invalid_classification_labels(
+    tmp_path: Path,
+    label,
+    problem_type: str,
+    match: str,
+):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": label}])
+    ds = _make_classification_dataset(path, problem_type=problem_type)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        ds.get_batch_in_order(0, 1)
+    ds.stop()
+
+
+class _CountingReader:
+    """Reader wrapper that counts ``__getitem__`` calls without changing
+    behaviour."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.count = 0
+
+    def __len__(self):
+        return len(self._inner)
+
+    def __getitem__(self, idx):
+        self.count += 1
+        return self._inner[idx]
+
+
+def test_render_one_reads_reader_once_for_seq_cls(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, [{"messages": [{"role": "user", "content": "Question"}], "label": 1}])
+    ds = _make_classification_dataset(path)
+    counting = _CountingReader(ds.reader)
+    ds.reader = counting
+
+    rendered = ds._render_one(0)
+
+    assert rendered is not None
+    assert rendered.classification_label.item() == 1
+    assert counting.count == 1
+    ds.stop()
+
+
+def test_render_one_reads_reader_once_for_causal_lm(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Q"},
+                    {"role": "assistant", "content": "A"},
+                ]
+            }
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys=None,
+        seed=42,
+        prefetch_max_cached=0,
+    )
+    counting = _CountingReader(ds.reader)
+    ds.reader = counting
+
+    rendered = ds._render_one(0)
+
+    assert rendered is not None
+    assert rendered.classification_label is None
+    assert counting.count == 1
     ds.stop()
 
 

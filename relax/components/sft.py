@@ -17,9 +17,9 @@ Megatron actor parses ``N`` from the partition name to know how many chunks
 to consume. The eval source is one of:
 
 - ``--eval-prompt-data NAME PATH`` — load a separate prompt-data dataset.
-- ``--eval-size N`` — carve a tail slice off the train dataset (``N<1`` is a
-  fraction, ``N>=1`` an absolute count); the reserved tail is excluded from
-  the train pool so train/eval samples never overlap.
+- ``--eval-size N`` — deterministically shuffle row IDs once and carve out an
+  eval subset (``N<1`` is a fraction, ``N>=1`` an absolute count); the held-out
+  rows are excluded from every shuffled training epoch.
 
 Mirrors `relax/components/advantages.py` in shape: no FastAPI ingress, plain
 `@serve.deployment` + async `run()` loop.
@@ -29,6 +29,7 @@ import asyncio
 import random
 from typing import Any
 
+import torch.nn.functional as F
 import transfer_queue as tq
 from ray import serve
 from transformers import AutoConfig, AutoTokenizer
@@ -36,6 +37,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.components.base import Base
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample
+from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.misc import load_function
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
@@ -72,6 +74,14 @@ def _resolve_pad_token_ids_from_config(model_path: str) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _resolve_classification_sentinel_token_id(tokenizer) -> int:
+    for attr in ("eos_token_id", "pad_token_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if isinstance(token_id, int) and token_id >= 0:
+            return token_id
+    raise ValueError("--task-type seq_cls requires a tokenizer with a valid EOS or PAD token id.")
+
+
 @serve.deployment
 class SFT(Base):
     def __init__(self, healthy, pgs, num_gpus, config, role, runtime_env=None):  # noqa: ARG002
@@ -86,7 +96,7 @@ class SFT(Base):
 
         self._dataset: Any | None = None
         self._eval_dataset: Any | None = None
-        self._eval_indices: range | None = None
+        self._eval_indices: tuple[int, ...] | None = None
         self._train_size: int = 0
         self._tokenizer = None
         self._processor_pool: ProcessorPool | None = None
@@ -112,6 +122,10 @@ class SFT(Base):
         prefetch_chunk_size = getattr(self.config, "sft_prefetch_chunk_size", 32)
         prefetch_num_workers = getattr(self.config, "sft_prefetch_num_workers", 4)
         seed = getattr(self.config, "seed", 42)
+        task_type = getattr(self.config, "task_type", "causal_lm")
+        classification_sentinel_token_id = (
+            _resolve_classification_sentinel_token_id(self._tokenizer) if task_type == "seq_cls" else None
+        )
 
         oversize_strategy = getattr(self.config, "sft_oversize_strategy", "keep")
         invalid_multimodal_strategy = getattr(self.config, "sft_invalid_multimodal_strategy", "error")
@@ -149,6 +163,11 @@ class SFT(Base):
                 oversize_custom_fn=oversize_custom_fn,
                 invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                require_response=task_type != "seq_cls",
+                task_type=task_type,
+                num_labels=getattr(self.config, "num_labels", None),
+                problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+                classification_sentinel_token_id=classification_sentinel_token_id,
             )
         else:
             self._dataset = dataset_cls.from_args(
@@ -163,25 +182,29 @@ class SFT(Base):
         eval_prompt_data = build_named_prompt_data_configs(getattr(self.config, "eval_prompt_data", None))
         eval_size_arg = getattr(self.config, "eval_size", None)
         if eval_size_arg is not None:
-            # Reserve the tail of the train dataset for eval so train and eval
-            # samples never overlap. Mutual exclusion with --eval-prompt-data
-            # is enforced in arguments.py.
-            if eval_size_arg < 1:
-                n_eval = max(1, int(n_avail * eval_size_arg))
-            else:
-                n_eval = int(eval_size_arg)
-            n_eval = min(n_eval, max(n_avail - 1, 0))
+            # Randomize the split once with a fixed seed. Each epoch reshuffles
+            # only the resulting train row IDs; eval membership stays fixed.
+            train_indices, eval_indices = resolve_sft_split_indices(n_avail, eval_size_arg, seed)
+            self._train_size = len(train_indices)
+            n_eval = len(eval_indices)
             if n_eval == 0:
                 self._logger.warning(
                     f"--eval-size {eval_size_arg} resolves to 0 samples on a dataset of size {n_avail}; "
                     "eval will be skipped."
                 )
             else:
-                self._train_size = n_avail - n_eval
-                self._eval_indices = range(self._train_size, n_avail)
+                self._eval_indices = eval_indices
+                restrict_training_indices = getattr(self._dataset, "restrict_training_indices", None)
+                get_batch_by_indices = getattr(self._dataset, "get_batch_by_indices", None)
+                if not callable(restrict_training_indices) or not callable(get_batch_by_indices):
+                    raise TypeError(
+                        "--eval-size requires the SFT dataset to implement restrict_training_indices(indices) "
+                        "and get_batch_by_indices(indices) for a deterministic random split."
+                    )
+                restrict_training_indices(train_indices)
                 self._logger.info(
-                    f"--eval-size carved {n_eval} samples (indices {self._train_size}..{n_avail - 1}) "
-                    f"out of train dataset; train pool size now {self._train_size}."
+                    f"--eval-size randomly held out {n_eval} samples with seed={seed}; "
+                    f"train pool size now {self._train_size}."
                 )
         elif eval_prompt_data:
             eval_input_key = getattr(self.config, "eval_input_key", None) or self.config.input_key
@@ -209,6 +232,11 @@ class SFT(Base):
                 oversize_custom_fn=oversize_custom_fn,
                 invalid_multimodal_strategy=invalid_multimodal_strategy,
                 apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                require_response=task_type != "seq_cls",
+                task_type=task_type,
+                num_labels=getattr(self.config, "num_labels", None),
+                problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+                classification_sentinel_token_id=classification_sentinel_token_id,
             )
 
         # Resume: align IndexManager with `start_rollout_id` so a restart sees
@@ -305,11 +333,15 @@ class SFT(Base):
             return
         s = samples[0]
         try:
+            loss_mask = s.loss_mask
+            if s.classification_label is not None:
+                loss_mask = F.pad(loss_mask, (s.total_length - 2, 1), value=0)
+                self._logger.info(f"First classification sample label: {s.classification_label.tolist()}")
             print_first_sample(
                 step=self.step,
                 sample_idx=s.source_idx,
                 input_ids=s.tokens,
-                loss_mask=s.loss_mask,
+                loss_mask=loss_mask,
                 multimodal_train_inputs=s.multimodal_train_inputs,
                 tokenizer=self._tokenizer,
             )
@@ -353,7 +385,7 @@ class SFT(Base):
         """
         if self._eval_indices is not None:
             assert self._dataset is not None
-            return self._dataset.get_batch_in_order(self._eval_indices.start, len(self._eval_indices))
+            return self._dataset.get_batch_by_indices(self._eval_indices)
         if self._eval_dataset is not None:
             return self._eval_dataset.get_batch_in_order(0, len(self._eval_dataset))
         return None
@@ -392,7 +424,19 @@ class SFT(Base):
         # so the padding is reproducible across restarts.
         gbs = self.config.global_batch_size
         n_original = len(samples)
-        if n_original < gbs:
+        is_classification = getattr(self.config, "task_type", "causal_lm") == "seq_cls"
+        sample_weights = None
+        if is_classification:
+            n_chunks = (n_original + gbs - 1) // gbs
+            pad_count = n_chunks * gbs - n_original
+            if pad_count:
+                samples = list(samples) + [samples[i % n_original] for i in range(pad_count)]
+            sample_weights = [1.0] * n_original + [0.0] * pad_count
+            self._logger.info(
+                f"Classification eval @ step {self.step}: {n_original} real samples, "
+                f"{pad_count} zero-weight padding samples, {n_chunks} chunk(s)."
+            )
+        elif n_original < gbs:
             rng = random.Random(self.step)
             pad_count = gbs - n_original
             samples = list(samples) + rng.choices(samples, k=pad_count)
@@ -403,7 +447,11 @@ class SFT(Base):
                 f"interpret with caution."
             )
 
-        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
+        backend_batch = pack_samples_for_tq(
+            samples,
+            force_multimodal_field=self.config.multimodal_keys is not None,
+            sample_weights=sample_weights,
+        )
         assert backend_batch is not None
         n_samples = len(backend_batch["tokens"])
 
@@ -412,7 +460,9 @@ class SFT(Base):
         await self._wait_for_partition_drained(f"sft_{self.step}")
 
         chunk_size = self.config.global_batch_size
-        # Drop trailing samples that don't fill a full chunk. The consumer's
+        # Causal-LM eval drops trailing samples that don't fill a full chunk;
+        # classification eval was padded above and therefore has no trailing
+        # real samples. The consumer's
         # `_get_data_from_transfer_queue` calls `tq.get_meta(batch_size=...)`
         # which returns size=0 when the partition has fewer than batch_size
         # samples, so a partial last chunk would never be marked consumed and

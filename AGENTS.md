@@ -110,6 +110,7 @@ Fire the appropriate **expert subagent** or **load a skill** based on what you'r
 | Task Launch & service deployment             | `launcher-expert`  |                   |
 | Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                   |
 | Development & code changes                   | `ray-expert`       | `dev`             |
+| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout` |
 | Distributed training hang debugging          | `ray-expert`       | `debug-hang`      |
 | Code review of git changes                   | --                 | `code-review`     |
 | Creating new skills                          | --                 | `creating-skills` |

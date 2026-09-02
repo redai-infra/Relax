@@ -86,8 +86,6 @@ ROLLOUT_ARGS=(
    --agent-timeout 660
    --agentic-reasoning-parser qwen3
    --agentic-tool-call-parser qwen
-   --agentic-prepare-pool-size 1
-
    --num-rollout 200
    --rollout-batch-size 32
    --n-samples-per-prompt 8

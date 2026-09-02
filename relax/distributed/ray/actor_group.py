@@ -7,6 +7,7 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
@@ -93,7 +94,7 @@ class RayTrainGroup:
         actor_impl = MegatronTrainRayActor
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
-        lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        lock = Lock.options(**with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})).remote()
 
         # Create worker actors
         self._actor_handlers = []

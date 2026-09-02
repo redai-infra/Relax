@@ -9,8 +9,7 @@ Consolidates three previously separate suites:
   the mode predicates that gate adapter vs merge paths, and the checkpoint save
   that writes an HF-PEFT dir + adapter-mode metadata.
 - **Colocate sync** — the transport-independent ``LoraAdapterSync`` helper:
-  ``config_dict`` (HF-PEFT shape + Megatron->HF target-module conversion) and
-  ``live_dir`` (shared-dir resolution + ``RELAX_LORA_LIVE_DIR`` override).
+  ``config_dict`` (HF-PEFT shape + Megatron->SGLang target-module conversion).
 - **Fully-async** — the pure/logic pieces gating the DeviceDirectBackend path:
   the adapter-param skip predicate, the delta-skip early-return contract, the
   Megatron->HF target-module expansion, the tp_size=1 merge formula, and the
@@ -230,24 +229,11 @@ class TestConfigDict:
         assert cd["task_type"] == "CAUSAL_LM"
         assert cd["bias"] == "none"
 
-    def test_config_dict_converts_target_modules_to_hf(self):
-        # Canonical Megatron names must be expanded to HF-style names for SGLang's PEFT loader.
+    def test_config_dict_converts_target_modules_to_engine_flavor(self):
+        # Canonical Megatron names must be expanded to the leaf names SGLang matches by.
         cd = _make_sync().config_dict()
         assert "linear_qkv" not in cd["target_modules"]
         assert {"q_proj", "k_proj", "v_proj", "o_proj"}.issubset(set(cd["target_modules"]))
-
-
-class TestLiveDir:
-    def test_live_dir_defaults_to_save(self):
-        assert _make_sync(save="/data/run").live_dir() == "/data/run/relax_lora_live/adapter"
-
-    def test_live_dir_env_override(self, monkeypatch):
-        monkeypatch.setenv("RELAX_LORA_LIVE_DIR", "/dev/shm/x")
-        assert _make_sync().live_dir() == "/dev/shm/x/relax_lora_live/adapter"
-
-    def test_live_dir_falls_back_to_tmp(self, monkeypatch):
-        monkeypatch.delenv("RELAX_LORA_LIVE_DIR", raising=False)
-        assert _make_sync(save=None).live_dir() == "/tmp/relax_lora_live/adapter"
 
 
 class TestInitialState:

@@ -157,8 +157,6 @@ ROLLOUT_ARGS=(
      "NEMO_GYM_LEASE_S=${NEMO_GYM_LEASE_S}"
    --agent-timeout "${NEMO_GYM_AGENT_TIMEOUT}"
    --agentic-tool-call-parser "${NEMO_GYM_TOOL_CALL_PARSER}"
-   --agentic-prepare-pool-size 1
-
    --num-rollout "${NEMO_GYM_NUM_ROLLOUT}"
    --rollout-batch-size 1
    --n-samples-per-prompt "${NEMO_GYM_N_SAMPLES_PER_PROMPT}"

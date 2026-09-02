@@ -527,6 +527,21 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|---------|-------------|
 | `--scale-out-timeout` | float | 300.0 | - | Timeout for all scale-out operations (engine startup, connect, health check, weight sync) in seconds |
 | `--scale-out-partial-success-policy` | str | rollback_all | `rollback_all`, `keep_partial` | Policy for partial success during scale-out. `rollback_all` reverts all engines on any failure; `keep_partial` keeps successfully scaled engines |
+| `--scale-weight-sync-precheck` | bool | True | - | Run an independent NCCL precheck before scale-out weight sync; fail-closed on incompatible transport. On by default; disable with `--no-scale-weight-sync-precheck` (disabling drops the fail-closed protection). See [Elastic Rollout · Weight Sync Precheck](./elastic-rollout.md#weight-sync-precheck) |
+
+### Precheck Env Vars
+
+These environment variables are for tuning and troubleshooting; all are optional (defaults shown). Read at runtime by `relax/utils/env.py`.
+
+| Env var | Type | Default | Description |
+|----------|------|--------|------|
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES` | int | 536870912 (512 MiB) | Minimum free GPU memory (bytes) for the Stage 2 probe; below it the probe returns `INSUFFICIENT_GPU_MEMORY` and fails closed. SGLang reserves 85–90% of VRAM; lowering this risks probe OOM. |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE` | int | 18000 | Lower bound of the Stage 2 probe subprocess rendezvous port range |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX` | int | 20000 | Upper bound of the Stage 2 probe subprocess rendezvous port range. **Cluster network policy must allow `[PORT_BASE, PORT_MAX]`**, otherwise the probe cannot connect → `PROBE_FAILED` |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS` | int | 2 | Max attempts for the Stage 2 probe |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEMS` | int | 3 | Max number of scale-out failure reasons surfaced in the TUI / stable log |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN` | int | 120 | Truncation length per failure reason |
+| `RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN` | int | 512 | Total truncation length for failure reasons (prevents excessively long raw-error output) |
 
 ### Scale-In Operation Parameters
 
@@ -566,7 +581,6 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|-------------|
 | `--log-passrate` | flag | False | Enable pass@n pass rate logging |
 | `--log-multi-turn` | flag | False | Enable multi-turn Rollout information logging |
-| `--log-correct-samples` | flag | False | Log correct samples |
 | `--log-reward-category` | str | None | Log reward category statistics. Specify key in reward dict |
 
 ### Notifications

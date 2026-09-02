@@ -38,6 +38,5 @@ pystack
 py-spy
 ipdb
 mathruler==0.1.0
-jupyter_client>=8  # host-side ZMQ client for examples/deepeyes_v2_agentic apptainer_jupyter sandbox
 pyarrow==14.0.2
 boto3  # s3:// -> /dev/shm model downloader (relax/utils/s3_model_loader.py)

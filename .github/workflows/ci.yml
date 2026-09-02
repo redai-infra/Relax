@@ -98,6 +98,9 @@ jobs:
           os.makedirs(sp, exist_ok=True)
           with open(os.path.join(sp, 'transfer_queue.py'), 'w') as f:
               f.write('# CI stub for transfer_queue (internal package)\n')
+              f.write('class StreamingTokenBudgetSampler:\n')
+              f.write('    def __init__(self, *a, **k): self._states = {}\n')
+              f.write('class SeqlenBalancedSampler(StreamingTokenBudgetSampler): pass\n')
               f.write('class _Stub:\n')
               f.write('    def __getattr__(self, name): return self\n')
               f.write('    def __call__(self, *a, **k): return self\n')

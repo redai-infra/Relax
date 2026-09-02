@@ -31,7 +31,35 @@
 
 ### 安装方法
 
-（推荐）基于 Dockerfile 构建镜像：`docker build -f docker/Dockerfile.npu -t npu-2026 .`
+`docker/Dockerfile.npu` 采用多阶段构建：
+
+- `base`：系统依赖 + CANN 工具链层；
+- `train`：安装 torch_npu、MindSpeed、Megatron、sglang-npu 和 sgl-kernel-npu；
+- `relax`：安装 Relax 的 Python 运行时依赖，不复制或安装 Relax 源码。训练任务运行时挂载目标分支代码。
+
+通过 Makefile 一次构建并推送完整 Ascend 镜像，标签形如 `ascend-dev-YYYYMMDD-<hash8>`：
+
+```bash
+REGISTRY=<registry> make docker-ascend
+```
+
+910C DinD 使用传统 builder 时：
+
+```bash
+REGISTRY=<registry> ASCEND_DOCKER_BUILDKIT=0 make docker-ascend
+```
+
+可配置变量：`BASE_IMAGE`（默认 `quay.io/ascend/cann:8.5.1-a3-ubuntu22.04-py3.11`）、`SOC_VERSION`（默认 `ascend910_9391`）、`REGISTRY`、`DO_PUSH`（默认 `1`，设为 `0` 时不推送并检查本地镜像）、`ASCEND_DOCKER_BUILDKIT`（默认 `1`）。远端已存在同名镜像时会跳过构建。
+
+（可选，内部 QS 镜像）复用 `ml-engine/tools/relax-ci` 的 `docker/Dockerfile.qs`（纯 Python 依赖，架构无关，ARM64 可直接构建）。由 CI 先 checkout relax-ci，再指向其 `Dockerfile.qs`：
+
+```bash
+# 需先 checkout relax-ci，ASCEND_QS_DOCKERFILE 指向其 docker/Dockerfile.qs
+REGISTRY=<registry> \
+  ASCEND_QS_DOCKERFILE=<relax-ci>/docker/Dockerfile.qs \
+  ASCEND_QS_BASE_IMAGE=<registry>/relax:ascend-dev-YYYYMMDD-<hash8> \
+  make docker-qs-ascend
+```
 
 ## 启动配置
 

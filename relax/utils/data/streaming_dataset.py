@@ -33,7 +33,7 @@ import time
 from bisect import bisect_right
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 
 try:
@@ -357,15 +357,20 @@ class IndexManager:
     Tracks current position within the epoch.
     """
 
-    def __init__(self, total_size: int, seed: int = 42):
+    def __init__(self, total_size: int, seed: int = 42, index_pool: Iterable[int] | None = None):
         """Initialize the index manager.
 
         Args:
             total_size: Total number of samples
             seed: Random seed for reproducible shuffling
+            index_pool: Optional physical row IDs to shuffle instead of
+                ``range(total_size)``.
         """
         self.total_size = total_size
         self.seed = seed
+        self.index_pool = tuple(range(total_size)) if index_pool is None else tuple(index_pool)
+        if len(self.index_pool) != total_size:
+            raise ValueError(f"index_pool length {len(self.index_pool)} does not match total_size {total_size}")
         self.current_epoch = -1
         self.indices: Optional[list[int]] = None
         self.position = 0
@@ -380,7 +385,7 @@ class IndexManager:
             return
 
         random.seed(self.seed + epoch_id)
-        self.indices = list(range(self.total_size))
+        self.indices = list(self.index_pool)
         random.shuffle(self.indices)
         self.current_epoch = epoch_id
         self.position = 0

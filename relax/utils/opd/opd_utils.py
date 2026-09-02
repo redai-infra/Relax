@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_opsd_worker
 
@@ -167,9 +168,10 @@ def create_managed_opd_teacher_manager(
     from relax.distributed.ray.teacher_manager import TeacherManager
 
     teacher_manager = TeacherManager.options(
-        num_cpus=1,
-        num_gpus=0,
-        runtime_env=runtime_env,
+        **with_control_plane_affinity(
+            args,
+            {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
+        )
     ).remote(
         args,
         num_replicas,
@@ -340,9 +342,10 @@ def _start_managed_multi_teacher(
         teacher_args.teacher_hf_checkpoint = checkpoint_path
 
         teacher_manager = TeacherManager.options(
-            num_cpus=1,
-            num_gpus=0,
-            runtime_env=runtime_env,
+            **with_control_plane_affinity(
+                teacher_args,
+                {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
+            )
         ).remote(
             teacher_args,
             replicas_per_teacher,

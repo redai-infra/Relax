@@ -100,8 +100,6 @@ ROLLOUT_ARGS=(
       "NEMO_GYM_LEASE_S=60"
     --agent-timeout 660
     --agentic-tool-call-parser qwen
-    --agentic-prepare-pool-size 1
-
     --num-rollout 1
     --rollout-batch-size 1
     --n-samples-per-prompt 2

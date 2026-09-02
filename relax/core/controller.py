@@ -5,31 +5,23 @@ import threading
 import time
 import traceback
 from argparse import Namespace
+from enum import Enum, IntEnum
+from functools import partial
 from typing import Any
 
 import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from transfer_queue import GRPOGroupNSampler, SeqlenBalancedSampler
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
+from transfer_queue import SeqlenBalancedSampler
 
-
-try:
-    from transfer_queue import StreamingTokenBudgetSampler
-except ImportError as e:
-    raise ImportError(
-        "transfer_queue is out of date (missing StreamingTokenBudgetSampler). Upgrade with:\n"
-        '    pip install "transferqueue @ git+https://github.com/redai-infra/'
-        'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps\n'
-        "or use the latest image."
-    ) from e
-
-from relax.agentic.pipeline.runtime import clear_agentic_runtime_caches
+from relax import utils as relax_utils
 from relax.agentic.session.service import (
     deploy_agentic_chat_api_services,
     shutdown_agentic_chat_api_services,
 )
+from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
@@ -38,6 +30,7 @@ from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrie
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
+from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
@@ -47,9 +40,19 @@ from relax.utils.opd.opd_utils import (
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
 )
-from relax.utils.s3_model_loader import cleanup_s3_model_weights_from_shm
+from relax.utils.s3_model_loader import (
+    cleanup_s3_model_weights_from_shm,
+    is_s3_uri,
+    prepare_local_model,
+    remove_stale_s3_model_caches,
+)
 from relax.utils.training.ppo_utils import validate_ppo_config
 from relax.utils.utils import compute_dp_size, recovery_load_path
+
+
+def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
+    actor_cls = ray.remote(num_cpus=1)(data_source_cls)
+    return actor_cls.options(**with_control_plane_affinity(config)).remote(config)
 
 
 def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
@@ -71,6 +74,22 @@ ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", "genrm"]
 _S3_MODEL_CLEANUP_SAFE_LOAD_FORMATS = {"dummy", "runai_streamer"}
 
 
+class ModelCompleteness(IntEnum):
+    NONE = 0
+    METADATA = 1
+    FULL = 2
+
+
+class ServiceStartupPhase(str, Enum):
+    ALLOCATE_RESOURCES = "allocate resources"
+    DEPLOY = "deploy"
+
+
+def _uses_s3_model_prefetch(config: Namespace) -> bool:
+    source = getattr(config, "model_source", None)
+    return source is not None and is_s3_uri(source.uri)
+
+
 def _require_positive_timeout(value: float, env_name: str) -> float:
     if value <= 0:
         raise ValueError(f"{env_name} must be greater than 0, got {value}")
@@ -79,6 +98,18 @@ def _require_positive_timeout(value: float, env_name: str) -> float:
 
 def _cleanup_s3_model_weights_on_node(config: Namespace) -> tuple[int, int]:
     return cleanup_s3_model_weights_from_shm(config)
+
+
+def _current_node_id() -> str:
+    return ray.get_runtime_context().get_node_id()
+
+
+def _remove_stale_s3_model_caches_on_node(config: Namespace) -> tuple[int, int]:
+    return remove_stale_s3_model_caches(config)
+
+
+def _prefetch_s3_model_on_node(config: Namespace, completeness: ModelCompleteness) -> str:
+    return prepare_local_model(config, completeness=completeness.name.lower()).path
 
 
 def _can_cleanup_s3_model_weights(config: Namespace, serve_dict: dict) -> bool:
@@ -121,7 +152,8 @@ class Controller:
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
-        self._health_manager = HealthManager(check_interval=1.0)
+        require_control_plane_resource(config)
+        self._health_manager = HealthManager(check_interval=1.0, config=config)
         self._restarting = False  # Flag to indicate a restart is in progress
         self._restart_done_event = threading.Event()  # Signals main thread that global restart Phase 1+2 is done
         self._restart_error = None  # Stores any error from the global restart thread
@@ -131,6 +163,8 @@ class Controller:
             self._pending_task_refs_lock = threading.Lock()
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
+        self._model_cache_node_bindings: dict[str, tuple[Any, int]] = {}
+        self._model_cache_node_ids: set[str] = set()
 
         # SFT: fill in num_rollout / num_rollout_per_epoch before any actor
         # is launched (RL is resolved later in placement_group.py).
@@ -138,7 +172,9 @@ class Controller:
 
         # Initialize data management system
         self._initialize_data_system()
-        self.dcs, self.config.coordinator_url = create_dcs_deployment()
+        self.dcs, self.config.coordinator_url = create_dcs_deployment(
+            ray_actor_options=with_control_plane_affinity(config, {"num_cpus": 1})
+        )
 
         self._metrics_service_enabled = getattr(config, "use_metrics_service", False)
         if self._metrics_service_enabled:
@@ -175,26 +211,23 @@ class Controller:
         else:
             logger.info("Global health check system disabled (use --use-health-check to enable)")
 
-    def _cleanup_s3_model_weights_after_init(self) -> None:
+    def _cleanup_s3_model_weights_after_init(self, *, force: bool = False) -> None:
         """Remove policy weight shards after every startup consumer is
         ready."""
         if getattr(self.config, "disable_s3_model_cleanup", False):
             logger.info("S3 model SHM cleanup is disabled")
             return
-        if getattr(self.config, "model_source", None) is None:
+        if not _uses_s3_model_prefetch(self.config):
             return
-        if not _can_cleanup_s3_model_weights(self.config, self.serve_dict):
+        if not force and not _can_cleanup_s3_model_weights(self.config, self.serve_dict):
             logger.info("Keeping S3 model weights in SHM because the rollout load plan may retain SHM-backed weights")
             return
 
         cleanup_task = ray.remote(num_cpus=0, max_retries=0)(_cleanup_s3_model_weights_on_node)
         refs = []
-        for node in ray.nodes():
-            if not node.get("Alive", False):
-                continue
-            node_id = node.get("NodeID")
-            if not node_id:
-                continue
+        alive_node_ids = {node["NodeID"] for node in ray.nodes() if node.get("Alive") and node.get("NodeID")}
+        target_node_ids = getattr(self, "_model_cache_node_ids", set()) or alive_node_ids
+        for node_id in sorted(target_node_ids & alive_node_ids):
             refs.append(
                 cleanup_task.options(
                     scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
@@ -242,34 +275,26 @@ class Controller:
 
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
-        batch_size_for_capacity = (
-            self.config.over_sampling_batch_size
-            if self.config.partial_rollout and self.config.use_dynamic_global_batch_size
-            else self.config.rollout_batch_size
-        )
-        total_storage_size = (
-            batch_size_for_capacity * (self.config.max_staleness + 1) * self.config.n_samples_per_prompt
-        )
+        dp_size = compute_dp_size(self.config)
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
-            # Fully-async + dynamic-batch path streams data per DP via token
-            # budget; the controller-side sampler maintains per-DP buckets and
-            # balances tokens at small-unit granularity.  See
-            # docs/zh/guide/fully-async-training.md.
-            sampler = StreamingTokenBudgetSampler(
-                n_samples_per_prompt=self.config.n_samples_per_prompt,
+            sampler = IdentityWindowSampler(
+                dp_size=dp_size,
+                placement="streaming",
+                balance_unit_multiplier=self.config.n_samples_per_prompt,
             )
-            logger.info("Using StreamingTokenBudgetSampler (fully_async + dynamic batch)")
-        elif algo_key == "sft" or getattr(self.config, "balance_data", False):
-            # SFT walks the SeqlenBalancedSampler branch (sequential / balanced sampling),
-            # since the GRPO grouped sampler assumes n_samples_per_prompt > 1 rollouts.
-            dp_size = compute_dp_size(self.config)
+            logger.info("Using IdentityWindowSampler (fully_async + dynamic batch)")
+        elif algo_key == "sft":
             sampler = SeqlenBalancedSampler(
                 n_samples_per_prompt=self.config.n_samples_per_prompt,
                 dp_size=dp_size,
             )
             logger.info(f"Using SeqlenBalancedSampler with dp_size={dp_size}")
+        elif getattr(self.config, "balance_data", False):
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="balanced")
+            logger.info(f"Using IdentityWindowSampler with balanced row placement, dp_size={dp_size}")
         else:
-            sampler = GRPOGroupNSampler(n_samples_per_prompt=self.config.n_samples_per_prompt)
+            sampler = IdentityWindowSampler(dp_size=dp_size, placement="sequential")
+            logger.info(f"Using IdentityWindowSampler with sequential row placement, dp_size={dp_size}")
 
         tq_config = OmegaConf.create(
             {
@@ -279,7 +304,6 @@ class Controller:
                 },
                 "backend": {
                     "SimpleStorage": {
-                        "total_storage_size": total_storage_size,
                         "num_data_storage_units": self.config.num_data_storage_units,
                     },
                 },
@@ -298,7 +322,9 @@ class Controller:
         """
         from relax.utils.metrics.service import MetricsService
 
-        deployment = MetricsService.bind(
+        deployment = MetricsService.options(
+            ray_actor_options=with_control_plane_affinity(self.config, {"num_cpus": 1})
+        ).bind(
             healthy=self._health_manager.status,
             pg=None,
             config=self.config,
@@ -316,7 +342,9 @@ class Controller:
         """
         from relax.utils.autoscaler.autoscaler_service import AutoscalerService
 
-        deployment = AutoscalerService.bind(
+        deployment = AutoscalerService.options(
+            ray_actor_options=with_control_plane_affinity(self.config, {"num_cpus": 1})
+        ).bind(
             healthy=self._health_manager.status,
             pg=None,
             autoscaler_config=self._autoscaler_config,
@@ -380,7 +408,16 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to report fatal error to metrics service: {e}")
 
-    def _create_service_task(self, role, cls, num_gpus, data_source, actor_rollout_pgs, actor_rollout_pg_roles=None):
+    def _create_service_task(
+        self,
+        role,
+        cls,
+        num_gpus,
+        data_source,
+        actor_rollout_pgs,
+        actor_rollout_pg_roles=None,
+        defer_deploy=False,
+    ):
         """Create a single service.
 
         Returns (role, service, error).
@@ -396,6 +433,7 @@ class Controller:
                 num_gpus=num_gpus,
                 data_source=data_source,
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
+                defer_deploy=defer_deploy,
                 runtime_env=self.runtime_env,
             )
             logger.info(f"Service {role} has been created successfully")
@@ -403,6 +441,167 @@ class Controller:
         except Exception as e:
             logger.exception(f"Failed to create service {role}: {e}")
             return (role, None, str(e))
+
+    @staticmethod
+    def _deploy_service_task(role, service):
+        try:
+            service.deploy()
+            return (role, service, None)
+        except Exception as e:
+            logger.exception(f"Failed to deploy service {role}: {e}")
+            return (role, None, str(e))
+
+    def _run_service_phase(
+        self,
+        phase: ServiceStartupPhase,
+        task: Any,
+        task_args: list[tuple],
+    ) -> dict[Any, Service]:
+        """Run one prepare/deploy phase with the existing startup
+        concurrency."""
+        if not task_args:
+            return {}
+        if self.config.fully_async:
+            logger.info(f"Using parallel service {phase.value} mode with {len(task_args)} services")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(task_args)) as executor:
+                futures = [executor.submit(task, *args) for args in task_args]
+                results = [future.result() for future in concurrent.futures.as_completed(futures)]
+        else:
+            logger.info(f"Using serial service {phase.value} mode (fully_async=False)")
+            results = [task(*args) for args in task_args]
+
+        failed_roles = [(role, error) for role, _service, error in results if error is not None]
+        if failed_roles:
+            error_msg = "; ".join(f"{role}: {error}" for role, error in failed_roles)
+            raise RuntimeError(f"Failed to {phase.value} {len(failed_roles)} services: {error_msg}")
+        return {role: service for role, service, _error in results}
+
+    def _start_services(self, service_args: list[tuple]) -> list[Any]:
+        """Start services, staging deployment only when S3 prefetch needs
+        placement groups."""
+        if not _uses_s3_model_prefetch(self.config):
+            services = self._run_service_phase(
+                ServiceStartupPhase.DEPLOY,
+                self._create_service_task,
+                service_args,
+            )
+            self.serve_dict.update(services)
+            return []
+
+        prepared_services = self._run_service_phase(
+            ServiceStartupPhase.ALLOCATE_RESOURCES,
+            partial(self._create_service_task, defer_deploy=True),
+            service_args,
+        )
+        service_pgs = {role: service.pgs for role, service in prepared_services.items()}
+        model_prefetch_refs = self._start_model_prefetch(service_pgs)
+        services = self._run_service_phase(
+            ServiceStartupPhase.DEPLOY,
+            self._deploy_service_task,
+            list(prepared_services.items()),
+        )
+        self.serve_dict.update(services)
+        return model_prefetch_refs
+
+    @staticmethod
+    def _policy_model_completeness(
+        config: Namespace,
+        role: Any,
+        *,
+        shares_actor_pg: bool,
+    ) -> ModelCompleteness:
+        role_name = str(role)
+        if role_name in {"actor", "critic", "reference", "actor_fwd"}:
+            return ModelCompleteness.FULL
+        if role_name != "rollout" or getattr(config, "rollout_external", False):
+            return ModelCompleteness.NONE
+        if getattr(config, "sglang_config", None) is not None:
+            return ModelCompleteness.FULL
+        load_format = getattr(config, "sglang_load_format", "auto")
+        if load_format == "dummy":
+            return ModelCompleteness.METADATA
+        if load_format == "runai_streamer":
+            return ModelCompleteness.NONE
+        if load_format == "auto":
+            return ModelCompleteness.FULL if shares_actor_pg else ModelCompleteness.NONE
+        return ModelCompleteness.FULL
+
+    def _start_model_prefetch(self, service_pgs: dict[Any, Any]) -> list[Any]:
+        cleanup_task = ray.remote(num_cpus=0, max_retries=0)(_remove_stale_s3_model_caches_on_node)
+        accelerator = device_utils.get_ray_accelerator_name()
+        cleanup_node_ids = sorted(
+            node["NodeID"]
+            for node in ray.nodes()
+            if node.get("Alive") and node.get("NodeID") and float(node.get("Resources", {}).get(accelerator, 0)) > 0
+        )
+        cleanup_refs = [
+            cleanup_task.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
+            ).remote(self.config)
+            for node_id in cleanup_node_ids
+        ]
+        if cleanup_refs:
+            ray.get(cleanup_refs)
+
+        source = getattr(self.config, "model_source", None)
+        if source is None or not is_s3_uri(source.uri):
+            return []
+
+        probe = ray.remote(num_cpus=0, max_retries=0)(_current_node_id)
+        role_nodes: dict[Any, set[str]] = {}
+        seen_pgs: dict[int, set[str]] = {}
+        for role, pgs in service_pgs.items():
+            if pgs is None:
+                role_nodes[role] = set()
+                continue
+            pg, bundle_indices, _gpu_ids = pgs
+            if id(pg) not in seen_pgs:
+                refs = [
+                    probe.options(
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=bundle_index,
+                        )
+                    ).remote()
+                    for bundle_index in bundle_indices
+                ]
+                resolved_node_ids = ray.get(refs)
+                node_ids = set(resolved_node_ids)
+                seen_pgs[id(pg)] = node_ids
+                for node_id, bundle_index in zip(resolved_node_ids, bundle_indices, strict=True):
+                    self._model_cache_node_bindings.setdefault(node_id, (pg, bundle_index))
+            role_nodes[role] = seen_pgs[id(pg)]
+
+        actor_pgs = next((pgs for role, pgs in service_pgs.items() if str(role) == "actor"), None)
+        node_completeness: dict[str, ModelCompleteness] = {}
+        for role, node_ids in role_nodes.items():
+            role_pgs = service_pgs[role]
+            shares_actor_pg = actor_pgs is not None and role_pgs is not None and role_pgs[0] is actor_pgs[0]
+            completeness = self._policy_model_completeness(
+                self.config,
+                role,
+                shares_actor_pg=shares_actor_pg,
+            )
+            if completeness == ModelCompleteness.NONE:
+                continue
+            for node_id in node_ids:
+                node_completeness[node_id] = max(
+                    completeness,
+                    node_completeness.get(node_id, ModelCompleteness.NONE),
+                )
+
+        self._model_cache_node_ids = set(node_completeness)
+
+        prefetch_task = ray.remote(num_cpus=0, max_retries=0)(_prefetch_s3_model_on_node)
+        return [
+            prefetch_task.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=self._model_cache_node_bindings[node_id][0],
+                    placement_group_bundle_index=self._model_cache_node_bindings[node_id][1],
+                )
+            ).remote(self.config, completeness)
+            for node_id, completeness in node_completeness.items()
+        ]
 
     def _validate_gpu_resources(self, roles_to_create, colocate, actor_rollout_pg_roles):
         """Validate that the cluster has enough GPUs before creating placement
@@ -507,7 +706,7 @@ class Controller:
                 continue
             if str(role) == "rollout":
                 data_source_cls = load_function(self.config.data_source_path)
-                data_source = ray.remote(num_cpus=1)(data_source_cls).remote(self.config)
+                data_source = create_data_source_actor(self.config, data_source_cls)
             else:
                 data_source = None
             # Optional roles (e.g. reference) may be absent from resource config
@@ -524,6 +723,7 @@ class Controller:
             roles_to_create.append((role, cls, num_gpus, data_source))
 
         self._maybe_resolve_num_rollout(roles_to_create)
+        relax_utils.report_train_start(self.config)
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
@@ -540,76 +740,25 @@ class Controller:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
 
-        # Choose creation strategy based on config
-        if not self.config.fully_async:
-            # Serial/blocking creation to preserve placement-group ordering
-            logger.info("Using serial creation mode (fully_async=False)")
-            for role, cls, num_gpus, data_source in roles_to_create:
-                role, service, error = self._create_service_task(
-                    role, cls, num_gpus, data_source, actor_rollout_pgs, actor_rollout_pg_roles
-                )
-                if error is not None:
-                    raise RuntimeError(f"Failed to create service {role}: {error}")
-                self.serve_dict[role] = service  # type: ignore
-        else:
-            # Parallel creation using ThreadPool to ensure all services are registered
-            logger.info(f"Using parallel creation mode (fully_async=True) with {len(roles_to_create)} services")
+        service_args = [
+            (
+                role,
+                cls,
+                num_gpus,
+                data_source,
+                actor_rollout_pgs,
+                actor_rollout_pg_roles,
+            )
+            for role, cls, num_gpus, data_source in roles_to_create
+        ]
+        # S3 prefetch needs the final placement groups before Ray Serve starts
+        # the consumers. Other model sources preserve constructor-immediate
+        # deployment inside Service.
+        model_prefetch_refs = self._start_services(service_args)
 
-            # Use ThreadPoolExecutor (not ProcessPoolExecutor) to avoid pickling issues
-            # ThreadPoolExecutor shares the same process memory, no serialization needed
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(roles_to_create)) as executor:
-                # Submit all creation tasks and collect futures
-                futures_dict = {}
-                for role, cls, num_gpus, data_source in roles_to_create:
-                    future = executor.submit(
-                        self._create_service_task,
-                        role,
-                        cls,
-                        num_gpus,
-                        data_source,
-                        actor_rollout_pgs,
-                        actor_rollout_pg_roles,
-                    )
-                    futures_dict[future] = role
-
-                # Wait for ALL futures to complete before proceeding
-                # This is critical: ALL_COMPLETED ensures we don't proceed until all services are created
-                done, not_done = concurrent.futures.wait(
-                    futures_dict.keys(),
-                    timeout=None,  # Wait indefinitely for all tasks to complete
-                    return_when=concurrent.futures.ALL_COMPLETED,
-                )
-
-                # Collect results from completed futures
-                failed_roles = []
-                completed_count = 0
-
-                for future in done:
-                    try:
-                        role, service, error = future.result()
-                        if error is not None:
-                            failed_roles.append((role, error))
-                            logger.error(f"Service {role} creation failed: {error}")
-                        else:
-                            self.serve_dict[role] = service  # type: ignore
-                            completed_count += 1
-                            logger.info(f"Service {role} registered ({completed_count}/{len(roles_to_create)})")
-                    except Exception as e:
-                        logger.exception(f"Exception while processing service creation result: {e}")
-                        role = futures_dict[future]
-                        failed_roles.append((role, str(e)))
-
-                # Check for any incomplete futures (shouldn't happen with ALL_COMPLETED)
-                if not_done:
-                    logger.error(f"Some service creation tasks did not complete: {len(not_done)}")
-                    for future in not_done:
-                        role = futures_dict[future]
-                        failed_roles.append((role, "Timeout or incomplete"))
-
-                # Raise error if any service creation failed
-                if failed_roles:
-                    error_msg = "; ".join([f"{r}: {e}" for r, e in failed_roles])
-                    raise RuntimeError(f"Failed to register {len(failed_roles)} services: {error_msg}")
+        if model_prefetch_refs:
+            ray.get(model_prefetch_refs)
+            logger.info(f"S3 model prefetch completed on {len(model_prefetch_refs)} consumer nodes")
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
 
@@ -644,14 +793,10 @@ class Controller:
         except Exception as e:
             logger.error(f"Failed to report error to metrics service: {e}")
 
-    def _shutdown_agentic_rollout_services(self, *, warning_prefix: str = "") -> None:
+    def _shutdown_agentic_rollout_services(self) -> None:
         if not self.config.use_agentic_rollout:
             return
         shutdown_agentic_chat_api_services()
-        try:
-            clear_agentic_runtime_caches()
-        except Exception as e:
-            logger.warning(f"{warning_prefix}Failed to clear agentic runtime caches: {e}")
 
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
@@ -805,6 +950,11 @@ class Controller:
         shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
+
+        try:
+            self._cleanup_s3_model_weights_after_init(force=True)
+        except Exception as e:
+            logger.warning(f"Failed to clean S3 model SHM cache during shutdown: {e}")
 
         logger.info("Controller shutdown complete.")
 
@@ -987,7 +1137,7 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to delete metrics deployment: {e}")
 
-        self._shutdown_agentic_rollout_services(warning_prefix="[Global Restart] ")
+        self._shutdown_agentic_rollout_services()
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:

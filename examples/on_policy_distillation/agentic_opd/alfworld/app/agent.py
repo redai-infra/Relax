@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 from openai import APIStatusError, AsyncOpenAI
 
 from app.env_alfworld import AlfworldEnv
@@ -55,7 +54,7 @@ async def run_alfworld(metadata: dict[str, Any]) -> dict[str, Any]:
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"],
-        timeout=httpx.Timeout(timeout=900.0, connect=30.0),
+        timeout=9999,
     )
 
     won = False

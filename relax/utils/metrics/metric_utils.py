@@ -185,12 +185,14 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     }
 
 
-def compute_rollout_explicit_reward_metrics(
+def compute_rollout_reward_metrics(
     args,
     samples: list[Sample],
     *,
     include_rloo_diagnostics: bool = True,
 ) -> dict[str, float]:
+    reward_values = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
+    log_dict = {"raw_reward": np.mean(reward_values).item()} if reward_values else {}
     reward_metric_values: dict[str, list[float]] = {}
     primary_reward_key = getattr(args, "reward_key", None)
     for sample in samples:
@@ -207,19 +209,20 @@ def compute_rollout_explicit_reward_metrics(
             ):
                 continue
             append_rollout_numeric_metric_values(reward_metric_values, key=key, value=value)
-    log_dict = finalize_rollout_explicit_metric_values(reward_metric_values)
-    if args.log_passrate:
-        rewards = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
-        if rewards:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(flat_rewards=rewards, group_size=args.n_samples_per_prompt),
-                "passrate/",
-            )
+    log_dict |= finalize_rollout_explicit_metric_values(reward_metric_values)
+    if args.log_passrate and reward_values:
+        log_dict |= dict_add_prefix(
+            compute_pass_rate(flat_rewards=reward_values, group_size=args.n_samples_per_prompt),
+            "passrate/",
+        )
 
     if include_rloo_diagnostics:
         log_dict |= _compute_rloo_group_diagnostics(args, samples)
 
     return log_dict
+
+
+compute_rollout_explicit_reward_metrics = compute_rollout_reward_metrics
 
 
 def compression_ratio(

@@ -5,6 +5,10 @@ import socket
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from relax.core.node_group_affinity import (
+    require_control_plane_resource_on_node,
+    with_control_plane_affinity,
+)
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -89,15 +93,21 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     # and other components expect the router to be accessible at the head node's IP
     head_node_id = _get_head_node_id()
     logger.info(f"Scheduling RolloutManager on head node: {head_node_id}")
+    require_control_plane_resource_on_node(args, head_node_id)
 
     rollout_manager = RolloutManager.options(
-        num_cpus=1,
-        num_gpus=0,
-        runtime_env=runtime_env,
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=head_node_id,
-            soft=False,  # Hard constraint: must run on the specified node
-        ),
+        **with_control_plane_affinity(
+            args,
+            {
+                "num_cpus": 1,
+                "num_gpus": 0,
+                "runtime_env": runtime_env,
+                "scheduling_strategy": NodeAffinitySchedulingStrategy(
+                    node_id=head_node_id,
+                    soft=False,  # Hard constraint: must run on the specified node
+                ),
+            },
+        )
     ).remote(args, pg, data_source=data_source)
 
     # Add timeout protection to prevent indefinite blocking during initialization
@@ -160,10 +170,15 @@ def create_genrm_manager(args, pg, runtime_env=None):
     # Used by custom_reward_post_process_path when GenRM lifecycle is managed
     # from userland.
     genrm_manager = GenRMManager.options(
-        name="relax_genrm_manager",
-        num_cpus=1,
-        num_gpus=0,
-        runtime_env=runtime_env,
+        **with_control_plane_affinity(
+            args,
+            {
+                "name": "relax_genrm_manager",
+                "num_cpus": 1,
+                "num_gpus": 0,
+                "runtime_env": runtime_env,
+            },
+        )
     ).remote(args, pg)
 
     logger.info("GenRMManager initialized successfully")

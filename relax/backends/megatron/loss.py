@@ -18,12 +18,13 @@ from relax.utils.opd.opd_utils import (
     resolve_opd_gather_topk_token_ids,
     validate_opd_topk_gather,
 )
+from relax.utils.replay import capture_hooks
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_cispo_loss,
     compute_gspo_kl,
-    compute_log_probs,
+    compute_m2po_loss,
     compute_opsm_mask,
     compute_policy_loss,
     compute_rloo_loss,
@@ -310,9 +311,8 @@ def get_log_probs_and_entropy(
 
     For each sample, extracts response-aligned logits and tokens, then computes
     log-probabilities via softmax across the tensor-parallel group. Log-probs
-    are squeezed from `[R, 1]` to `[R]`. Entropy values are always appended
-    (even when `with_entropy=False`), but only included in the result dict
-    when requested.
+    are squeezed from `[R, 1]` to `[R]`. When entropy is requested only as a
+    metric (`entropy_coef == 0`), its backward activations are not retained.
 
     Args:
         logits: Policy logits with shape `[1, T, V]`. When ``lm_head_forward``
@@ -368,6 +368,9 @@ def get_log_probs_and_entropy(
             sft_chunk_size = 1024
     resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
     tp_group = mpu.get_tensor_model_parallel_group()
+    # Keep entropy metrics, but skip saving entropy-backward activations when
+    # the entropy term cannot affect the loss.
+    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
     log_probs_list = []
     entropy_list = []
     topk_token_ids_list = []
@@ -398,14 +401,19 @@ def get_log_probs_and_entropy(
                 logits_sub = logits_sub.squeeze(1).float()
                 if args.rollout_temperature != 1.0:
                     logits_sub = logits_sub / args.rollout_temperature
-                chunk_lps.append(compute_log_probs(logits_sub, tokens_chunk[s:e], tp_group).squeeze(-1))
+                log_prob_sub, _ = calculate_log_probs_and_entropy(
+                    logits_sub,
+                    tokens_chunk[s:e],
+                    tp_group,
+                    with_entropy=False,
+                )
+                chunk_lps.append(log_prob_sub.squeeze(-1))
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
                 if chunk_lps
-                # fp32 to match compute_log_probs's return dtype (Megatron's
-                # fused_vocab_parallel_cross_entropy returns fp32 because we
-                # upcast logits with .float() above). Mismatch would break the
-                # downstream torch.cat over per-sample log_probs.
+                # fp32 to match calculate_log_probs_and_entropy's return dtype;
+                # logits are upcast above. A mismatch would break the downstream
+                # torch.cat over per-sample log-probabilities.
                 else logits_chunk.new_zeros((0,), dtype=torch.float32)
             )
             entropy = None
@@ -415,6 +423,7 @@ def get_log_probs_and_entropy(
                 tokens_chunk,
                 tp_group,
                 with_entropy=with_entropy,
+                with_entropy_grad=with_entropy_grad,
                 chunk_size=args.log_probs_chunk_size,
             )
             log_prob = log_prob.squeeze(-1)
@@ -576,11 +585,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "rloo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
-        # TODO: is the copy necessary?
-        advantages = [r for r in returns]  # noqa: C416
+        advantages = returns.copy()
 
     elif args.advantage_estimator == "ppo":
         old_rewards = rewards
@@ -979,6 +987,10 @@ def policy_loss_function(
             eps_clip=args.eps_clip,
             eps_clip_high=args.eps_clip_high,
         )
+    elif args.advantage_estimator == "m2po":
+        pg_loss, pg_clipfrac, _m2_now, _m2_after, _eps_low, _eps_high = compute_m2po_loss(
+            ppo_kl, advantages, args.m2po_kl2_budget, args.m2po_miniclip_low, args.m2po_miniclip_high
+        )
     elif args.advantage_estimator == "rloo":
         pg_loss, pg_clipfrac = compute_rloo_loss(
             log_probs=log_probs,
@@ -1027,8 +1039,8 @@ def policy_loss_function(
             tis_func = vanilla_tis_function
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
-        # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-        # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
+        # Rebuild with the modified numerator mask while preserving the original
+        # logical-sample denominator. The masks are sliced with CP in the reducer.
         sum_of_sample_mean = get_sum_of_sample_mean(
             total_lengths,
             response_lengths,
@@ -1039,6 +1051,7 @@ def policy_loss_function(
             padded_total_lengths,
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+            sample_denoms=batch.get("sample_index_mask_sums", None),
         )
         if is_reinforce_plus_plus:
             sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
@@ -1128,6 +1141,20 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
     }
 
+    # Trajectory-replay capture: record the loss.policy stage. No-op unless
+    # capture is enabled and this step is selected (single global read).
+    capture_hooks.capture_policy_loss(
+        old_log_probs=old_log_probs,
+        log_probs=log_probs,
+        entropy=entropy,
+        advantages=advantages,
+        loss_masks=batch["loss_masks"],
+        response_lengths=response_lengths,
+        total_lengths=total_lengths,
+        reported_loss=reported_loss,
+        micro_batch_index=batch.get("replay_micro_batch_index"),
+    )
+
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
         reported_loss["train_rollout_prob_abs_diff"] = train_rollout_prob_abs_diff.clone().detach()
@@ -1148,6 +1175,12 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    if args.advantage_estimator == "m2po":
+        reported_loss["ppo_kl_m2_before"] = torch.tensor(_m2_now, device=ppo_kl.device).detach()
+        reported_loss["ppo_kl_m2_after"] = torch.tensor(_m2_after, device=ppo_kl.device).detach()
+        reported_loss["m2po_eps_low"] = torch.tensor(_eps_low, device=ppo_kl.device).detach()
+        reported_loss["m2po_eps_high"] = torch.tensor(_eps_high, device=ppo_kl.device).detach()
 
     return loss, reported_loss
 
@@ -1265,6 +1298,91 @@ def sft_loss_function(
     )
 
 
+def get_sequence_classification_outputs(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, list[int]]:
+    """Pool one classification logit vector per sample on the owning CP
+    rank."""
+    local_logits: list[torch.Tensor] = []
+    local_indices: list[int] = []
+    for sample_idx, (logits_chunk, _) in enumerate(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens", None),
+            padded_total_lengths=batch.get("padded_total_lengths", None),
+            apply_temperature=False,
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
+    ):
+        if logits_chunk.shape[0] == 0:
+            continue
+        if logits_chunk.shape != (1, int(args.num_labels)):
+            raise ValueError(
+                "sequence classification pooling expected one logit vector with shape "
+                f"(1, {args.num_labels}), got {tuple(logits_chunk.shape)} for sample {sample_idx}"
+            )
+        local_logits.append(logits_chunk.squeeze(0))
+        local_indices.append(sample_idx)
+
+    if not local_logits:
+        return logits.new_empty((0, int(args.num_labels))), local_indices
+    return torch.stack(local_logits, dim=0), local_indices
+
+
+def sequence_classification_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute single-label CE or multi-label BCE on last-valid-token
+    logits."""
+    labels = batch.get("classification_labels")
+    if labels is None:
+        raise ValueError("sequence classification batch is missing classification_labels")
+
+    metric_name = "accuracy" if args.problem_type == "single_label_classification" else "subset_accuracy"
+    local_logits, local_indices = get_sequence_classification_outputs(args, batch, logits)
+    if local_indices:
+        local_labels = [labels[i] for i in local_indices]
+        if args.problem_type == "single_label_classification":
+            label_tensor = torch.stack([torch.as_tensor(label).reshape(()) for label in local_labels]).to(
+                device=local_logits.device, dtype=torch.long
+            )
+            per_sample_loss = F.cross_entropy(local_logits, label_tensor, reduction="none")
+            per_sample_correct = (local_logits.argmax(dim=-1) == label_tensor).float()
+        else:
+            label_tensor = torch.stack([torch.as_tensor(label).reshape(-1) for label in local_labels]).to(
+                device=local_logits.device, dtype=torch.float32
+            )
+            if label_tensor.shape != local_logits.shape:
+                raise ValueError(
+                    f"multi-label targets must have shape {tuple(local_logits.shape)}, got {tuple(label_tensor.shape)}"
+                )
+            per_sample_loss = F.binary_cross_entropy_with_logits(
+                local_logits,
+                label_tensor,
+                reduction="none",
+            ).mean(dim=-1)
+            predictions = torch.sigmoid(local_logits) >= args.classification_threshold
+            per_sample_correct = predictions.eq(label_tensor.bool()).all(dim=-1).float()
+
+        loss = sum_of_sample_mean(per_sample_loss)
+        accuracy = sum_of_sample_mean(per_sample_correct)
+    else:
+        loss = logits.sum() * 0.0
+        accuracy = logits.detach().sum() * 0.0
+
+    return loss, {"loss": loss.detach(), metric_name: accuracy.detach()}
+
+
 def sft_loss_function_chunked(
     args: Namespace,
     batch: RolloutBatch,
@@ -1310,6 +1428,18 @@ def sft_loss_function_chunked(
     return loss, {"loss": loss.clone().detach()}
 
 
+def mtp_only_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Trigger the attached MTP auxiliary loss without a main language loss."""
+    del args, batch, sum_of_sample_mean
+    loss = 0.0 * hidden_states.sum()
+    return loss, {"loss": loss.detach()}
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1345,7 +1475,9 @@ def loss_function(
         - `normalizer` is `num_tokens` (scalar tensor) if
           `args.calculate_per_token_loss` is True, else `1` (int).
         - `logging_dict` has keys "keys" (list of str metric names) and
-          "values" (1D tensor: [count, metric1, metric2, ...]).
+          "values" (1D tensor: [denominator, metric1, metric2, ...]). The
+          denominator is the token count for per-token loss and a zero
+          placeholder for sample-mean loss.
     """
     # CP-local token count (tokens whose loss this rank actually contributes).
     # Summed across the CP group in finalize_model_grads / the metric all-reduce,
@@ -1363,7 +1495,6 @@ def loss_function(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
-    num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1375,25 +1506,31 @@ def loss_function(
         batch.get("padded_total_lengths", None),
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        sample_denoms=batch.get("sample_index_mask_sums", None),
     )
 
-    match args.loss_type:
-        case "policy_loss":
-            func = policy_loss_function
-        case "value_loss":
-            func = value_loss_function
-        case "sft":
-            if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
-                # Bind lm_head_forward so chunked path matches the standard
-                # inner-func signature; outer body (recompute, CP guard,
-                # Megatron scaling, return-tuple) is then shared with legacy.
-                func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
-            else:
-                func = sft_loss_function
-        case "custom_loss":
-            func = load_function(args.custom_loss_function_path)
-        case _:
-            raise ValueError(f"Unknown loss type: {args.loss_type}")
+    if getattr(args, "mtp_only_training", False):
+        func = mtp_only_loss_function
+    else:
+        match args.loss_type:
+            case "policy_loss":
+                func = policy_loss_function
+            case "value_loss":
+                func = value_loss_function
+            case "sft":
+                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                    func = sequence_classification_loss_function
+                elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                    # Bind lm_head_forward so chunked path matches the standard
+                    # inner-func signature; outer body (recompute, CP guard,
+                    # Megatron scaling, return-tuple) is then shared with legacy.
+                    func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
+                else:
+                    func = sft_loss_function
+            case "custom_loss":
+                func = load_function(args.custom_loss_function_path)
+            case _:
+                raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
         loss, log = checkpoint(
@@ -1406,6 +1543,13 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    # M2PO scalar metrics are global (not per-token). When calculate_per_token_loss=True
+    # the framework divides all log values by num_tokens, so pre-multiply to cancel.
+    if args.calculate_per_token_loss and getattr(args, "advantage_estimator", None) == "m2po":
+        for key in ("ppo_kl_m2_before", "ppo_kl_m2_after", "m2po_eps_low", "m2po_eps_high"):
+            if key in log:
+                log[key] = log[key] * num_tokens
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding or all-masked). Without this, gradient doesn't flow through their attention
@@ -1451,13 +1595,17 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
-    log_values = torch.tensor(
-        [
-            num_samples if not args.calculate_per_token_loss else effective_num_tokens,
-        ]
-        + list(log.values()),
-        device=logits.device,
+    is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+    denominator = (
+        effective_num_tokens
+        if args.calculate_per_token_loss or is_sequence_classification
+        else torch.zeros_like(num_tokens)
     )
+    metric_values = [
+        value.to(logits.device) if isinstance(value, torch.Tensor) else torch.tensor(value, device=logits.device)
+        for value in log.values()
+    ]
+    log_values = torch.stack([denominator] + metric_values)
     if is_dummy:
         # Drop this mb's contribution from logged metric averages.
         log_values = torch.zeros_like(log_values)

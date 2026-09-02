@@ -18,7 +18,7 @@ from relax.utils import try_import_telemetry_hook
 try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
-from relax.core.node_group_affinity import _maybe_pin_baseline_to_stable  # noqa: E402
+from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
@@ -105,7 +105,7 @@ def main(args):
     # writes wandb_run_id into args, which then propagates to remote actors).
     init_tracking(args)
 
-    _maybe_pin_baseline_to_stable(args)
+    maybe_pin_baseline_to_stable(args)
 
     ctrl = Controller(args, runtime_env)
     _ctrl = ctrl

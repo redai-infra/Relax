@@ -8,7 +8,7 @@ import pytest
 from relax_nemo_gym_example.app.protocol import TrialResult, TrialStatus
 from relax_nemo_gym_example.app.result import to_relax_output, write_relax_output
 
-from relax.agentic.pipeline.runtime import SessionOutput
+from relax.agentic.runner import SessionOutput
 
 
 def test_scalar_reward_wrapper_maps_to_relax_reward_and_metadata():

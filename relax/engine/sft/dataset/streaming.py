@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, Iterable, Optional
 
 import torch
@@ -45,6 +46,7 @@ class ProcessedSample:
     total_length: int
     multimodal_train_inputs: dict[str, Any] | None
     source_idx: int
+    classification_label: torch.Tensor | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -206,6 +208,7 @@ def _build_canonical_sample_from_row(
     system_prompt: str | None,
     require_response: bool,
     source_name: str,
+    task_type: str = "causal_lm",
     conversation_key_map: dict[str, str] | None = None,
 ) -> CanonicalSample:
     prompt = row.get(prompt_key)
@@ -224,6 +227,28 @@ def _build_canonical_sample_from_row(
             # (build_messages, _canonicalize_messages) hits the hard-coded
             # OpenAI-format requirements. Shallow-copy the row so we don't
             # mutate the reader's cache.
+            prompt = _apply_conversation_key_map(prompt, conversation_key_map)
+            row = {**row, prompt_key: prompt}
+        _validate_multimodal_contract(
+            row,
+            prompt,
+            row_index=row_index,
+            multimodal_keys=multimodal_keys,
+            source_name=source_name,
+        )
+        raw_messages = build_messages(row, prompt_key, system_prompt, True, multimodal_keys)
+    elif task_type == "seq_cls":
+        if not isinstance(prompt, (str, list)):
+            raise TypeError(
+                f"--task-type seq_cls expects --input-key {prompt_key!r} to contain a prompt string "
+                f"or OpenAI messages list; got {type(prompt)}"
+            )
+        if row.get(label_key) is None:
+            raise ValueError(
+                f"Sequence classification row idx={row_index} in {source_name!r} is missing label key "
+                f"{label_key!r}: available keys={list(row.keys())}"
+            )
+        if isinstance(prompt, list) and conversation_key_map:
             prompt = _apply_conversation_key_map(prompt, conversation_key_map)
             row = {**row, prompt_key: prompt}
         _validate_multimodal_contract(
@@ -315,6 +340,10 @@ class SFTStreamingDataset:
         oversize_custom_fn: Callable[..., Optional[tuple[torch.Tensor, torch.Tensor]]] | None = None,
         invalid_multimodal_strategy: str = "error",
         apply_chat_template_kwargs: dict | None = None,
+        task_type: str = "causal_lm",
+        num_labels: int | None = None,
+        problem_type: str = "single_label_classification",
+        classification_sentinel_token_id: int | None = None,
     ) -> None:
         self.path = path
         self.tokenizer = tokenizer
@@ -336,7 +365,25 @@ class SFTStreamingDataset:
         # template is inference-only and drops training-critical content
         # (e.g. DeepSeek-R1 distill templates strip <think>...</think>).
         self.apply_chat_template_kwargs = apply_chat_template_kwargs
-
+        self.task_type = task_type
+        self.num_labels = num_labels
+        self.problem_type = problem_type
+        self.classification_sentinel_token_id = classification_sentinel_token_id
+        if self.task_type == "seq_cls":
+            valid_problem_types = {"single_label_classification", "multi_label_classification"}
+            if self.problem_type not in valid_problem_types:
+                raise ValueError(
+                    f"SFTStreamingDataset seq_cls problem_type must be one of {sorted(valid_problem_types)}, "
+                    f"got {self.problem_type!r}"
+                )
+            if self.label_key is None:
+                raise ValueError("SFTStreamingDataset seq_cls mode requires label_key")
+            if self.num_labels is None or self.num_labels < 2:
+                raise ValueError("SFTStreamingDataset seq_cls mode requires num_labels >= 2")
+            if self.classification_sentinel_token_id is None:
+                raise ValueError("SFTStreamingDataset seq_cls mode requires a sentinel token id")
+            if self.capacity is not None and self.capacity < 2:
+                raise ValueError("SFTStreamingDataset seq_cls capacity must be >= 2")
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
         if oversize_strategy not in valid_strategies:
             raise ValueError(f"oversize_strategy must be one of {sorted(valid_strategies)}, got {oversize_strategy!r}")
@@ -378,7 +425,8 @@ class SFTStreamingDataset:
 
         logger.info(
             f"SFTStreamingDataset path={path} total_size={len(self.reader)} "
-            f"capacity={self.capacity} prompt_key={self.prompt_key!r} label_key={self.label_key!r}"
+            f"capacity={self.capacity} prompt_key={self.prompt_key!r} label_key={self.label_key!r} "
+            f"task_type={self.task_type!r}"
         )
 
     def __len__(self) -> int:
@@ -387,6 +435,25 @@ class SFTStreamingDataset:
     @property
     def prefetch_enabled(self) -> bool:
         return self._prefetch is not None
+
+    def restrict_training_size(self, size: int) -> None:
+        """Restrict shuffled training indices to the leading ``size`` rows."""
+        if not 0 < size <= len(self.reader):
+            raise ValueError(f"training size must be in [1, {len(self.reader)}], got {size}")
+        self.restrict_training_indices(range(size))
+
+    def restrict_training_indices(self, indices: Iterable[int]) -> None:
+        """Restrict epoch shuffling to the provided physical row IDs."""
+        if self.index_manager.current_epoch >= 0 or self.index_manager.position != 0:
+            raise RuntimeError("training indices must be restricted before the dataset is shuffled or consumed")
+        index_pool = tuple(indices)
+        if not index_pool:
+            raise ValueError("training indices must not be empty")
+        if len(set(index_pool)) != len(index_pool):
+            raise ValueError("training indices must be unique")
+        if any(not isinstance(index, int) or index < 0 or index >= len(self.reader) for index in index_pool):
+            raise ValueError(f"training indices must be integers in [0, {len(self.reader)})")
+        self.index_manager = IndexManager(len(index_pool), seed=self.index_manager.seed, index_pool=index_pool)
 
     def shuffle(self, epoch_id: int, position: int = 0) -> None:
         self.index_manager.shuffle(epoch_id)
@@ -422,6 +489,18 @@ class SFTStreamingDataset:
                 out.append(sample)
         return out
 
+    def get_batch_by_indices(self, indices: Iterable[int]) -> list[ProcessedSample]:
+        """Render physical row IDs in the provided deterministic order."""
+        self._raise_if_failed()
+        out: list[ProcessedSample] = []
+        for idx in indices:
+            if idx < 0 or idx >= len(self.reader):
+                raise IndexError(f"index {idx} out of range [0, {len(self.reader)})")
+            sample = self._process_one(idx)
+            if sample is not None:
+                out.append(sample)
+        return out
+
     def _record_first_error(self, exc: BaseException) -> None:
         with self._error_lock:
             if self._first_error is None:
@@ -437,8 +516,9 @@ class SFTStreamingDataset:
         if self._prefetch is not None:
             self._prefetch.stop()
 
-    def get_canonical_sample(self, idx: int) -> CanonicalSample:
-        row = self.reader[idx]
+    def get_canonical_sample(self, idx: int, *, row: dict[str, Any] | None = None) -> CanonicalSample:
+        if row is None:
+            row = self.reader[idx]
         return _build_canonical_sample_from_row(
             row,
             row_index=idx,
@@ -451,7 +531,65 @@ class SFTStreamingDataset:
             system_prompt=self.system_prompt,
             require_response=self.require_response,
             source_name=self.source_name,
+            task_type=self.task_type,
         )
+
+    def get_classification_label(self, idx: int, *, row: dict[str, Any] | None = None) -> torch.Tensor | None:
+        if self.task_type != "seq_cls":
+            return None
+        assert self.label_key is not None and self.num_labels is not None
+        if row is None:
+            row = self.reader[idx]
+        if self.label_key not in row or row[self.label_key] is None:
+            raise ValueError(
+                f"Sequence classification row idx={idx} in {self.source_name!r} is missing label key "
+                f"{self.label_key!r}"
+            )
+        value = row[self.label_key]
+        if self.problem_type == "single_label_classification":
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(
+                    f"Sequence classification row idx={idx} in {self.source_name!r} requires an integer label; "
+                    f"got {type(value).__name__}"
+                )
+            label = int(value)
+            if not 0 <= label < self.num_labels:
+                raise ValueError(
+                    f"Sequence classification row idx={idx} in {self.source_name!r} has label {label}; "
+                    f"expected 0 <= label < {self.num_labels}"
+                )
+            return torch.tensor(label, dtype=torch.long)
+
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(
+                f"Multi-label classification row idx={idx} in {self.source_name!r} requires a class-index list; "
+                f"got {type(value).__name__}"
+            )
+        labels: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, Integral):
+                raise TypeError(
+                    f"Multi-label classification row idx={idx} in {self.source_name!r} contains a non-integer "
+                    f"class index {item!r}"
+                )
+            label = int(item)
+            if not 0 <= label < self.num_labels:
+                raise ValueError(
+                    f"Multi-label classification row idx={idx} in {self.source_name!r} has class index {label}; "
+                    f"expected 0 <= index < {self.num_labels}"
+                )
+            labels.append(label)
+        if len(set(labels)) != len(labels):
+            raise ValueError(
+                f"Multi-label classification row idx={idx} in {self.source_name!r} contains duplicate indices: "
+                f"{labels}"
+            )
+        multi_hot = torch.zeros(self.num_labels, dtype=torch.float32)
+        if labels:
+            multi_hot[labels] = 1.0
+        return multi_hot
 
     def _get_batch_prefetch(self, n: int) -> tuple[list[ProcessedSample], bool]:
         self._raise_if_failed()
@@ -566,8 +704,9 @@ class SFTStreamingDataset:
     def _render_one(self, idx: int) -> "_RenderedSample | None":
         if self.tokenizer is None:
             raise RuntimeError("SFTStreamingDataset: tokenizer is required for _render_one")
+        row = self.reader[idx]
         try:
-            sample = self.get_canonical_sample(idx)
+            sample = self.get_canonical_sample(idx, row=row)
         except SFTMultimodalContractError as exc:
             if self._invalid_multimodal_strategy == "error":
                 raise
@@ -577,9 +716,10 @@ class SFTStreamingDataset:
             sample, tokenizer=self.tokenizer, apply_chat_template_kwargs=self.apply_chat_template_kwargs
         )
         n = int(short_ids.shape[0])
-        if self.capacity is not None and n > self.capacity and self._oversize_strategy == "skip":
+        effective_n = n + 1 if self.task_type == "seq_cls" else n
+        if self.capacity is not None and effective_n > self.capacity and self._oversize_strategy == "skip":
             logger.warning(
-                f"SFTStreamingDataset[oversize=skip]: sample idx={idx} length {n} "
+                f"SFTStreamingDataset[oversize=skip]: sample idx={idx} length {effective_n} "
                 f"exceeds per-GPU capacity {self.capacity}; skipping."
             )
             return None
@@ -598,7 +738,8 @@ class SFTStreamingDataset:
             short_ids=short_ids,
             short_mask=short_mask,
             rendered_text=rendered_text,
-            total_length=n,
+            total_length=effective_n,
+            classification_label=self.get_classification_label(idx, row=row),
         )
 
     async def _finalize_async(self, rendered: "_RenderedSample") -> ProcessedSample | None:
@@ -620,26 +761,59 @@ class SFTStreamingDataset:
             loss_mask = rendered.short_mask
         else:
             tokens = _to_long_tensor(prompt_ids)
-            loss_mask = _expand_loss_mask_via_alignment(
-                short_ids=rendered.short_ids,
-                short_mask=rendered.short_mask,
-                expanded_ids=tokens,
-                pad_token_ids=self._pad_token_ids,
+            if self.task_type == "seq_cls":
+                loss_mask = torch.zeros_like(tokens)
+            else:
+                loss_mask = _expand_loss_mask_via_alignment(
+                    short_ids=rendered.short_ids,
+                    short_mask=rendered.short_mask,
+                    expanded_ids=tokens,
+                    pad_token_ids=self._pad_token_ids,
+                )
+        if self.task_type == "seq_cls":
+            if tokens.numel() == 0:
+                raise ValueError(
+                    f"Sequence classification row idx={rendered.idx} in {self.source_name!r} produced no prompt tokens"
+                )
+            prompt_capacity = None if self.capacity is None else self.capacity - 1
+            if prompt_capacity is not None and prompt_capacity < 1:
+                raise ValueError(
+                    f"Sequence classification capacity must leave room for one prompt token and one sentinel; "
+                    f"got capacity={self.capacity}"
+                )
+            result = self._apply_oversize_strategy(
+                tokens=tokens,
+                loss_mask=torch.zeros_like(tokens),
+                idx=rendered.idx,
+                has_multimodal=mm_inputs is not None,
+                capacity_override=prompt_capacity,
             )
-        result = self._apply_oversize_strategy(
-            tokens=tokens,
-            loss_mask=loss_mask,
-            idx=rendered.idx,
-            has_multimodal=mm_inputs is not None,
-        )
-        if result is None:
-            return None
-        tokens, loss_mask = result
+            if result is None:
+                return None
+            tokens, _ = result
+            sentinel = torch.tensor(
+                [self.classification_sentinel_token_id],
+                dtype=tokens.dtype,
+                device=tokens.device,
+            )
+            tokens = torch.cat([tokens, sentinel])
+            loss_mask = torch.ones(1, dtype=torch.long, device=tokens.device)
+        else:
+            result = self._apply_oversize_strategy(
+                tokens=tokens,
+                loss_mask=loss_mask,
+                idx=rendered.idx,
+                has_multimodal=mm_inputs is not None,
+            )
+            if result is None:
+                return None
+            tokens, loss_mask = result
         n = int(tokens.shape[0])
         return ProcessedSample(
             tokens=tokens,
             loss_mask=loss_mask,
             total_length=n,
+            classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
         )
@@ -651,9 +825,10 @@ class SFTStreamingDataset:
         loss_mask: torch.Tensor,
         idx: int,
         has_multimodal: bool,
+        capacity_override: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         n = int(tokens.shape[0])
-        cap = self.capacity
+        cap = self.capacity if capacity_override is None else capacity_override
         if cap is None or n <= cap:
             return tokens, loss_mask
         strategy = self._oversize_strategy
@@ -714,6 +889,7 @@ class _RenderedSample:
     short_mask: torch.Tensor
     rendered_text: str | None
     total_length: int
+    classification_label: torch.Tensor | None
 
 
 def _to_long_tensor(ids: Any) -> torch.Tensor:
@@ -776,13 +952,20 @@ def _expand_loss_mask_via_alignment(
     return torch.tensor(out, dtype=torch.long)
 
 
-def pack_samples_for_tq(samples: list[ProcessedSample], force_multimodal_field: bool = False) -> Optional[dict]:
+def pack_samples_for_tq(
+    samples: list[ProcessedSample],
+    force_multimodal_field: bool = False,
+    sample_weights: list[float] | None = None,
+) -> Optional[dict]:
     if not samples:
         return None
     tokens = [s.tokens.tolist() for s in samples]
     loss_masks = [s.loss_mask.tolist() for s in samples]
     total_lengths = [s.total_length for s in samples]
     has_mm = force_multimodal_field or any(s.multimodal_train_inputs is not None for s in samples)
+    is_classification = any(s.classification_label is not None for s in samples)
+    if is_classification and not all(s.classification_label is not None for s in samples):
+        raise ValueError("classification labels must be present for every sample in a batch")
     batch = {
         "tokens": tokens,
         "loss_masks": loss_masks,
@@ -790,10 +973,20 @@ def pack_samples_for_tq(samples: list[ProcessedSample], force_multimodal_field: 
         # Megatron data.py uses response_length == total_length to select
         # the SFT loss-mask alignment path; loss_masks carry the actual
         # assistant/function_call token positions.
-        "response_lengths": total_lengths,
+        "response_lengths": [1] * len(samples) if is_classification else total_lengths,
     }
+    if is_classification:
+        batch["classification_labels"] = [s.classification_label.tolist() for s in samples]
+    if sample_weights is not None:
+        if len(sample_weights) != len(samples):
+            raise ValueError(f"sample_weights length must match samples: {len(sample_weights)} != {len(samples)}")
+        batch["sample_weights"] = sample_weights
     if has_mm:
         batch["multimodal_train_inputs"] = [s.multimodal_train_inputs for s in samples]
+    batch_size = len(samples)
+    for key, value in batch.items():
+        if len(value) != batch_size:
+            raise ValueError(f"SFT batch field {key!r} has {len(value)} rows; expected {batch_size}")
     return batch
 
 

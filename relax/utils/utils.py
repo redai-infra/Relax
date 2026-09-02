@@ -100,6 +100,7 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
+    sample_indices = [sample.index for sample in samples]
     train_data = {
         "tokens": [sample.tokens for sample in samples],
         "response_lengths": [sample.response_length for sample in samples],
@@ -107,8 +108,11 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         # we could use key to select the reward.
         "rewards": rewards,
         "raw_reward": raw_rewards,
+        # Semantic group index (prompt group for GRPO reward normalization); needed
+        # by the per-rollout replay capture to recompute reward.post_process.
+        "group_index": [sample.group_index if sample.group_index is not None else 0 for sample in samples],
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
-        "sample_indices": [sample.index for sample in samples],
+        "sample_indices": sample_indices,
     }
 
     # loss mask
@@ -129,14 +133,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
-
-    # overwriting the raw reward
-    # populate this field for a subset of samples (e.g. SWE but not code).
-    if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
-        train_data["raw_reward"] = [
-            sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
-            for sample in samples
-        ]
+    mask_sums_by_sample_index: dict[Any, int] = {}
+    for sample_index, loss_mask in zip(sample_indices, loss_masks, strict=True):
+        mask_sums_by_sample_index[sample_index] = mask_sums_by_sample_index.get(sample_index, 0) + int(sum(loss_mask))
+    train_data["sample_index_mask_sums"] = [mask_sums_by_sample_index[sample_index] for sample_index in sample_indices]
 
     # For rollout buffer
     if samples[0].metadata and "round_number" in samples[0].metadata:
@@ -168,20 +168,34 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     return rollout_batch
 
 
+def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
+    return [
+        {"total_lengths": int(total_length), "sample_index": int(sample_index)}
+        for total_length, sample_index in zip(
+            rollout_batch["total_lengths"], rollout_batch["sample_indices"], strict=True
+        )
+    ]
+
+
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
-    """Post-process rewards and return (raw_rewards, possibly-normalized
-    rewards).
+    """Return raw rewards and post-processed rewards consumed by training.
 
     Returns:
         Tuple[List[float], List[float]]
     """
     if args.custom_reward_post_process_path is not None:
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
-        return custom_reward_post_process_func(args, samples)
+        processed_rewards = custom_reward_post_process_func(args, samples)
+        if isinstance(processed_rewards, tuple) and len(processed_rewards) == 2:
+            return processed_rewards
+        raw_rewards = [sample.get_reward_value(args) for sample in samples]
+        return raw_rewards, processed_rewards
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
+
     if (
         args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
         and args.rewards_normalization
@@ -274,6 +288,18 @@ def dict_to_tensordict(
     for key, value in data.items():
         if not isinstance(value, list):
             raise TypeError(f"Value for key '{key}' must be a list, got {type(value)}")
+        if key == "classification_labels":
+            depth = _nesting_depth(value)
+            if depth == 1:
+                result[key] = torch.tensor(value, dtype=torch.long, device=device)
+            elif depth == 2:
+                result[key] = torch.tensor(value, dtype=torch.float32, device=device)
+            else:
+                raise ValueError(
+                    "classification_labels must be scalar class ids or fixed-width multi-hot vectors; "
+                    f"got nesting depth {depth}"
+                )
+            continue
         if key == "rollout_routed_experts":
             # Flatten 3D numpy (seq_i, num_layers, topk) -> 2D tensor (seq_i, num_layers*topk)
             # so NestedTensor jagged layout can handle variable seq_len efficiently.
@@ -468,11 +494,15 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         logger.info(
             f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
         )
-    rollout_batch = convert_samples_to_train_data(args, data)
-
-    for key in rollout_batch:
-        rollout_batch[key] = rollout_batch[key][dp_rank * batch_size : (dp_rank + 1) * batch_size]
-    return rollout_batch
+    rows_by_sample_index: dict[int, list[Sample]] = {}
+    for sample in data:
+        rows_by_sample_index.setdefault(sample.index, []).append(sample)
+    sample_indices = list(rows_by_sample_index)
+    selected_sample_indices = sample_indices[dp_rank * batch_size : (dp_rank + 1) * batch_size]
+    selected_rows = [
+        sample for sample_index in selected_sample_indices for sample in rows_by_sample_index[sample_index]
+    ]
+    return convert_samples_to_train_data(args, selected_rows)
 
 
 async def transfer_batch_to_data_system(
@@ -514,14 +544,8 @@ async def transfer_batch_to_data_system(
         logger.info(f"Prepared rollout batch {batch_count} with {rollout_batch.numel()} samples for transfer")
         logger.info(f"Transferring batch rollout_batch: {rollout_batch}")
 
-        # Store total_lengths in custom_meta so the TransferQueue sampler can use it
-        # for seqlen-balanced / token-budget partitioning across DP ranks. Pass it
-        # inline to async_put so it lands ATOMICALLY with the samples becoming ready
-        # (otherwise a streaming consumer can fetch a ready sample before its
-        # total_lengths is set, forcing the sampler into a 1-sample-per-microbatch
-        # fallback and defeating dynamic batching).
-        total_lengths = rollout_batch.get("total_lengths", None)
-        custom_meta = [{"total_lengths": int(tl)} for tl in total_lengths] if total_lengths is not None else None
+        # Pass sampler metadata inline so it lands atomically with ready samples.
+        custom_meta = build_rollout_custom_meta(rollout_batch)
         await data_system_client.async_put(
             data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
         )

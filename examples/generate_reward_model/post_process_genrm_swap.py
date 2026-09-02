@@ -135,7 +135,7 @@ def custom_reward_post_process(args, samples):
       2. Onload GenRM (Ray handle — different actor).
       3. Batch-score every sample via GenRM HTTP.
       4. Offload GenRM.
-      5. Return (raw, normalized) — leave rollout offloaded (update_weights
+      5. Return normalized rewards — leave rollout offloaded (update_weights
          re-onloads it next iteration; skipping the redundant onload here
          saves one full weights+KV round trip).
     """
@@ -155,23 +155,8 @@ def custom_reward_post_process(args, samples):
     finally:
         ray.get(genrm.offload.remote())
 
-    # Stamp real scores back onto sample.reward and sample.metadata["raw_reward"]
-    # so downstream consumers see the real GenRM values instead of the dummy
-    # 0.0 placeholder written during inline reward:
-    #   - sample.reward (dict when --reward-key set, else scalar):
-    #       used by dump jsonl (train_dump_utils.py:206), log_rollout_data,
-    #       any TB metric keyed by sample.reward
-    #   - sample.metadata["raw_reward"] (scalar):
-    #       triggers the override at utils.py:133-137 so train_data["raw_reward"]
-    #       is a list of scalars matching what downstream `raw_reward == 1`
-    #       correctness accounting expects (backends/megatron/data.py:823).
-    # train_data["rewards"] (normalized) still comes from our return value.
     reward_key = getattr(args, "reward_key", None)
     for sample, score in zip(flat_samples, raw_rewards, strict=True):
         sample.reward = {reward_key: score} if reward_key else score
-        if sample.metadata is None:
-            sample.metadata = {}
-        sample.metadata["raw_reward"] = score
 
-    normalized = _grpo_normalize(args, raw_rewards)
-    return raw_rewards, normalized
+    return _grpo_normalize(args, raw_rewards)

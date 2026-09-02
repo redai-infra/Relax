@@ -13,6 +13,7 @@ import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.backends.sglang.sglang_engine import GenRMEngine
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
@@ -80,7 +81,9 @@ class GenRMManager:
         self._engine_addr_and_ports = {}  # rank -> {host, port, ...}
         self.num_new_engines = init_genrm_engines(args, pg, self.all_genrm_engines, self._engine_addr_and_ports)
         self.nodes_per_engine = max(1, args.genrm_num_gpus_per_engine // args.num_gpus_per_node)
-        self.genrm_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        self.genrm_engine_lock = Lock.options(
+            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
+        ).remote()
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; the caller (placement_group.py)
         # may immediately offload if offload_rollout is set.

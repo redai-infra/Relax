@@ -81,6 +81,9 @@ class ScaleOutStatusResponse(BaseModel):
     updated_at: float
     error_message: Optional[str]
     weight_version: Optional[str]
+    # Must be declared or FastAPI's response_model strips it from every scale-out
+    # HTTP surface (and the autoscaler poll-back that reads it).
+    failure_categories: List[str] = Field(default_factory=list)
 
 
 class EnginesInfoResponse(BaseModel):

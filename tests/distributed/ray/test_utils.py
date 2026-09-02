@@ -11,6 +11,8 @@
 
 import pytest
 
+from relax.utils.model_source import ModelSource
+
 
 try:
     from relax.distributed.ray.rollout import (
@@ -26,12 +28,46 @@ except ImportError:
 from conftest import (
     create_test_manager,
     make_engine_group,
+    make_mock_args,
     make_mock_engine,
     make_rollout_server,
 )
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+
+
+def _capture_engine_runtime_env(monkeypatch, args, sglang_overrides):
+    from relax.distributed.ray import rollout
+
+    captured = {}
+    engine = make_mock_engine()
+
+    class FakeRolloutRayActor:
+        @classmethod
+        def options(cls, **kwargs):
+            captured.update(kwargs)
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs):  # noqa: ARG003
+            return engine
+
+    monkeypatch.setattr(rollout.ray, "remote", lambda cls: FakeRolloutRayActor)
+    monkeypatch.setattr(rollout, "PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs)
+    monkeypatch.setattr(rollout, "validate_server_group_gpu_indices", lambda **kwargs: None)
+    monkeypatch.setattr(rollout, "get_ray_accelerator_kwargs", lambda num_gpus: {})
+    monkeypatch.setattr(
+        rollout,
+        "_allocate_rollout_engine_addr_and_ports_normal",
+        lambda **kwargs: ({0: {}}, {}),
+    )
+
+    group = make_engine_group(args=args, engines=[None], num_gpus_per_engine=1)
+    group.pg = (object(), [0], [0])
+    group.sglang_overrides = sglang_overrides
+    group.start_engines()
+    return captured["runtime_env"]["env_vars"]
 
 
 # ===================== _normalize_engine_addr ==============================
@@ -229,6 +265,35 @@ class TestCollectInFlightEngineAddrs:
 
 
 class TestEngineGroupProperties:
+    def test_start_engines_injects_runai_env_before_actor_import(self, monkeypatch):
+        monkeypatch.delenv("RUNAI_STREAMER_S3_ENDPOINT", raising=False)
+        args = make_mock_args(
+            model_source=ModelSource("s3://bucket/policy/", "http://provider.example"),
+            hf_checkpoint="s3://bucket/policy/",
+            sglang_load_format="runai_streamer",
+        )
+
+        env_vars = _capture_engine_runtime_env(monkeypatch, args, {})
+
+        assert env_vars["RUNAI_STREAMER_S3_ENDPOINT"] == "http://provider.example"
+        assert env_vars["AWS_ENDPOINT_URL"] == "http://provider.example"
+        assert env_vars["AWS_ENDPOINT_URL_S3"] == "http://provider.example"
+
+    def test_start_engines_does_not_inject_policy_env_for_other_model(self, monkeypatch):
+        args = make_mock_args(
+            model_source=ModelSource("s3://bucket/policy/", "http://provider.example"),
+            hf_checkpoint="s3://bucket/policy/",
+            sglang_load_format="auto",
+        )
+
+        env_vars = _capture_engine_runtime_env(
+            monkeypatch,
+            args,
+            {"model_path": "s3://bucket/other/", "load_format": "runai_streamer"},
+        )
+
+        assert "RUNAI_STREAMER_S3_ENDPOINT" not in env_vars
+
     def test_nodes_per_engine_single_node(self):
         args = type("A", (), {"num_gpus_per_node": 8})()
         g = make_engine_group(args=args, num_gpus_per_engine=2)

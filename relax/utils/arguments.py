@@ -14,6 +14,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
     is_managed_opd_teacher_enabled,
@@ -91,6 +92,10 @@ def _unknown_options(argv: list[str], registered: set[str]) -> list[str]:
         if option not in unknown:
             unknown.append(option)
     return unknown
+
+
+_MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
+_REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
 
 
 def check_transfer_queue_version() -> None:
@@ -449,7 +454,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--disable-s3-model-download",
                 action="store_true",
                 default=False,
-                help="Disable Relax-managed S3-to-SHM model materialization",
+                help="Disable Relax-managed S3 model loading, including registered model-source providers",
             )
             parser.add_argument(
                 "--disable-s3-model-cleanup",
@@ -471,24 +476,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "S3 model SHM root; it must already exist on every model consumer node, "
                     "otherwise loading fails without falling back to disk"
                 ),
-            )
-            parser.add_argument(
-                "--s3-model-endpoint",
-                type=str,
-                default=None,
-                help="Optional endpoint URL for an S3-compatible model store",
-            )
-            parser.add_argument(
-                "--s3-model-use-placeholder-credentials",
-                action="store_true",
-                default=False,
-                help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
-            )
-            parser.add_argument(
-                "--s3-model-use-path-style",
-                action="store_true",
-                default=False,
-                help="Use path-style addressing for an S3-compatible model store",
             )
             parser.add_argument(
                 "--custom-model-provider-path",
@@ -649,9 +636,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Carve a held-out eval split from --prompt-data instead of providing a separate "
                     "--eval-prompt-data. A value <1 is treated as a fraction of the train dataset "
-                    "(e.g. 0.05 → last 5%); a value ≥1 is treated as an absolute sample count. "
-                    "The reserved tail is removed from the train pool so train and eval samples never "
-                    "overlap. Mutually exclusive with --eval-prompt-data."
+                    "(e.g. 0.05 → 5%); a value ≥1 is treated as an absolute sample count. "
+                    "Rows are randomly split once using --seed; held-out rows are excluded from every "
+                    "training epoch. Mutually exclusive with --eval-prompt-data."
                 ),
             )
             parser.add_argument(
@@ -1109,6 +1096,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=["rollback_all", "keep_partial"],
                 help="Policy for handling partial success during scale-out. 'rollback_all' reverts all engines on any failure. 'keep_partial' keeps successfully scaled engines.",
             )
+            parser.add_argument(
+                "--scale-weight-sync-precheck",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Run an independent NCCL precheck before scale-out weight sync; fail-closed on "
+                "incompatible transport. Disable with --no-scale-weight-sync-precheck.",
+            )
             # Elastic rollout scale-in arguments
             parser.add_argument(
                 "--scale-in-drain-timeout",
@@ -1222,6 +1216,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
+            parser.add_argument(
+                "--task-type",
+                type=str,
+                choices=["causal_lm", "seq_cls"],
+                default="causal_lm",
+                help="SFT task type. `seq_cls` replaces the vocabulary head with a classification head.",
+            )
+            parser.add_argument(
+                "--num-labels",
+                type=int,
+                default=None,
+                help="Number of classes for --task-type seq_cls.",
+            )
+            parser.add_argument(
+                "--problem-type",
+                type=str,
+                choices=["single_label_classification", "multi_label_classification"],
+                default="single_label_classification",
+                help="Classification objective used by --task-type seq_cls.",
+            )
+            parser.add_argument(
+                "--classification-threshold",
+                type=float,
+                default=0.5,
+                help="Sigmoid threshold used by multi-label classification evaluation.",
+            )
             parser.add_argument(
                 "--multimodal-keys",
                 type=json.loads,
@@ -1514,22 +1534,74 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Custom group-level advantage function for explicit agentic exports.",
             )
             parser.add_argument(
-                "--agentic-prepare-pool-size",
+                "--agentic-concurrency",
                 type=int,
                 default=None,
                 help=(
-                    "Positive target size of the agentic prepare pool in groups, or 0 to start agent processes after "
-                    "rollout begins. If unset, defaults to over_sampling_batch_size."
+                    "Maximum number of resident training groups across Prepare and Runtime. "
+                    "If unset, defaults to over_sampling_batch_size."
                 ),
             )
             parser.add_argument(
-                "--agentic-eval-prepare-pool-size",
+                "--agentic-eval-concurrency",
                 type=int,
                 default=None,
+                help=("Maximum number of resident eval groups. If unset, derives from the training session capacity."),
+            )
+            parser.add_argument(
+                "--agentic-prelaunch",
+                action="store_true",
+                default=False,
+                help="Prelaunch agent processes for the next rollout step.",
+            )
+            parser.add_argument(
+                "--agentic-session-lifecycle",
+                action="store_true",
+                default=False,
                 help=(
-                    "Target size of the agentic eval prepare pool in groups. "
-                    "If unset, derives from the train prepare pool session budget."
+                    "Tag every backend attempt with its Agentic session ID and release the session's radix-cache "
+                    "entries when the session terminates. Requires --sglang-enable-session-radix-cache."
                 ),
+            )
+            parser.add_argument(
+                "--agentic-program-admission",
+                action="store_true",
+                default=False,
+                help=(
+                    "Gate each backend attempt with a cluster-wide execution-token budget. Capacity-bound attempts "
+                    "wait in a global FIFO queue; stale or unavailable metrics fail open to the request limiter."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-admission-headroom",
+                type=float,
+                default=0.90,
+                help="Fraction of aggregate KV token capacity usable as the admission ceiling (0, 1].",
+            )
+            parser.add_argument(
+                "--agentic-admission-expected-decode-cap",
+                type=int,
+                default=None,
+                help="Upper bound on expected decode tokens per reservation. Defaults to --rollout-max-response-len.",
+            )
+            parser.add_argument(
+                "--agentic-admission-pressure-threshold",
+                type=float,
+                default=0.92,
+                help="Per-worker KV token usage at or above which new attempts wait, in (0, 1].",
+            )
+            parser.add_argument(
+                "--agentic-admission-max-wait-s",
+                type=float,
+                default=30.0,
+                help="Maximum FIFO wait before the attempt bypasses admission, in seconds. Must be >= 0.",
+            )
+            parser.add_argument(
+                "--agentic-admission-scope",
+                type=str,
+                default="train",
+                choices=["train", "all"],
+                help="Which scopes admission applies to: 'train' only (default) or 'all' (train + eval).",
             )
             return parser
 
@@ -1628,6 +1700,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Target modules for LoRA (Megatron-style names, e.g. linear_qkv, "
                     "linear_proj, linear_fc1, linear_fc2). Expanded to HF-style names "
                     "automatically when exporting the adapter."
+                ),
+            )
+            parser.add_argument(
+                "--lora-scope",
+                type=str,
+                choices=["all", "language", "vision"],
+                default="all",
+                help=(
+                    "Which model region receives LoRA adapters (VL models only; no effect "
+                    "on text models, which have no vision tower). 'all' (default) wraps every "
+                    "matched module including the vision tower; 'language' excludes the vision "
+                    "tower / projector / audio encoder (typical for language-only RL); 'vision' "
+                    "wraps only those. Controls adapter INJECTION, not base-weight freezing."
                 ),
             )
             parser.add_argument(
@@ -1787,6 +1872,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "sapo",
                     "cispo",
+                    "m2po",
                     "rloo",
                 ],
                 default="grpo",
@@ -1807,6 +1893,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1.05,
                 help="Temperature for negative advantages in SAPO (default: 1.05)",
+            )
+            parser.add_argument(
+                "--m2po-kl2-budget",
+                type=float,
+                default=0.01,
+                help="M2PO second-moment budget per harmful token (KL2_budget in paper; paper uses 0.04, default: 0.01)",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-low",
+                type=float,
+                default=0.3,
+                help="M2PO minimum lower clip epsilon floor (paper default: 0.3)",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-high",
+                type=float,
+                default=0.5,
+                help="M2PO minimum upper clip epsilon floor (paper default: 0.5)",
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -2071,12 +2175,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Log statistics of the category of reward, such as why the reward function considers it as failed. "
                     "Specify the key in the reward dict using this argument.",
                 ),
-            )
-            parser.add_argument(
-                "--log-correct-samples",
-                action="store_true",
-                default=False,
-                help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
             )
             parser.add_argument("--wandb-run-id", type=str, default=None)
             return parser
@@ -2547,6 +2645,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Enable MTP layer parameter updates during training",
             )
+            parser.add_argument(
+                "--mtp-detach-paths",
+                nargs="+",
+                choices=(*_MTP_DETACH_PATHS, "none"),
+                default=_MTP_DETACH_PATHS,
+                help=(
+                    "MTP auxiliary-loss gradient paths to detach. Choose any combination of embedding, "
+                    "backbone, and lm-head, or use none by itself for fully joint gradients. "
+                    "Defaults to detaching all three paths."
+                ),
+            )
+            parser.add_argument(
+                "--mtp-only-training",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train only MTP parameters on SFT data. This enables MTP training, freezes every "
+                    "non-MTP parameter before DDP/optimizer construction, and skips the main language-model loss. "
+                    "Defaults --mtp-num-layers to 1 when it is not specified."
+                ),
+            )
 
             return parser
 
@@ -2682,36 +2801,19 @@ def _pre_parse_cli_model_source():
     parser.add_argument(
         "--disable-s3-model-download",
         action="store_true",
-        help="Disable Relax-managed S3-to-SHM model materialization",
-    )
-    parser.add_argument(
-        "--s3-model-endpoint",
-        help="Optional endpoint URL for an S3-compatible model store",
-    )
-    parser.add_argument(
-        "--s3-model-use-placeholder-credentials",
-        action="store_true",
-        help="Use placeholder credentials for an S3-compatible gateway that requires signed requests",
-    )
-    parser.add_argument(
-        "--s3-model-use-path-style",
-        action="store_true",
-        help="Use path-style addressing for an S3-compatible model store",
+        help="Disable Relax-managed S3 model loading, including registered model-source providers",
     )
     pre, _ = parser.parse_known_args()
     if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
         return None
-    return ModelSource(
-        uri=pre.hf_checkpoint,
-        endpoint=pre.s3_model_endpoint,
-        credential_mode="placeholder" if pre.s3_model_use_placeholder_credentials else "default",
-        addressing_style="path" if pre.s3_model_use_path_style else "auto",
-    )
+    return ModelSource(uri=pre.hf_checkpoint)
 
 
 def _prevalidate_resource_cli() -> None:
     """Validate resource shape before loading heavyweight backend parsers."""
     if any(option in sys.argv[1:] for option in ("-h", "--help")):
+        return
+    if not any(token.split("=", 1)[0] == "--resource" for token in sys.argv[1:]):
         return
     resource_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     resource_parser.add_argument("--resource", type=json.loads)
@@ -2725,33 +2827,43 @@ def parse_args(add_custom_arguments=None, *, strict=False):
     ``strict`` is used by static preflight callers to reject options that the
     split Megatron/SGLang parsers would otherwise silently ignore.
     """
-    from relax.utils.model_source import apply_model_source_to_argv, resolve_model_source
+    from relax.utils.model_source import resolve_model_source
 
-    original_argv = sys.argv
-    provider_source = resolve_model_source(original_argv)
-    if provider_source is not None:
-        sys.argv = apply_model_source_to_argv(original_argv, provider_source)
-    try:
-        if not strict:
-            return _parse_args_impl(add_custom_arguments, provider_source=provider_source)
-        with _registered_options() as registered:
-            args = _parse_args_impl(add_custom_arguments, provider_source=provider_source)
-        unknown = _unknown_options(sys.argv[1:], registered)
-        if unknown:
-            options = ", ".join(unknown)
-            raise ValueError(
-                f"Unknown training option(s): {options}. Fix: correct the spelling or remove unsupported options."
-            )
-        return args
-    finally:
-        sys.argv = original_argv
+    cli_source = _pre_parse_cli_model_source()
+    provider_source = None if _s3_model_download_disabled() else resolve_model_source(sys.argv)
+    model_source = provider_source or cli_source
+    if not strict:
+        return _parse_args_impl(add_custom_arguments, model_source=model_source)
+    with _registered_options() as registered:
+        args = _parse_args_impl(add_custom_arguments, model_source=model_source)
+    unknown = _unknown_options(sys.argv[1:], registered)
+    if unknown:
+        options = ", ".join(unknown)
+        raise ValueError(
+            f"Unknown training option(s): {options}. Fix: correct the spelling or remove unsupported options."
+        )
+    return args
 
 
-def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
+def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
+    for token in argv:
+        option = token.split("=", 1)[0]
+        if option in _REMOVED_MTP_DETACH_FLAGS:
+            raise ValueError(f"{option} has been removed; use --mtp-detach-paths instead.")
+
+
+def _s3_model_download_disabled() -> bool:
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--disable-s3-model-download", action="store_true")
+    pre, _ = parser.parse_known_args()
+    return pre.disable_s3_model_download
+
+
+def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     from relax.utils.s3_model_loader import is_s3_uri
 
-    model_source = provider_source or _pre_parse_cli_model_source()
+    _reject_removed_mtp_detach_flags(sys.argv[1:])
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2774,6 +2886,7 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
+        model_source=model_source,
         skip_hf_validate=(
             pre.debug_rollout_only
             or pre.skip_hf_validate
@@ -2811,12 +2924,15 @@ def _parse_args_impl(add_custom_arguments=None, *, provider_source=None):
     if not args.debug_train_only:
         _validate_sglang_args(args)
 
+    # Keep parser test doubles and third-party wrappers compatible while real
+    # Relax namespaces always carry the resource field.
+    if hasattr(args, "resource"):
+        validate_preflight_args(args)
+
     # Only fully-async mode relies on the newer TransferQueue (e.g.
     # StreamingTokenBudgetSampler), so gate the version requirement on it.
     if getattr(args, "fully_async", False):
         check_transfer_queue_version()
-
-    validate_preflight_args(args)
     return args
 
 
@@ -2862,6 +2978,64 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
         args.eval_prompt_data = None
 
     return eval_datasets
+
+
+_MTP_ONLY_PARAM_PATTERN = r"(^|\.)mtp(\.|$)"
+
+
+def _normalize_mtp_detach_paths(args) -> None:
+    """Validate and canonicalize the MTP auxiliary-loss detach paths."""
+    requested_paths = tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS))
+    if "none" in requested_paths:
+        if requested_paths != ("none",):
+            raise ValueError("--mtp-detach-paths none cannot be combined with other paths.")
+        args.mtp_detach_paths = ()
+        return
+
+    unknown_paths = sorted(set(requested_paths) - set(_MTP_DETACH_PATHS))
+    if unknown_paths:
+        raise ValueError(f"Unknown --mtp-detach-paths values: {', '.join(unknown_paths)}.")
+    args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
+
+
+def _normalize_mtp_only_training_args(args) -> None:
+    """Resolve the public MTP-only mode into existing training primitives."""
+    if not getattr(args, "mtp_only_training", False):
+        return
+
+    if getattr(args, "loss_type", None) != "sft":
+        raise ValueError("--mtp-only-training requires --loss-type sft.")
+
+    conflicts = []
+    if getattr(args, "only_train_params_name_list", None):
+        conflicts.append("--only-train-params-name-list")
+    if getattr(args, "freeze_params_name_list", None):
+        conflicts.append("--freeze-params-name-list")
+    if getattr(args, "lora_rank", 0) > 0:
+        conflicts.append("--lora-rank")
+    if getattr(args, "sft_chunked_logits", False):
+        conflicts.append("--sft-chunked-logits")
+    if getattr(args, "overlap_moe_expert_parallel_comm", False):
+        conflicts.append("--overlap-moe-expert-parallel-comm")
+    if getattr(args, "fully_async", False):
+        conflicts.append("--fully-async")
+    if getattr(args, "hybrid", False):
+        conflicts.append("--hybrid")
+    if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
+        conflicts.append("--mtp-detach-paths")
+    if conflicts:
+        raise ValueError(f"--mtp-only-training is incompatible with: {', '.join(conflicts)}.")
+
+    if args.mtp_num_layers is None:
+        args.mtp_num_layers = 1
+    if args.mtp_num_layers != 1:
+        raise ValueError("--mtp-only-training currently supports exactly one Qwen3.5 MTP layer.")
+    if args.mtp_loss_scaling_factor <= 0:
+        raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
+
+    args.enable_mtp_training = True
+    args.mtp_detach_paths = _MTP_DETACH_PATHS
+    args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
 def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
@@ -2948,10 +3122,26 @@ def _validate_agentic_rollout_args(args) -> None:
             raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
         if key.startswith("RELAX_"):
             raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
-    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size < 0:
-        raise ValueError("--agentic-prepare-pool-size must be >= 0.")
-    if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
-        raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
+    if args.agentic_concurrency is not None and args.agentic_concurrency <= 0:
+        raise ValueError("--agentic-concurrency must be > 0.")
+    if args.agentic_eval_concurrency is not None and args.agentic_eval_concurrency <= 0:
+        raise ValueError("--agentic-eval-concurrency must be > 0.")
+    if args.agentic_program_admission:
+        if args.agentic_admission_expected_decode_cap is None:
+            args.agentic_admission_expected_decode_cap = args.rollout_max_response_len
+        elif args.agentic_admission_expected_decode_cap <= 0:
+            raise ValueError("--agentic-admission-expected-decode-cap must be > 0.")
+        if not 0.0 < args.agentic_admission_headroom <= 1.0:
+            raise ValueError("--agentic-admission-headroom must be in (0, 1].")
+        if not 0.0 < args.agentic_admission_pressure_threshold <= 1.0:
+            raise ValueError("--agentic-admission-pressure-threshold must be in (0, 1].")
+        if args.agentic_admission_max_wait_s < 0:
+            raise ValueError("--agentic-admission-max-wait-s must be >= 0.")
+    if args.agentic_session_lifecycle:
+        if not args.sglang_enable_session_radix_cache:
+            raise ValueError("--agentic-session-lifecycle requires --sglang-enable-session-radix-cache.")
+        if args.sglang_radix_eviction_policy != "priority":
+            raise ValueError("--agentic-session-lifecycle requires --sglang-radix-eviction-policy priority.")
 
 
 def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
@@ -3028,6 +3218,68 @@ def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
         )
 
 
+def _declares_non_language_encoder(hf_checkpoint: str) -> bool | None:
+    """Whether the HF config declares a vision / audio encoder next to the LM.
+
+    Tri-state on purpose: ``None`` means the config could not be read (path not
+    materialized yet, or custom code that needs ``trust_remote_code``). Callers
+    degrade to a warning in that case — a best-effort guard must not become a
+    new way for a valid run to fail.
+    """
+    from relax.utils.misc import get_hf_config
+
+    try:
+        config = get_hf_config(hf_checkpoint)
+    except Exception as e:  # noqa: BLE001 - best-effort probe, never fatal
+        logger.warning("Could not read HF config at %s to check for a vision tower: %s", hf_checkpoint, e)
+        return None
+    return any(getattr(config, key, None) is not None for key in ("vision_config", "audio_config"))
+
+
+def _validate_lora_vision_scope(args) -> None:
+    """Reject LoRA adapter mode that would train a vision-tower adapter.
+
+    SGLang hosts LoRA on language-model layers only: ``should_apply_lora`` accepts
+    ``model.layers.*`` and nothing else, and its adapter loader bins tensors by a
+    ``layers.<N>.`` regex that a vision name (``model.visual.blocks.<N>....``) never
+    matches. A vision adapter therefore trains but is dropped on the way to the
+    rollout engine WITHOUT any log line — the actor optimizes a policy the rollout
+    never runs, and the gap widens every step.
+
+    Only adapter mode is affected. Merge mode folds the adapter into the base weights
+    and syncs those, so the engine never sees LoRA at all and any scope is safe.
+    """
+    if not getattr(args, "lora_adapter_mode", False) or getattr(args, "lora_scope", "all") != "all":
+        return
+
+    hf_checkpoint = getattr(args, "hf_checkpoint", None)
+    if not hf_checkpoint:
+        return
+
+    has_encoder = _declares_non_language_encoder(hf_checkpoint)
+    if has_encoder is None:
+        logger.warning(
+            "Skipped the --lora-scope check for --lora-adapter-mode (HF config unreadable). "
+            "If %s is a VL/omni model, pass --lora-scope language: SGLang cannot host a "
+            "vision-tower adapter and would silently drop it.",
+            hf_checkpoint,
+        )
+        return
+    if not has_encoder:
+        return
+
+    raise ValueError(
+        "--lora-adapter-mode with --lora-scope all is not supported on a model that has a "
+        "vision/audio encoder: SGLang only hosts LoRA on language-model layers, so the "
+        "vision-tower adapter would be trained but silently dropped before rollout, breaking "
+        "the on-policy assumption. Either pass --lora-scope language (keeps adapter mode and "
+        "its per-step bandwidth saving; the vision tower is left un-adapted), or switch to "
+        "--lora-merge-mode (folds the vision adapter into the synced base weights, at the cost "
+        "of a full weight sync every step). Pass --lora-scope language explicitly if your "
+        "--lora-target-modules provably match nothing in the vision tower."
+    )
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -3085,7 +3337,7 @@ def _validate_resource_config(args) -> None:
 
 
 def _validate_dataset_paths(args) -> None:
-    from relax.utils.data.data_utils import resolve_path_plan
+    from relax.utils.data.data_utils import SUPPORTED_DATA_EXTENSIONS, resolve_path_plan
 
     prompt_data = getattr(args, "prompt_data", None)
     is_sft = getattr(args, "loss_type", None) == "sft"
@@ -3121,6 +3373,13 @@ def _validate_dataset_paths(args) -> None:
             raise FileNotFoundError(
                 f"Dataset path(s) do not exist: {missing}. Fix: correct the path or mount/download the dataset first."
             )
+        unsupported = [path for path in paths if not path.endswith(SUPPORTED_DATA_EXTENSIONS)]
+        if unsupported:
+            formats = ", ".join(SUPPORTED_DATA_EXTENSIONS)
+            raise ValueError(
+                f"Unsupported dataset file format: {unsupported}. "
+                f"Fix: convert each file to one of the built-in loader formats: {formats}."
+            )
 
 
 def resolve_configured_roles(args) -> list[str]:
@@ -3145,6 +3404,7 @@ def validate_preflight_args(args) -> None:
     from relax.engine.sft.bootstrap import validate_sft_resource
     from relax.utils.training.ppo_utils import validate_ppo_config
 
+    _validate_resource_config(args)
     validate_ppo_config(args)
     validate_sft_resource(args)
     if getattr(args, "loss_type", None) != "sft":
@@ -3154,6 +3414,8 @@ def validate_preflight_args(args) -> None:
             required_roles = {"actor"}
         else:
             required_roles = {"actor", "rollout"}
+            if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+                required_roles.add("advantages")
         missing = sorted(required_roles - set(args.resource))
         if missing:
             raise ValueError(
@@ -3170,6 +3432,25 @@ def validate_preflight_args(args) -> None:
             "Fix: allocate at least one GPU to each active model role or remove the inactive role."
         )
     _validate_dataset_paths(args)
+
+
+def _validate_ref_load(args: argparse.Namespace) -> None:
+    """Validate a local reference checkpoint or defer a source alias."""
+    if is_model_source_alias(args, args.ref_load):
+        return
+    if is_model_uri(args.ref_load):
+        raise ValueError(
+            f"ref_load URI {args.ref_load!r} does not match the configured model source; "
+            "only a ref_load alias of hf_checkpoint or a local path is supported."
+        )
+    if not os.path.exists(args.ref_load):
+        raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+
+    if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
+        logger.info(
+            f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
+            "please make sure it is a valid megatron checkpoint directory."
+        )
 
 
 def slime_validate_args(args):
@@ -3219,6 +3500,18 @@ def slime_validate_args(args):
             raise ValueError(
                 "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
                 "support dp_size > 1)."
+            )
+        _validate_lora_vision_scope(args)
+        if "router" in getattr(args, "lora_target_modules", []) and not getattr(args, "lora_adapter_mode", False):
+            # Merge folds each adapter into its base via LoRAMerge, which only transforms
+            # LoRALinear modules; the router uses LoRATopKRouter, so its adapter would be
+            # silently dropped at sync time. Fail loud instead of training a router LoRA that
+            # never reaches the rollout engine. (Adapter mode exports via the bridge, which
+            # does handle the router, so it is not blocked here.)
+            raise ValueError(
+                "LoRA on 'router' is only supported in --lora-adapter-mode; merge mode cannot fold "
+                "the router adapter (LoRAMerge skips non-LoRALinear modules). Remove 'router' from "
+                "--lora-target-modules or switch to --lora-adapter-mode."
             )
         if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
             logger.info(
@@ -3276,14 +3569,7 @@ def slime_validate_args(args):
         )
 
     if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
-        if not os.path.exists(args.ref_load):
-            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
-
-        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
-            logger.info(
-                f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
-                "please make sure it is a valid megatron checkpoint directory."
-            )
+        _validate_ref_load(args)
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 
@@ -3541,6 +3827,35 @@ def slime_validate_args(args):
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
 
+    task_type = getattr(args, "task_type", "causal_lm")
+    if task_type == "seq_cls":
+        if args.loss_type != "sft":
+            raise ValueError("--task-type seq_cls requires --loss-type sft.")
+        if not args.label_key:
+            raise ValueError("--task-type seq_cls requires --label-key.")
+        if args.num_labels is None or args.num_labels < 2:
+            raise ValueError("--task-type seq_cls requires --num-labels >= 2.")
+        if not 0.0 <= args.classification_threshold <= 1.0:
+            raise ValueError("--classification-threshold must be in [0, 1].")
+        incompatible = {
+            "--fully-async": bool(args.fully_async),
+            "--hybrid": bool(args.hybrid),
+            "--sft-predict-interval": args.sft_predict_interval is not None,
+            "--sft-chunked-logits": bool(args.sft_chunked_logits),
+            "--enable-mtp-training": bool(args.enable_mtp_training),
+            "--mtp-num-layers": bool(args.mtp_num_layers),
+            "--save-hf": args.save_hf is not None,
+            "--allgather-cp": bool(args.allgather_cp),
+            "--custom-dataset-class": args.custom_dataset_class_path is not None,
+            "--sft-oversize-strategy custom": args.sft_oversize_strategy == "custom",
+            "--debug-train-only": bool(args.debug_train_only),
+        }
+        enabled = [name for name, is_enabled in incompatible.items() if is_enabled]
+        if enabled:
+            raise ValueError(f"--task-type seq_cls does not support: {', '.join(enabled)}.")
+    elif getattr(args, "num_labels", None) is not None:
+        raise ValueError("--num-labels is only meaningful under --task-type seq_cls.")
+
     args.use_critic = args.advantage_estimator == "ppo"
     # Synchronous PPO has no producer for
     # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
@@ -3790,6 +4105,9 @@ def slime_validate_args(args):
     if args.over_sampling_batch_size is None:
         args.over_sampling_batch_size = args.rollout_batch_size
 
+    if args.use_agentic_rollout and args.agentic_concurrency is None:
+        args.agentic_concurrency = args.over_sampling_batch_size
+
     assert args.over_sampling_batch_size >= args.rollout_batch_size, (
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
@@ -3818,11 +4136,14 @@ def slime_validate_args(args):
             "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
+    _normalize_mtp_detach_paths(args)
+    _normalize_mtp_only_training_args(args)
+
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     # --sft-chunked-logits incompatibilities. Both are flagged here so
-    # downstream (model.py _should_use_sft_chunked + the three loss.py direct
+    # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
     # Both are hard asserts — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.

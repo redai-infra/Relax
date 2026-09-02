@@ -158,6 +158,20 @@ def test_empty_dataset_directory_returns_nonzero(
     assert "add a .jsonl or .parquet file" in report["suggestion"]
 
 
+def test_existing_unsupported_dataset_file_returns_nonzero(
+    training_argv, tmp_path, capsys, optional_sglang_backend, megatron_backend
+):
+    unsupported = tmp_path / "prompt.txt"
+    unsupported.write_text("1+1\n", encoding="utf-8")
+    prompt_index = training_argv.index("--prompt-data") + 1
+    training_argv[prompt_index] = str(unsupported)
+
+    assert doctor.main(["--format", "json", "--", *training_argv]) == 1
+    report = json.loads(capsys.readouterr().err)
+    assert "Unsupported dataset file format" in report["error"]
+    assert "convert each file" in report["suggestion"]
+
+
 def test_custom_sft_dataset_owns_its_training_path_semantics():
     from relax.utils.arguments import _validate_dataset_paths
 

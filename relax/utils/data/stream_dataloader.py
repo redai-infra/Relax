@@ -611,6 +611,26 @@ def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast
     return out
 
 
+def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
+    if not value.is_nested:
+        return value.tolist()
+
+    rows = value.unbind(0)
+
+    try:
+        dense = torch.stack(rows)
+    except RuntimeError:
+        # Preserve row boundaries for truly ragged values.
+        return [row.tolist() for row in rows]
+
+    # TransferQueue may reconstruct scalar fields as singleton rows when
+    # the per-sample shape () is reported as (1,).
+    if dense.ndim == 2 and dense.shape[1] == 1:
+        return dense.squeeze(-1).tolist()
+
+    return dense.tolist()
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -883,9 +903,10 @@ def get_data_from_transfer_queue(
     if isinstance(rollout_data, TensorDict):
         new_rollout_data: Dict[str, Any] = {}
         for k, v in rollout_data.items():
-            # Convert length/reward-style fields to Python lists.
-            if "lengths" in k or "reward" in k:
-                new_rollout_data[k] = v.tolist()
+            # Keep scalar metadata as Python values across the TensorDict boundary,
+            # including NestedTensor values reconstructed by TransferQueue.
+            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
+                new_rollout_data[k] = _tensor_to_python_values(v)
             elif k == "multimodal_train_inputs":
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
@@ -953,6 +974,20 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "classification_labels" in rollout_data:
+        label_dtype = (
+            torch.long
+            if getattr(args, "problem_type", "single_label_classification") == "single_label_classification"
+            else torch.float32
+        )
+        rollout_data["classification_labels"] = [
+            torch.as_tensor(label, dtype=label_dtype, device=cuda_dev)
+            for label in rollout_data["classification_labels"]
+        ]
+    if "sample_weights" in rollout_data:
+        rollout_data["sample_weights"] = [
+            torch.as_tensor(weight, dtype=torch.float32, device=cuda_dev) for weight in rollout_data["sample_weights"]
+        ]
     # NOTE: multimodal_train_inputs are intentionally left on CPU here. Moving
     # the whole batch's pixel tensors to GPU up front would spike memory
     if args.qkv_format == "bshd":

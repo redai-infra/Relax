@@ -9,6 +9,7 @@ import torch
 
 from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
+    _QWEN38_PRESERVE_HISTORY_GATE,
     _QWEN_HISTORY_GATE,
     _QWEN_PRESERVE_HISTORY_GATE,
     try_patch_qwen_chat_template,
@@ -18,6 +19,8 @@ from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 
 _QWEN35_TEMPLATE = "\n".join(("template-start", _QWEN_HISTORY_GATE, "template-end"))
 _QWEN36_TEMPLATE = _QWEN35_TEMPLATE.replace(_QWEN_HISTORY_GATE, _QWEN_PRESERVE_HISTORY_GATE)
+# Qwen3.8 ships a preserve-by-default gate that also references reasoning_content.
+_QWEN38_TEMPLATE = "\n".join(("template-start reasoning_content", _QWEN38_PRESERVE_HISTORY_GATE, "template-end"))
 
 
 def _make_sample(*, historical_learn: bool = True) -> CanonicalSample:
@@ -145,6 +148,26 @@ def test_qwen36_native_gate_is_idempotent():
     assert result.template == _QWEN36_TEMPLATE
     assert "chat_template" not in result.kwargs
     assert result.kwargs["preserve_thinking"] is True
+
+
+def test_qwen38_preserve_gate_is_recognized_without_rewrite():
+    result = try_patch_qwen_chat_template(_make_sample(), _QWEN38_TEMPLATE, {})
+    assert result is not None
+    assert not result.changed
+    assert result.template == _QWEN38_TEMPLATE
+    assert "chat_template" not in result.kwargs
+    assert result.kwargs["preserve_thinking"] is True
+
+
+def test_qwen38_preserve_gate_explicit_false_disables_auto_preserve():
+    result = try_patch_qwen_chat_template(
+        _make_sample(),
+        _QWEN38_TEMPLATE,
+        {"preserve_thinking": False},
+    )
+    assert result is not None
+    assert not result.changed
+    assert result.kwargs["preserve_thinking"] is False
 
 
 def test_qwen_patch_rejects_ambiguous_gate():
