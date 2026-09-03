@@ -56,7 +56,7 @@ ______________________________________________________________________
 
 | 📣 Updates                                                                                                                                                                                         |
 | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **\[08/20/2026\]** 🧠 Added **M2PO**, **RLOO**, and two **REINFORCE++** variants, with dedicated recipes and an [Algorithm Reference](docs/en/examples/algorithms.md).                             |
+| **\[08/20/2026\]** 🧠 Added **M2PO**, **RLOO**, and two **REINFORCE++** variants, with runnable RLOO and REINFORCE++ recipes plus an [Algorithm Reference](docs/en/examples/algorithms.md) covering all four. |
 | **\[08/19/2026\]** 🤖 Added multi-agent training with multi-context trajectory export and a [Search-R1 reference recipe](examples/search_r1/).                                                     |
 | **\[08/18/2026\]** 🪶 LoRA RL now supports MoE models in both adapter and merge workflows. See the [LoRA Training Guide](docs/en/guide/low-rank-adaptation-training.md).                           |
 | **\[05/26/2026\]** 🔁 New **Hybrid** execution mode — streaming data + in-process ref/actor_fwd, with `--balance-data` support. See the [Hybrid Training Guide](docs/en/guide/hybrid-training.md). |

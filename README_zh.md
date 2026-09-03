@@ -56,7 +56,7 @@ ______________________________________________________________________
 
 | 📣 更新                                                                                                                                                              |
 | :------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **\[08/20/2026\]** 🧠 新增 **M2PO**、**RLOO** 与两种 **REINFORCE++** 算法，并提供配套训练脚本与[算法参考](docs/zh/examples/algorithms.md)。                          |
+| **\[08/20/2026\]** 🧠 新增 **M2PO**、**RLOO** 与两种 **REINFORCE++** 算法；提供 RLOO 与 REINFORCE++ 可运行配方，并在[算法参考](docs/zh/examples/algorithms.md)中涵盖以上四种算法。 |
 | **\[08/19/2026\]** 🤖 新增支持多上下文轨迹导出的 multi-agent 训练，并提供 [Search-R1 参考配方](examples/search_r1/)。                                                |
 | **\[08/18/2026\]** 🪶 LoRA RL 现已支持 MoE 模型的 adapter 与 merge 两种工作流，详见 [LoRA 训练指南](docs/zh/guide/low-rank-adaptation-training.md)。                 |
 | **\[05/26/2026\]** 🔁 新增 **Hybrid** 执行模式 —— 流式数据 + 进程内 ref/actor_fwd，支持 `--balance-data`，详见 [Hybrid 训练指南](docs/zh/guide/hybrid-training.md)。 |
