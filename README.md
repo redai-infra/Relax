@@ -122,7 +122,7 @@ Relax is designed for **omni-modal RL training** — text, vision, and audio in 
 | **Qwen3.5**                                                     | 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B | Text + Vision         | Reasoning, SFT, visual QA, multimodal reasoning      | Megatron |
 | **Qwen3-Omni**                                                  | 30B-A3B                                    | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
 | **Qwen3.6**                                                     | 27B, 35B-A3B                               | Text + Vision         | Reasoning, visual QA, multimodal reasoning           | Megatron |
-| **Qwen3.8**                                                     | 27B                                        | Text                  | Reasoning, SFT, post-training                        | Megatron |
+| **Qwen3.8**                                                     | 27B                                        | Text + Vision         | Reasoning, SFT, visual QA, multimodal reasoning      | Megatron |
 | **GLM5**                                                        | 744B-A40B (MoE)                            | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
 | **Kimi K2.6**                                                   | ~1T-A32B (MoE)                             | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
 | **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                                         | Vision + Language     | OCR, document understanding, multimodal reasoning    | Megatron |

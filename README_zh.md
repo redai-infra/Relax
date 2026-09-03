@@ -122,7 +122,7 @@ Relax 专为**全模态强化学习训练**设计 —— 文本、视觉、音�
 | **Qwen3.5**                                                     | 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B | 文本 + 视觉        | 推理、SFT、视觉问答、多模态推理          | Megatron |
 | **Qwen3-Omni**                                                  | 30B-A3B                                    | 文本 + 视觉 + 音频 | 图文音频联合问答、全模态理解             | Megatron |
 | **Qwen3.6**                                                     | 27B, 35B-A3B                               | 文本 + 视觉        | 推理、视觉问答、多模态推理               | Megatron |
-| **Qwen3.8**                                                     | 27B                                        | 文本               | 推理、SFT、后训练                        | Megatron |
+| **Qwen3.8**                                                     | 27B                                        | 文本 + 视觉        | 推理、SFT、视觉问答、多模态推理          | Megatron |
 | **GLM5**                                                        | 744B-A40B (MoE)                            | 文本               | 数学推理、代码生成、多轮对话             | Megatron |
 | **Kimi K2.6**                                                   | ~1T-A32B (MoE)                             | 视觉 + 语言        | 视觉问答、多模态推理；支持 INT4 QAT 训练 | Megatron |
 | **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                                         | 视觉 + 语言        | OCR、文档理解、多模态推理                | Megatron |
