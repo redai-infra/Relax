@@ -16,7 +16,7 @@
   <a href="https://arxiv.org/abs/2604.11554">
     <img src="https://img.shields.io/static/v1?label=arXiv&message=Paper&color=red" alt="arXiv">
   </a>
-  <a href="https://redai-infra.github.io/Relax">
+  <a href="https://redai-studio.github.io/Relax">
     <img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Documentation">
   </a>
   <a href="https://github.com/redai-studio/Relax/discussions/48" target="_blank">
@@ -34,7 +34,7 @@
 
 ______________________________________________________________________
 
-**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是小红书 AI 平台开源的、面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-infra/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
+**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是小红书 AI 平台开源的、面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-studio/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
 
 ______________________________________________________________________
 
@@ -137,12 +137,12 @@ ______________________________________________________________________
 
 ```bash
 # 拉取官方镜像
-docker pull ghcr.io/redai-infra/relaxrl:latest
+docker pull ghcr.io/redai-studio/relaxrl:latest
 
 # 启动容器，挂载 GPU、共享内存与工作目录
 docker run -it --gpus all --ipc=host --network=host \
   -v /path/to/your/workspace:/root \
-  ghcr.io/redai-infra/relaxrl:latest bash
+  ghcr.io/redai-studio/relaxrl:latest bash
 
 # 容器内克隆仓库并安装
 git clone https://github.com/redai-studio/Relax.git /root/Relax
@@ -254,7 +254,7 @@ ______________________________________________________________________
 
 ## 📚 文档
 
-完整的双语文档请访问 **[redai-infra.github.io/Relax](https://redai-infra.github.io/Relax)**。
+完整的双语文档请访问 **[redai-studio.github.io/Relax](https://redai-studio.github.io/Relax)**。
 
 ______________________________________________________________________
 

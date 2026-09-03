@@ -489,6 +489,6 @@ tail -f /tmp/ray/session_latest/logs/serve/*.log
 
 ## 获取帮助
 
-- [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-- [Discussions](https://github.com/redai-infra/Relax/discussions)
+- [GitHub Issues](https://github.com/redai-studio/Relax/issues)
+- [Discussions](https://github.com/redai-studio/Relax/discussions)
 - [介绍](../guide/introduction.md)

@@ -22,7 +22,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: github.repository == 'redai-infra/Relax'
+    if: github.repository == 'redai-studio/Relax'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.repository == 'redai-infra/Relax'
+    if: github.repository == 'redai-studio/Relax'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

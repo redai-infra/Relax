@@ -460,6 +460,6 @@ bash scripts/entrypoint/ray-job.sh scripts/training/multimodal/run-qwen35-9B-8xg
 
 ## Getting Help
 
-- [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-- [Discussions](https://github.com/redai-infra/Relax/discussions)
+- [GitHub Issues](https://github.com/redai-studio/Relax/issues)
+- [Discussions](https://github.com/redai-studio/Relax/discussions)
 - [Introduction](../guide/introduction.md)
