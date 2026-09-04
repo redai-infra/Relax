@@ -276,6 +276,7 @@ ______________________________________________________________________
 | Project                                                  | Description                                                                                                                                                             |
 | :------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [HyperEyes](https://github.com/DeepExperience/HyperEyes) | A parallel multimodal search agent that uses Relax for efficient RL training, combining visual grounding and retrieval to search across multiple entities concurrently. |
+| [Iris](https://github.com/AllSpark-Research/Iris)        | An open-weight search agent family post-trained with Relax from Qwen3.5/3.6, designed for long-horizon search, iterative evidence gathering, and context management.    |
 
 ______________________________________________________________________
 
