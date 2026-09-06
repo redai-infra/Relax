@@ -119,6 +119,16 @@ def get_rope_index(
             # Fallback to a dense mask if packed metadata is missing.
             attention_mask = torch.ones_like(input_ids)
 
+    # Position ids are built on CPU with torch.arange(...) below, and the running counters
+    # (`st`, `st_idx`) accumulate each segment's length into that CPU chain. `audio_seqlens`
+    # arrives as a CUDA tensor (callers derive it from `feature_attention_mask.sum(1)`), so
+    # `audio_len` stays on CUDA and poisons the counters. The video branches already guard
+    # this the same way with `second_per_grids[i].cpu()`; this mirrors it for audio. Only the
+    # compute device changes -- the lengths are identical and `position_ids` is still returned
+    # on `input_ids.device`.
+    if isinstance(audio_seqlens, torch.Tensor):
+        audio_seqlens = audio_seqlens.cpu()
+
     mrope_position_deltas = []
     if input_ids is not None and (
         image_grid_thw is not None or video_grid_thw is not None or audio_seqlens is not None
